@@ -146,7 +146,7 @@ pub fn secret_files_to_protect(
                 files.push(PathBuf::from(file.trim()));
             }
         }
-        files.extend(config.source_path.clone());
+        files.extend(config.source_path.0.clone());
     }
     files.extend(ClusterSecret::default_path());
     files.sort();
@@ -567,7 +567,7 @@ mod exposure_tests {
             ..SecretOpts::default()
         };
         let config = ConfigFile {
-            source_path: Some(PathBuf::from("/x/rusty-grid.toml")),
+            source_path: crate::config::SourcePath(Some(PathBuf::from("/x/rusty-grid.toml"))),
             secret_file: Some("/x/config.secret".into()),
             ..ConfigFile::default()
         };

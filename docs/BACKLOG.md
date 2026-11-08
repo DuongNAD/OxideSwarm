@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `5fb5575`: 54 items Implemented, 2 Partial and 14 Planned. "Pull
+On 2026-11-08, at `master` `4e1aeb3`: 54 items Implemented, 3 Partial and 13 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -191,7 +191,7 @@ design record that builds nothing.
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Partial | 122 (design), 129, 141 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133 |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
@@ -1388,3 +1388,9 @@ Add one dated line per finished item, newest last.
   before a surviving one stops `open`; any compaction error blocks every later write; a state
   directory open to others is tightened instead of refused, and symbolic links in it are followed;
   a missing journal next to a later-generation snapshot is recreated without a warning.
+- 2026-11-08: FEAT-3 is Partial: pull request 133 built `FEAT-3a` of design 0033, the core and
+  macOS (`--isolation off|fs|fs+net`, the `iso:` tag, `require:iso=`, `doctor` reporting and a
+  `sandbox-exec` profile). On macOS a confined task cannot read the home, the per-user temp and
+  cache directories, the cluster secret file or the config file in use, and under `fs+net` it has
+  no network. `FEAT-3b` (Linux) and `FEAT-3c` (Windows) are Planned, so on those systems a task can
+  still read `cluster.secret`.

@@ -16,13 +16,24 @@ use rusty_grid_core::error::{GridError, GridResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Where a [`ConfigFile`] was read from. Not part of the configuration: every two values compare
+/// equal, so the same settings read from a TOML and a JSON file are still equal.
+#[derive(Debug, Clone, Default)]
+pub struct SourcePath(pub Option<PathBuf>);
+
+impl PartialEq for SourcePath {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// Top-level configuration file schema supporting TOML and JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ConfigFile {
     /// The file this configuration was read from (not part of the file format). A worker with
     /// isolation keeps tasks from reading it: it may hold `secret =`.
     #[serde(skip)]
-    pub source_path: Option<PathBuf>,
+    pub source_path: SourcePath,
     /// Path of the cluster secret file used by every command (a section's own key wins).
     #[serde(default)]
     pub secret_file: Option<String>,
@@ -335,19 +346,19 @@ fn load_config_file_with_options(
             ))
         })?;
         Ok(Some(ConfigFile {
-            source_path: Some(path),
+            source_path: SourcePath(Some(path)),
             ..parsed
         }))
     } else {
         // Try TOML first, then fallback to JSON
         match toml::from_str::<ConfigFile>(&content) {
             Ok(parsed) => Ok(Some(ConfigFile {
-                source_path: Some(path),
+                source_path: SourcePath(Some(path)),
                 ..parsed
             })),
             Err(toml_err) => match serde_json::from_str::<ConfigFile>(&content) {
                 Ok(parsed) => Ok(Some(ConfigFile {
-                    source_path: Some(path),
+                    source_path: SourcePath(Some(path)),
                     ..parsed
                 })),
                 Err(_) => Err(GridError::Config(format!(
