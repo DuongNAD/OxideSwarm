@@ -261,14 +261,15 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 ### 3.5 Upgrading a running grid (master and workers)
 All nodes in a cluster (`master`, `worker`, and CLI/MCP clients) must run one build: `Task`, `TaskResult`, and message
 frames are encoded positionally with bincode. Workers, clients, and the master exchange `PROTOCOL_VERSION_CURRENT`
-(currently version 5, `PROTOCOL_VERSION_MIN_COMPATIBLE = 5`; see `docs/design/0040-protocol-versioning.md`). Every
+(currently version 6, `PROTOCOL_VERSION_MIN_COMPATIBLE = 6`; see `docs/design/0040-protocol-versioning.md`). Every
 protocol version bump breaks older peers (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT`), and each side
-refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v5 refuses v4 and older peers).
+refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v6 refuses v5 and older peers).
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`
 and `ClientResponse` (unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and
-`connect_master` runs a side-effect-free `ClusterStatus` version check before sending any state-changing request so a
-newer CLI never executes a task on an older master. Always **upgrade and restart the master first**, then the workers
-and CLIs: an upgraded v5 master immediately refuses v4 (and older) workers and clients before registration or task
+`connect_master` runs a side-effect-free `Hello` version check before sending any state-changing request so a
+newer CLI never executes a task on an older master (a master older than version 6 cannot decode `Hello`, closes the
+connection, and the CLI prints the "older or newer build" hint). Always **upgrade and restart the master first**, then the workers
+and CLIs: an upgraded v6 master immediately refuses v5 (and older) workers and clients before registration or task
 submission, whereas a newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`,
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).

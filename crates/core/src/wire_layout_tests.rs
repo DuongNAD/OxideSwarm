@@ -42,7 +42,7 @@ use crate::protocol::{
 };
 use crate::task::{
     AutoRigSpec, Bytes, CheckpointData, Generative3DSpec, OutputArtifact, StagedFile, Task, TaskId,
-    TaskRequirements, TaskResult, TaskSpec, TaskStatus,
+    TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceRef, WorkspaceSource,
 };
 
 /// The recorded encodings, relative to the crate root.
@@ -199,6 +199,13 @@ fn task(n: u8, spec: TaskSpec) -> Task {
             },
         ],
         output_globs: vec!["target/**/*.rlib".into()],
+        workspace: Some(WorkspaceRef {
+            name: "oxideswarm-agent.1".into(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: blob_id(0x70),
+                manifest_size: 2_048,
+            }),
+        }),
     }
 }
 
@@ -603,6 +610,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
                 },
             },
         ),
+        ("Hello", ClientMessage::Hello),
     ];
     check_instances("ClientMessage", &all, |msg| match msg {
         ClientMessage::SubmitTask { .. } => "SubmitTask",
@@ -613,6 +621,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ClientMessage::SubmitMapReduce { .. } => "SubmitMapReduce",
         ClientMessage::GetTaskResult { .. } => "GetTaskResult",
         ClientMessage::BlobRequest { .. } => "BlobRequest",
+        ClientMessage::Hello => "Hello",
     });
     all
 }
@@ -693,6 +702,12 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 },
             },
         ),
+        (
+            "Hello",
+            ClientResponse::Hello {
+                min_compatible_version: PROTOCOL_VERSION_MIN_COMPATIBLE,
+            },
+        ),
     ];
     check_instances("ClientResponse", &all, |msg| match msg {
         ClientResponse::TaskSubmitted { .. } => "TaskSubmitted",
@@ -705,6 +720,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         ClientResponse::MapReduceCompleted { .. } => "MapReduceCompleted",
         ClientResponse::Error { .. } => "Error",
         ClientResponse::BlobReply { .. } => "BlobReply",
+        ClientResponse::Hello { .. } => "Hello",
     });
     all
 }

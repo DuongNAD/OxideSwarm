@@ -3220,6 +3220,13 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 };
                 send_client_response(&mut transport, &resp).await?;
             }
+            ClientMessage::Hello => {
+                let resp = ClientResponse::Hello {
+                    min_compatible_version:
+                        rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                };
+                send_client_response(&mut transport, &resp).await?;
+            }
             ClientMessage::ListWorkers => {
                 let workers_info = registry.list_all_workers().await;
                 let mut workers = Vec::with_capacity(workers_info.len());
