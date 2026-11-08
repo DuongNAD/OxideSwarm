@@ -1564,6 +1564,7 @@ except OSError as e:
                 net.stderr_str()
             );
         }
+        eprintln!("NETLINK_CONFINED_DENIED {:?}", lines(&net));
     }
 
     /// The worker user's kernel keyring is out of reach (`EPERM`).
