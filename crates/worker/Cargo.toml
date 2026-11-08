@@ -20,7 +20,7 @@ getrandom = "0.4"
 tempfile = "3"
 sysinfo = { workspace = true }
 iroh = { workspace = true, optional = true }
-wgpu = { version = "22", optional = true }
+wgpu = { version = "30", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 
