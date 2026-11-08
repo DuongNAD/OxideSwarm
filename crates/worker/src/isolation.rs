@@ -187,6 +187,8 @@ pub fn prepare_environment(
 pub(crate) struct Jail<'a> {
     pub level: IsolationLevel,
     pub host: &'a HostDirs,
+    /// Files the task must not read wherever they are.
+    pub protected_files: &'a [PathBuf],
     /// The worker's sandbox base directory (`<base>/<task id>` holds this task's files).
     pub sandbox_base: &'a Path,
     /// The task's own sandbox directory.
@@ -333,7 +335,12 @@ mod macos {
     /// `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`, `CARGO_HOME`, `CARGO_CRED`,
     /// `CARGO_CRED_TOML`, `ANCESTOR_<n>` for `ancestors` entries), so no path is ever spliced into
     /// the profile text.
-    pub(super) fn profile(level: IsolationLevel, ancestors: usize, extra_denied: usize) -> String {
+    pub(super) fn profile(
+        level: IsolationLevel,
+        ancestors: usize,
+        extra_denied: usize,
+        protected: usize,
+    ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n");
         for dev in WRITABLE_DEVICES {
             p.push_str(&format!("    (literal \"{dev}\")\n"));
@@ -352,6 +359,13 @@ mod macos {
         p.push_str(
             "(deny file-read*\n    (literal (param \"CARGO_CRED\"))\n    (literal (param \"CARGO_CRED_TOML\")))\n",
         );
+        if protected > 0 {
+            p.push_str("(deny file-read*");
+            for i in 0..protected {
+                p.push_str(&format!("\n    (literal (param \"PROTECTED_{i}\"))"));
+            }
+            p.push_str(")\n");
+        }
         if ancestors > 0 {
             p.push_str("(allow file-read-metadata\n");
             for i in 0..ancestors {
@@ -434,6 +448,29 @@ mod macos {
         None
     }
 
+    /// The per-user cache directory (`DARWIN_USER_CACHE_DIR`, `/var/folders/../C`), next to the
+    /// temp directory.
+    #[cfg(target_os = "macos")]
+    fn user_cache_dir() -> Option<PathBuf> {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        // SAFETY: the buffer is valid for `len` bytes.
+        let n =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 || n > buf.len() {
+            return None;
+        }
+        // SAFETY: confstr NUL-terminates within the buffer when `n <= len`.
+        let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn user_cache_dir() -> Option<PathBuf> {
+        None
+    }
+
     /// The canonical form of `p`; a path that does not exist (yet) is returned as given, with
     /// its longest existing prefix canonicalized.
     fn canonical(p: &Path) -> PathBuf {
@@ -465,6 +502,7 @@ mod macos {
         let candidates = [
             account_home(),
             user_temp_dir(),
+            user_cache_dir(),
             Some(PathBuf::from("/Users/Shared")),
             Some(PathBuf::from("/private/tmp")),
             Some(PathBuf::from("/private/var/tmp")),
@@ -474,6 +512,19 @@ mod macos {
             let dir = canonical(&dir);
             if dir != home && dir != base && !extra.contains(&dir) {
                 extra.push(dir);
+            }
+        }
+
+        // The cluster secret file and the config file: denied wherever they are, after the allows
+        // (a secret file inside the toolchain directories stays denied too).
+        let mut protected: Vec<PathBuf> = Vec::new();
+        for file in jail.protected_files {
+            if file.as_os_str().is_empty() {
+                continue;
+            }
+            let file = canonical(file);
+            if !protected.contains(&file) {
+                protected.push(file);
             }
         }
 
@@ -502,7 +553,7 @@ mod macos {
 
         let mut args = vec![
             "-p".to_string(),
-            profile(jail.level, ancestors.len(), extra.len()),
+            profile(jail.level, ancestors.len(), extra.len(), protected.len()),
         ];
         let mut define = |name: &str, value: &Path| {
             args.push("-D".to_string());
@@ -518,6 +569,9 @@ mod macos {
         define("CARGO_CRED_TOML", &cargo.join("credentials.toml"));
         for (i, dir) in extra.iter().enumerate() {
             define(&format!("DENIED_{i}"), dir);
+        }
+        for (i, file) in protected.iter().enumerate() {
+            define(&format!("PROTECTED_{i}"), file);
         }
         for (i, dir) in ancestors.iter().enumerate() {
             define(&format!("ANCESTOR_{i}"), dir);
@@ -565,6 +619,7 @@ mod macos {
             let jail = Jail {
                 level,
                 host: &host,
+                protected_files: &[],
                 sandbox_base,
                 sandbox_dir: &probe_dir,
             };
@@ -625,8 +680,7 @@ pub(crate) mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
-        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
-        WAIT_OBJECT_0,
+        GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -1234,18 +1288,26 @@ pub(crate) mod windows {
         if !path.exists() {
             return;
         }
-        if !dacl_already_denies_sid(path, any_pkg_sid, GENERIC_ALL) {
-            let entry = explicit_access(any_pkg_sid, GENERIC_ALL, DENY_ACCESS, NO_INHERITANCE);
+        if !dacl_already_denies_sid(path, any_pkg_sid, FILE_ALL_ACCESS)
+            || dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES)
+        {
+            let entry = explicit_access(any_pkg_sid, FILE_ALL_ACCESS, DENY_ACCESS, NO_INHERITANCE);
             let _ = merge_entries_on_path(path, &[entry]);
         }
         if path.is_dir() {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for e in entries.take(64).flatten() {
                     let child = e.path();
-                    if child.is_file() && !dacl_already_denies_sid(&child, any_pkg_sid, GENERIC_ALL)
+                    if child.is_file()
+                        && (!dacl_already_denies_sid(&child, any_pkg_sid, FILE_ALL_ACCESS)
+                            || dacl_already_grants_sid(&child, any_pkg_sid, FILE_READ_ATTRIBUTES))
                     {
-                        let entry =
-                            explicit_access(any_pkg_sid, GENERIC_ALL, DENY_ACCESS, NO_INHERITANCE);
+                        let entry = explicit_access(
+                            any_pkg_sid,
+                            FILE_ALL_ACCESS,
+                            DENY_ACCESS,
+                            NO_INHERITANCE,
+                        );
                         let _ = merge_entries_on_path(&child, &[entry]);
                     }
                 }
@@ -1302,6 +1364,19 @@ pub(crate) mod windows {
             ".package-cache-lock",
         ] {
             grant_rx_non_inherited(&cargo.join(file), any_pkg_sid);
+        }
+        if let Ok(entries) = std::fs::read_dir(cargo) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let name = entry.file_name();
+                    if !name.eq_ignore_ascii_case("credentials")
+                        && !name.eq_ignore_ascii_case("credentials.toml")
+                    {
+                        grant_rx_non_inherited(&p, any_pkg_sid);
+                    }
+                }
+            }
         }
         grant_rx_recursive_cached(&cargo.join("bin"), any_pkg_sid);
         grant_rx_recursive_cached(&cargo.join("git"), any_pkg_sid);
@@ -1512,6 +1587,15 @@ pub(crate) mod windows {
             if sub.exists() {
                 grant_ancestor_traverse(&sub, any_pkg_sid);
                 grant_rx_recursive_cached(&sub, any_pkg_sid);
+            }
+        }
+
+        // Explicitly deny `ALL APPLICATION PACKAGES` on every protected file (such as a cluster
+        // secret file or config file located outside the denied home, or inside a toolchain
+        // directory).
+        for file in jail.protected_files {
+            if !file.as_os_str().is_empty() && file.exists() {
+                deny_any_package_on_path(file, any_pkg_sid);
             }
         }
     }
@@ -1843,6 +1927,7 @@ pub(crate) mod windows {
             let jail = Jail {
                 level,
                 host: &host,
+                protected_files: &[],
                 sandbox_base,
                 sandbox_dir: &probe_dir,
             };
@@ -2381,7 +2466,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_seatbelt_profile_orders_deny_allow_deny_and_adds_network_rule_for_fs_net() {
-        let fs = macos::profile(IsolationLevel::Fs, 2, 1);
+        let fs = macos::profile(IsolationLevel::Fs, 2, 1, 1);
         let at = |needle: &str| {
             fs.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing in\n{fs}"))
@@ -2407,10 +2492,11 @@ mod tests {
             "(deny file-ioctl",
             "(deny signal)\n(allow signal (target same-sandbox))",
             "(param \"DENIED_0\")",
+            "(deny file-read*\n    (literal (param \"PROTECTED_0\")))",
         ] {
             assert!(fs.contains(rule), "{rule} missing in\n{fs}");
         }
-        let net = macos::profile(IsolationLevel::FsNet, 0, 0);
+        let net = macos::profile(IsolationLevel::FsNet, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));
     }
@@ -2426,6 +2512,7 @@ mod tests {
         let jail = Jail {
             level: IsolationLevel::Fs,
             host: &h,
+            protected_files: &[],
             sandbox_base: Path::new("/nonexistent-base"),
             sandbox_dir: Path::new("/nonexistent-base/t1"),
         };
@@ -2480,6 +2567,7 @@ mod tests {
         let jail = Jail {
             level: IsolationLevel::Fs,
             host: &h,
+            protected_files: &[],
             sandbox_base: Path::new("/sb"),
             sandbox_dir: Path::new("/sb/t"),
         };
@@ -2507,6 +2595,7 @@ mod tests {
         let jail = Jail {
             level: IsolationLevel::Fs,
             host: &h,
+            protected_files: &[],
             sandbox_base: Path::new(r"C:\sb"),
             sandbox_dir: Path::new(r"C:\sb\t"),
         };

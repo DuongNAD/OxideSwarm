@@ -1970,6 +1970,13 @@ async fn run_worker(
         config = config.with_process_priority(priority);
     }
     config = config.with_isolation(isolation);
+    if isolation != IsolationLevel::Off {
+        config = config.with_protected_files(crate::secret_cmd::secret_files_to_protect(
+            &secret_opts,
+            config_file.as_ref(),
+            |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
+        ));
+    }
     config = config.with_keep_sandboxes(keep_sandboxes);
     let blob_cache_mb = resolve_u64(
         args.blob_cache_mb,

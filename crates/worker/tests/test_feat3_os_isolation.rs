@@ -812,6 +812,111 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         println!("{}", result.stdout_str());
     }
 
+    /// Review of the re-verification: the cluster secret file (and the config file) may live
+    /// anywhere, so the worker hands their paths to the policy.
+    #[tokio::test]
+    async fn test_a_secret_file_outside_the_home_is_unreadable_to_a_task() {
+        // The toolchain directories are readable by policy, so a file placed there is readable
+        // unless it is named as protected: the strongest proof that the rule is the cause.
+        let outside = tempfile::tempdir().unwrap();
+        let cargo_home = outside.path().join("cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let secret_file = cargo_home.join("cluster.secret");
+        std::fs::write(&secret_file, "DUMMY-SECRETFILE-feat3a").unwrap();
+        let config_file = cargo_home.join("rusty-grid.toml");
+        std::fs::write(&config_file, "secret = \"DUMMY-CONFIG-feat3a\"").unwrap();
+
+        let run = |level: IsolationLevel, protect: bool| {
+            let rig = Rig::new(level, false);
+            let mut host = rig.host.clone();
+            host.cargo_home = cargo_home.clone();
+            let mut config = RunnerConfig::new(SandboxConfig::new(rig.base.clone()))
+                .with_isolation(level)
+                .with_host_dirs(host);
+            if protect {
+                config =
+                    config.with_protected_files(vec![secret_file.clone(), config_file.clone()]);
+            }
+            let runner = TaskRunner::new(
+                uuid::Uuid::new_v4(),
+                WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
+                config,
+            );
+            let task = rig.task(
+                r#"cat "$T_A" 2>&1; echo; cat "$T_B" 2>&1; echo END"#,
+                &[
+                    ("T_A", secret_file.to_str().unwrap()),
+                    ("T_B", config_file.to_str().unwrap()),
+                ],
+                60,
+            );
+            async move {
+                let result = runner.execute_task(&task, None, None).await;
+                drop(rig);
+                result
+            }
+        };
+        // Unprotected, the policy itself lets the task read it (so the rule is what stops it).
+        let open = run(IsolationLevel::Fs, false).await;
+        assert!(
+            open.stdout_str().contains("DUMMY-SECRETFILE-feat3a"),
+            "{}",
+            open.stdout_str()
+        );
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run(level, true).await;
+            let out = result.stdout_str();
+            assert!(
+                !out.contains("DUMMY-SECRETFILE-feat3a") && !out.contains("DUMMY-CONFIG-feat3a"),
+                "{level}: {out}"
+            );
+            assert!(out.contains("Operation not permitted"), "{level}: {out}");
+        }
+    }
+
+    /// The per-user cache directory (`/var/folders/../C`) is denied like the temp directory.
+    #[tokio::test]
+    async fn test_the_user_cache_directory_is_unreadable_to_a_task() {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        let n =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 || n > buf.len() {
+            eprintln!("skipped: no user cache dir");
+            return;
+        }
+        let dir = PathBuf::from(
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let Ok(probe) = tempfile::Builder::new()
+            .prefix("feat3a-cache-probe")
+            .tempfile_in(&dir)
+        else {
+            eprintln!("skipped: cannot write to {}", dir.display());
+            return;
+        };
+        std::fs::write(probe.path(), "DUMMY-CACHE-feat3a").unwrap();
+        let path = probe.path().to_str().unwrap().to_string();
+        let script =
+            r#"cat "$T_FILE" 2>&1; ls "$T_DIR" >/dev/null 2>&1 && echo LISTED || echo NOT_LISTED"#;
+        let extra = [("T_FILE", path.as_str()), ("T_DIR", dir.to_str().unwrap())];
+        let control = run_at(IsolationLevel::Off, script, &extra).await;
+        assert!(
+            control.stdout_str().contains("DUMMY-CACHE-feat3a"),
+            "{}",
+            control.stdout_str()
+        );
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &extra).await;
+            assert!(
+                !result.stdout_str().contains("DUMMY-CACHE-feat3a"),
+                "{level}"
+            );
+            assert!(has(&result, "NOT_LISTED"), "{level}: {:?}", lines(&result));
+        }
+    }
+
     async fn wait_for_pid(pid: &AtomicU32) -> u32 {
         for _ in 0..200 {
             let v = pid.load(Ordering::Acquire);
@@ -1780,6 +1885,78 @@ try {
                 !pkg_dir.exists(),
                 "DeleteAppContainerProfile must remove {} on task cleanup",
                 pkg_dir.display()
+            );
+        }
+    }
+
+    /// Review of the re-verification: the cluster secret file (and the config file) may live
+    /// anywhere (even inside a toolchain directory), so the worker hands their paths to the
+    /// policy via `RunnerConfig::protected_files`.
+    #[tokio::test]
+    async fn test_a_secret_file_outside_the_home_is_unreadable_to_a_task() {
+        let outside = tempfile::tempdir().unwrap();
+        let cargo_home = outside.path().join("cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let secret_file = cargo_home.join("cluster.secret");
+        std::fs::write(&secret_file, "DUMMY-SECRETFILE-feat3c").unwrap();
+        let config_file = cargo_home.join("rusty-grid.toml");
+        std::fs::write(&config_file, "secret = \"DUMMY-CONFIG-feat3c\"").unwrap();
+
+        let run = |level: IsolationLevel, protect: bool| {
+            let rig = Rig::new(level, false);
+            let mut host = rig.host.clone();
+            host.cargo_home = cargo_home.clone();
+            let mut config = RunnerConfig::new(SandboxConfig::new(rig.base.clone()))
+                .with_isolation(level)
+                .with_host_dirs(host);
+            if protect {
+                config =
+                    config.with_protected_files(vec![secret_file.clone(), config_file.clone()]);
+            }
+            let runner = TaskRunner::new(
+                uuid::Uuid::new_v4(),
+                WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
+                config,
+            );
+            let script = r#"
+try { Write-Output (Get-Content -LiteralPath $env:T_A -Raw -ErrorAction Stop) } catch { Write-Output 'DENY_A' }
+try { Write-Output (Get-Content -LiteralPath $env:T_B -Raw -ErrorAction Stop) } catch { Write-Output 'DENY_B' }
+"#;
+            let task = win_task(
+                &rig,
+                script,
+                &[
+                    ("T_A", secret_file.to_str().unwrap()),
+                    ("T_B", config_file.to_str().unwrap()),
+                ],
+                60,
+            );
+            async move {
+                let result = runner.execute_task(&task, None, None).await;
+                drop(rig);
+                result
+            }
+        };
+
+        // Unprotected, the toolchain policy itself lets the task read files in `cargo_home`
+        // (proving the `protected_files` deny ACE is what blocks them below).
+        let open = run(IsolationLevel::Fs, false).await;
+        assert!(
+            open.stdout_str().contains("DUMMY-SECRETFILE-feat3c"),
+            "{}",
+            open.stdout_str()
+        );
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run(level, true).await;
+            let out = result.stdout_str();
+            assert!(
+                !out.contains("DUMMY-SECRETFILE-feat3c") && !out.contains("DUMMY-CONFIG-feat3c"),
+                "{level}: {out}"
+            );
+            let got = lines(&result);
+            assert!(
+                got.contains(&"DENY_A".to_string()) && got.contains(&"DENY_B".to_string()),
+                "{level}: {got:?}"
             );
         }
     }
