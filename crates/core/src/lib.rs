@@ -10,6 +10,7 @@ pub mod error;
 pub mod mapreduce;
 pub mod mode;
 pub mod placement;
+pub mod private_file;
 pub mod protocol;
 pub mod task;
 pub mod transport;

@@ -758,7 +758,12 @@ fn prepare_dir(dir: &Path) -> GridResult<()> {
             .create(dir)
             .map_err(|e| storage_io(dir, "create the state directory", e))?;
     }
-    #[cfg(not(unix))]
+    // Windows: a new directory gets a protected DACL for the current user, SYSTEM and
+    // Administrators (SEC-9, design 0047); the files created in it inherit it.
+    #[cfg(windows)]
+    rusty_grid_core::private_file::create_private_dir_all(dir)
+        .map_err(|e| storage_io(dir, "create the state directory", e))?;
+    #[cfg(not(any(unix, windows)))]
     std::fs::create_dir_all(dir).map_err(|e| storage_io(dir, "create the state directory", e))?;
 
     let meta = std::fs::symlink_metadata(dir)
@@ -806,8 +811,9 @@ fn prepare_dir(dir: &Path) -> GridResult<()> {
                 dir.display()
             )));
         }
-        // TODO(FEAT-1): restrict the DACL to the current user, SYSTEM and Administrators
-        // (design 0046 D1.3); until then the directory inherits its parent's ACL.
+        // An existing directory keeps its DACL; warn (never refuse) when it is open to others,
+        // as Unix tightens a wide mode (design 0046 D1.3, design 0047).
+        rusty_grid_core::private_file::warn_if_readable_by_others(dir, "task store directory");
     }
     Ok(())
 }
@@ -1624,6 +1630,33 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let msg = expect_storage_err(TaskStore::open(dir.path()));
         assert!(msg.contains("snapshot.bin"), "{msg}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_dir_gets_a_protected_dacl_and_its_files_inherit_it() {
+        use rusty_grid_core::private_file::{current_user_sid, open_grants, read_dacl};
+        let base = tempfile::tempdir().unwrap();
+        // Like a home folder: Everyone and Users can read, with inheritance.
+        let status = std::process::Command::new("icacls")
+            .arg(base.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R", "*S-1-5-32-545:(OI)(CI)R"])
+            .status()
+            .expect("icacls");
+        assert!(status.success());
+        let dir = base.path().join("state");
+        let (store, _) = TaskStore::open(&dir).unwrap();
+        store.compact_blocking(image_with(1)).unwrap();
+        drop(store);
+
+        let user = current_user_sid().unwrap();
+        let (aces, protected) = read_dacl(&dir).unwrap();
+        assert!(protected, "the state directory must not inherit");
+        assert!(open_grants(&aces, &user).is_empty(), "{aces:?}");
+        for name in [LOCK_FILE, JOURNAL_FILE, SNAPSHOT_FILE] {
+            let (aces, _) = read_dacl(&dir.join(name)).unwrap();
+            assert!(open_grants(&aces, &user).is_empty(), "{name}: {aces:?}");
+        }
     }
 
     #[cfg(unix)]

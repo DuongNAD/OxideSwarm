@@ -251,6 +251,8 @@ impl ClusterSecret {
                 }
             }
         }
+        #[cfg(windows)]
+        crate::private_file::warn_if_readable_by_others(path, "cluster secret file");
         let line = text
             .lines()
             .map(str::trim)
@@ -269,13 +271,18 @@ impl ClusterSecret {
 
     /// Writes the secret to `path` as a single hex line, creating missing parent directories.
     ///
-    /// The file is created with mode 0600 on Unix (best effort on Windows, where it inherits
-    /// the ACL of its directory). With `overwrite == false` an existing file is never touched
+    /// The file is created with mode 0600 on Unix and, on Windows, with a protected DACL that
+    /// grants only the current user, `SYSTEM` and `Administrators` (`private_file`). With `overwrite == false` an existing file is never touched
     /// and an error is returned; with `true` it is replaced atomically via a private temp file.
     pub fn save_file(&self, path: &Path, overwrite: bool) -> GridResult<()> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             let existed = parent.exists();
-            std::fs::create_dir_all(parent).map_err(|e| {
+            // Windows: a directory created here gets the protected owner-only DACL (SEC-9).
+            #[cfg(windows)]
+            let created = crate::private_file::create_private_dir_all(parent);
+            #[cfg(not(windows))]
+            let created = std::fs::create_dir_all(parent);
+            created.map_err(|e| {
                 GridError::Config(format!(
                     "cannot create directory '{}': {e}",
                     parent.display()
@@ -473,17 +480,23 @@ fn config_detail(e: &GridError) -> String {
     }
 }
 
-/// Creates `path` exclusively (mode 0600 on Unix) and writes `data` to it.
+/// Creates `path` exclusively (mode 0600 on Unix, a protected owner/SYSTEM/Administrators DACL on
+/// Windows) and writes `data` to it.
 fn write_private_new(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
+    #[cfg(windows)]
+    let mut file = crate::private_file::create_private_new(path)?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)?
+    };
     file.write_all(data)?;
     file.sync_all()
 }
