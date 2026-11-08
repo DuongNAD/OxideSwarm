@@ -111,21 +111,22 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
 ### D2: Append-only journal, group commit, and self-describing snapshot compaction (`crates/master/src/store.rs`)
 
 1. **File header (including `PROTOCOL_VERSION_CURRENT`) and frame envelope:**
-   - Both `journal.bin` and `snapshot.bin` begin with a 16-byte header:
+   - Both `journal.bin` and `snapshot.bin` begin with a 24-byte header:
      ```text
-     [magic: 8B][store_format_version: u32 LE][protocol_version: u32 LE]
+     [magic: 8B][store_format_version: u32 LE][protocol_version: u32 LE][generation: u64 LE]
      ```
      where `magic` is `b"OXSWJRN1"` for `journal.bin` and `b"OXSWSNP1"` for `snapshot.bin`,
      `store_format_version` is `1u32`, and `protocol_version` records
      `rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT` (`crates/core/src/protocol.rs:31`) at the
      time the file was written.
-   - Every journal frame after the 16-byte header has the fixed layout:
+   - Every journal frame after the 24-byte header has the fixed layout:
      ```text
-     [payload_len: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
+     [payload_len: u32 LE][len_check: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
      ```
      `payload_len` is bounded by `rusty_grid_core::protocol::MAX_FRAME_SIZE` (`64 MiB`,
      `crates/core/src/protocol.rs:16`). In `journal.bin`, `payload` is a `bincode`-serialized
-     `JournalRecord`. In `snapshot.bin`, a single frame follows the 16-byte header whose `payload`
+     `JournalRecord`. In `snapshot.bin`, a single frame follows the 24-byte header with a `u64` length
+     (`[payload_len: u64 LE][blake3][payload]`, bounded by 4 GiB) whose `payload`
      is UTF-8 JSON (`serde_json`) of `SnapshotImage` using the `is_human_readable() == true` serde
      representations (`HumanTaskSpec`, etc. in `crates/core/src/task.rs:1442-1460`), so snapshots
      remain self-describing across `PROTOCOL_VERSION_CURRENT` bumps via `#[serde(default)]`.
@@ -222,10 +223,10 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
      `DEFAULT_COMPACT_MAX_RECORDS` (`10,000` records), or on **clean master shutdown** (`shutdown_tx`
      / `SIGINT` / `SIGTERM`), `TaskStore` writes a self-describing JSON `SnapshotImage`
      (`next_sequence: u64` plus all non-evicted `PersistedTaskEntry` records in `tasks` and
-     `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with the 16-byte header (`b"OXSWSNP1"`,
-     `1u32`, `PROTOCOL_VERSION_CURRENT`) and frame envelope (`[payload_len][blake3][json_bytes]`),
+     `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with the 24-byte header (`b"OXSWSNP1"`,
+     `1u32`, `PROTOCOL_VERSION_CURRENT`) and frame envelope (`[payload_len u64][blake3][json_bytes]`),
      calls `sync_all()`, atomically renames `snapshot.bin.tmp` to `snapshot.bin`, and resets
-     `journal.bin` to its 16-byte header with `PROTOCOL_VERSION_CURRENT` and 0 records.
+     `journal.bin` to its 24-byte header (generation `g + 1` in both files) with `PROTOCOL_VERSION_CURRENT` and 0 records.
 
 ### D3: Startup replay, `max_retries == 0` enforcement, and adoption hold window
 
@@ -282,22 +283,28 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
 ### D4: Master-advertised hold, worker grace inequality, and `WorkerMessage::ResumeSession`
 
 1. **Capability and feature negotiation with master-sourced hold (`crates/core/src/protocol.rs`):**
-   - Add `pub const SESSION_RESUME: Self = Self(1 << 12);` to `ProtocolCapabilities` and include it
-     in `ProtocolCapabilities::all_supported()` (`crates/core/src/protocol.rs:95-108`).
+   - Add `pub const SESSION_RESUME: Self = Self(1 << 12);` to `ProtocolCapabilities` (`crates/core/src/protocol.rs:100`).
+     Keep `SESSION_RESUME` out of `ProtocolCapabilities::all_supported()` in the `F1-b` wire pull
+     request, and add it to `all_supported()` only in the pull request that implements master task
+     adoption and worker session resume (`F1-b` master adoption / `F1-c`) so a v4 worker built
+     before resume support does not cause a master to hold its tasks on disconnect.
    - Note: bit `1 << 10` is reserved for `WORKSPACES` (`docs/design/0039-agent-workspaces.md`)
      and bit `1 << 11` is reserved for `THREE_D` (`docs/design/0044-dead-code-and-connection-loop-unification.md`).
-   - In `master_features` (`crates/core/src/protocol.rs:1406-1417`), add:
+   - In `master_features` (`crates/core/src/protocol.rs:1441-1485`), add:
      - `pub const SESSION_RESUME_PREFIX: &str = "session-resume=";`
+     - `pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;` (`1 hour` upper bound so bogus values
+       such as `u64::MAX` are rejected before `Instant + Duration` arithmetic)
      - `pub fn session_resume_feature(hold_secs: u64) -> String` (formats `"session-resume={hold_secs}"`)
-     - `pub fn parse_session_resume_hold_secs(message: Option<&str>) -> Option<u64>`
+     - `pub fn parse_session_resume_hold_secs(message: Option<&str>) -> Option<u64>` (returns `None`
+       when missing, malformed, or `> MAX_SESSION_RESUME_HOLD_SECS`)
      When `ServerConfig::session_resume_hold` is non-zero (`--session-resume-hold-secs`, default
      `30`), the master includes `session-resume=<secs>` in the `RegisterAck` feature announcement
      (e.g., `features=mobile-telemetry,session-resume=30,blobs`). When `--session-resume-hold-secs 0`
      is configured, the token is omitted.
 2. **Wire message (`WorkerMessage::ResumeSession`) and removing `compute_intensity` on the bump:**
-   - Append `ResumeSession` at the end of `WorkerMessage` (`crates/core/src/protocol.rs:520`),
-     `HumanWorkerMessage` (`crates/core/src/protocol.rs:608`), and `BinaryWorkerMessage`
-     (`crates/core/src/protocol.rs:683`):
+   - Append `ResumeSession` at the end of `WorkerMessage` (`crates/core/src/protocol.rs:534`),
+     `HumanWorkerMessage` (`crates/core/src/protocol.rs:626`), and `BinaryWorkerMessage`
+     (`crates/core/src/protocol.rs:705`):
      ```rust
      /// Sent immediately after `RegisterAck` when both worker and master support
      /// `SESSION_RESUME` and the worker still has tasks running or buffered from its previous session.
@@ -311,10 +318,12 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
      updates `crates/core/tests/data/wire_layout.txt` via `UPDATE_WIRE_LAYOUT=1`.
    - Because `F1-b` performs the next required protocol version bump (`3 -> 4`), `F1-b` also removes
      the deprecated `compute_intensity: u32` field from `TaskSpec::GpuCompute`,
-     `HumanTaskSpec::GpuCompute`, and `BinaryTaskSpec::GpuCompute` (`crates/core/src/task.rs:1046`,
-     `:1100`, `:1157`, see `docs/design/0044-dead-code-and-connection-loop-unification.md` D1.5).
+     `HumanTaskSpec::GpuCompute`, and `BinaryTaskSpec::GpuCompute` (`crates/core/src/task.rs:1041`,
+     `:1091`, `:1149`, see `docs/design/0044-dead-code-and-connection-loop-unification.md` D1.5).
    - A worker sends `WorkerMessage::ResumeSession` **only** when the master's `RegisterAck`
-     announces a non-zero `session-resume=<secs>`.
+     announces a non-zero `session-resume=<secs>`. On two-lane multiplexed QUIC connections,
+     `WorkerMessage::ResumeSession` travels on the control stream (`STREAM_CONTROL = 0x01`,
+     `LaneKind::Control` in `crates/master/src/session.rs`).
 3. **Worker grace inequality, outbox buffering, and output blob upload (`crates/worker/src/client.rs`):**
    - **Why the worker's grace must be strictly shorter than the master's hold:**
      - When a silent network drop or master crash occurs at wall-clock time $t_0$, the master's
@@ -375,8 +384,9 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
        4. Flush all remaining non-cancelled buffered `Checkpoint` and `TaskResult` frames to
           `outbound_tx`.
      - Otherwise, cancel any carried-over active tasks and clear `pending_resume_outbox`.
-4. **Master handling of `WorkerMessage::ResumeSession` (`crates/master/src/server.rs`):**
-   - When the master receives `WorkerMessage::ResumeSession { worker_id, running }` on `session_id`:
+4. **Master handling of `WorkerMessage::ResumeSession` (`crates/master/src/session.rs` and `crates/master/src/server.rs`):**
+   - When the master receives `WorkerMessage::ResumeSession { worker_id, running }` on `session_id`
+     (on the single TCP stream `LaneKind::Unified` or the QUIC control stream `LaneKind::Control`):
      - Verify `worker_id == registered_worker_id` (rejecting mismatched IDs as a protocol violation).
      - Call `queue.adopt_session_tasks(worker_id, session_id, &running, store.as_ref()).await`:
        - For each `task_id` in `running`:
@@ -432,7 +442,7 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
   updates `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
 - **On-disk state across protocol version upgrades (path (a) — self-describing JSON snapshot on clean shutdown):**
   - Both `journal.bin` and `snapshot.bin` record `protocol_version: u32` (`PROTOCOL_VERSION_CURRENT`)
-    in bytes `12..16` of their 16-byte file header (D2.1).
+    in bytes `12..16` of their 24-byte file header (D2.1).
   - `snapshot.bin` is stored as UTF-8 JSON using the `Human*` serde representations (`#[serde(default)]`
     for added fields, unknown fields ignored on removal), and a clean master shutdown (`SIGTERM`,
     `SIGINT`, or `MasterHandle::shutdown`) always compacts all live and retained terminal tasks into
@@ -440,7 +450,7 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
   - On startup after a binary upgrade where `PROTOCOL_VERSION_CURRENT` changed:
     1. `TaskStore::open` reads `snapshot.bin` via `serde_json` even when the snapshot header's
        `protocol_version != PROTOCOL_VERSION_CURRENT`.
-    2. If `journal.bin` has 0 records after its 16-byte header (the normal state after a clean stop),
+    2. If `journal.bin` has 0 records after its 24-byte header (the normal state after a clean stop),
        `TaskStore::open` rewrites the `snapshot.bin` and `journal.bin` headers with the new
        `PROTOCOL_VERSION_CURRENT` and startup succeeds with all tasks preserved.
     3. If `journal.bin` contains uncompacted bincode records **and** its header
@@ -543,9 +553,10 @@ lands as a self-contained, reviewable unit.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| F1-design | Design record `0046` for master durability and worker session resume | `docs/design/0046-master-durability.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/README.md` | Design record reviewed and accepted by the owner | Draft |
+| F1-design | Design record `0046` for master durability and worker session resume | `docs/design/0046-master-durability.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/README.md` | Design record reviewed and accepted by the owner | Implemented |
 | F1-a | Append-only task journal, `5 ms` group commit, self-describing JSON snapshot compaction, `GridError::Storage`, `--state-dir`, and startup replay (`Scheduled`/`Running` -> `Queued` uncharged, `Running` with `max_retries == 0` -> `Failed` when unresumed, terminal results & queued tasks restored, blob re-pinning) | `crates/core/src/error.rs`, `crates/master/src/store.rs`, `crates/master/src/lib.rs`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md`, `docs/SECURITY.md`, `DEPLOYMENT.md` | Unit tests in `crates/master/src/store.rs` and `queue.rs` pass (round-trip, torn-tail recovery, mid-file corruption error, JSON snapshot across protocol versions, uncompacted version-mismatch error, 1,000-task group-commit timing test, lock exclusion, uncharged replay, and `Running` + `max_retries == 0` unresumed failure test) | Planned |
-| F1-b | `ProtocolCapabilities::SESSION_RESUME`, `master_features` `session-resume=<secs>`, `WorkerMessage::ResumeSession`, wire removal of deprecated `compute_intensity` (protocol bump `3 -> 4`), `--session-resume-hold-secs`, and master task adoption + `adoptable_by` / `pending_failover_charge` | `crates/core/src/protocol.rs`, `crates/core/src/task.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/master/src/registry.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Wire round-trip and golden-bytes tests pass at protocol version 4; master unit tests prove `adoptable_by` holds replayed/disconnected running tasks from duplicate dispatch, `ResumeSession` adopts them into `Running`, expired holds charge deferred failovers or fail `max_retries == 0` tasks, and unknown/cancelled/expired tasks receive `CancelTask` | Planned |
+| F1-b wire | `ProtocolCapabilities::SESSION_RESUME` (defined, not yet advertised in `all_supported()`), `master_features` `session-resume=<secs>` with `MAX_SESSION_RESUME_HOLD_SECS = 3_600`, `WorkerMessage::ResumeSession` (accepted on `LaneKind::Unified \| LaneKind::Control`), and wire removal of deprecated `compute_intensity` (protocol bump `3 -> 4`) | `crates/core/src/protocol.rs`, `crates/core/src/task.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/worker/src/runner.rs`, `DEPLOYMENT.md`, `README.md`, `CLAUDE.md`, `docs/BACKLOG.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/design/0046-master-durability.md` | Wire round-trip, hold-bound, and golden-bytes tests pass at protocol version 4; `SESSION_RESUME` is not advertised in `all_supported()` yet; `compute_intensity` is removed from `TaskSpec::GpuCompute` | Implemented |
+| F1-b master adoption | `--session-resume-hold-secs`, advertising `SESSION_RESUME` / `session-resume=<secs>`, and master task adoption + `adoptable_by` / `pending_failover_charge` | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/registry.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Master unit tests prove `adoptable_by` holds replayed/disconnected running tasks from duplicate dispatch, `ResumeSession` adopts them into `Running`, expired holds charge deferred failovers or fail `max_retries == 0` tasks, and unknown/cancelled/expired tasks receive `CancelTask` | Planned |
 | F1-c | Worker session-resume grace inequality (`hold - dead_peer_timeout - margin`, `--session-resume-grace-secs` clamp), disconnected outbox buffering with `BlobClient` output blob upload before `TaskResult`, and `tests/master_restart_recovery.rs` | `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/master/Cargo.toml`, `tests/master_restart_recovery.rs`, `README.md`, `docs/design/0046-master-durability.md` | `cargo test -p rusty_grid_master --test master_restart_recovery --locked` passes both the 4-task master restart recovery test and the expired-hold reconnect test, proving every task runs **exactly once** | Planned |
 
 ## Status log
@@ -560,3 +571,25 @@ lands as a self-contained, reviewable unit.
   plaintext task data on disk and Windows `icacls` owner-only ACLs in Security; defined deferred
   `pending_failover_charge` accounting and hold trade-off in D4.5; and scheduled the wire removal of
   deprecated `compute_intensity` in `F1-b` alongside the protocol version `3 -> 4` bump.
+- **2026-11-08:** `F1-a` module landed: `crates/master/src/store.rs` (`TaskStore` journal, 5 ms group
+  commit, JSON snapshot compaction, torn-tail recovery, `store.lock`) and `GridError::Storage`, not
+  yet wired into `TaskQueue`, `MasterServer` or the CLI. Windows owner-only ACL is still a TODO.
+- **2026-11-08:** Review fixes to the `store.rs` format (v1 is frozen with this change): 24-byte headers
+  carry a `u64` generation (a journal older than the snapshot is discarded after an interrupted
+  compaction); the snapshot frame has a `u64` length (4 GiB bound; `Bytes` keep the core JSON form,
+  base64 needs a core serde change and is deferred); a bad journal frame is a torn tail only if no
+  valid frame follows it, otherwise `open` refuses; a zero-filled tail is truncated; durable appends
+  enqueue synchronously and return a `DurableAck`; the journal byte layout is recorded in
+  `crates/master/tests/data/journal_layout.txt` and a change requires bumping `STORE_FORMAT_VERSION`.
+- **2026-11-08:** Review round 2 (still format v1): journal frames gain `len_check: u32` (a bijective
+  mix of `payload_len`). Header valid and payload past EOF is a torn tail with no scan; an invalid
+  header or a BLAKE3 mismatch probes only offsets whose `len_check` passes, so classification is
+  linear and a torn payload that embeds journal bytes still opens as a torn tail. `compact` takes
+  the `SnapshotImage` by value and encodes it on the writer thread. Moving snapshot `Bytes` to base64
+  later needs a `STORE_FORMAT_VERSION` bump (the reader takes a JSON string as raw UTF-8).
+- **2026-11-08:** Implemented `F1-b wire` (PR #141): bumped `PROTOCOL_VERSION_CURRENT` and
+  `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4`, added `ProtocolCapabilities::SESSION_RESUME`
+  (`1 << 12`, kept out of `all_supported()` until adoption and worker resume land), added
+  `master_features` `session-resume=<secs>` helpers bounded by `MAX_SESSION_RESUME_HOLD_SECS = 3_600`,
+  appended `WorkerMessage::ResumeSession` (routed on `LaneKind::Unified | LaneKind::Control`),
+  removed `TaskSpec::GpuCompute::compute_intensity` from the wire, and regenerated `wire_layout.txt`.

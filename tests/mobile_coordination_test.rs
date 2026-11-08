@@ -223,7 +223,6 @@ fn test_multi_tier_thermal_battery_throttling_policy() {
         input_data: vec![0u8; 64],
         work_group_size: 256,
         simulated_matrix_dim: 1024,
-        compute_intensity: 5,
     };
     let light_task = TaskSpec::BuiltinTest {
         test_name: "quick_test".into(),

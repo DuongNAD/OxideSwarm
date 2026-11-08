@@ -564,7 +564,6 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
             input_data: (0..=255).cycle().take(10_000).collect(), // 10KB binary
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: u32::MAX,
         },
         TaskSpec::BuiltinTest {
             test_name: "stress_test".into(),
@@ -938,7 +937,6 @@ fn test_task_spec_deep_validation_hostile() {
             input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: 1,
         };
         assert!(
             spec.validate().is_err(),

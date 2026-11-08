@@ -212,7 +212,6 @@ async fn test_strict_gpu_gating_unconditional_rejection() {
             input_data: vec![1, 2, 3, 4],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 2,
         },
         req_generic,
     );
@@ -312,7 +311,6 @@ async fn test_genuine_matrix_multiplication_oracle_dimensions() {
                 input_data: seed_bytes.clone(),
                 work_group_size,
                 simulated_matrix_dim: dim,
-                compute_intensity: 1,
             },
             TaskRequirements::gpu(60),
         );
