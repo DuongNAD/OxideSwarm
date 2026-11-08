@@ -88,6 +88,8 @@ pub struct MasterFileConfig {
     pub blob_store_mb: Option<u64>,
     /// Directory of the durable task queue state (`master --state-dir`).
     pub state_dir: Option<String>,
+    /// Seconds the master holds a disconnected session-resume worker's tasks (`master --session-resume-hold-secs`).
+    pub session_resume_hold_secs: Option<u64>,
     /// Allow a master that is reachable beyond this machine to run without a cluster secret.
     pub insecure: Option<bool>,
     pub secret_file: Option<String>,
@@ -119,6 +121,8 @@ pub struct WorkerFileConfig {
     /// User tags the worker advertises (`worker --tag`).
     pub tags: Option<Vec<String>>,
     pub heartbeat_interval_secs: Option<u64>,
+    /// Optional cap in seconds on how long the worker keeps running tasks alive across a disconnect (`worker --session-resume-grace-secs`).
+    pub session_resume_grace_secs: Option<u64>,
     pub max_concurrency: Option<usize>,
     pub sandbox_base_dir: Option<String>,
     /// Task isolation level: `off`, `fs` or `fs+net` (`worker --isolation`).
@@ -565,11 +569,13 @@ listen = "127.0.0.1:9090"
 port_file = "/tmp/port.txt"
 heartbeat_interval_secs = 5
 state_dir = "/var/lib/oxideswarm/master-state"
+session_resume_hold_secs = 45
 
 [worker]
 master = "127.0.0.1:9090"
 cores = 4
 simulate_gpu = true
+session_resume_grace_secs = 15
 
 [worker.hardware]
 cores = 8
@@ -583,9 +589,11 @@ gpu_name = "Mock RTX"
             master.state_dir.as_deref(),
             Some("/var/lib/oxideswarm/master-state")
         );
+        assert_eq!(master.session_resume_hold_secs, Some(45));
 
         let worker = parsed_toml.worker.unwrap();
         assert_eq!(worker.simulate_gpu, Some(true));
+        assert_eq!(worker.session_resume_grace_secs, Some(15));
         assert_eq!(
             worker.hardware.unwrap().gpu_name.as_deref(),
             Some("Mock RTX")

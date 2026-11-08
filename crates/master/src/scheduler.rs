@@ -247,6 +247,7 @@ pub enum ScheduleSkipReason {
     NoGpuWorkersAvailable,
     AllEligibleWorkersSaturated,
     MobileThrottledOrLowBattery,
+    WorkspaceBusy,
     ClusterLacksCapability(String),
 }
 
@@ -646,9 +647,9 @@ impl<'a> Engine<'a> {
             .as_ref()
             .is_some_and(|ws| self.active_workspaces.contains(ws))
         {
-            // Another task in this workspace is already Scheduled or Running (or was placed
-            // earlier in this pass). Leave this task queued without holding back any seat.
-            let verdict = Verdict::Skip(self.skip_reason(view, placement));
+            // Another task in this workspace is already Scheduled or Running, held for adoption,
+            // or was placed earlier in this pass. Leave this task queued without holding back any seat.
+            let verdict = Verdict::Skip(ScheduleSkipReason::WorkspaceBusy);
             self.dead.insert(shape, verdict.clone());
             return verdict;
         }
@@ -4158,6 +4159,10 @@ mod tests {
         w1.features.insert(ProtocolCapabilities::WORKSPACES);
         let mut w2 = make_worker("w2", 4, 8192, false, false);
         w2.features.insert(ProtocolCapabilities::WORKSPACES);
+        // Partially load w2 (1 slot used, 3 free) so that a 4-core task (`ws_a_2`) cannot fit on
+        // w2 right now and would trigger `hold_back` on w2 if the busy-workspace check ran after
+        // `candidates` / `hold_back`.
+        w2.active_tasks = 1;
 
         let ws_a_1 = Task::new(
             TaskSpec::new_command("cargo", vec!["check".into()]),
@@ -4171,7 +4176,7 @@ mod tests {
         .with_workspace(WorkspaceRef::new("ws-a"));
         let ws_b_1 = Task::new(
             TaskSpec::new_command("cargo", vec!["clippy".into()]),
-            TaskRequirements::generic(4, 30),
+            TaskRequirements::generic(2, 30),
         )
         .with_workspace(WorkspaceRef::new("ws-b"));
 
@@ -4182,11 +4187,14 @@ mod tests {
             &[w1.clone(), w2.clone()],
         );
 
-        // ws_a_1 and ws_b_1 are placed; ws_a_2 is skipped without holding back w2's seat.
+        // ws_a_1 takes w1 (4 slots) and ws_b_1 takes 2 of w2's 3 remaining slots; ws_a_2 is
+        // skipped with `WorkspaceBusy` without holding back w2's seat.
         let placed_ids: Vec<TaskId> = report.assignments.iter().map(|a| a.task_id).collect();
         assert_eq!(placed_ids, vec![ws_a_1.id, ws_b_1.id]);
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0].0, ws_a_2.id);
+        assert_eq!(
+            report.skipped,
+            vec![(ws_a_2.id, ScheduleSkipReason::WorkspaceBusy)]
+        );
     }
 
     #[tokio::test]
