@@ -126,9 +126,9 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `4e1aeb3`: 54 items Implemented, 3 Partial and 13 Planned. Five Planned
-items were added later that day from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1,
-REAPI-1, JOIN-1, LINK-1 and BENCH-1. "Pull requests" lists them by number, "(open)" marks one
+On 2026-11-09, at `master` `b7f112f`: 59 items Implemented, 6 Partial and 12 Planned. Five items
+were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
+JOIN-1, LINK-1 and BENCH-1. "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
@@ -192,24 +192,24 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
-| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Partial | 122 (design), 129, 141 |
+| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133 |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133, 150 |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Partial | 105 (design), 157, 156, 164, 166, 160, 165 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
-| FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
+| FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
-| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 (open) |
-| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 (open) |
-| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 (open) |
+| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
+| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
 
 ## Phase 0: integrate open work
 
@@ -1565,3 +1565,31 @@ Add one dated line per finished item, newest last.
 - 2026-11-08: REL-4 implemented in pull request 155: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
 - 2026-11-09: LINK-1 is Partial: steps 1 and 2 are in pull request 159. `doctor` has a `LINK` column, check C7 (warning for a relayed worker) and check C8 (an 8 MiB blob to each worker, MB/s, `--skip-throughput`). Steps 3 (relay URL option) and 4 (guide) are Planned; they touch `server.rs` and the worker client.
 - 2026-11-09: BENCH-1 is Partial: (a) and (b) are in pull request 162 with `benchmarks/grid/bench_grid.py` and a dated record from one Mac (loaded, noted in the record). (c), the two-machine `cargo test` offload, waits for WS-7.
+- 2026-11-09: FEAT-1 is Implemented: pull requests 129 (the store), 141 (wire layer), 147 (`F1-a`:
+  `--state-dir` and replay at start), 158 (`F1-b` master adoption and `F1-c` worker session resume)
+  and 167 (follow-ups: BLAKE3 `result_ack_token`, a session-keyed connected tracker, a SIGKILL test
+  with the CLI binary), design 0046 (pull request 122, status Implemented). The "Done when" test is
+  `tests/master_restart_recovery.rs`. The four store findings that the 2026-11-08 FEAT-1 entry lists were not
+  re-checked for this change.
+- 2026-11-09: FEAT-3 stays Partial: `FEAT-3b` (Linux: Landlock, seccomp and namespaces, design 0033)
+  is merged in pull request 150 next to macOS (pull request 133). `FEAT-3c` (Windows) is open as
+  pull request 152, so on Windows a task can still read `cluster.secret`.
+- 2026-11-09: FEAT-4 is Partial. Merged from design 0039: W1 (pull request 157: `Task::workspace`,
+  `Hello` probe, protocol version 6), W4 (156: source selection with `.gitignore` and limits), W2a
+  (164: the worker's workspace store, not wired into the runner yet), W3 (166: required feature,
+  affinity, one task per workspace), W9 (160: parallel blob uploads) and W8 (165: tool probes,
+  `require:tool=`). Open: W2b (runner and client wiring, `--workspaces`), W5 (`submit --workspace`
+  and the MCP field, pull request 168, open), W6 (end-to-end test), W7 (P2P for clients) and W10
+  (guide and live record). No workspace task can run end to end yet.
+- 2026-11-09: FEAT-10 is Implemented: pull request 165. A `RustCompilation` task with a
+  `Cargo.toml` runs `cargo build --offline` and returns the binary; `submit --type compile --source`
+  and the MCP `type: "compile"` send the crate; workers advertise `tool:cargo`, `tool:rustc`,
+  `tool:git` and a task can name `require:tool=`. The runner test
+  `test_rust_compilation_with_cargo_toml_runs_cargo_build_offline` builds a crate with a local path
+  dependency and checks the binary in the outputs. No run on a second machine is recorded.
+- 2026-11-09: JOIN-1 stays Partial and is now merged: pull request 163 adds `oxideswarm secret
+  join-token` and `oxideswarm join` (design 0048) with `tests/cli_join_e2e.rs`. Step 4, the QR code
+  for the Android app, waits for AND-1.
+- 2026-11-09: SEC-9 (pull request 154, design 0047) and TEST-19 (pull request 161) were already
+  Implemented in the Index; this log records them. REL-4, LINK-1 and BENCH-1 rows no longer say
+  "(open)" because their pull requests 155, 159 and 162 are merged.

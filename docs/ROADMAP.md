@@ -1,7 +1,7 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08
-Created: 2026-11-07    Updated: 2026-11-08
+Created: 2026-11-07    Updated: 2026-11-09
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -25,7 +25,7 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `6723945` on 2026-11-08.
+The state at `master` `b7f112f` on 2026-11-09.
 
 ### What works
 
@@ -36,6 +36,8 @@ The state at `master` `6723945` on 2026-11-08.
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
 | Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
 | Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel` and `doctor`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
+| Durability | `master --state-dir` keeps queued, running and finished tasks in a journal and replays it at start. A worker keeps its tasks across a short disconnect, and the master adopts them again (`ResumeSession`) | `crates/master/src/store.rs`, `crates/master/src/session.rs`, `tests/master_restart_recovery.rs` |
+| Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`) and Linux (Landlock, seccomp, namespaces). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
 | Operations | `oxideswarm doctor`, the dashboard, launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
 | Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows. Every job is a required check on `master`. A changed wire layout fails CI without a protocol version bump | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs` |
 
@@ -45,15 +47,13 @@ Each row is a limit a user meets today, and the item that removes it.
 
 | Limit | Effect | Item |
 |---|---|---|
-| The master keeps all state in memory | A master restart loses queued, running and finished tasks | FEAT-1 |
 | There is one master and no failover | The master is a single point of failure | FEAT-6 (Design only, decision D1) |
-| Delivery is at least once | A task can run twice after a worker is lost | FEAT-1, FEAT-2 |
-| On Linux and Windows a task runs as the worker's user without OS isolation. macOS has `--isolation fs` and `fs+net` (FEAT-3a) | A task on Linux or Windows can read `cluster.secret` and other sandboxes | FEAT-3 (`FEAT-3b`, `FEAT-3c`) |
-| Each task gets a fresh sandbox | An agent's `cargo test` builds from zero every time | FEAT-4 |
+| Delivery is at least once | A task can run twice after a worker is lost. A master with `--state-dir` and a worker that resumes shrink the window | FEAT-1, FEAT-2 |
+| On Windows a task runs as the worker's user without OS isolation. macOS and Linux have `--isolation fs` and `fs+net` (FEAT-3a, FEAT-3b) | A task on Windows can read `cluster.secret` and other sandboxes | FEAT-3 (`FEAT-3c`, pull request 152 open) |
+| A task still gets a fresh sandbox: the workspace store (W2a) and the scheduler support (W3) are merged, but the runner and the CLI do not use them yet | An agent's `cargo test` builds from zero every time | FEAT-4 (W2b, W5, W6) |
 | Clients connect over TCP only (`connect_master` in `crates/cli/src/connect.rs`) | A client on another network cannot reach a master that is reachable only over P2P | FEAT-4 |
-| `RustCompilation` runs bare `rustc` on one file | A crate with dependencies does not build | FEAT-10 |
-| Input trees carry no symbolic links or empty directories, and do not read `.gitignore` | The client picks paths by hand, or sends a whole project with its `target/` | FEAT-4 |
-| There is no release | A user must build from source | REL-4 |
+| Input trees carry no symbolic links or empty directories (design 0039 W11). The `.gitignore` scan (W4) is not wired to `submit` yet | The client picks paths by hand | FEAT-4 |
+| The release workflow exists, but no `v*` tag has been cut | A user must still build from source | REL-4 (owner cuts the tag) |
 | The Android app does not compile | There is no Android worker app to install | AND-1 |
 | GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
 
@@ -162,33 +162,37 @@ Passed on 2026-11-08 at `master` `6723945`. The one CI job that is not required 
 
 Goal: a master restart loses nothing, and a task cannot reach the worker's secrets.
 
-| Item | Work | State on 2026-11-08 (`master` `6723945`) |
+| Item | Work | State on 2026-11-09 (`master` `b7f112f`) |
 |---|---|---|
-| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Partial. Design 0046 (Draft). Merged: the wire layer (pull request 141: protocol version 4, `ResumeSession`) and the journal and snapshot module (pull request 129), which the master does not use yet |
+| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Implemented (pull requests 129, 141, 147, 158, 167, design 0046). `tests/master_restart_recovery.rs` is the "Done when" test |
 | FEAT-2 | A supervisor per task group that kills the group when the worker dies, on Linux and macOS | Implemented (pull request 123, design 0031) |
-| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Partial. Design 0033 (Accepted). The core and macOS (`FEAT-3a`) are merged (pull request 133). Linux (`FEAT-3b`) and Windows (`FEAT-3c`) are Planned |
+| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Partial. Design 0033 (Accepted). The core and macOS (`FEAT-3a`, pull request 133) and Linux (`FEAT-3b`, pull request 150) are merged. Windows (`FEAT-3c`) is open as pull request 152 |
 
 This phase comes before workspaces. A workspace keeps the owner's source code on another machine
 and runs commands an agent chose. Without FEAT-3 such a command can read `cluster.secret`. Without
 FEAT-1 a master restart loses a long build.
 
-**Exit check:** the "Done when" tests of FEAT-1, FEAT-2 and FEAT-3 pass in CI.
+**Exit check:** the "Done when" tests of FEAT-1, FEAT-2 and FEAT-3 pass in CI. FEAT-1 and FEAT-2
+pass; FEAT-3 waits for Windows (`FEAT-3c`).
 
 ### Phase C: agent workspaces
 
 Goal: the user story works between two real machines. The design record is
 `design/0039-agent-workspaces.md` (Accepted). Its work items W1 to W11 carry out the steps below.
 
-| ID | Work | Removes |
-|---|---|---|
-| WS-1 | A named workspace per worker that outlives a task. It holds its own build cache, such as `target/`, under a size bound with least-recently-used eviction | FEAT-4: fresh sandbox per task |
-| WS-2 | Source by tree sync: the client sends its working directory as a blob tree that follows `.gitignore` and leaves out `.git/`. Only changed files cross the network, files deleted locally are deleted on the worker, and build output stays. Workers need no `git`. Symbolic links and empty directories come later (design 0039, W11) | FEAT-4: whole-project uploads, `.gitignore` |
-| WS-3 | P2P tickets in `connect_master`, with a `STREAM_CLIENT` stream tag, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients |
-| WS-4 | `cargo build --offline` when `Cargo.toml` is present, and a `tool:rustc` worker tag | FEAT-10 |
-| WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout |
-| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` |
-| WS-7 | A guide in `docs/guides/` for offloading `cargo test` from a coding agent, with a recorded two-machine run | |
-| CACHE-1 | Reuse the result of an identical task, keyed by the command, the environment and the input digests (decision Q7) | Exact repeats of a run |
+| ID | Work | Removes | State on 2026-11-09 (`master` `b7f112f`) |
+|---|---|---|---|
+| WS-1 | A named workspace per worker that outlives a task. It holds its own build cache, such as `target/`, under a size bound with least-recently-used eviction | FEAT-4: fresh sandbox per task | Partial. The store (W2a, pull request 164) and the scheduler side (W3, pull request 166: required feature, affinity, one task per workspace) are merged. The runner and client wiring (W2b) is open |
+| WS-2 | Source by tree sync: the client sends its working directory as a blob tree that follows `.gitignore` and leaves out `.git/`. Only changed files cross the network, files deleted locally are deleted on the worker, and build output stays. Workers need no `git`. Symbolic links and empty directories come later (design 0039, W11) | FEAT-4: whole-project uploads, `.gitignore` | Partial. The scan with `.gitignore` and limits (W4, pull request 156) and the worker's sync (W2a) are merged; neither is wired to `submit` yet |
+| WS-3 | P2P tickets in `connect_master`, with a `STREAM_CLIENT` stream tag, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients | Planned (W7). The `Hello` probe of protocol 6 (W1, pull request 157) is merged |
+| WS-4 | `cargo build --offline` when `Cargo.toml` is present, and a `tool:rustc` worker tag | FEAT-10 | Implemented (W8, pull request 165) |
+| WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout | Partial. W5 (`submit --workspace`, the MCP `workspace` field and the `workspaces` tool) is open as pull request 168 |
+| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` | Partial. Several blobs in flight from one client (W9, pull request 160) is merged; compression is out of scope (design 0006) |
+| WS-7 | A guide in `docs/guides/` for offloading `cargo test` from a coding agent, with a recorded two-machine run | | Planned (W6 end-to-end test and W10 guide) |
+| CACHE-1 | Reuse the result of an identical task, keyed by the command, the environment and the input digests (decision Q7) | Exact repeats of a run | Planned |
+
+Workspaces are not usable end to end yet: a task cannot name a workspace from the CLI until W5 and
+W2b land.
 
 CACHE-1 is not part of the exit check. It starts with a design record, and MCP turns it on by
 default only after its hit rate on the WS-7 story is recorded.
@@ -200,14 +204,14 @@ and the run is recorded with its date.
 
 Goal: someone without Rust installed follows the README and reaches the user story.
 
-| Item | Work |
-|---|---|
-| REL-4 | Release workflow on `v*` tags with Linux, macOS and Windows archives, with and without `gpu-wgpu`, and `SHA256SUMS`. An install section in `README.md` |
-| Quick start | From install to the first offloaded `cargo test`, linking [guides/mcp-client-setup.md](guides/mcp-client-setup.md) and the WS-7 guide |
-| Release notes | A `CHANGELOG.md` entry for the release, with the upgrade order for mixed versions |
-| JOIN-1 | One join token that carries the master's address or ticket and the cluster secret, read from standard input (decision Q7) |
-| LINK-1 | `doctor` shows whether each worker is direct or relayed, and the owner can name a relay of their own (decision Q7) |
-| BENCH-1 | A benchmark page for task overhead, repeated uploads and the WS-7 offload, each number with its script and date (decision Q7) |
+| Item | Work | State on 2026-11-09 (`master` `b7f112f`) |
+|---|---|---|
+| REL-4 | Release workflow on `v*` tags with Linux, macOS and Windows archives, with and without `gpu-wgpu`, and `SHA256SUMS`. An install section in `README.md` | Implemented (pull request 155). No tag exists yet |
+| Quick start | From install to the first offloaded `cargo test`, linking [guides/mcp-client-setup.md](guides/mcp-client-setup.md) and the WS-7 guide | Planned |
+| Release notes | A `CHANGELOG.md` entry for the release, with the upgrade order for mixed versions | Planned. `[Unreleased]` carries the entries and an upgrade note |
+| JOIN-1 | One join token that carries the master's address or ticket and the cluster secret, read from standard input (decision Q7) | Partial (pull request 163, design 0048). The QR code step waits for AND-1 |
+| LINK-1 | `doctor` shows whether each worker is direct or relayed, and the owner can name a relay of their own (decision Q7) | Partial (pull request 159: `LINK` column, checks C7 and C8). The relay option and the guide are Planned |
+| BENCH-1 | A benchmark page for task overhead, repeated uploads and the WS-7 offload, each number with its script and date (decision Q7) | Partial (pull request 162: overhead and repeated uploads). The WS-7 offload waits for WS-7 |
 
 **Exit check:** a tagged release exists with archives and checksums, and a machine without Rust runs
 the WS-7 guide from the README alone, joining with one token (JOIN-1). The benchmark page holds a
@@ -299,3 +303,10 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
 - 2026-11-08: A web research run added "What the research of 2026-11-08 found", three rows of
   neighbouring tools and the Launch section. The owner accepted Q7: JOIN-1, LINK-1 and BENCH-1 in
   Phase D, CACHE-1 in Phase C outside its exit check, and REAPI-1 in the table of what waits.
+- 2026-11-09: States updated at `master` `b7f112f`. FEAT-1 is Implemented (pull requests 147, 158,
+  167 on top of 129 and 141) and leaves "What is missing", with "Durability" and "Isolation" rows
+  added to "What works". FEAT-3 has Linux (pull request 150); Windows is open as pull request 152.
+  FEAT-10 and WS-4 are Implemented (pull request 165). Phase C and Phase D tables gained a state
+  column: workspaces are Partial (W1, W2a, W3, W4, W8, W9 merged; W5 open as pull request 168; W2b,
+  W6, W7, W10 not started), and REL-4 is Implemented with no tag cut. JOIN-1, LINK-1 and BENCH-1
+  are Partial.
