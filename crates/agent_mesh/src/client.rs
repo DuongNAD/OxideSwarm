@@ -30,6 +30,27 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// rejection cannot succeed on its own, so do not hammer the hub.
 const REJECTED_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+/// Returns `true` when a WebSocket connection error is caused by transient loopback ephemeral
+/// port or non-paged socket buffer exhaustion under heavy parallel test/connection load
+/// (e.g. Windows `WSAENOBUFS` `10055` or `WSAEADDRINUSE` `10048`).
+fn is_transient_ws_connect_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    if let tokio_tungstenite::tungstenite::Error::Io(io_err) = err {
+        if matches!(io_err.raw_os_error(), Some(10055 | 10048 | 10053 | 10054)) {
+            return true;
+        }
+        if matches!(
+            io_err.kind(),
+            std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::OutOfMemory
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The hub answered the registration with a NACK (bad or missing token, duplicate node id, ...).
 #[derive(Debug, Clone)]
 pub struct RegistrationRejected {
@@ -251,9 +272,26 @@ impl AgentMeshClient {
     /// Establishes the WebSocket connection to the Hub and spawns the read/write message pump.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Connecting to OxideRelay Hub at {}...", self.hub_url);
-        let connector = self.build_tls_connector()?;
-        let (ws_stream, _) =
-            connect_async_tls_with_config(&self.hub_url, None, false, connector).await?;
+        let mut attempt = 0u32;
+        let (ws_stream, _) = loop {
+            let connector = self.build_tls_connector()?;
+            match connect_async_tls_with_config(&self.hub_url, None, false, connector).await {
+                Ok(pair) => break pair,
+                Err(e) if attempt < 5 && is_transient_ws_connect_error(&e) => {
+                    attempt += 1;
+                    let delay = Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                    warn!(
+                        hub_url = %self.hub_url,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "Transient socket error connecting to OxideRelay Hub; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(Box::new(e)),
+            }
+        };
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<WsMessage>();
@@ -1327,5 +1365,28 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         node2.close().await;
         proxy_task.abort();
         hub.stop().await;
+    }
+
+    #[test]
+    fn test_is_transient_ws_connect_error_classifies_wsaenobufs_and_addr_in_use() {
+        let wsaenobufs =
+            tokio_tungstenite::tungstenite::Error::Io(std::io::Error::from_raw_os_error(10055));
+        assert!(is_transient_ws_connect_error(&wsaenobufs));
+
+        let wsaeaddrinuse =
+            tokio_tungstenite::tungstenite::Error::Io(std::io::Error::from_raw_os_error(10048));
+        assert!(is_transient_ws_connect_error(&wsaeaddrinuse));
+
+        let oom = tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "no buffer space",
+        ));
+        assert!(is_transient_ws_connect_error(&oom));
+
+        let refused = tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(!is_transient_ws_connect_error(&refused));
     }
 }
