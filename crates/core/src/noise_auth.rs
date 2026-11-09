@@ -83,6 +83,10 @@ pub(crate) const KIND_NOISE_MSG1: u8 = 0x06;
 /// Pre-auth frame kind for Noise IK message 2 (`<- e, ee, se`).
 pub(crate) const KIND_NOISE_MSG2: u8 = 0x07;
 
+/// Maximum frame size (64 KiB) accepted for the first encrypted OXS-AUTH v3 transport record
+/// before the peer has proven liveness on the `Split()` session key.
+pub const V3_FIRST_RECORD_MAX_FRAME: usize = 64 * 1024;
+
 /// Domain-separation label used to derive the 32-byte record-layer `session_key` from the two raw
 /// directional `Split()` keys `(k_i2r, k_r2i)` produced by `snow`.
 const LABEL_V3_SESSION_KEY: &[u8] = b"oxs3-split-session-key";
@@ -873,7 +877,10 @@ where
     M: DeserializeOwned + 'static,
 {
     t.enable_encryption(pending.session_key(), EndpointRole::Server);
-    match t.recv_msg_with_codec::<M>().await {
+    match t
+        .recv_msg_with_codec_max::<M>(V3_FIRST_RECORD_MAX_FRAME)
+        .await
+    {
         Ok(Some((msg, codec))) => {
             let auth_peer = AuthenticatedV3Peer {
                 member_id: pending.peer_public_key.member_id(),
@@ -1297,6 +1304,122 @@ mod tests {
                 );
             }
             other => panic!("expected GridError::IncompatibleVersion on server, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_first_record_after_valid_or_replayed_msg1_is_refused_without_allocation() {
+        use tokio::io::AsyncWriteExt;
+
+        let master_kp = keypair(60);
+        let worker_kp = keypair(61);
+        let allowed_pub = *worker_kp.public_key();
+
+        let (mut raw_client, raw_server) = tokio::io::duplex(64 * 1024);
+        let mut server = MessageTransport::new(raw_server);
+
+        let hello = build_v3_hello_frame(PROTOCOL_VERSION_CURRENT, HandshakePurpose::Member);
+        let params: snow::params::NoiseParams = NOISE_PATTERN.parse().unwrap();
+        let mut init_hs = snow::Builder::new(params)
+            .local_private_key(worker_kp.private_bytes())
+            .and_then(|b| b.remote_public_key(master_kp.public_key().as_bytes()))
+            .and_then(|b| b.prologue(&hello))
+            .and_then(|b| b.build_initiator())
+            .unwrap();
+        let mut msg1_buf = [0u8; PRE_AUTH_MAX_FRAME];
+        let msg1_len = init_hs.write_message(&[], &mut msg1_buf).unwrap();
+        let msg1 = auth_frame(KIND_NOISE_MSG1, &[&msg1_buf[..msg1_len]]);
+
+        // Write length-prefixed HELLO and valid/replayed IK message 1, followed ONLY by a 4-byte
+        // length header announcing a 1 MiB first encrypted record (without sending 1 MiB of data).
+        for frame in [&hello, &msg1] {
+            raw_client
+                .write_all(&(frame.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            raw_client.write_all(frame).await.unwrap();
+        }
+        let announced_len: u32 = 1024 * 1024;
+        raw_client
+            .write_all(&announced_len.to_be_bytes())
+            .await
+            .unwrap();
+        raw_client.flush().await.unwrap();
+
+        let pending = v3_server_handshake(&mut server, &master_kp, |pk| *pk == allowed_pub)
+            .await
+            .expect("valid/replayed msg1 reaches pending confirmation");
+
+        let confirm_err = v3_server_confirm_first_record::<_, WorkerMessage>(&mut server, pending)
+            .await
+            .expect_err("oversized first encrypted frame must be refused immediately");
+
+        assert!(
+            confirm_err
+                .to_string()
+                .contains(&V3_FIRST_RECORD_MAX_FRAME.to_string()),
+            "expected FrameTooLarge with max {V3_FIRST_RECORD_MAX_FRAME}, got: {confirm_err}"
+        );
+        assert!(
+            server.read_buffer_capacity() < V3_FIRST_RECORD_MAX_FRAME,
+            "server read buffer must not allocate the announced 1 MiB frame (capacity = {})",
+            server.read_buffer_capacity()
+        );
+
+        // Once the first valid encrypted record decrypts and the peer is authenticated, the normal
+        // MAX_FRAME_SIZE limit is restored so larger records (> 64 KiB) succeed.
+        let (c2, s2) = tokio::io::duplex(512 * 1024);
+        let mut client2 = MessageTransport::new(c2);
+        let mut server2 = MessageTransport::new(s2);
+        let master_pub = *master_kp.public_key();
+        let master_kp2 = master_kp.clone();
+        let srv_task = tokio::spawn(async move {
+            let (peer, first, _): (_, WorkerMessage, _) =
+                v3_server_accept_authenticated(&mut server2, &master_kp2, |pk| *pk == allowed_pub)
+                    .await
+                    .unwrap();
+            let second = server2
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .expect("second larger record must succeed after auth confirmation");
+            (peer, first, second)
+        });
+        let sk = v3_client_handshake(
+            &mut client2,
+            &worker_kp,
+            &master_pub,
+            HandshakePurpose::Member,
+        )
+        .await
+        .unwrap();
+        client2.enable_encryption(&sk, EndpointRole::Client);
+        client2.send_msg(&sample_heartbeat()).await.unwrap();
+        let large_msg = WorkerMessage::TaskResult {
+            worker_id: Uuid::nil(),
+            task_id: crate::task::TaskId(Uuid::nil()),
+            exit_code: 0,
+            stdout: crate::task::Bytes(Bytes::from(vec![
+                b'x';
+                V3_FIRST_RECORD_MAX_FRAME + 16 * 1024
+            ])),
+            stderr: crate::task::Bytes(Bytes::new()),
+            execution_time_ms: 1,
+            is_gpu_executed: false,
+            device_name: None,
+            error: None,
+            asset_bytes: None,
+            artifacts: vec![],
+            outputs: vec![],
+        };
+        client2.send_msg(&large_msg).await.unwrap();
+        let (peer, _, second) = srv_task.await.unwrap();
+        assert_eq!(peer.public_key, allowed_pub);
+        match second {
+            WorkerMessage::TaskResult { stdout, .. } => {
+                assert_eq!(stdout.len(), V3_FIRST_RECORD_MAX_FRAME + 16 * 1024);
+            }
+            other => panic!("unexpected message: {other:?}"),
         }
     }
 }
