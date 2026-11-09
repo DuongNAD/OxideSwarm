@@ -313,6 +313,10 @@ impl AsyncWrite for GridStream {
     }
 }
 
+/// Environment variable naming a custom iroh relay URL (`https://...`) for master, worker,
+/// and client P2P endpoints.
+pub const RELAY_URL_ENV: &str = "RUSTY_GRID_RELAY_URL";
+
 #[cfg(feature = "p2p")]
 pub fn serialize_p2p_ticket(addr: &iroh::EndpointAddr) -> Result<String, serde_json::Error> {
     serde_json::to_string(addr)
@@ -323,15 +327,147 @@ pub fn parse_p2p_ticket(ticket: &str) -> Result<iroh::EndpointAddr, serde_json::
     serde_json::from_str(ticket)
 }
 
+/// Validates a custom iroh relay URL (`--relay-url` / `RUSTY_GRID_RELAY_URL` / `relay_url`):
+///
+/// * Must not be empty or contain whitespace.
+/// * Must parse as an [`iroh::RelayUrl`].
+/// * Scheme must be `https` (`http://` and other schemes are refused).
+/// * Must not contain embedded `user:password` (or `user@`) credentials.
+/// * Must have a non-empty host and no query or fragment.
+///
+/// Never echoes embedded credentials in error messages.
+#[cfg(feature = "p2p")]
+pub fn validate_relay_url(raw: &str) -> crate::GridResult<iroh::RelayUrl> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(crate::GridError::Config(
+            "Invalid relay URL: URL cannot be empty (expected https://<host>[:<port>])".into(),
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(crate::GridError::Config(
+            "Invalid relay URL: URL must not contain whitespace".into(),
+        ));
+    }
+    let has_at_in_authority = trimmed
+        .find("://")
+        .map(|idx| {
+            let after_scheme = &trimmed[idx + 3..];
+            let authority_end = after_scheme
+                .find(['/', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            after_scheme[..authority_end].contains('@')
+        })
+        .unwrap_or_else(|| trimmed.contains('@'));
+    if has_at_in_authority {
+        return Err(crate::GridError::Config(
+            "Invalid relay URL: URL must not contain user:password credentials".into(),
+        ));
+    }
+    let parsed: iroh::RelayUrl = trimmed.parse().map_err(|e| {
+        crate::GridError::Config(format!(
+            "Invalid relay URL '{trimmed}': must be a valid https:// relay URL ({e})"
+        ))
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(crate::GridError::Config(
+            "Invalid relay URL: URL must not contain user:password credentials".into(),
+        ));
+    }
+    if parsed.scheme() != "https" {
+        return Err(crate::GridError::Config(format!(
+            "Invalid relay URL '{trimmed}': scheme must be 'https' (got '{}')",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none_or(|h| h.is_empty()) {
+        return Err(crate::GridError::Config(format!(
+            "Invalid relay URL '{trimmed}': missing host"
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(crate::GridError::Config(format!(
+            "Invalid relay URL '{trimmed}': URL must not include a query string or fragment"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Validates `raw` and builds a custom [`iroh::RelayMap`] containing that single relay URL.
+#[cfg(feature = "p2p")]
+pub fn build_custom_relay_map(raw: &str) -> crate::GridResult<iroh::RelayMap> {
+    let url = validate_relay_url(raw)?;
+    Ok(iroh::RelayMap::from(url))
+}
+
+/// Resolves the [`iroh::RelayMode`] for a P2P endpoint from `minimal_preset` and `relay_url`.
+///
+/// * `minimal_preset = true` with `relay_url = Some(_)` is refused as a configuration error.
+/// * `minimal_preset = true` with `relay_url = None` returns [`iroh::RelayMode::Disabled`].
+/// * `minimal_preset = false` with `relay_url = Some(url)` validates `url` and returns
+///   [`iroh::RelayMode::Custom`] containing that single-entry [`iroh::RelayMap`].
+/// * `minimal_preset = false` with `relay_url = None` returns [`iroh::RelayMode::Default`].
+#[cfg(feature = "p2p")]
+pub fn resolve_p2p_relay_mode(
+    minimal_preset: bool,
+    relay_url: Option<&str>,
+) -> crate::GridResult<iroh::RelayMode> {
+    if let Some(raw) = relay_url {
+        let map = build_custom_relay_map(raw)?;
+        if minimal_preset {
+            return Err(crate::GridError::Config(
+                "Cannot combine a custom relay URL (--relay-url / RUSTY_GRID_RELAY_URL / relay_url) \
+                 with P2P minimal/no-relay mode (RUSTY_GRID_P2P_MINIMAL / p2p_minimal_preset)"
+                    .into(),
+            ));
+        }
+        Ok(iroh::RelayMode::Custom(map))
+    } else if minimal_preset {
+        Ok(iroh::RelayMode::Disabled)
+    } else {
+        Ok(iroh::RelayMode::Default)
+    }
+}
+
+/// Builds an [`iroh::endpoint::Builder`] for the requested `minimal_preset` and optional
+/// `relay_url`:
+///
+/// * `minimal_preset = true`, `relay_url = None`: `presets::Minimal` (no relay, no pkarr/DNS).
+/// * `minimal_preset = false`, `relay_url = Some(url)`: `presets::Minimal` +
+///   `RelayMode::Custom(RelayMap::from(url))` (uses the owner's relay instead of `presets::N0`).
+/// * `minimal_preset = false`, `relay_url = None`: `presets::N0` (default).
+#[cfg(feature = "p2p")]
+pub fn p2p_endpoint_builder(
+    minimal_preset: bool,
+    relay_url: Option<&str>,
+) -> crate::GridResult<iroh::endpoint::Builder> {
+    match resolve_p2p_relay_mode(minimal_preset, relay_url)? {
+        iroh::RelayMode::Disabled => Ok(iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)),
+        iroh::RelayMode::Custom(relay_map) => {
+            Ok(iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Custom(relay_map)))
+        }
+        iroh::RelayMode::Default | iroh::RelayMode::Staging => {
+            Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0))
+        }
+    }
+}
+
 /// Binds an iroh endpoint configured for `GRID_ALPN`, using `presets::Minimal` when
 /// `minimal_preset` is true (offline / loopback test mode) and `presets::N0` otherwise.
 #[cfg(feature = "p2p")]
 pub async fn bind_p2p_endpoint(minimal_preset: bool) -> crate::GridResult<iroh::Endpoint> {
-    let ep_builder = if minimal_preset {
-        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-    } else {
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-    };
+    bind_p2p_endpoint_with_relay(minimal_preset, None).await
+}
+
+/// Binds an iroh endpoint configured for `GRID_ALPN`, using `minimal_preset` or an optional
+/// custom `relay_url` (`iroh::RelayMode::Custom`) instead of `presets::N0`.
+#[cfg(feature = "p2p")]
+pub async fn bind_p2p_endpoint_with_relay(
+    minimal_preset: bool,
+    relay_url: Option<&str>,
+) -> crate::GridResult<iroh::Endpoint> {
+    let ep_builder = p2p_endpoint_builder(minimal_preset, relay_url)?;
     ep_builder
         .alpns(vec![GRID_ALPN.to_vec()])
         .bind()
@@ -390,7 +526,19 @@ pub async fn connect_p2p_client_stream(
     connect_timeout: Duration,
     minimal_preset: bool,
 ) -> crate::GridResult<GridStream> {
-    let endpoint = bind_p2p_endpoint(minimal_preset).await?;
+    connect_p2p_client_stream_with_relay(node_addr, connect_timeout, minimal_preset, None).await
+}
+
+/// Like [`connect_p2p_client_stream`], but accepts an optional custom `relay_url` (`https://...`)
+/// so the ephemeral client endpoint uses [`iroh::RelayMode::Custom`] instead of `presets::N0`.
+#[cfg(feature = "p2p")]
+pub async fn connect_p2p_client_stream_with_relay(
+    node_addr: iroh::EndpointAddr,
+    connect_timeout: Duration,
+    minimal_preset: bool,
+    relay_url: Option<&str>,
+) -> crate::GridResult<GridStream> {
+    let endpoint = bind_p2p_endpoint_with_relay(minimal_preset, relay_url).await?;
     let conn = match dial_p2p_endpoint(&endpoint, node_addr, connect_timeout).await {
         Ok(c) => c,
         Err(e) => {
@@ -630,5 +778,107 @@ mod tests {
         // client's P2pClientGuard without panicking.
         drop(read_half);
         drop(write_half);
+    }
+
+    #[cfg(feature = "p2p")]
+    #[test]
+    fn test_validate_relay_url_accepts_https_and_builds_custom_relay_map() {
+        let url = validate_relay_url("https://relay.example.com").unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("relay.example.com"));
+
+        let url_with_port = validate_relay_url("  https://relay.example.com:8443/  ").unwrap();
+        assert_eq!(url_with_port.scheme(), "https");
+        assert_eq!(url_with_port.host_str(), Some("relay.example.com"));
+        assert_eq!(url_with_port.port(), Some(8443));
+
+        let map = build_custom_relay_map("https://relay.example.com:8443").unwrap();
+        assert!(map.contains(&url_with_port));
+        let urls: Vec<_> = map.urls();
+        assert_eq!(urls, vec![url_with_port.clone()]);
+
+        let mode = resolve_p2p_relay_mode(false, Some("https://relay.example.com:8443")).unwrap();
+        match mode {
+            iroh::RelayMode::Custom(custom_map) => {
+                assert!(custom_map.contains(&url_with_port));
+                assert_eq!(custom_map.urls::<Vec<_>>(), vec![url_with_port]);
+            }
+            other => panic!("expected RelayMode::Custom, got {other:?}"),
+        }
+
+        assert!(matches!(
+            resolve_p2p_relay_mode(false, None).unwrap(),
+            iroh::RelayMode::Default
+        ));
+        assert!(matches!(
+            resolve_p2p_relay_mode(true, None).unwrap(),
+            iroh::RelayMode::Disabled
+        ));
+    }
+
+    #[cfg(feature = "p2p")]
+    #[test]
+    fn test_validate_relay_url_refuses_http_credentials_and_garbage() {
+        // Non-https schemes must be refused.
+        for bad_scheme in [
+            "http://relay.example.com",
+            "http://relay.example.com:3340",
+            "ws://relay.example.com",
+            "wss://relay.example.com",
+            "ftp://relay.example.com",
+        ] {
+            let err = validate_relay_url(bad_scheme).unwrap_err().to_string();
+            assert!(
+                err.contains("https"),
+                "expected https error for '{bad_scheme}', got: {err}"
+            );
+        }
+
+        // Credentials must be refused without echoing the secret.
+        for with_creds in [
+            "https://alice:hunter2@relay.example.com",
+            "https://alice@relay.example.com",
+            "https://:hunter2@relay.example.com:8443",
+        ] {
+            let err = validate_relay_url(with_creds).unwrap_err().to_string();
+            assert!(
+                err.contains("credentials"),
+                "expected credentials error for '{with_creds}', got: {err}"
+            );
+            assert!(
+                !err.contains("hunter2"),
+                "error must not echo password: {err}"
+            );
+        }
+
+        // Empty, whitespace, query/fragment, or unparseable garbage must be refused.
+        for garbage in [
+            "",
+            "   ",
+            "not-a-url",
+            "://missing-scheme",
+            "https://",
+            "https://relay.example.com/path with spaces",
+            "https://relay.example.com?token=abc",
+            "https://relay.example.com#frag",
+        ] {
+            assert!(
+                validate_relay_url(garbage).is_err(),
+                "expected '{garbage}' to be refused"
+            );
+        }
+    }
+
+    #[cfg(feature = "p2p")]
+    #[test]
+    fn test_resolve_p2p_relay_mode_refuses_minimal_plus_custom_relay_url() {
+        let err = resolve_p2p_relay_mode(true, Some("https://relay.example.com"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("minimal") && err.contains("relay"),
+            "expected minimal+relay conflict error, got: {err}"
+        );
+        assert!(p2p_endpoint_builder(true, Some("https://relay.example.com")).is_err());
     }
 }

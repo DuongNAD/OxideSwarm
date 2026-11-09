@@ -62,6 +62,9 @@ const MIB: u64 = 1024 * 1024;
 /// Help text of `--insecure` on the commands that connect to a master (worker and clients).
 const INSECURE_PEER_HELP: &str = "Continue WITHOUT a cluster secret although the master is remote, found by 'auto' discovery, or reached through a P2P ticket. The master is then not authenticated: a rogue host can run commands on a worker or receive what a client submits. Without this flag such a connection is refused when no secret is configured.";
 
+/// Help text of `--relay-url` across master, worker, and client commands.
+const RELAY_URL_HELP: &str = "Custom iroh relay URL (https://...) to use instead of n0's public relays (env RUSTY_GRID_RELAY_URL, config relay_url). Cannot be combined with RUSTY_GRID_P2P_MINIMAL.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rusty-grid",
@@ -233,6 +236,9 @@ pub struct MasterArgs {
     #[arg(long, help = "Enable native P2P QUIC endpoint for NAT traversal")]
     pub p2p: bool,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(long, help = "File path where P2P connection ticket string is written")]
     pub p2p_ticket_file: Option<PathBuf>,
 
@@ -384,6 +390,9 @@ pub struct WorkerArgs {
     #[arg(long, help = "P2P connection ticket string for NAT traversal")]
     pub p2p_ticket: Option<String>,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(
         long,
         help = "Human-readable worker node name override. A named worker also keeps the same worker id across restarts (~/.oxideswarm/worker_id.<NAME>, or the file in RUSTY_GRID_WORKER_ID_FILE): give every worker that shares a home directory its own name. Without a name the id is new at each start"
@@ -531,6 +540,9 @@ pub struct SubmitArgs {
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
 
     #[arg(
         long = "type",
@@ -828,6 +840,9 @@ pub struct StatusArgs {
     )]
     pub master: Option<String>,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(long, alias = "task", help = "Query status of a specific task ID")]
     pub task_id: Option<Uuid>,
 
@@ -852,6 +867,9 @@ pub struct CancelArgs {
     )]
     pub master: Option<String>,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
 
@@ -869,6 +887,9 @@ pub struct ResultArgs {
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
 
     #[arg(
         short,
@@ -899,6 +920,9 @@ pub struct WorkersArgs {
     )]
     pub master: Option<String>,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
 
@@ -914,6 +938,9 @@ pub struct WorkspacesArgs {
     )]
     pub master: Option<String>,
 
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
 
@@ -928,6 +955,9 @@ pub struct MapReduceArgs {
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
 
     #[arg(long, required = true, help = "Input data files or text datasets")]
     pub input: Vec<String>,
@@ -989,6 +1019,9 @@ pub struct DoctorArgs {
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
 
     #[arg(
         long,
@@ -1235,6 +1268,45 @@ fn resolve_wire_codec(flag: Option<String>, cfg_val: Option<String>) -> Result<W
     }
 }
 
+/// Resolves `--relay-url` > `RUSTY_GRID_RELAY_URL` > config `relay_url` > `None` without touching
+/// the global process environment, validates the URL as an `https://` `iroh::RelayUrl` without
+/// embedded credentials, and refuses combining a custom relay URL with `p2p_minimal` mode.
+pub(crate) fn resolve_relay_url_from(
+    cli_val: Option<String>,
+    env_val: Option<&str>,
+    cfg_val: Option<String>,
+    p2p_minimal: bool,
+) -> Result<Option<String>, String> {
+    let sourced = if let Some(v) = cli_val {
+        Some(("--relay-url", v))
+    } else if let Some(v) = env_val.map(str::trim).filter(|s| !s.is_empty()) {
+        Some((rusty_grid_core::transport::RELAY_URL_ENV, v.to_string()))
+    } else {
+        cfg_val
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|v| ("relay_url", v))
+    };
+    let Some((source, raw)) = sourced else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    rusty_grid_core::transport::resolve_p2p_relay_mode(p2p_minimal, Some(&trimmed))
+        .map_err(|e| format!("{source}: {e}"))?;
+    Ok(Some(trimmed))
+}
+
+/// Resolves `--relay-url` > `RUSTY_GRID_RELAY_URL` > config `relay_url` > `None`, validating
+/// the URL and refusing conflicts with `p2p_minimal`.
+pub(crate) fn resolve_relay_url(
+    cli_val: Option<String>,
+    cfg_val: Option<String>,
+    p2p_minimal: bool,
+) -> Result<Option<String>, String> {
+    let env_val = std::env::var(rusty_grid_core::transport::RELAY_URL_ENV).ok();
+    resolve_relay_url_from(cli_val, env_val.as_deref(), cfg_val, p2p_minimal)
+}
+
 /// Resolves `(master_addr, p2p_ticket)` for `oxideswarm worker` across CLI > Env > Config > Default,
 /// ensuring that an explicit `--master` (or `RUSTY_GRID_MASTER_ADDR` / `RUSTY_GRID_MASTER`) is not
 /// overridden by a lower-tier `p2p_ticket` (such as `[worker] p2p_ticket` in the config file).
@@ -1402,6 +1474,17 @@ async fn run_master(
     );
 
     let p2p_minimal = resolve_p2p_minimal();
+    let relay_url = match resolve_relay_url(
+        args.relay_url,
+        config_file.as_ref().and_then(|c| c.master_relay_url()),
+        p2p_minimal,
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     if let Some(pf) = port_file {
         server_config = server_config.with_port_file(pf);
@@ -1410,6 +1493,7 @@ async fn run_master(
         .with_heartbeat_interval(heartbeat_interval)
         .with_p2p(enable_p2p)
         .with_p2p_minimal_preset(p2p_minimal)
+        .with_relay_url(relay_url)
         .with_ephemeral_key(ephemeral_key)
         .with_max_retries(default_retry_max);
 
@@ -1789,6 +1873,19 @@ async fn run_worker(
     let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
+    let p2p_minimal = resolve_p2p_minimal();
+    let relay_url = match resolve_relay_url(
+        args.relay_url,
+        config_file.as_ref().and_then(|c| c.worker_relay_url()),
+        p2p_minimal,
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let (master_addr, p2p_ticket) =
         resolve_worker_target(args.master, args.p2p_ticket, worker_cfg.as_ref());
 
@@ -1974,7 +2071,6 @@ async fn run_worker(
     );
 
     let no_battery = resolve_no_battery();
-    let p2p_minimal = resolve_p2p_minimal();
 
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
@@ -2077,6 +2173,7 @@ async fn run_worker(
     if p2p_minimal {
         config = config.with_p2p_minimal_preset(true);
     }
+    config = config.with_relay_url(relay_url);
     if let Some(n) = name {
         config = config.with_name(n);
     }
@@ -3093,6 +3190,17 @@ async fn run_doctor_command(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.status_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master.clone(),
@@ -3120,7 +3228,11 @@ async fn run_doctor_command(
         skip_spread: args.skip_spread,
         skip_throughput: args.skip_throughput,
     };
-    let report = run_doctor(&master_addr, secret.as_ref(), &options).await;
+    let report = crate::connect::with_client_relay_url(
+        relay_url,
+        run_doctor(&master_addr, secret.as_ref(), &options),
+    )
+    .await;
     if args.json {
         println!(
             "{}",
@@ -3144,6 +3256,29 @@ pub async fn run_submit(args: SubmitArgs, config_file: Option<ConfigFile>) -> Ex
 }
 
 async fn run_submit_with_secret(
+    args: SubmitArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.submit_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_submit_with_secret_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_submit_with_secret_inner(
     args: SubmitArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
@@ -3665,6 +3800,29 @@ async fn run_status(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.status_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_status_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_status_inner(
+    args: StatusArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
@@ -3909,6 +4067,29 @@ pub async fn run_cancel(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.status_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_cancel_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_cancel_inner(
+    args: CancelArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
@@ -3991,6 +4172,29 @@ pub async fn run_cancel(
 }
 
 pub async fn run_result(
+    args: ResultArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.status_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_result_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_result_inner(
     args: ResultArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
@@ -4261,6 +4465,7 @@ async fn run_workers(
 ) -> ExitCode {
     let status_args = StatusArgs {
         master: args.master,
+        relay_url: args.relay_url,
         task_id: None,
         workers: true,
         json: args.json,
@@ -4270,6 +4475,29 @@ async fn run_workers(
 }
 
 pub async fn run_workspaces(
+    args: WorkspacesArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.status_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_workspaces_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_workspaces_inner(
     args: WorkspacesArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
@@ -4447,6 +4675,29 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
 }
 
 async fn run_mapreduce(
+    args: MapReduceArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let relay_url = match resolve_relay_url(
+        args.relay_url.clone(),
+        config_file.as_ref().and_then(|c| c.submit_relay_url()),
+        crate::connect::client_p2p_minimal_requested(),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    crate::connect::with_client_relay_url(
+        relay_url,
+        run_mapreduce_inner(args, config_file, secret_opts),
+    )
+    .await
+}
+
+async fn run_mapreduce_inner(
     args: MapReduceArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
@@ -7217,5 +7468,240 @@ edition = "2021"
         ]);
         let code = run_submit(too_many_bytes, None).await;
         assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_relay_url_flag_parses_and_precedence_holds_across_roles() {
+        let id = Uuid::new_v4().to_string();
+        let relay_of = |args: &[&str]| match parse(args).command {
+            Commands::Master(a) => a.relay_url,
+            Commands::Worker(a) => a.relay_url,
+            Commands::Submit(a) => a.relay_url,
+            Commands::Status(a) => a.relay_url,
+            Commands::Cancel(a) => a.relay_url,
+            Commands::Result(a) => a.relay_url,
+            Commands::Workers(a) => a.relay_url,
+            Commands::Workspaces(a) => a.relay_url,
+            Commands::Mapreduce(a) => a.relay_url,
+            Commands::Doctor(a) => a.relay_url,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        for with_flag in [
+            vec!["master", "--relay-url", "https://relay.example.com"],
+            vec!["worker", "--relay-url", "https://relay.example.com"],
+            vec![
+                "submit",
+                "--relay-url",
+                "https://relay.example.com",
+                "--",
+                "true",
+            ],
+            vec!["status", "--relay-url", "https://relay.example.com"],
+            vec!["cancel", &id, "--relay-url", "https://relay.example.com"],
+            vec!["result", &id, "--relay-url", "https://relay.example.com"],
+            vec!["workers", "--relay-url", "https://relay.example.com"],
+            vec!["workspaces", "--relay-url", "https://relay.example.com"],
+            vec![
+                "mapreduce",
+                "--input",
+                "x",
+                "--relay-url",
+                "https://relay.example.com",
+            ],
+            vec!["doctor", "--relay-url", "https://relay.example.com"],
+        ] {
+            let refs: Vec<&str> = with_flag.iter().map(AsRef::as_ref).collect();
+            assert_eq!(
+                relay_of(&refs).as_deref(),
+                Some("https://relay.example.com"),
+                "failed for {with_flag:?}"
+            );
+        }
+
+        // Default when unset: None -> RelayMode::Default.
+        assert_eq!(
+            resolve_relay_url_from(None, None, None, false).unwrap(),
+            None
+        );
+
+        // Precedence: CLI flag > RUSTY_GRID_RELAY_URL env > config file > default (None).
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+relay_url = "https://cfg-master.relay.example.com"
+
+[worker]
+relay_url = "https://cfg-worker.relay.example.com"
+
+[client]
+relay_url = "https://cfg-client.relay.example.com"
+"#,
+        )
+        .unwrap();
+
+        for (role_cfg, expected_cfg) in [
+            (
+                cfg.master_relay_url(),
+                "https://cfg-master.relay.example.com",
+            ),
+            (
+                cfg.worker_relay_url(),
+                "https://cfg-worker.relay.example.com",
+            ),
+            (
+                cfg.submit_relay_url(),
+                "https://cfg-client.relay.example.com",
+            ),
+            (
+                cfg.status_relay_url(),
+                "https://cfg-client.relay.example.com",
+            ),
+        ] {
+            // Tier 3: config file wins over default (None).
+            let from_cfg = resolve_relay_url_from(None, None, role_cfg.clone(), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(from_cfg, expected_cfg);
+
+            // Tier 2: RUSTY_GRID_RELAY_URL beats config file.
+            let from_env = resolve_relay_url_from(
+                None,
+                Some("https://env.relay.example.com:8443"),
+                role_cfg.clone(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(from_env, "https://env.relay.example.com:8443");
+
+            // Tier 1: --relay-url CLI flag beats both env and config file.
+            let from_cli = resolve_relay_url_from(
+                Some("https://cli.relay.example.com:9443".into()),
+                Some("https://env.relay.example.com:8443"),
+                role_cfg,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(from_cli, "https://cli.relay.example.com:9443");
+
+            // Resolved URL builds a custom iroh RelayMap containing that exact RelayUrl.
+            let expected_relay_url =
+                rusty_grid_core::transport::validate_relay_url(&from_cli).unwrap();
+            let map = rusty_grid_core::transport::build_custom_relay_map(&from_cli).unwrap();
+            assert!(map.contains(&expected_relay_url));
+            let urls: Vec<_> = map.urls();
+            assert_eq!(urls, vec![expected_relay_url]);
+        }
+
+        // Invalid URLs (http://, credentials, garbage) are refused at every tier with the source name.
+        for bad in [
+            "http://relay.example.com",
+            "https://user:secretpass@relay.example.com",
+            "not-a-valid-url",
+        ] {
+            let cli_err = resolve_relay_url_from(Some(bad.into()), None, None, false).unwrap_err();
+            assert!(
+                cli_err.starts_with("--relay-url: "),
+                "expected '--relay-url: ', got: {cli_err}"
+            );
+            assert!(!cli_err.contains("secretpass"));
+
+            let env_err = resolve_relay_url_from(None, Some(bad), None, false).unwrap_err();
+            assert!(
+                env_err.starts_with("RUSTY_GRID_RELAY_URL: "),
+                "expected 'RUSTY_GRID_RELAY_URL: ', got: {env_err}"
+            );
+            assert!(!env_err.contains("secretpass"));
+
+            let cfg_err = resolve_relay_url_from(None, None, Some(bad.into()), false).unwrap_err();
+            assert!(
+                cfg_err.starts_with("relay_url: "),
+                "expected 'relay_url: ', got: {cfg_err}"
+            );
+            assert!(!cfg_err.contains("secretpass"));
+        }
+
+        // Combining --relay-url with minimal/no-relay test mode is a clear error.
+        let minimal_err =
+            resolve_relay_url_from(Some("https://relay.example.com".into()), None, None, true)
+                .unwrap_err();
+        assert!(
+            minimal_err.starts_with("--relay-url: ") && minimal_err.contains("minimal"),
+            "got: {minimal_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_master_worker_and_client_refuse_invalid_relay_url_before_network() {
+        let secret = ClusterSecret::from_bytes(&[0x33; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(SecretText(secret.to_hex())),
+            file: None,
+        };
+
+        for bad in [
+            "http://relay.example.com",
+            "https://user:secret@relay.example.com",
+            "garbage-url",
+        ] {
+            let master_cli = Cli::try_parse_from([
+                "oxideswarm",
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--relay-url",
+                bad,
+            ])
+            .unwrap();
+            let Commands::Master(m_args) = master_cli.command else {
+                panic!("expected Master");
+            };
+            assert_eq!(
+                run_master(m_args, None, secret_opts.clone()).await,
+                ExitCode::FAILURE
+            );
+
+            let worker_cli = Cli::try_parse_from([
+                "oxideswarm",
+                "worker",
+                "--master",
+                "127.0.0.1:1",
+                "--relay-url",
+                bad,
+            ])
+            .unwrap();
+            let Commands::Worker(w_args) = worker_cli.command else {
+                panic!("expected Worker");
+            };
+            assert_eq!(
+                run_worker(w_args, None, secret_opts.clone()).await,
+                ExitCode::FAILURE
+            );
+
+            let sub_args = submit_args(&["--master", "127.0.0.1:1", "--relay-url", bad]);
+            assert_eq!(
+                run_submit_with_secret(sub_args, None, secret_opts.clone()).await,
+                ExitCode::FAILURE
+            );
+
+            let status_cli = Cli::try_parse_from([
+                "oxideswarm",
+                "status",
+                "--master",
+                "127.0.0.1:1",
+                "--relay-url",
+                bad,
+            ])
+            .unwrap();
+            let Commands::Status(st_args) = status_cli.command else {
+                panic!("expected Status");
+            };
+            assert_eq!(
+                run_status(st_args, None, secret_opts.clone()).await,
+                ExitCode::FAILURE
+            );
+        }
     }
 }
