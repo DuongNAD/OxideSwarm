@@ -232,3 +232,8 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
 - 2026-11-09: Review fixes for protocol version 6: `required_features` adds `WORKSPACES` to a task
   with a workspace, so it waits with `ClusterLacksCapability` until workers advertise the bit (`0039`
   W2, W3); the upgrade hint of `connect_master` also covers an undecodable reply to the `Hello` probe.
+- 2026-11-09: Protocol version 7 (design 0039 `W5`): added `ClientMessage::ListWorkspaces` and
+  `ClientResponse::Workspaces { workspaces: Vec<WorkspaceAffinity> }` (both appended last, so every
+  v6 request and response keeps the v7 layout and is refused by the version check with a clear
+  `Incompatible protocol version 6` error in both directions), and regenerated
+  `crates/core/tests/data/wire_layout.txt`.

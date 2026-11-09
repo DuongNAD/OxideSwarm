@@ -42,7 +42,8 @@ use crate::protocol::{
 };
 use crate::task::{
     AutoRigSpec, Bytes, CheckpointData, Generative3DSpec, OutputArtifact, StagedFile, Task, TaskId,
-    TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceRef, WorkspaceSource,
+    TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity, WorkspaceRef,
+    WorkspaceSource,
 };
 
 /// The recorded encodings, relative to the crate root.
@@ -611,6 +612,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
             },
         ),
         ("Hello", ClientMessage::Hello),
+        ("ListWorkspaces", ClientMessage::ListWorkspaces),
     ];
     check_instances("ClientMessage", &all, |msg| match msg {
         ClientMessage::SubmitTask { .. } => "SubmitTask",
@@ -622,6 +624,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ClientMessage::GetTaskResult { .. } => "GetTaskResult",
         ClientMessage::BlobRequest { .. } => "BlobRequest",
         ClientMessage::Hello => "Hello",
+        ClientMessage::ListWorkspaces => "ListWorkspaces",
     });
     all
 }
@@ -708,6 +711,16 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 min_compatible_version: PROTOCOL_VERSION_MIN_COMPATIBLE,
             },
         ),
+        (
+            "Workspaces",
+            ClientResponse::Workspaces {
+                workspaces: vec![WorkspaceAffinity {
+                    name: "oxideswarm-agent.1".into(),
+                    worker: worker_id(),
+                    last_used_utc: EPOCH_SECS + 42,
+                }],
+            },
+        ),
     ];
     check_instances("ClientResponse", &all, |msg| match msg {
         ClientResponse::TaskSubmitted { .. } => "TaskSubmitted",
@@ -721,6 +734,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         ClientResponse::Error { .. } => "Error",
         ClientResponse::BlobReply { .. } => "BlobReply",
         ClientResponse::Hello { .. } => "Hello",
+        ClientResponse::Workspaces { .. } => "Workspaces",
     });
     all
 }
