@@ -32,7 +32,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Job Objects for task process trees (already in Cargo.lock via tokio / mio)
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [features]
 default = ["p2p"]

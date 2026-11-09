@@ -5,7 +5,7 @@
 //! `OXIDESWARM_SECRET` or `--secret` would therefore be readable by every task, so a worker with
 //! isolation refuses to start with one. A secret file is fine. These tests run the real
 //! `rusty-grid worker` binary with a private `HOME`.
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
 use std::fs;

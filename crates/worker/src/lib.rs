@@ -31,7 +31,9 @@ pub use client::{
 };
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
-pub use isolation::{verify_isolation_support, HostDirs, IsolationLevel};
+pub use isolation::{
+    verify_isolation_support, verify_isolation_support_with_config, HostDirs, IsolationLevel,
+};
 pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{
     read_bounded_stream, RunnerConfig, TaskRunner, TaskRunnerError, DEFAULT_MAX_OUTPUT_BYTES,
