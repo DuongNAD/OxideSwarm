@@ -1447,12 +1447,19 @@ impl Drop for WorkerClient {
 /// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
 /// level (`iso:<level>`), its probed host tools (`tool:<name>`), then the
 /// configured user tags that are not among them.
+///
+/// On Windows, when the worker process is elevated (`elevated_on_windows`) and `isolation` is
+/// `Fs` or `FsNet`, `"tool:cargo"` is omitted because opening `NUL` (`\??\NUL`, used by
+/// `Stdio::null()` inside `cargo`) fails with `Access is denied (os error 5)` inside an
+/// AppContainer under an elevated logon session (design 0033 D4).
 fn advertised_tags(
     user_tags: &[String],
     slots: usize,
     isolation: IsolationLevel,
     tool_tags: &[String],
+    elevated_on_windows: bool,
 ) -> Vec<String> {
+    let drop_cargo = elevated_on_windows && isolation != IsolationLevel::Off;
     let mut tags = rusty_grid_core::placement::system_tags();
     tags.push(format!(
         "{}{}",
@@ -1461,6 +1468,9 @@ fn advertised_tags(
     ));
     tags.push(isolation.tag());
     for tag in tool_tags {
+        if drop_cargo && tag == "tool:cargo" {
+            continue;
+        }
         if tag.starts_with(rusty_grid_core::placement::TOOL_TAG_PREFIX) && !tags.contains(tag) {
             tags.push(tag.clone());
         }
@@ -1518,11 +1528,30 @@ impl WorkerClient {
             })
             .max(1);
         let tool_tags = capabilities.tags.clone();
+        let elevated_on_windows = {
+            #[cfg(windows)]
+            {
+                crate::isolation::windows::is_process_elevated()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        if elevated_on_windows && config.isolation != IsolationLevel::Off {
+            warn!(
+                worker_id = %worker_id,
+                isolation = %config.isolation,
+                "Worker is running under an elevated Windows token with --isolation {}; cargo and other programs that open NUL (\\??\\NUL) will fail with Access is denied (os error 5) because the elevated logon session's DosDevices directory has no ACE for CurrentUser. Run the worker non-elevated; dropping tool:cargo from advertised tags",
+                config.isolation
+            );
+        }
         capabilities = capabilities.with_tags(advertised_tags(
             &config.tags,
             concurrency_permits,
             config.isolation,
             &tool_tags,
+            elevated_on_windows,
         ));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
@@ -1985,14 +2014,6 @@ impl WorkerClient {
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.
         if self.config.isolation != IsolationLevel::Off {
-            if cfg!(windows) && self.config.workspaces {
-                let err = GridError::Config(
-                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (cargo under Windows isolation is FEAT-3d); start the worker with --isolation off or without --workspaces"
-                        .to_string(),
-                );
-                error!(worker_id = %self.worker_id, error = %err, "Task isolation with workspaces cannot be enforced on Windows");
-                return Err(err);
-            }
             if let Err(err) = crate::isolation::verify_isolation_support_with_config(
                 self.config.isolation,
                 &self.runner.config().sandbox_config.base_dir,
@@ -8174,5 +8195,58 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), portal_handle).await;
+    }
+
+    #[test]
+    fn test_advertised_tags_drops_tool_cargo_on_elevated_windows_worker_with_isolation() {
+        let tool_tags = vec![
+            "tool:cargo".to_string(),
+            "tool:rustc".to_string(),
+            "tool:git".to_string(),
+        ];
+        let user_tags = vec!["custom-tag".to_string()];
+
+        // Non-elevated with isolation Fs or FsNet keeps tool:cargo.
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            let tags = advertised_tags(&user_tags, 4, level, &tool_tags, false);
+            assert!(
+                tags.iter().any(|t| t == "tool:cargo"),
+                "non-elevated worker with isolation {level} must keep tool:cargo: {tags:?}"
+            );
+            assert!(tags.iter().any(|t| t == "tool:rustc"));
+            assert!(tags.iter().any(|t| t == "tool:git"));
+        }
+
+        // Elevated with IsolationLevel::Off keeps tool:cargo.
+        let off_elevated = advertised_tags(&user_tags, 4, IsolationLevel::Off, &tool_tags, true);
+        assert!(
+            off_elevated.iter().any(|t| t == "tool:cargo"),
+            "elevated worker with --isolation off must keep tool:cargo: {off_elevated:?}"
+        );
+
+        // Elevated with IsolationLevel::Fs or IsolationLevel::FsNet drops tool:cargo while keeping
+        // tool:rustc, tool:git, iso:<level>, slots:4, and custom user tags.
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let tags = advertised_tags(&user_tags, 4, level, &tool_tags, true);
+            assert!(
+                !tags.iter().any(|t| t == "tool:cargo"),
+                "elevated worker with --isolation {level} must drop tool:cargo: {tags:?}"
+            );
+            assert!(
+                tags.iter().any(|t| t == "tool:rustc"),
+                "elevated worker with --isolation {level} must retain tool:rustc: {tags:?}"
+            );
+            assert!(
+                tags.iter().any(|t| t == "tool:git"),
+                "elevated worker with --isolation {level} must retain tool:git: {tags:?}"
+            );
+            assert!(tags.iter().any(|t| t == &level.tag()));
+            assert!(tags.iter().any(|t| t == "slots:4"));
+            assert!(tags.iter().any(|t| t == "custom-tag"));
+        }
     }
 }

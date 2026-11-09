@@ -19,6 +19,8 @@ function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
 $TokenFile = Join-Path $Kit 'join.token'
+# A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
+if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
 if (-not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
@@ -114,11 +116,22 @@ if (Test-Path $cfg) {
     }
 }
 $checkArgs = @()
-if ($ticket) { $checkArgs = @('--master', $ticket); Write-Host "  link:    P2P ticket (the worker and the checks connect through iroh)" }
+if ($ticket) {
+    # Windows PowerShell 5.1 (and PowerShell 7 before 7.3) passes native arguments the legacy way
+    # and drops the inner double quotes of the JSON ticket, so they must arrive escaped.
+    $legacy = $true
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+    if ($mode -and $mode -ne 'Legacy') { $legacy = $false }
+    $ticketArg = if ($legacy) { $ticket.Replace('"', '\"') } else { $ticket }
+    $checkArgs = @('--master', $ticketArg)
+    Write-Host "  link:    P2P ticket (the worker and the checks connect through iroh)"
+}
 
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
-$workerArgs = "worker --name $Name --no-portal"
+# Use at most half of the CPU cores, so the machine stays responsive for its owner.
+$slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
+$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots"
 if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
 $log = Join-Path $LogDir 'worker.log'
 
@@ -149,11 +162,15 @@ $workerPid | Set-Content $pidFile
 Start-Sleep -Seconds 3
 if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { Fail "the worker stopped right away; see $log" }
 
-# 7. Wait until the master lists it.
+# 7. Wait until the master lists it. The checks run without log lines: release 0.1.x writes its
+# informational logs to standard output, which would break the JSON parsing below. The worker
+# was started above, so it keeps its own logging.
+$env:RUST_LOG = 'off'
 $connected = $false
 for ($i = 0; $i -lt 30; $i++) {
     # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-    $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json
+    $list = $null
+    try { $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json } catch { $list = $null }
     if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
     Start-Sleep -Seconds 1
 }

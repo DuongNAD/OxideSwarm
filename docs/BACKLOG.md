@@ -199,7 +199,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
-| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Planned |  |
+| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented | 183 (open) |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
@@ -1256,6 +1256,8 @@ Each item below needs a design record before code.
   `test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home` pass un-ignored in
   `test_feat3_os_isolation` on `windows-latest`, and workspaces with `--isolation fs|fs+net` work on
   Windows.
+  - *Verified (PR 183, CI run `42678349017`):* On a non-elevated Windows worker (`TokenElevation == 0`), `\Sessions\<S>\DosDevices\<UserLogonId>` carries `(A;;CCDCLCSWSDRCWDWO;;;<CurrentUser>)` and `cargo build --offline` (including cached registry dependencies under a denied `USERPROFILE`) and `--workspaces` (`<ws>/tree` and `<ws>/tmp` confined to the per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>`, with non-inherited traverse-only for `oxideswarm.toolchain` on `<workspace_root>` and `<workspace_root>/<ws_name>`) pass under `--isolation fs` and `--isolation fs+net`, both locally and on `windows-latest` (via a non-elevated scheduled task `InteractiveToken` / `LeastPrivilege`), and a worker with default sandbox settings (`%TEMP%\rusty_grid\sandboxes` inside `host.user_home`) starts cleanly.
+  - *Residual limitation:* On an **elevated** Windows worker (`TokenElevation != 0`), UAC creates `\Sessions\<S>\DosDevices\<AdminLogonId>` with `TokenOwner = BUILTIN\Administrators` (`O:BA D:(A;OICI;...;;;SY)(A;OICI;...;;;BA)`) and no ACE for `CurrentUser`, and `ntoskrnl.exe!SeIsTokenAssignableToProcess` refuses switching to a fresh logon session via `CreateProcessAsUserW` without `SeAssignPrimaryTokenPrivilege` (`os error 1314`), so `cargo` and other programs that open `NUL` fail with `os error 5` inside the AppContainer. Workers must run non-elevated; when an elevated Windows worker starts with `--isolation fs|fs+net`, it logs a startup `WARN` and drops `tool:cargo` from its advertised capability tags.
 
 ### FEAT-4: Remote workspaces for coding agents
 
@@ -2056,3 +2058,11 @@ Add one dated line per finished item, newest last.
   `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
   `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
   Index counts are now 64 Implemented, 4 Partial and 37 Planned.
+- 2026-11-10: Implemented FEAT-3d (pull request 183, open): enabled `cargo build --offline` and
+  `--workspaces` under `--isolation fs|fs+net` on non-elevated Windows workers without Object
+  Manager DACL edits (`get_or_init_worker_lua_token` using `CreateRestrictedToken` with `LUA_TOKEN`
+  + `CreateProcessAsUserW`, per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` on
+  `<ws>/tree` and `<ws>/tmp`, default `%TEMP%\rusty_grid\sandboxes` accepted under `host.user_home`
+  in `validate_sandbox_base_safe`, and a startup `WARN` + `tool:cargo` tag removal when a Windows
+  worker runs elevated with isolation). Verified in CI run `42678349017` across all 22 jobs and
+  locally on Windows 11. The Index counts are now 64 Implemented, 4 Partial and 36 Planned.
