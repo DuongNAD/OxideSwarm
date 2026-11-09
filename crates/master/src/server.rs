@@ -82,6 +82,9 @@ pub struct ServerConfig {
     /// relay or pkarr/DNS address lookup) so tests stay completely off the network. Production
     /// defaults to `false` (`presets::N0`); the CLI resolves `RUSTY_GRID_P2P_MINIMAL`.
     pub p2p_minimal_preset: bool,
+    /// Optional custom iroh relay URL (`https://...`). When set, builds the P2P endpoint with
+    /// `iroh::RelayMode::Custom(iroh::RelayMap::from(url))` instead of `presets::N0`.
+    pub p2p_relay_url: Option<String>,
     /// Optional explicit UDP socket address for the P2P endpoint (used by tests to keep a stable
     /// loopback UDP port across restarts when relays are disabled).
     pub p2p_bind_addr: Option<SocketAddr>,
@@ -185,6 +188,7 @@ impl Default for ServerConfig {
             handshake_timeout_secs: 5,
             enable_p2p: false,
             p2p_minimal_preset: false,
+            p2p_relay_url: None,
             p2p_bind_addr: None,
             p2p_ticket_file: None,
             // The dashboard is only reachable from other machines when its address is set
@@ -280,6 +284,19 @@ impl ServerConfig {
     /// keeps `presets::N0` (`false`).
     pub fn with_p2p_minimal_preset(mut self, minimal: bool) -> Self {
         self.p2p_minimal_preset = minimal;
+        self
+    }
+
+    /// Configures a custom iroh relay URL (`https://...`) so the P2P endpoint uses
+    /// `iroh::RelayMode::Custom` instead of `presets::N0`.
+    pub fn with_p2p_relay_url(mut self, url: impl Into<String>) -> Self {
+        self.p2p_relay_url = Some(url.into());
+        self
+    }
+
+    /// Sets or clears the optional custom iroh relay URL (`https://...`).
+    pub fn with_relay_url(mut self, url: Option<String>) -> Self {
+        self.p2p_relay_url = url;
         self
     }
 
@@ -571,6 +588,12 @@ impl MasterServer {
         scheduler_notify: Arc<tokio::sync::Notify>,
         waiters: WaiterMap,
     ) -> GridResult<Self> {
+        #[cfg(feature = "p2p")]
+        rusty_grid_core::transport::resolve_p2p_relay_mode(
+            config.p2p_minimal_preset,
+            config.p2p_relay_url.as_deref(),
+        )?;
+
         // Opened first: a store that cannot be used (e.g. `store.lock` held by another master)
         // must fail before `BlobStore::open` scans `blobs/` or purges `blobs/tmp/`, and before
         // any ticket or port file is written.
@@ -642,11 +665,10 @@ impl MasterServer {
                 config.p2p_key_file.clone().or_else(default_master_key_file)
             };
             let secret_key = resolve_p2p_secret_key(resolved_key_file.as_deref()).await?;
-            let mut ep_builder = if config.p2p_minimal_preset {
-                iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            } else {
-                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            };
+            let mut ep_builder = rusty_grid_core::transport::p2p_endpoint_builder(
+                config.p2p_minimal_preset,
+                config.p2p_relay_url.as_deref(),
+            )?;
             if let Some(p2p_addr) = config.p2p_bind_addr {
                 ep_builder = ep_builder
                     .clear_ip_transports()
@@ -7815,5 +7837,44 @@ mod tests {
         .with_workspace(WorkspaceRef::new("oxide-ws").with_tree(missing_manifest_id, 12));
         let err = admit_blob_task(Some(&store), &bad_task).await.unwrap_err();
         assert!(err.contains("is not on the master"), "got: {err}");
+    }
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn test_master_bind_refuses_invalid_relay_url_and_minimal_conflict() {
+        for bad_url in [
+            "http://relay.example.com",
+            "https://alice:secret@relay.example.com",
+            "not-a-valid-url",
+        ] {
+            let mut cfg = ServerConfig::default()
+                .with_ephemeral_key(true)
+                .with_p2p_relay_url(bad_url);
+            cfg.enable_p2p = true;
+            let res = MasterServer::bind(cfg, WorkerRegistry::new()).await;
+            let err = match res {
+                Ok(_) => panic!("expected bind to fail for '{bad_url}'"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("Invalid relay URL"),
+                "expected invalid relay URL error for '{bad_url}', got: {err}"
+            );
+            assert!(!err.contains("secret"), "must not echo password: {err}");
+        }
+
+        let conflict_cfg = ServerConfig::default()
+            .with_p2p(true)
+            .with_ephemeral_key(true)
+            .with_p2p_minimal_preset(true)
+            .with_p2p_relay_url("https://relay.example.com");
+        let err = match MasterServer::bind(conflict_cfg, WorkerRegistry::new()).await {
+            Ok(_) => panic!("expected bind to fail when minimal preset + relay URL are combined"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("minimal") && err.contains("relay"),
+            "expected minimal+relay conflict error, got: {err}"
+        );
     }
 }
