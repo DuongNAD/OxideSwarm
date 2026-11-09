@@ -1322,6 +1322,36 @@ fn kill_probe_group(pid: u32) {
 #[cfg(windows)]
 pub const WINDOWS_CREATE_SUSPENDED: u32 = 0x0000_0004;
 
+/// Windows process error-mode flags that suppress modal hard-error and crash dialogs:
+/// `SEM_FAILCRITICALERRORS` (`0x0001`) | `SEM_NOGPFAULTERRORBOX` (`0x0002`) |
+/// `SEM_NOOPENFILEERRORBOX` (`0x8000`) = `0x8003`.
+///
+/// Child processes on Windows inherit the parent process's error mode unless spawned with
+/// `CREATE_DEFAULT_ERROR_MODE`.
+#[cfg(windows)]
+pub const WINDOWS_SUPPRESS_ERROR_DIALOGS_MODE: u32 = 0x0001 | 0x0002 | 0x8000;
+
+/// Sets `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX` (`0x8003`) on
+/// the current Windows process (preserving any additional error-mode bits already set) so neither
+/// this process nor any child process it spawns can block on a modal Windows hard-error dialog
+/// (such as 16-bit/64-bit `.exe` incompatibility or missing-DLL pop-ups). No-op on non-Windows.
+pub fn suppress_windows_error_dialogs() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(umode: u32) -> u32;
+        }
+        // SAFETY: `SetErrorMode` is a thread-safe process-wide Win32 API with no pointer or
+        // handle preconditions. Calling `SetErrorMode(prev | mode)` preserves any additional
+        // error-mode flags the process already had enabled.
+        unsafe {
+            let prev = SetErrorMode(WINDOWS_SUPPRESS_ERROR_DIALOGS_MODE);
+            let _ = SetErrorMode(prev | WINDOWS_SUPPRESS_ERROR_DIALOGS_MODE);
+        }
+    }
+}
+
 /// Creates a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, assigns
 /// the suspended `process` handle to it, and resumes `process` via `NtResumeProcess`.
 ///
@@ -1460,6 +1490,7 @@ fn run_command_bounded(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        suppress_windows_error_dialogs();
         cmd.creation_flags(WINDOWS_CREATE_SUSPENDED);
     }
 
