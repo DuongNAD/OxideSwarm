@@ -30,8 +30,8 @@ use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, validate_user_tag, IsolationLevel, Placement, REQUIRE_PREFIX,
-    STATE_TAG_PREFIX,
+    listed_supports_workspaces, listed_worker_id, tag_value, validate_user_tag, IsolationLevel,
+    Placement, REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -146,7 +146,7 @@ pub enum Commands {
     /// List active worker nodes in the grid
     Workers(WorkersArgs),
 
-    /// List persistent workspaces and their worker affinities
+    /// List the master's workspace affinity map (does not list workspaces stored on workers)
     Workspaces(WorkspacesArgs),
 
     /// Execute a distributed Map/Reduce job
@@ -393,7 +393,7 @@ pub struct WorkerArgs {
     #[arg(
         long = "tag",
         value_name = "TAG",
-        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso: and tool: are reserved"
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso:, tool: and feat: are reserved"
     )]
     pub tags: Vec<String>,
 
@@ -3213,7 +3213,14 @@ async fn run_submit_with_secret(
                 (Some(ws_ref), Some(scan))
             }
         }
-        None => (None, None),
+        None => {
+            if args.workspace_max_files.is_some() || args.workspace_max_mb.is_some() {
+                eprintln!(
+                    "Warning: --workspace-max-files and --workspace-max-mb have no effect without --workspace"
+                );
+            }
+            (None, None)
+        }
     };
 
     let output_globs = if !args.outputs.is_empty() {
@@ -3271,13 +3278,23 @@ async fn run_submit_with_secret(
     };
 
     let had_secret = secret.is_some();
-    // A constrained task nobody can take would wait silently; say so (it is still submitted, a
-    // matching worker may connect later).
-    if !placement.is_empty() {
+    // A constrained or workspace task nobody can take would wait silently; say so (it is still
+    // submitted, a matching worker may connect later).
+    if !placement.is_empty() || workspace_ref.is_some() {
         if let Some(workers) = fetch_workers(&mut transport, &master_addr, had_secret).await {
-            if !workers
-                .iter()
-                .any(|w| listed_as_connected(w) && placement.matches_listed(w))
+            if workspace_ref.is_some()
+                && !workers
+                    .iter()
+                    .any(|w| listed_as_connected(w) && listed_supports_workspaces(w))
+            {
+                eprintln!(
+                    "Warning: no connected worker supports workspaces yet; the task will wait"
+                );
+            }
+            if !placement.is_empty()
+                && !workers
+                    .iter()
+                    .any(|w| listed_as_connected(w) && placement.matches_listed(w))
             {
                 eprintln!(
                     "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
@@ -3364,20 +3381,73 @@ async fn run_submit_with_secret(
     if let Some(ws) = workspace_ref {
         task = task.with_workspace(ws);
     }
+    let task_id = task.id;
     let wait = args.wait || args.output.is_some() || !output_globs.is_empty() || is_compile;
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
-    let response = match exchange(
-        &mut transport,
-        &master_addr,
-        had_secret,
-        &submit_msg,
-        "Failed to send task to Master",
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(code) => return code,
+    let response = if wait {
+        if let Err(e) = transport.send_msg(&submit_msg).await {
+            return report_master_failure(
+                &master_addr,
+                had_secret,
+                "Failed to send task to Master",
+                &GridError::from(e),
+            );
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            transport.recv_msg::<ClientResponse>(),
+        )
+        .await
+        {
+            Ok(Ok(Some(response))) => response,
+            Ok(Ok(None)) => {
+                return report_master_failure(
+                    &master_addr,
+                    had_secret,
+                    "Master closed the connection before replying",
+                    &GridError::ConnectionClosed,
+                );
+            }
+            Ok(Err(e)) => {
+                return report_master_failure(
+                    &master_addr,
+                    had_secret,
+                    "Communication error with Master",
+                    &GridError::from(e),
+                );
+            }
+            Err(_) => {
+                let msg = format!(
+                    "Timed out after {timeout_secs}s waiting for task {task_id} to complete"
+                );
+                eprintln!("{msg}");
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "timeout",
+                            "task_id": task_id.to_string(),
+                            "error": msg,
+                        })
+                    );
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match exchange(
+            &mut transport,
+            &master_addr,
+            had_secret,
+            &submit_msg,
+            "Failed to send task to Master",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(code) => return code,
+        }
     };
 
     match response {
@@ -7006,5 +7076,146 @@ edition = "2021"
         let _ = w1_handle.await;
         let _ = w2_handle.await;
         let _ = master.shutdown();
+    }
+
+    #[test]
+    fn test_submit_workspace_flag_parsing_and_conflicts() {
+        let parsed = submit_args(&[
+            "--workspace",
+            "oxideswarm",
+            "--sync",
+            "crates/core",
+            "--cwd",
+            "src",
+            "--workspace-max-files",
+            "500",
+            "--workspace-max-mb",
+            "64",
+            "--command",
+            "cargo",
+            "--",
+            "test",
+        ]);
+        assert_eq!(parsed.workspace.as_deref(), Some("oxideswarm"));
+        assert_eq!(parsed.sync.as_deref(), Some(Path::new("crates/core")));
+        assert!(!parsed.no_sync);
+        assert_eq!(parsed.cwd.as_deref(), Some("src"));
+        assert_eq!(parsed.workspace_max_files, Some(500));
+        assert_eq!(parsed.workspace_max_mb, Some(64));
+
+        let no_sync = submit_args(&[
+            "--workspace",
+            "oxideswarm",
+            "--no-sync",
+            "--cwd",
+            "crates/core",
+            "--command",
+            "cargo",
+        ]);
+        assert_eq!(no_sync.workspace.as_deref(), Some("oxideswarm"));
+        assert!(no_sync.no_sync);
+        assert!(no_sync.sync.is_none());
+        assert_eq!(no_sync.cwd.as_deref(), Some("crates/core"));
+
+        // Validation and conflicts enforced by `build_task_spec`:
+        let spec = build_task_spec(&parsed).expect("valid workspace command spec");
+        assert!(matches!(
+            spec,
+            TaskSpec::Command {
+                working_dir: Some(ref wd),
+                ..
+            } if wd == Path::new("src")
+        ));
+
+        assert!(
+            build_task_spec(&submit_args(&[
+                "--workspace",
+                "oxideswarm",
+                "--input",
+                "Cargo.toml",
+                "--command",
+                "cargo",
+            ]))
+            .unwrap_err()
+            .contains("--workspace cannot be combined with --input"),
+            "--workspace and --input must conflict"
+        );
+        assert!(
+            build_task_spec(&submit_args(&[
+                "--workspace",
+                "oxideswarm",
+                "--sync",
+                ".",
+                "--no-sync",
+                "--command",
+                "cargo",
+            ]))
+            .unwrap_err()
+            .contains("--sync cannot be combined with --no-sync"),
+            "--sync and --no-sync must conflict"
+        );
+        assert!(
+            build_task_spec(&submit_args(&["--cwd", "src", "--command", "cargo"]))
+                .unwrap_err()
+                .contains("--cwd requires --workspace"),
+            "--cwd requires --workspace"
+        );
+        assert!(
+            build_task_spec(&submit_args(&["--sync", ".", "--command", "cargo"]))
+                .unwrap_err()
+                .contains("--sync requires --workspace"),
+            "--sync requires --workspace"
+        );
+        assert!(
+            build_task_spec(&submit_args(&["--no-sync", "--command", "cargo"]))
+                .unwrap_err()
+                .contains("--no-sync requires --workspace"),
+            "--no-sync requires --workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_workspace_max_files_and_max_mb_enforced_before_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), vec![b'a'; 1024]).unwrap();
+        std::fs::write(dir.path().join("b.txt"), vec![b'b'; 1024]).unwrap();
+
+        // Exceeds `--workspace-max-files 1`: fails in `scan_workspace_source` before connecting.
+        let too_many_files = submit_args(&[
+            "--master",
+            "127.0.0.1:1",
+            "--workspace",
+            "oxideswarm",
+            "--sync",
+            dir.path().to_str().unwrap(),
+            "--workspace-max-files",
+            "1",
+            "--command",
+            "echo",
+        ]);
+        let code = run_submit(too_many_files, None).await;
+        assert_eq!(code, ExitCode::FAILURE);
+
+        // Write a >1 MiB file so total size exceeds `--workspace-max-mb 1` (1 MiB): fails in
+        // `scan_workspace_source` before connecting.
+        std::fs::write(
+            dir.path().join("big.bin"),
+            vec![b'x'; (MIB as usize) + 1024],
+        )
+        .unwrap();
+        let too_many_bytes = submit_args(&[
+            "--master",
+            "127.0.0.1:1",
+            "--workspace",
+            "oxideswarm",
+            "--sync",
+            dir.path().to_str().unwrap(),
+            "--workspace-max-mb",
+            "1",
+            "--command",
+            "echo",
+        ]);
+        let code = run_submit(too_many_bytes, None).await;
+        assert_eq!(code, ExitCode::FAILURE);
     }
 }

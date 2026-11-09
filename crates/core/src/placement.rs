@@ -6,10 +6,11 @@
 //!
 //! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
-//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>` and
-//!   `state:<state>`, and the worker adds its task isolation level as `iso:<level>`
-//!   ([`IsolationLevel`], design 0033) and probed host tools as `tool:<name>` (design 0039).
-//!   Those eight prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
+//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`
+//!   and `feat:<feature>` (`feat:workspaces` when the worker negotiated `WORKSPACES`), and the
+//!   worker adds its task isolation level as `iso:<level>` ([`IsolationLevel`], design 0033)
+//!   and probed host tools as `tool:<name>` (design 0039). Those nine prefixes are
+//!   [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
 //!   [`IsolationLevel`]), `tool` (repeatable) and `tag` (repeatable). Every
@@ -40,8 +41,12 @@ pub const STATE_TAG_PREFIX: &str = "state:";
 pub const ISO_TAG_PREFIX: &str = "iso:";
 /// Prefix of a probed host-tool tag a worker adds itself (`tool:cargo`, `tool:rustc`, `tool:git`).
 pub const TOOL_TAG_PREFIX: &str = "tool:";
+/// Prefix of a protocol-feature tag the master adds to worker listings (`feat:workspaces`).
+pub const FEAT_TAG_PREFIX: &str = "feat:";
+/// Tag the master adds to a listed worker when it negotiated `ProtocolCapabilities::WORKSPACES`.
+pub const FEAT_WORKSPACES_TAG: &str = "feat:workspaces";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 8] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 9] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
@@ -50,6 +55,7 @@ pub const RESERVED_TAG_PREFIXES: [&str; 8] = [
     STATE_TAG_PREFIX,
     ISO_TAG_PREFIX,
     TOOL_TAG_PREFIX,
+    FEAT_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;
@@ -174,6 +180,11 @@ pub fn tag_value<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
 /// The worker id the master put in a listed worker's tags (`id:<uuid>`), if any.
 pub fn listed_worker_id(caps: &WorkerCapabilities) -> Option<Uuid> {
     tag_value(&caps.tags, ID_TAG_PREFIX).and_then(|v| v.parse().ok())
+}
+
+/// Whether the master tagged a listed worker with `feat:workspaces` (`WORKSPACES` capability).
+pub fn listed_supports_workspaces(caps: &WorkerCapabilities) -> bool {
+    caps.tags.iter().any(|t| t == FEAT_WORKSPACES_TAG)
 }
 
 /// The task concurrency limit (`slots:<n>`) a worker advertised in its tags, if any (`n >= 1`).
@@ -481,6 +492,7 @@ mod tests {
             "tool:cargo",
             "tool:rustc",
             "tool:git",
+            "feat:workspaces",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }

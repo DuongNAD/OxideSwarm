@@ -43,8 +43,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, IsolationLevel, Placement, ARCH_TAG_PREFIX, OS_TAG_PREFIX,
-    REQUIRE_PREFIX, STATE_TAG_PREFIX,
+    listed_supports_workspaces, listed_worker_id, tag_value, IsolationLevel, Placement,
+    ARCH_TAG_PREFIX, OS_TAG_PREFIX, REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -715,7 +715,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "workspaces",
-            description: "List persistent agent workspaces and the worker affinity recorded for each workspace.",
+            description: "List the master's workspace affinity map (does not list workspaces stored on workers).",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1798,17 +1798,24 @@ async fn format_completed_task_result(
                 Ok(addr) => addr,
                 Err(e) => return ToolCallResult::error(e),
             };
-            let conn =
-                match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return ToolCallResult::error(format!(
-                            "Failed to connect to Master for output download: {e}"
-                        ))
-                    }
-                };
+            let conn = match tokio::time::timeout(
+                DEFAULT_MASTER_RPC_TIMEOUT,
+                crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to connect to Master for output download: {e}"
+                    ))
+                }
+                Err(_) => {
+                    return ToolCallResult::error(format!(
+                        "Timed out connecting to Master at {target_addr} for output download"
+                    ))
+                }
+            };
             match crate::blobs::download_outputs(&conn, &result.outputs, &out_dir).await {
                 Ok(paths) => saved_outputs = Some(paths),
                 Err(e) => {
@@ -1956,6 +1963,7 @@ async fn check_matching_worker_warning(
     state: &McpState,
     placement: &Placement,
     requirements: &TaskRequirements,
+    has_workspace: bool,
     timeout: Duration,
 ) -> Option<String> {
     let Ok(ClientResponse::WorkerList { workers }) = state
@@ -1964,6 +1972,18 @@ async fn check_matching_worker_warning(
     else {
         return None;
     };
+
+    if has_workspace
+        && !workers.iter().any(|w| {
+            let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
+            connected && listed_supports_workspaces(w)
+        })
+    {
+        let msg =
+            "Warning: no connected worker supports workspaces yet; the task will wait".to_string();
+        eprintln!("[mcp] {msg}");
+        return Some(msg);
+    }
 
     let any_matches = workers.iter().any(|w| {
         let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
@@ -2371,14 +2391,25 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
+    let blob_connect_timeout =
+        Duration::from_secs(wait_secs.max(1)).min(DEFAULT_MASTER_RPC_TIMEOUT);
+
     if !prepared_inputs.inputs.is_empty() {
-        let conn = match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
-            .await
+        let conn = match tokio::time::timeout(
+            blob_connect_timeout,
+            crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 return ToolCallResult::error(format!(
                     "Failed to connect to Master for input blob upload: {e}"
+                ))
+            }
+            Err(_) => {
+                return ToolCallResult::error(format!(
+                    "Timed out connecting to Master at {target_addr} for input blob upload"
                 ))
             }
         };
@@ -2388,13 +2419,21 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     }
 
     if let Some(ref uploads) = ws_uploads {
-        let conn = match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
-            .await
+        let conn = match tokio::time::timeout(
+            blob_connect_timeout,
+            crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 return ToolCallResult::error(format!(
                     "Failed to connect to Master for workspace blob upload: {e}"
+                ))
+            }
+            Err(_) => {
+                return ToolCallResult::error(format!(
+                    "Timed out connecting to Master at {target_addr} for workspace blob upload"
                 ))
             }
         };
@@ -2413,8 +2452,14 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
     let preflight_timeout =
         Duration::from_millis(500).min(Duration::from_secs(wait_secs.max(1)) / 2);
-    let warning =
-        check_matching_worker_warning(state, &placement, &requirements, preflight_timeout).await;
+    let warning = check_matching_worker_warning(
+        state,
+        &placement,
+        &requirements,
+        ws_meta.is_some(),
+        preflight_timeout,
+    )
+    .await;
 
     if ctx.is_cancelled() {
         ctx.aborted_by_cancel = true;

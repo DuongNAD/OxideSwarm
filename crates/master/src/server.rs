@@ -3197,6 +3197,12 @@ async fn listed_worker(
         rusty_grid_core::placement::STATE_TAG_PREFIX,
         w.status.as_str()
     ));
+    if w.features
+        .contains(rusty_grid_core::protocol::ProtocolCapabilities::WORKSPACES)
+    {
+        caps.tags
+            .push(rusty_grid_core::placement::FEAT_WORKSPACES_TAG.to_string());
+    }
     caps
 }
 
@@ -3444,16 +3450,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::ListWorkspaces => {
-                let workspaces = queue
-                    .list_workspaces()
-                    .await
-                    .into_iter()
-                    .map(|ws| rusty_grid_core::task::WorkspaceAffinity {
-                        name: ws.name,
-                        worker: ws.worker_id,
-                        last_used_utc: ws.last_used_utc,
-                    })
-                    .collect();
+                let workspaces = queue.list_workspaces().await;
                 let resp = ClientResponse::Workspaces { workspaces };
                 send_client_response(&mut transport, &resp).await?;
             }
