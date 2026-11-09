@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 4 Partial and 30 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 5 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -216,7 +216,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
-| USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Planned | (design 0053) |
+| USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
@@ -1974,10 +1974,15 @@ Add one dated line per finished item, newest last.
 - 2026-11-09: Phase 6b added after decision Q13 (ecosystem model A): ENROLL-1 (design 0051),
   JOIN-2 (design 0052) and USB-1 (design 0053), all Planned. The Index counts are now 61
   Implemented, 4 Partial and 30 Planned.
+- 2026-11-09: USB-1 is Partial. Kit format v0 is in `packaging/usb/`: `make_kit.sh`, and installers
+  and uninstallers for macOS, Windows and Linux that carry a join token. It was tested from a stick
+  on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
+  passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
+  29 Planned.
 - 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
-  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 4 Partial
-  and 30 Planned.
+  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
+  and 29 Planned.
