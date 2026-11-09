@@ -275,8 +275,9 @@ async fn assert_workspace_confinement(level: IsolationLevel, ws_in_home: bool) {
     let active_state_json = ws_root.join("active_ws/state.json");
     assert!(other_secret_path.exists());
 
-    // Now run a confined task in `active_ws` and verify it can read/write its own tree and tmp,
-    // but cannot read or write `other_ws`, `state.json`, `ws_root`, or the owner's home/secrets.
+    // Now run a task in `active_ws` and check its own tree/tmp accesses and cross-workspace /
+    // host probes (direct paths, `..` traversal, symlink to another workspace, hard link to
+    // another workspace's file).
     let script = r#"
 [ "$(cat src/in.txt)" = "manifest-hello" ] && echo READ_TREE_OK
 echo built-v1 > "$RUSTY_GRID_WORKSPACE_DIR/built.txt" && echo WRITE_TREE_OK
@@ -287,6 +288,12 @@ cat "$T_OTHER_SECRET" > /dev/null 2>&1 && echo LEAK_READ_OTHER_WS || echo DENY_R
 ( echo pwn > "$T_OTHER_PLANTED" ) 2>/dev/null && echo LEAK_WRITE_OTHER_WS || echo DENY_WRITE_OTHER_WS
 cat "$T_STATE_JSON" > /dev/null 2>&1 && echo LEAK_STATE_JSON || echo DENY_STATE_JSON
 ls "$T_WS_ROOT" > /dev/null 2>&1 && echo LEAK_WS_ROOT_LIST || echo DENY_WS_ROOT_LIST
+cat ../state.json > /dev/null 2>&1 && echo LEAK_DOTDOT_STATE || echo DENY_DOTDOT_STATE
+cat ../../other_ws/tree/secret.txt > /dev/null 2>&1 && echo LEAK_DOTDOT_OTHER_WS || echo DENY_DOTDOT_OTHER_WS
+( ln -s "$T_OTHER_SECRET" "$RUSTY_GRID_WORKSPACE_DIR/sym_other" 2>/dev/null && cat "$RUSTY_GRID_WORKSPACE_DIR/sym_other" > /dev/null 2>&1 ) && echo LEAK_SYMLINK_OTHER_WS || echo DENY_SYMLINK_OTHER_WS
+rm -f "$RUSTY_GRID_WORKSPACE_DIR/sym_other"
+( ln "$T_OTHER_SECRET" "$RUSTY_GRID_WORKSPACE_DIR/hard_other" 2>/dev/null && cat "$RUSTY_GRID_WORKSPACE_DIR/hard_other" > /dev/null 2>&1 ) && echo LEAK_HARDLINK_OTHER_WS || echo DENY_HARDLINK_OTHER_WS
+rm -f "$RUSTY_GRID_WORKSPACE_DIR/hard_other"
 cat "$T_SECRET" > /dev/null 2>&1 && echo LEAK_SECRET || echo DENY_SECRET
 cat "$T_KEY" > /dev/null 2>&1 && echo LEAK_KEY || echo DENY_KEY
 ( echo x > "$T_HOME/planted.txt" ) 2>/dev/null && echo LEAK_WRITE_HOME || echo DENY_WRITE_HOME
@@ -347,16 +354,41 @@ cat "$T_KEY" > /dev/null 2>&1 && echo LEAK_KEY || echo DENY_KEY
         "READ_BUILT_OK",
         "WRITE_TMP_OK",
         "READ_TMP_OK",
-        "DENY_READ_OTHER_WS",
-        "DENY_WRITE_OTHER_WS",
-        "DENY_STATE_JSON",
-        "DENY_WS_ROOT_LIST",
-        "DENY_SECRET",
-        "DENY_KEY",
-        "DENY_WRITE_HOME",
     ] {
         assert!(
             got.iter().any(|l| l == expected),
+            "{level} (ws_in_home={ws_in_home}): missing {expected}; output was {got:?}"
+        );
+    }
+
+    let probes = [
+        "READ_OTHER_WS",
+        "WRITE_OTHER_WS",
+        "STATE_JSON",
+        "WS_ROOT_LIST",
+        "DOTDOT_STATE",
+        "DOTDOT_OTHER_WS",
+        "SYMLINK_OTHER_WS",
+        "HARDLINK_OTHER_WS",
+        "SECRET",
+        "KEY",
+        "WRITE_HOME",
+    ];
+    if level == IsolationLevel::Off {
+        for probe in probes {
+            let expected = format!("LEAK_{probe}");
+            assert!(
+                got.contains(&expected),
+                "unconfined control (ws_in_home={ws_in_home}): {expected} must succeed so the confined tests prove something; output was {got:?}"
+            );
+        }
+        return;
+    }
+
+    for probe in probes {
+        let expected = format!("DENY_{probe}");
+        assert!(
+            got.contains(&expected),
             "{level} (ws_in_home={ws_in_home}): missing {expected}; output was {got:?}"
         );
     }
@@ -390,6 +422,225 @@ cat "$T_KEY" > /dev/null 2>&1 && echo LEAK_KEY || echo DENY_KEY
         res2.error,
         res2.stdout_str(),
         res2.stderr_str()
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn assert_workspace_tree_swap_regression(level: IsolationLevel) {
+    use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+    use rusty_grid_core::task::WorkspaceRef;
+
+    let home = tempfile::tempdir().expect("home");
+    let outside = tempfile::tempdir().expect("outside");
+    let victim_dir = home.path().join("victim");
+    let victim_sub = victim_dir.join("victim_only");
+    std::fs::create_dir_all(&victim_sub).unwrap();
+    let victim_secret = victim_dir.join("secret.txt");
+    let victim_planted = victim_sub.join("pwned.txt");
+    std::fs::write(&victim_secret, "dummy-victim-secret").unwrap();
+
+    let sandbox_base = outside.path().join("sandboxes");
+    let ws_root = outside.path().join("workspaces");
+
+    let real = HostDirs::detect();
+    let host = HostDirs::from_home(
+        home.path().to_path_buf(),
+        Some(real.rustup_home),
+        Some(real.cargo_home),
+    );
+    let config = RunnerConfig::new(SandboxConfig::new(sandbox_base))
+        .with_isolation(level)
+        .with_host_dirs(host)
+        .with_workspaces(true)
+        .with_workspace_root(Some(ws_root.clone()));
+    let caps = WorkerCapabilities::new("feat3-ws-swap", 4, 8192, false, false, None);
+    let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, config);
+    let cache = runner.blob_cache().expect("blob cache");
+
+    let file_data = b"hello";
+    let file_id = BlobId::of(file_data);
+    let tmp_file = cache.temp_path();
+    std::fs::write(&tmp_file, file_data).unwrap();
+    cache
+        .adopt(&tmp_file, file_id, file_data.len() as u64)
+        .unwrap();
+    let manifest = TreeManifest::new(vec![BlobFile {
+        path: "in.txt".into(),
+        id: file_id,
+        size: file_data.len() as u64,
+        executable: false,
+    }])
+    .unwrap();
+    let m_bytes = manifest.encode();
+    let m_id = BlobId::of(&m_bytes);
+    let tmp_m = cache.temp_path();
+    std::fs::write(&tmp_m, &m_bytes).unwrap();
+    cache.adopt(&tmp_m, m_id, m_bytes.len() as u64).unwrap();
+    let m_size = m_bytes.len() as u64;
+
+    // 1. Task 1 attempts `rm -rf <ws>/tree && ln -s <victim> <ws>/tree` from inside the sandbox,
+    //    then Task 2 runs in the same workspace with no source.
+    let swap_script = r#"
+rm -rf "$RUSTY_GRID_WORKSPACE_DIR" 2>/dev/null && ln -s "$T_VICTIM" "$RUSTY_GRID_WORKSPACE_DIR" 2>/dev/null && echo SWAP_OK || echo SWAP_DENIED
+"#;
+    let task1 = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), swap_script.into()],
+            env: HashMap::from([("T_VICTIM".into(), victim_dir.to_string_lossy().into_owned())]),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("swap_ws").with_tree(m_id, m_size));
+    let res1 = runner.execute_task(&task1, None, None).await;
+
+    let probe_victim_script = r#"
+cat secret.txt 2>/dev/null && echo LEAK_VICTIM_READ
+( echo pwn > victim_only/pwned.txt ) 2>/dev/null && echo LEAK_VICTIM_WRITE
+echo TASK2_RAN
+"#;
+    let task2 = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), probe_victim_script.into()],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("swap_ws"));
+    let res2 = runner.execute_task(&task2, None, None).await;
+
+    let swap_denied = res1.stdout_str().contains("SWAP_DENIED");
+    let task2_refused = !res2.is_success() && !res2.stdout_str().contains("TASK2_RAN");
+    assert!(
+        swap_denied || task2_refused,
+        "{level}: either task 1's tree swap must be denied or task 2 must be refused; res1={:?}/{}, res2={:?}/{}",
+        res1.error,
+        res1.stdout_str(),
+        res2.error,
+        res2.stdout_str()
+    );
+    assert!(
+        !res2.stdout_str().contains("LEAK_VICTIM_READ")
+            && !res2.stdout_str().contains("LEAK_VICTIM_WRITE")
+            && !res2.stdout_str().contains("dummy-victim-secret"),
+        "{level}: task 2 touched or read the victim directory: {}",
+        res2.stdout_str()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim_secret).unwrap(),
+        "dummy-victim-secret"
+    );
+    assert!(!victim_planted.exists());
+
+    // 2. Pre-run symlink check (defense in depth): even if `<ws>/tree` or `<ws>/tmp` is replaced
+    //    with a symlink on disk outside the sandbox, the next workspace run (without or with a
+    //    source) refuses to run, never touches the victim, and repairs the workspace.
+    let seed = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo ok".into()],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("tamper_ws").with_tree(m_id, m_size));
+    assert!(runner.execute_task(&seed, None, None).await.is_success());
+
+    let tamper_tree = ws_root.join("tamper_ws/tree");
+    std::fs::remove_dir_all(&tamper_tree).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, &tamper_tree).unwrap();
+
+    let no_source_task = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), probe_victim_script.into()],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("tamper_ws"));
+    let no_source_res = runner.execute_task(&no_source_task, None, None).await;
+    assert!(
+        !no_source_res.is_success() && !no_source_res.stdout_str().contains("TASK2_RAN"),
+        "{level}: task without source must be refused when tree is a symlink: {:?} / {} / {}",
+        no_source_res.error,
+        no_source_res.stdout_str(),
+        no_source_res.stderr_str()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim_secret).unwrap(),
+        "dummy-victim-secret"
+    );
+    assert!(!victim_planted.exists());
+    assert!(
+        !std::fs::symlink_metadata(&tamper_tree)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "tampered tree symlink must be wiped/repaired under the workspace lock"
+    );
+
+    // Also verify with a source manifest when `<ws>/tree` or `<ws>/tmp` is a symlink.
+    std::fs::remove_dir_all(&tamper_tree).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, &tamper_tree).unwrap();
+    let with_source_task = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), probe_victim_script.into()],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("tamper_ws").with_tree(m_id, m_size));
+    let with_source_res = runner.execute_task(&with_source_task, None, None).await;
+    assert!(
+        !with_source_res.is_success() && !with_source_res.stdout_str().contains("TASK2_RAN"),
+        "{level}: task with source must be refused when tree is a symlink: {:?} / {}",
+        with_source_res.error,
+        with_source_res.stderr_str()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim_secret).unwrap(),
+        "dummy-victim-secret"
+    );
+    assert!(!victim_planted.exists());
+    assert!(
+        !std::fs::symlink_metadata(&tamper_tree)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "tampered tree symlink must be wiped/repaired under the workspace lock"
+    );
+
+    let tamper_tmp = ws_root.join("tamper_ws/tmp");
+    std::fs::remove_dir_all(&tamper_tmp).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, &tamper_tmp).unwrap();
+    let tmp_res = runner.execute_task(&with_source_task, None, None).await;
+    assert!(
+        !tmp_res.is_success() && !tmp_res.stdout_str().contains("TASK2_RAN"),
+        "{level}: task must be refused when tmp is a symlink: {:?} / {}",
+        tmp_res.error,
+        tmp_res.stderr_str()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim_secret).unwrap(),
+        "dummy-victim-secret"
+    );
+    assert!(!victim_planted.exists());
+    assert!(
+        !std::fs::symlink_metadata(&tamper_tmp)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "tampered tmp symlink must be wiped/repaired under the workspace lock"
     );
 }
 
@@ -439,10 +690,18 @@ mod macos {
 
     #[tokio::test]
     async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
+        assert_workspace_confinement(IsolationLevel::Off, false).await;
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             assert_workspace_confinement(level, false).await;
         }
         assert_workspace_confinement(IsolationLevel::Fs, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_workspace_tree_swap_is_denied_and_never_touches_victim() {
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_workspace_tree_swap_regression(level).await;
+        }
     }
 
     #[tokio::test]
@@ -2234,10 +2493,19 @@ cargo build --offline 2>&1
     #[tokio::test]
     async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
         require_landlock!();
+        assert_workspace_confinement(IsolationLevel::Off, false).await;
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             assert_workspace_confinement(level, false).await;
         }
         assert_workspace_confinement(IsolationLevel::Fs, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_workspace_tree_swap_is_denied_and_never_touches_victim() {
+        require_landlock!();
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_workspace_tree_swap_regression(level).await;
+        }
     }
 }
 

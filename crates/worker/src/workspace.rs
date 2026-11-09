@@ -524,6 +524,10 @@ fn is_link_like(meta: &fs::Metadata) -> bool {
     false
 }
 
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !is_link_like(&m))
+}
+
 fn read_state(ws_dir: &Path) -> Option<WorkspaceState> {
     let bytes = fs::read(ws_dir.join(STATE_FILE)).ok()?;
     let st: WorkspaceState = serde_json::from_slice(&bytes).ok()?;
@@ -612,7 +616,125 @@ impl WorkspaceGuard {
 
     /// True when the workspace holds a tree that finished a sync (a task without a source can run).
     pub fn is_ready(&self) -> bool {
-        self.state().is_some_and(|s| s.state == SyncState::Ready) && self.tree_dir().is_dir()
+        self.state().is_some_and(|s| s.state == SyncState::Ready) && is_real_dir(&self.tree_dir())
+    }
+
+    /// Marks a corrupted workspace for repair under the held workspace lock: wipes everything in
+    /// the workspace except the lock file without following symbolic links, recreates clean real
+    /// `tree/` and `tmp/` directories, and writes a fresh `Syncing` state so the workspace cannot
+    /// run without a sync and the next sync rebuilds it cleanly.
+    pub fn mark_for_repair(&self) -> Result<(), WorkspaceError> {
+        self.wipe();
+        make_private_dir(&self.tree_dir())?;
+        make_private_dir(&self.tmp_dir())?;
+        self.write_state(&WorkspaceState::fresh())
+    }
+
+    /// Pre-run check executed before every workspace task (with or without a source): if `tree` or
+    /// `tmp` already exists on disk, it must be a real directory (not a symlink or Windows
+    /// junction/reparse point, and not a regular file) whose canonical path is
+    /// `<canonical workspace root>/<name>/{tree,tmp}`. On failure the workspace is wiped and
+    /// marked for repair under the workspace lock and the task is refused.
+    pub fn check_existing_dirs(&self) -> Result<(), WorkspaceError> {
+        let canon_root = self
+            .store
+            .root()
+            .canonicalize()
+            .map_err(io_err("canonicalizing workspace root"))?;
+        for (leaf, dir) in [("tree", self.tree_dir()), ("tmp", self.tmp_dir())] {
+            match fs::symlink_metadata(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    let _ = self.mark_for_repair();
+                    return Err(io_err(format!("inspecting workspace {leaf}"))(e));
+                }
+                Ok(meta) if is_link_like(&meta) || !meta.is_dir() => {
+                    let _ = self.mark_for_repair();
+                    return Err(WorkspaceError::Path {
+                        path: leaf.to_string(),
+                        reason: format!(
+                            "workspace '{}' {leaf} directory is not a real directory; workspace reset for repair",
+                            self.name
+                        ),
+                    });
+                }
+                Ok(_) => {
+                    let canon_dir = match dir.canonicalize() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = self.mark_for_repair();
+                            return Err(io_err(format!("canonicalizing workspace {leaf}"))(e));
+                        }
+                    };
+                    let expected = canon_root.join(&self.name).join(leaf);
+                    if canon_dir != expected {
+                        let _ = self.mark_for_repair();
+                        return Err(WorkspaceError::Path {
+                            path: leaf.to_string(),
+                            reason: format!(
+                                "workspace '{}' {leaf} canonical path '{}' does not match expected '{}'; workspace reset for repair",
+                                self.name,
+                                canon_dir.display(),
+                                expected.display()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies that both `<ws>/tree` and `<ws>/tmp` exist as real directories (via
+    /// `symlink_metadata`) and canonicalize to `<canonical workspace root>/<name>/{tree,tmp}`.
+    /// On failure the workspace is wiped and marked for repair under the lock and the task is
+    /// refused.
+    pub fn verify_run_dirs(&self) -> Result<(), WorkspaceError> {
+        let canon_root = self
+            .store
+            .root()
+            .canonicalize()
+            .map_err(io_err("canonicalizing workspace root"))?;
+        for (leaf, dir) in [("tree", self.tree_dir()), ("tmp", self.tmp_dir())] {
+            let meta = match fs::symlink_metadata(&dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = self.mark_for_repair();
+                    return Err(io_err(format!("inspecting workspace {leaf}"))(e));
+                }
+            };
+            if is_link_like(&meta) || !meta.is_dir() {
+                let _ = self.mark_for_repair();
+                return Err(WorkspaceError::Path {
+                    path: leaf.to_string(),
+                    reason: format!(
+                        "workspace '{}' {leaf} directory is not a real directory; workspace reset for repair",
+                        self.name
+                    ),
+                });
+            }
+            let canon_dir = match dir.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self.mark_for_repair();
+                    return Err(io_err(format!("canonicalizing workspace {leaf}"))(e));
+                }
+            };
+            let expected = canon_root.join(&self.name).join(leaf);
+            if canon_dir != expected {
+                let _ = self.mark_for_repair();
+                return Err(WorkspaceError::Path {
+                    path: leaf.to_string(),
+                    reason: format!(
+                        "workspace '{}' {leaf} canonical path '{}' does not match expected '{}'; workspace reset for repair",
+                        self.name,
+                        canon_dir.display(),
+                        expected.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Empties `tmp/` (and creates it); call before each task.

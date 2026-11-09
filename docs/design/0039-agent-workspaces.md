@@ -490,3 +490,8 @@ off by default until FEAT-3 is Implemented.
   `<ws>/state.json`), sandboxes, and the owner's home/secrets. Windows isolation + workspaces is
   deferred until FEAT-3c (`WorkerClient::run` refuses `--workspaces` together with
   `--isolation fs|fs+net` on Windows at start-up).
+- 2026-11-09: W2b security review fix (tree-swap). Every workspace run checks via `symlink_metadata`
+  and canonical path matching that `<ws>/tree` and `<ws>/tmp` are real directories under
+  `<workspace_root>/<name>` (wiping and marking the workspace for repair on mismatch), `isolation`
+  refuses symlinked or non-canonical jail directories, and the macOS Seatbelt profile denies
+  `file-write-unlink` and `file-write-create` on the `tree` and `tmp` directory nodes themselves.

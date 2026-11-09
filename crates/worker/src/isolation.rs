@@ -328,6 +328,79 @@ fn canonical(p: &Path) -> PathBuf {
     }
 }
 
+/// Ensures `jail.sandbox_dir` and `jail.extra_writable_dir` are real directories (never symbolic
+/// links) and that canonicalization does not follow a link out of `<sandbox_base>` or
+/// `<workspace_root>/<name>/{tree,tmp}`.
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn validate_jail_dirs(jail: &Jail<'_>) -> Result<(), String> {
+    let check_real_dir = |label: &str, p: &Path| -> Result<PathBuf, String> {
+        let meta = std::fs::symlink_metadata(p)
+            .map_err(|e| format!("cannot inspect {label} '{}': {e}", p.display()))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(format!(
+                "{label} '{}' is not a real directory (symbolic link or non-directory refused)",
+                p.display()
+            ));
+        }
+        p.canonicalize()
+            .map_err(|e| format!("cannot canonicalize {label} '{}': {e}", p.display()))
+    };
+
+    let canon_sandbox = check_real_dir("task sandbox directory", jail.sandbox_dir)?;
+
+    if let Some(extra_dir) = jail.extra_writable_dir {
+        let canon_extra = check_real_dir("workspace temp directory", extra_dir)?;
+        let ws_root = jail
+            .workspace_root
+            .ok_or_else(|| "workspace task jail is missing workspace_root".to_string())?;
+        let canon_ws_root = check_real_dir("workspace root directory", ws_root)?;
+        let rel_tree = jail.sandbox_dir.strip_prefix(ws_root).map_err(|_| {
+            format!(
+                "workspace tree '{}' is not inside workspace root '{}'",
+                jail.sandbox_dir.display(),
+                ws_root.display()
+            )
+        })?;
+        let expected_tree = canon_ws_root.join(rel_tree);
+        if canon_sandbox != expected_tree {
+            return Err(format!(
+                "workspace tree '{}' canonicalized to '{}', expected '{}'",
+                jail.sandbox_dir.display(),
+                canon_sandbox.display(),
+                expected_tree.display()
+            ));
+        }
+        let rel_tmp = extra_dir.strip_prefix(ws_root).map_err(|_| {
+            format!(
+                "workspace tmp '{}' is not inside workspace root '{}'",
+                extra_dir.display(),
+                ws_root.display()
+            )
+        })?;
+        let expected_tmp = canon_ws_root.join(rel_tmp);
+        if canon_extra != expected_tmp {
+            return Err(format!(
+                "workspace tmp '{}' canonicalized to '{}', expected '{}'",
+                extra_dir.display(),
+                canon_extra.display(),
+                expected_tmp.display()
+            ));
+        }
+    } else if let Ok(rel) = jail.sandbox_dir.strip_prefix(jail.sandbox_base) {
+        let canon_base = check_real_dir("sandbox base directory", jail.sandbox_base)?;
+        let expected_sb = canon_base.join(rel);
+        if canon_sandbox != expected_sb {
+            return Err(format!(
+                "task sandbox '{}' canonicalized to '{}', expected '{}'",
+                jail.sandbox_dir.display(),
+                canon_sandbox.display(),
+                expected_sb.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The Linux implementation: Landlock, `seccomp` and namespaces, applied by a `pre_exec` hook.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
@@ -386,6 +459,19 @@ mod macos {
             p.push_str(&format!("    (literal \"{dev}\")\n"));
         }
         p.push_str("    (subpath \"/dev/fd\"))\n");
+        // Deny unlinking, recreating, or renaming over the sandbox / workspace `tree` and `tmp`
+        // directory nodes themselves (Seatbelt mediates `rmdir`, `unlink`, `symlink`, `mkdir`,
+        // `rename` and `renamex_np` on the node via `file-write-unlink` and `file-write-create`),
+        // while keeping writes inside them allowed.
+        p.push_str("(deny file-write-unlink\n    (literal (param \"SANDBOX_DIR\"))");
+        if has_extra_writable {
+            p.push_str("\n    (literal (param \"EXTRA_WRITABLE_DIR\"))");
+        }
+        p.push_str(")\n(deny file-write-create\n    (literal (param \"SANDBOX_DIR\"))");
+        if has_extra_writable {
+            p.push_str("\n    (literal (param \"EXTRA_WRITABLE_DIR\"))");
+        }
+        p.push_str(")\n");
         p.push_str(
             "(deny file-read*\n    (subpath (param \"USER_HOME\"))\n    (subpath (param \"SANDBOX_BASE\"))\n    (subpath (param \"CACHE_DIR\"))",
         );
@@ -633,6 +719,7 @@ mod macos {
         program: &str,
         args: &[String],
     ) -> Result<(String, Vec<String>), String> {
+        super::validate_jail_dirs(jail)?;
         let mut full = arguments(jail);
         full.push("--".to_string());
         full.push(program.to_string());
@@ -865,7 +952,16 @@ mod tests {
             assert!(fs.contains(rule), "{rule} missing in\n{fs}");
         }
         let ws = macos::profile(IsolationLevel::Fs, true, 1, 1, 0);
-        assert!(ws.contains("(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
+        let ws_allow_write = ws
+            .find("(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))")
+            .expect("workspace allow file-write*");
+        let ws_deny_unlink = ws
+            .find("(deny file-write-unlink\n    (literal (param \"SANDBOX_DIR\"))\n    (literal (param \"EXTRA_WRITABLE_DIR\")))")
+            .expect("workspace deny file-write-unlink on tree and tmp");
+        let ws_deny_create = ws
+            .find("(deny file-write-create\n    (literal (param \"SANDBOX_DIR\"))\n    (literal (param \"EXTRA_WRITABLE_DIR\")))")
+            .expect("workspace deny file-write-create on tree and tmp");
+        assert!(ws_allow_write < ws_deny_unlink && ws_deny_unlink < ws_deny_create);
         assert!(ws.contains("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
         let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));

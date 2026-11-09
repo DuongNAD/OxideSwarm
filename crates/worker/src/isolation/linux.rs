@@ -617,6 +617,7 @@ mod sys {
                     std::env::consts::ARCH
                 )
             })?;
+            crate::isolation::validate_jail_dirs(jail)?;
             let handled = handled_fs(abi);
             let mut rules: Vec<Rule> = Vec::new();
 

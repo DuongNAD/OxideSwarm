@@ -1833,7 +1833,7 @@ impl TaskRunner {
         ws: &WorkspaceRef,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        cancel_rx: Option<oneshot::Receiver<String>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
         let fail = |msg: String| {
@@ -1874,15 +1874,66 @@ impl TaskRunner {
             None
         };
 
-        let ws_clone = ws.clone();
-        let store_clone = store.clone();
+        // Poll the workspace lock in short intervals and check task cancellation between attempts
+        // so a wait on a busy workspace never delays cancellation by up to `workspace_lock_wait`.
         let wait = self.config.workspace_lock_wait.min(timeout);
+        let lock_deadline = tokio::time::Instant::now() + wait;
+        let guard = loop {
+            if let Some(rx) = cancel_rx.as_mut() {
+                if let Ok(reason) = rx.try_recv() {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_CANCELLED,
+                        "",
+                        "",
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Cancelled: {reason}")),
+                    );
+                }
+            }
+            let store_try = store.clone();
+            let name_try = ws.name.clone();
+            let attempt =
+                tokio::task::spawn_blocking(move || store_try.acquire(&name_try, Duration::ZERO))
+                    .await;
+            match attempt {
+                Ok(Ok(guard)) => break guard,
+                Ok(Err(WorkspaceError::Busy(_))) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= lock_deadline {
+                        return fail(WorkspaceError::Busy(ws.name.clone()).to_string());
+                    }
+                    let step = Duration::from_millis(20).min(lock_deadline - now);
+                    tokio::select! {
+                        reason = cancellation(&mut cancel_rx) => {
+                            return TaskResult::failure(
+                                self.worker_id,
+                                task.id,
+                                EXIT_CODE_CANCELLED,
+                                "",
+                                "",
+                                start_time.elapsed().as_millis() as u64,
+                                Some(format!("Cancelled: {reason}")),
+                            );
+                        }
+                        _ = tokio::time::sleep(step) => {}
+                    }
+                }
+                Ok(Err(e)) => return fail(e.to_string()),
+                Err(e) => return fail(format!("workspace lock task panicked: {e}")),
+            }
+        };
+
+        let ws_clone = ws.clone();
         let spec_clone = task.spec.clone();
 
         let prepared = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let guard = store_clone
-                .acquire(&ws_clone.name, wait)
-                .map_err(|e| e.to_string())?;
+            // Pre-run symlink / canonical path check on `<ws>/tree` and `<ws>/tmp` before every
+            // workspace run (with or without a source).
+            guard
+                .check_existing_dirs()
+                .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
             if let Some(WorkspaceSource::Tree {
                 manifest,
                 manifest_size,
@@ -1915,6 +1966,9 @@ impl TaskRunner {
                 ));
             }
             guard.prepare_tmp().map_err(|e| e.to_string())?;
+            guard
+                .verify_run_dirs()
+                .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
 
             let tree_dir = guard.tree_dir();
             let tmp_dir = guard.tmp_dir();
@@ -5632,7 +5686,6 @@ mod workspace_runner_tests {
                 ("src/old.txt", b"remove-me", false),
             ],
         );
-        #[cfg(unix)]
         let script1 = r#"
 set -e
 echo "WS=$RUSTY_GRID_WORKSPACE"
@@ -5644,20 +5697,6 @@ mkdir -p target
 printf 'built-artifact-v1' > target/artifact.txt
 printf 'temp-scratch' > "$TMPDIR/scratch.tmp"
 [ -f "$TMPDIR/scratch.tmp" ] && echo "TMP_WRITE_OK"
-"#;
-        #[cfg(windows)]
-        let script1 = r#"
-echo WS=%RUSTY_GRID_WORKSPACE%
-echo WS_DIR=%RUSTY_GRID_WORKSPACE_DIR%
-echo TMP=%TMPDIR%
-set /p A=<src\a.txt
-echo A=%A%
-set /p OLD=<src\old.txt
-echo OLD=%OLD%
-mkdir target
-<nul set /p =built-artifact-v1> target\artifact.txt
-<nul set /p =temp-scratch> "%TMPDIR%\scratch.tmp"
-if exist "%TMPDIR%\scratch.tmp" echo TMP_WRITE_OK
 "#;
         let task1 = Task::new(
             TaskSpec::shell_script(script1),
@@ -5691,22 +5730,12 @@ if exist "%TMPDIR%\scratch.tmp" echo TMP_WRITE_OK
         // Untracked `target/artifact.txt` must survive, `src/old.txt` must be gone, and `$TMPDIR`
         // must have been wiped fresh by `prepare_tmp`.
         let (m2_id, m2_size) = store_manifest_in_cache(&cache, &[("src/a.txt", b"v2-beta", false)]);
-        #[cfg(unix)]
         let script2 = r#"
 set -e
 echo "A=$(cat src/a.txt)"
 [ ! -e src/old.txt ] && echo "OLD_DELETED"
 echo "KEPT=$(cat target/artifact.txt)"
 [ ! -e "$TMPDIR/scratch.tmp" ] && echo "TMP_WIPED"
-"#;
-        #[cfg(windows)]
-        let script2 = r#"
-set /p A=<src\a.txt
-echo A=%A%
-if not exist src\old.txt echo OLD_DELETED
-set /p KEPT=<target\artifact.txt
-echo KEPT=%KEPT%
-if not exist "%TMPDIR%\scratch.tmp" echo TMP_WIPED
 "#;
         let task2 = Task::new(
             TaskSpec::shell_script(script2),
@@ -5727,23 +5756,11 @@ if not exist "%TMPDIR%\scratch.tmp" echo TMP_WIPED
         assert!(out2.contains("TMP_WIPED"), "stdout: {out2}");
 
         // Task 3: runs in the already-ready workspace with no `source` and relative `working_dir`.
-        #[cfg(unix)]
         let cmd3 = TaskSpec::Command {
-            program: "/bin/sh".into(),
+            program: "sh".into(),
             args: vec![
                 "-c".into(),
                 "cat a.txt && cat ../target/artifact.txt".into(),
-            ],
-            env: HashMap::new(),
-            working_dir: Some("src".into()),
-            stdin: None,
-        };
-        #[cfg(windows)]
-        let cmd3 = TaskSpec::Command {
-            program: "cmd.exe".into(),
-            args: vec![
-                "/C".into(),
-                "type a.txt & type ..\\target\\artifact.txt".into(),
             ],
             env: HashMap::new(),
             working_dir: Some("src".into()),
@@ -5868,5 +5885,37 @@ if not exist "%TMPDIR%\scratch.tmp" echo TMP_WIPED
             "stderr should include finish() warning: {}",
             over_res.stderr_str()
         );
+
+        // 5. Cancellation while waiting on a busy workspace lock finishes promptly instead of
+        //    blocking for the full `workspace_lock_wait` (5s).
+        let store = runner
+            .ensure_workspace_store()
+            .await
+            .expect("open store")
+            .expect("store enabled");
+        let held = store
+            .acquire("busy_ws", Duration::ZERO)
+            .expect("acquire busy_ws");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = cancel_tx.send("cancelled during lock wait".to_string());
+        });
+        let wait_start = Instant::now();
+        let blocked_task = Task::new(
+            TaskSpec::shell_script("echo should-not-run"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("busy_ws").with_tree(m_id, m_size));
+        let cancel_res = runner
+            .execute_task(&blocked_task, None, Some(cancel_rx))
+            .await;
+        assert_eq!(cancel_res.exit_code, EXIT_CODE_CANCELLED);
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(1),
+            "cancellation during lock wait took too long: {:?}",
+            wait_start.elapsed()
+        );
+        drop(held);
     }
 }
