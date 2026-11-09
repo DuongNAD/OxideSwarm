@@ -342,7 +342,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Done |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Implemented |
 | W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
-| W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Planned |
+| W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Guide written; live two-machine record pending owner run |
 | W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Planned |
 
 Order: W1, then W2 to W5 in parallel, then W6 and W10. W7 to W9 and W11 can follow in any order.
@@ -504,3 +504,7 @@ off by default until FEAT-3 is Implemented.
   populates `target/`, second build reuses `target/` and prints no `Compiling` line (with
   `uploaded_bytes == 0` over MCP), third build after deleting a local source file removes the deleted
   file from the workspace tree while keeping `target/`, and `workspaces` lists the worker affinity.
+- 2026-11-09: W10 guide (`docs/guides/offload-cargo-test.md`, indexed in `docs/README.md`) written
+  to match the CLI and MCP commands, flags, cold/warm expected output, and deleted-file sync behavior
+  verified in W6 (`tests/agent_workspace_e2e.rs`), with a placeholder section (`### Recorded
+  two-machine run`) ready for the owner's live two-machine run.
