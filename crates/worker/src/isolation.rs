@@ -878,21 +878,6 @@ pub mod windows {
     #[link(name = "kernel32")]
     extern "system" {
         fn SetErrorMode(umode: u32) -> u32;
-        fn DefineDosDeviceW(flags: u32, device_name: *const u16, target_path: *const u16) -> i32;
-    }
-
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn LogonUserW(
-            lpsz_username: *const u16,
-            lpsz_domain: *const u16,
-            lpsz_password: *const u16,
-            dw_logon_type: u32,
-            dw_logon_provider: u32,
-            ph_token: *mut HANDLE,
-        ) -> i32;
-        fn ImpersonateLoggedOnUser(h_token: HANDLE) -> i32;
-        fn RevertToSelf() -> i32;
     }
 
     #[link(name = "user32")]
@@ -1624,6 +1609,83 @@ pub mod windows {
         Ok(())
     }
 
+    /// Merges `entries` into `path`'s existing DACL while also clearing `SE_DACL_PROTECTED`
+    /// (`UNPROTECTED_DACL_SECURITY_INFORMATION`) so inheritable ACEs from `path`'s parent
+    /// directory propagate cleanly. Refuses to operate on symlinks or NTFS junctions.
+    fn merge_entries_on_path_unprotected(
+        path: &Path,
+        entries: &[EXPLICIT_ACCESS_W],
+    ) -> io::Result<()> {
+        if !path.exists() || entries.is_empty() || is_reparse_point(path) {
+            return Ok(());
+        }
+        let wide_path = to_wide(path.as_os_str());
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let rc = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                old_dacl,
+                &mut new_dacl,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        let set_rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null(),
+            )
+        };
+        unsafe {
+            if !new_dacl.is_null() {
+                LocalFree(new_dacl as HLOCAL);
+            }
+            if !sd.is_null() {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+        if set_rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(set_rc as i32));
+        }
+        Ok(())
+    }
+
     /// Replaces `path`'s DACL with a fresh protected DACL (`PROTECTED_DACL_SECURITY_INFORMATION`)
     /// built purely from `entries`. Refuses to operate on symlinks or NTFS junctions.
     fn set_protected_dacl_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
@@ -2086,18 +2148,18 @@ pub mod windows {
         }
     }
 
-    /// Creates and caches a primary LUA-filtered token in a fresh logon session
-    /// (`LogonUserW` with `LOGON32_LOGON_NEW_CREDENTIALS` + `CreateRestrictedToken` with
-    /// `LUA_TOKEN` + `DuplicateTokenEx` with `TokenPrimary`), with `TokenOwner = CurrentUser` and
-    /// `TokenDefaultDacl` granting `CurrentUser` (in addition to `SYSTEM` and `Administrators`),
-    /// and initializes the new logon session's `DosDevices` directory (`\??`) while impersonating
-    /// the LUA-filtered token so the Windows kernel natively grants `CurrentUser` on `\??` (and
-    /// thus `CreateFileW("NUL")` / `Stdio::null()` inside child and grandchild processes such as
-    /// `cargo.exe` spawning `rustc.exe`) without touching any Object Manager DACLs.
+    /// Creates and caches a primary LUA-filtered token (`CreateRestrictedToken` with `LUA_TOKEN`
+    /// and `DuplicateTokenEx` with `TokenPrimary`) when the worker runs elevated
+    /// (`is_process_elevated() == true`), with `TokenOwner = CurrentUser` and `TokenDefaultDacl`
+    /// granting `CurrentUser` (in addition to `SYSTEM` and `Administrators`, never `BUILTIN\Users`
+    /// or `Everyone`). Returns `None` when the worker is not elevated.
     fn get_or_init_worker_lua_token() -> Option<HANDLE> {
         static WORKER_LUA_TOKEN: OnceLock<Option<usize>> = OnceLock::new();
         WORKER_LUA_TOKEN
             .get_or_init(|| {
+                if !is_process_elevated() {
+                    return None;
+                }
                 ensure_process_token_default_dacl_grants_current_user();
                 let user_sid = OwnedSid::current_user().ok()?;
                 unsafe {
@@ -2128,99 +2190,24 @@ pub mod windows {
                         return None;
                     }
                     apply_current_user_owner_and_default_dacl(restricted_token, user_sid.as_psid());
-
-                    // Allocate a fresh logon session (`LOGON32_LOGON_NEW_CREDENTIALS = 9`,
-                    // `LOGON32_PROVIDER_WINNT50 = 3`) while impersonating the LUA-filtered token
-                    // so the new logon session is not associated with the boot-time elevated
-                    // `DosDevices` directory (`\Sessions\0\DosDevices\<BootLogonId>`, which on
-                    // `windows-latest` was created when `TokenOwner` was `BUILTIN\Administrators`
-                    // and therefore lacked a `CurrentUser` ACE).
-                    let u_wide = to_wide(OsStr::new("OxideTask"));
-                    let d_wide = to_wide(OsStr::new("."));
-                    let p_wide = to_wide(OsStr::new("unused"));
-                    let mut logon_token: HANDLE = std::ptr::null_mut();
-                    let _ = ImpersonateLoggedOnUser(restricted_token);
-                    let mut logon_ok = LogonUserW(
-                        u_wide.as_ptr(),
-                        d_wide.as_ptr(),
-                        p_wide.as_ptr(),
-                        9,
-                        3,
-                        &mut logon_token,
-                    );
-                    let _ = RevertToSelf();
-                    if logon_ok == 0 || logon_token.is_null() {
-                        logon_ok = LogonUserW(
-                            u_wide.as_ptr(),
-                            d_wide.as_ptr(),
-                            p_wide.as_ptr(),
-                            9,
-                            3,
-                            &mut logon_token,
-                        );
-                    }
-
-                    let base_lua_token = if logon_ok != 0 && !logon_token.is_null() {
-                        apply_current_user_owner_and_default_dacl(logon_token, user_sid.as_psid());
-                        let mut lua_logon: HANDLE = std::ptr::null_mut();
-                        let ok2 = CreateRestrictedToken(
-                            logon_token,
-                            LUA_TOKEN,
-                            0,
-                            std::ptr::null(),
-                            0,
-                            std::ptr::null(),
-                            0,
-                            std::ptr::null(),
-                            &mut lua_logon,
-                        );
-                        CloseHandle(logon_token);
-                        if ok2 != 0 && !lua_logon.is_null() {
-                            CloseHandle(restricted_token);
-                            lua_logon
-                        } else {
-                            restricted_token
-                        }
-                    } else {
-                        restricted_token
-                    };
-
-                    // TOKEN_IMPERSONATE = 0x0004
                     let mut primary_token: HANDLE = std::ptr::null_mut();
                     let dup_ok = DuplicateTokenEx(
-                        base_lua_token,
+                        restricted_token,
                         TOKEN_ASSIGN_PRIMARY
                             | TOKEN_DUPLICATE
                             | TOKEN_QUERY
                             | TOKEN_ADJUST_DEFAULT
-                            | TOKEN_ADJUST_SESSIONID
-                            | 0x0004,
+                            | TOKEN_ADJUST_SESSIONID,
                         std::ptr::null(),
                         SecurityImpersonation,
                         TokenPrimary,
                         &mut primary_token,
                     );
-                    CloseHandle(base_lua_token);
+                    CloseHandle(restricted_token);
                     if dup_ok == 0 || primary_token.is_null() {
                         return None;
                     }
                     apply_current_user_owner_and_default_dacl(primary_token, user_sid.as_psid());
-
-                    // Trigger kernel creation of `\Sessions\<N>\DosDevices\<NewLogonId>` while
-                    // impersonating `primary_token` (`TokenOwner = CurrentUser`, `BA` deny-only)
-                    // so `ntoskrnl!SepCreateTokenDeviceMap` stamps `CurrentUser` into the new
-                    // logon session's `DosDevices` DACL.
-                    let dev_name = format!("OXIDEDEV_{}", std::process::id());
-                    let wide_dev = to_wide(OsStr::new(&dev_name));
-                    let sys_root = std::env::var_os("SystemRoot")
-                        .unwrap_or_else(|| OsString::from(r"C:\Windows"));
-                    let wide_target = to_wide(&sys_root);
-                    if ImpersonateLoggedOnUser(primary_token) != 0 {
-                        let _ = DefineDosDeviceW(0, wide_dev.as_ptr(), wide_target.as_ptr());
-                        let _ = DefineDosDeviceW(2, wide_dev.as_ptr(), wide_target.as_ptr());
-                        let _ = RevertToSelf();
-                    }
-
                     Some(primary_token as usize)
                 }
             })
@@ -2288,9 +2275,53 @@ pub mod windows {
         merge_entries_on_path(path, &entries)
     }
 
+    /// Ensures every existing directory and file under `root` grants `FILE_GENERIC_READ |
+    /// FILE_GENERIC_EXECUTE | SYNCHRONIZE` (`check_mask = FILE_READ_ATTRIBUTES | FILE_TRAVERSE |
+    /// FILE_READ_DATA`) to both `sid` and `user_sid`. When `SetNamedSecurityInfoW` on `root` has
+    /// already propagated `(I)(RX)` to a child, `dacl_already_grants_sid` returns `true` and the
+    /// child's DACL is left untouched (preserving N6 single-root-ACE inheritance). If any existing
+    /// child did not inherit `(RX)` (e.g. due to a protected DACL or non-auto-inheriting parent),
+    /// merges `(RX)` with `UNPROTECTED_DACL_SECURITY_INFORMATION`.
+    fn ensure_descendants_grant_rx(root: &Path, sid: PSID, user_sid: PSID) -> io::Result<()> {
+        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let check_mask = FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_READ_DATA;
+        let rx_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | SYNCHRONIZE;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if is_reparse_point(&p) {
+                    continue;
+                }
+                let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+                let c_has_sid = dacl_already_grants_sid(&p, sid, check_mask);
+                let c_has_user = dacl_already_grants_sid(&p, user_sid, check_mask);
+                if !c_has_sid || !c_has_user {
+                    let flags = if is_dir { inherit } else { NO_INHERITANCE };
+                    let mut c_entries = Vec::with_capacity(2);
+                    if !c_has_sid {
+                        c_entries.push(explicit_access(sid, rx_mask, GRANT_ACCESS, flags));
+                    }
+                    if !c_has_user {
+                        c_entries.push(explicit_access(user_sid, rx_mask, GRANT_ACCESS, flags));
+                    }
+                    let _ = merge_entries_on_path_unprotected(&p, &c_entries);
+                }
+                if is_dir {
+                    stack.push(p);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Sets a single inheritable read+execute ACE (`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`)
     /// on `path` itself and lets Win32 `SetNamedSecurityInfoW` propagate `(I)(OI)(CI)(RX)` to
-    /// descendants without walking or stamping duplicate explicit ACEs on children (N6).
+    /// descendants, then verifies via [`ensure_descendants_grant_rx`] that every existing
+    /// file and subdirectory under `path` actually received `(RX)` (N6).
     fn grant_rx_recursive(path: &Path, sid: PSID, manifest_path: Option<&Path>) -> io::Result<()> {
         if !path.exists() || is_reparse_point(path) {
             return Ok(());
@@ -2301,24 +2332,27 @@ pub mod windows {
         let has_sid = dacl_already_grants_sid_with_flags(path, sid, check_mask, inherit);
         let has_user =
             dacl_already_grants_sid_with_flags(path, user_sid.as_psid(), check_mask, inherit);
-        if has_sid && has_user {
-            return Ok(());
+        if !has_sid || !has_user {
+            record_acl_grant(manifest_path, path)?;
+            let rx_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | SYNCHRONIZE;
+            let mut entries = Vec::with_capacity(2);
+            if !has_sid {
+                entries.push(explicit_access(sid, rx_mask, GRANT_ACCESS, inherit));
+            }
+            if !has_user {
+                entries.push(explicit_access(
+                    user_sid.as_psid(),
+                    rx_mask,
+                    GRANT_ACCESS,
+                    inherit,
+                ));
+            }
+            merge_entries_on_path_unprotected(path, &entries)?;
         }
-        record_acl_grant(manifest_path, path)?;
-        let rx_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | SYNCHRONIZE;
-        let mut entries = Vec::with_capacity(2);
-        if !has_sid {
-            entries.push(explicit_access(sid, rx_mask, GRANT_ACCESS, inherit));
+        if path.is_dir() {
+            ensure_descendants_grant_rx(path, sid, user_sid.as_psid())?;
         }
-        if !has_user {
-            entries.push(explicit_access(
-                user_sid.as_psid(),
-                rx_mask,
-                GRANT_ACCESS,
-                inherit,
-            ));
-        }
-        merge_entries_on_path(path, &entries)
+        Ok(())
     }
 
     /// Grants `oxideswarm.toolchain` read+execute on the existing subdirectories and config files
@@ -2719,22 +2753,6 @@ pub mod windows {
                         )
                     },
                 )?;
-                if let Ok(entries) = std::fs::read_dir(&tc_root) {
-                    for entry in entries.flatten() {
-                        let tc = entry.path();
-                        if tc.is_dir() && !is_reparse_point(&tc) {
-                            let _ = grant_rx_recursive(&tc, toolchain_sid.as_psid(), manifest_opt);
-                            let tc_bin = tc.join("bin");
-                            if tc_bin.is_dir() && !is_reparse_point(&tc_bin) {
-                                let _ = grant_rx_recursive(
-                                    &tc_bin,
-                                    toolchain_sid.as_psid(),
-                                    manifest_opt,
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -2755,10 +2773,37 @@ pub mod windows {
         Ok(())
     }
 
-    /// Removes all explicit ACEs (both allow and deny) for `oxideswarm.toolchain` from `path`,
-    /// skipping reparse points (N4, N6).
+    /// Removes all explicit ACEs (both allow and deny) for `oxideswarm.toolchain` from `path`
+    /// and any descendants that still carry an explicit `oxideswarm.toolchain` ACE, skipping
+    /// reparse points (N4, N6).
     pub fn revoke_toolchain_sid_on_tree(path: &Path, toolchain_sid: PSID) -> io::Result<()> {
-        remove_sid_aces_from_path(path, toolchain_sid)
+        if !path.exists() || is_reparse_point(path) {
+            return Ok(());
+        }
+        remove_sid_aces_from_path(path, toolchain_sid)?;
+        if path.is_dir() {
+            let mut stack = vec![path.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if is_reparse_point(&p) {
+                        continue;
+                    }
+                    if dacl_already_grants_sid(&p, toolchain_sid, FILE_READ_ATTRIBUTES)
+                        || dacl_already_denies_sid(&p, toolchain_sid, FILE_READ_ATTRIBUTES)
+                    {
+                        let _ = remove_sid_aces_from_path(&p, toolchain_sid);
+                    }
+                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        stack.push(p);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reads the ACL grant manifest at `manifest_path`, revokes `oxideswarm.toolchain` allow and
@@ -3104,11 +3149,11 @@ pub mod windows {
 
                 // On `windows-latest`, `<LOCALAPPDATA>\Packages` has DACL
                 // `D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;LA)` without `user_sid`.
-                // Ensure `<LOCALAPPDATA>\Packages\<profile_name>` (which
-                // `BasepAppContainerEnvironmentExtension` uses as `%TEMP%`/`%TMP%` inside the
-                // AppContainer) grants `user_sid` and this task's `app_container_sid` (never
-                // `BUILTIN\Users` or `Everyone`) so Stage 1 and Stage 2 of `SepAccessCheck` both
-                // succeed for `%TEMP%` and `%TMP%`.
+                // Ensure `<LOCALAPPDATA>\Packages\<profile_name>` and its `AC` / `AC\Temp`
+                // subdirectories (which `CreateAppContainerProfile` marks with a protected DACL
+                // and `BasepAppContainerEnvironmentExtension` uses inside the AppContainer) grant
+                // `user_sid` and this task's `app_container_sid` (never `BUILTIN\Users` or
+                // `Everyone`) so Stage 1 and Stage 2 of `SepAccessCheck` both succeed.
                 if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
                     let pkg_dir = local_app_data.join("Packages").join(&profile_name);
                     if pkg_dir.exists() {
@@ -3127,6 +3172,11 @@ pub mod windows {
                             ),
                         ];
                         let _ = merge_entries_on_path(&pkg_dir, &pkg_entries);
+                        for sub in [pkg_dir.join("AC"), pkg_dir.join("AC").join("Temp")] {
+                            if sub.exists() {
+                                let _ = merge_entries_on_path_unprotected(&sub, &pkg_entries);
+                            }
+                        }
                     }
                 }
 
@@ -3818,6 +3868,56 @@ pub mod windows {
                     .map_err(|e| format!("grant admins_sid on Window Station failed: {e}"))?;
                 grant_sid_on_window_object(alt_winsta, toolchain_sid.as_psid(), WINSTA_TASK_MASK)
                     .map_err(|e| format!("grant toolchain_sid on Window Station failed: {e}"))?;
+
+                // When `alt_winsta` is a non-interactive Window Station (e.g.
+                // `Service-0x0-<LogonId>$` on `windows-latest`), console processes such as
+                // `cargo.exe` (which do not link `user32.dll`, so `Win32Process == NULL`) spawn
+                // grandchildren (`rustc.exe -vV`) via `std::process::Command::spawn()` with
+                // `si.lpDesktop == NULL`. When `si.lpDesktop == NULL` and `Win32Process == NULL`,
+                // Windows resolves the `"Default"` desktop of the process Window Station
+                // (`Service-0x0-<LogonId>$\Default`). Grant `user_sid` and `toolchain_sid`
+                // (`DESKTOP_TASK_MASK`) on `Service-0x0-<LogonId>$\Default` (never touching
+                // `WinSta0` or `WinSta0\Default`, N7) so grandchild console processes do not fail
+                // with `STATUS_ACCESS_DENIED (os error 5)`.
+                if !winsta_name.eq_ignore_ascii_case("WinSta0") {
+                    let orig_winsta = GetProcessWindowStation();
+                    if !orig_winsta.is_null() && SetProcessWindowStation(alt_winsta) != 0 {
+                        let wide_default = to_wide(OsStr::new("Default"));
+                        let default_desk = CreateDesktopW(
+                            wide_default.as_ptr(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                            0x000F_01FF,
+                            std::ptr::null(),
+                        );
+                        let _ = SetProcessWindowStation(orig_winsta);
+                        if !default_desk.is_null() {
+                            const DESKTOP_TASK_MASK: u32 = 0x0002_00C7;
+                            let _ = grant_sid_on_window_object(
+                                default_desk,
+                                user_sid.as_psid(),
+                                0x000F_01FF,
+                            );
+                            let _ = grant_sid_on_window_object(
+                                default_desk,
+                                system_sid.as_psid(),
+                                0x000F_01FF,
+                            );
+                            let _ = grant_sid_on_window_object(
+                                default_desk,
+                                admins_sid.as_psid(),
+                                0x000F_01FF,
+                            );
+                            let _ = grant_sid_on_window_object(
+                                default_desk,
+                                toolchain_sid.as_psid(),
+                                DESKTOP_TASK_MASK,
+                            );
+                            let _ = CloseDesktop(default_desk);
+                        }
+                    }
+                }
 
                 Ok((alt_winsta as usize, winsta_name))
             }

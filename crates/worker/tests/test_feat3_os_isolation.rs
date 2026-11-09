@@ -2830,6 +2830,24 @@ try {
             let tc_bin = tc_dir.join("bin");
             std::fs::create_dir_all(&tc_bin).unwrap();
             std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+            let vendor_crate = cargo_home.join("vendor").join("cfg-if");
+            std::fs::create_dir_all(vendor_crate.join("src")).unwrap();
+
+            let staged_host = HostDirs::from_home(
+                user_home.clone(),
+                Some(rustup_home.clone()),
+                Some(cargo_home.clone()),
+            );
+            // Prepare toolchain directory ACLs BEFORE copying files so newly created files under
+            // `toolchains` and `cargo_home/{bin,vendor}` inherit `(I)(RX)` at creation time, and
+            // call `prepare_worker_toolchains` again after copying to cover `config.toml` and
+            // verify every descendant file carries `(RX)`.
+            rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+                &staged_host,
+                &[],
+                None,
+            )
+            .expect("pre-prepare staged toolchain directory ACLs");
 
             // Copy `cargo.exe`, `rustc.exe`, and required DLLs (`rustc_driver-*.dll`, `std-*.dll`)
             // using `std::fs::copy` (never hard_link, so DACLs remain independent of the host).
@@ -2838,7 +2856,7 @@ try {
                 let name_str = name.to_string_lossy();
                 if name_str.eq_ignore_ascii_case("cargo.exe")
                     || name_str.eq_ignore_ascii_case("rustc.exe")
-                    || name_str.ends_with(".dll")
+                    || name_str.to_ascii_lowercase().ends_with(".dll")
                 {
                     std::fs::copy(entry.path(), tc_bin.join(&name)).unwrap();
                 }
@@ -2858,8 +2876,6 @@ try {
 
             // Stage a vendored `cfg-if = "1.0.0"` dependency in `cargo_home/vendor/cfg-if` and
             // configure `cargo_home/config.toml` so `--offline` builds resolve it from `CARGO_HOME`.
-            let vendor_crate = cargo_home.join("vendor").join("cfg-if");
-            std::fs::create_dir_all(vendor_crate.join("src")).unwrap();
             std::fs::write(
                 vendor_crate.join("Cargo.toml"),
                 "[package]\nname = \"cfg-if\"\nversion = \"1.0.0\"\nedition = \"2018\"\n",
@@ -2887,17 +2903,45 @@ try {
             )
             .unwrap();
 
-            let staged_host = HostDirs::from_home(
-                user_home.clone(),
-                Some(rustup_home.clone()),
-                Some(cargo_home.clone()),
-            );
             rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
                 &staged_host,
                 &[],
                 None,
             )
             .expect("prepare staged toolchain ACLs");
+
+            let rustc_bin = tc_bin.join("rustc.exe");
+            let cargo_bin = cargo_home.join("bin").join("cargo.exe");
+            let tc_sid =
+                rusty_grid_worker::isolation::windows::OwnedSid::oxideswarm_toolchain().unwrap();
+            let user_sid =
+                rusty_grid_worker::isolation::windows::OwnedSid::current_user().unwrap();
+            for p in [&tc_bin, &rustc_bin, &cargo_bin] {
+                assert!(
+                    rusty_grid_worker::isolation::windows::dacl_already_grants_sid(
+                        p,
+                        tc_sid.as_psid(),
+                        0x20,
+                    ),
+                    "expected oxideswarm.toolchain (RX) on {}: {}",
+                    p.display(),
+                    sddl_of(p)
+                );
+                assert!(
+                    rusty_grid_worker::isolation::windows::dacl_already_grants_sid(
+                        p,
+                        user_sid.as_psid(),
+                        0x20,
+                    ),
+                    "expected CurrentUser (RX) on {}: {}",
+                    p.display(),
+                    sddl_of(p)
+                );
+            }
+            let icacls_bin = sddl_of(&tc_bin);
+            let icacls_rustc = sddl_of(&rustc_bin);
+            eprintln!("=== icacls staged toolchain bin ===\n{icacls_bin}");
+            eprintln!("=== icacls staged rustc.exe ===\n{icacls_rustc}");
 
             StagedWinToolchain {
                 _home_dir: home_dir,
@@ -2938,7 +2982,11 @@ try {
             let task = win_cmd_task(
                 &rig,
                 r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & target\debug\tiny.exe"#,
-                &[("PATH", &path), ("RUSTC", &rustc)],
+                &[
+                    ("PATH", &path),
+                    ("RUSTC", &rustc),
+                    ("RUSTUP_TOOLCHAIN", "staged-x86_64-pc-windows-msvc"),
+                ],
                 300,
             );
             let result = rig.runner.execute_task(&task, None, None).await;
@@ -3001,6 +3049,7 @@ try {
                     &[
                         ("PATH", &path),
                         ("RUSTC", &rustc),
+                        ("RUSTUP_TOOLCHAIN", "staged-x86_64-pc-windows-msvc"),
                         ("T_DENIED_SECRET", &denied_secret),
                     ],
                     300,
