@@ -1,7 +1,7 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
-Q8 to Q12 (Phases F and G) on 2026-11-09.
+Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09.
 Created: 2026-11-07    Updated: 2026-11-09
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -239,6 +239,18 @@ After the Phase D exit check, and not before it:
 
 After the first release, in order of value to the user story:
 
+0. **Machines anywhere (decision Q13, model A):** each person or team runs a cluster, and trusted
+   people add their machines to it from any network.
+   - **ENROLL-1** ([design 0051](design/0051-machine-identity-and-invites.md)): a key per machine,
+     invites that work once, expire and need approval, revocation, and a handshake with forward
+     secrecy. Only the master keeps the cluster secret.
+   - **JOIN-2** ([design 0052](design/0052-short-code-pairing.md)): join on a LAN with a short code
+     such as `7-rocket-violin`.
+   - **USB-1** ([design 0053](design/0053-usb-setup-kit.md)): a USB stick that installs, joins and
+     starts a worker on macOS, Windows and Linux with one double-click and a passphrase.
+
+   ENROLL-1 comes first. JOIN-2 and USB-1 follow in parallel. The release that ships them is
+   `0.2.0`, because ENROLL-1 raises the protocol version to 8.
 1. **FEAT-7:** usable rendezvous discovery, so machines on different networks find the master.
 2. **FEAT-5:** checkpoints for process tasks, so long jobs resume after a worker loss.
 3. **FEAT-6:** real master failover. It starts only after FEAT-1, and needs replicated state,
@@ -329,6 +341,7 @@ answers.
 | Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | The own API and MCP first, REAPI cache-only next, remote execution last |
 | Q11 | Which licence and is there a commercial or hosted offering? | Keep `MIT OR Apache-2.0`. No hosted offering decided; revisit after the first release |
 | Q12 | Which autoscaling providers does SCALE-5 build first? | SSH pool, then Kubernetes, then one cloud |
+| Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
 
@@ -382,3 +395,5 @@ answers.
   recorded in [guides/offload-cargo-test.md](guides/offload-cargo-test.md#recorded-two-machine-run)
   and as BENCH-1 (c) in `benchmarks/grid/`. Phase D: the Quick start and the `0.1.0` release notes
   are written, and the first tag is `v0.1.0`.
+- 2026-11-09: The owner chose ecosystem model A (Q13) and asked for machines on any network and a
+  USB setup kit. ENROLL-1, JOIN-2 and USB-1 (designs 0051 to 0053) head Phase E.
