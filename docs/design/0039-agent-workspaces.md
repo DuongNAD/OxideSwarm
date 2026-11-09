@@ -339,7 +339,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Planned |
 | W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
-| W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Planned |
+| W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Done |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Implemented |
 | W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
 | W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Planned |
@@ -436,3 +436,15 @@ off by default until FEAT-3 is Implemented.
   worker's `CARGO_HOME` / `RUSTUP_HOME` when `Cargo.toml` is present in the sandbox, collects the
   built binary into `result.outputs`, and `submit --type compile --source <PATH>` builds a crate
   with a local dependency and downloads the binary to the client.
+- 2026-11-09: W7 done. `STREAM_CLIENT = 0x03` (`crates/core/src/transport.rs`) tags single-stream
+  QUIC connections opened by CLI and MCP clients and `BlobConnection`. On the master
+  (`crates/master/src/server.rs`), the P2P accept loop hands a `STREAM_CLIENT` stream directly to
+  `handle_connection` without waiting for a second stream. `connect_master`
+  (`crates/cli/src/connect.rs`), `BlobConnection` (`crates/cli/src/blobs.rs`), `McpState`
+  (`crates/cli/src/mcp.rs`), `doctor` (`crates/cli/src/doctor.rs`) and the CLI client commands
+  (`crates/cli/src/cli_app.rs`) now operate over `MessageTransport<GridStream>`, dialing an iroh P2P
+  ticket when `--master`, `OXIDESWARM_MASTER`, `RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, or
+  `[submit]`/`[status]` `p2p_ticket` (or `master`) holds a ticket (`{...` or `node1...`), keeping the
+  client endpoint alive for the lifetime of the `GridStream::P2p` via `P2pClientGuard`, requiring a
+  cluster secret unless `--insecure`, and mapping an older master's stream close after `STREAM_CLIENT`
+  to the protocol version upgrade hint.

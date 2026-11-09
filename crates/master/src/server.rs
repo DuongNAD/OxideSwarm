@@ -26,7 +26,9 @@ use rusty_grid_core::protocol::{
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
-use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
+use rusty_grid_core::transport::{
+    BiStream, GridStream, GRID_ALPN, STREAM_CLIENT, STREAM_CONTROL, STREAM_DATA,
+};
 use rusty_grid_core::{
     GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerCapabilities,
     WorkerMessage,
@@ -1499,6 +1501,7 @@ impl MasterServer {
             let p2p_codec = self.config.wire_codec;
             let p2p_conns = Arc::clone(&self.p2p_active_conns);
             let p2p_secret = self.config.cluster_secret.clone();
+            let p2p_mapreduce_parallelism = self.config.mapreduce_parallelism;
             let p2p_limits = limits.clone();
             let p2p_blob_store = self.blob_store.clone();
 
@@ -1645,6 +1648,33 @@ impl MasterServer {
                                             #[cfg(feature = "p2p")]
                                             Some(c_conns),
                                         ).await;
+                                    }
+                                    Ok(Ok(_)) if tag1[0] == STREAM_CLIENT => {
+                                        let stream = GridStream::P2p(BiStream::new(recv1, send1));
+                                        let _ = handle_connection(
+                                            stream,
+                                            remote_addr,
+                                            c_reg,
+                                            c_q,
+                                            c_sched,
+                                            c_wait,
+                                            p2p_hb,
+                                            p2p_to,
+                                            c_shut,
+                                            abort_handle,
+                                            c_codec,
+                                            c_secret,
+                                            Some(handshake_permit),
+                                            p2p_mapreduce_parallelism,
+                                            c_blob_store,
+                                            #[cfg(feature = "dashboard")]
+                                            c_bcast,
+                                            #[cfg(feature = "p2p")]
+                                            Some(c_conn),
+                                            #[cfg(feature = "p2p")]
+                                            Some(c_conns),
+                                        )
+                                        .await;
                                     }
                                     _ => {
                                         warn!("Failed or untagged P2P stream; closing connection");

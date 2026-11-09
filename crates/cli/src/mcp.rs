@@ -35,7 +35,6 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -47,6 +46,7 @@ use rusty_grid_core::placement::{
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
+use rusty_grid_core::transport::GridStream;
 
 use crate::config::ConfigFile;
 use crate::connect::{
@@ -209,7 +209,7 @@ pub struct McpState {
     pub master_addr: String,
     pub secret: Option<ClusterSecret>,
     resolved_master_addr: Mutex<Option<String>>,
-    transport: Mutex<Option<MessageTransport<TcpStream>>>,
+    transport: Mutex<Option<MessageTransport<GridStream>>>,
 }
 
 impl McpState {
@@ -353,7 +353,7 @@ impl McpState {
     }
 
     /// Obtains a dedicated one-off connection (e.g. for long-running streaming/waiting operations).
-    pub async fn connect_dedicated(&self) -> Result<MessageTransport<TcpStream>, String> {
+    pub async fn connect_dedicated(&self) -> Result<MessageTransport<GridStream>, String> {
         self.connect_dedicated_with_timeout(DEFAULT_MASTER_RPC_TIMEOUT)
             .await
     }
@@ -363,7 +363,7 @@ impl McpState {
     pub async fn connect_dedicated_with_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<MessageTransport<TcpStream>, String> {
+    ) -> Result<MessageTransport<GridStream>, String> {
         let had_cached = self.resolved_master_addr.lock().await.is_some();
         let target_addr = self.resolve_target_addr().await?;
         match tokio::time::timeout(timeout, connect_master(&target_addr, self.secret.as_ref()))
@@ -405,7 +405,7 @@ impl McpState {
     pub async fn connect_dedicated_until(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<MessageTransport<TcpStream>, String> {
+    ) -> Result<MessageTransport<GridStream>, String> {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         self.connect_dedicated_with_timeout(timeout).await
     }
@@ -3180,8 +3180,8 @@ pub async fn run_mcp(
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = normalize_master_addr(&crate::config::resolve_string(
         args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        crate::config::CLIENT_MASTER_ENV_VARS,
+        status_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     ));
 

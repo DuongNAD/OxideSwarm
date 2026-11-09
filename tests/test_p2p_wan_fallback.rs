@@ -507,3 +507,220 @@ async fn test_ticket_determinism_and_reconnection() {
     let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
     let _ = master2.shutdown();
 }
+
+/// W7 (design 0039 D7): verifies that a client can submit a task with blob inputs and download
+/// its output blob through a P2P ticket (`STREAM_CLIENT = 0x03`), and that a client without a
+/// cluster secret is refused both by the CLI secret policy and by the master handshake.
+#[tokio::test]
+async fn test_p2p_client_submits_task_and_downloads_output_and_refuses_without_secret() {
+    use rusty_grid_cli::blobs::{download_outputs, scan_inputs, upload_inputs, BlobConnection};
+    use rusty_grid_cli::connect::{connect_master, set_client_p2p_minimal_preset_for_testing};
+    use rusty_grid_cli::secret_cmd::{decide_peer_secret, PeerRole};
+    use rusty_grid_core::cluster_auth::ClusterSecret;
+    use rusty_grid_core::error::GridError;
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
+
+    set_client_p2p_minimal_preset_for_testing(true);
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let ticket_file = temp_dir.path().join("w7_master.ticket");
+    let blob_dir = temp_dir.path().join("master_blobs");
+    let secret = ClusterSecret::from_bytes(&[0x5Au8; 32]).expect("cluster secret");
+
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = ServerConfig::new(master_bind)
+        .with_p2p(true)
+        .with_p2p_minimal_preset(true)
+        .with_ephemeral_key(true)
+        .with_p2p_ticket_file(&ticket_file)
+        .with_cluster_secret(secret.clone())
+        .with_blob_store(&blob_dir, 64 * 1024 * 1024);
+
+    let master_handle = MasterServer::spawn(config)
+        .await
+        .expect("Failed to spawn master");
+
+    let raw_ticket = tokio::fs::read_to_string(&ticket_file)
+        .await
+        .expect("read master ticket");
+
+    // 1. A client without a cluster secret is refused before dialing by `decide_peer_secret`
+    //    (unless `--insecure`), and is also refused at the wire handshake if it dials directly.
+    let outcome = decide_peer_secret(None, &raw_ticket, false, false, PeerRole::Client);
+    match outcome {
+        Err(GridError::AuthRequired(reason)) => {
+            assert!(
+                reason.contains("P2P ticket"),
+                "refusal reason must mention P2P ticket, got: {reason}"
+            );
+        }
+        other => panic!("expected Err(AuthRequired) for P2P ticket without secret, got {other:?}"),
+    }
+
+    let unauth_err = connect_master(&raw_ticket, None)
+        .await
+        .err()
+        .expect("master must refuse unauthenticated P2P client");
+    assert!(
+        matches!(unauth_err, GridError::AuthRequired(_)),
+        "expected AuthRequired, got {unauth_err:?}"
+    );
+
+    let unauth_blob_err = BlobConnection::connect(&raw_ticket, None)
+        .await
+        .err()
+        .expect("master must refuse unauthenticated P2P blob connection");
+    assert!(
+        matches!(unauth_blob_err, GridError::AuthRequired(_)),
+        "expected AuthRequired on BlobConnection, got {unauth_blob_err:?}"
+    );
+
+    // 2. Spawn a P2P worker with the same secret and wait for registration.
+    let worker_sandbox = temp_dir.path().join("worker_sandbox");
+    let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
+        .with_name("w7-p2p-worker")
+        .with_cores(2)
+        .with_sandbox_base_dir(&worker_sandbox)
+        .with_p2p_ticket(&raw_ticket)
+        .with_p2p_minimal_preset(true)
+        .with_cluster_secret(secret.clone());
+
+    let mut worker = WorkerClient::new(worker_config);
+    let worker_id = worker.worker_id();
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+    let worker_task = tokio::spawn(async move {
+        let _ = worker.run(worker_shutdown_rx).await;
+    });
+
+    let start = std::time::Instant::now();
+    let mut registered = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        if master_handle
+            .registry()
+            .list_workers()
+            .await
+            .iter()
+            .any(|w| w.worker_id == worker_id)
+        {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered, "Worker must register via P2P ticket");
+
+    // 3. Stage an input file, upload it over a P2P BlobConnection, submit a task over a P2P
+    //    client connection, wait for completion, and download the output file over P2P.
+    let input_path = temp_dir.path().join("in.txt");
+    let expected_payload = b"hello from W7 p2p client and blob transfer\n";
+    std::fs::write(&input_path, expected_payload).expect("write input file");
+
+    let prepared = scan_inputs(&[format!("{}:in.txt", input_path.display())]).expect("scan inputs");
+    let blob_conn = BlobConnection::connect(&raw_ticket, Some(&secret))
+        .await
+        .expect("connect P2P BlobConnection with secret");
+    upload_inputs(&blob_conn, &prepared)
+        .await
+        .expect("upload input blobs over P2P ticket");
+
+    let mut client = connect_master(&raw_ticket, Some(&secret))
+        .await
+        .expect("connect P2P client with secret");
+
+    #[cfg(unix)]
+    let spec = TaskSpec::shell_script("cp in.txt out.txt && echo p2p-done");
+    #[cfg(windows)]
+    let spec = TaskSpec::shell_script("copy /Y in.txt out.txt && echo p2p-done");
+
+    let task = Task::new(spec, TaskRequirements::generic(1, 10))
+        .with_inputs(prepared.inputs)
+        .with_output_glob("out.txt");
+
+    client
+        .send_msg(&ClientMessage::SubmitTask { task, wait: true })
+        .await
+        .expect("send SubmitTask over P2P");
+    let result = match client.recv_msg::<ClientResponse>().await.expect("recv") {
+        Some(ClientResponse::TaskCompleted { result, .. }) => result,
+        other => panic!("expected TaskCompleted, got {other:?}"),
+    };
+
+    assert_eq!(result.exit_code, 0, "task stderr: {}", result.stderr_str());
+    assert!(result.stdout_str().contains("p2p-done"));
+    assert_eq!(result.outputs.len(), 1, "expected 1 output blob");
+
+    let out_dir = temp_dir.path().join("downloaded");
+    let saved = download_outputs(&blob_conn, &result.outputs, &out_dir)
+        .await
+        .expect("download output blobs over P2P ticket");
+    assert_eq!(saved.len(), 1);
+    let downloaded_bytes = std::fs::read(&saved[0]).expect("read downloaded output");
+    assert_eq!(downloaded_bytes, expected_payload);
+
+    drop(client);
+    drop(blob_conn);
+    let _ = worker_shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+    let _ = master_handle.shutdown();
+}
+
+/// D7 compatibility: an older P2P master that only accepts `STREAM_CONTROL` / `STREAM_DATA`
+/// closes a `STREAM_CLIENT` (`0x03`) stream after reading the tag byte; `connect_master`
+/// surfaces the protocol version upgrade hint rather than a raw EOF.
+#[tokio::test]
+async fn test_p2p_client_stream_closed_by_older_master_reports_protocol_version_hint() {
+    use rusty_grid_cli::connect::{connect_master, set_client_p2p_minimal_preset_for_testing};
+    use rusty_grid_core::error::GridError;
+    use rusty_grid_core::transport::{
+        bind_p2p_endpoint, serialize_p2p_ticket, GRID_ALPN, STREAM_CLIENT,
+    };
+
+    set_client_p2p_minimal_preset_for_testing(true);
+
+    let endpoint = bind_p2p_endpoint(true)
+        .await
+        .expect("bind mock older P2P master");
+    let ticket = serialize_p2p_ticket(&endpoint.addr()).expect("serialize ticket");
+
+    let server_ep = endpoint.clone();
+    let server_task = tokio::spawn(async move {
+        if let Some(incoming) = server_ep.accept().await {
+            if let Ok(conn) = incoming.await {
+                if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let mut tag = [0u8; 1];
+                    let _ = tokio::io::AsyncReadExt::read_exact(&mut recv, &mut tag).await;
+                    assert_eq!(tag[0], STREAM_CLIENT);
+                    let _ = send.finish();
+                    // Wait briefly for the client to send its Hello probe onto the stream before
+                    // dropping the stream/connection, matching an older master whose spawned
+                    // accept task returns on an unknown stream tag.
+                    let mut drain = [0u8; 64];
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        tokio::io::AsyncReadExt::read(&mut recv, &mut drain),
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+
+    let err = connect_master(&ticket, None)
+        .await
+        .err()
+        .expect("older P2P master closing STREAM_CLIENT must fail");
+    match err {
+        GridError::ConnectionFailed(msg) => {
+            assert!(
+                msg.contains("upgrade both Master and CLI to protocol version"),
+                "expected protocol version upgrade hint, got: {msg}"
+            );
+        }
+        other => panic!("expected ConnectionFailed with upgrade hint, got {other:?}"),
+    }
+
+    let _ = server_task.await;
+    endpoint.close().await;
+    let _ = GRID_ALPN;
+}

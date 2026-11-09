@@ -159,6 +159,7 @@ pub struct WorkerFileConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SubmitFileConfig {
     pub master: Option<String>,
+    pub p2p_ticket: Option<String>,
     pub timeout_secs: Option<u64>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
@@ -166,14 +167,59 @@ pub struct SubmitFileConfig {
     pub insecure: Option<bool>,
 }
 
+impl SubmitFileConfig {
+    /// Returns `p2p_ticket` when non-empty, otherwise `master`.
+    pub fn target_master(&self) -> Option<String> {
+        self.p2p_ticket
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.master
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StatusFileConfig {
     pub master: Option<String>,
+    pub p2p_ticket: Option<String>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
     /// Allow talking to a remote / `auto` master without a cluster secret.
     pub insecure: Option<bool>,
 }
+
+impl StatusFileConfig {
+    /// Returns `p2p_ticket` when non-empty, otherwise `master`.
+    pub fn target_master(&self) -> Option<String> {
+        self.p2p_ticket
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.master
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+    }
+}
+
+/// Environment variables checked (in order) for a client command's target Master address or P2P
+/// ticket (`OXIDESWARM_MASTER`, `RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`).
+pub const CLIENT_MASTER_ENV_VARS: &[&str] = &[
+    "OXIDESWARM_MASTER",
+    "RUSTY_GRID_MASTER_ADDR",
+    "RUSTY_GRID_MASTER",
+];
 
 /// A secret as typed by a human (`--secret`, the `secret` config key). It is a plain string, but
 /// `Debug` never shows it, so the derived `Debug` of the argument and config structs that hold it

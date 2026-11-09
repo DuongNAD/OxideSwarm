@@ -21,7 +21,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
@@ -35,6 +34,7 @@ use rusty_grid_core::placement::{
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
+use rusty_grid_core::transport::GridStream;
 use rusty_grid_core::WorkerCapabilities;
 use rusty_grid_master::{MasterServer, ReaperConfig, SchedulerConfig, ServerConfig};
 use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig};
@@ -42,7 +42,7 @@ use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig
 use crate::config::{
     load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
     resolve_opt_u16, resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u32, resolve_u64,
-    resolve_usize, ConfigFile, MasterFileConfig, SecretSection, SecretText,
+    resolve_usize, ConfigFile, MasterFileConfig, SecretSection, SecretText, CLIENT_MASTER_ENV_VARS,
 };
 use crate::connect::{
     connect_master, normalize_master_addr, report_master_failure, AUTH_EXIT_CODE,
@@ -2265,7 +2265,7 @@ async fn wait_for_worker_shutdown_signal() {
 /// clear message and returning the exit code on any failure (including an authentication
 /// rejection from a Master that requires a secret this client does not have).
 async fn exchange(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     master_addr: &str,
     had_secret: bool,
     request: &ClientMessage,
@@ -2937,7 +2937,7 @@ fn apply_default_spec_placement(spec: &TaskSpec, placement: &mut Placement) {
 }
 /// (see `rusty_grid_core::placement`). `None` when the master did not answer with a list.
 async fn fetch_workers(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     master_addr: &str,
     had_secret: bool,
 ) -> Option<Vec<WorkerCapabilities>> {
@@ -2984,8 +2984,8 @@ async fn run_doctor_command(
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master.clone(),
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        submit_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        submit_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(
@@ -3095,8 +3095,8 @@ async fn run_submit_with_secret(
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master.clone(),
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        submit_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        submit_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(
@@ -3421,8 +3421,8 @@ async fn run_status(
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        status_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(
@@ -3665,8 +3665,8 @@ pub async fn run_cancel(
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        status_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(
@@ -3751,8 +3751,8 @@ pub async fn run_result(
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        status_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(
@@ -4132,8 +4132,8 @@ async fn run_mapreduce(
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        submit_cfg.as_ref().and_then(|s| s.master.clone()),
+        CLIENT_MASTER_ENV_VARS,
+        submit_cfg.as_ref().and_then(|s| s.target_master()),
         DEFAULT_MASTER_ADDR,
     );
     let secret = match client_secret(

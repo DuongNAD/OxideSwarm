@@ -14,9 +14,39 @@ pub const GRID_ALPN: &[u8] = b"rusty-grid/v1";
 pub const STREAM_CONTROL: u8 = 0x01;
 /// Dedicated Task Data / Result Stream discriminator tag (bulk priority).
 pub const STREAM_DATA: u8 = 0x02;
+/// Single-stream Client RPC / Blob Stream discriminator tag (`connect_master`).
+pub const STREAM_CLIENT: u8 = 0x03;
 
 #[cfg(feature = "p2p")]
 pub use iroh;
+
+/// Keeps a client's ephemeral `iroh::Endpoint` and `iroh::endpoint::Connection` alive for the
+/// lifetime of its `GridStream::P2p`, closing both when the stream drops.
+#[cfg(feature = "p2p")]
+pub struct P2pClientGuard {
+    conn: iroh::endpoint::Connection,
+    endpoint: iroh::Endpoint,
+}
+
+#[cfg(feature = "p2p")]
+impl P2pClientGuard {
+    pub fn new(conn: iroh::endpoint::Connection, endpoint: iroh::Endpoint) -> Self {
+        Self { conn, endpoint }
+    }
+}
+
+#[cfg(feature = "p2p")]
+impl Drop for P2pClientGuard {
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"client done");
+        let ep = self.endpoint.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                ep.close().await;
+            });
+        }
+    }
+}
 
 /// Idle time before the first TCP keepalive probe is sent.
 pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(20);
@@ -64,11 +94,33 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> io::Result<()> {
 pub struct BiStream<R, W> {
     reader: R,
     writer: W,
+    #[cfg(feature = "p2p")]
+    #[allow(dead_code)]
+    p2p_guard: Option<P2pClientGuard>,
 }
 
 impl<R, W> BiStream<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
-        Self { reader, writer }
+        Self {
+            reader,
+            writer,
+            #[cfg(feature = "p2p")]
+            p2p_guard: None,
+        }
+    }
+
+    #[cfg(feature = "p2p")]
+    pub fn with_p2p_guard(
+        reader: R,
+        writer: W,
+        conn: iroh::endpoint::Connection,
+        endpoint: iroh::Endpoint,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            p2p_guard: Some(P2pClientGuard::new(conn, endpoint)),
+        }
     }
 
     pub fn into_split(self) -> (R, W) {
@@ -176,6 +228,107 @@ pub fn serialize_p2p_ticket(addr: &iroh::EndpointAddr) -> Result<String, serde_j
 #[cfg(feature = "p2p")]
 pub fn parse_p2p_ticket(ticket: &str) -> Result<iroh::EndpointAddr, serde_json::Error> {
     serde_json::from_str(ticket)
+}
+
+/// Binds an iroh endpoint configured for `GRID_ALPN`, using `presets::Minimal` when
+/// `minimal_preset` is true (offline / loopback test mode) and `presets::N0` otherwise.
+#[cfg(feature = "p2p")]
+pub async fn bind_p2p_endpoint(minimal_preset: bool) -> crate::GridResult<iroh::Endpoint> {
+    let ep_builder = if minimal_preset {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+    } else {
+        iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    };
+    ep_builder
+        .alpns(vec![GRID_ALPN.to_vec()])
+        .bind()
+        .await
+        .map_err(|e| {
+            crate::GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
+        })
+}
+
+/// Dials `node_addr` with `GRID_ALPN` within `connect_timeout`.
+#[cfg(feature = "p2p")]
+pub async fn dial_p2p_endpoint(
+    endpoint: &iroh::Endpoint,
+    node_addr: iroh::EndpointAddr,
+    connect_timeout: Duration,
+) -> crate::GridResult<iroh::endpoint::Connection> {
+    match tokio::time::timeout(connect_timeout, endpoint.connect(node_addr, GRID_ALPN)).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => Err(crate::GridError::ConnectionFailed(format!(
+            "P2P connect failed: {e}"
+        ))),
+        Err(_) => Err(crate::GridError::Timeout {
+            operation: "p2p_connect".into(),
+            duration_secs: connect_timeout.as_secs(),
+        }),
+    }
+}
+
+/// Opens a bidirectional QUIC stream on `conn` and writes the 1-byte lane `tag`.
+#[cfg(feature = "p2p")]
+pub async fn open_p2p_tagged_stream(
+    conn: &iroh::endpoint::Connection,
+    tag: u8,
+    label: &str,
+) -> crate::GridResult<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.map_err(|e| {
+        crate::GridError::ConnectionFailed(format!(
+            "Failed to open bidirectional {label} stream: {e}"
+        ))
+    })?;
+    tokio::io::AsyncWriteExt::write_all(&mut send, &[tag])
+        .await
+        .map_err(crate::GridError::Io)?;
+    tokio::io::AsyncWriteExt::flush(&mut send)
+        .await
+        .map_err(crate::GridError::Io)?;
+    Ok((send, recv))
+}
+
+/// Binds an ephemeral iroh endpoint, dials `node_addr` with `GRID_ALPN`, opens one bidirectional
+/// stream tagged with [`STREAM_CLIENT`], and returns a [`GridStream::P2p`] whose endpoint closes
+/// when the stream drops.
+#[cfg(feature = "p2p")]
+pub async fn connect_p2p_client_stream(
+    node_addr: iroh::EndpointAddr,
+    connect_timeout: Duration,
+    minimal_preset: bool,
+) -> crate::GridResult<GridStream> {
+    let endpoint = bind_p2p_endpoint(minimal_preset).await?;
+    let conn = match dial_p2p_endpoint(&endpoint, node_addr, connect_timeout).await {
+        Ok(c) => c,
+        Err(e) => {
+            endpoint.close().await;
+            return Err(e);
+        }
+    };
+    let opened = tokio::time::timeout(
+        connect_timeout,
+        open_p2p_tagged_stream(&conn, STREAM_CLIENT, "client"),
+    )
+    .await;
+    let (send, recv) = match opened {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"client stream open failed");
+            endpoint.close().await;
+            return Err(e);
+        }
+        Err(_) => {
+            conn.close(0u32.into(), b"client stream open timeout");
+            endpoint.close().await;
+            return Err(crate::GridError::Timeout {
+                operation: "p2p_open_streams".into(),
+                duration_secs: connect_timeout.as_secs(),
+            });
+        }
+    };
+    Ok(GridStream::P2p(BiStream::with_p2p_guard(
+        recv, send, conn, endpoint,
+    )))
 }
 
 /// Runtime path information for an active P2P (iroh QUIC) connection.
