@@ -487,6 +487,10 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--keep-sandboxes` | `false` (`RUSTY_GRID_KEEP_SANDBOXES`, `[worker].keep_sandboxes`) | Retain task sandbox directories after execution for debugging (skips both per-task teardown and the worker start-up leftover-sandbox sweep; a later worker start on the same `--sandbox-base-dir` without `--keep-sandboxes` sweeps any unlocked retained `<task_id>` directories) |
 | `--blob-cache-mb <MB>` | `2048` (`RUSTY_GRID_BLOB_CACHE_MB`, `[worker].blob_cache_mb`) | Megabytes of task input/output blobs cached in `<sandbox_base_dir>/cache/blobs` |
 | `--output-limit-mb <MB>` | `1024` (`RUSTY_GRID_OUTPUT_LIMIT_MB`, `[worker].output_limit_mb`) | Maximum megabytes of output files one task may return |
+| `--workspaces` | `false` (`RUSTY_GRID_WORKSPACES`, `[worker].workspaces`) | Enable persistent named workspaces on this worker ([design 0039](docs/design/0039-agent-workspaces.md)): opens the workspace store at start-up (refusing to start if the root fails the private-directory checks) and advertises `ProtocolCapabilities::WORKSPACES` (`feat:workspaces`) |
+| `--workspace-root <PATH>` | `<cache dir>/oxideswarm/workspaces` (`$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows; `RUSTY_GRID_WORKSPACE_ROOT`, `[worker].workspace_root`) | Root directory of the persistent named workspace store |
+| `--workspace-limit-mb <N>` | `20480` (`RUSTY_GRID_WORKSPACE_LIMIT_MB`, `[worker].workspace_limit_mb`) | Per-workspace disk quota in MiB (minimum `1`); a workspace exceeding this limit after a run logs a warning to the task's `stderr` and is evicted first when idle |
+| `--max-workspaces <N>` | `8` (`RUSTY_GRID_MAX_WORKSPACES`, `[worker].max_workspaces`) | Maximum number of persistent workspaces kept on disk before idle least-recently-used eviction (minimum `1`) |
 | `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `0.0.0.0:8080` |
 | `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
@@ -691,6 +695,10 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion (`--keep-sandboxes`) |
 | `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default `2048`) |
 | `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default `1024`) |
+| `RUSTY_GRID_WORKSPACES` | Worker | Enables persistent named workspaces on the worker (`--workspaces`, `[worker].workspaces`; default `false`, [design 0039](docs/design/0039-agent-workspaces.md)) |
+| `RUSTY_GRID_WORKSPACE_ROOT` | Worker | Root directory of the persistent workspace store (`--workspace-root`, `[worker].workspace_root`; default `<cache dir>/oxideswarm/workspaces`) |
+| `RUSTY_GRID_WORKSPACE_LIMIT_MB` | Worker | Per-workspace disk quota in MiB (`--workspace-limit-mb`, `[worker].workspace_limit_mb`; default `20480`) |
+| `RUSTY_GRID_MAX_WORKSPACES` | Worker | Maximum persistent workspaces retained on disk before idle LRU eviction (`--max-workspaces`, `[worker].max_workspaces`; default `8`) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
 | `RUSTY_GRID_NO_BATTERY` | Worker | Disables host battery and thermal probing in `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0028](docs/design/0028-host-battery-probe-override.md)) |
 | `RUSTY_GRID_SESSION_RESUME_GRACE_SECS` | Worker | Optional upper bound in seconds on how long the worker keeps running tasks alive across a disconnect (`--session-resume-grace-secs`, `[worker].session_resume_grace_secs`; clamped to `hold - dead_peer_timeout - 3 s`, `0` disables worker session resume, [design 0046](docs/design/0046-master-durability.md)) |
@@ -700,7 +708,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | :--- | :--- | :--- |
 | `RUSTY_GRID_TASK_ID` | Task Runner | UUIDv4 string of the currently executing task (injected into child env) |
 | `RUSTY_GRID_WORKER_ID` | Task Runner | UUIDv4 string of the assigned worker node |
-| `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory |
+| `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory (or the workspace `tree/` directory for workspace tasks) |
+| `RUSTY_GRID_WORKSPACE` | Task Runner | Workspace name when the task runs inside a persistent named workspace (`Task::workspace`) |
+| `RUSTY_GRID_WORKSPACE_DIR` | Task Runner | Absolute path to `<workspace_root>/<name>/tree` when the task runs inside a persistent named workspace |
 
 #### Tier E: Subnet Discovery & Network Helpers
 | Variable | Component | Purpose |

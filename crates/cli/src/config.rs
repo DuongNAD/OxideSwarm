@@ -150,6 +150,14 @@ pub struct WorkerFileConfig {
     pub blob_cache_mb: Option<u64>,
     /// Megabytes of output files one task may bring back (`worker --output-limit-mb`).
     pub output_limit_mb: Option<u64>,
+    /// Enable persistent named workspaces on this worker (`worker --workspaces`).
+    pub workspaces: Option<bool>,
+    /// Root directory of the persistent workspace store (`worker --workspace-root`).
+    pub workspace_root: Option<String>,
+    /// Per-workspace disk quota in MiB (`worker --workspace-limit-mb`, default 20480).
+    pub workspace_limit_mb: Option<u64>,
+    /// Maximum number of workspaces kept on disk before LRU eviction (`worker --max-workspaces`, default 8).
+    pub max_workspaces: Option<usize>,
     /// Leave out the standby portal on :8080 (`worker --no-portal`).
     pub no_portal: Option<bool>,
     pub cores: Option<usize>,

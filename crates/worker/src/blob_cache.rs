@@ -373,7 +373,7 @@ impl BlobCache {
         crate::sandbox::set_permissions(dest, if executable { 0o755 } else { 0o644 })
     }
 
-    fn drop_corrupt(&self, id: &BlobId) {
+    pub(crate) fn drop_corrupt(&self, id: &BlobId) {
         warn!(blob = %id, "Cached blob no longer matches its id; dropping it");
         let mut inner = self.lock();
         let _ = std::fs::remove_file(self.object_path(id));
@@ -425,6 +425,26 @@ impl BlobCache {
             );
         }
         total_evicted
+    }
+}
+
+impl crate::workspace::BlobSource for BlobCache {
+    fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {
+        let path = self.object_path(id);
+        match File::open(&path) {
+            Ok(file) => {
+                self.lock().touch(id);
+                Ok(Box::new(file))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.lock().remove(id);
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("blob {id} is not in the worker's blob cache"),
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
