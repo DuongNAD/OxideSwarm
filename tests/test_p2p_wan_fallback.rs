@@ -628,10 +628,7 @@ async fn test_p2p_client_submits_task_and_downloads_output_and_refuses_without_s
         .await
         .expect("connect P2P client with secret");
 
-    #[cfg(unix)]
     let spec = TaskSpec::shell_script("cp in.txt out.txt && echo p2p-done");
-    #[cfg(windows)]
-    let spec = TaskSpec::shell_script("copy /Y in.txt out.txt && echo p2p-done");
 
     let task = Task::new(spec, TaskRequirements::generic(1, 10))
         .with_inputs(prepared.inputs)
