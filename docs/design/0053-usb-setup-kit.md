@@ -209,5 +209,5 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
 
   It was tested from a 16 GB exFAT stick on macOS (Apple M5) and on Windows 11 (Intel Core
   i7-1355U) against a demo cluster with a throw-away secret. The worker joined, and the probe
-  tasks of the doctor checks completed without errors. The installer waits for `state:connected` in `workers --json`, because the plain
+  tasks of the doctor checks completed without errors, and the uninstaller stopped it. The installer waits for `state:connected` in `workers --json`, because the plain
   listing also showed disconnected workers (fixed in `oxideswarm workers`).

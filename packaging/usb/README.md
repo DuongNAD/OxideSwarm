@@ -66,4 +66,4 @@ Each installer does the following, without administrator rights:
 
 `python3 tests/test_launcher_scripts.py` (class `UsbKitTests`) runs `make_kit.sh`, `install.sh` and
 `uninstall.sh` against fake binaries in a private home directory, on Linux and macOS. The Windows
-scripts were run by hand on Windows 11 on 2026-11-09: `install.ps1` from a stick; `uninstall.ps1` still needs that run.
+scripts were run by hand from a stick on Windows 11 on 2026-11-09: `install.ps1` joined the worker, and `uninstall.ps1` stopped it.
