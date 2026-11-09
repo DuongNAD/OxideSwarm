@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrading
 
-This release changes the wire protocol: the master's `PROTOCOL_VERSION_CURRENT` is now 6
+This release changes the wire protocol: the master's `PROTOCOL_VERSION_CURRENT` is now 7
 (`crates/core/src/protocol.rs`), and a peer outside the supported range is refused. Upgrade and
 restart the master first, then the workers and clients ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5).
 A master that already has a format-1 `--state-dir` must be stopped cleanly (`SIGTERM`, so it writes

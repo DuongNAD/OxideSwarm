@@ -9,6 +9,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -21,7 +22,21 @@ use rusty_grid_core::task::{
     validate_relative_sandbox_path, OutputArtifact, StagedFile, MAX_AGGREGATE_STAGED_BYTES,
     MAX_STAGED_FILE_BYTES,
 };
-use rusty_grid_core::transport::configure_tcp_stream;
+use rusty_grid_core::transport::{configure_tcp_stream, GridStream};
+
+static CLIENT_P2P_MINIMAL_FOR_TESTING: AtomicBool = AtomicBool::new(false);
+
+/// Forces client P2P connections in [`connect_master`] to use `iroh::endpoint::presets::Minimal`
+/// during in-process integration tests.
+pub fn set_client_p2p_minimal_preset_for_testing(enabled: bool) {
+    CLIENT_P2P_MINIMAL_FOR_TESTING.store(enabled, Ordering::Relaxed);
+}
+
+fn client_p2p_minimal_preset() -> bool {
+    cfg!(test)
+        || CLIENT_P2P_MINIMAL_FOR_TESTING.load(Ordering::Relaxed)
+        || crate::cli_app::resolve_p2p_minimal()
+}
 
 /// TCP port of the Master's grid listener (workers and clients).
 pub const DEFAULT_MASTER_PORT: u16 = 8088;
@@ -42,6 +57,18 @@ fn is_auto(addr: &str) -> bool {
     addr.eq_ignore_ascii_case("auto") || addr.to_ascii_lowercase().starts_with("auto:")
 }
 
+/// Returns `true` when `addr` is an iroh P2P ticket (`EndpointAddr` JSON starting with `{`,
+/// bech32 `node1...` ticket, or any string accepted by `parse_p2p_ticket`).
+pub fn is_p2p_ticket(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    trimmed.starts_with('{')
+        || (trimmed.starts_with("node1")
+            && trimmed.len() > 32
+            && !trimmed.contains(':')
+            && !trimmed.contains('.'))
+        || (!trimmed.is_empty() && rusty_grid_core::transport::parse_p2p_ticket(trimmed).is_ok())
+}
+
 /// Whether a worker or client must hold a cluster secret to talk to `master_addr`.
 ///
 /// True for everything except a master on this very machine: `auto` (UDP discovery picks whoever
@@ -55,7 +82,7 @@ fn is_auto(addr: &str) -> bool {
 /// stdin of every submitted task. The CLI therefore refuses to continue without a secret in these
 /// cases unless `--insecure` is given (see `crate::secret_cmd::decide_peer_secret`).
 pub fn master_requires_secret(master_addr: &str, via_p2p_ticket: bool) -> bool {
-    if via_p2p_ticket {
+    if via_p2p_ticket || is_p2p_ticket(master_addr) {
         return true;
     }
     let addr = normalize_master_addr(master_addr);
@@ -79,11 +106,13 @@ pub fn master_requires_secret(master_addr: &str, via_p2p_ticket: bool) -> bool {
 }
 
 /// Completes a `--master` value: a bare host or IP gets the default grid port (`192.168.1.5` ->
-/// `192.168.1.5:8088`, `::1` -> `[::1]:8088`). `host:port`, `[v6]:port`, and the discovery
-/// keywords `auto` / `auto:<udp port>` are returned unchanged (trimmed), as is an empty string.
+/// `192.168.1.5:8088`, `::1` -> `[::1]:8088`). `host:port`, `[v6]:port`, P2P tickets, and the
+/// discovery keywords `auto` / `auto:<udp port>` are returned unchanged (trimmed), as is an empty
+/// string.
 pub fn normalize_master_addr(addr: &str) -> String {
     let addr = addr.trim();
-    if addr.is_empty() || is_auto(addr) || addr.parse::<SocketAddr>().is_ok() {
+    if addr.is_empty() || is_auto(addr) || is_p2p_ticket(addr) || addr.parse::<SocketAddr>().is_ok()
+    {
         return addr.to_string();
     }
     if let Ok(ip) = addr.parse::<IpAddr>() {
@@ -107,6 +136,9 @@ pub fn normalize_master_addr(addr: &str) -> String {
 /// guessed address: it would hide that no (authentic) master answered.
 pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> GridResult<String> {
     let addr = addr.trim();
+    if is_p2p_ticket(addr) {
+        return Ok(addr.to_string());
+    }
     if !is_auto(addr) {
         return Ok(normalize_master_addr(addr));
     }
@@ -148,11 +180,11 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
 
 /// Connects to the Master at `addr` and, when a `secret` is given, authenticates with it.
 ///
-/// This is the single entry point for client commands: it resolves `auto` and bare hosts
-/// ([`resolve_master_addr`]), connects with a timeout, applies the grid's TCP options
-/// (`configure_tcp_stream`: nodelay + keepalive), runs the cluster handshake
-/// (`rusty_grid_core::cluster_auth::client_handshake`) and returns the transport, ready for
-/// `ClientMessage`s.
+/// This is the single entry point for client commands: it dials P2P tickets directly over iroh
+/// (`STREAM_CLIENT`) or resolves `auto` and bare hosts ([`resolve_master_addr`]), connects with a
+/// timeout, applies the grid's TCP options (`configure_tcp_stream`: nodelay + keepalive), runs the
+/// cluster handshake (`rusty_grid_core::cluster_auth::client_handshake`) and returns the
+/// transport, ready for `ClientMessage`s.
 ///
 /// Errors: `ConnectionFailed("Failed to connect to Master at ...")` when the socket cannot be
 /// opened, `AuthFailed` / `AuthRequired` when the Master rejects the secret or the Master does not
@@ -180,36 +212,79 @@ pub fn resolve_client_wire_codec() -> GridResult<rusty_grid_core::protocol::Wire
 pub async fn connect_master(
     addr: &str,
     secret: Option<&ClusterSecret>,
-) -> GridResult<MessageTransport<TcpStream>> {
+) -> GridResult<MessageTransport<GridStream>> {
     let codec = resolve_client_wire_codec()?;
-    let addr = resolve_master_addr(addr, secret).await?;
+    let trimmed = addr.trim();
 
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            return Err(GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {addr}: {e}"
-            )))
-        }
-        Err(_) => {
-            return Err(GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {addr}: timed out after {}s",
-                CONNECT_TIMEOUT.as_secs()
-            )))
-        }
+    let (addr, stream, via_p2p) = if is_p2p_ticket(trimmed) {
+        let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(trimmed)?;
+        let label = format!("iroh://{}", endpoint_addr.id);
+        let minimal = client_p2p_minimal_preset();
+        let stream = rusty_grid_core::transport::connect_p2p_client_stream(
+            endpoint_addr,
+            CONNECT_TIMEOUT,
+            minimal,
+        )
+        .await
+        .map_err(|e| match e {
+            GridError::Timeout { duration_secs, .. } => GridError::ConnectionFailed(format!(
+                "Failed to connect to Master at {label}: timed out after {duration_secs}s"
+            )),
+            GridError::ConnectionFailed(detail) => GridError::ConnectionFailed(format!(
+                "Failed to connect to Master at {label}: {detail}"
+            )),
+            other => other,
+        })?;
+        (label, stream, true)
+    } else {
+        let addr = resolve_master_addr(trimmed, secret).await?;
+        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return Err(GridError::ConnectionFailed(format!(
+                    "Failed to connect to Master at {addr}: {e}"
+                )))
+            }
+            Err(_) => {
+                return Err(GridError::ConnectionFailed(format!(
+                    "Failed to connect to Master at {addr}: timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        // Best effort: a failure here only costs latency / dead-peer detection.
+        let _ = configure_tcp_stream(&stream);
+        (addr, GridStream::Tcp(stream), false)
     };
-    // Best effort: a failure here only costs latency / dead-peer detection.
-    let _ = configure_tcp_stream(&stream);
+
+    let upgrade_hint = |detail: &str| {
+        GridError::ConnectionFailed(format!(
+            "Failed to connect to Master at {addr}: the reply to the protocol version check could not be read ({detail}). If the Master is running an older or newer build, upgrade both Master and CLI to protocol version {}",
+            rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+        ))
+    };
 
     let mut transport = MessageTransport::with_codec(stream, codec);
     if let Some(secret) = secret {
-        let session_key =
-            tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
-                .await
-                .map_err(|_| GridError::Timeout {
-                    operation: "cluster_authentication".into(),
-                    duration_secs: AUTH_TIMEOUT.as_secs(),
-                })??;
+        let hs_res = tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
+            .await
+            .map_err(|_| GridError::Timeout {
+                operation: "cluster_authentication".into(),
+                duration_secs: AUTH_TIMEOUT.as_secs(),
+            })?;
+        let session_key = match hs_res {
+            Ok(key) => key,
+            Err(GridError::HandshakeFailed(detail)) if via_p2p => {
+                return Err(upgrade_hint(&detail));
+            }
+            Err(GridError::ConnectionClosed) if via_p2p => {
+                return Err(upgrade_hint("connection closed by peer"));
+            }
+            Err(GridError::Io(e)) if via_p2p => {
+                return Err(upgrade_hint(&e.to_string()));
+            }
+            Err(other) => return Err(other),
+        };
         transport.enable_encryption(&session_key, EndpointRole::Client);
     }
 
@@ -233,10 +308,9 @@ pub async fn connect_master(
             duration_secs: AUTH_TIMEOUT.as_secs(),
         })?
         .map_err(|e| match GridError::from(e) {
-            GridError::Framing(detail) => GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {addr}: the reply to the protocol version check could not be read ({detail}). If the Master is running an older or newer build, upgrade both Master and CLI to protocol version {}",
-                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
-            )),
+            GridError::Framing(detail) => upgrade_hint(&detail),
+            GridError::ConnectionClosed if via_p2p => upgrade_hint("connection closed by peer"),
+            GridError::Io(io_err) if via_p2p => upgrade_hint(&io_err.to_string()),
             other => other,
         })?;
     match probe_reply {
@@ -252,6 +326,7 @@ pub async fn connect_master(
             expected: "Hello".into(),
             actual: format!("{other:?}"),
         }),
+        None if via_p2p => Err(upgrade_hint("connection closed by peer")),
         None => Err(GridError::ConnectionClosed),
     }
 }
@@ -705,5 +780,54 @@ mod tests {
             .err()
             .expect("an unauthenticated probe must be rejected by a secret-requiring master");
         assert!(matches!(err, GridError::AuthRequired(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_is_p2p_ticket_and_config_target_master() {
+        let json_ticket = r#"{"id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","addrs":[{"Ip":"127.0.0.1:11223"}]}"#;
+        let bech32_ticket = "node1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        assert!(is_p2p_ticket(json_ticket));
+        assert!(is_p2p_ticket(bech32_ticket));
+        assert!(!is_p2p_ticket("127.0.0.1:8088"));
+        assert!(!is_p2p_ticket("node1:8088"));
+        assert!(!is_p2p_ticket("node1.local"));
+        assert!(!is_p2p_ticket("auto"));
+
+        // Even when a P2P ticket lists only 127.0.0.1, `master_requires_secret` must treat it as a
+        // ticket (`via_p2p_ticket`) and require a cluster secret.
+        assert!(master_requires_secret(json_ticket, false));
+        assert!(master_requires_secret(bech32_ticket, false));
+        assert_eq!(normalize_master_addr(json_ticket), json_ticket);
+        assert_eq!(normalize_master_addr(bech32_ticket), bech32_ticket);
+
+        let submit_with_ticket = crate::config::SubmitFileConfig {
+            master: None,
+            p2p_ticket: Some(json_ticket.to_string()),
+            timeout_secs: None,
+            secret_file: None,
+            secret: None,
+            insecure: None,
+        };
+        assert_eq!(
+            submit_with_ticket.target_master().as_deref(),
+            Some(json_ticket)
+        );
+        let submit_with_both = crate::config::SubmitFileConfig {
+            master: Some("10.0.0.1:8088".to_string()),
+            ..submit_with_ticket.clone()
+        };
+        assert_eq!(
+            submit_with_both.target_master().as_deref(),
+            Some(json_ticket)
+        );
+        let submit_with_master_only = crate::config::SubmitFileConfig {
+            master: Some("10.0.0.1:8088".to_string()),
+            p2p_ticket: None,
+            ..submit_with_ticket
+        };
+        assert_eq!(
+            submit_with_master_only.target_master().as_deref(),
+            Some("10.0.0.1:8088")
+        );
     }
 }

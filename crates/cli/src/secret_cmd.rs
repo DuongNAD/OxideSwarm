@@ -526,6 +526,7 @@ pub fn decide_peer_secret(
     insecure: bool,
     role: PeerRole,
 ) -> GridResult<PeerSecretOutcome> {
+    let via_p2p_ticket = via_p2p_ticket || crate::connect::is_p2p_ticket(master_addr);
     if secret.is_some() {
         return Ok(PeerSecretOutcome::Authenticated);
     }

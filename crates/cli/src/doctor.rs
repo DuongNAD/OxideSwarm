@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use rusty_grid_core::blob::TaskInput;
@@ -27,6 +26,7 @@ use rusty_grid_core::placement::{
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
+use rusty_grid_core::transport::GridStream;
 use rusty_grid_core::WorkerCapabilities;
 
 use crate::connect::{connect_master, describe_auth_error};
@@ -386,7 +386,7 @@ struct Probe {
 
 /// One request, one reply.
 async fn request(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     message: &ClientMessage,
 ) -> Result<ClientResponse, GridError> {
     transport.send_msg(message).await.map_err(GridError::from)?;
@@ -399,7 +399,7 @@ async fn request(
 
 /// Submits `task` without waiting for it.
 async fn submit(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     task: Task,
 ) -> Result<Result<TaskId, String>, GridError> {
     Ok(
@@ -414,7 +414,7 @@ async fn submit(
 /// Polls `GetTaskResult` for every task until each one finished or `timeout` passed; tasks still
 /// running then are cancelled.
 async fn collect(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     tasks: &[TaskId],
     timeout: Duration,
 ) -> Result<HashMap<TaskId, Collected>, GridError> {
@@ -423,7 +423,7 @@ async fn collect(
 
 /// [`collect`] with its own polling interval.
 async fn collect_with(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     tasks: &[TaskId],
     timeout: Duration,
     poll_interval: Duration,
@@ -926,7 +926,7 @@ fn throughput_task(worker_id: Uuid, os: &str, inputs: &[TaskInput], timeout: Dur
 async fn throughput_check(
     master_addr: &str,
     secret: Option<&ClusterSecret>,
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     options: &DoctorOptions,
     connected: &[WorkerSummary],
     report: &mut DoctorReport,
@@ -1066,7 +1066,7 @@ async fn throughput_check(
 
 /// C6: unpinned tasks spread over the workers.
 async fn spread_check(
-    transport: &mut MessageTransport<TcpStream>,
+    transport: &mut MessageTransport<GridStream>,
     options: &DoctorOptions,
     connected: &[WorkerSummary],
     report: &mut DoctorReport,
