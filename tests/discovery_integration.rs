@@ -20,7 +20,7 @@ use rusty_grid_worker::client::{spawn_worker_redirection_portal, WorkerClient, W
 #[tokio::test]
 async fn test_master_beacon_broadcast_and_unicast_query() {
     let discovery_port = 29001;
-    let master_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = ServerConfig::new(master_bind)
         .with_discovery(true)
         .with_discovery_port(discovery_port);
@@ -91,7 +91,7 @@ async fn test_master_beacon_broadcast_and_unicast_query() {
 #[tokio::test]
 async fn test_worker_e2e_connection_via_auto_discovery() {
     let discovery_port = 29002;
-    let master_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = ServerConfig::new(master_bind)
         .with_discovery(true)
         .with_discovery_port(discovery_port);
@@ -273,7 +273,7 @@ async fn test_worker_redirection_portal_with_auto_master() {
 
     let discovery_port = 29011;
     let portal_port = 29012;
-    let master_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = ServerConfig::new(master_bind)
         .with_discovery(true)
         .with_discovery_port(discovery_port);
