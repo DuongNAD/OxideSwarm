@@ -192,3 +192,8 @@ path = "../../tests/cli_join_e2e.rs"
 [[test]]
 name = "agent_workspace_e2e"
 path = "../../tests/agent_workspace_e2e.rs"
+
+[[test]]
+name = "enroll_v3_e2e"
+path = "../../tests/enroll_v3_e2e.rs"
+

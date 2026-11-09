@@ -45,6 +45,10 @@ pub struct ConfigFile {
     /// section (`[master]`, `[worker]`, `[client]`, `[submit]`, `[status]`) does not set its own.
     #[serde(default)]
     pub relay_url: Option<String>,
+    /// Optional pinned Master X25519 public key (64 hex chars) used as a top-level fallback for
+    /// OXS-AUTH v3 when a role section (`[worker]`, `[submit]`, `[status]`) does not set its own.
+    #[serde(default)]
+    pub master_key: Option<String>,
     #[serde(default)]
     pub master: Option<MasterFileConfig>,
     #[serde(default)]
@@ -63,6 +67,8 @@ pub struct ConfigFile {
 pub struct ClientFileConfig {
     /// Custom iroh relay URL (`https://...`) for client P2P connections.
     pub relay_url: Option<String>,
+    /// Pinned Master X25519 public key (64 hex chars) for OXS-AUTH v3 client connections.
+    pub master_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -108,6 +114,8 @@ pub struct MasterFileConfig {
     pub session_resume_hold_secs: Option<u64>,
     /// Allow a master that is reachable beyond this machine to run without a cluster secret.
     pub insecure: Option<bool>,
+    /// Authentication mode (`secret`, `members`, or `both`; `master --auth`).
+    pub auth: Option<String>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
 }
@@ -178,6 +186,8 @@ pub struct WorkerFileConfig {
     pub hardware: Option<WorkerHardwareConfig>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
+    /// Pinned Master X25519 public key (64 hex chars) for OXS-AUTH v3 (`--master-key`).
+    pub master_key: Option<String>,
     /// Allow connecting to a remote / `auto` / P2P master without a cluster secret.
     pub insecure: Option<bool>,
 }
@@ -191,6 +201,8 @@ pub struct SubmitFileConfig {
     pub timeout_secs: Option<u64>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
+    /// Pinned Master X25519 public key (64 hex chars) for OXS-AUTH v3 (`--master-key`).
+    pub master_key: Option<String>,
     /// Allow talking to a remote / `auto` master without a cluster secret.
     pub insecure: Option<bool>,
 }
@@ -221,6 +233,8 @@ pub struct StatusFileConfig {
     pub relay_url: Option<String>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
+    /// Pinned Master X25519 public key (64 hex chars) for OXS-AUTH v3 (`--master-key`).
+    pub master_key: Option<String>,
     /// Allow talking to a remote / `auto` master without a cluster secret.
     pub insecure: Option<bool>,
 }
@@ -366,6 +380,40 @@ impl ConfigFile {
             .or_else(|| non_empty(self.client.as_ref().and_then(|c| c.relay_url.as_deref())))
             .or_else(|| non_empty(self.submit.as_ref().and_then(|s| s.relay_url.as_deref())))
             .or_else(|| non_empty(self.relay_url.as_deref()))
+    }
+
+    /// Resolves the pinned `master_key` (64 hex chars) for `section`: the section's own key wins
+    /// over `[client]` (for client commands) and top-level `master_key`. Empty strings count as unset.
+    pub fn master_key(&self, section: SecretSection) -> Option<String> {
+        let non_empty = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match section {
+            SecretSection::Master => None,
+            SecretSection::Worker => {
+                non_empty(self.worker.as_ref().and_then(|w| w.master_key.as_deref()))
+                    .or_else(|| non_empty(self.master_key.as_deref()))
+            }
+            SecretSection::Submit => {
+                non_empty(self.submit.as_ref().and_then(|s| s.master_key.as_deref()))
+                    .or_else(|| {
+                        non_empty(self.client.as_ref().and_then(|c| c.master_key.as_deref()))
+                    })
+                    .or_else(|| non_empty(self.master_key.as_deref()))
+            }
+            SecretSection::Status => {
+                non_empty(self.status.as_ref().and_then(|s| s.master_key.as_deref()))
+                    .or_else(|| {
+                        non_empty(self.client.as_ref().and_then(|c| c.master_key.as_deref()))
+                    })
+                    .or_else(|| {
+                        non_empty(self.submit.as_ref().and_then(|s| s.master_key.as_deref()))
+                    })
+                    .or_else(|| non_empty(self.master_key.as_deref()))
+            }
+        }
     }
 }
 

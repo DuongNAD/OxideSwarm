@@ -17,12 +17,19 @@ use uuid::Uuid;
 use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS};
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::cluster_auth::{
-    send_reject, server_handshake, ClusterSecret, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
+    peek_hello_version, recv_auth_frame, reject_peer, send_reject, server_handshake_from_hello,
+    ClusterSecret, AUTH_VERSION, AUTH_VERSION_V3, REJECT_AUTH_FAILED, REJECT_AUTH_REQUIRED,
+    REJECT_MEMBERS_ONLY, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
 };
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
+use rusty_grid_core::noise_auth::{
+    master_noise_key_path, v3_server_confirm_first_record, v3_server_handshake_from_hello,
+    NodeKeypair, PublicKey,
+};
 use rusty_grid_core::protocol::{
-    format_incompatible_version_error, ClientMessage, ClientResponse, EndpointRole, InboundMessage,
-    ProtocolError,
+    deserialize_message, format_incompatible_version_error, ClientMessage, ClientResponse,
+    EndpointRole, InboundMessage, ProtocolCapabilities, ProtocolError, PROTOCOL_VERSION_CURRENT,
+    WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
@@ -32,6 +39,13 @@ use rusty_grid_core::transport::{
 use rusty_grid_core::{
     GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerCapabilities,
     WorkerMessage,
+};
+
+#[path = "members.rs"]
+pub mod members;
+pub use members::{
+    AuthMode, MemberEntry, MemberRole, MemberStore, MembersFile, MEMBERS_FILE_NAME,
+    MEMBERS_FILE_VERSION,
 };
 
 use crate::auth::DevBypass;
@@ -170,6 +184,14 @@ pub struct ServerConfig {
     /// True when `with_session_resume_hold` was called explicitly so `with_state_dir` does not
     /// overwrite an explicit `Duration::ZERO`.
     session_resume_hold_explicit: bool,
+    /// Master authentication mode (`--auth secret|members|both`, default: [`AuthMode::Both`]).
+    pub auth_mode: AuthMode,
+    /// Static X25519 key pair for OXS-AUTH v3 (`master_noise.key`).
+    pub master_noise_key: Option<NodeKeypair>,
+    /// Enrolled member list (`members.json`).
+    pub members: Arc<MemberStore>,
+    /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
+    members_explicit: bool,
 }
 
 impl Default for ServerConfig {
@@ -221,6 +243,10 @@ impl Default for ServerConfig {
             state_dir: None,
             session_resume_hold: Duration::ZERO,
             session_resume_hold_explicit: false,
+            auth_mode: AuthMode::default(),
+            master_noise_key: None,
+            members: Arc::new(MemberStore::new()),
+            members_explicit: false,
         }
     }
 }
@@ -503,6 +529,25 @@ impl ServerConfig {
         self.session_resume_hold_explicit = true;
         self
     }
+
+    /// Sets the master authentication mode (`secret`, `members`, or `both`).
+    pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
+        self.auth_mode = mode;
+        self
+    }
+
+    /// Sets the master's static X25519 key pair for OXS-AUTH v3 handshakes.
+    pub fn with_master_noise_key(mut self, key: NodeKeypair) -> Self {
+        self.master_noise_key = Some(key);
+        self
+    }
+
+    /// Sets the enrolled member store for OXS-AUTH v3 handshakes.
+    pub fn with_members(mut self, members: MemberStore) -> Self {
+        self.members = Arc::new(members);
+        self.members_explicit = true;
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -582,7 +627,7 @@ impl MasterServer {
 
     /// Full constructor with explicit subsystem references.
     pub async fn bind_full(
-        config: ServerConfig,
+        mut config: ServerConfig,
         registry: WorkerRegistry,
         queue: TaskQueue,
         scheduler_notify: Arc<tokio::sync::Notify>,
@@ -593,6 +638,34 @@ impl MasterServer {
             config.p2p_minimal_preset,
             config.p2p_relay_url.as_deref(),
         )?;
+
+        if !config.members_explicit {
+            if let Some(ref state_dir) = config.state_dir {
+                config.members = Arc::new(MemberStore::load_from_dir(Some(state_dir))?);
+            }
+        }
+        if config.master_noise_key.is_none() {
+            if let Some(ref state_dir) = config.state_dir {
+                if !config.ephemeral_key {
+                    if let Some(key_path) = master_noise_key_path(Some(state_dir)) {
+                        let (kp, _) = NodeKeypair::load_or_generate_file(&key_path)?;
+                        config.master_noise_key = Some(kp);
+                    }
+                }
+            }
+            if config.master_noise_key.is_none() {
+                config.master_noise_key = Some(NodeKeypair::generate()?);
+            }
+        }
+        if let Some(ref kp) = config.master_noise_key {
+            info!(
+                master_public_key = %kp.public_key().to_hex(),
+                fingerprint = %kp.fingerprint(),
+                auth_mode = %config.auth_mode,
+                members = config.members.len(),
+                "Master OXS-AUTH v3 identity ready"
+            );
+        }
 
         // Opened first: a store that cannot be used (e.g. `store.lock` held by another master)
         // must fail before `BlobStore::open` scans `blobs/` or purges `blobs/tmp/`, and before
@@ -860,6 +933,14 @@ impl MasterServer {
         let p2p_active_conns = Arc::clone(&server.p2p_active_conns);
         let p2p_ticket = server.p2p_ticket.clone();
         let blob_store = server.blob_store.clone();
+        let master_noise_public_key = server
+            .config
+            .master_noise_key
+            .as_ref()
+            .map(NodeKeypair::public_key)
+            .copied();
+        let auth_mode = server.config.auth_mode;
+        let members = Arc::clone(&server.config.members);
 
         #[cfg(feature = "dashboard")]
         let (dashboard_server_opt, broadcast_tx) = if enable_web_ui
@@ -1071,6 +1152,9 @@ impl MasterServer {
             p2p_active_conns,
             p2p_ticket: p2p_ticket.clone(),
             cluster_secret: config.cluster_secret.clone(),
+            master_noise_public_key,
+            auth_mode,
+            members,
             blob_store: blob_store.clone(),
         };
 
@@ -1510,6 +1594,11 @@ impl MasterServer {
             self.config.max_connections,
             self.config.max_pending_handshakes,
         );
+        let auth_ctx = MasterAuthContext {
+            auth_mode: self.config.auth_mode,
+            master_noise_key: self.config.master_noise_key.clone(),
+            members: Arc::clone(&self.config.members),
+        };
 
         #[cfg(feature = "p2p")]
         if let Some(endpoint) = self.p2p_endpoint {
@@ -1526,6 +1615,7 @@ impl MasterServer {
             let p2p_mapreduce_parallelism = self.config.mapreduce_parallelism;
             let p2p_limits = limits.clone();
             let p2p_blob_store = self.blob_store.clone();
+            let p2p_auth_ctx = auth_ctx.clone();
 
             tokio::spawn(async move {
                 let mut p2p_shutdown = p2p_shutdown_rx;
@@ -1557,6 +1647,7 @@ impl MasterServer {
                             let c_conns = Arc::clone(&p2p_conns);
                             let c_secret = p2p_secret.clone();
                             let c_blob_store = p2p_blob_store.clone();
+                            let c_auth_ctx = p2p_auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let c_bcast = p2p_broadcast_tx.clone();
 
@@ -1661,6 +1752,7 @@ impl MasterServer {
                                             abort_handle,
                                             c_codec,
                                             c_secret,
+                                            c_auth_ctx,
                                             Some(handshake_permit),
                                             c_blob_store,
                                             #[cfg(feature = "dashboard")]
@@ -1686,6 +1778,7 @@ impl MasterServer {
                                             abort_handle,
                                             c_codec,
                                             c_secret,
+                                            c_auth_ctx,
                                             Some(handshake_permit),
                                             p2p_mapreduce_parallelism,
                                             c_blob_store,
@@ -1748,6 +1841,7 @@ impl MasterServer {
                             let conn_secret = self.config.cluster_secret.clone();
                             let conn_mapreduce_parallelism = self.config.mapreduce_parallelism;
                             let conn_blob_store = self.blob_store.clone();
+                            let conn_auth_ctx = auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let conn_broadcast_tx = self.broadcast_tx.clone();
                             #[cfg(feature = "p2p")]
@@ -1770,6 +1864,7 @@ impl MasterServer {
                                     abort_handle,
                                     conn_wire_codec,
                                     conn_secret,
+                                    conn_auth_ctx,
                                     Some(handshake_permit),
                                     conn_mapreduce_parallelism,
                                     conn_blob_store,
@@ -3574,23 +3669,221 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     Ok(())
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct MasterAuthContext {
+    pub auth_mode: AuthMode,
+    pub master_noise_key: Option<NodeKeypair>,
+    pub members: Arc<MemberStore>,
+}
+
+async fn run_v3_auth_from_hello<S>(
+    transport: &mut MessageTransport<S>,
+    peer: &str,
+    lane: &str,
+    hello_frame: &[u8],
+    auth_ctx: &MasterAuthContext,
+    deadline: tokio::time::Instant,
+    handshake_timeout: Duration,
+) -> GridResult<(InboundMessage, WireCodec)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let timed_out = || GridError::Timeout {
+        operation: "handshake".into(),
+        duration_secs: handshake_timeout.as_secs(),
+    };
+    if !auth_ctx.auth_mode.allows_members() {
+        let err = tokio::time::timeout_at(
+            deadline,
+            reject_peer(
+                transport,
+                REJECT_AUTH_FAILED,
+                "peer attempted OXS-AUTH v3 on a master configured with --auth secret",
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| timed_out());
+        warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+        return Err(err);
+    }
+    let Some(ref master_key) = auth_ctx.master_noise_key else {
+        let err = tokio::time::timeout_at(
+            deadline,
+            reject_peer(
+                transport,
+                REJECT_AUTH_FAILED,
+                "peer attempted OXS-AUTH v3 but master has no master_noise.key configured",
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| timed_out());
+        warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+        return Err(err);
+    };
+    let members = Arc::clone(&auth_ctx.members);
+    let pending = match tokio::time::timeout_at(
+        deadline,
+        v3_server_handshake_from_hello(transport, hello_frame, master_key, |pk| {
+            members.contains(pk)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e @ (GridError::ConnectionClosed | GridError::Io(_)))) => {
+            debug!(remote = %peer, lane, error = %e, "Peer disconnected during OXS-AUTH v3 handshake");
+            return Err(e);
+        }
+        Ok(Err(e)) => {
+            warn!(remote = %peer, lane, error = %e, "OXS-AUTH v3 handshake failed; dropping connection");
+            return Err(e);
+        }
+        Err(_) => {
+            warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "OXS-AUTH v3 handshake timed out; dropping connection");
+            return Err(timed_out());
+        }
+    };
+
+    let (auth_peer, first_msg, codec) = match tokio::time::timeout_at(
+        deadline,
+        v3_server_confirm_first_record::<_, InboundMessage>(transport, pending),
+    )
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(GridError::IncompatibleVersion(message))) => {
+            warn!(
+                remote = %peer,
+                lane,
+                error = %message,
+                "Refusing v3 client connection with incompatible protocol version"
+            );
+            if let Some(detected) = transport.last_detected_codec() {
+                transport.set_outbound_codec(detected);
+            }
+            let err_resp = ClientResponse::Error {
+                message: message.clone(),
+            };
+            let _ =
+                tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp)).await;
+            return Err(GridError::IncompatibleVersion(message));
+        }
+        Ok(Err(e @ (GridError::ConnectionClosed | GridError::Io(_)))) => {
+            debug!(remote = %peer, lane, error = %e, "Peer closed connection before first encrypted v3 record");
+            return Err(e);
+        }
+        Ok(Err(e)) => {
+            warn!(remote = %peer, lane, error = %e, "First encrypted v3 record failed to decrypt or decode; dropping connection");
+            return Err(e);
+        }
+        Err(_) => {
+            warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Handshake watchdog timed out waiting for first v3 record");
+            return Err(timed_out());
+        }
+    };
+
+    debug!(
+        remote = %peer,
+        lane,
+        member_id = %auth_peer.member_id,
+        "Peer authenticated with OXS-AUTH v3 (Noise IK)"
+    );
+
+    match &first_msg {
+        InboundMessage::Worker(WorkerMessage::Register { worker_id, .. }) => {
+            let has_worker_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_worker_role());
+            if !has_worker_role {
+                let reason = "member does not have the worker role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    worker_id = %worker_id,
+                    "Refusing Register from v3 member without the worker role"
+                );
+                if codec == WireCodec::Json {
+                    transport.set_outbound_codec(WireCodec::Json);
+                }
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id: *worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(reason.clone()),
+                };
+                let _ =
+                    tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&reject_ack))
+                        .await;
+                return Err(GridError::AuthFailed(reason));
+            }
+        }
+        InboundMessage::Worker(_) => {
+            let has_worker_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_worker_role());
+            if !has_worker_role {
+                let reason = "member does not have the worker role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    "Refusing worker connection from v3 member without the worker role"
+                );
+                return Err(GridError::AuthFailed(reason));
+            }
+        }
+        InboundMessage::Client(_) => {
+            let has_client_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_client_role());
+            if !has_client_role {
+                let reason = "member does not have the client role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    "Refusing client connection from v3 member without the client role"
+                );
+                if codec == WireCodec::Json {
+                    transport.set_outbound_codec(WireCodec::Json);
+                }
+                let err_resp = ClientResponse::Error {
+                    message: format!("Authentication failed: {reason}"),
+                };
+                let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp))
+                    .await;
+                return Err(GridError::AuthFailed(reason));
+            }
+        }
+    }
+
+    Ok((first_msg, codec))
+}
+
 /// Authenticates a freshly accepted peer and reads its first protocol message, all inside one
 /// `handshake_timeout` window.
 ///
-/// With a `cluster_secret` the OXS-AUTH handshake (`rusty_grid_core::cluster_auth`) runs first and
-/// only a peer that proves knowledge of the secret gets to send a first `InboundMessage`; until
-/// then frames are capped at 1 KiB. Failures are logged with the peer address and the (secret-free)
-/// reason, and the connection is dropped, so no task is created and no worker registered.
+/// With a `cluster_secret` or enrolled `members`, the OXS-AUTH v2 or v3 handshake runs first and
+/// only an authenticated peer gets to send a first `InboundMessage`; until then frames are capped
+/// at 1 KiB. Failures are logged with the peer address and the (secret-free) reason, and the
+/// connection is dropped, so no task is created and no worker registered.
 ///
-/// Without a secret the first message is read as before, except that a peer that opens with an
-/// authentication HELLO is told `REJECT("server has no secret configured")` instead of being
-/// silently dropped, so a misconfigured worker gets an actionable error.
+/// Without a secret or required members, the first message is read as before, except that a peer
+/// that opens with a v2 authentication HELLO is told `REJECT("server has no secret configured")`
+/// instead of being silently dropped, so a misconfigured worker gets an actionable error.
 ///
 /// `lane` only labels the log lines ("connection" for TCP, "control stream" for QUIC).
 pub(crate) async fn authenticate_and_read_first_message<S>(
     transport: &mut MessageTransport<S>,
     peer: &str,
     cluster_secret: Option<&ClusterSecret>,
+    auth_ctx: &MasterAuthContext,
     handshake_timeout: Duration,
     lane: &str,
 ) -> GridResult<(InboundMessage, WireCodec)>
@@ -3602,74 +3895,239 @@ where
         operation: "handshake".into(),
         duration_secs: handshake_timeout.as_secs(),
     };
+    let effective_secret = if auth_ctx.auth_mode.allows_secret() {
+        cluster_secret
+    } else {
+        None
+    };
+    let requires_auth = effective_secret.is_some()
+        || auth_ctx.auth_mode == AuthMode::Members
+        || (auth_ctx.auth_mode.allows_members() && !auth_ctx.members.is_empty());
 
-    if let Some(secret) = cluster_secret {
-        match tokio::time::timeout_at(deadline, server_handshake(transport, secret)).await {
-            Ok(Ok(session_key)) => {
-                debug!(remote = %peer, lane, "Peer authenticated with the cluster secret");
-                transport.enable_encryption(&session_key, EndpointRole::Server);
+    if requires_auth {
+        let hello_frame = match tokio::time::timeout_at(deadline, recv_auth_frame(transport)).await
+        {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => {
+                debug!(remote = %peer, lane, "Peer disconnected during cluster authentication");
+                return Err(GridError::ConnectionClosed);
             }
-            Ok(Err(e @ (GridError::ConnectionClosed | GridError::Io(_)))) => {
-                debug!(remote = %peer, lane, error = %e, "Peer disconnected during cluster authentication");
-                return Err(e);
+            Ok(Err(ProtocolError::FrameTooLarge { max, .. })) => {
+                let err = tokio::time::timeout_at(
+                    deadline,
+                    reject_peer(
+                        transport,
+                        REJECT_AUTH_REQUIRED,
+                        format!("first frame exceeds the {max} byte pre-authentication limit"),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| timed_out());
+                warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+                return Err(err);
             }
             Ok(Err(e)) => {
-                warn!(remote = %peer, lane, error = %e, "Cluster authentication failed; dropping connection");
-                return Err(e);
+                let err: GridError = e.into();
+                if matches!(err, GridError::ConnectionClosed | GridError::Io(_)) {
+                    debug!(remote = %peer, lane, error = %err, "Peer disconnected during cluster authentication");
+                } else {
+                    warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+                }
+                return Err(err);
             }
             Err(_) => {
                 warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Cluster authentication timed out; dropping connection");
                 return Err(timed_out());
             }
-        }
-    }
+        };
 
-    match tokio::time::timeout_at(deadline, transport.recv_msg_with_codec::<InboundMessage>()).await
-    {
-        Ok(Ok(Some(first))) => Ok(first),
-        Ok(Ok(None)) => {
-            debug!(remote = %peer, lane, "Peer closed connection before handshake");
-            Err(GridError::ConnectionClosed)
+        match peek_hello_version(&hello_frame) {
+            Some(AUTH_VERSION_V3) => {
+                return run_v3_auth_from_hello(
+                    transport,
+                    peer,
+                    lane,
+                    &hello_frame,
+                    auth_ctx,
+                    deadline,
+                    handshake_timeout,
+                )
+                .await;
+            }
+            Some(AUTH_VERSION) if auth_ctx.auth_mode == AuthMode::Members => {
+                let err = tokio::time::timeout_at(
+                    deadline,
+                    reject_peer(
+                        transport,
+                        REJECT_MEMBERS_ONLY,
+                        "peer attempted OXS-AUTH v2 on a master configured with --auth members",
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| timed_out());
+                warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+                return Err(err);
+            }
+            Some(AUTH_VERSION) if effective_secret.is_none() => {
+                warn!(remote = %peer, lane, "Peer attempted cluster authentication but this master has no cluster secret configured; rejecting");
+                let _ = tokio::time::timeout(
+                    REFUSAL_DRAIN_TIMEOUT,
+                    send_reject(transport, REJECT_NO_SECRET),
+                )
+                .await;
+                return Err(GridError::AuthFailed(
+                    "peer requested cluster authentication but this master has no secret configured"
+                        .into(),
+                ));
+            }
+            _ => {
+                if let Some(secret) = effective_secret {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        server_handshake_from_hello(transport, &hello_frame, secret),
+                    )
+                    .await
+                    {
+                        Ok(Ok(session_key)) => {
+                            debug!(remote = %peer, lane, "Peer authenticated with the cluster secret");
+                            transport.enable_encryption(&session_key, EndpointRole::Server);
+                        }
+                        Ok(Err(e @ (GridError::ConnectionClosed | GridError::Io(_)))) => {
+                            debug!(remote = %peer, lane, error = %e, "Peer disconnected during cluster authentication");
+                            return Err(e);
+                        }
+                        Ok(Err(e)) => {
+                            warn!(remote = %peer, lane, error = %e, "Cluster authentication failed; dropping connection");
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Cluster authentication timed out; dropping connection");
+                            return Err(timed_out());
+                        }
+                    }
+                } else {
+                    let err = tokio::time::timeout_at(
+                        deadline,
+                        reject_peer(
+                            transport,
+                            REJECT_AUTH_REQUIRED,
+                            "first frame was not an authentication HELLO",
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| timed_out());
+                    warn!(remote = %peer, lane, error = %err, "Cluster authentication failed; dropping connection");
+                    return Err(err);
+                }
+            }
         }
-        // The peer opened with an authentication HELLO but we hold no secret to answer it.
-        Ok(Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))) if cluster_secret.is_none() => {
+
+        match tokio::time::timeout_at(deadline, transport.recv_msg_with_codec::<InboundMessage>())
+            .await
+        {
+            Ok(Ok(Some(first))) => Ok(first),
+            Ok(Ok(None)) => {
+                debug!(remote = %peer, lane, "Peer closed connection before handshake");
+                Err(GridError::ConnectionClosed)
+            }
+            Ok(Err(ProtocolError::IncompatibleVersion { peer_version, .. })) => {
+                let message = format_incompatible_version_error("client", peer_version);
+                warn!(
+                    remote = %peer,
+                    lane,
+                    peer_version,
+                    error = %message,
+                    "Refusing client connection with incompatible protocol version"
+                );
+                if let Some(detected) = transport.last_detected_codec() {
+                    transport.set_outbound_codec(detected);
+                }
+                let err_resp = ClientResponse::Error {
+                    message: message.clone(),
+                };
+                let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp))
+                    .await;
+                Err(GridError::IncompatibleVersion(message))
+            }
+            Ok(Err(e)) => {
+                warn!(remote = %peer, lane, error = %e, "Protocol error during handshake");
+                Err(e.into())
+            }
+            Err(_) => {
+                warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Handshake watchdog timed out");
+                Err(timed_out())
+            }
+        }
+    } else {
+        let raw_frame = match tokio::time::timeout_at(deadline, transport.recv_raw_frame()).await {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => {
+                debug!(remote = %peer, lane, "Peer closed connection before handshake");
+                return Err(GridError::ConnectionClosed);
+            }
+            Ok(Err(e)) => {
+                warn!(remote = %peer, lane, error = %e, "Protocol error during handshake");
+                return Err(e.into());
+            }
+            Err(_) => {
+                warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Handshake watchdog timed out");
+                return Err(timed_out());
+            }
+        };
+
+        if raw_frame.first() == Some(&WIRE_FORMAT_AUTH) {
+            if peek_hello_version(&raw_frame) == Some(AUTH_VERSION_V3) {
+                return run_v3_auth_from_hello(
+                    transport,
+                    peer,
+                    lane,
+                    &raw_frame,
+                    auth_ctx,
+                    deadline,
+                    handshake_timeout,
+                )
+                .await;
+            }
             warn!(remote = %peer, lane, "Peer attempted cluster authentication but this master has no cluster secret configured; rejecting");
             let _ = tokio::time::timeout(
                 REFUSAL_DRAIN_TIMEOUT,
                 send_reject(transport, REJECT_NO_SECRET),
             )
             .await;
-            Err(GridError::AuthFailed(
+            return Err(GridError::AuthFailed(
                 "peer requested cluster authentication but this master has no secret configured"
                     .into(),
-            ))
+            ));
         }
-        Ok(Err(ProtocolError::IncompatibleVersion { peer_version, .. })) => {
-            let message = format_incompatible_version_error("client", peer_version);
-            warn!(
-                remote = %peer,
-                lane,
-                peer_version,
-                error = %message,
-                "Refusing client connection with incompatible protocol version"
-            );
-            if let Some(detected) = transport.last_detected_codec() {
-                transport.set_outbound_codec(detected);
+
+        match deserialize_message::<InboundMessage>(&raw_frame) {
+            Ok(first) => Ok(first),
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                let message = format_incompatible_version_error("client", peer_version);
+                warn!(
+                    remote = %peer,
+                    lane,
+                    peer_version,
+                    error = %message,
+                    "Refusing client connection with incompatible protocol version"
+                );
+                if matches!(
+                    raw_frame.first().copied(),
+                    Some(WIRE_FORMAT_JSON | b'{' | b' ' | b'\t' | b'\r' | b'\n')
+                ) {
+                    transport.set_outbound_codec(WireCodec::Json);
+                }
+                let err_resp = ClientResponse::Error {
+                    message: message.clone(),
+                };
+                let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp))
+                    .await;
+                Err(GridError::IncompatibleVersion(message))
             }
-            let err_resp = ClientResponse::Error {
-                message: message.clone(),
-            };
-            let _ =
-                tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp)).await;
-            Err(GridError::IncompatibleVersion(message))
-        }
-        Ok(Err(e)) => {
-            warn!(remote = %peer, lane, error = %e, "Protocol error during handshake");
-            Err(e.into())
-        }
-        Err(_) => {
-            warn!(remote = %peer, lane, timeout_secs = handshake_timeout.as_secs(), "Handshake watchdog timed out");
-            Err(timed_out())
+            Err(e) => {
+                warn!(remote = %peer, lane, error = %e, "Protocol error during handshake");
+                Err(e.into())
+            }
         }
     }
 }
@@ -3831,6 +4289,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
+    auth_ctx: MasterAuthContext,
     handshake_permit: Option<OwnedSemaphorePermit>,
     mapreduce_parallelism: usize,
     blob_store: Option<Arc<BlobStore>>,
@@ -3864,6 +4323,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         abort_handle,
         wire_codec,
         cluster_secret,
+        auth_ctx,
         handshake_permit,
         blob_store,
         #[cfg(feature = "dashboard")]
@@ -3891,6 +4351,7 @@ async fn handle_multiplexed_connection<
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
+    auth_ctx: MasterAuthContext,
     handshake_permit: Option<OwnedSemaphorePermit>,
     blob_store: Option<Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
@@ -3923,6 +4384,7 @@ async fn handle_multiplexed_connection<
         abort_handle,
         wire_codec,
         cluster_secret,
+        auth_ctx,
         handshake_permit,
         blob_store,
         #[cfg(feature = "dashboard")]
@@ -4005,10 +4467,28 @@ pub struct MasterHandle {
     /// Master's active P2P ticket, if enabled.
     pub p2p_ticket: Option<String>,
     pub cluster_secret: Option<ClusterSecret>,
+    master_noise_public_key: Option<PublicKey>,
+    auth_mode: AuthMode,
+    members: Arc<MemberStore>,
     blob_store: Option<Arc<BlobStore>>,
 }
 
 impl MasterHandle {
+    /// Returns the master's OXS-AUTH v3 static X25519 public key, if configured.
+    pub fn master_noise_public_key(&self) -> Option<PublicKey> {
+        self.master_noise_public_key
+    }
+
+    /// Returns the configured [`AuthMode`] for this master.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.auth_mode
+    }
+
+    /// Returns the enrolled [`MemberStore`] for this master.
+    pub fn members(&self) -> &Arc<MemberStore> {
+        &self.members
+    }
+
     /// The blob store of task inputs and output files, if this master runs one.
     pub fn blob_store(&self) -> Option<&Arc<BlobStore>> {
         self.blob_store.as_ref()
@@ -5326,6 +5806,7 @@ mod tests {
                 None,
                 WireCodec::Bincode,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -5537,6 +6018,7 @@ mod tests {
                         None,
                         WireCodec::Bincode,
                         secret_clone,
+                        MasterAuthContext::default(),
                         None,
                         4,
                         None,
@@ -5575,6 +6057,7 @@ mod tests {
                         None,
                         WireCodec::Bincode,
                         secret_clone,
+                        MasterAuthContext::default(),
                         None,
                         None,
                         #[cfg(feature = "dashboard")]
@@ -5959,6 +6442,7 @@ mod tests {
                 None,
                 WireCodec::Json,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -6058,6 +6542,7 @@ mod tests {
                 None,
                 WireCodec::Bincode,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -7959,6 +8444,150 @@ mod tests {
         assert!(
             err.contains("minimal") && err.contains("relay"),
             "expected minimal+relay conflict error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_auth_role_check_and_members_only_mode() {
+        use super::members::{MemberEntry, MemberRole};
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose};
+        use rusty_grid_core::WorkerCapabilities;
+
+        let master_kp = NodeKeypair::generate().unwrap();
+        let worker_kp = NodeKeypair::generate().unwrap();
+        let client_only_kp = NodeKeypair::generate().unwrap();
+
+        let members = Arc::new(MemberStore::from_entries(vec![
+            MemberEntry::new(
+                "worker-a",
+                *worker_kp.public_key(),
+                vec![MemberRole::Worker],
+            ),
+            MemberEntry::new(
+                "client-only",
+                *client_only_kp.public_key(),
+                vec![MemberRole::Client],
+            ),
+        ]));
+        let secret = ClusterSecret::from_hex("0123456789abcdef0123456789abcdef").unwrap();
+
+        // 1. v3 peer without the `worker` role cannot Register.
+        let ctx_both = MasterAuthContext {
+            auth_mode: AuthMode::Both,
+            master_noise_key: Some(master_kp.clone()),
+            members: Arc::clone(&members),
+        };
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let client_pub = *master_kp.public_key();
+        let client_kp = client_only_kp.clone();
+        let client_task = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            let sk = v3_client_handshake(&mut t, &client_kp, &client_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            let reg = WorkerMessage::Register {
+                worker_id: Uuid::new_v4(),
+                capabilities: WorkerCapabilities::default(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            };
+            t.send_msg(&reg).await.unwrap();
+            t.recv_msg::<MasterMessage>().await.unwrap()
+        });
+
+        let mut st = MessageTransport::new(s_stream);
+        let server_res = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50000",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
+        .await;
+        let err = server_res.unwrap_err().to_string();
+        assert!(
+            err.contains("member does not have the worker role"),
+            "expected missing worker role error, got: {err}"
+        );
+        let ack = client_task.await.unwrap();
+        match ack {
+            Some(MasterMessage::RegisterAck {
+                accepted: false,
+                message: Some(msg),
+                ..
+            }) => assert!(msg.contains("worker role"), "got: {msg}"),
+            other => panic!("expected rejected RegisterAck, got: {other:?}"),
+        }
+
+        // 1b. v3 peer without the `client` (or `admin`) role cannot open a client session.
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let client_pub = *master_kp.public_key();
+        let worker_only = worker_kp.clone();
+        let worker_as_client_task = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            let sk =
+                v3_client_handshake(&mut t, &worker_only, &client_pub, HandshakePurpose::Member)
+                    .await
+                    .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::Hello).await.unwrap();
+            t.recv_msg::<ClientResponse>().await.unwrap()
+        });
+
+        let mut st = MessageTransport::new(s_stream);
+        let server_res = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50002",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
+        .await;
+        let err = server_res.unwrap_err().to_string();
+        assert!(
+            err.contains("member does not have the client role"),
+            "expected missing client role error, got: {err}"
+        );
+        let resp = worker_as_client_task.await.unwrap();
+        match resp {
+            Some(ClientResponse::Error { message }) => {
+                assert!(message.contains("client role"), "got: {message}");
+            }
+            other => panic!("expected ClientResponse::Error, got: {other:?}"),
+        }
+
+        // 2. With `--auth members`, a v2 secret peer is refused with REJECT_MEMBERS_ONLY.
+        let ctx_members = MasterAuthContext {
+            auth_mode: AuthMode::Members,
+            master_noise_key: Some(master_kp.clone()),
+            members: Arc::clone(&members),
+        };
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let secret_c = secret.clone();
+        let v2_client = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            client_handshake(&mut t, &secret_c).await
+        });
+        let mut st = MessageTransport::new(s_stream);
+        let v2_server = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50001",
+            Some(&secret),
+            &ctx_members,
+            Duration::from_secs(5),
+            "connection",
+        )
+        .await;
+        assert!(v2_server.is_err());
+        let v2_client_err = v2_client.await.unwrap().unwrap_err().to_string();
+        assert!(
+            v2_client_err
+                .contains("this master admits enrolled machines only; join with an invite"),
+            "expected members-only rejection reason, got: {v2_client_err}"
         );
     }
 }
