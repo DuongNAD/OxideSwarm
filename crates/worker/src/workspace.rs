@@ -886,6 +886,18 @@ impl WorkspaceGuard {
             .chain(st.pending_symlinks.iter())
             .cloned()
             .collect();
+        let folded_tracked_symlinks: HashSet<String> = was_tracked_symlink
+            .iter()
+            .map(|p| fold_blob_path(p))
+            .collect();
+        for (s, _, _) in &link_targets {
+            ensure_target_walks_no_on_disk_symlink(
+                &tree,
+                &s.path,
+                &s.target,
+                &folded_tracked_symlinks,
+            )?;
+        }
 
         // 1. pending paths, Syncing, flush.
         for p in &new_file_paths {
@@ -1116,8 +1128,10 @@ impl WorkspaceGuard {
         }
 
         let mut symlinks_out = BTreeMap::new();
+        let empty_set: HashSet<String> = HashSet::new();
         for (link, path, resolved) in &link_targets {
             ensure_parents(&tree, path, &link.path)?;
+            ensure_target_walks_no_on_disk_symlink(&tree, &link.path, &link.target, &empty_set)?;
             let target_is_dir = folded_manifest_dirs.contains(&fold_blob_path(resolved))
                 || is_real_dir(&tree.join(resolved));
             let tracked = was_tracked_symlink.contains(&link.path);
@@ -1293,6 +1307,57 @@ fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> 
 #[cfg(test)]
 thread_local! {
     static FORCE_SYMLINK_1314: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn ensure_target_walks_no_on_disk_symlink(
+    tree: &Path,
+    link_path: &str,
+    target: &str,
+    ignored_folded_symlinks: &HashSet<String>,
+) -> Result<(), WorkspaceError> {
+    let mut cur: Vec<&str> = link_path.split('/').collect();
+    cur.pop();
+    let check_cur = |segs: &[&str]| -> Result<(), WorkspaceError> {
+        if segs.is_empty() {
+            return Ok(());
+        }
+        let rel = segs.join("/");
+        if ignored_folded_symlinks.contains(&fold_blob_path(&rel)) {
+            return Ok(());
+        }
+        let mut disk_path = tree.to_path_buf();
+        for seg in segs {
+            disk_path.push(seg);
+        }
+        if let Ok(m) = fs::symlink_metadata(&disk_path) {
+            if is_link_like(&m) {
+                return Err(WorkspaceError::Path {
+                    path: link_path.to_string(),
+                    reason: format!(
+                        "symbolic link target '{target}' traverses through symbolic link '{rel}'"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    };
+    for len in 1..=cur.len() {
+        check_cur(&cur[..len])?;
+    }
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => check_cur(&cur)?,
+            ".." => {
+                cur.pop();
+                check_cur(&cur)?;
+            }
+            s => {
+                cur.push(s);
+                check_cur(&cur)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn symlink_kind_matches(meta: &fs::Metadata, target_is_dir: bool) -> bool {
@@ -2609,5 +2674,227 @@ mod tests {
         let meta = fs::symlink_metadata(g.tree_dir().join("alias")).unwrap();
         assert!(symlink_kind_matches(&meta, true));
         assert_eq!(read(&g, "alias/sub.txt"), "inside-dir");
+    }
+
+    #[test]
+    fn w11_symlinked_parent_left_by_task_refuses_links_and_empty_dirs_and_skips_deletes() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::create_dir(&probe_orig).unwrap();
+        if !crate::sandbox::try_create_test_symlink_dir(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("k", "keep", false)];
+        let m_with_link = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "sub/alias".to_string(),
+                target: "../k".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let m_with_empty = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["sub/empty".to_string()],
+        )
+        .unwrap();
+        let m_both = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "sub/alias".to_string(),
+                target: "../k".to_string(),
+            }],
+            vec!["sub/empty".to_string()],
+        )
+        .unwrap();
+        g.sync(&m_both, &Mem::new(v1_files)).unwrap();
+
+        // A task replaces `tree/sub` with a symlink to `victim` outside `tree/`.
+        let victim = td.path().join("victim");
+        fs::create_dir_all(victim.join("empty")).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_file(
+            Path::new("../k"),
+            &victim.join("alias")
+        ));
+        fs::remove_dir_all(g.tree_dir().join("sub")).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_dir(
+            &victim,
+            &g.tree_dir().join("sub")
+        ));
+
+        // Dropping `sub/alias` and `sub/empty` must NOT delete inside `victim` through `tree/sub`.
+        let m_only_k = manifest(v1_files);
+        g.sync(&m_only_k, &Mem::new(v1_files)).unwrap();
+        assert!(fs::symlink_metadata(victim.join("alias")).is_ok());
+        assert!(victim.join("empty").is_dir());
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("sub")).unwrap()
+        ));
+
+        // Placing a symlink or empty directory under `tree/sub` must fail without touching `victim`.
+        let _ = remove_symlink(&victim.join("alias"));
+        fs::remove_dir(victim.join("empty")).unwrap();
+        assert!(g.sync(&m_with_link, &Mem::new(v1_files)).is_err());
+        assert!(fs::symlink_metadata(victim.join("alias")).is_err());
+        assert!(g.sync(&m_with_empty, &Mem::new(v1_files)).is_err());
+        assert!(!victim.join("empty").exists());
+    }
+
+    #[test]
+    fn w11_switching_entry_between_directory_symlink_and_file_across_syncs() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        // Sync 1: `d` is a non-empty directory (`d/inside.txt`), `empty_d` is an empty directory,
+        // and `target.txt` is a regular file.
+        let v1_files: Files = &[
+            ("d/inside.txt", "in-d", false),
+            ("target.txt", "target-body", false),
+        ];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["empty_d".to_string()],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert!(g.tree_dir().join("d").is_dir());
+        assert!(g.tree_dir().join("empty_d").is_dir());
+
+        // Sync 2: `d` and `empty_d` both switch from directories to symlinks pointing to `target.txt`.
+        let v2_files: Files = &[("target.txt", "target-body", false)];
+        let m2 = TreeManifest::with_entries(
+            manifest(v2_files).into_files(),
+            vec![
+                BlobSymlink {
+                    path: "d".to_string(),
+                    target: "target.txt".to_string(),
+                },
+                BlobSymlink {
+                    path: "empty_d".to_string(),
+                    target: "target.txt".to_string(),
+                },
+            ],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m2, &Mem::new(v2_files)).unwrap();
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("d")).unwrap()
+        ));
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("empty_d")).unwrap()
+        ));
+        assert_eq!(read(&g, "d"), "target-body");
+        assert_eq!(read(&g, "empty_d"), "target-body");
+
+        // Sync 3: `d` switches from a symlink to a regular file, and `empty_d` switches from a
+        // symlink back to an empty directory.
+        let v3_files: Files = &[
+            ("d", "regular-d", false),
+            ("target.txt", "target-body", false),
+        ];
+        let m3 = TreeManifest::with_entries(
+            manifest(v3_files).into_files(),
+            vec![],
+            vec!["empty_d".to_string()],
+        )
+        .unwrap();
+        g.sync(&m3, &Mem::new(v3_files)).unwrap();
+        let d_meta = fs::symlink_metadata(g.tree_dir().join("d")).unwrap();
+        assert!(d_meta.is_file() && !is_link_like(&d_meta));
+        assert_eq!(read(&g, "d"), "regular-d");
+        let empty_meta = fs::symlink_metadata(g.tree_dir().join("empty_d")).unwrap();
+        assert!(empty_meta.is_dir() && !is_link_like(&empty_meta));
+    }
+
+    #[test]
+    fn w11_case_folded_symlink_chain_and_task_leftover_link_traversal_are_refused() {
+        // 1. In-manifest case-folded chain (`a/b/up -> ..` and `hop -> A/B/UP/../..`) is refused.
+        let res = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "a/b/up".to_string(),
+                    target: "..".to_string(),
+                },
+                BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "A/B/UP/../..".to_string(),
+                },
+            ],
+            vec![],
+        );
+        assert!(
+            res.is_err(),
+            "case-folded chain in manifest must be refused"
+        );
+
+        // 2. If a task leaves an untracked symlink `a/b/up -> ..` on disk in `tree/`, a later sync
+        //    introducing `hop -> a/b/up/../..` (and `hop -> A/B/UP/../..` on case-insensitive
+        //    filesystems) is refused before creating `hop`.
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::create_dir(&probe_orig).unwrap();
+        if !crate::sandbox::try_create_test_symlink_dir(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("a/b/keep.txt", "ok", false)];
+        g.sync(&manifest(v1_files), &Mem::new(v1_files)).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_dir(
+            Path::new(".."),
+            &g.tree_dir().join("a/b/up")
+        ));
+
+        let m_exact = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "hop".to_string(),
+                target: "a/b/up/../..".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let err_exact = g.sync(&m_exact, &Mem::new(v1_files)).unwrap_err();
+        assert!(
+            matches!(err_exact, WorkspaceError::Path { ref path, .. } if path == "hop"),
+            "expected WorkspaceError::Path for hop traversing on-disk link, got: {err_exact}"
+        );
+        assert!(fs::symlink_metadata(g.tree_dir().join("hop")).is_err());
+
+        if g.tree_dir().join("A/B/UP").exists() {
+            let m_folded = TreeManifest::with_entries(
+                manifest(v1_files).into_files(),
+                vec![BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "A/B/UP/../..".to_string(),
+                }],
+                vec![],
+            )
+            .unwrap();
+            let err_folded = g.sync(&m_folded, &Mem::new(v1_files)).unwrap_err();
+            assert!(
+                matches!(err_folded, WorkspaceError::Path { ref path, .. } if path == "hop"),
+                "expected WorkspaceError::Path for case-folded hop traversing on-disk link, got: {err_folded}"
+            );
+            assert!(fs::symlink_metadata(g.tree_dir().join("hop")).is_err());
+        }
     }
 }
