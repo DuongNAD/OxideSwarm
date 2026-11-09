@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::noise_auth::{
-    default_oxideswarm_dir, derive_pairing_code, verify_enroll_proof, KEY_LEN,
+    default_oxideswarm_dir, derive_pairing_code, verify_enroll_proof, verify_pairing_code, KEY_LEN,
 };
 pub use rusty_grid_core::noise_auth::{
     InviteSummary, MemberEntry, MemberRole, PendingEnrollmentInfo, PublicKey, RedactedBytes32,
@@ -810,6 +810,8 @@ impl MemberStore {
         &self,
         peer_public_key: PublicKey,
         handshake_hash: &[u8; KEY_LEN],
+        master_fingerprint: &str,
+        remote_addr: &str,
         invite_id: &str,
         proof: &RedactedBytes32,
         name: String,
@@ -900,6 +902,8 @@ impl MemberStore {
             roles: invite.roles.clone(),
             invite_id: invite.invite_id.clone(),
             pairing_code,
+            master_fingerprint: master_fingerprint.to_string(),
+            remote_addr: remote_addr.to_string(),
             requested_at: now,
             expires_at: now.saturating_add(PENDING_ENROLLMENT_TTL_SECS),
         };
@@ -935,9 +939,10 @@ impl MemberStore {
         list
     }
 
-    /// Approves a pending enrollment request by ID, prefix, or name (design 0051 D4/D5).
+    /// Approves a pending enrollment request by ID, prefix, or name after verifying the 6-digit
+    /// pairing check in constant time (design 0051 D4/D5).
     /// Consumes one use from the invite at approval time.
-    pub fn approve_pending(&self, target: &str) -> GridResult<MemberEntry> {
+    pub fn approve_pending(&self, target: &str, pairing_code: &str) -> GridResult<MemberEntry> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         guard.prune_pending(now);
@@ -950,6 +955,15 @@ impl MemberStore {
                 .map(|e| (e.info.pending_id.as_str(), e.info.name.as_str())),
             "pending enrollment",
         )?;
+        let expected_code_matches = guard
+            .pending
+            .get(&id)
+            .is_some_and(|e| verify_pairing_code(e.info.pairing_code.as_str(), pairing_code));
+        if !expected_code_matches {
+            return Err(GridError::Config(format!(
+                "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
+            )));
+        }
         let pending = guard
             .pending
             .remove(&id)
@@ -1305,6 +1319,8 @@ mod tests {
             .handle_enroll_request(
                 *cand1.public_key(),
                 &hash1,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50001",
                 &invite.invite_id,
                 &proof1,
                 "box-1".into(),
@@ -1316,6 +1332,8 @@ mod tests {
             .handle_enroll_request(
                 *cand2.public_key(),
                 &hash2,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50002",
                 &invite.invite_id,
                 &proof2,
                 "box-2".into(),
@@ -1347,8 +1365,23 @@ mod tests {
         ));
         assert_eq!(store.list_invites()[0].uses_remaining, 1);
 
-        // Approving the second takes the single use and enrolls box-2.
-        let enrolled = store.approve_pending("box-2").unwrap();
+        // Approving with a wrong pairing code is refused, keeps the request pending, and takes no use.
+        let code2 = derive_pairing_code(&hash2);
+        let wrong_code = if code2.as_str() == "000000" {
+            "999999"
+        } else {
+            "000000"
+        };
+        let wrong_err = store
+            .approve_pending(&pid2, wrong_code)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_err.contains("pairing code mismatch"));
+        assert_eq!(store.list_pending().len(), 1);
+        assert_eq!(store.list_invites()[0].uses_remaining, 1);
+
+        // Approving the second with the matching pairing code takes the single use and enrolls box-2.
+        let enrolled = store.approve_pending("box-2", code2.as_str()).unwrap();
         assert_eq!(enrolled.id, pid2);
         assert!(matches!(
             rx2.try_recv().unwrap(),

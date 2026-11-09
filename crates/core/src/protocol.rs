@@ -2113,8 +2113,12 @@ pub enum ClientMessage {
     ListMembers,
     /// Lists pending enrollment requests (design 0051 D5; requires `admin` role).
     ListPendingEnrollments,
-    /// Approves a pending enrollment request (design 0051 D4/D5; requires `admin` role).
-    ApproveEnrollment { pending_id: String },
+    /// Approves a pending enrollment request after verifying the 6-digit pairing check
+    /// (design 0051 D4/D5; requires `admin` role).
+    ApproveEnrollment {
+        pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
+    },
     /// Rejects a pending enrollment request (design 0051 D4/D5; requires `admin` role).
     RejectEnrollment { pending_id: String },
     /// Revokes an enrolled member by ID, prefix, or name (design 0051 D5; requires `admin` role).
@@ -2211,6 +2215,7 @@ enum HumanClientMessage {
     },
     ApproveEnrollment {
         pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
@@ -2302,6 +2307,7 @@ enum BinaryClientMessage {
     },
     ApproveEnrollment {
         pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
         protocol_version: u32,
     },
     RejectEnrollment {
@@ -2449,12 +2455,14 @@ impl HumanClientMessage {
             ClientMessage::ListPendingEnrollments => {
                 HumanClientMessage::ListPendingEnrollments { protocol_version }
             }
-            ClientMessage::ApproveEnrollment { pending_id } => {
-                HumanClientMessage::ApproveEnrollment {
-                    pending_id,
-                    protocol_version,
-                }
-            }
+            ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            } => HumanClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                protocol_version,
+            },
             ClientMessage::RejectEnrollment { pending_id } => {
                 HumanClientMessage::RejectEnrollment {
                     pending_id,
@@ -2594,12 +2602,14 @@ impl BinaryClientMessage {
             ClientMessage::ListPendingEnrollments => {
                 BinaryClientMessage::ListPendingEnrollments { protocol_version }
             }
-            ClientMessage::ApproveEnrollment { pending_id } => {
-                BinaryClientMessage::ApproveEnrollment {
-                    pending_id,
-                    protocol_version,
-                }
-            }
+            ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            } => BinaryClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                protocol_version,
+            },
             ClientMessage::RejectEnrollment { pending_id } => {
                 BinaryClientMessage::RejectEnrollment {
                     pending_id,
@@ -2733,9 +2743,14 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::ListPendingEnrollments { .. } => {
                 ClientMessage::ListPendingEnrollments
             }
-            HumanClientMessage::ApproveEnrollment { pending_id, .. } => {
-                ClientMessage::ApproveEnrollment { pending_id }
-            }
+            HumanClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                ..
+            } => ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            },
             HumanClientMessage::RejectEnrollment { pending_id, .. } => {
                 ClientMessage::RejectEnrollment { pending_id }
             }
@@ -2814,9 +2829,14 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::ListPendingEnrollments { .. } => {
                 ClientMessage::ListPendingEnrollments
             }
-            BinaryClientMessage::ApproveEnrollment { pending_id, .. } => {
-                ClientMessage::ApproveEnrollment { pending_id }
-            }
+            BinaryClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                ..
+            } => ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            },
             BinaryClientMessage::RejectEnrollment { pending_id, .. } => {
                 ClientMessage::RejectEnrollment { pending_id }
             }

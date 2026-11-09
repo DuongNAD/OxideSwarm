@@ -1380,16 +1380,23 @@ async fn run_join_invite(
             return ExitCode::from(AUTH_EXIT_CODE);
         }
         ClientResponse::EnrollPending { pending_id } => {
-            println!("Master key fingerprint: {}", token.master_key.fingerprint());
-            println!("Pairing code: {}", pairing_code.as_str());
+            let fp = token.master_key.fingerprint();
             println!(
-                "Pending enrollment ID: {pending_id} (waiting for admin approval: `oxideswarm members approve {pending_id}`)"
+                "Pairing code: {}  (Master key fingerprint: {fp})",
+                pairing_code.as_str()
+            );
+            println!(
+                "Pending enrollment ID: {pending_id} (waiting for admin approval: `oxideswarm members approve {pending_id} --code {}`)",
+                pairing_code.as_str()
             );
             None
         }
         ClientResponse::Enrolled { member_id, roles } => {
-            println!("Master key fingerprint: {}", token.master_key.fingerprint());
-            println!("Pairing code: {}", pairing_code.as_str());
+            let fp = token.master_key.fingerprint();
+            println!(
+                "Pairing code: {}  (Master key fingerprint: {fp})",
+                pairing_code.as_str()
+            );
             Some((member_id, roles))
         }
         other => {

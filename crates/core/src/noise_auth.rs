@@ -648,6 +648,8 @@ pub struct PendingEnrollmentInfo {
     pub roles: Vec<MemberRole>,
     pub invite_id: String,
     pub pairing_code: RedactedString,
+    pub master_fingerprint: String,
+    pub remote_addr: String,
     pub requested_at: u64,
     pub expires_at: u64,
 }
@@ -695,6 +697,21 @@ pub fn derive_pairing_code(handshake_hash: &[u8; KEY_LEN]) -> RedactedString {
     let b = d.as_ref();
     let code = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) % 1_000_000;
     RedactedString(format!("{code:06}"))
+}
+
+/// Verifies a 6-digit pairing check in constant time (ignoring surrounding whitespace and
+/// optional hyphens).
+pub fn verify_pairing_code(expected: &str, candidate: &str) -> bool {
+    let exp = expected.trim();
+    let cand: String = candidate.trim().chars().filter(|c| *c != '-').collect();
+    if exp.len() != 6 || cand.len() != 6 || !cand.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in exp.bytes().zip(cand.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -925,6 +942,7 @@ pub struct PendingV3Session {
     handshake_hash: [u8; KEY_LEN],
     peer_public_key: PublicKey,
     purpose: HandshakePurpose,
+    master_fingerprint: String,
 }
 
 impl fmt::Debug for PendingV3Session {
@@ -934,6 +952,7 @@ impl fmt::Debug for PendingV3Session {
             .field("handshake_hash", &"<redacted>")
             .field("peer_public_key", &self.peer_public_key)
             .field("purpose", &self.purpose)
+            .field("master_fingerprint", &self.master_fingerprint)
             .finish()
     }
 }
@@ -982,6 +1001,8 @@ pub struct AuthenticatedV3Peer {
     pub member_id: String,
     pub purpose: HandshakePurpose,
     pub handshake_hash: RedactedBytes32,
+    pub master_fingerprint: String,
+    pub remote_addr: String,
 }
 
 /// Runs the server (responder) side of the OXS-AUTH v3 handshake from the start of the stream.
@@ -1138,6 +1159,7 @@ where
         handshake_hash,
         peer_public_key,
         purpose,
+        master_fingerprint: master_key.fingerprint(),
     })
 }
 
@@ -1168,6 +1190,8 @@ where
                 public_key: pending.peer_public_key,
                 purpose: pending.purpose,
                 handshake_hash: RedactedBytes32(pending.handshake_hash),
+                master_fingerprint: pending.master_fingerprint.clone(),
+                remote_addr: String::new(),
             };
             Ok((auth_peer, msg, codec))
         }

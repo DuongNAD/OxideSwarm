@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::noise_auth::{
     invite_payload_check_hex, InviteSummary, MemberEntry, MemberRole, PendingEnrollmentInfo,
-    PublicKey, RedactedBytes32,
+    PublicKey, RedactedBytes32, RedactedString,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
 
@@ -815,8 +815,8 @@ pub enum MembersAction {
     List(MembersCommonArgs),
     /// List pending enrollment requests awaiting approval
     Pending(MembersCommonArgs),
-    /// Approve a pending enrollment request by its ID (or unique prefix)
-    Approve(MembersTargetArgs),
+    /// Approve a pending enrollment request by its ID (or unique prefix) and 6-digit pairing code
+    Approve(MembersApproveArgs),
     /// Reject a pending enrollment request by its ID (or unique prefix)
     Reject(MembersTargetArgs),
     /// Revoke an enrolled member by name or ID
@@ -827,6 +827,35 @@ pub enum MembersAction {
 
 #[derive(Parser, Debug, Clone)]
 pub struct MembersCommonArgs {
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        help = "Address of the Master's grid port (default 127.0.0.1:8088)"
+    )]
+    pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
+    #[arg(long, help = "Format output as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct MembersApproveArgs {
+    /// Pending enrollment ID (or unique hex prefix)
+    pub target: String,
+
+    #[arg(
+        long,
+        value_name = "NNNNNN",
+        help = "6-digit pairing code shown on the joining machine"
+    )]
+    pub code: String,
+
     #[arg(
         long,
         value_name = "HOST:PORT",
@@ -896,7 +925,8 @@ impl MembersAction {
             Self::List(a) | Self::Pending(a) => {
                 (a.master.clone(), a.relay_url.clone(), a.json, a.insecure)
             }
-            Self::Approve(a) | Self::Reject(a) | Self::Revoke(a) => {
+            Self::Approve(a) => (a.master.clone(), a.relay_url.clone(), a.json, a.insecure),
+            Self::Reject(a) | Self::Revoke(a) => {
                 (a.master.clone(), a.relay_url.clone(), a.json, a.insecure)
             }
             Self::Rename(a) => (a.master.clone(), a.relay_url.clone(), a.json, a.insecure),
@@ -935,6 +965,16 @@ async fn run_members_inner(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    if let MembersAction::Approve(ref a) = args.action {
+        let clean_code: String = a.code.trim().chars().filter(|c| *c != '-').collect();
+        if clean_code.len() != 6 || !clean_code.bytes().all(|b| b.is_ascii_digit()) {
+            eprintln!(
+                "--code: expected the 6-digit pairing code shown on the joining machine (for example --code 123456)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let (cli_master, _, json, insecure_flag) = args.action.common_opts();
     let connect_addr = resolve_admin_connect_addr(cli_master, config_file.as_ref());
     let insecure = peer_insecure(insecure_flag, cfg_client_insecure(config_file.as_ref()));
@@ -969,9 +1009,13 @@ async fn run_members_inner(
     let req = match &args.action {
         MembersAction::List(_) => ClientMessage::ListMembers,
         MembersAction::Pending(_) => ClientMessage::ListPendingEnrollments,
-        MembersAction::Approve(a) => ClientMessage::ApproveEnrollment {
-            pending_id: a.target.clone(),
-        },
+        MembersAction::Approve(a) => {
+            let clean_code: String = a.code.trim().chars().filter(|c| *c != '-').collect();
+            ClientMessage::ApproveEnrollment {
+                pending_id: a.target.clone(),
+                pairing_code: RedactedString(clean_code),
+            }
+        }
         MembersAction::Reject(a) => ClientMessage::RejectEnrollment {
             pending_id: a.target.clone(),
         },
@@ -1142,9 +1186,11 @@ fn render_pending_list(pending: &[PendingEnrollmentInfo], json: bool) {
             String::new()
         };
         println!(
-            "{}  code={}  name={}  os={}/{}  member_id={}  roles={}  invite={}{}",
+            "{}  code={}  master_fingerprint={}  from={}  name={}  os={}/{}  member_id={}  roles={}  invite={}{}",
             p.pending_id,
             p.pairing_code.as_str(),
+            p.master_fingerprint,
+            p.remote_addr,
             p.name,
             p.os,
             p.arch,

@@ -3756,6 +3756,8 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 match auth_ctx.members.handle_enroll_request(
                     peer.public_key,
                     peer.handshake_hash.as_bytes(),
+                    &peer.master_fingerprint,
+                    &peer.remote_addr,
                     &invite_id,
                     &proof,
                     name,
@@ -4045,8 +4047,14 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 )
                 .await?;
             }
-            ClientMessage::ApproveEnrollment { pending_id } => {
-                match auth_ctx.members.approve_pending(&pending_id) {
+            ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            } => {
+                match auth_ctx
+                    .members
+                    .approve_pending(&pending_id, pairing_code.as_str())
+                {
                     Ok(entry) => {
                         info!(
                             pending_id = %pending_id,
@@ -4354,7 +4362,7 @@ where
         }
     };
 
-    let (auth_peer, first_msg, codec) = match tokio::time::timeout_at(
+    let (mut auth_peer, first_msg, codec) = match tokio::time::timeout_at(
         deadline,
         v3_server_confirm_first_record::<_, InboundMessage>(transport, pending),
     )
@@ -4391,6 +4399,8 @@ where
             return Err(timed_out());
         }
     };
+
+    auth_peer.remote_addr = peer.to_string();
 
     debug!(
         remote = %peer,
@@ -9141,6 +9151,8 @@ mod tests {
         let ctx_both = MasterAuthContext {
             auth_mode: AuthMode::Both,
             master_noise_key: Some(master_kp.clone()),
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::clone(&members),
             p2p_ticket: None,
         };
@@ -9303,6 +9315,8 @@ mod tests {
         let ctx_members = MasterAuthContext {
             auth_mode: AuthMode::Members,
             master_noise_key: Some(master_kp.clone()),
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::clone(&members),
             p2p_ticket: None,
         };
