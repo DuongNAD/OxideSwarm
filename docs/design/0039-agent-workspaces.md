@@ -334,7 +334,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
-| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/worker/src/isolation.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Done (W2a + W2b; Windows isolation + workspaces deferred until FEAT-3c) |
+| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/worker/src/isolation.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Done (W2a + W2b, including Windows AppContainer isolation + workspaces) |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Done |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Done (`workspaces` lists the master's affinity map only, not the workspaces stored on workers, which needs W2b; `submit --workspace` warns when no connected worker advertises `WORKSPACES` yet) |
@@ -508,3 +508,10 @@ off by default until FEAT-3 is Implemented.
   to match the CLI and MCP commands, flags, cold/warm expected output, and deleted-file sync behavior
   verified in W6 (`tests/agent_workspace_e2e.rs`), with a placeholder section (`### Recorded
   two-machine run`) ready for the owner's live two-machine run.
+- 2026-11-09: Windows AppContainer isolation + `--workspaces` completed (`FEAT-3d`). Removed the
+  Windows `--workspaces` + `--isolation fs|fs+net` start-up and runner refusals (`client.rs`,
+  `runner.rs`), validated `workspace_root` with `validate_workspace_root_safe` (`isolation.rs`),
+  denied `<workspace_root>` (`(OI)(CI)`) to `oxideswarm.workspace.deny` while granting `<ws>/tree`
+  and `<ws>/tmp` to the per-task `oxideswarm.sandbox.<task_id>` SID without `DELETE` on the `tree`
+  and `tmp` directory nodes themselves, and added Windows workspace confinement and tree-swap
+  regression tests in `crates/worker/tests/test_feat3_os_isolation.rs`.
