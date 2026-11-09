@@ -44,10 +44,68 @@ pub const SANDBOX_ROOT: &str = ".";
 
 /// First bytes of a legacy v1 encoded [`TreeManifest`].
 const MANIFEST_MAGIC_V1: &[u8] = b"oxideswarm-tree/1\n";
-/// First bytes of every encoded [`TreeManifest`] (`oxideswarm-tree/2`, design 0039 W11).
+/// First bytes of every v2 encoded [`TreeManifest`] (`oxideswarm-tree/2`, design 0039 W11).
 const MANIFEST_MAGIC: &[u8] = b"oxideswarm-tree/2\n";
-/// Maximum symbolic link hops followed when validating in-tree link targets.
-const MAX_SYMLINK_HOPS: usize = 40;
+/// Maximum number of `oxideswarm-tree/2` manifest [`BlobId`]s cached in memory for capability
+/// negotiation.
+const MAX_TRACKED_V2_MANIFESTS: usize = 65_536;
+
+struct KnownV2Manifests {
+    set: HashSet<BlobId>,
+    order: std::collections::VecDeque<BlobId>,
+}
+
+static KNOWN_V2_MANIFESTS: std::sync::OnceLock<std::sync::Mutex<KnownV2Manifests>> =
+    std::sync::OnceLock::new();
+
+fn known_v2_manifests() -> &'static std::sync::Mutex<KnownV2Manifests> {
+    KNOWN_V2_MANIFESTS.get_or_init(|| {
+        std::sync::Mutex::new(KnownV2Manifests {
+            set: HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Records `id` as the [`BlobId`] of an `oxideswarm-tree/2` [`TreeManifest`] so the scheduler can
+/// require [`crate::protocol::ProtocolCapabilities::TREE_V2`].
+pub fn register_v2_manifest_blob(id: BlobId) {
+    let mut guard = known_v2_manifests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.set.insert(id) {
+        if guard.order.len() >= MAX_TRACKED_V2_MANIFESTS {
+            if let Some(evicted) = guard.order.pop_front() {
+                guard.set.remove(&evicted);
+            }
+        }
+        guard.order.push_back(id);
+    }
+}
+
+/// Returns `true` when `id` is known to be an `oxideswarm-tree/2` [`TreeManifest`].
+pub fn is_v2_manifest_blob(id: &BlobId) -> bool {
+    known_v2_manifests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set
+        .contains(id)
+}
+
+/// Returns a case-folded and canonically decomposed (Unicode NFD) representation of `s` for
+/// comparing paths across case-insensitive and normalization-insensitive filesystems (macOS
+/// APFS/HFS+ and Windows NTFS).
+pub fn fold_blob_path(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let nfd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd();
+    let lowered: String = nfd
+        .normalize_iter(s.chars())
+        .flat_map(char::to_lowercase)
+        .collect();
+    nfd.normalize_iter(lowered.chars()).collect()
+}
 
 /// BLAKE3 hash of a blob's content, its name everywhere. Text form: 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -432,13 +490,33 @@ impl TreeManifest {
         self.files.iter().map(|f| f.size).sum()
     }
 
-    /// The canonical `oxideswarm-tree/2` encoding (a fixed header, then bincode), which is what
-    /// the manifest's blob id names.
+    /// Returns `true` if this manifest uses `oxideswarm-tree/2` features (symbolic links or empty
+    /// directories).
+    pub fn is_v2(&self) -> bool {
+        !self.symlinks.is_empty() || !self.empty_dirs.is_empty()
+    }
+
+    /// Returns `true` if `bytes` begins with the `oxideswarm-tree/2` header.
+    pub fn is_v2_bytes(bytes: &[u8]) -> bool {
+        bytes.starts_with(MANIFEST_MAGIC)
+    }
+
+    /// The canonical manifest encoding (`oxideswarm-tree/1` when there are no symbolic links or
+    /// empty directories, `oxideswarm-tree/2` otherwise), which is what the manifest's blob id
+    /// names.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = MANIFEST_MAGIC.to_vec();
-        bincode::serialize_into(&mut out, &(&self.files, &self.symlinks, &self.empty_dirs))
-            .expect("serializing a manifest into memory cannot fail");
-        out
+        if self.is_v2() {
+            let mut out = MANIFEST_MAGIC.to_vec();
+            bincode::serialize_into(&mut out, &(&self.files, &self.symlinks, &self.empty_dirs))
+                .expect("serializing a manifest into memory cannot fail");
+            register_v2_manifest_blob(BlobId::of(&out));
+            out
+        } else {
+            let mut out = MANIFEST_MAGIC_V1.to_vec();
+            bincode::serialize_into(&mut out, &self.files)
+                .expect("serializing a manifest into memory cannot fail");
+            out
+        }
     }
 
     /// The blob id of [`TreeManifest::encode`].
@@ -456,6 +534,7 @@ impl TreeManifest {
                 bytes.len()
             ));
         }
+        let is_v2_header = Self::is_v2_bytes(bytes);
         use bincode::Options;
         let (files, symlinks, empty_dirs): (Vec<BlobFile>, Vec<BlobSymlink>, Vec<String>) =
             if let Some(body) = bytes.strip_prefix(MANIFEST_MAGIC) {
@@ -486,6 +565,9 @@ impl TreeManifest {
             empty_dirs,
         };
         manifest.validate()?;
+        if is_v2_header || manifest.is_v2() {
+            register_v2_manifest_blob(BlobId::of(bytes));
+        }
         Ok(manifest)
     }
 
@@ -504,7 +586,8 @@ impl TreeManifest {
         let mut all_paths = HashSet::with_capacity(total);
         let mut leaf_paths = HashSet::with_capacity(self.files.len() + self.symlinks.len());
         let mut empty_dir_set = HashSet::with_capacity(self.empty_dirs.len());
-        let mut link_map = std::collections::HashMap::with_capacity(self.symlinks.len());
+        let mut folded_links: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::with_capacity(self.symlinks.len());
 
         for file in &self.files {
             validate_blob_path(&file.path)?;
@@ -520,7 +603,14 @@ impl TreeManifest {
                 return Err(format!("path '{}' is listed twice", link.path));
             }
             leaf_paths.insert(link.path.as_str());
-            link_map.insert(link.path.as_str(), link.target.as_str());
+            let folded = fold_blob_path(&link.path);
+            if let Some(&prev) = folded_links.get(&folded) {
+                return Err(format!(
+                    "symbolic link '{}' collides with symbolic link '{prev}' after case/Unicode folding",
+                    link.path
+                ));
+            }
+            folded_links.insert(folded, link.path.as_str());
         }
         for dir in &self.empty_dirs {
             validate_blob_path(dir)?;
@@ -549,62 +639,102 @@ impl TreeManifest {
                     ));
                 }
             }
+            if !folded_links.is_empty() {
+                let folded_entry = fold_blob_path(entry_path);
+                for (pos, _) in folded_entry.match_indices('/') {
+                    let folded_parent = &folded_entry[..pos];
+                    if let Some(&link_path) = folded_links.get(folded_parent) {
+                        return Err(format!(
+                            "'{link_path}' is listed as a symbolic link and as the directory of '{entry_path}'"
+                        ));
+                    }
+                }
+            }
         }
         for link in &self.symlinks {
-            resolve_symlink_chain_in_tree(&link.path, &link.target, &link_map)?;
+            check_no_symlink_traversal(&link.path, &link.target, &folded_links)?;
         }
         Ok(())
     }
 }
 
-fn resolve_symlink_chain_in_tree(
+/// Checks in $O(|\text{link\_path}| + |\text{target}|)$ time that resolving `target` from the
+/// parent directory of `link_path` never steps onto or through any symbolic link in `folded_links`
+/// (compared after [`fold_blob_path`] case-folding and Unicode NFD decomposition).
+pub fn check_no_symlink_traversal(
     link_path: &str,
     target: &str,
-    link_map: &std::collections::HashMap<&str, &str>,
-) -> Result<String, String> {
-    let mut cur: Vec<&str> = link_path.split('/').collect();
-    cur.pop();
-    let mut queue: std::collections::VecDeque<&str> = target.split('/').collect();
-    let mut hops = 0usize;
-    while let Some(seg) = queue.pop_front() {
-        match seg {
+    folded_links: &std::collections::HashMap<String, &str>,
+) -> Result<(), String> {
+    let mut folded_buf = String::with_capacity(link_path.len() + target.len());
+    let mut slash_positions: Vec<usize> = Vec::new();
+    let mut link_segs = link_path.split('/').peekable();
+    while let Some(seg) = link_segs.next() {
+        if link_segs.peek().is_none() {
+            break;
+        }
+        slash_positions.push(folded_buf.len());
+        if !folded_buf.is_empty() {
+            folded_buf.push('/');
+        }
+        folded_buf.push_str(&fold_blob_path(seg));
+        if let Some(&other) = folded_links.get(folded_buf.as_str()) {
+            return Err(format!(
+                "symbolic link '{link_path}' sits under symbolic link '{other}'"
+            ));
+        }
+    }
+    for segment in target.split('/') {
+        match segment {
             "" => {
                 return Err(format!(
                     "symbolic link '{link_path}' target '{target}' has an empty segment"
                 ))
             }
-            "." => {}
+            "." => {
+                if !folded_buf.is_empty() {
+                    if let Some(&other) = folded_links.get(folded_buf.as_str()) {
+                        return Err(format!(
+                            "symbolic link '{link_path}' target '{target}' traverses through symbolic link '{other}'"
+                        ));
+                    }
+                }
+            }
             ".." => {
-                if cur.pop().is_none() {
+                let Some(prev_len) = slash_positions.pop() else {
                     return Err(format!(
                         "symbolic link '{link_path}' target '{target}' leaves the tree"
                     ));
+                };
+                folded_buf.truncate(prev_len);
+                if !folded_buf.is_empty() {
+                    if let Some(&other) = folded_links.get(folded_buf.as_str()) {
+                        return Err(format!(
+                            "symbolic link '{link_path}' target '{target}' traverses through symbolic link '{other}'"
+                        ));
+                    }
                 }
             }
             s => {
-                cur.push(s);
-                let candidate = cur.join("/");
-                if let Some(&next_target) = link_map.get(candidate.as_str()) {
-                    hops += 1;
-                    if hops > MAX_SYMLINK_HOPS {
-                        return Err(format!(
-                            "symbolic link '{link_path}' exceeds maximum symbolic link depth ({MAX_SYMLINK_HOPS})"
-                        ));
-                    }
-                    cur.pop();
-                    for next_seg in next_target.split('/').rev() {
-                        queue.push_front(next_seg);
-                    }
+                slash_positions.push(folded_buf.len());
+                if !folded_buf.is_empty() {
+                    folded_buf.push('/');
+                }
+                folded_buf.push_str(&fold_blob_path(s));
+                if let Some(&other) = folded_links.get(folded_buf.as_str()) {
+                    return Err(format!(
+                        "symbolic link '{link_path}' target '{target}' traverses through symbolic link '{other}'"
+                    ));
                 }
             }
         }
     }
-    if cur.is_empty() {
+    if folded_buf.is_empty() {
         return Err(format!(
             "symbolic link '{link_path}' target '{target}' points to the tree root itself"
         ));
     }
-    Ok(cur.join("/"))
+    Ok(())
 }
 
 /// Where a [`TaskInput`] comes from.
@@ -1010,7 +1140,9 @@ mod tests {
     fn manifest_decode_refuses_tampered_input() {
         let manifest = TreeManifest::new(vec![file("x", b"1"), file("y", b"2")]).unwrap();
         let encoded = manifest.encode();
-        assert!(encoded.starts_with(b"oxideswarm-tree/2\n"));
+        assert!(encoded.starts_with(b"oxideswarm-tree/1\n"));
+        assert!(!manifest.is_v2());
+        assert!(!is_v2_manifest_blob(&manifest.id()));
 
         assert!(TreeManifest::decode(b"not a manifest").is_err());
         assert!(TreeManifest::decode(&encoded[..encoded.len() - 3]).is_err());
@@ -1068,6 +1200,8 @@ mod tests {
         .unwrap();
         let encoded = m.encode();
         assert!(encoded.starts_with(b"oxideswarm-tree/2\n"));
+        assert!(m.is_v2());
+        assert!(is_v2_manifest_blob(&m.id()));
         let decoded = TreeManifest::decode(&encoded).unwrap();
         assert_eq!(decoded, m);
         assert_eq!(decoded.symlinks().len(), 2);
@@ -1108,13 +1242,54 @@ mod tests {
                     target: "..".to_string(), // resolves to "a" (depth 1)
                 },
                 BlobSymlink {
-                    path: " hop".trim().to_string(),
-                    target: "a/b/up/../..".to_string(), // follows "a/b/up" -> "a", then "../.." leaves tree
+                    path: "hop".to_string(),
+                    target: "a/b/up/../..".to_string(),
                 },
             ],
             vec![],
         );
         assert!(chain_escape.is_err(), "multi-hop escape must be refused");
+
+        // Case-folded multi-hop symlink chain (`a/b/up -> ..` and `hop -> A/B/UP/../..`) is refused.
+        let case_chain_escape = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "a/b/up".to_string(),
+                    target: "..".to_string(),
+                },
+                BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "A/B/UP/../..".to_string(),
+                },
+            ],
+            vec![],
+        );
+        assert!(
+            case_chain_escape.is_err(),
+            "case-folded link traversal must be refused"
+        );
+
+        // Unicode NFC/NFD multi-hop symlink traversal (`caf\u{00e9}/up -> ..` and
+        // `hop -> cafe\u{0301}/up/../..`) is refused.
+        let unicode_chain_escape = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "caf\u{00e9}/up".to_string(),
+                    target: "..".to_string(),
+                },
+                BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "cafe\u{0301}/up/../..".to_string(),
+                },
+            ],
+            vec![],
+        );
+        assert!(
+            unicode_chain_escape.is_err(),
+            "Unicode NFC/NFD link traversal must be refused"
+        );
 
         // Symlink loop is refused.
         let loop_res = TreeManifest::with_entries(
@@ -1132,6 +1307,36 @@ mod tests {
             vec![],
         );
         assert!(loop_res.is_err(), "symlink loop must be refused");
+
+        // DoS regression: 40 chained links + 1,000 compound links must be refused in < 50 ms.
+        let mut dos_links = Vec::with_capacity(1040);
+        for i in 0..39 {
+            dos_links.push(BlobSymlink {
+                path: format!("l{i}"),
+                target: format!("l{}", i + 1),
+            });
+        }
+        dos_links.push(BlobSymlink {
+            path: "l39".to_string(),
+            target: "real".to_string(),
+        });
+        for i in 0..1000 {
+            dos_links.push(BlobSymlink {
+                path: format!("p{i:04}"),
+                target: "l0/l0/l0/l0/l0".to_string(),
+            });
+        }
+        let t0 = std::time::Instant::now();
+        let dos_res = TreeManifest::with_entries(vec![], dos_links, vec![]);
+        let elapsed = t0.elapsed();
+        assert!(
+            dos_res.is_err(),
+            "chained link DoS manifest must be refused"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "validation took {elapsed:?}, expected < 50 ms"
+        );
 
         // Non-empty directory listed in empty_dirs or colliding with file/symlink is refused.
         assert!(TreeManifest::with_entries(

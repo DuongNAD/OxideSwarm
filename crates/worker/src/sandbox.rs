@@ -1126,15 +1126,18 @@ impl Drop for Sandbox {
 /// Environment variable that forces tests creating Windows symbolic links to
 /// fail rather than skip when the process lacks `SeCreateSymbolicLinkPrivilege`
 /// (`ERROR_PRIVILEGE_NOT_HELD`, OS error `1314`) and Developer Mode is off.
-#[doc(hidden)]
-pub const REQUIRE_SYMLINKS_ENV: &str = "RUSTY_GRID_REQUIRE_SYMLINKS";
+#[cfg(test)]
+pub(crate) const REQUIRE_SYMLINKS_ENV: &str = "RUSTY_GRID_REQUIRE_SYMLINKS";
 
+#[cfg(test)]
 const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 
+#[cfg(test)]
 fn require_symlinks_from_env() -> bool {
     std::env::var_os(REQUIRE_SYMLINKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
+#[cfg(test)]
 fn handle_test_symlink_result(
     res: std::io::Result<()>,
     original: &Path,
@@ -1169,8 +1172,8 @@ fn handle_test_symlink_result(
 /// returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`) and `RUSTY_GRID_REQUIRE_SYMLINKS=1`
 /// is not set, prints why to stderr and returns `false` so the caller can skip
 /// cleanly. Panics on any other error or when `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
-#[doc(hidden)]
-pub fn try_create_test_symlink_dir(original: &Path, link: &Path) -> bool {
+#[cfg(test)]
+pub(crate) fn try_create_test_symlink_dir(original: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let res = std::os::unix::fs::symlink(original, link);
     #[cfg(windows)]
@@ -1184,8 +1187,8 @@ pub fn try_create_test_symlink_dir(original: &Path, link: &Path) -> bool {
 /// returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`) and `RUSTY_GRID_REQUIRE_SYMLINKS=1`
 /// is not set, prints why to stderr and returns `false` so the caller can skip
 /// cleanly. Panics on any other error or when `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
-#[doc(hidden)]
-pub fn try_create_test_symlink_file(original: &Path, link: &Path) -> bool {
+#[cfg(test)]
+pub(crate) fn try_create_test_symlink_file(original: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let res = std::os::unix::fs::symlink(original, link);
     #[cfg(windows)]

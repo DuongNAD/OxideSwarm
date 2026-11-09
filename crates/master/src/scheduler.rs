@@ -302,6 +302,9 @@ fn feature_names(features: ProtocolCapabilities) -> String {
     if features.contains(ProtocolCapabilities::WORKSPACES) {
         names.push("WORKSPACES");
     }
+    if features.contains(ProtocolCapabilities::TREE_V2) {
+        names.push("TREE_V2");
+    }
     names.join(" and ")
 }
 
@@ -4298,5 +4301,137 @@ mod tests {
         // Fail t2 on w1 (non-rejection execution failure, max_retries = 0); affinity stays on w1.
         let _ = w2_sess;
         let _ = w2_id;
+    }
+
+    #[test]
+    fn test_tree_v1_and_v2_version_negotiation_in_scheduler() {
+        use rusty_grid_core::blob::{BlobFile, BlobId, BlobSymlink, TaskInput, TreeManifest};
+        use rusty_grid_core::task::{WorkspaceRef, WorkspaceSource};
+
+        let v1_manifest = TreeManifest::new(vec![BlobFile {
+            path: "src/main.rs".to_string(),
+            id: BlobId::of(b"fn main() {}"),
+            size: 12,
+            executable: false,
+        }])
+        .unwrap();
+        let v1_bytes = v1_manifest.encode();
+        assert!(v1_bytes.starts_with(b"oxideswarm-tree/1\n"));
+        let v1_id = v1_manifest.id();
+
+        let v2_manifest = TreeManifest::with_entries(
+            vec![BlobFile {
+                path: "src/main.rs".to_string(),
+                id: BlobId::of(b"fn main() {}"),
+                size: 12,
+                executable: false,
+            }],
+            vec![BlobSymlink {
+                path: "src/alias.rs".to_string(),
+                target: "main.rs".to_string(),
+            }],
+            vec!["empty".to_string()],
+        )
+        .unwrap();
+        let v2_bytes = v2_manifest.encode();
+        assert!(v2_bytes.starts_with(b"oxideswarm-tree/2\n"));
+        let v2_id = v2_manifest.id();
+
+        let mut w_v1 = make_worker("worker-v1", 4, 8192, false, false);
+        w_v1.features = ProtocolCapabilities::BLOB_TRANSFER | ProtocolCapabilities::WORKSPACES;
+
+        let mut w_v2 = make_worker("worker-v2", 4, 8192, false, false);
+        w_v2.features = ProtocolCapabilities::BLOB_TRANSFER
+            | ProtocolCapabilities::WORKSPACES
+            | ProtocolCapabilities::TREE_V2;
+
+        // 1. A v1 manifest (no symlinks, no empty dirs) does NOT require TREE_V2 and schedules
+        //    onto a worker without TREE_V2 (`w_v1`).
+        let mut t_v1_input = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_v1_input.inputs = vec![TaskInput::tree(".", v1_id, v1_bytes.len() as u64)];
+        let r_v1_input = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&t_v1_input),
+            std::slice::from_ref(&w_v1),
+        );
+        assert_eq!(r_v1_input.assignments.len(), 1);
+        assert_eq!(r_v1_input.assignments[0].worker_id, w_v1.worker_id);
+
+        let t_v1_ws = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef {
+            name: "ws-v1".to_string(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: v1_id,
+                manifest_size: v1_bytes.len() as u64,
+            }),
+        });
+        let r_v1_ws = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&t_v1_ws),
+            std::slice::from_ref(&w_v1),
+        );
+        assert_eq!(r_v1_ws.assignments.len(), 1);
+        assert_eq!(r_v1_ws.assignments[0].worker_id, w_v1.worker_id);
+
+        // 2. A v2 manifest (with symlinks/empty dirs) requires TREE_V2: it is refused on `w_v1`
+        //    alone and placed onto `w_v2` when both workers are present.
+        let mut t_v2_input = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_v2_input.inputs = vec![TaskInput::tree(".", v2_id, v2_bytes.len() as u64)];
+        let cfg_fail = SchedulerConfig {
+            fail_unfulfillable_tasks: true,
+            ..SchedulerConfig::default()
+        };
+        let r_v2_on_v1 = WorkloadScheduler::matchmake(
+            &cfg_fail,
+            std::slice::from_ref(&t_v2_input),
+            std::slice::from_ref(&w_v1),
+        );
+        assert!(r_v2_on_v1.assignments.is_empty());
+        assert_eq!(r_v2_on_v1.unfulfillable.len(), 1);
+        assert!(
+            r_v2_on_v1.unfulfillable[0].1.contains("TREE_V2"),
+            "expected TREE_V2 in unfulfillable reason: {}",
+            r_v2_on_v1.unfulfillable[0].1
+        );
+
+        let t_v2_ws = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef {
+            name: "ws-v2".to_string(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: v2_id,
+                manifest_size: v2_bytes.len() as u64,
+            }),
+        });
+        let r_v2_ws_on_v1 = WorkloadScheduler::matchmake(
+            &cfg_fail,
+            std::slice::from_ref(&t_v2_ws),
+            std::slice::from_ref(&w_v1),
+        );
+        assert!(r_v2_ws_on_v1.assignments.is_empty());
+        assert_eq!(r_v2_ws_on_v1.unfulfillable.len(), 1);
+        assert!(r_v2_ws_on_v1.unfulfillable[0].1.contains("TREE_V2"));
+
+        let r_v2_both = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            &[t_v2_input.clone(), t_v2_ws.clone()],
+            &[w_v1, w_v2.clone()],
+        );
+        assert_eq!(r_v2_both.assignments.len(), 2);
+        assert!(r_v2_both
+            .assignments
+            .iter()
+            .all(|a| a.worker_id == w_v2.worker_id));
     }
 }

@@ -20,8 +20,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::blob::{
-    open_regular_file_nofollow, validate_blob_path, validate_symlink_target, BlobFile, BlobHasher,
-    BlobId, BlobSymlink, TreeManifest,
+    fold_blob_path, open_regular_file_nofollow, validate_blob_path, validate_symlink_target,
+    BlobFile, BlobHasher, BlobId, BlobSymlink, TreeManifest,
 };
 use rusty_grid_core::task::validate_workspace_name;
 use serde::{Deserialize, Serialize};
@@ -217,6 +217,11 @@ pub struct SyncReport {
     /// Files hashed (not skipped by the size and time fast path).
     pub hashed: usize,
     pub deleted: usize,
+    /// Symbolic links skipped when the Windows worker lacks `SeCreateSymbolicLinkPrivilege`
+    /// (OS error `1314`) and Developer Mode is off.
+    pub skipped_symlinks: usize,
+    /// Warning for the task's stderr when symbolic links were skipped due to error `1314`.
+    pub warning: Option<String>,
 }
 
 /// One row of [`WorkspaceStore::list`].
@@ -873,6 +878,14 @@ impl WorkspaceGuard {
                 manifest_dirs.insert(&p[..pos]);
             }
         }
+        let folded_manifest_dirs: HashSet<String> =
+            manifest_dirs.iter().map(|d| fold_blob_path(d)).collect();
+        let was_tracked_symlink: HashSet<String> = st
+            .symlinks
+            .keys()
+            .chain(st.pending_symlinks.iter())
+            .cloned()
+            .collect();
 
         // 1. pending paths, Syncing, flush.
         for p in &new_file_paths {
@@ -1105,18 +1118,18 @@ impl WorkspaceGuard {
         let mut symlinks_out = BTreeMap::new();
         for (link, path, resolved) in &link_targets {
             ensure_parents(&tree, path, &link.path)?;
-            let target_is_dir =
-                manifest_dirs.contains(resolved.as_str()) || is_real_dir(&tree.join(resolved));
-            let tracked =
-                st.symlinks.contains_key(&link.path) || st.pending_symlinks.contains(&link.path);
+            let target_is_dir = folded_manifest_dirs.contains(&fold_blob_path(resolved))
+                || is_real_dir(&tree.join(resolved));
+            let tracked = was_tracked_symlink.contains(&link.path);
             let kept = match fs::symlink_metadata(path) {
                 Ok(m) if is_link_like(&m) => {
                     let existing = fs::read_link(path)
                         .ok()
                         .and_then(|p| p.to_str().map(|s| s.replace('\\', "/")));
-                    if existing.as_deref() == Some(link.target.as_str()) {
+                    let same_target = existing.as_deref() == Some(link.target.as_str());
+                    if same_target && symlink_kind_matches(&m, target_is_dir) {
                         true
-                    } else if tracked {
+                    } else if same_target || tracked {
                         remove_symlink(path)
                             .map_err(io_err(format!("replacing symbolic link {}", link.path)))?;
                         false
@@ -1150,12 +1163,30 @@ impl WorkspaceGuard {
             };
             if kept {
                 report.unchanged += 1;
+                symlinks_out.insert(link.path.clone(), link.target.clone());
             } else {
-                create_in_tree_symlink(&link.target, path, target_is_dir)
-                    .map_err(io_err(format!("creating symbolic link {}", link.path)))?;
-                report.written += 1;
+                match create_in_tree_symlink(&link.target, path, target_is_dir) {
+                    Ok(()) => {
+                        report.written += 1;
+                        symlinks_out.insert(link.path.clone(), link.target.clone());
+                    }
+                    Err(e) if (cfg!(windows) || cfg!(test)) && e.raw_os_error() == Some(1314) => {
+                        report.skipped_symlinks += 1;
+                    }
+                    Err(e) => {
+                        return Err(io_err(format!("creating symbolic link {}", link.path))(e));
+                    }
+                }
             }
-            symlinks_out.insert(link.path.clone(), link.target.clone());
+        }
+        if report.skipped_symlinks > 0 {
+            report.warning = Some(format!(
+                "workspace '{}': skipped {} symbolic link(s) because Windows returned \
+                 ERROR_PRIVILEGE_NOT_HELD (1314); enable Developer Mode in Settings -> System -> \
+                 For developers -> Developer Mode (or grant SeCreateSymbolicLinkPrivilege) to \
+                 materialize symbolic links",
+                self.name, report.skipped_symlinks
+            ));
         }
 
         // 5. records := new manifest, clear pending, Ready, flush.
@@ -1210,19 +1241,19 @@ impl WorkspaceGuard {
     }
 }
 
-/// Refuses a manifest whose paths differ only by case (`A.rs` and `a.rs`, or a file `A` next to
-/// `a/x`): on the case-insensitive default file systems of macOS and Windows they are one file,
-/// so the sync would leave one of the contents in place and rewrite it every time. Uses Unicode
-/// lowercasing on every host. Residual: names that differ only by NFC/NFD normalisation (macOS
-/// APFS treats them as equal) are not detected.
+/// Refuses a manifest whose paths differ only by case or Unicode NFC/NFD normalisation (`A.rs`
+/// and `a.rs`, `caf\u{00e9}.rs` and `cafe\u{0301}.rs`, or a file `A` next to `a/x`): on the
+/// case- and normalisation-insensitive default file systems of macOS and Windows they are one
+/// file, so the sync would leave one of the contents in place and rewrite it every time. Uses
+/// [`fold_blob_path`] (Unicode NFD + lowercasing) on every host.
 fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> {
     let mut files: HashSet<String> = HashSet::new();
     let mut dirs: HashSet<String> = HashSet::new();
     let clash = |path: &str, other: &str| WorkspaceError::Path {
         path: path.to_string(),
         reason: format!(
-            "it differs from '{other}' only by case, which one file system entry cannot hold \
-             on macOS and Windows"
+            "it differs from '{other}' only by case or Unicode normalisation, which one file \
+             system entry cannot hold on macOS and Windows"
         ),
     };
     for p in manifest
@@ -1231,7 +1262,7 @@ fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> 
         .map(|f| f.path.as_str())
         .chain(manifest.symlinks().iter().map(|s| s.path.as_str()))
     {
-        let folded = p.to_lowercase();
+        let folded = fold_blob_path(p);
         if dirs.contains(&folded) || !files.insert(folded.clone()) {
             return Err(clash(p, &folded));
         }
@@ -1244,7 +1275,7 @@ fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> 
         }
     }
     for d_path in manifest.empty_dirs() {
-        let folded = d_path.to_lowercase();
+        let folded = fold_blob_path(d_path);
         if files.contains(&folded) || !dirs.insert(folded.clone()) {
             return Err(clash(d_path, &folded));
         }
@@ -1259,11 +1290,38 @@ fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> 
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_SYMLINK_1314: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn symlink_kind_matches(meta: &fs::Metadata, target_is_dir: bool) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        let ft = meta.file_type();
+        if target_is_dir {
+            ft.is_symlink_dir()
+        } else {
+            ft.is_symlink_file()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (meta, target_is_dir);
+        true
+    }
+}
+
 fn create_in_tree_symlink(
     target: &str,
     link_path: &Path,
     target_is_dir: bool,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_SYMLINK_1314.with(|c| c.get()) {
+        return Err(std::io::Error::from_raw_os_error(1314));
+    }
     #[cfg(unix)]
     {
         let _ = target_is_dir;
@@ -2416,5 +2474,140 @@ mod tests {
         let r4 = g.sync(&m3, &Mem::new(v1_files)).unwrap();
         assert_eq!(r4.deleted, 1);
         assert!(fs::symlink_metadata(g.tree_dir().join("ox-mode")).is_err());
+    }
+
+    #[test]
+    fn w11_windows_error_1314_skips_symlinks_with_developer_mode_warning() {
+        struct Force1314Guard;
+        impl Drop for Force1314Guard {
+            fn drop(&mut self) {
+                FORCE_SYMLINK_1314.with(|c| c.set(false));
+            }
+        }
+        FORCE_SYMLINK_1314.with(|c| c.set(true));
+        let _guard = Force1314Guard;
+
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("src/main.rs", "fn main() {}", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![
+                BlobSymlink {
+                    path: "alias1".to_string(),
+                    target: "src/main.rs".to_string(),
+                },
+                BlobSymlink {
+                    path: "alias2".to_string(),
+                    target: "src".to_string(),
+                },
+            ],
+            vec!["empty_dir".to_string()],
+        )
+        .unwrap();
+        let r = g
+            .sync(&m1, &Mem::new(v1_files))
+            .expect("sync must succeed with a warning when error 1314 occurs");
+        assert_eq!(r.written, 1);
+        assert_eq!(r.skipped_symlinks, 2);
+        let warning = r.warning.expect("expected warning on skipped symlinks");
+        assert!(
+            warning.contains("1314") && warning.contains("Developer Mode"),
+            "unexpected warning text: {warning}"
+        );
+        assert_eq!(read(&g, "src/main.rs"), "fn main() {}");
+        assert!(g.tree_dir().join("empty_dir").is_dir());
+        assert!(!g.tree_dir().join("alias1").exists());
+        assert!(!g.tree_dir().join("alias2").exists());
+        let st = g.state().unwrap();
+        assert_eq!(st.state, SyncState::Ready);
+        assert!(st.symlinks.is_empty());
+    }
+
+    #[test]
+    fn w11_untracked_file_at_new_symlink_path_is_refused_and_preserved() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("a.rs", "aaa", false)];
+        g.sync(&manifest(v1_files), &Mem::new(v1_files)).unwrap();
+
+        // A build writes an untracked file `out.bin` in `tree/`.
+        fs::write(g.tree_dir().join("out.bin"), "build-artifact").unwrap();
+
+        // Next sync introduces a symlink at `out.bin -> a.rs`. Because `out.bin` was not a tracked
+        // symlink, `sync` must refuse with `WorkspaceError::Path` and leave `out.bin` untouched.
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "out.bin".to_string(),
+                target: "a.rs".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let err = g.sync(&m2, &Mem::new(v1_files)).unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Path { ref path, .. } if path == "out.bin"),
+            "expected WorkspaceError::Path for untracked file at symlink path, got: {err}"
+        );
+        assert_eq!(read(&g, "out.bin"), "build-artifact");
+    }
+
+    #[test]
+    fn w11_unicode_nfc_nfd_colliding_paths_are_refused_before_any_change() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        // `caf\u{00e9}.rs` (NFC) vs `cafe\u{0301}.rs` (NFD)
+        let nfc_nfd: Files = &[
+            ("caf\u{00e9}.rs", "nfc", false),
+            ("cafe\u{0301}.rs", "nfd", false),
+        ];
+        let err = g.sync(&manifest(nfc_nfd), &Mem::new(nfc_nfd)).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Path { .. }), "{err}");
+        assert!(!g.tree_dir().exists(), "nothing was created");
+    }
+
+    #[test]
+    fn w11_symlink_target_changing_between_file_and_dir_recreates_link() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        // Sync 1: `item` is a regular file, `alias -> item`.
+        let v1_files: Files = &[("item", "file-body", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!(read(&g, "alias"), "file-body");
+
+        // Sync 2: `ITEM/sub.txt` is a file inside directory `ITEM`, and `alias -> item` (differing
+        // in case from `ITEM`, and changing target kind from file to directory).
+        let v2_files: Files = &[("ITEM/sub.txt", "inside-dir", false)];
+        let m2 = TreeManifest::with_entries(
+            manifest(v2_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m2, &Mem::new(v2_files)).unwrap();
+        let meta = fs::symlink_metadata(g.tree_dir().join("alias")).unwrap();
+        assert!(symlink_kind_matches(&meta, true));
+        assert_eq!(read(&g, "alias/sub.txt"), "inside-dir");
     }
 }

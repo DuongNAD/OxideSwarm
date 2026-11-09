@@ -625,6 +625,9 @@ impl BlobStore {
         if let Err(e) = upload.file.write_all(data) {
             return abandon(upload, failed(format!("cannot store blob {id}: {e}")));
         }
+        if offset == 0 && TreeManifest::is_v2_bytes(data) {
+            rusty_grid_core::blob::register_v2_manifest_blob(id);
+        }
         upload.hasher.update(data);
         upload.received += data.len() as u64;
         upload.last_chunk = Instant::now();

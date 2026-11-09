@@ -510,13 +510,26 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     if task.uses_blobs() {
         features.insert(ProtocolCapabilities::BLOB_TRANSFER);
     }
+    if task.inputs.iter().any(|input| {
+        matches!(
+            input.source,
+            rusty_grid_core::blob::InputSource::Tree { manifest, .. }
+                if rusty_grid_core::blob::is_v2_manifest_blob(&manifest)
+        )
+    }) {
+        features.insert(ProtocolCapabilities::TREE_V2);
+    }
     if matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)) {
         features.insert(ProtocolCapabilities::THREE_D);
     }
     if let Some(workspace) = &task.workspace {
         features.insert(ProtocolCapabilities::WORKSPACES);
-        if workspace.source.is_some() {
+        if let Some(source) = &workspace.source {
             features.insert(ProtocolCapabilities::BLOB_TRANSFER);
+            let rusty_grid_core::task::WorkspaceSource::Tree { manifest, .. } = source;
+            if rusty_grid_core::blob::is_v2_manifest_blob(manifest) {
+                features.insert(ProtocolCapabilities::TREE_V2);
+            }
         }
     }
     features

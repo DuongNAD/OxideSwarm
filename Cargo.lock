@@ -3389,6 +3389,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "icu_normalizer",
  "iroh",
  "libc",
  "ring",

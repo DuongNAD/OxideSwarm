@@ -516,18 +516,25 @@ off by default until FEAT-3 is Implemented.
   line and nothing uploaded. The run found that closing standard input cancels a running MCP call,
   and the guide's MCP example now keeps the pipe open.
 - 2026-11-09: W11 done (`oxideswarm-tree/2`). `TreeManifest` (`crates/core/src/blob.rs`,
-  `MANIFEST_FORMAT_V2 = "oxideswarm-tree/2"`, while still accepting `"oxideswarm-tree/1"`) adds
-  `links: Vec<TreeSymlink>` (`TreeSymlink { path, target }`) and `dirs: Vec<String>` (empty
-  directories). `validate_manifest` enforces sorted unique paths across `files`, `links` and `dirs`,
-  no path overlap or ancestor/descendant conflict with a link or empty directory, and that every
-  `TreeSymlink::target` is a relative `/` path (`.`, `..` and normal components only, no NUL or `\`)
-  whose lexical resolution from `path`'s parent stays strictly inside the tree root and does not
-  traverse through another `links` entry. `scan_workspace_source` (`crates/cli/src/blobs.rs`)
-  records in-tree relative symbolic links in `manifest.links`, refuses links whose target is
-  absolute or resolves outside the tree root, and records empty non-ignored directories in
-  `manifest.dirs`. `WorkspaceGuard::sync` (`crates/worker/src/workspace.rs`) tracks `links` and
-  `dirs` in `state.json`, removes stale tracked links and empty directories before creating new
-  entries, creates empty directories and symbolic links after verifying non-symlink parents, and on
-  Windows maps `ERROR_PRIVILEGE_NOT_HELD` (`1314`) when creating a symbolic link to a clear hint to
-  enable Windows Developer Mode. Windows symlink tests skip cleanly when symlink creation returns
-  OS error `1314` unless `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
+  `MANIFEST_MAGIC = b"oxideswarm-tree/2\n"` when symbolic links or empty directories are present and
+  `MANIFEST_MAGIC_V1 = b"oxideswarm-tree/1\n"` otherwise, while `TreeManifest::decode` accepts both)
+  adds `symlinks: Vec<BlobSymlink>` (`BlobSymlink { path, target }`) and `empty_dirs: Vec<String>`
+  (empty directories), negotiated with workers via `ProtocolCapabilities::TREE_V2` (`1 << 13`).
+  `TreeManifest::validate`, `validate_symlink_target` and `check_no_symlink_traversal` enforce sorted
+  unique paths across `files`, `symlinks` and `empty_dirs`, no path overlap or ancestor/descendant
+  conflict with a link or empty directory, and that every `BlobSymlink::target` is a relative `/`
+  path (`.`, `..` and normal components only, no `:`, `\` or NUL) whose lexical resolution from
+  `path`'s parent stays strictly inside the tree root and never steps onto or through another
+  `symlinks` entry (compared after `fold_blob_path` case-folding and Unicode NFD decomposition).
+  `scan_workspace_source` (`crates/cli/src/blobs.rs`) records in-tree relative symbolic links in
+  `manifest.symlinks()`, skips links whose target is non-UTF-8, absolute, leaves the tree root or
+  traverses through another link (reporting each in `prepared.skipped`), and records empty
+  non-ignored directories in `manifest.empty_dirs()`. `WorkspaceGuard::sync`
+  (`crates/worker/src/workspace.rs`) checks case and Unicode NFC/NFD collisions via
+  `fold_blob_path`, tracks `symlinks` and `empty_dirs` in `state.json`, removes stale tracked links
+  and empty directories before creating new entries, creates empty directories and symbolic links
+  after verifying non-symlink parents, and on Windows skips symbolic links when creation returns
+  `ERROR_PRIVILEGE_NOT_HELD` (`1314`), recording `SyncReport { skipped_symlinks, warning }` (with a
+  hint to enable Windows Developer Mode) forwarded to the task's `stderr`. Windows symlink tests
+  skip cleanly when symlink creation returns OS error `1314` unless `RUSTY_GRID_REQUIRE_SYMLINKS=1`
+  is set.

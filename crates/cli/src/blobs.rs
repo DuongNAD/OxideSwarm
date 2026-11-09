@@ -499,9 +499,10 @@ pub struct WorkspaceScan {
 /// 0039 W11). It honours `.gitignore`, `.ignore` and `.git/info/exclude` (also outside a git
 /// repository, and only those found inside `root`: no parent directory and no global excludes, so
 /// the result does not depend on the machine), includes hidden files and empty directories, and
-/// always leaves out `.git`. Relative symbolic links whose target stays inside `root` are included
-/// in the manifest; a symbolic link that leaves `root` (or is absolute) is refused. Special files
-/// are skipped and listed in `prepared.skipped`. Fails when a limit of `limits` is exceeded.
+/// always leaves out `.git`. Relative symbolic links whose target stays inside `root` without
+/// traversing through another link are included in the manifest; links that leave `root`, are
+/// absolute, or traverse through another link, as well as special files, are skipped and listed in
+/// `prepared.skipped`. Fails when a limit of `limits` is exceeded.
 pub fn scan_workspace_source(
     root: &Path,
     limits: WorkspaceLimits,
@@ -566,22 +567,32 @@ pub fn scan_workspace_source(
             continue;
         }
         if file_type.is_symlink() {
-            let raw_target = std::fs::read_link(path)
-                .map_err(|e| format!("workspace source {}: {e}", path.display()))?;
+            let raw_target = match std::fs::read_link(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    prepared.skipped.push(format!(
+                        "{} (unreadable symbolic link: {e})",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
             let Some(raw_str) = raw_target.to_str() else {
-                return Err(format!(
-                    "workspace source {}: symbolic link '{}' target is not UTF-8",
-                    root.display(),
-                    rel
+                prepared.skipped.push(format!(
+                    "{} (symbolic link target is not UTF-8)",
+                    path.display()
                 ));
+                continue;
             };
             #[cfg(windows)]
             let target = raw_str.replace('\\', "/");
             #[cfg(not(windows))]
             let target = raw_str.to_string();
-            validate_symlink_target(&rel, &target)
-                .map_err(|e| format!("workspace source {}: {e}", root.display()))?;
-            symlinks.push(BlobSymlink { path: rel, target });
+            if let Err(e) = validate_symlink_target(&rel, &target) {
+                prepared.skipped.push(format!("{} ({e})", path.display()));
+                continue;
+            }
+            symlinks.push((path.to_path_buf(), BlobSymlink { path: rel, target }));
             continue;
         }
         if !file_type.is_file() {
@@ -628,6 +639,40 @@ pub fn scan_workspace_source(
             executable,
         });
     }
+    let mut folded_links: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(symlinks.len());
+    let mut deduplicated_symlinks = Vec::with_capacity(symlinks.len());
+    for (full_path, link) in symlinks {
+        let folded = rusty_grid_core::blob::fold_blob_path(&link.path);
+        if let Some(prev) = folded_links.get(&folded) {
+            prepared.skipped.push(format!(
+                "{} (symbolic link '{}' collides with symbolic link '{prev}' after case/Unicode folding)",
+                full_path.display(),
+                link.path
+            ));
+            continue;
+        }
+        folded_links.insert(folded, link.path.clone());
+        deduplicated_symlinks.push((full_path, link));
+    }
+    let folded_link_refs: std::collections::HashMap<String, &str> = folded_links
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str()))
+        .collect();
+    let mut valid_symlinks = Vec::with_capacity(deduplicated_symlinks.len());
+    for (full_path, link) in deduplicated_symlinks {
+        match rusty_grid_core::blob::check_no_symlink_traversal(
+            &link.path,
+            &link.target,
+            &folded_link_refs,
+        ) {
+            Ok(()) => valid_symlinks.push(link),
+            Err(e) => prepared
+                .skipped
+                .push(format!("{} ({e})", full_path.display())),
+        }
+    }
+    let symlinks = valid_symlinks;
     let mut non_empty_dirs = std::collections::HashSet::new();
     for entry_path in files
         .iter()
@@ -1426,8 +1471,26 @@ mod tests {
             assert!(scan_workspace_source(&r.join("a"), WorkspaceLimits::default()).is_err());
         }
 
+        fn try_create_test_symlink_file(target: &Path, link: &Path) -> bool {
+            #[cfg(unix)]
+            let res = std::os::unix::fs::symlink(target, link);
+            #[cfg(windows)]
+            let res = std::os::windows::fs::symlink_file(target, link);
+            match res {
+                Ok(()) => true,
+                #[cfg(windows)]
+                Err(e)
+                    if e.raw_os_error() == Some(1314)
+                        && std::env::var_os("OXIDESWARM_TEST_REQUIRE_SYMLINKS").is_none() =>
+                {
+                    false
+                }
+                Err(e) => panic!("failed to create test file symlink {}: {e}", link.display()),
+            }
+        }
+
         #[test]
-        fn in_tree_links_and_empty_dirs_are_kept_and_escaping_links_are_refused() {
+        fn in_tree_links_and_empty_dirs_are_kept_and_escaping_links_are_skipped() {
             let dir = tempfile::tempdir().unwrap();
             let r = dir.path();
             write(r, "run.sh", "#!/bin/sh");
@@ -1446,10 +1509,7 @@ mod tests {
             assert!(scan_no_links.manifest.files()[0].executable);
             assert!(!scan_no_links.manifest.files()[1].executable);
 
-            if !rusty_grid_worker::sandbox::try_create_test_symlink_file(
-                Path::new("../run.sh"),
-                &r.join("sub/alias.sh"),
-            ) {
+            if !try_create_test_symlink_file(Path::new("../run.sh"), &r.join("sub/alias.sh")) {
                 return;
             }
             let scan = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
@@ -1463,31 +1523,70 @@ mod tests {
             assert_eq!(scan.manifest.empty_dirs(), &["empty/leaf"]);
             assert!(scan.prepared.skipped.is_empty());
 
-            // Relative link that leaves the tree is refused.
-            assert!(rusty_grid_worker::sandbox::try_create_test_symlink_file(
+            // Relative link that leaves the tree is skipped (not fatal) and reported in `skipped`.
+            assert!(try_create_test_symlink_file(
                 Path::new("../../outside"),
                 &r.join("sub/escape"),
             ));
-            let err = scan_workspace_source(r, WorkspaceLimits::default())
-                .err()
-                .expect("link leaving the tree must be refused");
-            assert!(err.contains("leaves the tree"), "{err}");
+            let scan_esc = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(
+                scan_esc.manifest.symlinks(),
+                &[BlobSymlink {
+                    path: "sub/alias.sh".to_string(),
+                    target: "../run.sh".to_string(),
+                }]
+            );
+            assert_eq!(scan_esc.prepared.skipped.len(), 1);
+            assert!(
+                scan_esc.prepared.skipped[0].contains("leaves the tree"),
+                "{:?}",
+                scan_esc.prepared.skipped
+            );
             let _ = fs::remove_file(r.join("sub/escape"));
 
-            // Absolute link is refused.
+            // Absolute link is also skipped and reported in `skipped`.
             let outside = tempfile::tempdir().unwrap();
             let outside_secret = outside.path().join("secret");
             fs::write(&outside_secret, "s").unwrap();
-            assert!(rusty_grid_worker::sandbox::try_create_test_symlink_file(
+            assert!(try_create_test_symlink_file(
                 &outside_secret,
                 &r.join("abs_link"),
             ));
-            let abs_err = scan_workspace_source(r, WorkspaceLimits::default())
-                .err()
-                .expect("absolute link must be refused");
+            let scan_abs = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(
+                scan_abs.manifest.symlinks(),
+                &[BlobSymlink {
+                    path: "sub/alias.sh".to_string(),
+                    target: "../run.sh".to_string(),
+                }]
+            );
+            assert_eq!(scan_abs.prepared.skipped.len(), 1);
             assert!(
-                abs_err.contains("leaves the tree") || abs_err.contains("not allowed"),
-                "{abs_err}"
+                scan_abs.prepared.skipped[0].contains("leaves the tree")
+                    || scan_abs.prepared.skipped[0].contains("not allowed"),
+                "{:?}",
+                scan_abs.prepared.skipped
+            );
+            let _ = fs::remove_file(r.join("abs_link"));
+
+            // Link traversing through another link is also skipped and reported in `skipped`.
+            assert!(try_create_test_symlink_file(
+                Path::new("alias.sh"),
+                &r.join("sub/chained.sh"),
+            ));
+            let scan_chain = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(
+                scan_chain.manifest.symlinks(),
+                &[BlobSymlink {
+                    path: "sub/alias.sh".to_string(),
+                    target: "../run.sh".to_string(),
+                }]
+            );
+            assert_eq!(scan_chain.prepared.skipped.len(), 1);
+            assert!(
+                scan_chain.prepared.skipped[0].contains("traverses through symbolic link"),
+                "{:?}",
+                scan_chain.prepared.skipped
             );
         }
     }
