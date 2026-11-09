@@ -333,12 +333,14 @@ async fn execute_workspace_task(
             };
 
             cmd.current_dir(&work_dir);
+            cmd.env("CARGO_TARGET_DIR", work_dir.join("target"));
             for (k, v) in guard.task_env() {
                 cmd.env(k, v);
             }
             cmd.env("TMPDIR", guard.tmp_dir());
             cmd.env("TEMP", guard.tmp_dir());
             cmd.env("TMP", guard.tmp_dir());
+            cmd.env("CARGO_TERM_COLOR", "never");
 
             let output = cmd.output().map_err(|e| WorkspaceError::Io {
                 context: "spawning workspace command".to_string(),
@@ -478,10 +480,13 @@ async fn test_cli_workspace_cargo_build_offline_incremental_and_deleted_file_syn
     let cluster = HarnessCluster::spawn().await;
     let temp = tempfile::tempdir().expect("create client temp dir");
     let client_home = temp.path().join("client_home");
+    let cargo_home = temp.path().join("cargo_home");
     let project_dir = temp.path().join("sample_crate");
     std::fs::create_dir_all(&client_home).expect("create client_home");
+    std::fs::create_dir_all(&cargo_home).expect("create cargo_home");
     create_sample_crate(&project_dir);
 
+    let cargo_home_env = format!("CARGO_HOME={}", cargo_home.display());
     let run_submit = || {
         Command::new(oxideswarm_bin())
             .current_dir(&project_dir)
@@ -491,6 +496,12 @@ async fn test_cli_workspace_cargo_build_offline_incremental_and_deleted_file_syn
                 &cluster.master_addr.to_string(),
                 "--workspace",
                 "w6-cli",
+                "--env",
+                &cargo_home_env,
+                "--env",
+                "CARGO_TARGET_DIR=target",
+                "--env",
+                "CARGO_TERM_COLOR=never",
                 "--wait",
                 "--",
                 "cargo",
@@ -522,7 +533,7 @@ async fn test_cli_workspace_cargo_build_offline_incremental_and_deleted_file_syn
         "first workspace cargo build failed:\n{combined1}"
     );
     assert!(
-        combined1.contains("Compiling w6_sample_app"),
+        combined1.contains("Compiling") && combined1.contains("w6_sample_app"),
         "first build must print Compiling line, got:\n{combined1}"
     );
 
@@ -606,8 +617,10 @@ async fn test_mcp_workspace_cargo_build_offline_incremental_and_deleted_file_syn
     let cluster = HarnessCluster::spawn().await;
     let temp = tempfile::tempdir().expect("create client temp dir");
     let client_home = temp.path().join("client_home");
+    let cargo_home = temp.path().join("cargo_home");
     let project_dir = temp.path().join("mcp_sample_crate");
     std::fs::create_dir_all(&client_home).expect("create client_home");
+    std::fs::create_dir_all(&cargo_home).expect("create cargo_home");
     create_sample_crate(&project_dir);
 
     let mut mcp = McpProcess::spawn(cluster.master_addr, &project_dir, &client_home);
@@ -631,6 +644,7 @@ async fn test_mcp_workspace_cargo_build_offline_incremental_and_deleted_file_syn
         "method": "notifications/initialized"
     }));
 
+    let cargo_home_str = cargo_home.to_string_lossy().to_string();
     let submit_call = |id: u64| {
         json!({
             "jsonrpc": "2.0",
@@ -642,6 +656,11 @@ async fn test_mcp_workspace_cargo_build_offline_incremental_and_deleted_file_syn
                     "type": "command",
                     "command": "cargo",
                     "args": ["build", "--offline"],
+                    "env": {
+                        "CARGO_HOME": cargo_home_str,
+                        "CARGO_TARGET_DIR": "target",
+                        "CARGO_TERM_COLOR": "never"
+                    },
                     "workspace": {
                         "name": "w6-mcp",
                         "sync_dir": "."
@@ -672,7 +691,8 @@ async fn test_mcp_workspace_cargo_build_offline_incremental_and_deleted_file_syn
     let stderr1 = body1["stderr"].as_str().unwrap_or("");
     let stdout1 = body1["stdout"].as_str().unwrap_or("");
     assert!(
-        stderr1.contains("Compiling w6_sample_app") || stdout1.contains("Compiling w6_sample_app"),
+        (stderr1.contains("Compiling") && stderr1.contains("w6_sample_app"))
+            || (stdout1.contains("Compiling") && stdout1.contains("w6_sample_app")),
         "first MCP build must print Compiling line, got: {body1}"
     );
 
