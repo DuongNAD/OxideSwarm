@@ -1,6 +1,7 @@
 # Roadmap
 
-Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08
+Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
+Q8 to Q12 (Phases F and G) on 2026-11-09.
 Created: 2026-11-07    Updated: 2026-11-09
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -22,6 +23,10 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   agent workspaces, then ship a release. These four phases, A to D, are the core.
 - Later work starts after the core: the launch, Phase E and the table of what waits. Android, master
   failover, 3D, language model inference and distributed training are later work.
+- Ambition (Draft, 2026-11-09): grow from one owner's machines to a grid that a team or a community
+  runs at scale, with many workers, many submitters and standard tools around it. Phase F (scale
+  out) and Phase G (product and ecosystem) carry this work. They follow the core, and the
+  architecture is in [design 0050](design/0050-scale-out-architecture.md).
 
 ## Where the project stands
 
@@ -245,6 +250,50 @@ After the first release, in order of value to the user story:
    security part goes ahead, at any time: remove the fallback in which `parse_binary_data` reads a
    hub-local file that a peer names (`crates/agent_mesh/src/bridge.rs`).
 
+### Phase F: scale out
+
+Draft, after the core (principle 6). Goal: the grid runs with hundreds of workers and many
+submitters, survives the loss of its master, and grows and shrinks with its queue. The design
+record is [design 0050](design/0050-scale-out-architecture.md) (Draft). The target scale is open
+(Q8), and SCALE-1 measures where the limits are before any other item is sized.
+
+| ID | Work | Relates to |
+|---|---|---|
+| SCALE-1 | Load harness: simulated workers at 100, 500 and 1000, with published numbers under the rules of BENCH-1 | Extends BENCH-1 |
+| SCALE-2 | Scheduler and queue at scale: indexes, larger batches, cold results out of memory, fair share per submitter | Needs SCALE-1. Fair share needs ECO-3 |
+| SCALE-3 | Worker-to-worker blob distribution: workers advertise cached blob ids, the master is tracker and fallback | Needs SCALE-1 |
+| SCALE-4 | Master high availability: replicated journal or active-passive with a fencing epoch (Q9) | Supersedes the Design-only part of FEAT-6. Builds on FEAT-1 |
+| SCALE-5 | Autoscaling providers driven by queue depth: SSH pool, cloud VMs, Kubernetes (Q12) | Uses JOIN-1 tokens. Needs SCALE-1 |
+| SCALE-6 | Multi-site federation. Last, and only if Q8 needs more than one site | Needs SCALE-2 to SCALE-4 |
+
+**Exit check:** the SCALE-1 harness records, with date and hardware, a grid at the worker and
+submitter counts of Q8, with scheduling latency inside the bound the owner sets. A run that kills
+the master leader loses no accepted task (SCALE-4). A queue backlog starts workers through at least
+one provider and idle time drains them (SCALE-5).
+
+### Phase G: product and ecosystem
+
+Draft, after the Phase D exit check; its items run in parallel with Phase F where they do not
+depend on it. Goal: other people and tools can install, call and trust OxideSwarm without the
+owner's help. Order of priority is open (Q10, Q11).
+
+| ID | Work | Relates to |
+|---|---|---|
+| ECO-1 | Remote Execution API compatibility: grow the cache facade into remote execution for Bazel, Buck2 and Pants | Grows REAPI-1 (cache only) into the `Execution` service. Needs ECO-2 |
+| ECO-2 | Action cache: reuse the result of an identical task | Is CACHE-1. Not duplicated |
+| ECO-3 | Multi-tenancy and quotas: tenants, projects, scoped tokens, quotas, audit log | Design 0050 D6 |
+| ECO-4 | Observability: Prometheus metrics and OpenTelemetry traces | Design 0050 D7 |
+| ECO-5 | Packaging: Homebrew, winget, apt and rpm, a container image, signed and notarized binaries | Extends REL-4 |
+| ECO-6 | Client SDKs and a versioned public API | Needs a stable subset of the client protocol |
+| ECO-7 | Integrations for coding agents and CI: MCP setups for common agents, a GitHub Actions runner pool on the grid | Extends DOC-7 and `mcp` |
+| ECO-8 | Documentation site and community: contributing, governance, security reporting | Extends REL-5 |
+
+**Exit check:** a Bazel project builds twice against the grid and the second build hits the cache
+(ECO-1 cache part through ECO-2), a user on each of macOS, Windows and Linux installs from a package
+manager and runs the quick start (ECO-5), a Prometheus scrape of a running master returns the
+design 0050 series (ECO-4), and a second tenant is refused when over quota (ECO-3). Each result is
+recorded with its date.
+
 ## What waits, and why
 
 | Area | Items | Why it waits | Plan |
@@ -257,9 +306,14 @@ After the first release, in order of value to the user story:
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
 | Distributed training | TRAIN-1 to TRAIN-5 ([design 0045](design/0045-distributed-training.md)) | It does not serve the user story. Until FEAT-3 a training task can read the worker's `cluster.secret`, and long rounds need FEAT-1 and FEAT-5 | After the Phase D exit check (decision Q6). TRAIN-1, independent runs, comes first |
 
+LLM inference, training, Android and 3D become Phase H candidates once Phase F lands. This makes
+no commitment: each still needs its own owner decision.
+
 ## Decisions for the owner
 
-The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
+The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q12 were open until the owner accepted their recommended defaults on 2026-11-09: the
+right column is a recommended default, not a decision, and no work depends on it until the owner
+answers.
 
 | ID | Question | Decision |
 |---|---|---|
@@ -270,6 +324,11 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
 | Q5 | Make every CI job a required check on `master` (TEST-6)? | Yes |
 | Q6 | When does distributed training start? | After the Phase D exit check. Design 0045 records the direction, and nothing is built before then |
 | Q7 | Add the items from the research of 2026-11-08? | Yes. JOIN-1, LINK-1 and BENCH-1 join Phase D. CACHE-1 joins Phase C outside its exit check. REAPI-1 waits |
+| Q8 | What scale does the Phase F exit check target: how many workers and how many submitters? | 500 workers and 20 submitters on one site, with 1000 workers as a stretch run of SCALE-1 |
+| Q9 | Which HA approach does SCALE-4 build: active-passive with a fencing epoch, or a Raft-replicated journal? | Active-passive first, with the journal format and the epoch fixed so Raft can replace the replication layer later |
+| Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | The own API and MCP first, REAPI cache-only next, remote execution last |
+| Q11 | Which licence and is there a commercial or hosted offering? | Keep `MIT OR Apache-2.0`. No hosted offering decided; revisit after the first release |
+| Q12 | Which autoscaling providers does SCALE-5 build first? | SSH pool, then Kubernetes, then one cloud |
 
 ## Risks
 
@@ -282,6 +341,8 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
 | Documents drift from the code | The writing standard in [README.md](README.md), and a BACKLOG Index kept current |
 | A launch claims more than the evidence shows | BENCH-1, writing standard rule 6, and the order in "Launch" |
 | Links that fall back to the n0 public relays are rate-limited | LINK-1 |
+| Phases F and G pull effort from the user story before the release | Principle 6: they start after the Phase D exit check. SCALE-1 first, to size the rest from numbers |
+| A scale claim without a measurement | SCALE-1 and writing standard rule 6 |
 
 ## Status log
 
@@ -310,3 +371,9 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
   column: workspaces are Partial (W1, W2a, W3, W4, W8, W9 merged; W5 open as pull request 168; W2b,
   W6, W7, W10 not started), and REL-4 is Implemented with no tag cut. JOIN-1, LINK-1 and BENCH-1
   are Partial.
+- 2026-11-09: Draft added at the owner's request to grow OxideSwarm into a large project: Phase F
+  (scale out, SCALE-1 to SCALE-6), Phase G (product and ecosystem, ECO-1 to ECO-8), the ambition in
+  the Summary, a note in "What waits", and open decisions Q8 to Q12. The architecture is
+  [design 0050](design/0050-scale-out-architecture.md) (Draft). Nothing the owner decided moved.
+- 2026-11-09: The owner accepted Q8 to Q12 with their recommended defaults. Phases F and G are
+  Accepted; design 0050 stays a Draft until SCALE-1 has numbers.

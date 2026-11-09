@@ -126,9 +126,10 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `b7f112f`: 59 items Implemented, 6 Partial and 12 Planned. Five items
+On 2026-11-09, at `master` `b7f112f`: 59 items Implemented, 6 Partial and 26 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
-JOIN-1, LINK-1 and BENCH-1. "Pull requests" lists them by number, "(open)" marks one
+JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
+2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
@@ -210,6 +211,20 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
+| SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
+| SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
+| SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
+| SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned |  |
+| SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned |  |
+| SCALE-6 | Multi-site federation | P3 | L | SCALE-2, SCALE-3, SCALE-4 |  | Planned |  |
+| ECO-1 | Remote Execution API compatibility | P3 | L | REAPI-1, ECO-2 |  | Planned |  |
+| ECO-2 | Action cache (is CACHE-1) | P2 | L | FEAT-1 |  | Planned |  |
+| ECO-3 | Multi-tenancy and quotas | P2 | L | SCALE-1 |  | Planned |  |
+| ECO-4 | Observability: metrics and traces | P2 | M |  |  | Planned |  |
+| ECO-5 | Packaging for package managers and containers | P2 | M | REL-4 | Yes | Planned |  |
+| ECO-6 | Client SDKs and a versioned public API | P3 | L | FEAT-8 |  | Planned |  |
+| ECO-7 | Integrations for coding agents and CI | P2 | M | DOC-7 |  | Planned |  |
+| ECO-8 | Documentation site and community | P3 | M | REL-5 | Yes | Planned |  |
 
 ## Phase 0: integrate open work
 
@@ -1427,6 +1442,237 @@ Each item below needs a design record before code.
 - **Done when:** The script runs on macOS, Linux and Windows. Dated records of (a) and (b) on one
   machine, and of (c) on two machines, are committed, and `README.md` links them.
 
+## Phase 7: scale out
+
+Draft, added on 2026-11-09 with Phase F of [ROADMAP.md](ROADMAP.md). The design is
+[design 0050](design/0050-scale-out-architecture.md). Every item starts after the Phase D exit check
+of the roadmap, and SCALE-1 comes first because it measures the limits the other items remove. The
+owner's decisions Q8, Q9 and Q12 are open.
+
+### SCALE-1: Load harness with simulated workers
+
+- **Evidence:** Read, on 2026-11-09 at `master` `09a8990`. `benchmarks/grid/bench_grid.py` starts one
+  to four real workers on loopback on one machine (BENCH-1). No run has more than four workers,
+  more than one submitter or a network between master and workers. `docs/README.md` rule 6 forbids
+  a scale claim without a script.
+- **Problem:** The project cannot say how many workers one master handles, where the limit is, or
+  what a mass reconnect costs. Every later item needs that number.
+- **Do:**
+  1. Add a simulated worker: a `WorkerClient` with a fake runner that answers after a set delay,
+     with optional link delay and loss, so 1000 of them run on one host.
+  2. Extend `benchmarks/grid/` with scenarios at 100, 500 and 1000 workers and several submitters:
+     submit-to-assign p50 and p99, throughput, master CPU and memory, journal bytes, replay time
+     and the time to settle after every worker reconnects at once.
+  3. Write each run to a results file under the BENCH-1 rules: date, commit, hardware, operating
+     system, network and raw runs.
+- **Done when:** Dated records at 100, 500 and 1000 simulated workers are committed on one named
+  machine, and `README.md` links them.
+
+### SCALE-2: Scheduler and queue at scale
+
+- **Evidence:** Read. `WorkloadScheduler::schedule_batch` and the placement `Engine`
+  (`crates/master/src/scheduler.rs`) run in one process. `TaskQueue` holds all tasks in memory
+  (`crates/master/src/queue.rs`), bounded by `--max-active-mb` and the retained-task limits. No code
+  shares capacity between submitters.
+- **Problem:** A placement pass, the memory of finished tasks and one submitter's backlog can each
+  limit a grid with hundreds of workers. Nothing measures which does.
+- **Do:**
+  1. After SCALE-1, profile the pass and fix the largest cost first: index workers by OS,
+     architecture, tag and free slots, and raise the micro-batch size where the profile supports it.
+  2. Move cold terminal results out of memory into the store.
+  3. Add fair share: a queue per submitter (the ECO-3 identity) with weighted round robin before
+     placement. Until ECO-3 exists, the submitter key is the connection's client id.
+  4. Keep the 8-state machine and `Engine::hold_back`.
+- **Done when:** The SCALE-1 numbers improve by the bound the owner sets (Q8) with identical
+  placement results on the existing scheduler tests, and a test shows a second submitter's task
+  placed while a first submitter's backlog is larger than the free slots.
+
+### SCALE-3: Worker-to-worker blob distribution
+
+- **Evidence:** Read. A worker fetches input blobs from the master's `BlobStore` and uploads
+  outputs to it (`crates/worker/src/blob_client.rs`, `crates/master/src/blob_store.rs`, design 0006).
+  A worker's cache (`crates/worker/src/blob_cache.rs`) already verifies BLAKE3 ids.
+- **Problem:** N workers that need one tree make the master send it N times, so the master's disk and
+  uplink bound the grid.
+- **Do:**
+  1. Add a `ProtocolCapabilities` bit and a message pair so a worker advertises the blob ids it
+     holds as deltas, and the master answers a missing-blob request with a short list of peers
+     (design 0050 D3). Follow the wire rule and bump the protocol version.
+  2. Peer fetch uses the cluster handshake and encrypted records and 4 MiB chunks, verifies the id,
+     and falls back to the master when no peer answers. A worker that cannot listen (mobile,
+     Windows service) stays a client only.
+  3. Record the master's blob bytes with SCALE-1 before and after.
+- **Done when:** A test starts N workers that need one blob: the master sends it once and the others
+  fetch it from peers, and the result bytes match. A dropped peer falls back to the master.
+
+### SCALE-4: Master high availability
+
+- **Evidence:** Read. One `MasterServer` holds scheduling, sessions and the blob store
+  (`crates/master/src/server.rs`). Design 0046 gives a journal and replay
+  (`crates/master/src/store.rs`) and workers resume (`ResumeSession`), so a restart loses nothing,
+  but there is no standby. `FEAT-6` refuses `ClaimMasterRole` (design 0026) and says real failover
+  needs replicated state, renewed leases and a fencing epoch.
+- **Problem:** The master host is a single point of failure for submission and placement.
+- **Do:**
+  1. Write the HA choice into design 0050 D4 after the owner answers Q9 (active-passive with a
+     fencing epoch, or a Raft-replicated journal). The journal format and the epoch are fixed first.
+  2. Ship the journal to a standby, add the lease and the epoch, and make every assignment carry the
+     epoch so a worker refuses a lower one.
+  3. Teach workers and clients a list of master addresses and dial the next on failure.
+  4. Add a kill-the-leader scenario to the SCALE-1 harness.
+- **Done when:** A test kills the leader with tasks queued and running: the standby takes over, no
+  accepted task is lost, and no task runs more often than the at-least-once bound. A deposed leader
+  places nothing after it sees a higher epoch. This item supersedes the "Design only" note of
+  `FEAT-6`, which stays Implemented as the refusal.
+
+### SCALE-5: Autoscaling providers
+
+- **Evidence:** Read. Nothing starts or stops a worker on queue depth. `oxideswarm join` and join
+  tokens exist (design 0048). Workers drain without a retry charge (`WorkerMessage::Disconnecting`,
+  design 0036).
+- **Problem:** The grid has only the workers someone started, so a burst waits and idle machines
+  cost money.
+- **Do:**
+  1. Define a provider interface (`start`, `stop`, `list`) and a scaler that reads queue depth and
+     free capacity per tag and respects `min`, `max` and a cooldown.
+  2. Build providers in the order the owner picks (Q12). Recommended: an SSH pool, then Kubernetes,
+     then one cloud. A cloud provider needs a hard `max` and a budget line.
+  3. A started worker gets a scoped, short-lived join token. Scale-down drains idle workers only.
+  4. Keep provider credentials in the scaler's own files at mode 600, never in `cluster.secret`.
+- **Done when:** A test with a fake provider shows a backlog adding workers and idle time removing
+  them within the cooldown. A live run through the first real provider on two machines is recorded
+  with its date.
+
+### SCALE-6: Multi-site federation
+
+- **Evidence:** Read. A master knows only its own workers. Blob ids are global, so a blob moves by
+  id between any two stores.
+- **Problem:** A grid in one site cannot use capacity in another.
+- **Do:** Only if the owner's target (Q8) needs more than one site. Design the layer in design 0050
+  D8 (a metadata coordinator or peering masters), give each site its own secret and a narrow
+  forward permission, and forward a task when the local site lacks a capability or capacity.
+- **Done when:** A task submitted at one site runs at a worker of another, and its input blob is not
+  sent twice. A site without the forward permission is refused.
+
+## Phase 8: product and ecosystem
+
+Draft, added on 2026-11-09 with Phase G of [ROADMAP.md](ROADMAP.md). The items start after the
+Phase D exit check and run in parallel with Phase 7 where they do not depend on it. The owner's
+decisions Q10 and Q11 are open. Items that overlap an existing one say which they extend.
+
+### ECO-1: Remote Execution API compatibility
+
+- **Evidence:** Read. REAPI-1 plans a cache-only profile: `Capabilities`, CAS, `ByteStream` and
+  `ActionCache`, with the `Execution` service left out. A `BlobId` equals a REAPI BLAKE3
+  `Digest.hash` (REAPI-1 evidence).
+- **Problem:** Bazel, Buck2 and Pants can use the grid as a cache but cannot run actions on it.
+- **Do:** After REAPI-1 and ECO-2, implement the `Execution` service: turn an `Action` into a task
+  with the input root as a blob tree and the output paths as output patterns, run it under
+  `--isolation`, and return an `ActionResult`. This item extends REAPI-1; it does not replace it,
+  and the cache part stays REAPI-1. Order against ECO-6 follows decision Q10.
+- **Done when:** A sample Bazel project with remote execution pointed at the master builds, and a
+  second build hits the action cache. A client without the cluster credential is refused.
+
+### ECO-2: Action cache
+
+- **Evidence:** See CACHE-1. It is the same work and keeps its own section.
+- **Problem:** Identical tasks run again.
+- **Do:** Carry out CACHE-1 as written. ECO-2 is its name in Phase G so the exit check can reference
+  it. Do not write a second design.
+- **Done when:** The "Done when" of CACHE-1 passes.
+
+### ECO-3: Multi-tenancy and quotas
+
+- **Evidence:** Read. `AuthScope` (`crates/master/src/auth.rs`) covers the dashboard only. The
+  cluster secret is one trust domain, and `Task` has no tenant or project field
+  (`crates/core/src/task.rs`). `retry_history` is the only audit-like record.
+- **Problem:** A shared grid cannot tell submitters apart, limit them or show who did what.
+- **Do:**
+  1. Add tenant and project to `Task` and a protocol feature bit (wire rule, version bump).
+  2. Issue scoped tokens (a new HMAC label per purpose) so a client does not hold the secret.
+  3. Add quotas per tenant: concurrent tasks, queued bytes, CPU-seconds per day, blob share.
+     Admission refuses with a typed error.
+  4. Add an append-only audit log of submit, cancel and read, in the journal store.
+  5. Document that tenants are not mutually hostile (design 0050 D6).
+- **Done when:** A second tenant over its quota is refused with the typed error, a scoped token
+  cannot do what another purpose's token does, and the audit log shows the refusal.
+
+### ECO-4: Observability
+
+- **Evidence:** Read. No Prometheus or OpenTelemetry code is in `crates/`. The dashboard
+  (`crates/master/src/web_ui.rs`) shows live state to a person.
+- **Problem:** An operator cannot alert on queue depth or scheduling latency with the tools they
+  already use.
+- **Do:**
+  1. Add `/metrics` in Prometheus text format on the dashboard listener, behind the Observer scope:
+     queue depth by state, tasks per second, scheduling latency histogram, workers by state and
+     link, blob bytes, journal size, store health.
+  2. Add OpenTelemetry traces behind an opt-in Cargo feature, exported over OTLP.
+  3. List new dependencies for the owner before adding them. Never put the secret or task inputs in
+     a metric label or span.
+- **Done when:** A test scrapes `/metrics` from a running master and finds each listed series, a
+  request without the Observer scope is refused, and `cargo check -p rusty_grid_master
+  --no-default-features` still passes.
+
+### ECO-5: Packaging for package managers and containers
+
+- **Evidence:** Read. REL-4 (`.github/workflows/release.yml`) builds archives and `SHA256SUMS` on
+  `v*` tags, and no tag exists. `ls` of the repository root shows no container file. `packaging/`
+  holds launchd, Windows service and Termux installers.
+- **Problem:** Installing means downloading an archive and unpacking it by hand.
+- **Do:**
+  1. After the first tag, add a Homebrew formula, a winget manifest, `.deb` and `.rpm` packages and
+     a container image of the master and worker. Each is built in CI from the release archives.
+  2. Sign the Windows binary, and sign and notarize the macOS binary. This needs the owner's
+     certificates and accounts (owner item).
+  3. Never put the secret in an image or a package; the README shows how to mount it.
+- **Done when:** A fresh macOS, Windows and Linux machine installs from its package manager and runs
+  `oxideswarm doctor`. The macOS binary passes Gatekeeper and the Windows binary shows a publisher.
+
+### ECO-6: Client SDKs and a versioned public API
+
+- **Evidence:** Read. The client protocol is `ClientMessage` / `ClientResponse` with
+  `protocol_version` (design 0040), and MCP exposes six tools (`crates/cli/src/mcp.rs`). Both
+  change with the wire protocol, and `PROTOCOL_VERSION_MIN_COMPATIBLE` equals the current version.
+- **Problem:** A program outside this repository must track the wire format to submit work.
+- **Do:**
+  1. Choose a public surface (an HTTP/JSON API on the dashboard listener, or a stable subset of the
+     client protocol) and version it separately from the internal protocol, with a stated
+     deprecation rule.
+  2. Publish typed SDKs for Python and one more language (decision Q10), generated from one
+     description of the API.
+  3. Add a conformance test that runs each SDK against a master.
+- **Done when:** The API description and the SDKs are in the repository, and each SDK passes the
+  conformance test in CI against the built master. A change to the internal protocol does not fail
+  it.
+
+### ECO-7: Integrations for coding agents and CI
+
+- **Evidence:** Read. `docs/guides/mcp-client-setup.md` covers Claude Code, Codex and Cursor over
+  stdio (DOC-7). Nothing runs CI jobs on the grid.
+- **Problem:** Other agents need their own setup, and a team's CI cannot use idle machines.
+- **Do:**
+  1. Add tested MCP setups for more common agents and a one-line check that each lists the tools.
+  2. Add a GitHub Actions runner pool: a worker mode or a small adapter that registers as a
+     self-hosted runner, picks jobs by label, and runs each in a fresh sandbox under `--isolation`.
+     State that a workflow from a fork must not run on it without approval.
+- **Done when:** A guide per agent has a recorded run. A workflow in a test repository runs on a
+  grid worker and reports its result to GitHub.
+
+### ECO-8: Documentation site and community
+
+- **Evidence:** Read. `CONTRIBUTING.md` and the REL-5 files exist. Documents are Markdown under
+  `docs/` and no site renders them.
+- **Problem:** A newcomer has no single place to read, ask or report a vulnerability.
+- **Do:**
+  1. Build a documentation site from `docs/` in CI, with the same links check.
+  2. Add a governance file (who decides, how a change is accepted), a code of conduct, a security
+     reporting policy with a contact, and issue and discussion templates. The owner decides each
+     (owner item, and Q11 for licence).
+  3. Link all of it from `README.md`.
+- **Done when:** The site builds in CI and is reachable, `README.md` links the governance and the
+  security policy, and a test report of a vulnerability reaches the named contact.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -1602,3 +1848,8 @@ Add one dated line per finished item, newest last.
   validation ([design 0049](design/0049-custom-relay.md)), and
   [docs/guides/self-hosted-relay.md](guides/self-hosted-relay.md) documents running `iroh-relay`.
   LINK-1 stays Partial until a live run through a self-hosted relay is recorded by the owner.
+- 2026-11-09: Phases 7 and 8 added with SCALE-1 to SCALE-6 and ECO-1 to ECO-8, all Planned, from
+  Phases F and G of [ROADMAP.md](ROADMAP.md) and [design 0050](design/0050-scale-out-architecture.md).
+  ECO-2 is CACHE-1 under its Phase G name, ECO-1 extends REAPI-1 with the `Execution` service, and
+  SCALE-4 supersedes the "Design only" note of FEAT-6, which stays Implemented as the refusal. The
+  Index counts changed from 12 to 26 Planned.
