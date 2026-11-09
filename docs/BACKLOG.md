@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 5 Partial and 29 Planned. Five items
+On 2026-11-10, at `master` `3ce2a65` plus the live two-machine run: 64 items Implemented, 4 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -174,7 +174,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
 | CLI-1 | Add `cancel` and `result` commands | P1 | M | INT-4 |  | Implemented | 30, 47 |
-| LOG-1 | Close P2P client endpoints cleanly and send client logs to stderr | P1 | S | FEAT-4 |  | Implemented | (open) |
+| LOG-1 | Close P2P client endpoints cleanly and send client logs to stderr | P1 | S | FEAT-4 |  | Implemented | 194 (open) |
 | MCP-1 | Make the MCP server concurrent, with deadlines | P1 | M | SEC-2 |  | Implemented | 31, 41 |
 | MCP-2 | Return outputs safely to an LLM | P1 | M | MCP-1 |  | Implemented | 62 |
 | MCP-3 | Correct JSON-RPC and argument handling | P2 | S | MCP-1 |  | Implemented | 97 |
@@ -214,7 +214,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
-| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
@@ -2015,11 +2015,18 @@ Add one dated line per finished item, newest last.
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
   and 29 Planned.
-- 2026-11-09: Added and implemented LOG-1: client P2P endpoints in `crates/core/src/transport.rs`,
-  `crates/cli/src/connect.rs` and `crates/cli/src/blobs.rs` now close gracefully before process
-  exit (with `drain_pending_p2p_client_closes` awaited before `with_client_relay_url`,
-  `run_doctor`, `McpState::close` and `run_cli_with` return), and `run_cli_with` routes all
-  tracing of client commands (`submit`, `status`, `result`, `cancel`, `workers`, `workspaces`,
-  `mapreduce`, `doctor`, `join`, `secret`, `mcp`) to `stderr` so `iroh` `INFO` lines never land on
-  `stdout` ahead of `--json` output. The Index counts are now 63 Implemented, 5 Partial and 29
-  Planned.
+- 2026-11-10: BENCH-1 is Implemented. Its "Done when" passes:
+  - `benchmarks/grid/bench_grid.py` ran on macOS (pull request 162), Windows (187) and Linux (189,
+    arm64 in a Docker Desktop VM, labelled as such);
+  - (c) is recorded on two machines (pull request 175 and the live run of 2026-11-09);
+  - `README.md` links the page.
+
+  The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
+- 2026-11-10: Added and implemented LOG-1 (pull request 194, open): client P2P endpoints in
+  `crates/core/src/transport.rs`, `crates/cli/src/connect.rs` and `crates/cli/src/blobs.rs` now
+  close gracefully before process exit (with `drain_pending_p2p_client_closes` awaited before
+  `with_client_relay_url`, `run_doctor`, `McpState::close` and `run_cli_with` return), and
+  `run_cli_with` routes all tracing of client commands (`submit`, `status`, `result`, `cancel`,
+  `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`, `mcp`) to `stderr` so `iroh`
+  `INFO` lines never land on `stdout` ahead of `--json` output. The Index counts are now 64
+  Implemented, 4 Partial and 29 Planned.

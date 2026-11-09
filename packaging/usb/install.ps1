@@ -96,6 +96,26 @@ Write-Host "Joining the cluster ..."
 Get-Content -Raw $TokenFile | & $Exe join --no-doctor
 if ($LASTEXITCODE -ne 0) { Fail "join failed (see the message above); nothing was started" }
 
+# The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
+# machines cannot reach each other directly (school or office Wi-Fi with client isolation), the
+# client checks below must use that ticket too. A ticket is an address, not a credential.
+$ticket = $null
+$cfg = Join-Path $State 'rusty-grid.toml'
+if (Test-Path $cfg) {
+    $inWorker = $false
+    foreach ($line in Get-Content $cfg) {
+        if ($line -match '^\[') { $inWorker = ($line -match '^\[worker\]\s*$') }
+        elseif ($inWorker -and $line -match '^\s*p2p_ticket\s*=\s*(.+?)\s*$') {
+            $v = $Matches[1]
+            if (($v.StartsWith("'") -and $v.EndsWith("'")) -or ($v.StartsWith('"') -and $v.EndsWith('"'))) { $v = $v.Substring(1, $v.Length - 2) }
+            $ticket = $v
+            break
+        }
+    }
+}
+$checkArgs = @()
+if ($ticket) { $checkArgs = @('--master', $ticket); Write-Host "  link:    P2P ticket (the worker and the checks connect through iroh)" }
+
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
 $workerArgs = "worker --name $Name --no-portal"
@@ -133,7 +153,7 @@ if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { Fail "the
 $connected = $false
 for ($i = 0; $i -lt 30; $i++) {
     # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-    $list = (& $Exe workers --json | Out-String) | ConvertFrom-Json
+    $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json
     if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
     Start-Sleep -Seconds 1
 }
@@ -152,7 +172,7 @@ if (-not $NoAutostart) {
 # 9. Check the cluster.
 Write-Host ""
 Write-Host "Checking the cluster (oxideswarm doctor) ..."
-& $Exe doctor
+& $Exe doctor @checkArgs
 $doctor = if ($LASTEXITCODE -eq 0) { "passed" } else { "reported a problem (see above)" }
 Write-Host ""
 Write-Host "Done. Worker '$Name' is part of the cluster; the doctor check $doctor."
