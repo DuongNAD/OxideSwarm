@@ -1564,21 +1564,19 @@ impl WorkerClient {
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
 
-        let initial_beacon = if !config.master_addr.is_empty()
+        let initial_beacon = if config.p2p_ticket.is_none()
+            && !config.master_addr.is_empty()
             && !config.master_addr.eq_ignore_ascii_case("auto")
             && !config.master_addr.starts_with("auto:")
         {
-            let host = if let Some(idx) = config.master_addr.find(':') {
-                &config.master_addr[..idx]
-            } else {
-                &config.master_addr
-            };
-            Some(rusty_grid_core::discovery::MasterBeacon::new(
-                config.master_addr.clone(),
-                format!("http://{}:8080", host),
-                "KnownMaster",
-                0,
-            ))
+            portal_host_of(config.master_addr.trim()).map(|host| {
+                rusty_grid_core::discovery::MasterBeacon::new(
+                    config.master_addr.clone(),
+                    format!("http://{}:8080", url_host(&host)),
+                    "KnownMaster",
+                    0,
+                )
+            })
         } else {
             None
         };
@@ -3856,6 +3854,48 @@ fn is_local_only_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
+/// True when `addr` targets a loopback master (`127.x.x.x`, `[::1]`, or `localhost`).
+pub(crate) fn is_loopback_master_addr(addr: &str) -> bool {
+    let Some(host) = portal_host_of(addr.trim()) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Returns the socket address the standby redirection portal should bind for `target`.
+///
+/// When the worker targets a loopback master, we bind `127.0.0.1:<portal_port>` rather than
+/// `0.0.0.0:<portal_port>` (and rather than skipping the portal altogether):
+/// - A visitor on another machine cannot reach a loopback master anyway (and
+///   [`resolve_portal_master`] already refuses to serve a loopback redirect to non-loopback
+///   clients), so binding all interfaces only triggers a Windows Firewall prompt ("allow public
+///   and private networks?") when a worker or test connects to `127.0.0.1`.
+/// - Binding `127.0.0.1` instead of skipping the portal preserves local `/api/status` probing,
+///   local browser redirects on the same host, and tests that exercise the portal against a
+///   loopback master.
+async fn portal_bind_addr_for_target(
+    portal_port: u16,
+    target: &PortalTarget,
+) -> std::net::SocketAddr {
+    let is_loopback = match target {
+        PortalTarget::Static(addr) => is_loopback_master_addr(addr),
+        PortalTarget::Dynamic(beacon_state) => beacon_state
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|beacon| is_loopback_master_addr(&beacon.cluster_addr)),
+    };
+    let bind_ip = if is_loopback {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    std::net::SocketAddr::new(bind_ip, portal_port)
+}
+
 /// Host of a validated `scheme://host[:port]` origin, without brackets.
 fn origin_host(origin: &str) -> Option<String> {
     portal_host_of(origin.split_once("://")?.1)
@@ -4181,15 +4221,13 @@ pub async fn spawn_worker_redirection_portal_with_secret(
     secret: Option<ClusterSecret>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
-    use std::net::SocketAddr;
-    let bind_addr = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        portal_port,
-    );
+    let target = target.into();
+    let bind_addr = portal_bind_addr_for_target(portal_port, &target).await;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) => {
             debug!(
+                bind_addr = %bind_addr,
                 port = portal_port,
                 error = %e,
                 "Worker standby redirection portal not started (port 8080 likely bound by Master or other service)"
@@ -4199,13 +4237,14 @@ pub async fn spawn_worker_redirection_portal_with_secret(
     };
 
     info!(
+        bind_addr = %bind_addr,
         portal_port = portal_port,
-        "Worker standby HTTP redirection portal active on port 8080"
+        "Worker standby HTTP redirection portal active"
     );
 
     run_portal(
         listener,
-        target.into(),
+        target,
         secret,
         shutdown_rx,
         PORTAL_MAX_CONNECTIONS,
@@ -7964,5 +8003,105 @@ mod tests {
                 "child running junk .exe ({exe_path}) must fail with non-zero exit code, got: {res:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let make_worker = |master_addr: &str| {
+            WorkerClient::new(
+                WorkerConfig::new(master_addr)
+                    .with_no_gpu(true)
+                    .with_no_blender(true)
+                    .with_no_cuda(true)
+                    .with_no_battery(true)
+                    .with_sandbox_base_dir(dir.path().join("sandboxes")),
+            )
+        };
+
+        // 1. Loopback master addresses resolve to 127.0.0.1:<port>, not 0.0.0.0:<port>.
+        for loopback_master in ["127.0.0.1:8088", "[::1]:8088", "localhost:8088"] {
+            let worker = make_worker(loopback_master);
+            let bind_addr = portal_bind_addr_for_target(
+                8080,
+                &PortalTarget::from(worker.master_beacon.clone()),
+            )
+            .await;
+            assert_eq!(
+                bind_addr.ip(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "worker targeting loopback master {loopback_master} must bind portal to 127.0.0.1, got {bind_addr}"
+            );
+            let static_bind =
+                portal_bind_addr_for_target(8080, &PortalTarget::from(loopback_master)).await;
+            assert_eq!(static_bind.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        }
+
+        // 2. Non-loopback and auto-discovery targets keep binding 0.0.0.0:<port>.
+        for lan_master in ["192.0.2.10:8088", "auto", "auto:8089"] {
+            let worker = make_worker(lan_master);
+            let bind_addr = portal_bind_addr_for_target(
+                8080,
+                &PortalTarget::from(worker.master_beacon.clone()),
+            )
+            .await;
+            assert_eq!(
+                bind_addr.ip(),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                "worker targeting non-loopback master {lan_master} must keep binding 0.0.0.0, got {bind_addr}"
+            );
+        }
+
+        // 3. Spawn a live portal for a loopback-targeting worker and prove it listens on 127.0.0.1
+        //    and does not occupy the port on non-loopback interfaces.
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let portal_port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+
+        let worker = make_worker("127.0.0.1:18088");
+        let target = PortalTarget::from(worker.master_beacon.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let portal_handle = tokio::spawn(async move {
+            spawn_worker_redirection_portal_with_secret(portal_port, target, None, shutdown_rx)
+                .await;
+        });
+
+        let mut connected = None;
+        for _ in 0..30 {
+            if let Ok(stream) = TcpStream::connect(("127.0.0.1", portal_port)).await {
+                connected = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut stream = connected.expect("portal should listen on 127.0.0.1");
+        stream
+            .write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write status request");
+        let mut buf = vec![0u8; 2048];
+        let n = stream.read(&mut buf).await.expect("read status response");
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("200 OK"), "{resp}");
+        assert!(
+            resp.contains("\"master_cluster_addr\":\"127.0.0.1:18088\""),
+            "{resp}"
+        );
+
+        let lan_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+        if !lan_ip.is_loopback() {
+            let lan_bind = std::net::TcpListener::bind((lan_ip, portal_port));
+            assert!(
+                lan_bind.is_ok(),
+                "loopback-targeting worker portal must not bind 0.0.0.0:{portal_port} (binding {lan_ip}:{portal_port} failed: {:?})",
+                lan_bind.err()
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), portal_handle).await;
     }
 }
