@@ -96,6 +96,7 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 | **23. Generative 3D & Procedural SDF** | Pure Rust procedural Signed Distance Field (SDF) mesh generation (`Procedural-SDF-PureRust`) for default (`auto`) and procedural (`sdf`) tiers, honest failure on missing neural model checkpoints, client-side pre-submission validation, and virtual environment isolation. Design: [docs/design/0017-honest-3d-sdf-fallback.md](docs/design/0017-honest-3d-sdf-fallback.md). | Implemented |
 | **24. Agent Mesh command hardening & process controls** | Restricts mesh nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`); unadvertised commands return exit 127. `--no-shell` flag filters out `shell_exec` capability and rejects execution requests with 127. Child processes inherit no stdin (`DEVNULL`), output is capped at 1 MiB per stream, and 5 secret env vars are stripped from parent environment inheritance. Design: [docs/design/0011-agent-mesh-hardening.md](docs/design/0011-agent-mesh-hardening.md). | Implemented |
 | **25. Head-and-tail task stream capture** | Workers capture up to 10 MiB per output stream (`stdout` and `stderr`) using a split head-and-tail buffer (`first 5 MiB` + truncation notice + rolling `last 5 MiB`) so both startup banners and final build/test summaries survive when a task writes more than 10 MiB. `MapReduceEngine` checks both the legacy tail position and the midpoint position for `[rusty_grid: output truncated after exceeding size limit]`; upgrade the master before workers so an older master does not miss a midpoint marker. Design: [docs/design/0022-head-and-tail-stream-capture.md](docs/design/0022-head-and-tail-stream-capture.md). | Implemented |
+| **26. Agent workspaces** | `submit --workspace <NAME>` (and the MCP `workspace` field) syncs the current directory, following `.gitignore`, into a named workspace on a worker started with `--workspaces`; only changed files travel, files deleted locally are deleted remotely, and build output such as `target/` stays, so a second `cargo test` is incremental. One task per workspace at a time, with affinity to the worker that holds it ([design 0039](docs/design/0039-agent-workspaces.md), [guide](docs/guides/offload-cargo-test.md)). Measured on 2026-11-09 between a Mac and a Windows laptop: 207 s cold, 7 s warm ([record](docs/guides/offload-cargo-test.md#recorded-two-machine-run)). Symbolic links in the tree are skipped (W11) | Implemented |
 
 ### Per-Platform Verification Summary
 
@@ -133,10 +134,49 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 Ports: **8088** is the cluster port (workers and `submit` / `status` talk to it), **8080** is the dashboard
 (never a valid `--master` target), **8089/udp** is discovery. Details: [docs/SECURITY.md](docs/SECURITY.md#4-what-each-port-exposes).
 
+### Quick start: offload `cargo test` to a second machine
+
+Two machines on one network: on **A** you edit code (with or without a coding agent), **B** has Rust
+installed and does the work. Neither machine has to build OxideSwarm.
+
+1. **Install** the release archive for each system on both machines ([Install](#install)).
+2. **Start the master on A.** The first start creates `~/.oxideswarm/cluster.secret`:
+
+   ```bash
+   oxideswarm master --listen 0.0.0.0:8088
+   ```
+
+3. **Join B with one token** ([design 0048](docs/design/0048-join-token.md)). The token carries the
+   secret: move it over a channel you trust (never chat or e-mail), and pipe it in rather than
+   typing it as an argument:
+
+   ```bash
+   oxideswarm secret join-token --master <A_IP>:8088 > join.token   # on A
+   oxideswarm join < join.token                                     # on B: saves the secret and the address, runs the doctor checks
+   oxideswarm worker --workspaces                                   # on B
+   ```
+
+4. **Check from A** that B offers workspaces and Cargo: in `oxideswarm workers --json`, B's `tags`
+   include `feat:workspaces` and `tool:cargo`.
+5. **Offload** from the root of a Rust project on A:
+
+   ```bash
+   oxideswarm submit --workspace myproject --require-tool cargo --wait -- cargo test
+   ```
+
+   The first run sends every file that `.gitignore` does not exclude and builds from scratch. Run it
+   again: only changed files travel, and B reuses its `target/` directory.
+
+A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
+its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
+expected output, the MCP calls and troubleshooting, is
+[guides/offload-cargo-test.md](docs/guides/offload-cargo-test.md), and measured times are in
+[benchmarks/grid/README.md](benchmarks/grid/README.md).
+
 ### Install
 
-> No release exists yet: the first archives appear on the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-> when the owner pushes a `v*` tag. Until then, build from source (Step 0 below).
+Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
+(the first release is `v0.1.0`), or build from source (Step 0 below).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should

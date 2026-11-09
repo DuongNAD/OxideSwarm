@@ -26,20 +26,20 @@ On a macOS or Linux worker machine:
 On a Windows worker machine (PowerShell):
 
 ```powershell
-.\target\release\oxideswarm.exe worker --master <MASTER_IP>:8088 --workspaces
+.\target\release\oxideswarm.exe worker --master <MASTER_IP>:8088 --workspaces --isolation fs
 ```
 
-On macOS and Linux, `--isolation fs` ([design 0033](../design/0033-os-level-task-isolation.md)) confines each workspace task to `<workspace_root>/<WORKSPACE>/tree` and `<workspace_root>/<WORKSPACE>/tmp` while mounting the host's `RUSTUP_HOME` and `CARGO_HOME` read-only (`$CARGO_HOME/credentials.toml` is denied). On Windows, `--isolation fs` is **Planned** (`FEAT-3c`), so Windows workers run with `--isolation off`.
+`--isolation fs` ([design 0033](../design/0033-os-level-task-isolation.md)) confines each workspace task to `<workspace_root>/<WORKSPACE>/tree` and `<workspace_root>/<WORKSPACE>/tmp` while granting read-only access to the host's `RUSTUP_HOME` and `CARGO_HOME` (`$CARGO_HOME/credentials.toml` is denied).
 
 ### 2. Check that the worker advertises workspaces and cargo
 
 On the client machine:
 
 ```bash
-./target/release/oxideswarm workers --master <MASTER_IP>:8088
+./target/release/oxideswarm workers --master <MASTER_IP>:8088 --json
 ```
 
-Expected: the remote worker is `connected` and its `TAGS` column includes `feat:workspaces` and `tool:cargo` (`crates/cli/src/cli_app.rs`).
+Expected: the remote worker's `tags` include `state:connected`, `feat:workspaces` and `tool:cargo` (the plain `workers` listing shows the worker and its link, but not its tags).
 
 ### 3. Offload cargo test from the command line
 
@@ -67,6 +67,7 @@ Expected output on the first (cold) run:
 - Standard error prints the blob upload summary and Cargo's compilation output:
 
 ```text
+Warning: --workspace skips ./ox-mode (symbolic links are not sent)
 Workspace 'oxideswarm-dev': <N> files (<SIZE>); sent <M> of <M> blobs (<SIZE>), 0 already on the master
 Stderr:
    Compiling ...
@@ -106,39 +107,40 @@ To run another command in the same remote workspace without scanning or syncing 
 
 When a coding agent is connected to `oxideswarm mcp` ([mcp-client-setup.md](mcp-client-setup.md)), it calls the `submit` tool (`crates/cli/src/mcp.rs`) with `type: "command"`, `command: "cargo"`, `tools: ["cargo"]`, `workspace: { "name": "oxideswarm-dev", "sync_dir": "." }`, and `wait: true`. `scan_mcp_workspace_in_dir` (`crates/cli/src/mcp.rs`) checks that `sync_dir` stays inside the MCP working directory without traversing symbolic links.
 
-On the client machine (from the repository root):
+On the client machine (from the repository root). An MCP client keeps standard input open while a call runs; when standard input closes, `oxideswarm mcp` cancels the calls that are still running (their task ends with exit code `130`). To try the calls by hand, keep the pipe open with `sleep` and press Ctrl-C once the `id: 2` answer has arrived (a cold build can take several minutes):
 
 ```bash
-printf '%s\n%s\n%s\n%s\n' \
+{ printf '%s\n%s\n%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"offload","version":"1.0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit","arguments":{"type":"command","command":"cargo","args":["test","-p","rusty_grid_core","--lib"],"tools":["cargo"],"workspace":{"name":"oxideswarm-dev","sync_dir":"."},"wait":true,"wait_secs":120}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspaces","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit","arguments":{"type":"command","command":"cargo","args":["test","-p","rusty_grid_core","--lib"],"tools":["cargo"],"workspace":{"name":"oxideswarm-dev","sync_dir":"."},"wait":true}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspaces","arguments":{}}}'; sleep 900; } \
   | ./target/release/oxideswarm mcp --master <MASTER_IP>:8088
 ```
 
-The JSON text inside `result.content[0].text` of response `id: 2` includes:
+`wait_secs` is left out: with a workspace it defaults to the task timeout (`1800` s) plus 5 s, which covers a cold build. The JSON text inside `result.content[0].text` of response `id: 2` includes (output shortened):
 
 ```json
 {
   "status": "completed",
   "task_id": "<TASK_ID>",
-  "worker_id": "<WORKER_UUID>",
   "exit_code": 0,
-  "execution_time_ms": 0,
-  "stdout": "running <K> tests\n...",
-  "stderr": "    Finished `test` profile ...\n     Running unittests src/lib.rs ...\n",
+  "duration_ms": <DURATION_MS>,
+  "error": null,
+  "stdout": "\nrunning <K> tests\n...",
+  "stderr": "   Compiling ...\n    Finished `test` profile ...\n     Running unittests src/lib.rs ...\n",
+  "truncated": true,
   "workspace": {
     "name": "oxideswarm-dev",
     "worker": "<WORKER_UUID>",
-    "files": 0,
-    "uploaded_bytes": 0,
-    "skipped": 0
+    "files": <N>,
+    "uploaded_bytes": <BYTES>,
+    "skipped": <SKIPPED>
   }
 }
 ```
 
-On the warm second run with unchanged files, `"uploaded_bytes"` is `0` and neither `"stderr"` nor `"stdout"` contains `Compiling`. Response `id: 3` (`workspaces`) returns the master's affinity table as JSON (`[{"name": "oxideswarm-dev", "worker": "<WORKER_UUID>", "last_used_utc": "<TIMESTAMP>"}]`).
+`uploaded_bytes` counts only the blobs that the master did not hold yet, so it is `0` when another workspace or an earlier `submit` already sent the same files. `skipped` counts the symbolic links left out of the scan. Output beyond the inline limit (`max_output_bytes`, default 16384) is cut in the middle and marked with `truncated`. On the warm second run with unchanged files, `"uploaded_bytes"` is `0` and neither `"stderr"` nor `"stdout"` contains `Compiling`. Response `id: 3` (`workspaces`) returns the master's affinity table as JSON, with `last_used_utc` in Unix seconds (`[{"name": "oxideswarm-dev", "worker": "<WORKER_UUID>", "last_used_utc": <UNIX_SECONDS>}]`).
 
 ## Verify
 
@@ -188,18 +190,27 @@ python3 benchmarks/grid/bench_grid.py \
 
 ### Recorded two-machine run
 
-Status: **Planned** (placeholder for the live two-machine run on the owner's cluster per [design 0039](../design/0039-agent-workspaces.md) W10; automated end-to-end loopback coverage of CLI and MCP workspace builds, warm `target/` reuse, deleted-file sync, and `workspaces` affinity runs in `tests/agent_workspace_e2e.rs` on Linux, macOS, and Windows in CI).
+Run on 2026-11-09 between 12:35 and 12:55 UTC, on one home LAN with a direct TCP link (`link:TCP/LAN`, no relay):
 
-| Field | Live run record (to be filled by owner) |
+| Field | Value |
 |---|---|
-| Date (UTC) | `<TBD>` |
-| Client commit | `<TBD>` (at a commit the worker machine does not have checked out) |
-| Client / master host | `<TBD>` |
-| Worker host (`--workspaces`) | `<TBD>` |
-| Command | `cargo test -p rusty_grid_core --lib` over MCP (`workspace: { "name": "oxideswarm-dev", "sync_dir": "." }`, `tools: ["cargo"]`) |
-| Cold first run (`target/` populated) | `<TBD>` (`files: <TBD>`, `uploaded_bytes: <TBD>`, `execution_time_ms: <TBD>`, `Compiling rusty_grid_core` present) |
-| Warm second run (`target/` reused) | `<TBD>` (`uploaded_bytes: 0`, `execution_time_ms: <TBD>`, no `Compiling` line in `stderr`) |
-| `workspaces` affinity output | `oxideswarm-dev -> worker <TBD> (last_used_utc: <TBD>)` |
+| Client and master | MacBook Air, Apple M5 (10 cores), 32 GiB, macOS (Darwin 27.2.0), AC power. Release build of `5c9e126`. The synced tree was the local commit `8743ed1` (`5c9e126` plus documentation edits), which the worker machine did not have |
+| Worker (`--workspaces`, `--isolation off`) | Laptop with an Intel Core i7-1355U (10 cores, 12 threads), 16 GB, Windows 11 Home (build 26300). Release build of `5c9e126`, Rust 1.96.0 |
+| Tree | 404 files, 10.1 MiB (405 blobs with the manifest); the two symbolic links were skipped with a warning |
+| Command | `cargo test -p rusty_grid_core --lib`: 249 tests, all passed in every run |
+
+| Run | Interface and workspace | Client wall clock | Worker time | Sent | `Compiling` lines |
+|---|---|---|---|---|---|
+| Cold | CLI, `oxideswarm-dev` | 210.7 s | 207 180 ms | 405 of 405 blobs (10.2 MiB) | 274, `rusty_grid_core` included (Cargo: `Finished` in 3m 17s) |
+| Warm | CLI, `oxideswarm-dev` | 6.9 s | 6 499 ms | 0 of 405 blobs | none (Cargo: `Finished` in 0.78s) |
+| Cold | MCP, `oxideswarm-mcp` | 207.4 s | `duration_ms` 207 123 | `uploaded_bytes: 0`: the master already held every blob from the CLI run | present (stderr truncated inline) |
+| Warm | MCP, `oxideswarm-mcp` | 6.6 s | `duration_ms` 6 428 | `uploaded_bytes: 0` | none |
+
+The `workspaces` tool and `oxideswarm workspaces` then listed both names on the Windows worker, for example `oxideswarm-dev -> worker 79e049ee-b7d4-480a-ab70-dd5745544be9 (last_used_utc: 1794227945)`. The second run of the same command took about 3 % of the first. Three more cold and warm pairs in fresh workspaces, with `--offline`, are the BENCH-1 (c) record in [benchmarks/grid/README.md](../../benchmarks/grid/README.md). On the same day, `oxideswarm join` on the Windows machine (under a temporary profile) saved the secret and the address and passed 8 of the doctor checks, with C5 skipped for lack of a GPU.
+
+Later the same day the released `v0.1.0` archives repeated the CLI run on the same two machines, with the macOS archive as client and master and the Windows archive as worker. The run sent the 407 blobs to the new master in 30.0 s without recompiling, and then took 7.2 s warm, with 249 tests passed.
+
+The run also found that a pipe which closes standard input cancels a running MCP call (task exit code `130`). Step 4 above keeps the pipe open for that reason.
 
 ## Troubleshooting
 
@@ -211,4 +222,3 @@ Status: **Planned** (placeholder for the live two-machine run on the owner's clu
 | `invalid workspace name '...'` | The workspace name uses uppercase letters, path separators, leading punctuation, or a reserved Windows device name (`con`, `nul`, `com1`, ...) | Use 1 to 64 lowercase ASCII characters from `[a-z0-9][a-z0-9._-]{0,63}` without a trailing `.` or space (`validate_workspace_name` in `crates/core/src/task.rs`). |
 | A second `submit --workspace <NAME>` waits in `Queued` while the first is still running | The scheduler allows at most one active (`Scheduled` or `Running`) task per workspace name at a time so two Cargo processes do not contend on `target/` | Wait for the running task in `<NAME>` to finish, or use a second workspace name (`<NAME>-2`) if you want an independent build tree. |
 | Cargo fails with `attempt to download ...` when `--offline` or `--isolation fs+net` is used | Crate dependencies are not cached in the worker's `$CARGO_HOME` or vendored in the workspace tree | Run once without `--offline` (under `--isolation fs` or `off`) so Cargo populates `$CARGO_HOME/registry`, or vendor dependencies in the repository before running under `--isolation fs+net`. |
-| Windows worker refuses to start when given `--workspaces --isolation fs` | Windows AppContainer confinement (`FEAT-3c`) is **Planned** | Start the Windows worker without `--isolation fs` (`--isolation off`, the default). |

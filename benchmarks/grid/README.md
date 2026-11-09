@@ -89,9 +89,28 @@ The JSON record captures client wall clock (`wall_s`), worker-side execution tim
 `Workspace '<name>': ...` summary line, `reused_target` on the warm run, and sanitized worker hardware/OS/link
 capabilities from `oxideswarm workers --json` (omitting worker names and IDs so no host names are recorded).
 
+**(c) Recorded run.** Record: [`results/2026-11-09-c-macos-arm64-to-windows-x86_64.json`](results/2026-11-09-c-macos-arm64-to-windows-x86_64.json).
+2026-11-09 (UTC). Client and master: Apple M5, 10 cores, 32 GiB, macOS (Darwin 27.2.0), AC power, load
+average about 2.5 before and after. Worker: Intel Core i7-1355U (12 threads), 16 GB, Windows 11 Home
+(build 26300), `--workspaces`, `--isolation off`, a direct TCP link on one home LAN. Both binaries were
+release builds of `5c9e126`; the synced tree was the local commit `8743ed1` (404 files, 10.1 MiB), run
+with the default `test -p rusty_grid_core --lib --offline`, 3 repetitions.
+
+| Run | Client wall clock, s (median, range) | Worker time, ms (median, range) | Blobs sent | `target/` reused |
+|---|---|---|---|---|
+| Cold | 209.6 (209.4 to 224.2) | 209171 (209092 to 223881) | 0 of 405 | no |
+| Warm | 7.6 (7.3 to 7.7) | 7248 (7085 to 7279) | 0 of 405 | yes, in all 3 runs |
+
+Every `submit` exited with code 0, which the harness requires. The cold runs sent no blobs because the master already held the tree from
+the CLI and MCP runs of the [offload guide record](../../docs/guides/offload-cargo-test.md#recorded-two-machine-run)
+made just before (its first run sent 405 of 405 blobs, 10.2 MiB, in a 210.7 s submit). So the cold
+figure is the worker writing a fresh tree from its blob cache and compiling the dependencies from
+scratch; the warm figure is a sync that changes nothing plus an incremental `cargo test`. Each warm run
+took about 3.6 % of its cold run.
+
 ## Limits
 
-- One machine, loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
+- (a) and (b) run on one machine over loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
   unauthenticated and unencrypted, so no handshake or AEAD cost). It says nothing about a LAN or the Internet.
 - Throughput is measured through separate CLI processes, so it is limited by process start, not only by
   the master. A client that keeps one connection open would show a different, probably higher, figure.
@@ -101,5 +120,5 @@ capabilities from `oxideswarm workers --json` (omitting worker names and IDs so 
 - Workers use the default below-normal task priority and a fresh sandbox per task; a no-op task is the
   cheapest possible task. Real tasks add their own run time.
 - No other scheduler was run, so these figures are not a comparison with any other system.
-- (c), the offload of `cargo test` between two machines, is implemented in `bench_grid.py --offload-master`
-  and waits for a live two-machine run once worker workspace wiring (Design 0039 W2b / W10) lands.
+- (c) is one pair of machines on one LAN, a single worker and one crate: it shows what a reused `target/` saves, not how the grid scales, and a
+  relayed or Internet link would add transfer time to a first run.
