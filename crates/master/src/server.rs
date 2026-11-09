@@ -2888,6 +2888,9 @@ pub async fn handle_worker_disconnect_with_broadcast(
         debug!(worker_id = %worker_id, "Worker unregister skipped (stale session or already handled)");
         return;
     }
+    if let Some(sid) = session_id {
+        queue.set_worker_session_resume_connected(*worker_id, sid, false);
+    }
 
     warn!(
         worker_id = %worker_id,
@@ -2945,6 +2948,9 @@ pub async fn handle_worker_evacuate_with_broadcast(
     if !unregistered {
         debug!(worker_id = %worker_id, "Worker drain unregister skipped (stale session or already handled)");
         return;
+    }
+    if let Some(sid) = session_id {
+        queue.set_worker_session_resume_connected(*worker_id, sid, false);
     }
 
     info!(

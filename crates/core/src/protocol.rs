@@ -1476,26 +1476,64 @@ pub mod master_features {
 
     const PREFIX: &str = "features=";
 
-    /// Computes a deterministic 64-bit token for a [`crate::task::TaskResult`] so a result
-    /// acknowledgment (`"oxs:result-ack:<token>"`) only ever acknowledges the matching attempt's
-    /// buffered result and never a later retry of the same `task_id`.
+    /// Computes a deterministic 64-bit BLAKE3 token for a [`crate::task::TaskResult`] over a
+    /// canonical little-endian encoding of `task_id`, `worker_id`, `exit_code`,
+    /// `execution_time_ms`, `is_gpu_executed`, `device_name`, `stdout`, `stderr`, `error`,
+    /// `asset_bytes`, `artifacts`, and `outputs`, taking the first 8 digest bytes in little-endian
+    /// order so a result acknowledgment (`"oxs:result-ack:<token>"`) is stable across Rust versions
+    /// and builds and only ever acknowledges the matching attempt's buffered result.
     pub fn result_ack_token(result: &crate::task::TaskResult) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        result.task_id.hash(&mut hasher);
-        result.exit_code.hash(&mut hasher);
-        result.stdout.hash(&mut hasher);
-        result.stderr.hash(&mut hasher);
-        result.execution_time_ms.hash(&mut hasher);
-        result.is_gpu_executed.hash(&mut hasher);
-        result.device_name.hash(&mut hasher);
-        result.error.hash(&mut hasher);
-        for o in &result.outputs {
-            o.path.hash(&mut hasher);
-            o.id.hash(&mut hasher);
-            o.size.hash(&mut hasher);
+        fn put_bytes(h: &mut blake3::Hasher, bytes: &[u8]) {
+            h.update(&(bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
         }
-        hasher.finish()
+        fn put_opt_bytes(h: &mut blake3::Hasher, opt: Option<&[u8]>) {
+            match opt {
+                Some(bytes) => {
+                    h.update(&[1u8]);
+                    put_bytes(h, bytes);
+                }
+                None => {
+                    h.update(&[0u8]);
+                }
+            }
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(result.task_id.0.as_bytes());
+        hasher.update(result.worker_id.as_bytes());
+        hasher.update(&result.exit_code.to_le_bytes());
+        hasher.update(&result.execution_time_ms.to_le_bytes());
+        hasher.update(&[u8::from(result.is_gpu_executed)]);
+        put_opt_bytes(
+            &mut hasher,
+            result.device_name.as_deref().map(str::as_bytes),
+        );
+        put_bytes(&mut hasher, result.stdout.as_bytes());
+        put_bytes(&mut hasher, result.stderr.as_bytes());
+        put_opt_bytes(&mut hasher, result.error.as_deref().map(str::as_bytes));
+        put_opt_bytes(
+            &mut hasher,
+            result.asset_bytes.as_ref().map(|b| b.as_bytes()),
+        );
+        hasher.update(&(result.artifacts.len() as u64).to_le_bytes());
+        for a in &result.artifacts {
+            put_bytes(&mut hasher, a.path.as_bytes());
+            hasher.update(&a.size.to_le_bytes());
+            hasher.update(&a.sha256);
+            put_bytes(&mut hasher, a.data.as_bytes());
+        }
+        hasher.update(&(result.outputs.len() as u64).to_le_bytes());
+        for o in &result.outputs {
+            put_bytes(&mut hasher, o.path.as_bytes());
+            hasher.update(&o.id.0);
+            hasher.update(&o.size.to_le_bytes());
+            hasher.update(&[u8::from(o.executable)]);
+        }
+        let digest = hasher.finalize();
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(out)
     }
 
     /// Formats a `MasterMessage::CancelTask` reason string acknowledging `result` (`token`).
@@ -6049,7 +6087,7 @@ mod tests {
 
     #[test]
     fn test_v6_responses_at_a_v7_client_are_refused_as_version_6() {
-        // Every v6 ClientResponse variant (`WorkspaceList` was appended in v7, nothing moved)
+        // Every v6 ClientResponse variant (`Workspaces` was appended in v7, nothing moved)
         // decodes with its v6 version trailer and is refused as IncompatibleVersion(6).
         let responses = [
             ClientResponse::Hello {
@@ -6090,5 +6128,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_result_ack_token_is_blake3_canonical_and_includes_worker_id() {
+        let tid = TaskId(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
+        let wid1 = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let wid2 = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8889);
+
+        let mut base = TaskResult::success(wid1, tid, "out-payload", 42, false);
+        base.stderr = crate::task::Bytes::from_static(b"err-payload");
+        let token1 = master_features::result_ack_token(&base);
+        // Deterministic BLAKE3 LE u64 across builds and platforms:
+        assert_eq!(token1, 12_561_239_036_294_283_620_u64);
+
+        // Changing worker_id must change the token (D4 / N2):
+        let mut other_worker = base.clone();
+        other_worker.worker_id = wid2;
+        assert_ne!(master_features::result_ack_token(&other_worker), token1);
+
+        // Changing execution_time_ms, stdout, or outputs must change the token:
+        let mut other_time = base.clone();
+        other_time.execution_time_ms = 43;
+        assert_ne!(master_features::result_ack_token(&other_time), token1);
+
+        let mut other_out = base.clone();
+        other_out.stdout = crate::task::Bytes::from_static(b"changed");
+        assert_ne!(master_features::result_ack_token(&other_out), token1);
     }
 }

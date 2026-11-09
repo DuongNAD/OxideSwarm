@@ -483,23 +483,28 @@ pub fn available_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "submit",
-            description: "Submit a compute workload (command, shell script, or GPU compute) to the grid cluster with placement constraints, environment variables, staged files, and artifact retrieval.",
+            description: "Submit a compute workload (command, shell script, GPU compute, or Rust compilation) to the grid cluster with placement constraints, environment variables, staged files, and artifact retrieval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["command", "shell", "gpu"],
-                        "description": "Task type (default: command). Requires 'command' when 'command' (or omitted); requires 'script' or 'command' when 'shell'"
+                        "enum": ["command", "shell", "gpu", "compile"],
+                        "description": "Task type (default: command). Requires 'command' when 'command' (or omitted); requires 'script' or 'command' when 'shell'; requires 'source_files' or 'files' when 'compile'"
                     },
                     "command": {
                         "type": "string",
-                        "description": "Command executable to run (required when type is 'command' or omitted; also accepted as shell script string when type is 'shell' and 'script' is omitted)"
+                        "description": "Command executable to run (required when type is 'command' or omitted; also accepted as shell script string when type is 'shell' and 'script' is omitted, or crate name when type is 'compile')"
                     },
                     "args": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Arguments for command execution"
+                        "description": "Arguments for command execution (or compiler_flags when type is 'compile')"
+                    },
+                    "source_files": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Source files map (relative path -> UTF-8 source text) for 'compile' tasks"
                     },
                     "script": {
                         "type": "string",
@@ -551,6 +556,11 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Required worker user tags"
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Required worker host tools (e.g. [\"cargo\", \"rustc\", \"git\"]), matched against worker tool:<name> tags"
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -856,14 +866,35 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
         "submit" => {
             let raw_type = check_opt_str(obj, "type")?.unwrap_or("command");
             let task_type = raw_type.to_lowercase();
-            if !matches!(task_type.as_str(), "command" | "shell" | "gpu") {
+            if !matches!(task_type.as_str(), "command" | "shell" | "gpu" | "compile") {
                 return Err(format!(
-                    "Invalid task 'type': '{raw_type}' (expected 'command', 'shell', or 'gpu')"
+                    "Invalid task 'type': '{raw_type}' (expected 'command', 'shell', 'gpu', or 'compile')"
                 ));
             }
 
             let cmd_opt = check_opt_str(obj, "command")?;
             let script_opt = check_opt_str(obj, "script")?;
+            let files_opt = check_opt_str_array(obj, "files")?;
+            let mut has_source_files = false;
+            if let Some(sf_val) = obj.get("source_files") {
+                if !sf_val.is_null() {
+                    let sf_obj = sf_val.as_object().ok_or_else(|| {
+                        "Property 'source_files' must be an object mapping relative paths to strings"
+                            .to_string()
+                    })?;
+                    for (k, v) in sf_obj {
+                        if k.trim().is_empty() {
+                            return Err(
+                                "Source file path in 'source_files' must not be empty".to_string()
+                            );
+                        }
+                        if !v.is_string() {
+                            return Err(format!("Source file '{k}' content must be a string"));
+                        }
+                    }
+                    has_source_files = !sf_obj.is_empty();
+                }
+            }
             match task_type.as_str() {
                 "command" => {
                     if cmd_opt.is_none_or(|c| c.trim().is_empty()) {
@@ -883,6 +914,15 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
                     }
                 }
                 "gpu" => {}
+                "compile" => {
+                    let has_files = files_opt.as_ref().is_some_and(|f| !f.is_empty());
+                    if !has_source_files && !has_files {
+                        return Err(
+                            "Compile task requires a non-empty 'source_files' object or 'files' array"
+                                .to_string(),
+                        );
+                    }
+                }
                 _ => unreachable!(),
             }
 
@@ -908,6 +948,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             let arch_opt = check_opt_str(obj, "arch")?;
             let worker_opt = check_opt_str(obj, "worker")?;
             let req_tags = check_opt_str_array(obj, "require_tags")?;
+            let tools_opt = check_opt_str_array(obj, "tools")?;
             let isolation_opt = check_opt_str(obj, "isolation")?;
 
             let mut placement_tags = Vec::new();
@@ -928,6 +969,11 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             if let Some(tags) = req_tags {
                 for t in tags {
                     placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
+                }
+            }
+            if let Some(tools) = tools_opt {
+                for t in tools {
+                    placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
                 }
             }
             Placement::from_task_tags(&placement_tags)
@@ -2052,9 +2098,54 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 stdin,
             }
         }
+        "compile" => {
+            let mut source_files = HashMap::new();
+            if let Some(sf_obj) = args.get("source_files").and_then(Value::as_object) {
+                for (k, v) in sf_obj {
+                    if let Some(s) = v.as_str() {
+                        source_files.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+            let compiler_flags: Vec<String> = args
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let crate_name = args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    source_files
+                        .get("Cargo.toml")
+                        .and_then(|manifest| toml::from_str::<toml::Value>(manifest).ok())
+                        .and_then(|val| {
+                            val.get("package")?
+                                .get("name")?
+                                .as_str()
+                                .map(|s| s.trim().to_string())
+                        })
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "crate".to_string());
+            TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir: None,
+            }
+        }
         other => {
             return ToolCallResult::error(format!(
-                "Invalid task 'type': '{other}' (expected 'command', 'shell', or 'gpu')"
+                "Invalid task 'type': '{other}' (expected 'command', 'shell', 'gpu', or 'compile')"
             ));
         }
     };
@@ -2104,8 +2195,13 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
         }
     }
+    if let Some(tools_arr) = args.get("tools").and_then(Value::as_array) {
+        for t in tools_arr.iter().filter_map(Value::as_str) {
+            placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
+        }
+    }
 
-    let placement = match Placement::from_task_tags(&placement_tags) {
+    let mut placement = match Placement::from_task_tags(&placement_tags) {
         Ok(p) => p,
         Err(e) => return ToolCallResult::error(format!("Invalid placement constraints: {e}")),
     };
@@ -2151,6 +2247,18 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 Ok(inputs) => prepared_inputs = inputs,
                 Err(e) => return ToolCallResult::error(format!("Staged files error: {e}")),
             }
+        }
+    }
+
+    if let TaskSpec::RustCompilation { source_files, .. } = &spec {
+        if placement.tools.is_empty() {
+            let has_cargo_manifest = source_files.contains_key("Cargo.toml")
+                || prepared_inputs
+                    .inputs
+                    .iter()
+                    .any(|inp| inp.path == "Cargo.toml");
+            let default_tool = if has_cargo_manifest { "cargo" } else { "rustc" };
+            placement.tools.push(default_tool.to_string());
         }
     }
 
@@ -3963,6 +4071,179 @@ mod tests {
         assert_eq!(queued_val["connected_workers"], 0);
         assert_eq!(queued_val["total_tasks"], 1);
         assert_eq!(queued_val["pending_tasks"], 1);
+
+        let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_submit_tools_argument_validates_and_adds_require_tool_placement() {
+        assert_eq!(
+            validate_tool_arguments(
+                "submit",
+                &json!({"command": "echo", "tools": ["cargo", "rustc", "GIT"]})
+            ),
+            Ok(())
+        );
+        for bad in [
+            json!({"command": "echo", "tools": [""]}),
+            json!({"command": "echo", "tools": ["bad:tool"]}),
+            json!({"command": "echo", "tools": "cargo"}),
+        ] {
+            assert!(
+                validate_tool_arguments("submit", &bad).is_err(),
+                "expected invalid tools arg {bad} to be rejected"
+            );
+        }
+
+        let submit_schema = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap()
+            .input_schema;
+        assert_eq!(submit_schema["properties"]["tools"]["type"], "array");
+        assert_eq!(
+            submit_schema["properties"]["tools"]["items"]["type"],
+            "string"
+        );
+
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+
+        let state = McpState::new(master.server_addr().to_string(), None);
+        let submit_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "command",
+                "command": "echo",
+                "args": ["needs-cargo"],
+                "tools": ["cargo", "git"],
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!submit_res.is_error, "{submit_res:?}");
+
+        let tasks = master.queue().list_tasks().await;
+        assert_eq!(tasks.len(), 1);
+        let task = master
+            .queue()
+            .get_task_spec(&tasks[0].task_id)
+            .await
+            .expect("task spec");
+        let placement = task.placement().expect("valid placement");
+        assert_eq!(
+            placement.tools,
+            vec!["cargo".to_string(), "git".to_string()]
+        );
+
+        // Compile task with Cargo.toml automatically adds `require:tool=cargo` when `tools` is omitted.
+        let compile_cargo_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "compile",
+                "source_files": {
+                    "Cargo.toml": "[package]\nname = \"mcp_bin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    "src/main.rs": "fn main() {}\n"
+                },
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!compile_cargo_res.is_error, "{compile_cargo_res:?}");
+        let cargo_submit_val: Value = serde_json::from_str(match &compile_cargo_res.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        let cargo_tid = rusty_grid_core::TaskId::from_uuid(
+            Uuid::parse_str(cargo_submit_val["task_id"].as_str().unwrap()).unwrap(),
+        );
+        let cargo_task = master
+            .queue()
+            .get_task_spec(&cargo_tid)
+            .await
+            .expect("cargo task");
+        assert_eq!(
+            cargo_task.placement().unwrap().tools,
+            vec!["cargo".to_string()]
+        );
+
+        // Compile task without Cargo.toml automatically adds `require:tool=rustc` when `tools` is omitted.
+        let compile_rustc_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "compile",
+                "command": "mcp_lib",
+                "source_files": {
+                    "src/lib.rs": "pub fn answer() -> u32 { 42 }\n"
+                },
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!compile_rustc_res.is_error, "{compile_rustc_res:?}");
+        let rustc_submit_val: Value = serde_json::from_str(match &compile_rustc_res.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        let rustc_tid = rusty_grid_core::TaskId::from_uuid(
+            Uuid::parse_str(rustc_submit_val["task_id"].as_str().unwrap()).unwrap(),
+        );
+        let rustc_task = master
+            .queue()
+            .get_task_spec(&rustc_tid)
+            .await
+            .expect("rustc task");
+        assert_eq!(
+            rustc_task.placement().unwrap().tools,
+            vec!["rustc".to_string()]
+        );
+
+        // Explicit `tools` on a compile task is preserved without duplication.
+        let compile_explicit_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "compile",
+                "source_files": {
+                    "Cargo.toml": "[package]\nname = \"mcp_explicit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    "src/main.rs": "fn main() {}\n"
+                },
+                "tools": ["cargo", "git"],
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!compile_explicit_res.is_error, "{compile_explicit_res:?}");
+        let explicit_submit_val: Value =
+            serde_json::from_str(match &compile_explicit_res.content[0] {
+                ToolContent::Text { text } => text,
+            })
+            .unwrap();
+        let explicit_tid = rusty_grid_core::TaskId::from_uuid(
+            Uuid::parse_str(explicit_submit_val["task_id"].as_str().unwrap()).unwrap(),
+        );
+        let explicit_task = master
+            .queue()
+            .get_task_spec(&explicit_tid)
+            .await
+            .expect("explicit task");
+        assert_eq!(
+            explicit_task.placement().unwrap().tools,
+            vec!["cargo".to_string(), "git".to_string()]
+        );
 
         let _ = master.shutdown();
     }

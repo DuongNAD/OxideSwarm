@@ -603,6 +603,7 @@ impl<
             .await?;
         queue.set_worker_session_resume(worker_id, worker_supports_resume);
         let session_id = registration.session_id;
+        queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
         registry
             .set_rx_clock(&worker_id, session_id, rx_clock)
             .await;
@@ -622,7 +623,6 @@ impl<
             )
             .await;
         }
-        queue.set_worker_session_resume_connected(worker_id, worker_supports_resume);
         if !worker_supports_resume {
             let outcome = queue.adopt_session_tasks(worker_id, session_id, &[]).await;
             if !outcome.newly_failed.is_empty() {
