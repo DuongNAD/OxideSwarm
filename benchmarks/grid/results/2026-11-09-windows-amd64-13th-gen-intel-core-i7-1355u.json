@@ -1,0 +1,611 @@
+{
+  "benchmark": "BENCH-1 (a) task overhead and (b) repeated upload",
+  "date_utc": "2026-11-09T15:52:04Z",
+  "git": {
+    "commit": "4181a6d943c04d4b89408081f22865a0aa61c64b",
+    "dirty_tree": false
+  },
+  "binary": {
+    "version": "rusty-grid 0.1.0",
+    "build_profile": "release"
+  },
+  "hardware": {
+    "cpu_model": "13th Gen Intel(R) Core(TM) i7-1355U",
+    "cores": 12,
+    "ram_bytes": 16849256448
+  },
+  "os": {
+    "system": "Windows",
+    "release": "11",
+    "version": "10.0.26300",
+    "machine": "AMD64"
+  },
+  "network": "loopback (127.0.0.1), master and workers on this machine",
+  "power": "unknown (not recorded on this platform)",
+  "load_average_before": null,
+  "load_average_after": null,
+  "python": "3.13.3",
+  "note": "",
+  "parameters": {
+    "runs": 3,
+    "latency_samples": 100,
+    "throughput_tasks": 300,
+    "concurrency": 16,
+    "max_workers": 4,
+    "files": 500,
+    "max_file_bytes": 65536,
+    "seed": 20261109,
+    "quick": false
+  },
+  "a_summary": [
+    {
+      "workers": 1,
+      "throughput_tasks_per_s": {
+        "median": 50.93,
+        "min": 48.87,
+        "max": 52.4,
+        "runs": 3
+      },
+      "floor_throughput_calls_per_s": {
+        "median": 146.7,
+        "min": 139.37,
+        "max": 155.06,
+        "runs": 3
+      },
+      "latency_p50_ms": {
+        "median": 69.042,
+        "min": 68.461,
+        "max": 77.318,
+        "runs": 3
+      },
+      "latency_p99_ms": {
+        "median": 113.542,
+        "min": 101.123,
+        "max": 116.825,
+        "runs": 3
+      },
+      "floor_latency_p50_ms": {
+        "median": 30.914,
+        "min": 21.235,
+        "max": 31.424,
+        "runs": 3
+      },
+      "floor_latency_p99_ms": {
+        "median": 53.795,
+        "min": 48.768,
+        "max": 56.601,
+        "runs": 3
+      }
+    },
+    {
+      "workers": 2,
+      "throughput_tasks_per_s": {
+        "median": 45.39,
+        "min": 38.36,
+        "max": 50.07,
+        "runs": 3
+      },
+      "floor_throughput_calls_per_s": {
+        "median": 138.63,
+        "min": 136.37,
+        "max": 146.61,
+        "runs": 3
+      },
+      "latency_p50_ms": {
+        "median": 73.74,
+        "min": 66.144,
+        "max": 91.757,
+        "runs": 3
+      },
+      "latency_p99_ms": {
+        "median": 146.85,
+        "min": 128.689,
+        "max": 170.709,
+        "runs": 3
+      },
+      "floor_latency_p50_ms": {
+        "median": 26.539,
+        "min": 26.345,
+        "max": 30.753,
+        "runs": 3
+      },
+      "floor_latency_p99_ms": {
+        "median": 59.742,
+        "min": 48.045,
+        "max": 61.958,
+        "runs": 3
+      }
+    },
+    {
+      "workers": 3,
+      "throughput_tasks_per_s": {
+        "median": 47.87,
+        "min": 42.87,
+        "max": 50.42,
+        "runs": 3
+      },
+      "floor_throughput_calls_per_s": {
+        "median": 145.12,
+        "min": 117.3,
+        "max": 146.64,
+        "runs": 3
+      },
+      "latency_p50_ms": {
+        "median": 88.315,
+        "min": 62.644,
+        "max": 90.907,
+        "runs": 3
+      },
+      "latency_p99_ms": {
+        "median": 213.646,
+        "min": 106.512,
+        "max": 237.499,
+        "runs": 3
+      },
+      "floor_latency_p50_ms": {
+        "median": 27.972,
+        "min": 20.471,
+        "max": 31.411,
+        "runs": 3
+      },
+      "floor_latency_p99_ms": {
+        "median": 58.042,
+        "min": 56.048,
+        "max": 63.701,
+        "runs": 3
+      }
+    },
+    {
+      "workers": 4,
+      "throughput_tasks_per_s": {
+        "median": 48.41,
+        "min": 45.82,
+        "max": 52.07,
+        "runs": 3
+      },
+      "floor_throughput_calls_per_s": {
+        "median": 170.18,
+        "min": 154.52,
+        "max": 205.66,
+        "runs": 3
+      },
+      "latency_p50_ms": {
+        "median": 88.672,
+        "min": 77.53,
+        "max": 92.972,
+        "runs": 3
+      },
+      "latency_p99_ms": {
+        "median": 169.596,
+        "min": 136.407,
+        "max": 272.961,
+        "runs": 3
+      },
+      "floor_latency_p50_ms": {
+        "median": 25.795,
+        "min": 25.731,
+        "max": 27.566,
+        "runs": 3
+      },
+      "floor_latency_p99_ms": {
+        "median": 56.707,
+        "min": 54.674,
+        "max": 67.053,
+        "runs": 3
+      }
+    }
+  ],
+  "b_summary": {
+    "first": {
+      "wall_s": {
+        "median": 10.8457,
+        "min": 10.7297,
+        "max": 13.657,
+        "runs": 3
+      },
+      "blobs_sent": {
+        "median": 501,
+        "min": 501,
+        "max": 501,
+        "runs": 3
+      },
+      "master_blob_store_growth_bytes": {
+        "median": 16864821,
+        "min": 16864821,
+        "max": 16864821,
+        "runs": 3
+      }
+    },
+    "repeat_same": {
+      "wall_s": {
+        "median": 1.79,
+        "min": 1.5651,
+        "max": 1.8893,
+        "runs": 3
+      },
+      "blobs_sent": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 3
+      },
+      "master_blob_store_growth_bytes": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 3
+      }
+    },
+    "repeat_one_file_changed": {
+      "wall_s": {
+        "median": 1.7224,
+        "min": 1.4206,
+        "max": 1.8075,
+        "runs": 3
+      },
+      "blobs_sent": {
+        "median": 2,
+        "min": 2,
+        "max": 2,
+        "runs": 3
+      },
+      "master_blob_store_growth_bytes": {
+        "median": 55102,
+        "min": 55102,
+        "max": 55102,
+        "runs": 3
+      }
+    }
+  },
+  "raw": {
+    "a": [
+      {
+        "workers": 1,
+        "latency_ms": {
+          "p50": 69.042,
+          "p99": 101.123,
+          "min": 43.553,
+          "max": 155.921,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 21.235,
+          "p99": 48.768,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 48.87,
+        "floor_throughput_calls_per_s": 139.37,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.139,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 1,
+        "latency_ms": {
+          "p50": 77.318,
+          "p99": 116.825,
+          "min": 42.482,
+          "max": 124.953,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 31.424,
+          "p99": 53.795,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 50.93,
+        "floor_throughput_calls_per_s": 146.7,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 5.89,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 1,
+        "latency_ms": {
+          "p50": 68.461,
+          "p99": 113.542,
+          "min": 40.487,
+          "max": 140.799,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 30.914,
+          "p99": 56.601,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 52.4,
+        "floor_throughput_calls_per_s": 155.06,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 5.725,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 2,
+        "latency_ms": {
+          "p50": 91.757,
+          "p99": 146.85,
+          "min": 45.79,
+          "max": 152.976,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 26.539,
+          "p99": 59.742,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 45.39,
+        "floor_throughput_calls_per_s": 138.63,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.609,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 2,
+        "latency_ms": {
+          "p50": 73.74,
+          "p99": 170.709,
+          "min": 42.581,
+          "max": 183.985,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 30.753,
+          "p99": 61.958,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 38.36,
+        "floor_throughput_calls_per_s": 136.37,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 7.82,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 2,
+        "latency_ms": {
+          "p50": 66.144,
+          "p99": 128.689,
+          "min": 44.14,
+          "max": 193.342,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 26.345,
+          "p99": 48.045,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 50.07,
+        "floor_throughput_calls_per_s": 146.61,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 5.991,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 3,
+        "latency_ms": {
+          "p50": 88.315,
+          "p99": 213.646,
+          "min": 41.782,
+          "max": 260.931,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 31.411,
+          "p99": 58.042,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 47.87,
+        "floor_throughput_calls_per_s": 145.12,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.267,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 3,
+        "latency_ms": {
+          "p50": 90.907,
+          "p99": 237.499,
+          "min": 46.688,
+          "max": 245.842,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 27.972,
+          "p99": 63.701,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 50.42,
+        "floor_throughput_calls_per_s": 146.64,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 5.951,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 3,
+        "latency_ms": {
+          "p50": 62.644,
+          "p99": 106.512,
+          "min": 40.653,
+          "max": 192.772,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 20.471,
+          "p99": 56.048,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 42.87,
+        "floor_throughput_calls_per_s": 117.3,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.998,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 4,
+        "latency_ms": {
+          "p50": 77.53,
+          "p99": 136.407,
+          "min": 40.435,
+          "max": 175.784,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 25.795,
+          "p99": 67.053,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 45.82,
+        "floor_throughput_calls_per_s": 205.66,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.548,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 4,
+        "latency_ms": {
+          "p50": 92.972,
+          "p99": 169.596,
+          "min": 47.067,
+          "max": 278.584,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 27.566,
+          "p99": 56.707,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 52.07,
+        "floor_throughput_calls_per_s": 170.18,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 5.762,
+        "client_concurrency": 16
+      },
+      {
+        "workers": 4,
+        "latency_ms": {
+          "p50": 88.672,
+          "p99": 272.961,
+          "min": 43.56,
+          "max": 299.92,
+          "samples": 100
+        },
+        "floor_latency_ms": {
+          "p50": 25.731,
+          "p99": 54.674,
+          "samples": 100
+        },
+        "throughput_tasks_per_s": 48.41,
+        "floor_throughput_calls_per_s": 154.52,
+        "throughput_tasks": 300,
+        "throughput_wall_s": 6.197,
+        "client_concurrency": 16
+      }
+    ],
+    "b": [
+      {
+        "tree_files": 500,
+        "tree_bytes": 16833795,
+        "seed": 20261109,
+        "first": {
+          "wall_s": 13.657,
+          "master_blob_store_growth_bytes": 16864821,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 501,
+          "blobs_total": 501,
+          "bytes_sent_reported": "16.1 MiB",
+          "blobs_already_on_master": 0
+        },
+        "repeat_same": {
+          "wall_s": 1.5651,
+          "master_blob_store_growth_bytes": 0,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 501,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 501
+        },
+        "repeat_one_file_changed": {
+          "wall_s": 1.4206,
+          "master_blob_store_growth_bytes": 55102,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 2,
+          "blobs_total": 501,
+          "bytes_sent_reported": "53.8 KiB",
+          "blobs_already_on_master": 499
+        }
+      },
+      {
+        "tree_files": 500,
+        "tree_bytes": 16833795,
+        "seed": 20261109,
+        "first": {
+          "wall_s": 10.7297,
+          "master_blob_store_growth_bytes": 16864821,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 501,
+          "blobs_total": 501,
+          "bytes_sent_reported": "16.1 MiB",
+          "blobs_already_on_master": 0
+        },
+        "repeat_same": {
+          "wall_s": 1.8893,
+          "master_blob_store_growth_bytes": 0,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 501,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 501
+        },
+        "repeat_one_file_changed": {
+          "wall_s": 1.7224,
+          "master_blob_store_growth_bytes": 55102,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 2,
+          "blobs_total": 501,
+          "bytes_sent_reported": "53.8 KiB",
+          "blobs_already_on_master": 499
+        }
+      },
+      {
+        "tree_files": 500,
+        "tree_bytes": 16833795,
+        "seed": 20261109,
+        "first": {
+          "wall_s": 10.8457,
+          "master_blob_store_growth_bytes": 16864821,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 501,
+          "blobs_total": 501,
+          "bytes_sent_reported": "16.1 MiB",
+          "blobs_already_on_master": 0
+        },
+        "repeat_same": {
+          "wall_s": 1.79,
+          "master_blob_store_growth_bytes": 0,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 501,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 501
+        },
+        "repeat_one_file_changed": {
+          "wall_s": 1.8075,
+          "master_blob_store_growth_bytes": 55102,
+          "files": 500,
+          "tree_size": "16.1 MiB",
+          "blobs_sent": 2,
+          "blobs_total": 501,
+          "bytes_sent_reported": "53.8 KiB",
+          "blobs_already_on_master": 499
+        }
+      }
+    ]
+  }
+}

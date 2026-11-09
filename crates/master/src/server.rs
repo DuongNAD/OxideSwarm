@@ -4323,6 +4323,23 @@ fn advertised_web_ui_url(dashboard_addr: Option<SocketAddr>, lan_ip: std::net::I
     format!("http://{}", SocketAddr::new(host, addr.port()))
 }
 
+/// Returns the UDP socket address the Master discovery service should bind for `listen_ip`.
+///
+/// When the master's TCP listener is bound to a loopback address (`127.x.x.x` or `::1`), the
+/// discovery socket binds to that loopback address (`<listen_ip>:<discovery_port>`) rather than
+/// `0.0.0.0:<discovery_port>` so a loopback master never opens an all-interfaces UDP listener
+/// (which triggers a Windows Firewall prompt on desktop and test runs) while still answering local
+/// unicast discovery probes. Non-loopback and unspecified listen addresses bind
+/// `0.0.0.0:<discovery_port>`.
+fn discovery_bind_addr(listen_ip: std::net::IpAddr, discovery_port: u16) -> SocketAddr {
+    let bind_ip = if listen_ip.to_canonical().is_loopback() {
+        listen_ip
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(bind_ip, discovery_port)
+}
+
 /// Spawns the Master discovery UDP service that broadcasts periodic beacons
 /// and answers incoming client discovery queries.
 async fn spawn_master_discovery_service(
@@ -4334,7 +4351,8 @@ async fn spawn_master_discovery_service(
     cluster_secret: Option<ClusterSecret>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let local_ip = if listen_ip.is_loopback() {
+    let is_loopback = listen_ip.to_canonical().is_loopback();
+    let local_ip = if is_loopback {
         listen_ip
     } else if listen_ip.is_unspecified() {
         rusty_grid_core::discovery::get_local_ip_or_loopback()
@@ -4348,10 +4366,7 @@ async fn spawn_master_discovery_service(
     );
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "OxideMaster".to_string());
 
-    let bind_addr = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        discovery_port,
-    );
+    let bind_addr = discovery_bind_addr(listen_ip, discovery_port);
     let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
@@ -4359,9 +4374,12 @@ async fn spawn_master_discovery_service(
             return;
         }
     };
-    let _ = socket.set_broadcast(true);
+    if !is_loopback {
+        let _ = socket.set_broadcast(true);
+    }
 
     info!(
+        bind_addr = %bind_addr,
         discovery_port = discovery_port,
         cluster_addr = %cluster_addr,
         web_ui_url = %web_ui_url,
@@ -4386,10 +4404,12 @@ async fn spawn_master_discovery_service(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // An unsolicited broadcast cannot carry a MAC bound to a probe nonce, and clients
-                // holding the secret ignore unsigned beacons, so a master with a secret does not
-                // advertise itself to the whole LAN: it answers authenticated probes only.
-                if cluster_secret.is_some() {
+                // A loopback-bound socket cannot send broadcast beacons (and a loopback master is
+                // only reachable locally via unicast probes). Likewise, an unsolicited broadcast
+                // cannot carry a MAC bound to a probe nonce, and clients holding the secret ignore
+                // unsigned beacons, so a master with a secret does not advertise itself to the
+                // whole LAN: it answers authenticated probes only.
+                if is_loopback || cluster_secret.is_some() {
                     continue;
                 }
                 let workers_count = registry.list_workers().await.len();
@@ -4554,6 +4574,70 @@ mod tests {
         assert!(beacon
             .cluster_addr
             .ends_with(&format!(":{}", handle.server_addr().port())));
+
+        let _ = handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_loopback_master_binds_discovery_socket_to_loopback_not_all_interfaces() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // 1. Pure address mapping: loopback listen IPs bind to loopback; non-loopback and
+        //    unspecified listen IPs bind to 0.0.0.0.
+        assert_eq!(
+            discovery_bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 8089),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8089)
+        );
+        assert_eq!(
+            discovery_bind_addr(IpAddr::V6(Ipv6Addr::LOCALHOST), 8089),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8089)
+        );
+        assert_eq!(
+            discovery_bind_addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8089),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8089)
+        );
+        assert_eq!(
+            discovery_bind_addr("192.0.2.10".parse().unwrap(), 8089),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8089)
+        );
+
+        // 2. Live loopback master: binds 127.0.0.1:<disc_port>, answers unicast probes on
+        //    127.0.0.1:<disc_port>, and leaves non-loopback interfaces unbound.
+        let probe_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let disc_port = probe_sock.local_addr().unwrap().port();
+        drop(probe_sock);
+
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_discovery(true)
+            .with_discovery_port(disc_port);
+
+        let handle = MasterServer::spawn(config).await.unwrap();
+        assert!(handle.server_addr().ip().is_loopback());
+
+        // Wait until the loopback discovery socket is bound and answering unicast probes.
+        let discovered =
+            rusty_grid_core::discovery::discover_master(Duration::from_millis(1500), disc_port)
+                .await
+                .expect("loopback master discovery socket should answer unicast probe");
+        assert_eq!(discovered.cluster_addr, handle.server_addr().to_string());
+
+        // 127.0.0.1:<disc_port> is occupied by the master's loopback discovery socket.
+        assert!(
+            std::net::UdpSocket::bind(("127.0.0.1", disc_port)).is_err(),
+            "loopback master should hold 127.0.0.1:{disc_port}"
+        );
+
+        // Non-loopback interface on the same port must remain free (proving the master did not
+        // bind 0.0.0.0:<disc_port>).
+        let lan_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+        if !lan_ip.is_loopback() {
+            let lan_bind = std::net::UdpSocket::bind((lan_ip, disc_port));
+            assert!(
+                lan_bind.is_ok(),
+                "loopback master must not bind 0.0.0.0:{disc_port} (binding {lan_ip}:{disc_port} failed: {:?})",
+                lan_bind.err()
+            );
+        }
 
         let _ = handle.shutdown();
     }

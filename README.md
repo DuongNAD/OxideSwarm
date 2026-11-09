@@ -167,6 +167,10 @@ installed and does the work. Neither machine has to build OxideSwarm.
    The first run sends every file that `.gitignore` does not exclude and builds from scratch. Run it
    again: only changed files travel, and B reuses its `target/` directory.
 
+To set up several machines, a USB stick can carry the program for every system and the token:
+see [packaging/usb/README.md](packaging/usb/README.md). It installs, joins and starts the worker
+with one double-click.
+
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
 expected output, the MCP calls and troubleshooting, is
@@ -531,7 +535,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--workspace-root <PATH>` | `<cache dir>/oxideswarm/workspaces` (`$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows; `RUSTY_GRID_WORKSPACE_ROOT`, `[worker].workspace_root`) | Root directory of the persistent named workspace store |
 | `--workspace-limit-mb <N>` | `20480` (`RUSTY_GRID_WORKSPACE_LIMIT_MB`, `[worker].workspace_limit_mb`) | Per-workspace disk quota in MiB (minimum `1`); a workspace exceeding this limit after a run logs a warning to the task's `stderr` and is evicted first when idle |
 | `--max-workspaces <N>` | `8` (`RUSTY_GRID_MAX_WORKSPACES`, `[worker].max_workspaces`) | Maximum number of persistent workspaces kept on disk before idle least-recently-used eviction (minimum `1`) |
-| `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `0.0.0.0:8080` |
+| `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `:8080` (`127.0.0.1:8080` when targeting a loopback master, `0.0.0.0:8080` otherwise) |
 | `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
@@ -618,8 +622,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | :--- | :--- | :--- | :--- |
 | **8088** | TCP | Master Grid Coordinator | Primary cluster communication port for worker node registration, heartbeat exchanges, task distribution, and CLI client requests (`submit`, `status`, `workers`, `mapreduce`). Protected by mutual HMAC-SHA256 handshake (`cluster_auth`). |
 | **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--port 8090`) when co-locating services. |
-| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master, it binds `0.0.0.0:8080` to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
-| **8089** | UDP | Master Discovery Beacon | Master broadcasts cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`). When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
+| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
+| **8089** | UDP | Master Discovery Beacon | When the master listens on a non-loopback address, it binds `0.0.0.0:8089` and broadcasts its cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`); when the master listens on loopback, it binds that loopback address (`127.0.0.1:8089`), answers local unicast probes only, and does not broadcast. When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
 | **8085** | TCP (HTTP) | Cross-Machine Sync Probe | Standalone reachability probe used strictly by `scripts/sync_network` to verify LAN connectivity between nodes using cloud-shared mailboxes. Completely independent of the Rust grid runtime. |
 | **8086** | TCP (HTTP, removed) | Former Secret Bootstrap Helper | Previously used by the removed `agent_bridge.py serve-secret` plain-HTTP secret transfer helper (`SEC-4`). No component opens port 8086; cluster secrets must be copied over an authenticated channel (`scp`, `sftp`, `adb push`, or physical media). |
 
@@ -739,7 +743,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_WORKSPACE_ROOT` | Worker | Root directory of the persistent workspace store (`--workspace-root`, `[worker].workspace_root`; default `<cache dir>/oxideswarm/workspaces`) |
 | `RUSTY_GRID_WORKSPACE_LIMIT_MB` | Worker | Per-workspace disk quota in MiB (`--workspace-limit-mb`, `[worker].workspace_limit_mb`; default `20480`) |
 | `RUSTY_GRID_MAX_WORKSPACES` | Worker | Maximum persistent workspaces retained on disk before idle LRU eviction (`--max-workspaces`, `[worker].max_workspaces`; default `8`) |
-| `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
+| `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `:8080` (`--no-portal`), e.g. for a second worker on one machine |
 | `RUSTY_GRID_NO_BATTERY` | Worker | Disables host battery and thermal probing in `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0028](docs/design/0028-host-battery-probe-override.md)) |
 | `RUSTY_GRID_SESSION_RESUME_GRACE_SECS` | Worker | Optional upper bound in seconds on how long the worker keeps running tasks alive across a disconnect (`--session-resume-grace-secs`, `[worker].session_resume_grace_secs`; clamped to `hold - dead_peer_timeout - 3 s`, `0` disables worker session resume, [design 0046](docs/design/0046-master-durability.md)) |
 

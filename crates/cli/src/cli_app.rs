@@ -1897,6 +1897,7 @@ async fn run_worker(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    rusty_grid_core::capabilities::suppress_windows_error_dialogs();
     let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
@@ -4008,11 +4009,20 @@ async fn run_status_inner(
                         serde_json::to_string_pretty(&enriched_workers).unwrap()
                     );
                 } else {
-                    println!("Connected Workers ({}):", workers.len());
+                    let connected = workers.iter().filter(|w| worker_is_connected(w)).count();
+                    println!(
+                        "Workers ({} connected, {} registered):",
+                        connected,
+                        workers.len()
+                    );
                     for w in &workers {
+                        let state = match worker_state(w) {
+                            Some(state) if state != "connected" => format!(" [{state}]"),
+                            _ => String::new(),
+                        };
                         println!(
-                            "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {})",
-                            w.name, w.cpu_cores, w.ram_mb, w.has_gpu, w.is_simulated_gpu,
+                            "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {}){}",
+                            w.name, w.cpu_cores, w.ram_mb, w.has_gpu, w.is_simulated_gpu, state,
                         );
                         if let Some(link) = parse_worker_link(w) {
                             println!("  └─ {}", link);
@@ -4083,7 +4093,11 @@ async fn run_status_inner(
                     println!("{}", out);
                 } else {
                     println!("=== RustyGrid Cluster Status ===");
-                    println!("Connected Workers: {}", workers.len());
+                    println!(
+                        "Connected Workers: {} ({} registered)",
+                        workers.iter().filter(|w| worker_is_connected(w)).count(),
+                        workers.len()
+                    );
                     println!("Total Tasks:      {}", total_tasks);
                     println!("Pending Tasks:    {}", pending_tasks);
                     println!("Running Tasks:    {}", running_tasks);
@@ -4506,6 +4520,18 @@ async fn run_result_inner(
             }
         }
     }
+}
+
+/// The `state:` tag the master adds to each worker in `ListWorkers` and `ClusterStatus`
+/// (`connected`, `disconnected`, ...), or `None` when the master sent none.
+fn worker_state(w: &rusty_grid_core::WorkerCapabilities) -> Option<&str> {
+    w.tags.iter().find_map(|tag| tag.strip_prefix("state:"))
+}
+
+/// Whether a listed worker is connected. A worker without a `state:` tag counts as connected,
+/// which is how such a listing was meant before the master added the tag.
+fn worker_is_connected(w: &rusty_grid_core::WorkerCapabilities) -> bool {
+    worker_state(w).is_none_or(|state| state == "connected")
 }
 
 fn parse_worker_link(w: &rusty_grid_core::WorkerCapabilities) -> Option<String> {
@@ -5585,6 +5611,21 @@ insecure = false
             .with_tags(vec!["link:Relay (DERP):120ms".to_string()]);
         let link = parse_worker_link(&caps);
         assert_eq!(link.as_deref(), Some("Link: Relay (DERP) | RTT: 120ms"));
+    }
+
+    #[test]
+    fn test_worker_state_counts_only_connected_workers() {
+        let connected = WorkerCapabilities::new("a", 4, 4096, false, false, None)
+            .with_tags(vec!["state:connected".to_string()]);
+        let gone = WorkerCapabilities::new("b", 4, 4096, false, false, None)
+            .with_tags(vec!["state:disconnected".to_string()]);
+        let untagged = WorkerCapabilities::new("c", 4, 4096, false, false, None);
+        assert_eq!(worker_state(&connected), Some("connected"));
+        assert_eq!(worker_state(&gone), Some("disconnected"));
+        assert_eq!(worker_state(&untagged), None);
+        assert!(worker_is_connected(&connected));
+        assert!(!worker_is_connected(&gone));
+        assert!(worker_is_connected(&untagged));
     }
 
     #[test]
