@@ -9,6 +9,7 @@ before adding or changing a document.
 |---|---|---|
 | [README.md](../README.md) | Overview, quickstart, CLI reference, ports, environment variables | Users |
 | [guides/two-machine-cluster.md](guides/two-machine-cluster.md) | Runbook: a macOS machine and a Windows machine as one cluster, verified with `oxideswarm doctor` | Users |
+| [guides/self-hosted-relay.md](guides/self-hosted-relay.md) | Runbook: run a self-hosted `iroh-relay` server and point master, worker, and clients at it with `--relay-url` | Users |
 | [guides/mcp-client-setup.md](guides/mcp-client-setup.md) | Runbook: connect Claude Code, Codex, or Cursor to `oxideswarm mcp` over stdio | Users, coding agents |
 | [guides/multi-agent-collaboration.md](guides/multi-agent-collaboration.md) | Runbook: cross-machine coding agent coordination and root-cause diagnostics via `OxideSwarm_Agent_Hub` | Coding agents |
 | [SECURITY.md](SECURITY.md) | Threat model, cluster secret, ports, tokens, who runs tasks | Users, reviewers |
@@ -41,6 +42,7 @@ before adding or changing a document.
 | [design/0046-master-durability.md](design/0046-master-durability.md) | Implemented: append-only task journal and snapshot store (`--state-dir`), startup replay, store-health reporting (`ClusterStatus.store_error`, protocol version 5), and worker session resume (`WorkerMessage::ResumeSession`) (`FEAT-1`) | Contributors |
 | [design/0047-windows-private-files.md](design/0047-windows-private-files.md) | Implemented: files created as private on Windows (cluster secret, master P2P key, ticket file and their directory) get a protected DACL for the current user, SYSTEM and Administrators at creation, and loading them warns with the `icacls` fix when the DACL is wider (`SEC-9`) | Contributors |
 | [design/0048-join-token.md](design/0048-join-token.md) | Implemented: `oxideswarm secret join-token` prints one token (master address, optional P2P ticket, cluster secret, integrity tag) and `oxideswarm join` reads it from standard input, saves the secret at mode 600 and the address in `rusty-grid.toml`, and runs the doctor checks (`JOIN-1`) | Contributors |
+| [design/0049-custom-relay.md](design/0049-custom-relay.md) | Implemented: `--relay-url`, `RUSTY_GRID_RELAY_URL`, and `relay_url` across master, worker, and client P2P endpoints (`RelayMode::Custom` on `presets::Minimal`), URL validation, and self-hosted `iroh-relay` guide (`LINK-1`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 

@@ -445,6 +445,9 @@ pub struct WorkerConfig {
     /// stay off the network. Production defaults to `false` (`presets::N0`); the CLI resolves
     /// `RUSTY_GRID_P2P_MINIMAL`.
     pub p2p_minimal_preset: bool,
+    /// Optional custom iroh relay URL (`https://...`). When set, builds the worker's P2P endpoint
+    /// with `iroh::RelayMode::Custom(iroh::RelayMap::from(url))` instead of `presets::N0`.
+    pub p2p_relay_url: Option<String>,
     /// Worker UUID. If `None`, it is read from `worker_id_file` / the default id file when
     /// persistence is enabled (see [`WorkerConfig::with_persistent_worker_id`]), otherwise generated
     /// once at client initialization; either way it is preserved across reconnects.
@@ -559,6 +562,7 @@ impl WorkerConfig {
             master_addr: master_addr.into(),
             p2p_ticket: None,
             p2p_minimal_preset: false,
+            p2p_relay_url: None,
             worker_id: None,
             worker_id_file: None,
             persist_worker_id: false,
@@ -621,6 +625,19 @@ impl WorkerConfig {
     /// production keeps `presets::N0` (`false`).
     pub fn with_p2p_minimal_preset(mut self, minimal: bool) -> Self {
         self.p2p_minimal_preset = minimal;
+        self
+    }
+
+    /// Configures a custom iroh relay URL (`https://...`) so the worker's P2P endpoint uses
+    /// `iroh::RelayMode::Custom` instead of `presets::N0`.
+    pub fn with_p2p_relay_url(mut self, url: impl Into<String>) -> Self {
+        self.p2p_relay_url = Some(url.into());
+        self
+    }
+
+    /// Sets or clears the optional custom iroh relay URL (`https://...`).
+    pub fn with_relay_url(mut self, url: Option<String>) -> Self {
+        self.p2p_relay_url = url;
         self
     }
 
@@ -1851,6 +1868,12 @@ impl WorkerClient {
     /// P2P ticket). A Master going away, in any manner, only ever makes the worker reconnect.
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> GridResult<()> {
         #[cfg(feature = "p2p")]
+        rusty_grid_core::transport::resolve_p2p_relay_mode(
+            self.config.p2p_minimal_preset,
+            self.config.p2p_relay_url.as_deref(),
+        )?;
+
+        #[cfg(feature = "p2p")]
         if let Some(ticket) = self.config.p2p_ticket.as_deref() {
             if let Err(e) = rusty_grid_core::transport::parse_p2p_ticket(ticket) {
                 let err = GridError::Config(format!("Invalid P2P ticket: {e}"));
@@ -2810,9 +2833,11 @@ impl WorkerClient {
         let (endpoint, is_cached) = match ep_guard.as_ref() {
             Some(ep) => (ep.clone(), true),
             None => {
-                let ep =
-                    rusty_grid_core::transport::bind_p2p_endpoint(self.config.p2p_minimal_preset)
-                        .await?;
+                let ep = rusty_grid_core::transport::bind_p2p_endpoint_with_relay(
+                    self.config.p2p_minimal_preset,
+                    self.config.p2p_relay_url.as_deref(),
+                )
+                .await?;
                 *ep_guard = Some(ep.clone());
                 (ep, false)
             }
