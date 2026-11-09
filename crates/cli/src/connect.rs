@@ -17,6 +17,9 @@ use tracing::info;
 
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret};
 use rusty_grid_core::error::{GridError, GridResult};
+use rusty_grid_core::noise_auth::{
+    default_node_key_path, v3_client_handshake, HandshakePurpose, NodeKeypair, PublicKey,
+};
 use rusty_grid_core::protocol::{EndpointRole, MessageTransport};
 use rusty_grid_core::task::{
     validate_relative_sandbox_path, OutputArtifact, StagedFile, MAX_AGGREGATE_STAGED_BYTES,
@@ -25,9 +28,72 @@ use rusty_grid_core::task::{
 use rusty_grid_core::transport::{configure_tcp_stream, GridStream};
 
 static CLIENT_P2P_MINIMAL_FOR_TESTING: AtomicBool = AtomicBool::new(false);
+static DEFAULT_CLIENT_V3_AUTH: std::sync::Mutex<Option<(NodeKeypair, PublicKey)>> =
+    std::sync::Mutex::new(None);
+static CLI_MASTER_KEY_FLAG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Environment variable naming the Master's pinned static X25519 public key (64 hex chars).
+pub const MASTER_KEY_ENV: &str = "RUSTY_GRID_MASTER_KEY";
 
 tokio::task_local! {
     static CLIENT_RELAY_URL: Option<String>;
+    static CLIENT_V3_AUTH: Option<(NodeKeypair, PublicKey)>;
+}
+
+/// Records the global `--master-key <HEX>` CLI flag value for the current CLI invocation.
+pub fn set_cli_master_key_flag(master_key: Option<String>) {
+    if let Ok(mut guard) = CLI_MASTER_KEY_FLAG.lock() {
+        *guard = master_key;
+    }
+}
+
+/// Returns the global `--master-key <HEX>` CLI flag value, if one was passed.
+pub fn cli_master_key_flag() -> Option<String> {
+    CLI_MASTER_KEY_FLAG.lock().ok().and_then(|g| g.clone())
+}
+
+/// Sets the process-wide default client OXS-AUTH v3 credentials resolved by `client_secret`
+/// (`--master-key` > `RUSTY_GRID_MASTER_KEY` > config `master_key`).
+pub fn set_default_client_v3_auth(v3: Option<(NodeKeypair, PublicKey)>) {
+    if let Ok(mut guard) = DEFAULT_CLIENT_V3_AUTH.lock() {
+        *guard = v3;
+    }
+}
+
+/// Scopes a resolved client OXS-AUTH v3 identity (`(node_key, pinned_master_key)`) across a client
+/// command's async execution so every inner [`connect_master`] call authenticates with v3.
+pub async fn with_client_v3_auth<F>(v3: Option<(NodeKeypair, PublicKey)>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CLIENT_V3_AUTH.scope(v3, fut).await
+}
+
+/// Returns the active client OXS-AUTH v3 credentials from the task-local scope, the CLI-resolved
+/// default, or `RUSTY_GRID_MASTER_KEY` in the environment (loading/creating
+/// `~/.oxideswarm/node.key`) when called outside [`with_client_v3_auth`].
+pub fn active_client_v3_auth() -> GridResult<Option<(NodeKeypair, PublicKey)>> {
+    if let Ok(val) = CLIENT_V3_AUTH.try_with(|v| v.clone()) {
+        return Ok(val);
+    }
+    if let Ok(guard) = DEFAULT_CLIENT_V3_AUTH.lock() {
+        if let Some(ref val) = *guard {
+            return Ok(Some(val.clone()));
+        }
+    }
+    let Some(raw_master_key) = std::env::var(MASTER_KEY_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let master_pub = PublicKey::from_hex(&raw_master_key)?;
+    let node_path = default_node_key_path().ok_or_else(|| {
+        GridError::Config("Could not determine home directory for ~/.oxideswarm/node.key".into())
+    })?;
+    let (node_key, _) = NodeKeypair::load_or_generate_file(&node_path)?;
+    Ok(Some((node_key, master_pub)))
 }
 
 /// Scopes a resolved client `relay_url` (`--relay-url` > `RUSTY_GRID_RELAY_URL` > config
@@ -97,18 +163,19 @@ pub fn is_p2p_ticket(addr: &str) -> bool {
         || (!trimmed.is_empty() && rusty_grid_core::transport::parse_p2p_ticket(trimmed).is_ok())
 }
 
-/// Whether a worker or client must hold a cluster secret to talk to `master_addr`.
+/// Whether a worker or client must hold a credential (a cluster secret or a pinned master key +
+/// `node.key`) to talk to `master_addr`.
 ///
 /// True for everything except a master on this very machine: `auto` (UDP discovery picks whoever
 /// answers first), any P2P ticket (`via_p2p_ticket`: a ticket only addresses a node, it proves
 /// nothing about who runs it), an empty address (the worker treats it as `auto`), and any host
 /// that is not a loopback IP or `localhost` / `*.localhost`. Host names are judged by name only,
-/// never resolved: a name that merely happens to point at 127.0.0.1 still needs a secret.
+/// never resolved: a name that merely happens to point at 127.0.0.1 still needs a credential.
 ///
-/// Without a secret the peer cannot tell the genuine master from a rogue one: a worker would obey
-/// whatever commands the rogue sends, and a client would hand it the command, environment and
-/// stdin of every submitted task. The CLI therefore refuses to continue without a secret in these
-/// cases unless `--insecure` is given (see `crate::secret_cmd::decide_peer_secret`).
+/// Without a credential the peer cannot tell the genuine master from a rogue one: a worker would
+/// obey whatever commands the rogue sends, and a client would hand it the command, environment and
+/// stdin of every submitted task. The CLI therefore refuses to continue without a secret or pinned
+/// master key in these cases unless `--insecure` is given (see `crate::secret_cmd::decide_peer_secret`).
 pub fn master_requires_secret(master_addr: &str, via_p2p_ticket: bool) -> bool {
     if via_p2p_ticket || is_p2p_ticket(master_addr) {
         return true;
@@ -312,7 +379,36 @@ pub async fn connect_master_with_relay(
     };
 
     let mut transport = MessageTransport::with_codec(stream, codec);
-    if let Some(secret) = secret {
+    if let Some((node_key, master_pub)) = active_client_v3_auth()? {
+        let hs_res = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            v3_client_handshake(
+                &mut transport,
+                &node_key,
+                &master_pub,
+                HandshakePurpose::Member,
+            ),
+        )
+        .await
+        .map_err(|_| GridError::Timeout {
+            operation: "cluster_authentication".into(),
+            duration_secs: AUTH_TIMEOUT.as_secs(),
+        })?;
+        let session_key = match hs_res {
+            Ok(key) => key,
+            Err(GridError::HandshakeFailed(detail)) if via_p2p => {
+                return Err(upgrade_hint(&detail));
+            }
+            Err(GridError::ConnectionClosed) if via_p2p => {
+                return Err(upgrade_hint("connection closed by peer"));
+            }
+            Err(GridError::Io(e)) if via_p2p => {
+                return Err(upgrade_hint(&e.to_string()));
+            }
+            Err(other) => return Err(other),
+        };
+        transport.enable_encryption(&session_key, EndpointRole::Client);
+    } else if let Some(secret) = secret {
         let hs_res = tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
             .await
             .map_err(|_| GridError::Timeout {
@@ -854,6 +950,7 @@ mod tests {
             timeout_secs: None,
             secret_file: None,
             secret: None,
+            master_key: None,
             insecure: None,
         };
         assert_eq!(

@@ -41,6 +41,7 @@ use rusty_grid_core::capabilities::{
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
+use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose, NodeKeypair, PublicKey};
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, is_protocol_version_compatible, master_features,
     EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
@@ -503,11 +504,18 @@ pub struct WorkerConfig {
     /// re-established. `None` (default): [`DEAD_PEER_HEARTBEAT_FACTOR`] heartbeat intervals, at
     /// least [`MIN_DEAD_PEER_TIMEOUT`].
     pub dead_peer_timeout: Option<Duration>,
-    /// Shared cluster secret. When set, the worker proves knowledge of it to the Master
-    /// (`rusty_grid_core::cluster_auth`) on every connect and reconnect, TCP and P2P alike, before
-    /// it sends `Register`, and refuses a Master that cannot prove it holds the same secret. A
-    /// worker without a secret only joins masters that run without one.
+    /// Shared cluster secret. When set (and `master_public_key` is not set), the worker proves
+    /// knowledge of it to the Master (`rusty_grid_core::cluster_auth`) on every connect and
+    /// reconnect, TCP and P2P alike, before it sends `Register`, and refuses a Master that cannot
+    /// prove it holds the same secret. A worker without a secret or pinned master key only joins
+    /// masters that run without authentication.
     pub cluster_secret: Option<ClusterSecret>,
+    /// Static per-machine X25519 key pair (`~/.oxideswarm/node.key`) used for the OXS-AUTH v3
+    /// (Noise `IK`) handshake when `master_public_key` is configured.
+    pub node_key: Option<NodeKeypair>,
+    /// Pinned static X25519 public key of the Master (`--master-key`, `RUSTY_GRID_MASTER_KEY`, or
+    /// `master_key` in config). When set, the worker authenticates with OXS-AUTH v3 instead of v2.
+    pub master_public_key: Option<PublicKey>,
     /// Live battery / thermal state shared with whoever can read it (the Android app, via the JNI
     /// bridge). When set, the worker neither polls the OS itself nor trusts the snapshot taken at
     /// startup: it registers with the handle's state, gates incoming tasks on it, and reports every
@@ -610,6 +618,8 @@ impl WorkerConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             dead_peer_timeout: None,
             cluster_secret: None,
+            node_key: None,
+            master_public_key: None,
             mobile_telemetry: None,
             tags: Vec::new(),
             sandbox_base_dir: None,
@@ -800,6 +810,25 @@ impl WorkerConfig {
     /// Makes the worker authenticate to the Master with `secret` before registering.
     pub fn with_cluster_secret(mut self, secret: ClusterSecret) -> Self {
         self.cluster_secret = Some(secret);
+        self
+    }
+
+    /// Sets the worker's static X25519 key pair for OXS-AUTH v3 (Noise `IK`).
+    pub fn with_node_key(mut self, node_key: NodeKeypair) -> Self {
+        self.node_key = Some(node_key);
+        self
+    }
+
+    /// Sets the Master's pinned static X25519 public key for OXS-AUTH v3 (Noise `IK`).
+    pub fn with_master_public_key(mut self, master_public_key: PublicKey) -> Self {
+        self.master_public_key = Some(master_public_key);
+        self
+    }
+
+    /// Configures both the worker's `node.key` and the Master's pinned public key for OXS-AUTH v3.
+    pub fn with_v3_auth(mut self, node_key: NodeKeypair, master_public_key: PublicKey) -> Self {
+        self.node_key = Some(node_key);
+        self.master_public_key = Some(master_public_key);
         self
     }
 
@@ -3650,7 +3679,28 @@ impl WorkerClient {
         &self,
         transport: &mut MessageTransport<S>,
     ) -> GridResult<Duration> {
-        if let Some(secret) = self.config.cluster_secret.as_ref() {
+        if let Some(master_pub) = self.config.master_public_key.as_ref() {
+            let node_key = self.config.node_key.as_ref().ok_or_else(|| {
+                GridError::Config(
+                    "master_public_key is set on WorkerConfig without node_key; pass both via WorkerConfig::with_v3_auth".into(),
+                )
+            })?;
+            let session_key = tokio::time::timeout(
+                self.config.handshake_timeout,
+                v3_client_handshake(transport, node_key, master_pub, HandshakePurpose::Member),
+            )
+            .await
+            .map_err(|_| GridError::Timeout {
+                operation: "cluster_authentication".into(),
+                duration_secs: self.config.handshake_timeout.as_secs(),
+            })??;
+            debug!(
+                worker_id = %self.worker_id,
+                member_id = %node_key.member_id(),
+                "Master authenticated via OXS-AUTH v3 (Noise IK)"
+            );
+            transport.enable_encryption(&session_key, EndpointRole::Client);
+        } else if let Some(secret) = self.config.cluster_secret.as_ref() {
             // Upgrade transport to AEAD record layer upon successful authentication.
             let session_key = tokio::time::timeout(
                 self.config.handshake_timeout,
@@ -7945,6 +7995,26 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(stdout2.as_bytes()).trim(),
             ":built-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_perform_handshake_master_public_key_without_node_key_returns_config_error() {
+        let master_kp = NodeKeypair::generate().unwrap();
+        let mut config =
+            WorkerConfig::new("127.0.0.1:8088").with_master_public_key(*master_kp.public_key());
+        config.node_key = None;
+        let client = WorkerClient::new(config);
+        let (a, _b) = tokio::io::duplex(4096);
+        let mut transport = MessageTransport::new(a);
+        let err = client
+            .perform_handshake(&mut transport)
+            .await
+            .expect_err("master_public_key without node_key must return GridError::Config");
+        assert!(matches!(err, GridError::Config(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("with_v3_auth"),
+            "unexpected error message: {err}"
         );
     }
 

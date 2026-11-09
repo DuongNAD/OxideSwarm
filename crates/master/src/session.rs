@@ -49,7 +49,7 @@ use crate::server::{
     handle_oversized_master_message, handle_session_task_message,
     handle_worker_disconnect_with_broadcast, handle_worker_evacuate_with_broadcast,
     reject_master_role_claim, resolve_terminal_waiters, send_refusal_and_drain,
-    serve_worker_blob_request, AbortOnDrop, BlobService, WaiterMap,
+    serve_worker_blob_request, AbortOnDrop, BlobService, MasterAuthContext, WaiterMap,
 };
 
 /// Which inbound lane delivered a [`WorkerMessage`].
@@ -361,6 +361,7 @@ impl<
         abort_handle: Option<AbortHandle>,
         wire_codec: WireCodec,
         cluster_secret: Option<ClusterSecret>,
+        auth_ctx: MasterAuthContext,
         handshake_permit: Option<OwnedSemaphorePermit>,
         blob_store: Option<Arc<BlobStore>>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
@@ -385,6 +386,7 @@ impl<
                     transport,
                     &peer_label,
                     cluster_secret.as_ref(),
+                    &auth_ctx,
                     handshake_timeout,
                     "connection",
                 )
@@ -408,6 +410,7 @@ impl<
                     ctrl_transport,
                     &peer_label,
                     cluster_secret.as_ref(),
+                    &auth_ctx,
                     handshake_timeout,
                     "control stream",
                 )
@@ -1414,6 +1417,7 @@ mod tests {
                 None,
                 WireCodec::Bincode,
                 None,
+                MasterAuthContext::default(),
                 None,
                 blob_store,
                 #[cfg(feature = "dashboard")]
