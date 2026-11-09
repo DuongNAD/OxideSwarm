@@ -540,6 +540,156 @@ class ShellLauncherTests(unittest.TestCase):
         )
 
 
+# A stand-in for the released binary inside the USB-kit archives (packaging/usb). It records its
+# arguments, checks that `join` gets the token on standard input, and answers `workers --json` with
+# the worker it runs, in the layout the installer parses.
+FAKE_KIT_BINARY = """#!/bin/bash
+echo "$*" >> "${FAKE_ARGS_LOG:?}"
+case "$1" in
+  --version) echo "rusty-grid 9.9.9"; exit 0 ;;
+  join)
+    tok=$(cat)
+    case "$tok" in oxs1-join:*) touch "$OXIDESWARM_HOME/joined"; exit 0 ;; *) echo "bad token" >&2; exit 3 ;; esac ;;
+  worker)
+    shift
+    while [ $# -gt 0 ]; do [ "$1" = "--name" ] && echo "$2" > "$OXIDESWARM_HOME/fake_worker_name"; shift; done
+    echo $$ > "$OXIDESWARM_HOME/fake_worker_pid"
+    while true; do sleep 1; done ;;
+  workers)
+    pid=$(cat "$OXIDESWARM_HOME/fake_worker_pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '[\\n  {\\n    "name": "%s",\\n    "tags": [\\n      "state:connected"\\n    ]\\n  }\\n]\\n' "$(cat "$OXIDESWARM_HOME/fake_worker_name")"
+    else
+      echo "[]"
+    fi
+    exit 0 ;;
+  doctor) echo "Summary: fake"; exit 0 ;;
+esac
+exit 0
+"""
+
+KIT_TARGETS = ("aarch64-apple-darwin.tar.gz", "x86_64-apple-darwin.tar.gz",
+               "x86_64-pc-windows-msvc.zip", "x86_64-unknown-linux-gnu.tar.gz")
+KIT_TOKEN = "oxs1-join:" + "QUJD" * 10 + "." + "0" * 32
+
+
+@unittest.skipIf(IS_WINDOWS, "the bash kit scripts are tested on Linux and macOS; the .cmd path runs on Windows")
+class UsbKitTests(unittest.TestCase):
+    """packaging/usb: make_kit.sh writes a kit, install.sh installs from it, uninstall.sh removes it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ox_usbkit_test_")
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        self.args_log = os.path.join(self.tmp, "fake_args.log")
+        open(self.args_log, "w").close()
+        self.addCleanup(self._cleanup)
+        # Release-like archives with a fake binary, and their SHA256SUMS.
+        self.archives = os.path.join(self.tmp, "archives")
+        os.makedirs(self.archives)
+        sums = []
+        for target in KIT_TARGETS:
+            name = "oxideswarm-9.9.9-" + target
+            path = os.path.join(self.archives, name)
+            if target.endswith(".tar.gz"):
+                stage = os.path.join(self.tmp, "stage", name[:-len(".tar.gz")])
+                os.makedirs(stage)
+                exe = os.path.join(stage, "oxideswarm")
+                with open(exe, "w") as f:
+                    f.write(FAKE_KIT_BINARY)
+                os.chmod(exe, 0o755)
+                subprocess.run(["tar", "-czf", path, "-C", os.path.dirname(stage), os.path.basename(stage)], check=True)
+            else:
+                with open(path, "wb") as f:
+                    f.write(b"not used on this system")
+            sums.append("%s  %s" % (hashlib.sha256(read_bytes(path)).hexdigest(), name))
+        with open(os.path.join(self.archives, "SHA256SUMS"), "w") as f:
+            f.write("\n".join(sums) + "\n")
+        self.stick = os.path.join(self.tmp, "stick")
+        os.makedirs(self.stick)
+
+    def _cleanup(self):
+        listing = subprocess.run(["ps", "-axo", "pid=,command="], stdout=subprocess.PIPE, text=True).stdout
+        for line in listing.splitlines():
+            pid_text, _, command = line.strip().partition(" ")
+            if self.tmp in command and pid_text.isdigit() and int(pid_text) != os.getpid():
+                try:
+                    os.kill(int(pid_text), signal.SIGKILL)
+                except OSError:
+                    pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def env(self):
+        return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": self.home, "TMPDIR": self.tmp,
+                "FAKE_ARGS_LOG": self.args_log}
+
+    def make_kit(self, token=KIT_TOKEN, extra=()):
+        return subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick,
+             "--version", "9.9.9", "--archives", self.archives] + list(extra),
+            input=token, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+
+    def test_make_kit_writes_the_kit_and_keeps_the_token_off_the_command_line(self):
+        res = self.make_kit()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        for name in ("install.sh", "install.ps1", "Install OxideSwarm.cmd", "Install OxideSwarm.command",
+                     "README.txt", "archives/SHA256SUMS"):
+            self.assertTrue(os.path.isfile(os.path.join(kit, name)), name)
+        token_path = os.path.join(kit, "join.token")
+        self.assertEqual(read(token_path).strip(), KIT_TOKEN)
+        self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode) & 0o077, 0)
+        self.assertNotIn(KIT_TOKEN, res.stdout)
+        self.assertEqual(glob.glob(os.path.join(kit, "._*")), [])
+        # A second run refuses to overwrite, and anything that is not a token is refused.
+        self.assertNotEqual(self.make_kit().returncode, 0)
+        self.assertNotEqual(self.make_kit(token="hello", extra=["--replace"]).returncode, 0)
+
+    def test_install_and_uninstall_from_the_kit_stay_in_their_folder(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-test"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("checksum OK", res.stdout)
+        self.assertIn("connected", res.stdout)
+        calls = [line for line in read(self.args_log).splitlines() if line.strip()]
+        self.assertIn("join --no-doctor", calls)
+        worker_calls = [c for c in calls if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--name kit-test" in worker_calls[0] and "--no-portal" in worker_calls[0],
+                        calls)
+        self.assertTrue(all(KIT_TOKEN not in c for c in calls), "the token reached a command line")
+        self.assertTrue(os.path.isfile(os.path.join(root, "home", "joined")))
+        # The user's own state folder and autostart folders are untouched.
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oxideswarm")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library", "LaunchAgents")))
+        pid = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        self.assertTrue(pid_alive(pid))
+        res = subprocess.run(["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root, "--yes"],
+                             env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertFalse(os.path.exists(root))
+        self.assertTrue(wait_until(lambda: not pid_alive(pid), timeout=10), "the worker kept running")
+
+    def test_install_refuses_a_damaged_archive_before_installing_anything(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        for path in glob.glob(os.path.join(kit, "archives", "*.tar.gz")):
+            with open(path, "ab") as f:
+                f.write(b"x")
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--no-autostart"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("checksum mismatch", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
+        self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
+
+
 class StaticRepositoryChecks(unittest.TestCase):
     def test_gitattributes_pins_line_endings(self):
         path = os.path.join(ROOT, ".gitattributes")

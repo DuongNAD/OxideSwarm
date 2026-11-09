@@ -1,6 +1,6 @@
 # 0053: Set up machines from a USB stick
 
-Status: Accepted (decision Q13, 2026-11-09); not built; needs ENROLL-1b
+Status: Accepted (decision Q13, 2026-11-09). Kit format v0 is built in `packaging/usb/`; `usb create` needs ENROLL-1b
 Created: 2026-11-09    Updated: 2026-11-09
 
 ## Summary
@@ -200,3 +200,14 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   - bounded Argon2id parameters, with the header as associated data;
   - the tampering note states plainly what the checks catch;
   - approval from an admin member, the shared word list and the full command synopsis.
+- 2026-11-09: Kit format v0 built in `packaging/usb/` (the first part of USB-1b). It carries a join
+  token instead of an encrypted invite, until ENROLL-1b. It contains:
+  - `make_kit.sh`;
+  - installers for macOS, Windows and Linux that install for the current user, keep their state in
+    `<folder>/home` through `OXIDESWARM_HOME`, start the worker and add a start at login;
+  - uninstallers.
+
+  It was tested from a 16 GB exFAT stick on macOS (Apple M5) and on Windows 11 (Intel Core
+  i7-1355U) against a demo cluster with a throw-away secret. The worker joined, and the probe
+  tasks of the doctor checks completed without errors, and the uninstaller stopped it. The installer waits for `state:connected` in `workers --json`, because the plain
+  listing also showed disconnected workers (fixed in `oxideswarm workers`).

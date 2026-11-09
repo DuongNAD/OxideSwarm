@@ -167,6 +167,10 @@ installed and does the work. Neither machine has to build OxideSwarm.
    The first run sends every file that `.gitignore` does not exclude and builds from scratch. Run it
    again: only changed files travel, and B reuses its `target/` directory.
 
+To set up several machines, a USB stick can carry the program for every system and the token:
+see [packaging/usb/README.md](packaging/usb/README.md). It installs, joins and starts the worker
+with one double-click.
+
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
 expected output, the MCP calls and troubleshooting, is
