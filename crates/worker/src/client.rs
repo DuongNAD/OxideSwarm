@@ -2810,18 +2810,9 @@ impl WorkerClient {
         let (endpoint, is_cached) = match ep_guard.as_ref() {
             Some(ep) => (ep.clone(), true),
             None => {
-                let ep_builder = if self.config.p2p_minimal_preset {
-                    iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                } else {
-                    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                };
-                let ep = ep_builder
-                    .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
-                    .bind()
-                    .await
-                    .map_err(|e| {
-                        GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
-                    })?;
+                let ep =
+                    rusty_grid_core::transport::bind_p2p_endpoint(self.config.p2p_minimal_preset)
+                        .await?;
                 *ep_guard = Some(ep.clone());
                 (ep, false)
             }
@@ -2835,25 +2826,17 @@ impl WorkerClient {
                 *guard = None;
             }
         };
-        let conn = match tokio::time::timeout(
+        let conn = match rusty_grid_core::transport::dial_p2p_endpoint(
+            &endpoint,
+            node_addr,
             connect_timeout,
-            endpoint.connect(node_addr, rusty_grid_core::transport::GRID_ALPN),
         )
         .await
         {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
+            Ok(c) => c,
+            Err(e) => {
                 reset_cached_endpoint().await;
-                return Err(GridError::ConnectionFailed(format!(
-                    "P2P connect failed: {e}"
-                )));
-            }
-            Err(_) => {
-                reset_cached_endpoint().await;
-                return Err(GridError::Timeout {
-                    operation: "p2p_connect".into(),
-                    duration_secs: connect_timeout.as_secs(),
-                });
+                return Err(e);
             }
         };
 
@@ -2861,35 +2844,18 @@ impl WorkerClient {
         // A peer that accepts the connection but never completes the stream setup must not
         // be able to park the worker here forever.
         let open_lanes = async {
-            let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.map_err(|e| {
-                GridError::ConnectionFailed(format!(
-                    "Failed to open bidirectional control stream: {e}"
-                ))
-            })?;
-            tokio::io::AsyncWriteExt::write_all(
-                &mut ctrl_send,
-                &[rusty_grid_core::transport::STREAM_CONTROL],
+            let (ctrl_send, ctrl_recv) = rusty_grid_core::transport::open_p2p_tagged_stream(
+                &conn,
+                rusty_grid_core::transport::STREAM_CONTROL,
+                "control",
             )
-            .await
-            .map_err(GridError::Io)?;
-            tokio::io::AsyncWriteExt::flush(&mut ctrl_send)
-                .await
-                .map_err(GridError::Io)?;
-
-            let (mut data_send, data_recv) = conn.open_bi().await.map_err(|e| {
-                GridError::ConnectionFailed(format!(
-                    "Failed to open bidirectional data stream: {e}"
-                ))
-            })?;
-            tokio::io::AsyncWriteExt::write_all(
-                &mut data_send,
-                &[rusty_grid_core::transport::STREAM_DATA],
+            .await?;
+            let (data_send, data_recv) = rusty_grid_core::transport::open_p2p_tagged_stream(
+                &conn,
+                rusty_grid_core::transport::STREAM_DATA,
+                "data",
             )
-            .await
-            .map_err(GridError::Io)?;
-            tokio::io::AsyncWriteExt::flush(&mut data_send)
-                .await
-                .map_err(GridError::Io)?;
+            .await?;
             GridResult::Ok((ctrl_send, ctrl_recv, data_send, data_recv))
         };
         let (ctrl_send, ctrl_recv, data_send, data_recv) =

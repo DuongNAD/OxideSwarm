@@ -493,7 +493,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm submit` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[submit].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto`) |
+| `--master <ADDR\|auto\|TICKET>` | `127.0.0.1:8088` (`OXIDESWARM_MASTER`, `RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[submit].master`, `[submit].p2p_ticket`) | Master grid port address (`HOST:8088`, bare `HOST`, `auto`, or an iroh P2P connection ticket) |
 | `--type <TYPE>` (alias `--task-type`) | `generic` | Task type: `command` (`generic`), `shell`, `compile`, `gpu`, `3d`, or `autorig` |
 | `--command <CMD>` | — | Executable name or shell snippet to run on the worker |
 | `-- <ARGS>...` | — | Trailing command arguments passed to `--command` |
@@ -537,24 +537,24 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--embed-animations <ANIMATIONS>` | — | Comma-separated animation clips to embed (e.g. `idle,walk,turnaround`) |
 | `--preferred-provider <PROVIDER>` | `builtin` | Auto-rigging provider: `builtin` (Rust skinning) or `blender` (headless Blender `engines/autorig/blender_rig.py`) |
 | `-o`, `--output-asset <OUTPUT_PATH>` (alias `--glb-output`) | — | Destination path to write the generated or rigged `.glb` asset |
-| `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[submit].insecure`) | Allow submitting to a remote or `auto` master without a cluster secret |
+| `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[submit].insecure`) | Allow submitting to a remote, `auto`, or P2P master without a cluster secret |
 
 #### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands
 | Subcommand | Flags / Aliases | Description |
 | :--- | :--- | :--- |
-| `oxideswarm status` | `--master <ADDR\|auto>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
-| `oxideswarm workers` | `--master <ADDR\|auto>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
-| `oxideswarm workspaces` | `--master <ADDR\|auto>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
-| `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
-| `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
-| `oxideswarm mapreduce` | `--master <ADDR\|auto>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
-| `oxideswarm doctor` | `--master <ADDR\|auto>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
+| `oxideswarm status` | `--master <ADDR\|auto\|TICKET>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
+| `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
+| `oxideswarm workspaces` | `--master <ADDR\|auto\|TICKET>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
+| `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
+| `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
+| `oxideswarm mapreduce` | `--master <ADDR\|auto\|TICKET>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
+| `oxideswarm doctor` | `--master <ADDR\|auto\|TICKET>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
 | `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
 | `oxideswarm secret show` | `--raw`, `--dashboard-token` | Show the resolved secret source + fingerprint, raw 64-char hex (`--raw`), or derived dashboard admin bearer token (`--dashboard-token`) |
 | `oxideswarm secret join-token` | `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>` | Print a join token (`oxs1-join:...`: the master address, an optional P2P ticket and the cluster secret, with an integrity tag) to stdout, with a warning on stderr. The token is as sensitive as the secret. Without `--master`, the `[master] listen` of the config file is used unless it is a wildcard |
 | `oxideswarm join` | `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | Read a join token from **standard input** (piped, or pasted at a no-echo prompt on a terminal; an argument is refused), save the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` (edited in place, comments kept, a private `.bak-<time>` backup first, never through a symlink), refuse a different secret configured via `OXIDESWARM_SECRET*`, `--secret*` or the config file, refuse to replace a different secret without `--replace-secret` or a different master or ticket without `--replace-master`, then run the doctor checks and exit with their status. Design: [docs/design/0048-join-token.md](docs/design/0048-join-token.md) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
-| `oxideswarm mcp` | `--master <ADDR\|auto>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
+| `oxideswarm mcp` | `--master <ADDR\|auto\|TICKET>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
 
 #### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
 | Subcommand | Flags | Description |
@@ -606,7 +606,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written (`--p2p-ticket-file`) |
 | `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted (`--p2p-key-file`) |
 | `RUSTY_GRID_EPHEMERAL_KEY` | Master | Forces generation of ephemeral P2P key without file persistence (`--ephemeral-key`) |
-| `RUSTY_GRID_P2P_MINIMAL` | Master & Worker | Selects `iroh::endpoint::presets::Minimal` (disabling DERP relay and pkarr/DNS address lookup) in `oxideswarm master` and `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0030](docs/design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md)) |
+| `RUSTY_GRID_P2P_MINIMAL` | Master, Worker & CLI | Selects `iroh::endpoint::presets::Minimal` (disabling DERP relay and pkarr/DNS address lookup) in `oxideswarm master`, `oxideswarm worker`, and client P2P connections (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0030](docs/design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md)) |
 | `RUSTY_GRID_MAX_QUEUE_SIZE` | Master | Maximum queued or running (non-terminal) tasks held in the queue (`--max-queue-size`; minimum `1`) |
 | `RUSTY_GRID_SCHEDULER_POLICY` | Master | Load-balancing policy (`--scheduler-policy`: `weighted`, `least-loaded`, or `round-robin`; default `weighted`) |
 | `RUSTY_GRID_WIRE_CODEC` | Master, Worker & Client | Wire format serialization codec (`--wire-codec`: `bincode` or `json`; default `bincode`; invalid values exit `1`) |
@@ -637,7 +637,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 #### Tier C: Worker Node Engine, GPU, CUDA, Blender & 3D Subsystem
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `RUSTY_GRID_MASTER_ADDR` | Worker & CLI | Target Master grid address (`--master HOST:PORT` or `auto`) |
+| `OXIDESWARM_MASTER` | CLI & MCP | Target Master grid address (`--master HOST:PORT`, `auto`, or an iroh P2P connection ticket) |
+| `RUSTY_GRID_MASTER_ADDR` | Worker & CLI | Target Master grid address (`--master HOST:PORT`, `auto`, or P2P ticket) |
 | `RUSTY_GRID_MASTER` | Worker & CLI | Secondary alias for Master grid address |
 | `RUSTY_GRID_P2P_TICKET` | Worker | Iroh P2P connection ticket for remote NAT traversal (`--p2p-ticket`) |
 | `RUSTY_GRID_WORKER_NAME` | Worker | Advertised worker name (`--name`; persists UUID to `~/.oxideswarm/worker_id.<NAME>`) |

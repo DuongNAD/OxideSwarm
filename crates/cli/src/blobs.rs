@@ -18,7 +18,6 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use rusty_grid_core::blob::{
@@ -34,6 +33,7 @@ use rusty_grid_core::error::GridResult;
 use rusty_grid_core::protocol::{
     ClientMessage, ClientResponse, MessageReader, MessageTransport, MessageWriter,
 };
+use rusty_grid_core::transport::GridStream;
 
 use crate::connect::connect_master;
 
@@ -669,7 +669,7 @@ fn lock_pipeline(p: &SharedPipeline) -> std::sync::MutexGuard<'_, Pipeline> {
 /// request, answers it, then reads the next; a client that sends faster is held back by the
 /// socket buffers, so the Master never queues more than it is reading).
 pub struct BlobConnection {
-    writer: Mutex<MessageWriter<tokio::io::WriteHalf<TcpStream>>>,
+    writer: Mutex<MessageWriter<tokio::io::WriteHalf<GridStream>>>,
     pipeline: SharedPipeline,
     permits: tokio::sync::Semaphore,
     reader: tokio::task::JoinHandle<()>,
@@ -688,7 +688,7 @@ const OLD_MASTER_HINT: &str = "if the master runs an older version, restart it w
 
 /// Reads replies and completes the oldest waiting call with each, until the connection ends.
 async fn run_blob_reader(
-    mut reader: MessageReader<tokio::io::ReadHalf<TcpStream>>,
+    mut reader: MessageReader<tokio::io::ReadHalf<GridStream>>,
     pipeline: SharedPipeline,
 ) {
     loop {
@@ -727,7 +727,7 @@ async fn run_blob_reader(
 }
 
 impl BlobConnection {
-    pub fn new(transport: MessageTransport<TcpStream>) -> Self {
+    pub fn new(transport: MessageTransport<GridStream>) -> Self {
         let (writer, reader) = transport.split();
         let pipeline = SharedPipeline::default();
         let reader = tokio::spawn(run_blob_reader(reader, std::sync::Arc::clone(&pipeline)));

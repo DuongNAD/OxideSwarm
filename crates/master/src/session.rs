@@ -370,11 +370,20 @@ impl<
             PreAuthSession::Single {
                 transport,
                 remote_addr,
+                #[cfg(feature = "p2p")]
+                p2p_conn,
                 ..
             } => {
+                #[cfg(feature = "p2p")]
+                let peer_label = match p2p_conn {
+                    Some(ref conn) => format!("{remote_addr} (iroh node {})", conn.remote_id()),
+                    None => remote_addr.to_string(),
+                };
+                #[cfg(not(feature = "p2p"))]
+                let peer_label = remote_addr.to_string();
                 authenticate_and_read_first_message(
                     transport,
-                    &remote_addr.to_string(),
+                    &peer_label,
                     cluster_secret.as_ref(),
                     handshake_timeout,
                     "connection",
@@ -411,20 +420,45 @@ impl<
         let (first_msg, detected_codec) = match first_res {
             Ok(pair) => pair,
             Err(e) => {
-                if let PreAuthSession::Multiplexed {
-                    ref mut ctrl_transport,
-                    #[cfg(feature = "p2p")]
-                    ref p2p_conn,
-                    ..
-                } = pre_auth
-                {
-                    if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
-                        drain_refusal_stream(
-                            ctrl_transport,
+                if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
+                    match pre_auth {
+                        PreAuthSession::Single {
+                            ref mut transport,
                             #[cfg(feature = "p2p")]
-                            p2p_conn.as_ref(),
-                        )
-                        .await;
+                            ref p2p_conn,
+                            ..
+                        } if {
+                            #[cfg(feature = "p2p")]
+                            {
+                                p2p_conn.is_some()
+                            }
+                            #[cfg(not(feature = "p2p"))]
+                            {
+                                false
+                            }
+                        } =>
+                        {
+                            drain_refusal_stream(
+                                transport,
+                                #[cfg(feature = "p2p")]
+                                p2p_conn.as_ref(),
+                            )
+                            .await;
+                        }
+                        PreAuthSession::Multiplexed {
+                            ref mut ctrl_transport,
+                            #[cfg(feature = "p2p")]
+                            ref p2p_conn,
+                            ..
+                        } => {
+                            drain_refusal_stream(
+                                ctrl_transport,
+                                #[cfg(feature = "p2p")]
+                                p2p_conn.as_ref(),
+                            )
+                            .await;
+                        }
+                        _ => {}
                     }
                 }
                 return Err(e);
@@ -452,6 +486,8 @@ impl<
                 PreAuthSession::Single {
                     transport,
                     mapreduce_parallelism,
+                    #[cfg(feature = "p2p")]
+                        p2p_conn: _p2p_conn,
                     #[cfg(feature = "p2p")]
                     p2p_conns,
                     ..
