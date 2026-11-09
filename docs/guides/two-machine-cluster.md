@@ -62,7 +62,7 @@ whether `rusty-grid` may accept incoming connections, allow it.
 
 Machines on different networks: start the master with `./switch_role.sh master --p2p` instead, and
 connect the Windows machine with `connect_remote.cmd` and the ticket from
-`~/.oxideswarm/master_ticket.txt` ([README, section D](../../README.md#d-remote-wan-connection-cross-network--internet--requires-ticket-and-secret));
+`~/.oxideswarm/master_ticket.txt` ([README, machines on other networks](../../README.md#machines-on-other-networks-p2p));
 then continue with step 6.
 
 ### 4. Join Windows with one token (or copy the cluster secret)
