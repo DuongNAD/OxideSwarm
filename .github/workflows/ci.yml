@@ -160,6 +160,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-on-failure: true
+      - name: Windows AppContainer isolation tests (--test-threads=1 --nocapture)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --test-threads=1 --nocapture
       - run: cargo test --workspace --locked --no-fail-fast
       # Design 0033 (FEAT-3b): the workspace run above is the restricted-userns case of
       # `ubuntu-latest` (AppArmor lets `unshare` succeed without capabilities); this run has the

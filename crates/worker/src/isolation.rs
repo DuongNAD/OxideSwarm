@@ -860,19 +860,25 @@ pub mod windows {
     };
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid, DeleteAce,
-        DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid,
-        SetFileSecurityW, SetTokenInformation, TokenDefaultDacl, TokenElevation, TokenOwner,
-        TokenUser, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
-        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
-        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
-        LUA_TOKEN, NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-        SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+        DeriveCapabilitySidsFromName, DuplicateTokenEx, EqualSid, FreeSid, GetAce,
+        GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetTokenInformation, IsValidSid, SecurityImpersonation, SetFileSecurityW,
+        SetTokenInformation, TokenDefaultDacl, TokenElevation, TokenOwner, TokenPrimary, TokenUser,
+        WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
+        WinCapabilityPrivateNetworkClientServerSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+        ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE, LUA_TOKEN, NO_INHERITANCE,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+        TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL,
+        TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
         UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
     };
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetErrorMode(umode: u32) -> u32;
+    }
 
     #[link(name = "user32")]
     extern "system" {
@@ -2065,13 +2071,17 @@ pub mod windows {
         }
     }
 
-    /// Creates a LUA-filtered token (`CreateRestrictedToken` with `LUA_TOKEN`) from the current
-    /// process token, with `TokenOwner = CurrentUser` and `TokenDefaultDacl` granting
-    /// `CurrentUser` (in addition to `SYSTEM` and `Administrators`), so an AppContainer child
-    /// spawned via `CreateProcessAsUserW` never inherits administrative elevation and always
-    /// passes Stage 1 (`CurrentUser`) of `SepAccessCheck` on objects created with its default
-    /// DACL.
-    fn create_lua_filtered_token() -> io::Result<HANDLE> {
+    /// When the worker runs elevated (`is_process_elevated() == true`), creates a primary
+    /// LUA-filtered token (`CreateRestrictedToken` with `LUA_TOKEN` + `DuplicateTokenEx` with
+    /// `TokenPrimary`) from the current process token, with `TokenOwner = CurrentUser` and
+    /// `TokenDefaultDacl` granting `CurrentUser` (in addition to `SYSTEM` and `Administrators`),
+    /// so an AppContainer child spawned via `CreateProcessAsUserW` never inherits administrative
+    /// elevation and always passes Stage 1 (`CurrentUser`) of `SepAccessCheck` on objects created
+    /// with its default DACL. Returns `Ok(None)` when the worker process is not elevated.
+    fn create_lua_filtered_token() -> io::Result<Option<HANDLE>> {
+        if !is_process_elevated() {
+            return Ok(None);
+        }
         let user_sid = OwnedSid::current_user()?;
         unsafe {
             let mut proc_token: HANDLE = std::ptr::null_mut();
@@ -2084,7 +2094,7 @@ pub mod windows {
             {
                 return Err(io::Error::last_os_error());
             }
-            let mut lua_token: HANDLE = std::ptr::null_mut();
+            let mut restricted_token: HANDLE = std::ptr::null_mut();
             let ok = CreateRestrictedToken(
                 proc_token,
                 LUA_TOKEN,
@@ -2094,15 +2104,33 @@ pub mod windows {
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
-                &mut lua_token,
+                &mut restricted_token,
             );
             let err = io::Error::last_os_error();
             CloseHandle(proc_token);
-            if ok == 0 || lua_token.is_null() {
+            if ok == 0 || restricted_token.is_null() {
                 return Err(err);
             }
-            apply_current_user_owner_and_default_dacl(lua_token, user_sid.as_psid());
-            Ok(lua_token)
+            let mut primary_token: HANDLE = std::ptr::null_mut();
+            let dup_ok = DuplicateTokenEx(
+                restricted_token,
+                TOKEN_ASSIGN_PRIMARY
+                    | TOKEN_DUPLICATE
+                    | TOKEN_QUERY
+                    | TOKEN_ADJUST_DEFAULT
+                    | TOKEN_ADJUST_SESSIONID,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary_token,
+            );
+            let dup_err = io::Error::last_os_error();
+            CloseHandle(restricted_token);
+            if dup_ok == 0 || primary_token.is_null() {
+                return Err(dup_err);
+            }
+            apply_current_user_owner_and_default_dacl(primary_token, user_sid.as_psid());
+            Ok(Some(primary_token))
         }
     }
 
@@ -3244,12 +3272,12 @@ pub mod windows {
             let comspec = std::env::var("COMSPEC")
                 .unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
             let mut cmd_line = format!(
-                "echo ok > inside || exit 2 & (echo no > ..\\{outside_name} 2>nul && exit 3)"
+                "echo ok > inside || exit 2 & (echo no > ..\\{outside_name} 2>probe_err && exit 3)"
             );
             for idx in 0..existing_protected.len() {
                 let code = 10 + idx;
                 cmd_line.push_str(&format!(
-                    " & ((ver >nul) < \"%OXIDE_PROBE_PROTECTED_{idx}%\" 2>nul && exit {code})"
+                    " & ((ver >probe_sink) < %OXIDE_PROBE_PROTECTED_{idx}% 2>probe_err && exit {code})"
                 ));
             }
             cmd_line.push_str(" & exit 0");
@@ -3269,10 +3297,22 @@ pub mod windows {
             let mut child = guard
                 .spawn_in_appcontainer(&mut cmd, 0)
                 .map_err(|e| fail(format!("could not spawn AppContainer probe: {e}")))?;
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| fail(format!("waiting for AppContainer probe failed: {e}")))?;
+            let status = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(res) => res
+                    .map_err(|e| fail(format!("waiting for AppContainer probe failed: {e}")))?,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    drop(guard);
+                    return Err(fail(
+                        "AppContainer startup probe timed out after 15s".to_string(),
+                    ));
+                }
+            };
             drop(guard);
             match status.code() {
                 Some(0) if probe_dir.join("inside").exists() && !outside_file.exists() => Ok(()),
@@ -3625,6 +3665,7 @@ pub mod windows {
     ) -> io::Result<(HANDLE, Vec<u16>)> {
         static WORKER_WINSTA: OnceLock<Result<(usize, String), String>> = OnceLock::new();
 
+        ensure_process_token_default_dacl_grants_current_user();
         let _spawn_guard = WINDOWS_SPAWN_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3632,19 +3673,19 @@ pub mod windows {
         let winsta_res = WORKER_WINSTA.get_or_init(|| {
             let toolchain_sid = OwnedSid::oxideswarm_toolchain().map_err(|e| e.to_string())?;
             let user_sid = OwnedSid::current_user().map_err(|e| e.to_string())?;
+            let system_sid =
+                OwnedSid::from_well_known(WinLocalSystemSid).map_err(|e| e.to_string())?;
+            let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)
+                .map_err(|e| e.to_string())?;
             unsafe {
-                // Attempt a worker-unique Window Station name first (`OxideSwarmWinsta_<pid>`,
-                // allowed when running as `SYSTEM` / Windows service); fall back to `NULL`
-                // (`Service-0x<LogonId>$`) when `\Sessions\<N>\Windows\WindowStations` denies
-                // arbitrary station names to a standard user token (`ERROR_ACCESS_DENIED`).
-                let unique_name = format!("OxideSwarmWinsta_{}", std::process::id());
-                let wide_unique = to_wide(OsStr::new(&unique_name));
-                let mut alt_winsta =
-                    CreateWindowStationW(wide_unique.as_ptr(), 0, 0x000F_037F, std::ptr::null());
-                if alt_winsta.is_null() {
-                    alt_winsta =
-                        CreateWindowStationW(std::ptr::null(), 0, 0x000F_037F, std::ptr::null());
-                }
+                // Always open/create the logon session's built-in non-interactive Window Station
+                // (`NULL` -> `Service-0x0-<LogonId>$`). Unlike custom-named stations under
+                // `\Sessions\<N>\Windows\WindowStations` (whose parent directory only grants
+                // traversal to `SYSTEM` and `BUILTIN\Administrators`), `Service-0x0-<LogonId>$`
+                // is accessible to the logon session's LUA-filtered token (`S-1-5-5-0-<LogonId>`)
+                // when `BUILTIN\Administrators` is stripped (`SE_GROUP_USE_FOR_DENY_ONLY`).
+                let alt_winsta =
+                    CreateWindowStationW(std::ptr::null(), 0, 0x000F_037F, std::ptr::null());
                 if alt_winsta.is_null() {
                     return Err(format!(
                         "CreateWindowStationW failed: {}",
@@ -3678,6 +3719,10 @@ pub mod windows {
                 const WINSTA_TASK_MASK: u32 = 0x0002_0123;
                 grant_sid_on_window_object(alt_winsta, user_sid.as_psid(), 0x000F_037F)
                     .map_err(|e| format!("grant user_sid on Window Station failed: {e}"))?;
+                grant_sid_on_window_object(alt_winsta, system_sid.as_psid(), 0x000F_037F)
+                    .map_err(|e| format!("grant system_sid on Window Station failed: {e}"))?;
+                grant_sid_on_window_object(alt_winsta, admins_sid.as_psid(), 0x000F_037F)
+                    .map_err(|e| format!("grant admins_sid on Window Station failed: {e}"))?;
                 grant_sid_on_window_object(alt_winsta, toolchain_sid.as_psid(), WINSTA_TASK_MASK)
                     .map_err(|e| format!("grant toolchain_sid on Window Station failed: {e}"))?;
 
@@ -3883,18 +3928,30 @@ pub mod windows {
                         si_ex.StartupInfo.hStdError = stderr_write;
                         si_ex.lpAttributeList = attr_list;
 
-                        // Start the AppContainer child from a LUA-filtered token
-                        // (`CreateRestrictedToken` with `LUA_TOKEN` + `CreateProcessAsUserW`
-                        // with the same `SECURITY_CAPABILITIES`) so that even when the worker
-                        // process runs elevated (e.g. `runneradmin` on GitHub Actions
-                        // `windows-latest`), the child never inherits administrative elevation.
-                        let lua_token = create_lua_filtered_token().ok();
+                        // Suppress any Windows hard-error modal dialog (`SEM_FAILCRITICALERRORS |
+                        // SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX = 0x8003`) so a child
+                        // initialization failure exits immediately with a non-zero status instead
+                        // of blocking inside `csrss.exe` waiting for an interactive "OK" click.
+                        unsafe {
+                            let _ = SetErrorMode(0x8003);
+                        }
+
+                        // When the worker runs elevated (`is_process_elevated() == true`, e.g.
+                        // `runneradmin` on GitHub Actions `windows-latest`), start the
+                        // AppContainer child from a primary LUA-filtered token
+                        // (`CreateRestrictedToken` with `LUA_TOKEN` + `DuplicateTokenEx` with
+                        // `TokenPrimary` + `CreateProcessAsUserW` with the same
+                        // `SECURITY_CAPABILITIES`) so the child never inherits administrative
+                        // elevation. Clone `cmdline` before `CreateProcessAsUserW` because Win32
+                        // `CreateProcessAsUserW` may mutate `lpCommandLine` in place.
+                        let lua_token = create_lua_filtered_token().ok().flatten();
                         let spawned = unsafe {
                             let res = if let Some(tok) = lua_token {
+                                let mut lua_cmdline = cmdline.clone();
                                 let ok = CreateProcessAsUserW(
                                     tok,
                                     std::ptr::null(),
-                                    cmdline.as_mut_ptr(),
+                                    lua_cmdline.as_mut_ptr(),
                                     std::ptr::null(),
                                     std::ptr::null(),
                                     1,

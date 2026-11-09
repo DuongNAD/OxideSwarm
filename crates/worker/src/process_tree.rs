@@ -1392,6 +1392,9 @@ impl Drop for TreeInner {
 /// kills whatever is still running in the tree and closes the lifeline pipe write end.
 pub(crate) struct ProcessTree {
     inner: Option<Arc<TreeInner>>,
+    #[cfg(windows)]
+    fallback_app_container:
+        Option<Arc<Mutex<Option<crate::isolation::windows::WindowsAppContainerGuard>>>>,
 }
 
 impl ProcessTree {
@@ -1427,7 +1430,11 @@ impl ProcessTree {
                 cgroup_leaf: Mutex::new(unix.cgroup_leaf.take()),
             })
         });
-        Self { inner }
+        Self {
+            inner,
+            #[cfg(windows)]
+            fallback_app_container: app_container.map(|ac| Arc::new(Mutex::new(Some(ac)))),
+        }
     }
 
     /// Whether the whole tree (not only the leader) can be reached.
@@ -1463,7 +1470,15 @@ impl ProcessTree {
                     .await;
                 }
             }
-            None => kill_by_leader(live_leader),
+            None => {
+                kill_by_leader(live_leader);
+                #[cfg(windows)]
+                if let Some(fb) = &self.fallback_app_container {
+                    if let Ok(mut ac) = fb.lock() {
+                        drop(ac.take());
+                    }
+                }
+            }
         }
     }
 }
@@ -1479,6 +1494,12 @@ impl Drop for ProcessTree {
                     return;
                 }
                 inner.kill_and_release_once(false);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(fb) = self.fallback_app_container.take() {
+            if let Ok(mut ac) = fb.lock() {
+                drop(ac.take());
             }
         }
     }

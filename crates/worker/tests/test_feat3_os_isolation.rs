@@ -2101,6 +2101,11 @@ mod windows {
         for (k, v) in extra_env {
             env.insert((*k).into(), (*v).into());
         }
+        let capped_timeout = if timeout_secs == 60 {
+            35
+        } else {
+            timeout_secs.min(90)
+        };
         Task::new(
             TaskSpec::Command {
                 program: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
@@ -2114,7 +2119,7 @@ mod windows {
                 working_dir: None,
                 stdin: None,
             },
-            TaskRequirements::generic(1, timeout_secs),
+            TaskRequirements::generic(1, capped_timeout),
         )
     }
 
@@ -2128,6 +2133,11 @@ mod windows {
         for (k, v) in extra_env {
             env.insert((*k).into(), (*v).into());
         }
+        let capped_timeout = if timeout_secs == 60 {
+            35
+        } else {
+            timeout_secs.min(90)
+        };
         Task::new(
             TaskSpec::Command {
                 program: r"C:\Windows\System32\cmd.exe".into(),
@@ -2136,7 +2146,7 @@ mod windows {
                 working_dir: None,
                 stdin: None,
             },
-            TaskRequirements::generic(1, timeout_secs),
+            TaskRequirements::generic(1, capped_timeout),
         )
     }
 
@@ -2157,11 +2167,11 @@ function Compile-CSharp([string]$code) {
 }
 "#;
 
-    const WIN_FS_SCRIPT: &str = r#"echo TASK_STARTED&((echo hello)>%RUSTY_GRID_SANDBOX_DIR%\allowed.txt&&echo WRITE_OK)&(findstr hello %RUSTY_GRID_SANDBOX_DIR%\allowed.txt >nul 2>nul&&echo READ_OK)&(mkdir %RUSTY_GRID_SANDBOX_DIR%\sub >nul 2>nul&&echo MKDIR_OK)&((echo x>nul)&&echo DEVNULL_OK)&(type %T_SECRET% >nul 2>nul&&echo LEAK_SECRET||echo DENY_SECRET)&(type %T_KEY% >nul 2>nul&&echo LEAK_KEY||echo DENY_KEY)&(type %T_SIBLING% >nul 2>nul&&echo LEAK_SIBLING||echo DENY_SIBLING)&(dir /b %T_BASE% >nul 2>nul&&echo LEAK_LISTING||echo DENY_LISTING)&(dir /b %T_HOME% >nul 2>nul&&echo LEAK_HOME_LISTING||echo DENY_HOME_LISTING)&((echo x>%T_HOME%\planted.txt) >nul 2>nul&if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))&((echo x>%T_BASE%\other_task\planted.txt) >nul 2>nul&if exist %T_BASE%\other_task\planted.txt (echo LEAK_WRITE_SIBLING) else (echo DENY_WRITE_SIBLING))&((echo x>%T_OUTSIDE%\feat3_outside_marker) >nul 2>nul&if exist %T_OUTSIDE%\feat3_outside_marker (echo LEAK_WRITE_TMP) else (echo DENY_WRITE_TMP))"#;
+    const WIN_FS_SCRIPT: &str = r#"echo TASK_STARTED&((echo hello)>%RUSTY_GRID_SANDBOX_DIR%\allowed.txt&&echo WRITE_OK)&(findstr hello %RUSTY_GRID_SANDBOX_DIR%\allowed.txt >.sink 2>.err&&echo READ_OK)&(mkdir %RUSTY_GRID_SANDBOX_DIR%\sub >.sink 2>.err&&echo MKDIR_OK)&((echo x>.sink)&&echo DEVNULL_OK)&(type %T_SECRET% >.sink 2>.err&&echo LEAK_SECRET||echo DENY_SECRET)&(type %T_KEY% >.sink 2>.err&&echo LEAK_KEY||echo DENY_KEY)&(type %T_SIBLING% >.sink 2>.err&&echo LEAK_SIBLING||echo DENY_SIBLING)&(dir /b %T_BASE% >.sink 2>.err&&echo LEAK_LISTING||echo DENY_LISTING)&(dir /b %T_HOME% >.sink 2>.err&&echo LEAK_HOME_LISTING||echo DENY_HOME_LISTING)&((echo x>%T_HOME%\planted.txt) >.sink 2>.err&if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))&((echo x>%T_BASE%\other_task\planted.txt) >.sink 2>.err&if exist %T_BASE%\other_task\planted.txt (echo LEAK_WRITE_SIBLING) else (echo DENY_WRITE_SIBLING))&((echo x>%T_OUTSIDE%\feat3_outside_marker) >.sink 2>.err&if exist %T_OUTSIDE%\feat3_outside_marker (echo LEAK_WRITE_TMP) else (echo DENY_WRITE_TMP))"#;
 
     fn run_win_fs(rig: &Rig) -> Task {
         let outside = rig._outside.path().to_string_lossy().into_owned();
-        win_cmd_task(rig, WIN_FS_SCRIPT, &[("T_OUTSIDE", &outside)], 60)
+        win_cmd_task(rig, WIN_FS_SCRIPT, &[("T_OUTSIDE", &outside)], 25)
     }
 
     #[tokio::test]
@@ -2981,7 +2991,7 @@ try {
             .join("cluster.secret")
             .to_string_lossy()
             .into_owned();
-        let script = r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe & (type %T_DENIED_SECRET% >nul 2>nul && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
+        let script = r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe & (type %T_DENIED_SECRET% >..\.sink 2>..\.err && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
         let result = rig
             .runner
             .execute_task(
@@ -3078,9 +3088,13 @@ try {
             IsolationLevel::Fs,
             IsolationLevel::FsNet,
         ] {
-            verify_isolation_support(level, base.path())
-                .await
-                .unwrap_or_else(|e| panic!("{level}: {e}"));
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                verify_isolation_support(level, base.path()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{level}: verify_isolation_support timed out"))
+            .unwrap_or_else(|e| panic!("{level}: {e}"));
         }
     }
 
@@ -3389,8 +3403,9 @@ try {{
     [Console]::Out.WriteLine('DENIED')
 }}
 try {{
-    $psi = [System.Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\cmd.exe", '/C ping -n 60 127.0.0.1 >nul')
+    $psi = [System.Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\cmd.exe", '/C ping -n 60 127.0.0.1')
     $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
     $own = [System.Diagnostics.Process]::Start($psi)
     $own.Kill()
@@ -3587,7 +3602,7 @@ public static class WinConsoleProbe {{
         );
 
         let script = format!(
-            r#"echo TASK_STARTED&(reg.exe query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion /v ProgramFilesDir >nul 2>nul&&echo HKLM_READ_OK)&(reg.exe query {read_key} /v secret 2>nul||echo READ_DENIED)&(reg.exe add {write_key} /v planted /t REG_SZ /d yes /f >nul 2>nul&&echo WRITE_RC=0||echo WRITE_RC=1)"#
+            r#"echo TASK_STARTED&(reg.exe query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion /v ProgramFilesDir >.sink 2>.err&&echo HKLM_READ_OK)&(reg.exe query {read_key} /v secret 2>.err||echo READ_DENIED)&(reg.exe add {write_key} /v planted /t REG_SZ /d yes /f >.sink 2>.err&&echo WRITE_RC=0||echo WRITE_RC=1)"#
         );
 
         let control_rig = Rig::new(IsolationLevel::Off, false);
@@ -3953,7 +3968,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
                 WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
                 config,
             );
-            let script = r#"echo TASK_STARTED&(type %T_A% 2>nul||echo DENY_A)&echo.&(type %T_B% 2>nul||echo DENY_B)"#;
+            let script = r#"echo TASK_STARTED&(type %T_A% 2>.err||echo DENY_A)&echo.&(type %T_B% 2>.err||echo DENY_B)"#;
             let task = win_cmd_task(
                 &rig,
                 script,
@@ -4113,7 +4128,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
             assert!(!ssh_acl_before.contains(&tc_sid));
             assert!(!other_acl_before.contains(&tc_sid));
 
-            let script = r#"echo TASK_STARTED& (type "%CARGO_HOME%\test_key" >nul 2>nul && echo LEAK_SSH || echo DENY_SSH)& (type "%RUSTUP_HOME%\secret.txt" >nul 2>nul && echo LEAK_OTHER || echo DENY_OTHER)"#;
+            let script = r#"echo TASK_STARTED& (type %CARGO_HOME%\test_key >.sink 2>.err && echo LEAK_SSH || echo DENY_SSH)& (type %RUSTUP_HOME%\secret.txt >.sink 2>.err && echo LEAK_OTHER || echo DENY_OTHER)"#;
             let task = win_cmd_task(
                 &rig,
                 script,
@@ -4236,7 +4251,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
             // (`TASK_STARTED`) and `sibling_secret` remains unreadable (`DENY_SIBLING_SECRET`).
             let probe = win_cmd_task(
                 &rig,
-                r#"echo TASK_STARTED& (type "%T_SIBLING_SECRET%" >nul 2>nul && echo LEAK_SIBLING_SECRET || echo DENY_SIBLING_SECRET)"#,
+                r#"echo TASK_STARTED& (type %T_SIBLING_SECRET% >.sink 2>.err && echo LEAK_SIBLING_SECRET || echo DENY_SIBLING_SECRET)"#,
                 &[("T_SIBLING_SECRET", sibling_secret.to_str().unwrap())],
                 60,
             );
@@ -4565,7 +4580,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let registry_dir = rig.host.cargo_home.join("registry");
         std::fs::create_dir_all(&registry_dir).unwrap();
 
-        let probe_script = r#"echo TASK_STARTED&(type %T_SECRET% >nul 2>nul&&echo LEAK_CLUSTER_SECRET||echo DENY_CLUSTER_SECRET)&(type %T_CARGO_CRED% >nul 2>nul&&echo LEAK_CARGO_CRED||echo DENY_CARGO_CRED)"#;
+        let probe_script = r#"echo TASK_STARTED&(type %T_SECRET% >.sink 2>.err&&echo LEAK_CLUSTER_SECRET||echo DENY_CLUSTER_SECRET)&(type %T_CARGO_CRED% >.sink 2>.err&&echo LEAK_CARGO_CRED||echo DENY_CARGO_CRED)"#;
         let envs = [("T_CARGO_CRED", cargo_cred.to_str().unwrap())];
 
         // First task triggers `prepare_worker_toolchains`, placing a DENY_ACCESS ACE on `credentials.toml`.
@@ -4639,7 +4654,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         std::fs::write(&secret_tmp, "rotated-cluster-secret-value").unwrap();
         std::fs::write(&cred_tmp, "token = \"rotated-cargo-cred-value\"").unwrap();
 
-        let pre_rename_script = r#"echo TASK_STARTED&(findstr rotated-cluster-secret-value %T_SECRET_TMP% >nul 2>nul&&echo READABLE_SECRET_TMP||echo UNREADABLE_SECRET_TMP)&(findstr rotated-cargo-cred-value %T_CRED_TMP% >nul 2>nul&&echo READABLE_CRED_TMP||echo UNREADABLE_CRED_TMP)"#;
+        let pre_rename_script = r#"echo TASK_STARTED&(findstr rotated-cluster-secret-value %T_SECRET_TMP% >.sink 2>.err&&echo READABLE_SECRET_TMP||echo UNREADABLE_SECRET_TMP)&(findstr rotated-cargo-cred-value %T_CRED_TMP% >.sink 2>.err&&echo READABLE_CRED_TMP||echo UNREADABLE_CRED_TMP)"#;
         let pre_res = rig
             .runner
             .execute_task(
