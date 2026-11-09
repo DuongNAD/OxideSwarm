@@ -117,6 +117,19 @@ sc.exe create OxideAgentMesh binPath= "C:\OxideSwarm\agent-mesh.exe node --hub w
 sc.exe start OxideAgentMesh
 ```
 
+#### Compute-Grid Worker OS Isolation (`--isolation fs|fs+net`) & Revoking Toolchain ACLs:
+When `rusty_grid_worker` runs on Windows with `--isolation fs` or `--isolation fs+net` (design 0033 D4), it derives the dedicated capability SID `oxideswarm.toolchain` via `DeriveCapabilitySidsFromName`, records every toolchain directory it prepares (and the original DACL SDDL of `sandbox_base`) in `%USERPROFILE%\.oxideswarm\windows_acl_grants.txt` (or `$env:RUSTY_GRID_ACL_GRANT_LOG`), and grants read+execute on those toolchain directories to `oxideswarm.toolchain` only (never `ALL APPLICATION PACKAGES` / `S-1-15-2-1`, and never modifying `%USERPROFILE%`). **Stop the worker first**, then run `windows\revoke-isolation-acls.ps1` to revoke all `oxideswarm.toolchain` allow/deny ACEs, restore `sandbox_base`'s original DACL, and sweep leftover `oxideswarm.task.*` AppContainer profiles:
+```powershell
+# Preview the revoke actions without changing disk state:
+powershell -ExecutionPolicy Bypass -File .\windows\revoke-isolation-acls.ps1 -DryRun
+
+# Stop the worker first, then revoke all oxideswarm.toolchain ACEs, restore sandbox_base DACL, and remove the manifest:
+powershell -ExecutionPolicy Bypass -File .\windows\revoke-isolation-acls.ps1 -RemoveManifest
+
+# When the worker ran under a Windows service account (e.g. LocalService) or custom manifest path, pass -ManifestPath:
+powershell -ExecutionPolicy Bypass -File .\windows\revoke-isolation-acls.ps1 -ManifestPath "C:\Windows\ServiceProfiles\LocalService\.oxideswarm\windows_acl_grants.txt" -RemoveManifest
+```
+
 ---
 
 ### 3.2 macOS (Apple Silicon M-Series & Intel)

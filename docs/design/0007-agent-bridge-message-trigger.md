@@ -1,7 +1,7 @@
 # 0007: Message trigger for the agent bridge
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-01
+Created: 2026-11-01    Updated: 2026-11-09
 
 ## Summary
 
@@ -92,6 +92,21 @@ uses an OS file lock, which ends with the process. Later hooks exit at once.
   liveness while `git`, `lan_ip`, and `security_and_config` (the secret fingerprint) stay frozen at
    the values from the last full write.
 
+### D5: Identity from the environment
+
+The hooks in `.claude/settings.json` are the same on every clone, so they cannot pass `--agent-id`.
+A machine that needs an identity other than its platform sets `OXIDESWARM_AGENT_ID` instead, in its
+own `.claude/settings.local.json` (`{ "env": { "OXIDESWARM_AGENT_ID": "owner" } }`). Two cases need
+it: a coordinating Claude Code session that reads `mailbox/to_owner` instead of the platform
+agent's mailbox, and a second machine of one platform (`win-2`).
+
+- The order is `--agent-id`, then `OXIDESWARM_AGENT_ID`, then the platform. The value is normalised
+  like the flag (`agent-owner` becomes `owner`).
+- Every command follows it: the mailbox read by `inbox`, `peek` and `watch`, the sender of `send`
+  and `incident`, the state file of `heartbeat` and `watch`, and the consumer name of `watch`, which
+  gets the identity as a suffix as it does with the flag.
+- There is no variable for the peer. A coordinator names each recipient with `--peer-id`.
+
 ## Compatibility
 
 The message format is unchanged, so an older peer still reads every message. `watch` keeps its
@@ -118,6 +133,8 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
 - Targeted mutations of the script were caught by those tests.
 - A headless Claude Code 2.1.308 session on macOS was woken twice while idle, by two files written to
   a temporary hub. The watcher had rearmed itself after the first wake.
+- D5: `IdentityFromEnvironment` checks `inbox`, `send`, `peek` and `watch` under the variable, and
+  that `--agent-id` wins over it. The three tests fail against the script before D5.
 - Not tested: a real exchange through Google Drive between two machines, the Windows toast, and the
   hooks on Windows.
 
@@ -142,3 +159,5 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
   overwriting the active agent watcher's state.
 - 2026-11-01: `watch --hook` now measures state age from `updated_at_utc` alone and updates only
   `updated_at_utc` (preserving the `git` block) when refreshing an existing state file (`BRIDGE-3`).
+- 2026-11-09: D5. `OXIDESWARM_AGENT_ID` sets the identity when `--agent-id` is not given, so the
+  shared hooks can serve a coordinating session (`owner`) or a second machine of one platform.

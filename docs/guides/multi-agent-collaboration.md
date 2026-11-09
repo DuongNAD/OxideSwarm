@@ -27,7 +27,7 @@ python scripts/agent_bridge.py heartbeat
 python scripts/agent_bridge.py inbox
 ```
 
-Each agent writes only its own state file (`nodes/mac_state.json` or `nodes/win_state.json`, or `nodes/<id>_state.json` when `--agent-id <id>` is passed) using atomic temporary-file replacement (`atomic_write` in `scripts/agent_bridge.py`) so concurrent syncs never collide.
+Each agent writes only its own state file (`nodes/mac_state.json` or `nodes/win_state.json`, or `nodes/<id>_state.json` when `--agent-id <id>` is passed or `OXIDESWARM_AGENT_ID` is set; the flag wins) using atomic temporary-file replacement (`atomic_write` in `scripts/agent_bridge.py`) so concurrent syncs never collide.
 
 ### 2. Run cross-machine root-cause diagnostics
 

@@ -297,7 +297,23 @@ pub enum TaskRunnerError {
 }
 
 #[cfg(windows)]
-use rusty_grid_core::capabilities::{augment_windows_path, resolve_windows_executable};
+use rusty_grid_core::capabilities::resolve_windows_executable;
+
+#[cfg(windows)]
+fn augment_windows_path(existing_path: &str) -> String {
+    let augmented = rusty_grid_core::capabilities::augment_windows_path(existing_path);
+    if let Some((msvc_bin, _)) = crate::isolation::windows::resolve_windows_msvc_env() {
+        let msvc_str = msvc_bin.to_string_lossy();
+        let lower_existing = augmented.to_ascii_lowercase();
+        if !lower_existing.contains(&msvc_str.to_ascii_lowercase()) && msvc_bin.is_dir() {
+            if augmented.is_empty() {
+                return msvc_str.to_string();
+            }
+            return format!("{msvc_str};{augmented}");
+        }
+    }
+    augmented
+}
 
 /// Resolves the worker's active `rustup` toolchain name so `RUSTUP_TOOLCHAIN` can be pinned for
 /// `cargo build --offline` tasks, preventing a task's `rust-toolchain.toml` or `rust-toolchain`
@@ -595,11 +611,11 @@ struct OutputReaders {
 }
 
 impl OutputReaders {
-    fn spawn(
-        stdout: Option<tokio::process::ChildStdout>,
-        stderr: Option<tokio::process::ChildStderr>,
-        max_bytes: usize,
-    ) -> Self {
+    fn spawn<Out, Err>(stdout: Option<Out>, stderr: Option<Err>, max_bytes: usize) -> Self
+    where
+        Out: tokio::io::AsyncRead + Unpin + Send + 'static,
+        Err: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         let stdout_capture = SharedCapture::default();
         let stderr_capture = SharedCapture::default();
         Self {
@@ -1847,6 +1863,13 @@ impl TaskRunner {
                 Some(msg),
             )
         };
+
+        if cfg!(windows) && self.config.isolation != IsolationLevel::Off {
+            return fail(
+                "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet; start the worker with --isolation off or without --workspaces"
+                    .to_string(),
+            );
+        }
 
         if !task.inputs.is_empty() || !task.staged_files.is_empty() {
             return fail(
@@ -3297,9 +3320,69 @@ impl TaskRunner {
         };
 
         #[cfg(windows)]
+        let effective_path = if self.config.isolation != IsolationLevel::Off {
+            effective_path
+                .split(';')
+                .map(|part| {
+                    if (part.contains('~') || part.contains('/')) && !part.is_empty() {
+                        let p = Path::new(part);
+                        if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
+                            return crate::isolation::windows::normalize_win_path(p)
+                                .to_string_lossy()
+                                .into_owned();
+                        }
+                    }
+                    part.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        } else {
+            effective_path
+        };
+
+        #[cfg(windows)]
         let resolved_program = resolve_windows_executable(program, &effective_path);
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
+
+        #[cfg(windows)]
+        let (eff_sandbox_path, eff_cwd, eff_sandbox_base) = if self.config.isolation
+            != IsolationLevel::Off
+        {
+            let sp = if sandbox_path.exists()
+                && !crate::isolation::windows::is_reparse_point(sandbox_path)
+            {
+                crate::isolation::windows::normalize_win_path(sandbox_path)
+            } else {
+                sandbox_path.to_path_buf()
+            };
+            let cw = if cwd.exists() && !crate::isolation::windows::is_reparse_point(cwd) {
+                crate::isolation::windows::normalize_win_path(cwd)
+            } else {
+                cwd.to_path_buf()
+            };
+            let sb = if self.config.sandbox_config.base_dir.exists()
+                && !crate::isolation::windows::is_reparse_point(
+                    &self.config.sandbox_config.base_dir,
+                ) {
+                crate::isolation::windows::normalize_win_path(&self.config.sandbox_config.base_dir)
+            } else {
+                self.config.sandbox_config.base_dir.clone()
+            };
+            (sp, cw, sb)
+        } else {
+            (
+                sandbox_path.to_path_buf(),
+                cwd.to_path_buf(),
+                self.config.sandbox_config.base_dir.clone(),
+            )
+        };
+        #[cfg(not(windows))]
+        let (eff_sandbox_path, eff_cwd, eff_sandbox_base) = (
+            sandbox_path.to_path_buf(),
+            cwd.to_path_buf(),
+            self.config.sandbox_config.base_dir.clone(),
+        );
 
         // Under `--isolation fs|fs+net` the task is confined by the platform's mechanism (macOS:
         // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
@@ -3309,8 +3392,8 @@ impl TaskRunner {
             level: self.config.isolation,
             host: &self.config.host_dirs,
             protected_files: &self.config.protected_files,
-            sandbox_base: &self.config.sandbox_config.base_dir,
-            sandbox_dir: sandbox_path,
+            sandbox_base: &eff_sandbox_base,
+            sandbox_dir: &eff_sandbox_path,
             extra_writable_dir: workspace_ctx.as_ref().map(|w| w.tmp_dir),
             workspace_root: workspace_ctx
                 .as_ref()
@@ -3347,7 +3430,7 @@ impl TaskRunner {
 
         let mut cmd = tokio::process::Command::new(&spawn_program);
         cmd.args(&spawn_args);
-        cmd.current_dir(cwd);
+        cmd.current_dir(&eff_cwd);
 
         // A confined task gets an allowlisted environment, not a copy of the worker's: tokens and
         // credentials in the worker's environment are none of its business (design 0033 D1.4).
@@ -3369,6 +3452,17 @@ impl TaskRunner {
         // Inject user environment variables (skipping PATH to preserve effective_path)
         for (k, v) in env {
             if k != "PATH" {
+                #[cfg(windows)]
+                if self.config.isolation != IsolationLevel::Off
+                    && (k.eq_ignore_ascii_case("RUSTC") || k.eq_ignore_ascii_case("CARGO"))
+                    && (v.contains('~') || v.contains('/'))
+                {
+                    let p = Path::new(v);
+                    if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
+                        cmd.env(k, crate::isolation::windows::normalize_win_path(p));
+                        continue;
+                    }
+                }
                 cmd.env(k, v);
             }
         }
@@ -3378,14 +3472,14 @@ impl TaskRunner {
         cmd.env("RUSTY_GRID_WORKER_ID", self.worker_id.to_string());
         cmd.env(
             "RUSTY_GRID_SANDBOX_DIR",
-            sandbox_path.to_string_lossy().to_string(),
+            eff_sandbox_path.to_string_lossy().to_string(),
         );
 
         if self.config.isolation != IsolationLevel::Off {
             let home_and_tmp = workspace_ctx
                 .as_ref()
                 .map(|w| w.tmp_dir)
-                .unwrap_or(sandbox_path);
+                .unwrap_or(&eff_sandbox_path);
             let plan =
                 crate::isolation::prepare_environment(&self.config.host_dirs, env, home_and_tmp);
             for (name, value) in &plan.set {
@@ -3393,6 +3487,12 @@ impl TaskRunner {
             }
             for name in &plan.remove {
                 cmd.env_remove(name);
+            }
+            #[cfg(windows)]
+            if !env.contains_key("LIB") {
+                if let Some((_, msvc_lib)) = crate::isolation::windows::resolve_windows_msvc_env() {
+                    cmd.env("LIB", msvc_lib);
+                }
             }
         }
 
@@ -3425,6 +3525,72 @@ impl TaskRunner {
         if let Some(jail) = &jail {
             if let Err(e) = crate::isolation::confine_command(jail, &mut cmd) {
                 return isolation_failure(&e);
+            }
+        }
+
+        #[cfg(windows)]
+        if self.config.isolation != IsolationLevel::Off {
+            let level = self.config.isolation;
+            let host_dirs = self.config.host_dirs.clone();
+            let protected_files = self.config.protected_files.clone();
+            let sandbox_base = eff_sandbox_base.clone();
+            let sandbox_dir = eff_sandbox_path.clone();
+            let run_token = configured.run_token();
+            let std_cmd = cmd.as_std();
+            let prog_for_setup = std_cmd.get_program().to_string_lossy().to_string();
+            let mut cmd_cargo_home: Option<PathBuf> = None;
+            let mut cmd_rustup_home: Option<PathBuf> = None;
+            for (k, v) in std_cmd.get_envs() {
+                if k.eq_ignore_ascii_case("CARGO_HOME") {
+                    cmd_cargo_home = v.map(PathBuf::from);
+                } else if k.eq_ignore_ascii_case("RUSTUP_HOME") {
+                    cmd_rustup_home = v.map(PathBuf::from);
+                }
+            }
+            let setup_res = tokio::task::spawn_blocking(move || {
+                crate::isolation::windows::prepare_worker_toolchains(
+                    &host_dirs,
+                    &protected_files,
+                    Some(&sandbox_base),
+                )
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg))?;
+                let jail = crate::isolation::Jail {
+                    level,
+                    host: &host_dirs,
+                    protected_files: &protected_files,
+                    sandbox_base: &sandbox_base,
+                    sandbox_dir: &sandbox_dir,
+                    extra_writable_dir: None,
+                    workspace_root: None,
+                };
+                crate::isolation::windows::WindowsAppContainerGuard::create_blocking(
+                    run_token,
+                    &jail,
+                    &prog_for_setup,
+                    cmd_cargo_home.as_deref(),
+                    cmd_rustup_home.as_deref(),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "AppContainer setup task panicked: {e}"
+                )))
+            });
+
+            match setup_res {
+                Ok(guard) => configured.set_app_container(guard),
+                Err(e) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task_id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        "",
+                        format!("Cannot run '{program}' with --isolation {level}: {e}"),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Isolation error for '{program}' ({level}): {e}")),
+                    );
+                }
             }
         }
 
@@ -3461,8 +3627,15 @@ impl TaskRunner {
             holder.store(pid, Ordering::Release);
         }
 
+        #[cfg(windows)]
+        let (child_stdin, child_stdout, child_stderr) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr());
+        #[cfg(not(windows))]
+        let (child_stdin, child_stdout, child_stderr) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+
         // Concurrent asynchronous stdin writer
-        let _stdin_writer = match (child.stdin.take(), stdin_data) {
+        let _stdin_writer = match (child_stdin, stdin_data) {
             (Some(mut writer), Some(bytes)) => Some(AbortOnDrop(tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let _ = writer.write_all(&bytes).await;
@@ -3473,11 +3646,8 @@ impl TaskRunner {
         };
 
         // Concurrent asynchronous bounded stdout / stderr readers
-        let mut readers = OutputReaders::spawn(
-            child.stdout.take(),
-            child.stderr.take(),
-            self.config.max_output_bytes,
-        );
+        let mut readers =
+            OutputReaders::spawn(child_stdout, child_stderr, self.config.max_output_bytes);
 
         enum Ended {
             Exited(std::io::Result<std::process::ExitStatus>),
@@ -3587,7 +3757,7 @@ impl TaskRunner {
     /// Ends a task's process tree: a polite stop (`SIGTERM`; Windows has none), a short grace
     /// period for the leader to wind down, then a kill of everything that is left, and the leader
     /// is reaped so that no zombie remains. Never blocks a runtime thread.
-    async fn stop_tree(&self, child: &mut tokio::process::Child, tree: &ProcessTree) {
+    async fn stop_tree(&self, child: &mut crate::process_tree::SpawnedChild, tree: &ProcessTree) {
         if tree.request_stop() {
             let _ = tokio::time::timeout(self.config.stop_grace, child.wait()).await;
         }

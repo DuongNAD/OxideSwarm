@@ -195,7 +195,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133, 150 |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133, 150, 152 |
+| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Planned |  |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Partial | 105 (design), 157, 156, 164, 166, 160, 165 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
@@ -1190,6 +1191,44 @@ Each item below needs a design record before code.
   `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows. Advertise an `iso:` tag.
 - **Done when:** With `fs`, a probe that reads `cluster.secret` fails on each OS and writing the
   sandbox works. With `fs+net`, an outbound connection fails. `doctor` reports the level.
+
+### FEAT-3d: cargo under Windows isolation
+
+- **Evidence:** Reproduced on `windows-latest` (`Windows Server 2025`, CI run `42608546025`, job
+  `129130623354`, commit `c9891fe`). Round 10/11 diagnostics inside the confined AppContainer task
+  (`tiny`) proved:
+  1. `icacls` on `<rustup_home>\toolchains\staged-x86_64-pc-windows-msvc\bin` and `bin\rustc.exe` shows
+     both `oxideswarm.toolchain` (`S-1-15-3-1024-...`) and `CurrentUser` carry `(I)(OI)(CI)(RX)` on
+     `bin` and `(I)(RX)` on `rustc.exe` after `SetNamedSecurityInfoW` with
+     `UNPROTECTED_DACL_SECURITY_INFORMATION`.
+  2. Job object basic limits queried via `QueryInformationJobObject` are `LimitFlags=0x2000`
+     (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` only) and `ActiveProcessLimit=0`.
+  3. The spawn working directory `tiny` is readable and traversable (`DIAG_READ_DIR_CWD=Ok(2)`), and
+     anonymous pipe creation succeeds (`DIAG_ANON_PIPE=Ok("OK")`).
+  4. Spawning `rustc.exe -vV` directly from inside the AppContainer succeeds (`ExitStatus(0)`, prints
+     `rustc 1.96.0 (ac68faa20 2026-05-25)`) when `stdin` is `Stdio::inherit()`
+     (`DIAG_SPAWN_INHERIT=Ok(ExitStatus(0))` and `DIAG_SPAWN_STDIO_PIPED=Ok(ExitStatus(0))`).
+  5. Opening `"NUL"` (`\Device\Null` / `\\.\GLOBALROOT\Device\Null`) from inside the AppContainer
+     under an elevated administrator session (`runneradmin` on `windows-latest`) fails Stage 1 of
+     `SepAccessCheck` with `ERROR_ACCESS_DENIED (os error 5)`
+     (`DIAG_OPEN_NUL_READ=Err(Os { code: 5 })`, `DIAG_OPEN_NUL_WRITE=Err(Os { code: 5 })`,
+     `DIAG_OPEN_GLOBALROOT_NULL=Err(Os { code: 5 })`). Because Rust's `std::process::Command::output()`
+     (used by `cargo` when running `rustc -vV`, even with `RUSTC` and `CARGO_BUILD_JOBS=1` set) opens
+     `"NUL"` (`Stdio::null()`) for `stdin` inside `cargo.exe` before calling `CreateProcessW`, every
+     spawn that uses `Stdio::null()` (`DIAG_SPAWN_STDIN_NULL`, `DIAG_SPAWN_FULL_OUTPUT`, `cargo -vV`,
+     `cargo build --offline`) fails with `Access is denied. (os error 5)` (`never executed`).
+- **Problem:** On Windows, `cargo` builds under `--isolation fs|fs+net` fail when `cargo` spawns
+  `rustc -vV` with `Stdio::null()`, and `--workspaces` combined with `--isolation fs|fs+net` is
+  refused on Windows (design 0033 D4, design 0039 W2b).
+- **Do:** Enable `cargo` builds (and `--workspaces` with `--isolation fs|fs+net`) inside a Windows
+  AppContainer without editing Object Manager namespace DACLs (`\??`, `\GLOBAL??`, `\Device\Null`) or
+  adding `BUILTIN\Users` / `Everyone` to user or toolchain files, and un-ignore
+  `test_cargo_build_offline_works_under_fs` and
+  `test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home` on Windows.
+- **Done when:** Both `test_cargo_build_offline_works_under_fs` and
+  `test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home` pass un-ignored in
+  `test_feat3_os_isolation` on `windows-latest`, and workspaces with `--isolation fs|fs+net` work on
+  Windows.
 
 ### FEAT-4: Remote workspaces for coding agents
 
