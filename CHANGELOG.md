@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Machine identity and OXS-AUTH v3 (`ENROLL-1a`): per-machine X25519 static keys (`~/.oxideswarm/node.key` and `master_noise.key`, or in `--state-dir` when set, stored as private files and printed with key fingerprint on master startup), Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication with cleartext `HELLO` prologue and `Split()` key derivation into the `0x04` ChaCha20-Poly1305 record layer, `members.json` read at master startup with worker-role enforcement on `Register`, `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`) ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 
+### Fixed
+- `oxideswarm workers` printed every registered worker under "Connected Workers", including workers that had disconnected, and `status` counted them as connected. Both now count only workers whose `state:` tag is `connected`, and `workers` marks the others, for example `[disconnected]`. Use `workers --json` in scripts.
+
 ## [0.1.0] - 2026-11-09
 
 The first tagged release: archives for Linux, macOS and Windows, with and without `gpu-wgpu`, and
