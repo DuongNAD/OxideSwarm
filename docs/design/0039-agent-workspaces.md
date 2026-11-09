@@ -338,7 +338,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Done |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Done (`workspaces` lists the master's affinity map only, not the workspaces stored on workers, which needs W2b; `submit --workspace` warns when no connected worker advertises `WORKSPACES` yet) |
-| W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
+| W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Done (against a test worker advertising `WORKSPACES` until W2b lands) |
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Done |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Implemented |
 | W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
@@ -467,3 +467,13 @@ off by default until FEAT-3 is Implemented.
   client endpoint alive for the lifetime of the `GridStream::P2p` via `P2pClientGuard`, requiring a
   cluster secret unless `--insecure`, and mapping an older master's stream close after `STREAM_CLIENT`
   to the protocol version upgrade hint.
+- 2026-11-09: W6 done (`tests/agent_workspace_e2e.rs`, registered as a `[[test]]` of
+  `rusty_grid_cli`). Spawns a loopback `MasterServer` with a temporary blob store and an in-process
+  test worker that advertises `ProtocolCapabilities::WORKSPACES` and drives
+  `rusty_grid_worker::workspace::WorkspaceStore` directly (ready to switch to `WorkerClient` with
+  `--workspaces` once W2b lands). Covers the full test-plan integration flow with a temporary `HOME`
+  / `OXIDESWARM_HOME` and workspace directory over both `oxideswarm submit --workspace` and
+  `oxideswarm mcp` stdio JSON-RPC: first `cargo build --offline` compiles a dependency-free crate and
+  populates `target/`, second build reuses `target/` and prints no `Compiling` line (with
+  `uploaded_bytes == 0` over MCP), third build after deleting a local source file removes the deleted
+  file from the workspace tree while keeping `target/`, and `workspaces` lists the worker affinity.
