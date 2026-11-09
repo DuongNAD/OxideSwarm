@@ -12,6 +12,9 @@ Commands:
   python3 scripts/agent_bridge.py incident  [--agent-id ID] --id INC-001 --title "..." --symptom "..." --root-cause "..." [--fix "..."] [--status OPEN|FIXED|VERIFIED|CLOSED]
   python3 scripts/agent_bridge.py peek      [--agent-id ID] (one line about unread messages, for hooks)
   python3 scripts/agent_bridge.py watch     [--agent-id ID] [--once-on-message] [--notify] [--on-event "<COMMAND>"] [--consumer NAME] [--hook]
+
+Without --agent-id, the identity comes from OXIDESWARM_AGENT_ID, else from the platform (mac, win or linux).
+The variable lets a machine give the shared Claude Code hooks its own identity.
 """
 
 import argparse
@@ -160,12 +163,24 @@ def normalize_agent_short(raw_id):
     return s or None
 
 
+AGENT_ID_ENV = "OXIDESWARM_AGENT_ID"
+
+
 def resolve_self_short(args=None):
+    """`--agent-id`, else `OXIDESWARM_AGENT_ID`, else the platform id.
+
+    The variable exists for the Claude Code hooks: `.claude/settings.json` is shared by every clone, so a
+    machine that needs another identity (a coordinating session, a second machine of one platform) sets
+    it in its own `.claude/settings.local.json`.
+    """
+    raw = None
     if args is not None:
         raw = getattr(args, "sub_agent_id", None) or getattr(args, "agent_id", None)
-        norm = normalize_agent_short(raw)
-        if norm:
-            return norm
+    if not raw:
+        raw = os.environ.get(AGENT_ID_ENV)
+    norm = normalize_agent_short(raw)
+    if norm:
+        return norm
     return SELF_SHORT
 
 
@@ -1061,7 +1076,7 @@ def add_identity_args(subparser, include_peer=False):
         "--agent-id",
         dest="sub_agent_id",
         default=None,
-        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to platform id",
+        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to $OXIDESWARM_AGENT_ID, else the platform id",
     )
     if include_peer:
         subparser.add_argument(
@@ -1078,7 +1093,7 @@ def main():
     parser.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
     parser.add_argument(
         "--agent-id",
-        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to platform id",
+        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to $OXIDESWARM_AGENT_ID, else the platform id",
         default=None,
     )
     parser.add_argument(

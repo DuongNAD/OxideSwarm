@@ -50,6 +50,7 @@ class BridgeCase(unittest.TestCase):
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
         self.env["OXIDESWARM_HOME"] = os.path.join(self.tmp, "state")
         self.env.pop("OXIDESWARM_AGENT_HUB", None)
+        self.env.pop("OXIDESWARM_AGENT_ID", None)
         self.env.pop("PYTHONIOENCODING", None)
         self.children = []
         self.addCleanup(self.stop_children)
@@ -805,6 +806,60 @@ class Diagnose(BridgeCase):
             if hashlib.sha256(tok.encode("utf-8")).hexdigest() in forbidden_digests
         ]
         self.assertEqual(found, [])
+
+
+class IdentityFromEnvironment(BridgeCase):
+    """OXIDESWARM_AGENT_ID gives the shared Claude Code hooks a per-machine identity; --agent-id still wins."""
+
+    def owner_inbox(self):
+        path = os.path.join(self.hub, "mailbox", "to_owner")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def write_owner_message(self, title="For the coordinator"):
+        with open(os.path.join(self.owner_inbox(), "MSG_owner_1.md"), "w", encoding="utf-8") as f:
+            f.write(f"# [HIGH] {title}\n\n- **From**: `agent-win-2` (`peer-host`)\n\n---\n\nOwner body.\n")
+
+    def test_inbox_reads_the_mailbox_the_variable_names_and_a_flag_wins(self):
+        self.write_owner_message()
+        self.write_message(title="For the platform agent")
+        env = dict(self.env, OXIDESWARM_AGENT_ID="agent-owner")
+
+        result = self.run_bridge("inbox", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.decode("utf-8", "replace")
+        self.assertIn("For the coordinator", stdout)
+        self.assertNotIn("For the platform agent", stdout)
+
+        result = self.run_bridge("inbox", "--agent-id", SELF, env=env)
+        stdout = result.stdout.decode("utf-8", "replace")
+        self.assertIn("For the platform agent", stdout)
+        self.assertNotIn("For the coordinator", stdout)
+
+    def test_send_signs_with_the_identity_of_the_variable(self):
+        env = dict(self.env, OXIDESWARM_AGENT_ID="owner")
+        result = self.run_bridge("send", "--peer-id", "win-2", "--title", "Next item", "--body", "W2b.", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = os.listdir(os.path.join(self.hub, "mailbox", "to_win-2"))
+        self.assertEqual(len(sent), 1, sent)
+        self.assertIn("_from_owner_", sent[0])
+        with open(os.path.join(self.hub, "mailbox", "to_win-2", sent[0]), encoding="utf-8") as f:
+            self.assertIn("`agent-owner`", f.read())
+
+    def test_the_hook_commands_follow_the_variable(self):
+        self.write_owner_message()
+        env = dict(self.env, OXIDESWARM_AGENT_ID="owner")
+        result = self.run_bridge("peek", env=env)
+        self.assertIn("1 unread message(s)", result.stdout.decode("utf-8", "replace"))
+        result = self.run_bridge("peek")
+        self.assertEqual(result.stdout.decode("utf-8", "replace").strip(), "", "the platform mailbox is empty")
+
+        self.env["OXIDESWARM_AGENT_ID"] = "owner"
+        code, stdout, _ = self.finish(self.start_bridge(*self.watch_args("--once-on-message", "--max-wait", "20")))
+        self.assertEqual(code, 0)
+        self.assertIn("For the coordinator", stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.nodes, "owner_state.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.nodes, f"{SELF}_state.json")))
 
 
 if __name__ == "__main__":

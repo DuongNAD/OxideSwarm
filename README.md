@@ -727,6 +727,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `OXIDESWARM_CONFIG` | Windows Service | Machine-level config path read by `packaging/windows/ServiceWrapper.cs` |
 | `OXIDESWARM_LOG_DIR` | Windows Service | Machine-level log directory read by `packaging/windows/ServiceWrapper.cs` |
 | `OXIDESWARM_AGENT_HUB` | Agent Bridge | Google Drive / shared folder path for `scripts/agent_bridge.py` |
+| `OXIDESWARM_AGENT_ID` | Agent Bridge | Identity of `scripts/agent_bridge.py` when `--agent-id` is not given (default: the platform, `mac`, `win` or `linux`); a machine sets it in `.claude/settings.local.json` to give the shared Claude Code hooks its own mailbox ([design 0007](docs/design/0007-agent-bridge-message-trigger.md) D5) |
 | `OXIDESWARM_EVENT_KIND` / `OXIDESWARM_EVENT_FILE` / `OXIDESWARM_EVENT_TITLE` / `OXIDESWARM_EVENT_PRIORITY` / `OXIDESWARM_EVENT_FROM` | Agent Bridge | Event metadata variables passed to `--on-event` hooks by `scripts/agent_bridge.py watch` |
 | `OXIDESWARM_SYNC_DIR` | Sync Probe | Base directory override for `scripts/sync_network/sync_network.py` |
 | `OXIDE_ROOT` | Benchmarks | Root workspace directory override used by benchmark runners |
