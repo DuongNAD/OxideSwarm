@@ -116,7 +116,16 @@ if (Test-Path $cfg) {
     }
 }
 $checkArgs = @()
-if ($ticket) { $checkArgs = @('--master', $ticket); Write-Host "  link:    P2P ticket (the worker and the checks connect through iroh)" }
+if ($ticket) {
+    # Windows PowerShell 5.1 (and PowerShell 7 before 7.3) passes native arguments the legacy way
+    # and drops the inner double quotes of the JSON ticket, so they must arrive escaped.
+    $legacy = $true
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+    if ($mode -and $mode -ne 'Legacy') { $legacy = $false }
+    $ticketArg = if ($legacy) { $ticket.Replace('"', '\"') } else { $ticket }
+    $checkArgs = @('--master', $ticketArg)
+    Write-Host "  link:    P2P ticket (the worker and the checks connect through iroh)"
+}
 
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
@@ -153,11 +162,15 @@ $workerPid | Set-Content $pidFile
 Start-Sleep -Seconds 3
 if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { Fail "the worker stopped right away; see $log" }
 
-# 7. Wait until the master lists it.
+# 7. Wait until the master lists it. The checks run without log lines: release 0.1.x writes its
+# informational logs to standard output, which would break the JSON parsing below. The worker
+# was started above, so it keeps its own logging.
+$env:RUST_LOG = 'off'
 $connected = $false
 for ($i = 0; $i -lt 30; $i++) {
     # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-    $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json
+    $list = $null
+    try { $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json } catch { $list = $null }
     if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
     Start-Sleep -Seconds 1
 }

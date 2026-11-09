@@ -171,12 +171,13 @@ if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
   kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
 fi
 
-# 7. Wait until the master lists it.
+# 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
+# informational logs to standard output, and iroh logs an error line when a client exits.
 CONNECTED=0
 i=0
 while [ $i -lt 30 ]; do
   # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-  if { if [ -n "$TICKET" ]; then "$BIN" workers --json --master "$TICKET"; else "$BIN" workers --json; fi; } 2>/dev/null | awk -v n="$NAME" '
+  if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" workers --json --master "$TICKET"; else RUST_LOG=off "$BIN" workers --json; fi; } 2>/dev/null | awk -v n="$NAME" '
       /"name":/ { v = $2; gsub(/[",]/, "", v); cur = v }
       /"state:connected"/ && cur == n { found = 1 }
       END { exit !found }'; then
@@ -243,7 +244,7 @@ fi
 # 9. Check the cluster.
 say ""
 say "Checking the cluster (oxideswarm doctor) ..."
-if { if [ -n "$TICKET" ]; then "$BIN" doctor --master "$TICKET"; else "$BIN" doctor; fi; }; then
+if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" doctor --master "$TICKET"; else RUST_LOG=off "$BIN" doctor; fi; }; then
   DOCTOR="passed"
 else
   DOCTOR="reported a problem (see above)"

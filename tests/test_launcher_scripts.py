@@ -545,6 +545,7 @@ class ShellLauncherTests(unittest.TestCase):
 # the worker it runs, in the layout the installer parses.
 FAKE_KIT_BINARY = """#!/bin/bash
 echo "$*" >> "${FAKE_ARGS_LOG:?}"
+case "$1" in workers|doctor) echo "$1 RUST_LOG=${RUST_LOG:-}" >> "$FAKE_ARGS_LOG.env" ;; esac
 case "$1" in
   --version) echo "rusty-grid 9.9.9"; exit 0 ;;
   join)
@@ -699,6 +700,36 @@ class UsbKitTests(unittest.TestCase):
         calls = [line for line in read(self.args_log).splitlines() if line.strip()]
         self.assertIn("workers --json --master " + ticket, calls)
         self.assertIn("doctor --master " + ticket, calls)
+
+    def test_install_checks_run_without_log_lines(self):
+        # Release 0.1.x writes informational logs to standard output: the installer's checks
+        # must run with RUST_LOG=off, or the JSON listing and the doctor output carry log lines.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-quiet"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        calls = [line for line in read(self.args_log + ".env").splitlines() if line.strip()]
+        self.assertTrue(any(c.startswith("workers ") for c in calls), calls)
+        self.assertTrue(any(c.startswith("doctor ") for c in calls), calls)
+        for call in calls:
+            self.assertTrue(call.endswith("RUST_LOG=off"), call)
+
+    def test_windows_installer_escapes_the_ticket_and_silences_logs(self):
+        # Windows PowerShell 5.1 drops the inner double quotes of a native argument, which turns
+        # the JSON ticket into an unreadable master address. The fix is static text here; the
+        # live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("PSNativeCommandArgumentPassing", text)
+        self.assertIn("$ticket.Replace('\"', '\\\"')", text)
+        self.assertIn("$checkArgs = @('--master', $ticketArg)", text)
+        start = text.index("Start-Process -FilePath 'wscript.exe'")
+        quiet = text.index("$env:RUST_LOG = 'off'")
+        listing = text.index("workers --json @checkArgs")
+        self.assertTrue(start < quiet < listing, "RUST_LOG=off must be set after the worker starts and before the checks")
 
     def test_trial_kit_adds_no_autostart_and_caps_concurrency(self):
         # A kit for someone else's machine (make_kit.sh --no-autostart) must not add a start at
