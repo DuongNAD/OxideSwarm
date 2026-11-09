@@ -89,7 +89,7 @@ pub enum MemberRole {
 }
 
 fn default_member_roles() -> Vec<MemberRole> {
-    vec![MemberRole::Worker, MemberRole::Client]
+    vec![MemberRole::Worker]
 }
 
 /// A single enrolled machine entry in `members.json`.
@@ -131,13 +131,9 @@ impl MemberEntry {
         }
     }
 
-    /// Effective member ID (`self.id` if non-empty, otherwise `self.public_key.member_id()`).
+    /// Canonical member ID derived from `self.public_key`.
     pub fn effective_id(&self) -> String {
-        if self.id.trim().is_empty() {
-            self.public_key.member_id()
-        } else {
-            self.id.clone()
-        }
+        self.public_key.member_id()
     }
 
     /// Returns `true` if this member is permitted to register as a worker.
@@ -178,6 +174,91 @@ pub struct MemberStore {
     by_pubkey: HashMap<PublicKey, MemberEntry>,
 }
 
+#[cfg(unix)]
+fn check_members_file_permissions(path: &Path) -> GridResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).map_err(|e| {
+        GridError::Config(format!(
+            "failed to stat members file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        let msg = format!(
+            "refusing to load members file {}: permissions {:03o} allow group/others write access (fix with: chmod 600 {})",
+            path.display(),
+            mode,
+            path.display()
+        );
+        tracing::warn!("{msg}");
+        return Err(GridError::Config(msg));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let dir_meta = std::fs::metadata(parent).map_err(|e| {
+            GridError::Config(format!(
+                "failed to stat members directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+        let dir_mode = dir_meta.permissions().mode() & 0o777;
+        if dir_mode & 0o022 != 0 {
+            let msg = format!(
+                "refusing to load members file {}: parent directory {} has permissions {:03o} allowing group/others write access (fix with: chmod 700 {})",
+                path.display(),
+                parent.display(),
+                dir_mode,
+                parent.display()
+            );
+            tracing::warn!("{msg}");
+            return Err(GridError::Config(msg));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn check_members_file_permissions(path: &Path) -> GridResult<()> {
+    use rusty_grid_core::private_file::{
+        current_user_sid, open_acl_warning, open_grants, read_dacl,
+    };
+    let user_sid = current_user_sid().map_err(|e| {
+        GridError::Config(format!(
+            "failed to query current user SID while checking {}: {e}",
+            path.display()
+        ))
+    })?;
+    let user_name = std::env::var("USERNAME").unwrap_or_else(|_| "%USERNAME%".to_string());
+    let (aces, _) = read_dacl(path).map_err(|e| {
+        GridError::Config(format!(
+            "failed to read DACL of members file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let offenders = open_grants(&aces, &user_sid);
+    if let Some(msg) = open_acl_warning(path, "members file", &offenders, &user_name) {
+        tracing::warn!("{msg}");
+        return Err(GridError::Config(msg));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok((dir_aces, _)) = read_dacl(parent) {
+            let dir_offenders = open_grants(&dir_aces, &user_sid);
+            if let Some(msg) =
+                open_acl_warning(parent, "members directory", &dir_offenders, &user_name)
+            {
+                tracing::warn!("{msg}");
+                return Err(GridError::Config(msg));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn check_members_file_permissions(_path: &Path) -> GridResult<()> {
+    Ok(())
+}
+
 impl MemberStore {
     /// Creates an empty member store.
     pub fn new() -> Self {
@@ -188,12 +269,41 @@ impl MemberStore {
     pub fn from_entries(entries: impl IntoIterator<Item = MemberEntry>) -> Self {
         let mut by_pubkey = HashMap::new();
         for mut entry in entries {
-            if entry.id.trim().is_empty() {
-                entry.id = entry.public_key.member_id();
-            }
+            entry.id = entry.public_key.member_id();
             by_pubkey.insert(entry.public_key, entry);
         }
         Self { by_pubkey }
+    }
+
+    /// Validates and builds a store from `entries`, refusing mismatched member IDs or duplicate
+    /// public keys.
+    pub fn try_from_entries(
+        entries: impl IntoIterator<Item = MemberEntry>,
+        source_path: &Path,
+    ) -> GridResult<Self> {
+        let mut by_pubkey = HashMap::new();
+        for mut entry in entries {
+            let expected_id = entry.public_key.member_id();
+            let raw_id = entry.id.trim();
+            if !raw_id.is_empty() && !raw_id.eq_ignore_ascii_case(&expected_id) {
+                return Err(GridError::Config(format!(
+                    "invalid members file {}: member '{}' has id '{}' which does not match its public_key id '{expected_id}'",
+                    source_path.display(),
+                    entry.name,
+                    raw_id
+                )));
+            }
+            entry.id = expected_id.clone();
+            if by_pubkey.contains_key(&entry.public_key) {
+                return Err(GridError::Config(format!(
+                    "invalid members file {}: duplicate public_key '{}' (member id '{expected_id}')",
+                    source_path.display(),
+                    entry.public_key.to_hex()
+                )));
+            }
+            by_pubkey.insert(entry.public_key, entry);
+        }
+        Ok(Self { by_pubkey })
     }
 
     /// Resolves the path to `members.json` inside `state_dir` or `~/.oxideswarm/members.json`.
@@ -208,7 +318,10 @@ impl MemberStore {
     /// Loads `members.json` from `path`. If the file does not exist, returns an empty store.
     pub fn load_file(path: &Path) -> GridResult<Self> {
         match std::fs::read_to_string(path) {
-            Ok(raw) => Self::from_json_str(&raw, path),
+            Ok(raw) => {
+                check_members_file_permissions(path)?;
+                Self::from_json_str(&raw, path)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(e) => Err(GridError::Config(format!(
                 "failed to read members file {}: {e}",
@@ -242,7 +355,7 @@ impl MemberStore {
                 MEMBERS_FILE_VERSION
             )));
         }
-        Ok(Self::from_entries(parsed.members))
+        Self::try_from_entries(parsed.members, source_path)
     }
 
     /// Number of enrolled members in the store.
@@ -332,5 +445,124 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn omitted_roles_defaults_to_worker_only() {
+        let kp = NodeKeypair::generate().unwrap();
+        let json = format!(
+            r#"{{
+                "version": 1,
+                "members": [
+                    {{
+                        "name": "worker-default",
+                        "public_key": "{}"
+                    }}
+                ]
+            }}"#,
+            kp.public_key().to_hex(),
+        );
+        let store = MemberStore::from_json_str(&json, Path::new("members.json")).unwrap();
+        let entry = store.get(kp.public_key()).unwrap();
+        assert_eq!(entry.roles, vec![MemberRole::Worker]);
+        assert!(entry.has_worker_role());
+        assert!(!entry.has_client_role());
+        assert_eq!(entry.id, kp.member_id());
+    }
+
+    #[test]
+    fn reject_entry_with_mismatched_id() {
+        let kp = NodeKeypair::generate().unwrap();
+        let json = format!(
+            r#"{{
+                "version": 1,
+                "members": [
+                    {{
+                        "id": "0000000000000000",
+                        "name": "bad-id",
+                        "public_key": "{}"
+                    }}
+                ]
+            }}"#,
+            kp.public_key().to_hex(),
+        );
+        let err = MemberStore::from_json_str(&json, Path::new("members.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match its public_key id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_public_keys() {
+        let kp = NodeKeypair::generate().unwrap();
+        let json = format!(
+            r#"{{
+                "version": 1,
+                "members": [
+                    {{
+                        "id": "{id}",
+                        "name": "first",
+                        "public_key": "{pk}",
+                        "roles": ["worker"]
+                    }},
+                    {{
+                        "id": "{id}",
+                        "name": "second",
+                        "public_key": "{pk}",
+                        "roles": ["admin"]
+                    }}
+                ]
+            }}"#,
+            id = kp.member_id(),
+            pk = kp.public_key().to_hex(),
+        );
+        let err = MemberStore::from_json_str(&json, Path::new("members.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("duplicate public_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_group_or_world_writable_members_file_or_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("members.json");
+        let kp = NodeKeypair::generate().unwrap();
+        let json = format!(
+            r#"{{"version": 1, "members": [{{"name": "w", "public_key": "{}"}}]}}"#,
+            kp.public_key().to_hex()
+        );
+        std::fs::write(&path, &json).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Private file + private directory succeeds.
+        assert_eq!(MemberStore::load_file(&path).unwrap().len(), 1);
+
+        // Group-writable members.json is refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let err = MemberStore::load_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("allow group/others write access"),
+            "unexpected error: {err}"
+        );
+
+        // Restore 0600 on file, make parent directory world-writable: refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = MemberStore::load_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("parent directory") && err.contains("allowing group/others write access"),
+            "unexpected error: {err}"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
