@@ -2023,10 +2023,9 @@ Add one dated line per finished item, newest last.
 
   The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
 - 2026-11-10: Added and implemented LOG-1 (pull request 194, open): client P2P endpoints in
-  `crates/core/src/transport.rs`, `crates/cli/src/connect.rs` and `crates/cli/src/blobs.rs` now
-  close gracefully before process exit (with `drain_pending_p2p_client_closes` awaited before
-  `with_client_relay_url`, `run_doctor`, `McpState::close` and `run_cli_with` return), and
-  `run_cli_with` routes all tracing of client commands (`submit`, `status`, `result`, `cancel`,
-  `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`, `mcp`) to `stderr` so `iroh`
-  `INFO` lines never land on `stdout` ahead of `--json` output. The Index counts are now 64
-  Implemented, 4 Partial and 29 Planned.
+  `crates/core/src/transport.rs` and `crates/cli/src/blobs.rs` now close gracefully before process
+  exit (with `drain_pending_p2p_client_closes` awaited before `run_doctor`, `McpState::close` and
+  `run_cli_with` return), and `run_cli_with` routes all tracing of client commands (`submit`,
+  `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
+  `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
+  Index counts are now 64 Implemented, 4 Partial and 29 Planned.

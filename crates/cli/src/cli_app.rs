@@ -3529,11 +3529,7 @@ async fn run_submit_with_secret_inner(
     let upload = if let Some(ref scan) = workspace_scan {
         let uploaded =
             match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref()).await {
-                Ok(connection) => {
-                    let res = crate::blobs::upload_inputs(&connection, &scan.prepared).await;
-                    connection.close().await;
-                    res
-                }
+                Ok(connection) => crate::blobs::upload_inputs(&connection, &scan.prepared).await,
                 Err(e) => Err(e.to_string()),
             };
         match uploaded {
@@ -3560,11 +3556,7 @@ async fn run_submit_with_secret_inner(
     } else {
         let uploaded =
             match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref()).await {
-                Ok(connection) => {
-                    let res = crate::blobs::upload_inputs(&connection, &inputs).await;
-                    connection.close().await;
-                    res
-                }
+                Ok(connection) => crate::blobs::upload_inputs(&connection, &inputs).await,
                 Err(e) => Err(e.to_string()),
             };
         match uploaded {
@@ -3711,55 +3703,50 @@ async fn run_submit_with_secret_inner(
 
             let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
             let mut download_failed = false;
-            let saved_outputs =
-                if result.outputs.is_empty() {
-                    None
-                } else {
-                    let downloaded =
-                        match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref())
+            let saved_outputs = if result.outputs.is_empty() {
+                None
+            } else {
+                let downloaded = match crate::blobs::BlobConnection::connect(
+                    &master_addr,
+                    secret.as_ref(),
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        crate::blobs::download_outputs(&connection, &result.outputs, output_dir)
                             .await
-                        {
-                            Ok(connection) => {
-                                let res = crate::blobs::download_outputs(
-                                    &connection,
-                                    &result.outputs,
-                                    output_dir,
-                                )
-                                .await;
-                                connection.close().await;
-                                res
-                            }
-                            Err(e) => Err(e.to_string()),
-                        };
-                    match downloaded {
-                        Ok(saved) => {
-                            if is_compile && result.asset_bytes.is_none() {
-                                if let (Some(ref out_path), Some(first)) =
-                                    (&asset_output_path, saved.first())
-                                {
-                                    if let Some(parent) = out_path.parent() {
-                                        if !parent.as_os_str().is_empty() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                    }
-                                    if let Err(e) = std::fs::copy(first, out_path) {
-                                        eprintln!(
-                                            "Failed to write compiled output to '{}': {e}",
-                                            out_path.display()
-                                        );
-                                        download_failed = true;
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                match downloaded {
+                    Ok(saved) => {
+                        if is_compile && result.asset_bytes.is_none() {
+                            if let (Some(ref out_path), Some(first)) =
+                                (&asset_output_path, saved.first())
+                            {
+                                if let Some(parent) = out_path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        let _ = std::fs::create_dir_all(parent);
                                     }
                                 }
+                                if let Err(e) = std::fs::copy(first, out_path) {
+                                    eprintln!(
+                                        "Failed to write compiled output to '{}': {e}",
+                                        out_path.display()
+                                    );
+                                    download_failed = true;
+                                }
                             }
-                            Some(saved)
                         }
-                        Err(e) => {
-                            eprintln!("Downloading the output files failed: {e}");
-                            download_failed = true;
-                            None
-                        }
+                        Some(saved)
                     }
-                };
+                    Err(e) => {
+                        eprintln!("Downloading the output files failed: {e}");
+                        download_failed = true;
+                        None
+                    }
+                }
+            };
             let mut artifact_save_error: Option<String> = None;
             let saved_artifacts = if !result.artifacts.is_empty() {
                 match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {

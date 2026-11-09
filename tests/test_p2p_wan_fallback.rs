@@ -879,9 +879,44 @@ async fn test_log_1_cli_client_commands_over_p2p_ticket_close_endpoints_without_
     let out_dir_arg = out_dir.to_str().unwrap();
 
     #[cfg(windows)]
-    let copy_script = "copy /Y in.txt out.txt >NUL && echo log1-ok";
+    let submit_cmd_args: Vec<&str> = vec![
+        "submit",
+        "--master",
+        &raw_ticket,
+        "--secret-file",
+        secret_arg,
+        "--input",
+        &input_spec,
+        "--output",
+        "out.txt",
+        "--output-dir",
+        out_dir_arg,
+        "--wait",
+        "--command",
+        "cmd",
+        "--",
+        "/c",
+        "copy /Y in.txt out.txt >NUL && echo log1-ok",
+    ];
     #[cfg(not(windows))]
-    let copy_script = "cp in.txt out.txt && echo log1-ok";
+    let submit_cmd_args: Vec<&str> = vec![
+        "submit",
+        "--master",
+        &raw_ticket,
+        "--secret-file",
+        secret_arg,
+        "--input",
+        &input_spec,
+        "--output",
+        "out.txt",
+        "--output-dir",
+        out_dir_arg,
+        "--wait",
+        "--type",
+        "shell",
+        "--command",
+        "cp in.txt out.txt && echo log1-ok",
+    ];
 
     let commands: Vec<(&str, Vec<&str>)> = vec![
         (
@@ -915,27 +950,7 @@ async fn test_log_1_cli_client_commands_over_p2p_ticket_close_endpoints_without_
                 secret_arg,
             ],
         ),
-        (
-            "submit",
-            vec![
-                "submit",
-                "--master",
-                &raw_ticket,
-                "--secret-file",
-                secret_arg,
-                "--input",
-                &input_spec,
-                "--output",
-                "out.txt",
-                "--output-dir",
-                out_dir_arg,
-                "--wait",
-                "--type",
-                "shell",
-                "--command",
-                copy_script,
-            ],
-        ),
+        ("submit", submit_cmd_args),
     ];
 
     for (label, args) in commands {
