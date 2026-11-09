@@ -5347,6 +5347,103 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             );
         }
     }
+
+    /// Verifies that a Windows worker with `--isolation fs` and default sandbox settings
+    /// (`%TEMP%\rusty_grid\sandboxes`, where `%TEMP%` is `<USERPROFILE>\AppData\Local\Temp` inside
+    /// `host.user_home`) passes `ensure_usable`, passes `verify_isolation_support_with_config`,
+    /// runs a confined task that cannot read `cluster.secret`, and cleanly revokes its ACL grants.
+    #[tokio::test]
+    async fn test_worker_with_isolation_fs_and_default_sandbox_base_starts_and_runs_task() {
+        let home = tempfile::tempdir().expect("temp user_home");
+        let user_temp = home.path().join("AppData").join("Local").join("Temp");
+        let rustup_home = home.path().join(".rustup");
+        let cargo_home = home.path().join(".cargo");
+        let ox_dir = home.path().join(".oxideswarm");
+        std::fs::create_dir_all(&user_temp).unwrap();
+        std::fs::create_dir_all(rustup_home.join("toolchains")).unwrap();
+        std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+        std::fs::create_dir_all(&ox_dir).unwrap();
+        let secret_file = ox_dir.join("cluster.secret");
+        std::fs::write(&secret_file, SECRET).unwrap();
+
+        let host = HostDirs::from_home(
+            home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+        let sandbox_config = SandboxConfig::default_under(&user_temp);
+        assert_eq!(
+            sandbox_config.base_dir,
+            user_temp.join("rusty_grid").join("sandboxes")
+        );
+        sandbox_config
+            .ensure_usable()
+            .await
+            .expect("default sandbox_config.ensure_usable()");
+        let orig_base_sddl =
+            rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&sandbox_config.base_dir)
+                .expect("orig_base_sddl");
+
+        if let Err(e) = rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &sandbox_config.base_dir,
+            &host,
+            std::slice::from_ref(&secret_file),
+        )
+        .await
+        {
+            cannot_run(&e.to_string());
+            return;
+        }
+
+        let runner_cfg = RunnerConfig::new(sandbox_config.clone())
+            .with_isolation(IsolationLevel::Fs)
+            .with_host_dirs(host.clone())
+            .with_protected_files(vec![secret_file.clone()]);
+        let caps = WorkerCapabilities::new("feat3-default-base", 4, 4096, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_cfg);
+
+        let mut env = HashMap::new();
+        env.insert(
+            "T_SECRET".into(),
+            secret_file.to_string_lossy().into_owned(),
+        );
+        let script = r#"echo TASK_STARTED&((echo ok)>%RUSTY_GRID_SANDBOX_DIR%\ok.txt&&echo WRITE_OK||echo WRITE_ERR)&(type %T_SECRET% >.sink 2>.err&&echo LEAK_SECRET||echo DENY_SECRET)"#;
+        let task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), script.into()],
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(res.is_success(), "task failed: stderr={}", res.stderr_str());
+        assert_eq!(
+            lines(&res),
+            vec!["TASK_STARTED", "WRITE_OK", "DENY_SECRET"],
+            "unexpected task output: {:?}",
+            lines(&res)
+        );
+
+        let manifest = rusty_grid_worker::isolation::windows::acl_grant_manifest_path(&host);
+        let revoked =
+            rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(&manifest)
+                .expect("revoke_oxideswarm_toolchain_acls");
+        assert!(
+            !revoked.is_empty(),
+            "expected recorded ACL grants to be revoked"
+        );
+        let restored_base_sddl =
+            rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&sandbox_config.base_dir)
+                .expect("restored_base_sddl");
+        assert_eq!(
+            restored_base_sddl, orig_base_sddl,
+            "revoke must restore default sandbox_base's original DACL SDDL"
+        );
+    }
 }
 
 /// Where there is no implementation on an unsupported OS, isolation is refused

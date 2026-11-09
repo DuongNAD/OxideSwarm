@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 5 Partial and 29 Planned. Five items
+On 2026-11-09, at `master` `a804e5b` plus the live two-machine run: 63 items Implemented, 5 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -153,6 +153,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
+| BUG-18 | Allow the default Windows `%TEMP%\rusty_grid\sandboxes` under `--isolation fs` | P1 | S | FEAT-3 |  | Implemented | 197 (open) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -611,6 +612,13 @@ These items remove ways to lose data or to run code without authorisation.
 - **Do:** Confirm each defect against the code. Write a failing test for it, then fix it.
 - **Done when:** Each defect has a test that failed before the fix.
   `cargo test -p rusty_grid_cli --test blob_transfer_e2e` passes.
+
+### BUG-18: Allow the default Windows `%TEMP%\rusty_grid\sandboxes` under `--isolation fs`
+
+- **Evidence:** Reproduced on Windows 11 with the `v0.1.0` release binary: `oxideswarm worker --master 127.0.0.1:18088 --name iso-win --isolation fs` exited with code `1` (`refusing to rewrite the DACL of user folder 'C:\Users\<user>\AppData\Local\Temp\rusty_grid\sandboxes' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as 'C:\Users\<user>\.oxideswarm\sandboxes'`).
+- **Problem:** On Windows, `SandboxConfig::default()` resolves to `%TEMP%\rusty_grid\sandboxes` (`<user_home>\AppData\Local\Temp\rusty_grid\sandboxes`). In `validate_sandbox_base_safe` (`crates/worker/src/isolation.rs`), the `USERPROFILE` check allowed paths under `temp_root` (`%TEMP%`), and the `%TEMP%` error message explicitly recommended `{temp_root}\rusty_grid\sandboxes`, but the `host.user_home` check immediately above it only allowed `<user_home>\.oxideswarm\sandboxes` and omitted the temp-subdirectory allowance. In `test_feat3_os_isolation`, `Rig::new` placed `host.user_home` and `sandbox_base` in separate sibling `TempDir`s, so `sandbox_base` was outside `host.user_home` and the bug was not exercised.
+- **Do:** Unify the `host.user_home` and `USERPROFILE` checks in `validate_sandbox_base_safe` so both accept a dedicated subdirectory under `%TEMP%` or `<home>\AppData\Local\Temp` (such as `%TEMP%\rusty_grid\sandboxes`) while still refusing `%TEMP%` / `<home>\AppData\Local\Temp` itself, user folders (`Documents`, `Desktop`, `%LOCALAPPDATA%`, `%APPDATA%`), and any existing directory containing non-OxideSwarm entries. Add unit and integration tests where `sandbox_base` is `<user_home>\AppData\Local\Temp\rusty_grid\sandboxes`.
+- **Done when:** `test_validate_sandbox_base_safe_rejects_user_folders_and_non_empty_dirs` and `test_worker_with_isolation_fs_and_default_sandbox_base_starts_and_runs_task` pass on Windows with temporary `USERPROFILE`, `CARGO_HOME` and `RUSTUP_HOME`.
 
 ## Phase 2: make the tests trustworthy
 
@@ -1979,10 +1987,18 @@ Add one dated line per finished item, newest last.
   on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
   passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
   29 Planned.
-- 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
+- 2026-11-09: Added and implemented TEST-20 (pull request 181): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
   and 29 Planned.
+- 2026-11-09: Added and implemented BUG-18 (pull request 197, open): `validate_sandbox_base_safe`
+  (`crates/worker/src/isolation.rs`) now allows a dedicated OxideSwarm subdirectory under `%TEMP%`
+  / `<user_home>\AppData\Local\Temp` (such as the default `%TEMP%\rusty_grid\sandboxes`) in the
+  `host.user_home` check just as in the `USERPROFILE` check, while continuing to refuse `%TEMP%`
+  itself, user folders, and directories with non-OxideSwarm entries. Verified by
+  `test_worker_with_isolation_fs_and_default_sandbox_base_starts_and_runs_task` in
+  `crates/worker/tests/test_feat3_os_isolation.rs`. The Index counts are now 63 Implemented, 5
+  Partial and 29 Planned.

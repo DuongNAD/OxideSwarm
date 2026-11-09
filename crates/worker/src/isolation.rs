@@ -2688,24 +2688,39 @@ pub mod windows {
         }
         // Refuse to rewrite the DACL of a folder inside the user's home directory (such as
         // `C:\Users\me\Documents` or `C:\Users\me\Desktop`) unless it is inside OxideSwarm's own
-        // `<user_home>\.oxideswarm\sandboxes` directory.
-        if !host.user_home.as_os_str().is_empty()
-            && path_starts_with_ci(sandbox_base, &host.user_home)
+        // `<user_home>\.oxideswarm\sandboxes` directory or a dedicated subdirectory inside the
+        // temp directory (`%TEMP%` / `<user_home>\AppData\Local\Temp`, such as the default
+        // `%TEMP%\rusty_grid\sandboxes`).
+        let env_up = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        for home_dir in [Some(&host.user_home), env_up.as_ref()]
+            .into_iter()
+            .flatten()
         {
-            let allowed_ox = host.user_home.join(".oxideswarm").join("sandboxes");
-            if !path_starts_with_ci(sandbox_base, &allowed_ox) {
-                return Err(format!(
-                    "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
-                    sandbox_base.display(),
-                    allowed_ox.display()
-                ));
-            }
-        }
-        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-            if !env_up.as_os_str().is_empty() && path_starts_with_ci(sandbox_base, &env_up) {
-                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
+            if !home_dir.as_os_str().is_empty() && path_starts_with_ci(sandbox_base, home_dir) {
+                let allowed_ox = home_dir.join(".oxideswarm").join("sandboxes");
+                let user_temp_root =
+                    normalize_win_path(&home_dir.join("AppData").join("Local").join("Temp"));
+                if norm
+                    .as_os_str()
+                    .eq_ignore_ascii_case(user_temp_root.as_os_str())
+                {
+                    return Err(format!(
+                        "refusing to rewrite the DACL of the shared system temp directory '{}' as sandbox_base; use a subdirectory such as '{}\\rusty_grid\\sandboxes'",
+                        sandbox_base.display(),
+                        sandbox_base.display()
+                    ));
+                }
                 let in_ox_sandboxes = path_starts_with_ci(sandbox_base, &allowed_ox);
-                let in_temp = path_starts_with_ci(sandbox_base, &temp_root);
+                let temp_root_inside_home = path_starts_with_ci(&temp_root, home_dir)
+                    && !path_starts_with_ci(home_dir, &temp_root);
+                let in_user_temp = path_starts_with_ci(sandbox_base, &user_temp_root)
+                    && !norm
+                        .as_os_str()
+                        .eq_ignore_ascii_case(user_temp_root.as_os_str());
+                let in_sys_temp_under_home = temp_root_inside_home
+                    && path_starts_with_ci(sandbox_base, &temp_root)
+                    && !norm.as_os_str().eq_ignore_ascii_case(temp_root.as_os_str());
+                let in_temp = in_user_temp || in_sys_temp_under_home;
                 if !in_ox_sandboxes && !in_temp {
                     return Err(format!(
                         "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
@@ -4693,6 +4708,29 @@ mod tests {
         std::fs::create_dir_all(&ox_sandboxes).unwrap();
         windows::validate_sandbox_base_safe(&ox_sandboxes, &host)
             .expect("<user_home>\\.oxideswarm\\sandboxes must be accepted");
+
+        let user_temp = fake_home.path().join("AppData").join("Local").join("Temp");
+        std::fs::create_dir_all(&user_temp).unwrap();
+        let err_temp_root = windows::validate_sandbox_base_safe(&user_temp, &host)
+            .expect_err("must reject <user_home>\\AppData\\Local\\Temp itself");
+        assert!(
+            err_temp_root.contains("shared system temp directory"),
+            "{err_temp_root}"
+        );
+
+        let default_temp_sandboxes =
+            crate::sandbox::SandboxConfig::default_under(&user_temp).base_dir;
+        std::fs::create_dir_all(&default_temp_sandboxes).unwrap();
+        windows::validate_sandbox_base_safe(&default_temp_sandboxes, &host).expect(
+            "default <user_home>\\AppData\\Local\\Temp\\rusty_grid\\sandboxes must be accepted",
+        );
+
+        let dirty_temp_sub = user_temp.join("other_app");
+        std::fs::create_dir_all(&dirty_temp_sub).unwrap();
+        std::fs::write(dirty_temp_sub.join("user_file.txt"), "data").unwrap();
+        let err_dirty_temp = windows::validate_sandbox_base_safe(&dirty_temp_sub, &host)
+            .expect_err("must reject temp subdirectory containing non-sandbox files");
+        assert!(err_dirty_temp.contains("user_file.txt"), "{err_dirty_temp}");
 
         let outside = tempfile::tempdir().unwrap();
         let non_empty = outside.path().join("operator_folder");
