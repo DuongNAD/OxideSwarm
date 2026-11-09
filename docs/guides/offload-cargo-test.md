@@ -208,6 +208,8 @@ Run on 2026-11-09 between 12:35 and 12:55 UTC, on one home LAN with a direct TCP
 
 The `workspaces` tool and `oxideswarm workspaces` then listed both names on the Windows worker, for example `oxideswarm-dev -> worker 79e049ee-b7d4-480a-ab70-dd5745544be9 (last_used_utc: 1794227945)`. The second run of the same command took about 3 % of the first. Three more cold and warm pairs in fresh workspaces, with `--offline`, are the BENCH-1 (c) record in [benchmarks/grid/README.md](../../benchmarks/grid/README.md). On the same day, `oxideswarm join` on the Windows machine (under a temporary profile) saved the secret and the address and passed 8 of the doctor checks, with C5 skipped for lack of a GPU.
 
+Later the same day the released `v0.1.0` archives repeated the CLI run on the same two machines, with the macOS archive as client and master and the Windows archive as worker. The run sent the 407 blobs to the new master in 30.0 s without recompiling, and then took 7.2 s warm, with 249 tests passed.
+
 The run also found that a pipe which closes standard input cancels a running MCP call (task exit code `130`). Step 4 above keeps the pipe open for that reason.
 
 ## Troubleshooting
