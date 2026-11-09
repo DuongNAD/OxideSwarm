@@ -695,6 +695,23 @@ pub(crate) async fn cancellation(slot: &mut Option<oneshot::Receiver<String>>) -
     }
 }
 
+/// Checks whether `slot` has already received a cancellation signal without blocking.
+/// As with [`cancellation`], a sender dropped without sending is ignored and clears `slot`.
+pub(crate) fn check_cancelled_now(slot: &mut Option<oneshot::Receiver<String>>) -> Option<String> {
+    let receiver = slot.as_mut()?;
+    match receiver.try_recv() {
+        Ok(reason) => {
+            *slot = None;
+            Some(reason)
+        }
+        Err(oneshot::error::TryRecvError::Closed) => {
+            *slot = None;
+            None
+        }
+        Err(oneshot::error::TryRecvError::Empty) => None,
+    }
+}
+
 /// Shell that runs a `ShellScript` without an explicit interpreter on Unix-like systems.
 ///
 /// `/bin/sh` where it exists; otherwise the first `sh` on `path` (Termux keeps its shell in
@@ -2167,9 +2184,21 @@ impl TaskRunner {
         stdin: Option<&[u8]>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        cancel_rx: Option<oneshot::Receiver<String>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_CANCELLED,
+                "",
+                "",
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
+        }
+
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
             Err(e) => {
@@ -2269,9 +2298,21 @@ impl TaskRunner {
         env: &HashMap<String, String>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        cancel_rx: Option<oneshot::Receiver<String>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_CANCELLED,
+                "",
+                "",
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
+        }
+
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
             Err(e) => {
@@ -2409,9 +2450,21 @@ impl TaskRunner {
         target_dir: Option<&PathBuf>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        cancel_rx: Option<oneshot::Receiver<String>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_CANCELLED,
+                "",
+                "",
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
+        }
+
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
             Err(e) => {
@@ -3305,6 +3358,18 @@ impl TaskRunner {
         start_time: Instant,
         workspace_ctx: Option<WorkspaceProcessCtx<'_>>,
     ) -> TaskResult {
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_CANCELLED,
+                "",
+                "",
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
+        }
+
         let effective_path = match env.get("PATH") {
             Some(p) => {
                 #[cfg(windows)]
@@ -3602,6 +3667,18 @@ impl TaskRunner {
                     );
                 }
             }
+        }
+
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_CANCELLED,
+                "",
+                "",
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
         }
 
         let spawned = configured.spawn(&mut cmd);
@@ -6097,5 +6174,38 @@ echo "KEPT=$(cat target/artifact.txt)"
             wait_start.elapsed()
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_runner_pre_cancelled_task_does_not_spawn_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runner = TaskRunner::new(
+            Uuid::new_v4(),
+            WorkerCapabilities::default(),
+            RunnerConfig::new(SandboxConfig::new(tmp.path())),
+        );
+        let task = Task::new(
+            TaskSpec::shell_script("sleep 5; echo should-not-spawn"),
+            TaskRequirements::generic(1, 30),
+        );
+        let child_pid = Arc::new(AtomicU32::new(0));
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        cancel_tx
+            .send("WorkerClient dropped".to_string())
+            .expect("send cancel");
+
+        let res = runner
+            .execute_task(&task, Some(Arc::clone(&child_pid)), Some(cancel_rx))
+            .await;
+        assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
+        assert_eq!(
+            child_pid.load(Ordering::Acquire),
+            0,
+            "pre-cancelled task must not spawn a child process"
+        );
+        assert_eq!(
+            res.error.as_deref(),
+            Some("Cancelled: WorkerClient dropped")
+        );
     }
 }

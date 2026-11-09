@@ -1721,6 +1721,7 @@ impl WorkerClient {
         simulate_gpu: bool,
     ) -> Self {
         let mut config = WorkerConfig::new(master_addr)
+            .with_ram_mb(4096)
             .with_no_battery(true)
             .with_no_gpu(!simulate_gpu)
             .with_no_blender(true)

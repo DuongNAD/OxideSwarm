@@ -1345,10 +1345,11 @@ impl TreeInner {
         }
         #[cfg(windows)]
         if !child_already_exited {
-            // Avoid terminating a freshly resumed MSYS2/Cygwin child while it is still inside
-            // `msys-2.0.dll` `dll_crt0_1` shared-memory initialization, which can stall
-            // concurrent MSYS2 processes on Windows for 15s waiting on the global init lock.
-            const MIN_LIVE_KILL_AGE: std::time::Duration = std::time::Duration::from_millis(80);
+            // Avoid terminating a freshly resumed MSYS2/Cygwin child (or the immediate sub-command
+            // it spawns via `child_info_spawn`, such as `sh -c "sleep ..."`) while either process
+            // is still inside `msys-2.0.dll` `dll_crt0_1` shared-memory initialization, which can
+            // stall concurrent MSYS2 processes on Windows for 15s waiting on the global init lock.
+            const MIN_LIVE_KILL_AGE: std::time::Duration = std::time::Duration::from_millis(250);
             if let Some(remaining) = MIN_LIVE_KILL_AGE.checked_sub(self.spawned_at.elapsed()) {
                 std::thread::sleep(remaining);
             }
@@ -1382,7 +1383,7 @@ impl TreeInner {
 
 impl Drop for TreeInner {
     fn drop(&mut self) {
-        self.kill_and_release_once(true);
+        self.kill_and_release_once(false);
     }
 }
 
