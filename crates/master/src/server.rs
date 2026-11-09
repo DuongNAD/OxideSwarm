@@ -1658,7 +1658,7 @@ impl MasterServer {
                             // The QUIC handshake itself runs inside the spawned task: awaiting it
                             // here would let one stalled peer hold up every other new connection.
                             let (abort_tx, abort_rx) = oneshot::channel::<AbortHandle>();
-                            let conn_task = tokio::spawn(MASTER_AUTH_CTX.scope(c_auth_ctx, async move {
+                            let conn_task = tokio::spawn(async move {
                                 let _conn_permit = conn_permit;
                                 let abort_handle = abort_rx.await.ok();
                                 let conn = match tokio::time::timeout(p2p_to, incoming).await {
@@ -1752,6 +1752,7 @@ impl MasterServer {
                                             abort_handle,
                                             c_codec,
                                             c_secret,
+                                            c_auth_ctx,
                                             Some(handshake_permit),
                                             c_blob_store,
                                             #[cfg(feature = "dashboard")]
@@ -1777,6 +1778,7 @@ impl MasterServer {
                                             abort_handle,
                                             c_codec,
                                             c_secret,
+                                            c_auth_ctx,
                                             Some(handshake_permit),
                                             p2p_mapreduce_parallelism,
                                             c_blob_store,
@@ -1793,7 +1795,7 @@ impl MasterServer {
                                         warn!("Failed or untagged P2P stream; closing connection");
                                     }
                                 }
-                            }));
+                            });
                             let _ = abort_tx.send(conn_task.abort_handle());
                         }
                         res = p2p_shutdown.changed() => {
@@ -1846,7 +1848,7 @@ impl MasterServer {
                             let conn_p2p_active = Arc::clone(&self.p2p_active_conns);
 
                             let (abort_tx, abort_rx) = oneshot::channel::<AbortHandle>();
-                            let conn_handle = tokio::spawn(MASTER_AUTH_CTX.scope(conn_auth_ctx, async move {
+                            let conn_handle = tokio::spawn(async move {
                                 let _conn_permit = conn_permit;
                                 let abort_handle = abort_rx.await.ok();
                                 if let Err(e) = handle_connection(
@@ -1862,6 +1864,7 @@ impl MasterServer {
                                     abort_handle,
                                     conn_wire_codec,
                                     conn_secret,
+                                    conn_auth_ctx,
                                     Some(handshake_permit),
                                     conn_mapreduce_parallelism,
                                     conn_blob_store,
@@ -1874,7 +1877,7 @@ impl MasterServer {
                                 ).await {
                                     debug!(remote_addr = %remote_addr, error = %e, "Worker connection ended");
                                 }
-                            }));
+                            });
                             let _ = abort_tx.send(conn_handle.abort_handle());
                         }
                         Err(e) => {
@@ -3673,22 +3676,6 @@ pub(crate) struct MasterAuthContext {
     pub members: Arc<MemberStore>,
 }
 
-tokio::task_local! {
-    static MASTER_AUTH_CTX: MasterAuthContext;
-}
-
-fn current_master_auth_ctx() -> MasterAuthContext {
-    MASTER_AUTH_CTX.try_with(Clone::clone).unwrap_or_default()
-}
-
-#[cfg(test)]
-pub(crate) async fn with_master_auth_context<F: std::future::Future>(
-    ctx: MasterAuthContext,
-    fut: F,
-) -> F::Output {
-    MASTER_AUTH_CTX.scope(ctx, fut).await
-}
-
 async fn run_v3_auth_from_hello<S>(
     transport: &mut MessageTransport<S>,
     peer: &str,
@@ -3896,6 +3883,7 @@ pub(crate) async fn authenticate_and_read_first_message<S>(
     transport: &mut MessageTransport<S>,
     peer: &str,
     cluster_secret: Option<&ClusterSecret>,
+    auth_ctx: &MasterAuthContext,
     handshake_timeout: Duration,
     lane: &str,
 ) -> GridResult<(InboundMessage, WireCodec)>
@@ -3907,7 +3895,6 @@ where
         operation: "handshake".into(),
         duration_secs: handshake_timeout.as_secs(),
     };
-    let auth_ctx = current_master_auth_ctx();
     let effective_secret = if auth_ctx.auth_mode.allows_secret() {
         cluster_secret
     } else {
@@ -3961,7 +3948,7 @@ where
                     peer,
                     lane,
                     &hello_frame,
-                    &auth_ctx,
+                    auth_ctx,
                     deadline,
                     handshake_timeout,
                 )
@@ -4095,7 +4082,7 @@ where
                     peer,
                     lane,
                     &raw_frame,
-                    &auth_ctx,
+                    auth_ctx,
                     deadline,
                     handshake_timeout,
                 )
@@ -4302,6 +4289,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
+    auth_ctx: MasterAuthContext,
     handshake_permit: Option<OwnedSemaphorePermit>,
     mapreduce_parallelism: usize,
     blob_store: Option<Arc<BlobStore>>,
@@ -4335,6 +4323,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         abort_handle,
         wire_codec,
         cluster_secret,
+        auth_ctx,
         handshake_permit,
         blob_store,
         #[cfg(feature = "dashboard")]
@@ -4362,6 +4351,7 @@ async fn handle_multiplexed_connection<
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
+    auth_ctx: MasterAuthContext,
     handshake_permit: Option<OwnedSemaphorePermit>,
     blob_store: Option<Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
@@ -4394,6 +4384,7 @@ async fn handle_multiplexed_connection<
         abort_handle,
         wire_codec,
         cluster_secret,
+        auth_ctx,
         handshake_permit,
         blob_store,
         #[cfg(feature = "dashboard")]
@@ -5731,6 +5722,7 @@ mod tests {
                 None,
                 WireCodec::Bincode,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -5942,6 +5934,7 @@ mod tests {
                         None,
                         WireCodec::Bincode,
                         secret_clone,
+                        MasterAuthContext::default(),
                         None,
                         4,
                         None,
@@ -5980,6 +5973,7 @@ mod tests {
                         None,
                         WireCodec::Bincode,
                         secret_clone,
+                        MasterAuthContext::default(),
                         None,
                         None,
                         #[cfg(feature = "dashboard")]
@@ -6364,6 +6358,7 @@ mod tests {
                 None,
                 WireCodec::Json,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -6463,6 +6458,7 @@ mod tests {
                 None,
                 WireCodec::Bincode,
                 None,
+                MasterAuthContext::default(),
                 None,
                 None,
                 #[cfg(feature = "dashboard")]
@@ -8417,17 +8413,15 @@ mod tests {
             t.recv_msg::<MasterMessage>().await.unwrap()
         });
 
-        let server_res = with_master_auth_context(ctx_both.clone(), async {
-            let mut st = MessageTransport::new(s_stream);
-            authenticate_and_read_first_message(
-                &mut st,
-                "127.0.0.1:50000",
-                Some(&secret),
-                Duration::from_secs(5),
-                "connection",
-            )
-            .await
-        })
+        let mut st = MessageTransport::new(s_stream);
+        let server_res = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50000",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
         .await;
         let err = server_res.unwrap_err().to_string();
         assert!(
@@ -8459,17 +8453,15 @@ mod tests {
             t.recv_msg::<ClientResponse>().await.unwrap()
         });
 
-        let server_res = with_master_auth_context(ctx_both.clone(), async {
-            let mut st = MessageTransport::new(s_stream);
-            authenticate_and_read_first_message(
-                &mut st,
-                "127.0.0.1:50002",
-                Some(&secret),
-                Duration::from_secs(5),
-                "connection",
-            )
-            .await
-        })
+        let mut st = MessageTransport::new(s_stream);
+        let server_res = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50002",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
         .await;
         let err = server_res.unwrap_err().to_string();
         assert!(
@@ -8496,17 +8488,15 @@ mod tests {
             let mut t = MessageTransport::new(c_stream);
             client_handshake(&mut t, &secret_c).await
         });
-        let v2_server = with_master_auth_context(ctx_members, async {
-            let mut st = MessageTransport::new(s_stream);
-            authenticate_and_read_first_message(
-                &mut st,
-                "127.0.0.1:50001",
-                Some(&secret),
-                Duration::from_secs(5),
-                "connection",
-            )
-            .await
-        })
+        let mut st = MessageTransport::new(s_stream);
+        let v2_server = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50001",
+            Some(&secret),
+            &ctx_members,
+            Duration::from_secs(5),
+            "connection",
+        )
         .await;
         assert!(v2_server.is_err());
         let v2_client_err = v2_client.await.unwrap().unwrap_err().to_string();
