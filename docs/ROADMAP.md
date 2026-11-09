@@ -222,6 +222,15 @@ Goal: someone without Rust installed follows the README and reaches the user sto
 the WS-7 guide from the README alone, joining with one token (JOIN-1). The benchmark page holds a
 dated run of the WS-7 offload (BENCH-1).
 
+Checked on 2026-11-09. [`v0.1.0`](https://github.com/DuongNAD/OxideSwarm/releases/tag/v0.1.0)
+has 8 archives and `SHA256SUMS`. The macOS archive (checksum verified) ran the master and the
+client, and the Windows archive (checksum verified, no SmartScreen prompt) ran the worker. With
+those binaries only, the Quick start command offloaded `cargo test -p rusty_grid_core --lib` from
+the Mac to the Windows worker: 249 tests passed, and the repeated run took 7.2 s. The client
+machine has Rust installed, but the run did not use it. `oxideswarm join` was checked on the
+Windows machine with a build of `5c9e126`, which has the same join code as the release. BENCH-1 (c)
+is recorded. Phase D is complete; the Launch section comes next.
+
 ### Launch
 
 After the Phase D exit check, and not before it:
@@ -382,3 +391,5 @@ answers.
   recorded in [guides/offload-cargo-test.md](guides/offload-cargo-test.md#recorded-two-machine-run)
   and as BENCH-1 (c) in `benchmarks/grid/`. Phase D: the Quick start and the `0.1.0` release notes
   are written, and the first tag is `v0.1.0`.
+- 2026-11-09: Phase D exit check passed with the released `v0.1.0` binaries on a Mac and a Windows
+  laptop (details under Phase D). Phases A to D, the core, are complete.
