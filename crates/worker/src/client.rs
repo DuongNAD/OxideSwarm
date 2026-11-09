@@ -36,7 +36,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::{
-    detect_live_mobile_status, MobileLiveStatus, WorkerCapabilities,
+    detect_live_mobile_status, suppress_windows_error_dialogs, MobileLiveStatus, WorkerCapabilities,
 };
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
@@ -1456,6 +1456,7 @@ fn physical_gpu_requested_by_env() -> bool {
 impl WorkerClient {
     /// Initializes a new WorkerClient, detecting host hardware and honoring CLI overrides.
     pub fn new(config: WorkerConfig) -> Self {
+        suppress_windows_error_dialogs();
         let worker_id = resolve_worker_id(&config);
         let overrides = rusty_grid_core::capabilities::HardwareOverrides {
             name: config.name.clone(),
@@ -1928,6 +1929,8 @@ impl WorkerClient {
     /// dropped), or with `GridError::Config` for a configuration no retry can fix (an unparsable
     /// P2P ticket). A Master going away, in any manner, only ever makes the worker reconnect.
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> GridResult<()> {
+        suppress_windows_error_dialogs();
+
         #[cfg(feature = "p2p")]
         rusty_grid_core::transport::resolve_p2p_relay_mode(
             self.config.p2p_minimal_preset,
@@ -7882,5 +7885,84 @@ mod tests {
             String::from_utf8_lossy(stdout2.as_bytes()).trim(),
             ":built-1"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_worker_task_running_junk_exe_fails_fast_without_error_dialog() {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetErrorMode() -> u32;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_name("win-error-mode-worker")
+                .with_cores(2)
+                .with_no_gpu(true)
+                .with_no_blender(true)
+                .with_no_cuda(true)
+                .with_no_battery(true)
+                .with_redirection_portal(false)
+                .with_sandbox_base_dir(dir.path().join("sandboxes")),
+        );
+
+        let mode = unsafe { GetErrorMode() };
+        let expected_bits = rusty_grid_core::capabilities::WINDOWS_SUPPRESS_ERROR_DIALOGS_MODE;
+        assert_eq!(
+            mode & expected_bits,
+            expected_bits,
+            "WorkerClient::new must set SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX (0x8003), got 0x{mode:04x}"
+        );
+
+        let junk_non_pe = dir.path().join("fake_blender_file.exe");
+        std::fs::write(&junk_non_pe, b"not-a-real-blender").expect("write junk non-PE exe");
+        let junk_non_pe_str = junk_non_pe.to_string_lossy().to_string();
+
+        let junk_mz = dir.path().join("fake_16bit_stub.exe");
+        std::fs::write(&junk_mz, b"MZ\x00\x00not-a-valid-64bit-pe-executable")
+            .expect("write junk MZ exe");
+        let junk_mz_str = junk_mz.to_string_lossy().to_string();
+
+        // 1. Direct task execution of junk-byte .exe files (with --isolation off).
+        for exe_path in [&junk_non_pe_str, &junk_mz_str] {
+            let task = Task::new(
+                rusty_grid_core::task::TaskSpec::command(exe_path.clone(), vec![]),
+                TaskRequirements::generic(1, 5),
+            );
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.runner.execute_task(&task, None, None),
+            )
+            .await
+            .expect("junk .exe task must fail fast without hanging on a modal dialog");
+            assert!(
+                !res.is_success() && res.exit_code != 0,
+                "junk .exe ({exe_path}) must fail with non-zero exit code, got: {res:?}"
+            );
+        }
+
+        // 2. Child process (`cmd.exe /C <junk.exe>`) inherits the worker's error mode and fails
+        //    fast with a non-zero exit code instead of blocking on a 16-bit/64-bit modal dialog.
+        for exe_path in [&junk_non_pe_str, &junk_mz_str] {
+            let child_task = Task::new(
+                rusty_grid_core::task::TaskSpec::command(
+                    "cmd.exe",
+                    vec!["/C".to_string(), exe_path.clone()],
+                ),
+                TaskRequirements::generic(1, 5),
+            );
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.runner.execute_task(&child_task, None, None),
+            )
+            .await
+            .expect("child process running junk .exe must fail fast without hanging");
+            assert!(
+                !res.is_success() && res.exit_code != 0,
+                "child running junk .exe ({exe_path}) must fail with non-zero exit code, got: {res:?}"
+            );
+        }
     }
 }

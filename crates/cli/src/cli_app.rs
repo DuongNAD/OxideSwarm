@@ -1897,6 +1897,7 @@ async fn run_worker(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    rusty_grid_core::capabilities::suppress_windows_error_dialogs();
     let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 

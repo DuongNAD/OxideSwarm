@@ -849,6 +849,7 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(worker_id: Uuid, capabilities: WorkerCapabilities, config: RunnerConfig) -> Self {
+        rusty_grid_core::capabilities::suppress_windows_error_dialogs();
         let initial_store = config.workspace_store.clone();
         Self {
             worker_id,
