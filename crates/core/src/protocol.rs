@@ -3730,6 +3730,14 @@ impl<T> MessageTransport<T> {
     }
 }
 
+impl MessageTransport<crate::transport::GridStream> {
+    /// Gracefully closes the underlying client P2P endpoint (if this transport wraps a
+    /// [`crate::transport::GridStream::P2p`]). No-op for TCP and in-memory streams.
+    pub async fn close(&mut self) {
+        self.get_mut().close().await;
+    }
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     /// Splits transport into independent read and write halves via `tokio::io::split`,
     /// preserving any unconsumed read buffer or unflushed write buffer, propagating

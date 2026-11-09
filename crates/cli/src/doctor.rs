@@ -631,6 +631,7 @@ pub async fn run_doctor(
         let id = if report.checks.is_empty() { "C1" } else { "--" };
         report.push(id, "Connection", None, Outcome::Fail, detail);
     }
+    rusty_grid_core::transport::drain_pending_p2p_client_closes().await;
     report
 }
 
@@ -834,6 +835,7 @@ async fn run_checks(
             "--skip-throughput",
         );
     }
+    transport.close().await;
     Ok(())
 }
 
@@ -957,8 +959,11 @@ async fn throughput_check(
             .await
             .map_err(|e| e.to_string())?;
         let started = Instant::now();
-        crate::blobs::upload_inputs(&connection, &prepared).await?;
-        Ok::<_, String>((prepared, started.elapsed()))
+        let upload_res = crate::blobs::upload_inputs(&connection, &prepared).await;
+        let elapsed = started.elapsed();
+        connection.close().await;
+        upload_res?;
+        Ok::<_, String>((prepared, elapsed))
     }
     .await;
     let _ = std::fs::remove_file(&path);
