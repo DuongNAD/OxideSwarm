@@ -1,7 +1,7 @@
 # Roadmap
 
-Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
-Phases F and G and decisions Q8 to Q12 are a Draft that waits for the owner.
+Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
+Q8 to Q12 (Phases F and G) on 2026-11-09.
 Created: 2026-11-07    Updated: 2026-11-09
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -311,7 +311,7 @@ no commitment: each still needs its own owner decision.
 
 ## Decisions for the owner
 
-The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q12 are open: the
+The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q12 were open until the owner accepted their recommended defaults on 2026-11-09: the
 right column is a recommended default, not a decision, and no work depends on it until the owner
 answers.
 
@@ -324,11 +324,11 @@ answers.
 | Q5 | Make every CI job a required check on `master` (TEST-6)? | Yes |
 | Q6 | When does distributed training start? | After the Phase D exit check. Design 0045 records the direction, and nothing is built before then |
 | Q7 | Add the items from the research of 2026-11-08? | Yes. JOIN-1, LINK-1 and BENCH-1 join Phase D. CACHE-1 joins Phase C outside its exit check. REAPI-1 waits |
-| Q8 | What scale does the Phase F exit check target: how many workers and how many submitters? | Open. Recommended: 500 workers and 20 submitters on one site, with 1000 workers as a stretch run of SCALE-1 |
-| Q9 | Which HA approach does SCALE-4 build: active-passive with a fencing epoch, or a Raft-replicated journal? | Open. Recommended: active-passive first, with the journal format and the epoch fixed so Raft can replace the replication layer later |
-| Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | Open. Recommended: the own API and MCP first, REAPI cache-only next, remote execution last |
-| Q11 | Which licence and is there a commercial or hosted offering? | Open. Recommended: keep `MIT OR Apache-2.0`, no hosted offering decided, and revisit after the first release |
-| Q12 | Which autoscaling providers does SCALE-5 build first? | Open. Recommended: SSH pool, then Kubernetes, then one cloud |
+| Q8 | What scale does the Phase F exit check target: how many workers and how many submitters? | 500 workers and 20 submitters on one site, with 1000 workers as a stretch run of SCALE-1 |
+| Q9 | Which HA approach does SCALE-4 build: active-passive with a fencing epoch, or a Raft-replicated journal? | Active-passive first, with the journal format and the epoch fixed so Raft can replace the replication layer later |
+| Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | The own API and MCP first, REAPI cache-only next, remote execution last |
+| Q11 | Which licence and is there a commercial or hosted offering? | Keep `MIT OR Apache-2.0`. No hosted offering decided; revisit after the first release |
+| Q12 | Which autoscaling providers does SCALE-5 build first? | SSH pool, then Kubernetes, then one cloud |
 
 ## Risks
 
@@ -375,3 +375,5 @@ answers.
   (scale out, SCALE-1 to SCALE-6), Phase G (product and ecosystem, ECO-1 to ECO-8), the ambition in
   the Summary, a note in "What waits", and open decisions Q8 to Q12. The architecture is
   [design 0050](design/0050-scale-out-architecture.md) (Draft). Nothing the owner decided moved.
+- 2026-11-09: The owner accepted Q8 to Q12 with their recommended defaults. Phases F and G are
+  Accepted; design 0050 stays a Draft until SCALE-1 has numbers.
