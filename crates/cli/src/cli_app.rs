@@ -52,8 +52,7 @@ use crate::doctor::{run_doctor, DoctorOptions};
 use crate::mode_cli;
 use crate::secret_cmd::{
     announce_master_secret, announce_peer_secret, client_secret, decide_master_secret,
-    decide_peer_secret, peer_insecure, run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs,
-    SecretOpts,
+    peer_insecure, run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs, SecretOpts,
 };
 
 /// Bytes in a MiB, for the `*-mb` options.
@@ -110,6 +109,14 @@ pub struct Cli {
         help = "Cluster secret as hex (discouraged: visible in the process list; prefer --secret-file)"
     )]
     pub secret: Option<SecretText>,
+
+    #[arg(
+        global = true,
+        long = "master-key",
+        value_name = "HEX",
+        help = "Pinned Master OXS-AUTH v3 X25519 public key as 64 hex characters (env RUSTY_GRID_MASTER_KEY, config master_key)"
+    )]
+    pub master_key: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -287,6 +294,13 @@ pub struct MasterArgs {
         help = "Enable local development mode (bypasses auth for loopback requests)"
     )]
     pub dev: bool,
+
+    #[arg(
+        long = "auth",
+        value_name = "MODE",
+        help = "Peer authentication mode: secret (OXS-AUTH v2 shared secret only), members (OXS-AUTH v3 enrolled machines only), or both (default; env RUSTY_GRID_AUTH, config [master].auth)"
+    )]
+    pub auth: Option<String>,
 
     #[arg(
         long = "auth-token",
@@ -1144,6 +1158,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     };
 
     let secret_opts = cli.secret_opts();
+    crate::connect::set_cli_master_key_flag(cli.master_key.clone());
     rusty_grid_core::mode::set_mode_runner_hook(crate::mode_cli::execute_mode_action);
     match cli.command {
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
@@ -1293,6 +1308,40 @@ fn resolve_wire_codec(flag: Option<String>, cfg_val: Option<String>) -> Result<W
         Some((source, raw)) => raw.parse().map_err(|e| format!("{source}: {e}")),
         None => Ok(WireCodec::Bincode),
     }
+}
+
+/// Environment variable selecting the Master's peer authentication mode (`secret|members|both`).
+pub const AUTH_MODE_ENV: &str = "RUSTY_GRID_AUTH";
+
+/// Resolve `master --auth` > `RUSTY_GRID_AUTH` > `[master].auth` > `AuthMode::Both` without
+/// touching the process environment.
+pub(crate) fn resolve_auth_mode_from(
+    cli_val: Option<String>,
+    env_val: Option<&str>,
+    cfg_val: Option<String>,
+) -> Result<rusty_grid_master::server::AuthMode, String> {
+    let sourced = if let Some(v) = cli_val {
+        Some(("--auth", v))
+    } else if let Some(v) = env_val.map(str::trim).filter(|s| !s.is_empty()) {
+        Some((AUTH_MODE_ENV, v.to_string()))
+    } else {
+        cfg_val
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|v| ("auth", v))
+    };
+    match sourced {
+        Some((source, raw)) => raw.parse().map_err(|e| format!("{source}: {e}")),
+        None => Ok(rusty_grid_master::server::AuthMode::Both),
+    }
+}
+
+fn resolve_auth_mode(
+    flag: Option<String>,
+    cfg_val: Option<String>,
+) -> Result<rusty_grid_master::server::AuthMode, String> {
+    let env_val = std::env::var(AUTH_MODE_ENV).ok();
+    resolve_auth_mode_from(flag, env_val.as_deref(), cfg_val)
 }
 
 /// Resolves `--relay-url` > `RUSTY_GRID_RELAY_URL` > config `relay_url` > `None` without touching
@@ -1683,6 +1732,54 @@ async fn run_master(
     // the P2P listener, since an iroh ticket is an address and not a credential) must
     // authenticate its peers. Resolve the secret, generate the default file if nothing resolves,
     // or honour the explicit --insecure escape hatch.
+    let auth_mode =
+        match resolve_auth_mode(args.auth, master_cfg.as_ref().and_then(|m| m.auth.clone())) {
+            Ok(mode) => mode,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let members = match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref())
+    {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("Failed to load members.json: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let master_noise_key = if ephemeral_key && state_dir.is_none() {
+        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
+            Ok(kp) => kp,
+            Err(e) => {
+                eprintln!("Failed to generate master_noise.key: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(key_path) =
+        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
+    {
+        match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(&key_path) {
+            Ok((kp, _)) => kp,
+            Err(e) => {
+                eprintln!("Failed to load or generate {}: {e}", key_path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
+            Ok(kp) => kp,
+            Err(e) => {
+                eprintln!("Failed to generate master_noise.key: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    server_config = server_config
+        .with_auth_mode(auth_mode)
+        .with_members(members)
+        .with_master_noise_key(master_noise_key);
+
     let insecure = resolve_bool(
         if args.insecure { Some(true) } else { None },
         &["RUSTY_GRID_INSECURE"],
@@ -1692,7 +1789,8 @@ async fn run_master(
     let secret_outcome = match secret_opts
         .resolve(config_file.as_ref(), SecretSection::Master)
         .and_then(|resolved| {
-            let exposed = !server_config.bind_addr.ip().is_loopback() || enable_p2p;
+            let exposed = (!server_config.bind_addr.ip().is_loopback() || enable_p2p)
+                && auth_mode.allows_secret();
             decide_master_secret(resolved, exposed, insecure, ClusterSecret::default_path())
         }) {
         Ok(outcome) => outcome,
@@ -1701,7 +1799,11 @@ async fn run_master(
             return ExitCode::FAILURE;
         }
     };
-    announce_master_secret(&secret_outcome, &listen_addr_str, insecure);
+    if auth_mode == rusty_grid_master::server::AuthMode::Members {
+        println!("Cluster authentication: members only (enrolled machines via OXS-AUTH v3)");
+    } else {
+        announce_master_secret(&secret_outcome, &listen_addr_str, insecure);
+    }
     if let Some(secret) = secret_outcome.secret() {
         server_config = server_config.with_cluster_secret(secret.clone());
     }
@@ -1775,6 +1877,13 @@ async fn run_master(
         };
 
     println!("RustyGrid Master started on {}", handle.server_addr());
+    if let Some(pub_key) = handle.master_noise_public_key() {
+        println!(
+            "Master v3 public key: {} (fingerprint: {})",
+            pub_key.to_hex(),
+            pub_key.fingerprint()
+        );
+    }
     if let Some(dash_addr) = handle.dashboard_addr() {
         println!("Embedded Dashboard available at http://{}", dash_addr);
         for line in dashboard_banner(
@@ -1920,6 +2029,13 @@ async fn run_worker(
         std::env::set_var(rusty_grid_core::discovery::RENDEZVOUS_ENV, r_url);
     }
 
+    let v3_auth = match secret_opts.resolve_v3_auth(config_file.as_ref(), SecretSection::Worker) {
+        Ok(v3) => v3,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cluster_secret = match secret_opts.resolve(config_file.as_ref(), SecretSection::Worker) {
         Ok(secret) => secret,
         Err(e) => {
@@ -1928,12 +2044,12 @@ async fn run_worker(
         }
     };
 
-    // Fail closed: a worker obeys whatever its master sends, so without a secret it may only
-    // follow a master on this machine. Remote, `auto`-discovered and P2P-ticket masters need the
-    // cluster secret (to prove the master is genuine) unless --insecure is given explicitly.
+    // Fail closed: a worker obeys whatever its master sends, so without a credential it may only
+    // follow a master on this machine. Remote, `auto`-discovered and P2P-ticket masters need a
+    // cluster credential (the cluster secret or a pinned v3 master key) unless --insecure is given.
     let insecure = peer_insecure(args.insecure, worker_cfg.as_ref().and_then(|w| w.insecure));
-    let peer_outcome = match decide_peer_secret(
-        cluster_secret.as_ref(),
+    let peer_outcome = match crate::secret_cmd::decide_peer_credential(
+        cluster_secret.is_some() || v3_auth.is_some(),
         &master_addr,
         p2p_ticket.is_some(),
         insecure,
@@ -2191,6 +2307,9 @@ async fn run_worker(
     );
 
     let mut config = WorkerConfig::new(master_addr);
+    if let Some((node_key, master_pub)) = v3_auth {
+        config = config.with_v3_auth(node_key, master_pub);
+    }
     if let Some(secret) = cluster_secret.as_ref() {
         config = config.with_cluster_secret(secret.clone());
     }
@@ -7854,5 +7973,39 @@ max_workspaces = 4
                 ExitCode::FAILURE
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_precedence_and_cli_flags() {
+        use rusty_grid_master::server::AuthMode;
+
+        assert_eq!(
+            resolve_auth_mode_from(None, None, None).unwrap(),
+            AuthMode::Both
+        );
+        assert_eq!(
+            resolve_auth_mode_from(None, None, Some("secret".into())).unwrap(),
+            AuthMode::Secret
+        );
+        assert_eq!(
+            resolve_auth_mode_from(None, Some("members"), Some("secret".into())).unwrap(),
+            AuthMode::Members
+        );
+        assert_eq!(
+            resolve_auth_mode_from(Some("both".into()), Some("members"), Some("secret".into()))
+                .unwrap(),
+            AuthMode::Both
+        );
+        assert!(resolve_auth_mode_from(Some("bogus".into()), None, None).is_err());
+
+        let cli = parse(&["master", "--auth", "members"]);
+        match cli.command {
+            Commands::Master(m) => assert_eq!(m.auth.as_deref(), Some("members")),
+            other => panic!("expected Master, got {other:?}"),
+        }
+
+        let hex = "11".repeat(32);
+        let cli_w = parse(&["worker", "--master-key", &hex]);
+        assert_eq!(cli_w.master_key.as_deref(), Some(hex.as_str()));
     }
 }
