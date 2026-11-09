@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 4 Partial and 29 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 64 items Implemented, 4 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -162,7 +162,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
-| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
+| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
+| TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -1993,3 +1994,16 @@ Add one dated line per finished item, newest last.
   - `README.md` links the page.
 
   The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
+- 2026-11-10: Added and implemented TEST-21 (pull request 198, open): fixed the Windows CI flakes in
+  `tests/m6_challenger_1_stress.rs` and `crates/agent_mesh/tests/test_sec6_mesh_sandbox.rs` by
+  delegating Windows task process termination on drop to `ProcessTree` (`#[cfg(not(windows))]
+  cmd.kill_on_drop(true)` in `runner.rs` with leader-PID fallback in `ProcessTree::drop`) so
+  `tokio::process::Child::drop` does not call `TerminateProcess` synchronously ahead of
+  `MIN_LIVE_KILL_AGE`, keeping `shutdown_tx` alive across `ChallengerTestCluster::abort_worker`,
+  aborting the actual assigned worker (`info.assigned_worker_id`) with `SINGLE_TASK_TIMEOUT` in
+  `test_adversarial_unexpected_tcp_eof_during_active_task_execution`, summing numbers in pure POSIX
+  shell before `sleep` in `test_adversarial_mapreduce_worker_drop_during_reduce_phase`, and retrying
+  transient socket buffer/port exhaustion (`WSAENOBUFS` `10055`, `WSAEADDRINUSE` `10048`) in
+  `AgentMeshClient::connect` and `AgentMeshHub::start`. `m6_challenger_1_stress` passed 20/20
+  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 64 Implemented, 4 Partial
+  and 29 Planned.

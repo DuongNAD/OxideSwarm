@@ -3582,7 +3582,11 @@ impl TaskRunner {
         }
 
         // Last line of defence for the direct child if this future is dropped; the process tree
-        // below takes care of everything else.
+        // below takes care of everything else. On Windows, `ProcessTree` owns termination through
+        // `TreeInner::kill_and_release_once` (and falls back to `kill_by_leader` if Job Object
+        // attachment failed) so dropping `child` synchronously does not call `TerminateProcess`
+        // ahead of `MIN_LIVE_KILL_AGE`.
+        #[cfg(not(windows))]
         cmd.kill_on_drop(true);
         let mut configured = configure_command(&mut cmd, self.config.process_priority, task_id);
         // After `configure_command`: the isolation hook (Linux) must run after the process-tree
@@ -3841,6 +3845,11 @@ impl TaskRunner {
         }
         tree.kill_async(child.id()).await;
         // The leader at least, even where no tree could be tracked.
+        #[cfg(windows)]
+        if !tree.is_tracked() {
+            let _ = child.start_kill();
+        }
+        #[cfg(not(windows))]
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
     }

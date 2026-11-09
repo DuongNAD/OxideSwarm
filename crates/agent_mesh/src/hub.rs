@@ -405,7 +405,27 @@ impl AgentMeshHub {
         &self,
         bind_addr: &str,
     ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(bind_addr).await?;
+        let mut bind_attempt = 0u32;
+        let listener = loop {
+            match TcpListener::bind(bind_addr).await {
+                Ok(l) => break l,
+                Err(e)
+                    if bind_attempt < 5
+                        && (matches!(e.raw_os_error(), Some(10055))
+                            || matches!(
+                                e.kind(),
+                                std::io::ErrorKind::OutOfMemory
+                                    | std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                            )) =>
+                {
+                    bind_attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50 * (1u64 << (bind_attempt - 1))))
+                        .await;
+                }
+                Err(e) => return Err(Box::new(e)),
+            }
+        };
         let local_addr = listener.local_addr()?;
         let port = local_addr.port();
 

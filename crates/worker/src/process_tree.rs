@@ -1394,6 +1394,8 @@ impl Drop for TreeInner {
 pub(crate) struct ProcessTree {
     inner: Option<Arc<TreeInner>>,
     #[cfg(windows)]
+    fallback_leader_pid: std::sync::atomic::AtomicU32,
+    #[cfg(windows)]
     fallback_app_container:
         Option<Arc<Mutex<Option<crate::isolation::windows::WindowsAppContainerGuard>>>>,
 }
@@ -1431,8 +1433,16 @@ impl ProcessTree {
                 cgroup_leaf: Mutex::new(unix.cgroup_leaf.take()),
             })
         });
+        #[cfg(windows)]
+        let fallback_leader_pid = std::sync::atomic::AtomicU32::new(if inner.is_none() {
+            child.id().unwrap_or(0)
+        } else {
+            0
+        });
         Self {
             inner,
+            #[cfg(windows)]
+            fallback_leader_pid,
             #[cfg(windows)]
             fallback_app_container: app_container.map(|ac| Arc::new(Mutex::new(Some(ac)))),
         }
@@ -1472,7 +1482,14 @@ impl ProcessTree {
                 }
             }
             None => {
-                kill_by_leader(live_leader);
+                #[cfg(windows)]
+                let leader = {
+                    let stored = self.fallback_leader_pid.swap(0, Ordering::AcqRel);
+                    live_leader.or_else(|| (stored != 0).then_some(stored))
+                };
+                #[cfg(not(windows))]
+                let leader = live_leader;
+                kill_by_leader(leader);
                 #[cfg(windows)]
                 if let Some(fb) = &self.fallback_app_container {
                     if let Ok(mut ac) = fb.lock() {
@@ -1495,6 +1512,14 @@ impl Drop for ProcessTree {
                     return;
                 }
                 inner.kill_and_release_once(false);
+            }
+        } else {
+            #[cfg(windows)]
+            {
+                let pid = self.fallback_leader_pid.swap(0, Ordering::AcqRel);
+                if pid != 0 {
+                    kill_by_leader(Some(pid));
+                }
             }
         }
         #[cfg(windows)]
