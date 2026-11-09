@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `packaging/usb/make_kit.sh --no-autostart` writes a trial kit: its installers add no start at login. The kit's workers use half of the CPU cores ([design 0053](docs/design/0053-usb-setup-kit.md)).
+
+### Fixed
+- The Windows USB installer passes a P2P ticket intact under Windows PowerShell 5.1, which dropped its double quotes, and the installers' checks no longer break on log lines that release 0.1.x writes to standard output.
+
 ## [0.1.1] - 2026-11-10
 
 A patch release with fixes found while running 0.1.0 on real desktops. The protocol is still

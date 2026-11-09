@@ -1,7 +1,7 @@
 # 0053: Set up machines from a USB stick
 
 Status: Accepted (decision Q13, 2026-11-09). Kit format v0 is built in `packaging/usb/`; `usb create` needs ENROLL-1b
-Created: 2026-11-09    Updated: 2026-11-09
+Created: 2026-11-09    Updated: 2026-11-10
 
 ## Summary
 
@@ -211,3 +211,10 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   i7-1355U) against a demo cluster with a throw-away secret. The worker joined, and the probe
   tasks of the doctor checks completed without errors, and the uninstaller stopped it. The installer waits for `state:connected` in `workers --json`, because the plain
   listing also showed disconnected workers (fixed in `oxideswarm workers`).
+- 2026-11-10: Trial kits for someone else's machine. `make_kit.sh --no-autostart` writes a
+  `no-autostart` file, and the installers then add no start at login. The worker gets
+  `--max-concurrency` of half the CPU cores. The installers' checks run with `RUST_LOG=off`, because
+  release 0.1.x writes informational logs to standard output, which broke the JSON parsing of
+  `workers --json` over P2P. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of
+  the P2P ticket, which the legacy argument passing dropped. A P2P-only kit passed end to end under
+  PowerShell 5.1 on Windows 11 and from a stick on macOS.
