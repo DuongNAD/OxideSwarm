@@ -72,6 +72,7 @@ struct ChallengerTestCluster {
     pub master: MasterHandle,
     pub master_addr: SocketAddr,
     pub workers: Vec<SpawnedWorker>,
+    pub aborted_shutdown_txs: Vec<watch::Sender<bool>>,
     pub temp_dirs: Vec<TempDir>,
 }
 
@@ -99,6 +100,7 @@ impl ChallengerTestCluster {
             master,
             master_addr,
             workers: Vec::new(),
+            aborted_shutdown_txs: Vec::new(),
             temp_dirs: Vec::new(),
         }
     }
@@ -167,6 +169,10 @@ impl ChallengerTestCluster {
         if let Some(pos) = self.workers.iter().position(|w| w.id == id) {
             let w = self.workers.remove(pos);
             w.handle.abort();
+            // Keep `shutdown_tx` alive until `ChallengerTestCluster::drop` so `w.handle.abort()`
+            // causes an abrupt TCP EOF rather than racing with `shutdown_rx` (which would send a
+            // graceful `WorkerMessage::Disconnecting`).
+            self.aborted_shutdown_txs.push(w.shutdown_tx);
         }
     }
 
@@ -608,7 +614,7 @@ async fn test_adversarial_truncated_length_header_unexpected_eof() {
 async fn test_adversarial_unexpected_tcp_eof_during_active_task_execution() {
     let mut cluster = ChallengerTestCluster::new().await;
 
-    let w1 = cluster.spawn_worker("victim-w1", 2, 2048, false).await;
+    let _w1 = cluster.spawn_worker("victim-w1", 2, 2048, false).await;
     let _w2 = cluster.spawn_worker("survivor-w2", 2, 2048, false).await;
 
     assert!(cluster.wait_for_workers(2, Duration::from_secs(5)).await);
@@ -617,25 +623,27 @@ async fn test_adversarial_unexpected_tcp_eof_during_active_task_execution() {
     let task = make_sleep_script_task(1.5);
     let task_id = cluster.master.submit_task(task).await.unwrap();
 
-    // Wait until task is actively Running
+    // Wait until task is actively Running and identify the worker executing it
     let start = Instant::now();
-    let mut is_running = false;
+    let mut victim = None;
     while start.elapsed() < SINGLE_TASK_TIMEOUT {
-        if let Ok(TaskStatus::Running) = cluster.master.get_task_status(task_id).await {
-            is_running = true;
-            break;
+        if let Ok(info) = cluster.master.get_task_info(task_id).await {
+            if info.state == TaskState::Running {
+                victim = info.assigned_worker_id;
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
-    assert!(is_running, "Task should enter Running state");
+    let victim_id = victim.expect("Task should enter Running state with an assigned worker");
 
-    // Abruptly sever w1's TCP stream mid-execution
-    cluster.abort_worker(w1);
+    // Abruptly sever the active worker's TCP stream mid-execution
+    cluster.abort_worker(victim_id);
 
-    // Master detects TCP EOF, marks task for retry, and survivor-w2 executes it
+    // Master detects TCP EOF, marks task for retry, and the survivor worker executes it
     let result = cluster
         .master
-        .wait_task(task_id, Some(Duration::from_secs(15)))
+        .wait_task(task_id, Some(SINGLE_TASK_TIMEOUT))
         .await
         .expect("Task must resolve on survivor worker");
 
@@ -794,13 +802,32 @@ async fn test_adversarial_mapreduce_worker_drop_during_reduce_phase() {
         "beta\t15".to_string(),
     ];
 
-    // Reducer is a shell script with a slight delay so it stays active during kill
+    // Reducer is a shell script with a slight delay so it stays active during kill.
+    // Sum integer tokens in pure POSIX shell before sleeping so each reducer only spawns `sleep`
+    // once at start-up rather than forking a 4-process `echo | grep | awk` pipeline right as
+    // `MIN_LIVE_KILL_AGE` expires on Windows.
     let reducer_script = r#"
 while IFS= read -r line || [ -n "$line" ]; do
+  sum=0
+  num=""
+  rest="$line"
+  while [ -n "$rest" ]; do
+    ch="${rest%"${rest#?}"}"
+    rest="${rest#?}"
+    case "$ch" in
+      [0-9]) num="${num}${ch}" ;;
+      *)
+        if [ -n "$num" ]; then
+          sum=$((sum + num))
+          num=""
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$num" ]; then
+    sum=$((sum + num))
+  fi
   sleep 0.08
-  # Input JSON has {"key": "...", "values": [...]}
-  # Extract values and sum them
-  sum=$(echo "$line" | grep -o '[0-9]\+' | awk '{s+=$1} END {print (s=="")?0:s}')
   printf "%d\n" "$sum"
 done
 "#;
