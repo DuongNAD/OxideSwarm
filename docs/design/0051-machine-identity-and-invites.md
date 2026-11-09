@@ -81,10 +81,14 @@ master before it sends anything. Clusters that use the shared secret keep workin
 2. **Noise:** `Noise_IK_25519_ChaChaPoly_BLAKE2s` through the `snow` crate. The prologue is the
    exact HELLO bytes. The initiator, a worker or a client, knows the master's static key from its
    invite or its config. The initiator's static key travels encrypted in message 1.
-3. **Record layer:** after message 2 both sides take the two directional keys of the existing AEAD
-   record layer (`0x04`, `AeadReaderSession`) from Noise `Split()`. Every later message, including
-   `ENROLL`, `ENROLLED`, `REJECT` and the pending-approval messages, is an encrypted record. A
-   failure after this point closes the connection without a cleartext answer.
+3. **Record layer:** after message 2 both sides extract the two raw directional `Split()` cipher
+   keys `(k_i2r, k_r2i)` via `snow::HandshakeState::dangerously_get_raw_split()`, derive
+   `session_key = HMAC-SHA256(key = "oxs3-split-session-key", k_i2r || k_r2i)` (volatile-zeroing
+   `k_i2r` and `k_r2i`), and feed `session_key` into `MessageTransport::enable_encryption` so the
+   existing AEAD record layer (`0x04`, `AeadReaderSession`) derives `k_c2s` and `k_s2c` strictly
+   from the Noise `Split()` output (never from public handshake values). Every later message,
+   including `ENROLL`, `ENROLLED`, `REJECT` and the pending-approval messages, is an encrypted
+   record. A failure after this point closes the connection without a cleartext answer.
 4. **Authenticated only after the first record.** IK message 1 can be replayed, so the master
    treats the peer as authenticated only after the first transport record from it decrypts.
 5. **Admission:** a key in the member list goes on with its roles (D6). With purpose `enroll`, a key
@@ -264,7 +268,7 @@ joins through iroh, through the owner's relay if one is set (`--relay-url`,
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| ENROLL-1a | Node and master keys; OXS-AUTH v3 (Noise `IK`, cleartext HELLO, `Split()` into the record layer); a member list read at start | `crates/core/src/cluster_auth.rs`, `crates/core/src/noise_auth.rs` (new), `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/cli/src/connect.rs` | v3 unit tests pass, and a worker whose key is in a hand-written `members.json` runs a task next to a v2 worker | Planned |
+| ENROLL-1a | Node and master keys; OXS-AUTH v3 (Noise `IK`, cleartext HELLO, `Split()` into the record layer); a member list read at start | `crates/core/src/cluster_auth.rs`, `crates/core/src/noise_auth.rs` (new), `crates/master/src/members.rs` (new), `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/config.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/secret_cmd.rs`, `tests/enroll_v3_e2e.rs` (new) | v3 unit tests pass, and a worker whose key is in a hand-written `members.json` runs a task next to a v2 worker | Implemented |
 | ENROLL-1b | Invites, `ENROLL`, pending requests, pairing check, approval, `invite`, `members`, `join` with invites, `--auth`, admin enrolment of the master's host, protocol 8 | `crates/master/src/members.rs` (new), `crates/core/src/protocol.rs`, `crates/cli/src/join.rs`, `crates/cli/src/members_cmd.rs` (new) | `cli_enroll_e2e` passes on Linux, macOS and Windows | Planned |
 | ENROLL-1c | Roles per message, worker-id ownership, revocation across all lanes, submitter of each task | `crates/master/src/members.rs`, `crates/master/src/server.rs`, `crates/master/src/session.rs`, `crates/master/src/queue.rs`, `crates/master/src/store.rs` | `cli_revoke_e2e` and the role tests pass on Linux, macOS and Windows | Planned |
 | ENROLL-1d | Dashboard members page with approval, `docs/SECURITY.md`, `README.md`, guide `docs/guides/add-a-machine.md` | `crates/master/src/web_ui.rs`, `dashboard.html`, docs | A dashboard API test lists, approves and revokes; the guide's live run from another network is recorded | Planned |
@@ -280,3 +284,5 @@ joins through iroh, through the owner's relay if one is set (`--relay-url`,
   - the joiner confirms the pairing check, and a use is taken at approval, not on request;
   - the HELLO is the Noise prologue, records are encrypted after `Split()`, and limits are global;
   - migration notes, and ENROLL-1b split into 1b and 1c.
+- 2026-11-09: `ENROLL-1a` implemented (`crates/core/src/noise_auth.rs`, `crates/master/src/members.rs`, `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/cli`, `tests/enroll_v3_e2e.rs`). Per-machine X25519 keys (`node.key`, `master_noise.key`), OXS-AUTH v3 Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s` with exact cleartext `HELLO` bytes as prologue and `Split()` key derivation into `0x04` AEAD records), `members.json` loaded at master startup, `--master-key` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`).
+- 2026-11-09: `ENROLL-1a` security review fixes: enforce v3 `client`/`admin` role on `InboundMessage::Client`, cap the first encrypted v3 record at 64 KiB until decrypted, pass `MasterAuthContext` explicitly without task-local fallback, harden `members.json` (worker-only default roles, `id`/duplicate-key validation, and private file/dir permissions), require explicit `node_key` in `WorkerClient::perform_handshake`, and expand unit/e2e coverage with neutral handshake failure wording.
