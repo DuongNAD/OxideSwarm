@@ -1956,7 +1956,7 @@ impl WorkerClient {
         if self.config.isolation != IsolationLevel::Off {
             if cfg!(windows) && self.config.workspaces {
                 let err = GridError::Config(
-                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (FEAT-3c is not implemented); start the worker with --isolation off or without --workspaces"
+                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (cargo under Windows isolation is FEAT-3d); start the worker with --isolation off or without --workspaces"
                         .to_string(),
                 );
                 error!(worker_id = %self.worker_id, error = %err, "Task isolation with workspaces cannot be enforced on Windows");

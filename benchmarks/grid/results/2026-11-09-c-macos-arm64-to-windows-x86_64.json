@@ -1,0 +1,299 @@
+{
+  "benchmark": "BENCH-1 (c) two-machine workspace cargo test offload",
+  "date_utc": "2026-11-09T12:44:06Z",
+  "git": {
+    "commit": "8743ed10b29526ba610ae95e3a74327d2ff82cfc",
+    "dirty_tree": false
+  },
+  "binary": {
+    "version": "rusty-grid 0.1.0",
+    "build_profile": "unknown"
+  },
+  "hardware": {
+    "cpu_model": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368
+  },
+  "os": {
+    "system": "Darwin",
+    "release": "27.2.0",
+    "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+    "machine": "arm64"
+  },
+  "network": "two-machine cluster via client -> master -> workspace worker",
+  "power": [
+    "Now drawing from 'AC Power'",
+    " -InternalBattery-0 (id=23658595)\t100%; charged; 0:00 remaining present: true"
+  ],
+  "load_average_before": [
+    2.21,
+    2.79,
+    3.3
+  ],
+  "load_average_after": [
+    2.6,
+    2.84,
+    3.09
+  ],
+  "python": "3.11.8",
+  "note": "",
+  "parameters": {
+    "runs": 3,
+    "latency_samples": 100,
+    "throughput_tasks": 300,
+    "concurrency": 16,
+    "max_workers": 4,
+    "files": 500,
+    "max_file_bytes": 65536,
+    "seed": 20261109,
+    "quick": false
+  },
+  "c_summary": {
+    "cold": {
+      "wall_s": {
+        "median": 209.5835,
+        "min": 209.4296,
+        "max": 224.156,
+        "runs": 3
+      },
+      "blobs_sent": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 3
+      },
+      "blobs_total": {
+        "median": 405,
+        "min": 405,
+        "max": 405,
+        "runs": 3
+      },
+      "worker_execution_time_ms": {
+        "median": 209171,
+        "min": 209092,
+        "max": 223881,
+        "runs": 3
+      }
+    },
+    "warm": {
+      "wall_s": {
+        "median": 7.605,
+        "min": 7.307,
+        "max": 7.698,
+        "runs": 3
+      },
+      "blobs_sent": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 3
+      },
+      "blobs_total": {
+        "median": 405,
+        "min": 405,
+        "max": 405,
+        "runs": 3
+      },
+      "worker_execution_time_ms": {
+        "median": 7248,
+        "min": 7085,
+        "max": 7279,
+        "runs": 3
+      },
+      "all_reused_target": true
+    }
+  },
+  "remote_workers": [
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "link": "Link: TCP/LAN",
+      "isolation": "off",
+      "cpu_cores": 12,
+      "ram_mb": 16068,
+      "has_gpu": false,
+      "is_simulated_gpu": false,
+      "tools": [
+        "cargo",
+        "git",
+        "rustc"
+      ],
+      "features": [
+        "workspaces"
+      ]
+    }
+  ],
+  "offload_cargo_args": [
+    "test",
+    "-p",
+    "rusty_grid_core",
+    "--lib",
+    "--offline"
+  ],
+  "raw": {
+    "c": [
+      {
+        "workspace": "bench1c-r1-7d67b4",
+        "cargo_args": [
+          "test",
+          "-p",
+          "rusty_grid_core",
+          "--lib",
+          "--offline"
+        ],
+        "workers_snapshot": [
+          {
+            "os": "windows",
+            "arch": "x86_64",
+            "link": "Link: TCP/LAN",
+            "isolation": "off",
+            "cpu_cores": 12,
+            "ram_mb": 16068,
+            "has_gpu": false,
+            "is_simulated_gpu": false,
+            "tools": [
+              "cargo",
+              "git",
+              "rustc"
+            ],
+            "features": [
+              "workspaces"
+            ]
+          }
+        ],
+        "cold": {
+          "wall_s": 209.5835,
+          "worker_execution_time_ms": 209171,
+          "reused_target": false,
+          "workspace": "bench1c-r1-7d67b4",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        },
+        "warm": {
+          "wall_s": 7.698,
+          "worker_execution_time_ms": 7279,
+          "reused_target": true,
+          "workspace": "bench1c-r1-7d67b4",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        }
+      },
+      {
+        "workspace": "bench1c-r2-e17689",
+        "cargo_args": [
+          "test",
+          "-p",
+          "rusty_grid_core",
+          "--lib",
+          "--offline"
+        ],
+        "workers_snapshot": [
+          {
+            "os": "windows",
+            "arch": "x86_64",
+            "link": "Link: TCP/LAN",
+            "isolation": "off",
+            "cpu_cores": 12,
+            "ram_mb": 16068,
+            "has_gpu": false,
+            "is_simulated_gpu": false,
+            "tools": [
+              "cargo",
+              "git",
+              "rustc"
+            ],
+            "features": [
+              "workspaces"
+            ]
+          }
+        ],
+        "cold": {
+          "wall_s": 209.4296,
+          "worker_execution_time_ms": 209092,
+          "reused_target": false,
+          "workspace": "bench1c-r2-e17689",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        },
+        "warm": {
+          "wall_s": 7.307,
+          "worker_execution_time_ms": 7085,
+          "reused_target": true,
+          "workspace": "bench1c-r2-e17689",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        }
+      },
+      {
+        "workspace": "bench1c-r3-292f3a",
+        "cargo_args": [
+          "test",
+          "-p",
+          "rusty_grid_core",
+          "--lib",
+          "--offline"
+        ],
+        "workers_snapshot": [
+          {
+            "os": "windows",
+            "arch": "x86_64",
+            "link": "Link: TCP/LAN",
+            "isolation": "off",
+            "cpu_cores": 12,
+            "ram_mb": 16068,
+            "has_gpu": false,
+            "is_simulated_gpu": false,
+            "tools": [
+              "cargo",
+              "git",
+              "rustc"
+            ],
+            "features": [
+              "workspaces"
+            ]
+          }
+        ],
+        "cold": {
+          "wall_s": 224.156,
+          "worker_execution_time_ms": 223881,
+          "reused_target": false,
+          "workspace": "bench1c-r3-292f3a",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        },
+        "warm": {
+          "wall_s": 7.605,
+          "worker_execution_time_ms": 7248,
+          "reused_target": true,
+          "workspace": "bench1c-r3-292f3a",
+          "files": 404,
+          "tree_size": "10.1 MiB",
+          "blobs_sent": 0,
+          "blobs_total": 405,
+          "bytes_sent_reported": "0 B",
+          "blobs_already_on_master": 405
+        }
+      }
+    ]
+  }
+}

@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `b7f112f`: 59 items Implemented, 6 Partial and 26 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 61 items Implemented, 4 Partial and 27 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -195,9 +195,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | 117 (design), 133, 150, 152 |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
 | FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Planned |  |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Partial | 105 (design), 157, 156, 164, 166, 160, 165 |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
@@ -1892,3 +1892,12 @@ Add one dated line per finished item, newest last.
   ECO-2 is CACHE-1 under its Phase G name, ECO-1 extends REAPI-1 with the `Execution` service, and
   SCALE-4 supersedes the "Design only" note of FEAT-6, which stays Implemented as the refusal. The
   Index counts changed from 12 to 26 Planned.
+- 2026-11-09: FEAT-3 is Implemented: Windows isolation merged in pull request 152, and its "Done when"
+  passes in CI on macOS, Linux and Windows. `cargo` inside the Windows AppContainer is split off as
+  FEAT-3d (Planned). FEAT-4 is Implemented: on 2026-11-09 a coding-agent call over MCP on a Mac ran
+  `cargo test -p rusty_grid_core --lib` on a Windows worker at a commit that machine did not have,
+  and the second run reused `target/` (6.6 s against 207.4 s; record in
+  [guides/offload-cargo-test.md](guides/offload-cargo-test.md#recorded-two-machine-run)). BENCH-1
+  gained the dated (c) record; it stays Partial until the script is run on Linux and Windows.
+  JOIN-1 was checked live on Windows (`join` exit 0, 8 doctor checks passed) and stays Partial for
+  the QR code step. The Index counts are now 61 Implemented, 4 Partial and 27 Planned.
