@@ -1322,19 +1322,6 @@ fn kill_probe_group(pid: u32) {
 #[cfg(windows)]
 pub const WINDOWS_CREATE_SUSPENDED: u32 = 0x0000_0004;
 
-/// Stores the most recently queried `(LimitFlags, ActiveProcessLimit)` of a Windows task Job
-/// Object (`QueryInformationJobObject(..., JobObjectExtendedLimitInformation, ...)`).
-#[cfg(windows)]
-static LAST_JOB_BASIC_LIMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Returns `(LimitFlags, ActiveProcessLimit)` queried from the most recently created task Job
-/// Object on Windows.
-#[cfg(windows)]
-pub fn last_job_basic_limits() -> (u32, u32) {
-    let raw = LAST_JOB_BASIC_LIMITS.load(std::sync::atomic::Ordering::Acquire);
-    ((raw >> 32) as u32, (raw & 0xFFFF_FFFF) as u32)
-}
-
 /// Creates a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, assigns
 /// the suspended `process` handle to it, and resumes `process` via `NtResumeProcess`.
 ///
@@ -1347,7 +1334,7 @@ pub fn attach_suspended_process_to_kill_on_close_job(
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
@@ -1388,21 +1375,6 @@ pub fn attach_suspended_process_to_kill_on_close_job(
             CloseHandle(job);
             resume_process(process);
             return None;
-        }
-        let mut queried: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        let mut ret_len: u32 = 0;
-        if QueryInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &mut queried as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            &mut ret_len,
-        ) != 0
-        {
-            let flags = queried.BasicLimitInformation.LimitFlags;
-            let active = queried.BasicLimitInformation.ActiveProcessLimit;
-            let packed = ((flags as u64) << 32) | (active as u64);
-            LAST_JOB_BASIC_LIMITS.store(packed, std::sync::atomic::Ordering::Release);
         }
         resume_process(process);
         Some(job as isize)
