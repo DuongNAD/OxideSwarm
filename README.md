@@ -456,6 +456,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `-q`, `--quiet` | `RUST_LOG=error` | Suppress informational output (errors only) |
 | `--secret-file <PATH>` | `OXIDESWARM_SECRET_FILE`, `secret_file`, `~/.oxideswarm/cluster.secret` | File containing the 64-hex-character cluster secret (mode `0600`) |
 | `--secret <HEX>` | `OXIDESWARM_SECRET`, `secret` | Cluster secret as 64 hex characters (hidden from `--help` because command-line arguments are visible in `ps`; prefer `--secret-file` or `OXIDESWARM_SECRET_FILE`) |
+| `--master-key <HEX>` | `RUSTY_GRID_MASTER_KEY`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key` | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication using `~/.oxideswarm/node.key` ([design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `-h`, `--help` | — | Print help information |
 | `-V`, `--version` | — | Print version information |
 
@@ -484,6 +485,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--dashboard-port-file <PATH>` | `RUSTY_GRID_DASHBOARD_PORT_FILE`, `OXIDE_SWARM_DASHBOARD_PORT_FILE`, `[master].dashboard_port_file` | File path where the bound dashboard HTTP port number is written |
 | `--dev` | `false` (`OXIDE_DEV_MODE`) | Enable local development mode (bypasses dashboard token auth on loopback interfaces only) |
 | `--auth-token <TOKEN:NAME:SCOPES>` | Repeatable | Register an explicit dashboard API bearer token with comma-separated scopes (`admin`, `submit`, `observer`) |
+| `--auth <MODE>` | `both` (`RUSTY_GRID_AUTH`, `[master].auth`) | Peer admission mode ([design 0051](docs/design/0051-machine-identity-and-invites.md)): `both` (admits v2 cluster-secret peers and v3 `members.json` peers), `secret` (admits v2 cluster-secret peers only), or `members` (admits v3 `members.json` peers only and refuses v2 peers with `"this master admits enrolled machines only; join with an invite"`) |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[master].insecure`) | Allow a non-loopback or `--p2p` master to run without a cluster secret |
 | `--max-retained-tasks <N>` | `10000` (`RUSTY_GRID_MAX_RETAINED_TASKS`, `[master].max_retained_tasks`) | Finished tasks retained in memory before evicting the oldest |
 | `--max-retained-mb <MB>` | `256` (`RUSTY_GRID_MAX_RETAINED_MB`, `[master].max_retained_mb`) | Megabytes of finished-task payload and output retained in memory |
@@ -633,6 +635,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | :--- | :--- | :--- |
 | `OXIDESWARM_SECRET` | Global & Agent Mesh | 64-character hex cluster secret for mutual node authentication (`--secret`) |
 | `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (`--secret-file`, mode `0600`; preferred over inline hex) |
+| `RUSTY_GRID_MASTER_KEY` | Worker, CLI & MCP | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 Noise `IK` authentication (`--master-key`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file (`--config`) |
 | `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
 | `RUST_LOG` | Global | Standard `tracing_subscriber::EnvFilter` directive overriding `--verbose` / `--quiet` |
@@ -670,6 +673,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks (`--mapreduce-parallelism`; default `256`) |
 | `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port (`--max-connections`; default `1024`) |
 | `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state (`--max-pending-handshakes`; default `64`) |
+| `RUSTY_GRID_AUTH` | Master | Peer admission mode (`--auth`, `[master].auth`: `secret`, `members`, or `both`; default `both`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret (`--insecure`) |
 | `RUSTY_GRID_DASHBOARD_PORT` | Master & `ox-mode` | HTTP listener port for embedded web dashboard on Master (`--dashboard-port`; default `8080`) and target dashboard port for `ox-mode dev status` (`--port`) |
 | `OXIDE_SWARM_DASHBOARD_PORT` | Master | Alternative alias for dashboard HTTP port |
