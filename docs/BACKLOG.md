@@ -163,7 +163,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
-| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | (open) |
+| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2029,7 +2029,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-10: Phase 9 added with NET-1 to NET-8, all Planned, from Phase H of the roadmap and design
   0054 (Draft): the owner's long-term goal of an open compute network. The Index counts are now
   63 Implemented, 4 Partial and 37 Planned.
-- 2026-11-10: Added and implemented TEST-22 (open): updated `contains_standalone_number` in
+- 2026-11-10: Added and implemented TEST-22 (pull request 200, open): updated `contains_standalone_number` in
   `tests/workflow_modes_test.rs` so UUIDv4 hex groups (`-4090-`, `4090a...`) and JSON/unit-labelled
   numeric measurements (`: 4090`, `4090 ms`, `4090 MB`) in `research_report.json` are not mistaken
   for an invented RTX 4090 GPU model name. The Index counts are now 64 Implemented, 4 Partial and
