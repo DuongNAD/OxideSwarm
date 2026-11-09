@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrading
 
-This release changes the wire protocol: the master's `PROTOCOL_VERSION_CURRENT` is now 6
+This release changes the wire protocol: the master's `PROTOCOL_VERSION_CURRENT` is now 7
 (`crates/core/src/protocol.rs`), and a peer outside the supported range is refused. Upgrade and
 restart the master first, then the workers and clients ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5).
 A master that already has a format-1 `--state-dir` must be stopped cleanly (`SIGTERM`, so it writes
@@ -34,7 +34,7 @@ its snapshot) before the binary is replaced ([design 0046](docs/design/0046-mast
 ### Changed
 - Removed `oxideswarm mcp --sse` in favour of stdio-only MCP transport and fail-closed client secret enforcement on non-loopback masters ([design 0004](docs/design/0004-mcp-and-discovery.md)).
 - Enforced bounded host capability probes, active queue budgets, oversized task result handling, and inbound JSON/blob request routing ([design 0008](docs/design/0008-oversized-task-results-and-active-queue-budget.md), [design 0018](docs/design/0018-inbound-json-blob-request-routing.md), [design 0020](docs/design/0020-bounded-host-capability-probes.md)).
-- Protocol version 6. Version 4 removed `compute_intensity` from the GPU task spec and added `ResumeSession`, and version 6 added the `Hello` probe and `Task::workspace`. Older peers are refused ([design 0040](docs/design/0040-protocol-versioning.md)).
+- Protocol version 7. Version 4 removed `compute_intensity` from the GPU task spec and added `ResumeSession`, version 6 added the `Hello` probe and `Task::workspace`, and version 7 added `ListWorkspaces` and `Workspaces`. Older peers are refused ([design 0040](docs/design/0040-protocol-versioning.md)).
 - `gen3d` and `autorig` build only with the opt-in Cargo feature `3d`; a worker without it does not take 3D tasks. Dead code, the Android lease shims and the second connection loop of the master were removed, and leftover task sandboxes are swept at worker start-up ([design 0044](docs/design/0044-dead-code-and-connection-loop-unification.md)).
 
 ### Security

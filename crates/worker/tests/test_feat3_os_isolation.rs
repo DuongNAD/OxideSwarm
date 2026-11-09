@@ -4717,7 +4717,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
     }
 
     /// Dedicated PowerShell diagnostic test under `IsolationLevel::Off` and `IsolationLevel::Fs`
-    /// printing `$PSVersionTable`, `$env:PSModulePath`, `Get-Module -ListAvailable | Select -First 5`,
+    /// printing `$PSVersionTable`, `$env:PSModulePath`,
     /// `Test-Path C:\Windows\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility`,
     /// and `[Environment]::GetEnvironmentVariables()` (names only).
     #[tokio::test]
@@ -4733,12 +4733,6 @@ try {
     [Console]::Out.WriteLine("TEST_PATH_CMDLET=$tp")
 } catch {
     [Console]::Out.WriteLine("TEST_PATH_ERR=$($_.Exception.Message)")
-}
-try {
-    $mods = @(Get-Module -ListAvailable | Select-Object -First 5 | ForEach-Object { $_.Name })
-    [Console]::Out.WriteLine("MODULES=$($mods -join ',')")
-} catch {
-    [Console]::Out.WriteLine("MODULES_ERR=$($_.Exception.Message)")
 }
 $names = [System.Collections.Generic.List[string]]::new()
 foreach ($k in [Environment]::GetEnvironmentVariables().Keys) { $null = $names.Add([string]$k) }
