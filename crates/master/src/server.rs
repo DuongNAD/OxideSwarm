@@ -3802,34 +3802,77 @@ where
         "Peer authenticated with OXS-AUTH v3 (Noise IK)"
     );
 
-    if let InboundMessage::Worker(WorkerMessage::Register { worker_id, .. }) = &first_msg {
-        let has_worker_role = auth_ctx
-            .members
-            .get(&auth_peer.public_key)
-            .is_some_and(|m| m.has_worker_role());
-        if !has_worker_role {
-            let reason = "member does not have the worker role".to_string();
-            warn!(
-                remote = %peer,
-                lane,
-                member_id = %auth_peer.member_id,
-                worker_id = %worker_id,
-                "Refusing Register from v3 member without the worker role"
-            );
-            if codec == WireCodec::Json {
-                transport.set_outbound_codec(WireCodec::Json);
+    match &first_msg {
+        InboundMessage::Worker(WorkerMessage::Register { worker_id, .. }) => {
+            let has_worker_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_worker_role());
+            if !has_worker_role {
+                let reason = "member does not have the worker role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    worker_id = %worker_id,
+                    "Refusing Register from v3 member without the worker role"
+                );
+                if codec == WireCodec::Json {
+                    transport.set_outbound_codec(WireCodec::Json);
+                }
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id: *worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(reason.clone()),
+                };
+                let _ =
+                    tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&reject_ack))
+                        .await;
+                return Err(GridError::AuthFailed(reason));
             }
-            let reject_ack = MasterMessage::RegisterAck {
-                accepted: false,
-                worker_id: *worker_id,
-                heartbeat_interval_secs: 0,
-                protocol_version: PROTOCOL_VERSION_CURRENT,
-                features: ProtocolCapabilities::empty(),
-                message: Some(reason.clone()),
-            };
-            let _ =
-                tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&reject_ack)).await;
-            return Err(GridError::AuthFailed(reason));
+        }
+        InboundMessage::Worker(_) => {
+            let has_worker_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_worker_role());
+            if !has_worker_role {
+                let reason = "member does not have the worker role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    "Refusing worker connection from v3 member without the worker role"
+                );
+                return Err(GridError::AuthFailed(reason));
+            }
+        }
+        InboundMessage::Client(_) => {
+            let has_client_role = auth_ctx
+                .members
+                .get(&auth_peer.public_key)
+                .is_some_and(|m| m.has_client_role());
+            if !has_client_role {
+                let reason = "member does not have the client role".to_string();
+                warn!(
+                    remote = %peer,
+                    lane,
+                    member_id = %auth_peer.member_id,
+                    "Refusing client connection from v3 member without the client role"
+                );
+                if codec == WireCodec::Json {
+                    transport.set_outbound_codec(WireCodec::Json);
+                }
+                let err_resp = ClientResponse::Error {
+                    message: format!("Authentication failed: {reason}"),
+                };
+                let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp))
+                    .await;
+                return Err(GridError::AuthFailed(reason));
+            }
         }
     }
 
@@ -8339,7 +8382,7 @@ mod tests {
             MemberEntry::new(
                 "worker-a",
                 *worker_kp.public_key(),
-                vec![MemberRole::Worker, MemberRole::Client],
+                vec![MemberRole::Worker],
             ),
             MemberEntry::new(
                 "client-only",
@@ -8399,6 +8442,46 @@ mod tests {
                 ..
             }) => assert!(msg.contains("worker role"), "got: {msg}"),
             other => panic!("expected rejected RegisterAck, got: {other:?}"),
+        }
+
+        // 1b. v3 peer without the `client` (or `admin`) role cannot open a client session.
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let client_pub = *master_kp.public_key();
+        let worker_only = worker_kp.clone();
+        let worker_as_client_task = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            let sk =
+                v3_client_handshake(&mut t, &worker_only, &client_pub, HandshakePurpose::Member)
+                    .await
+                    .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::Hello).await.unwrap();
+            t.recv_msg::<ClientResponse>().await.unwrap()
+        });
+
+        let server_res = with_master_auth_context(ctx_both.clone(), async {
+            let mut st = MessageTransport::new(s_stream);
+            authenticate_and_read_first_message(
+                &mut st,
+                "127.0.0.1:50002",
+                Some(&secret),
+                Duration::from_secs(5),
+                "connection",
+            )
+            .await
+        })
+        .await;
+        let err = server_res.unwrap_err().to_string();
+        assert!(
+            err.contains("member does not have the client role"),
+            "expected missing client role error, got: {err}"
+        );
+        let resp = worker_as_client_task.await.unwrap();
+        match resp {
+            Some(ClientResponse::Error { message }) => {
+                assert!(message.contains("client role"), "got: {message}");
+            }
+            other => panic!("expected ClientResponse::Error, got: {other:?}"),
         }
 
         // 2. With `--auth members`, a v2 secret peer is refused with REJECT_MEMBERS_ONLY.

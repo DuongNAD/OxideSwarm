@@ -134,15 +134,21 @@ fn assert_private(path: &Path) {
 fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
     let master_home = TempDir::new().unwrap();
     let worker_a_home = TempDir::new().unwrap();
+    let client_a_home = TempDir::new().unwrap();
     let worker_b_home = TempDir::new().unwrap();
     let worker_c_home = TempDir::new().unwrap();
     let mut seen = Seen::default();
 
-    // 1. Generate node keypairs for Worker A (enrolled) and Worker C (un-enrolled).
+    // 1. Generate node keypairs for Worker A (worker-only), Client A (client-only), and Worker C (un-enrolled).
     let worker_a_kp = NodeKeypair::generate().unwrap();
     let worker_a_key_path = worker_a_home.path().join(".oxideswarm").join("node.key");
     worker_a_kp.save_file(&worker_a_key_path, false).unwrap();
     assert_private(&worker_a_key_path);
+
+    let client_a_kp = NodeKeypair::generate().unwrap();
+    let client_a_key_path = client_a_home.path().join(".oxideswarm").join("node.key");
+    client_a_kp.save_file(&client_a_key_path, false).unwrap();
+    assert_private(&client_a_key_path);
 
     let worker_c_kp = NodeKeypair::generate().unwrap();
     let worker_c_key_path = worker_c_home.path().join(".oxideswarm").join("node.key");
@@ -174,7 +180,8 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         .unwrap();
     assert_private(&worker_b_secret_file);
 
-    // Write members.json in Master's ~/.oxideswarm/ with Worker A enrolled as worker + client.
+    // Write members.json in Master's ~/.oxideswarm/ with Worker A enrolled as worker-only
+    // and Client A enrolled as client.
     let members_json = serde_json::json!({
         "version": 1,
         "members": [
@@ -182,7 +189,13 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
                 "id": worker_a_kp.member_id(),
                 "name": "worker-a",
                 "public_key": worker_a_kp.public_key().to_hex(),
-                "roles": ["worker", "client"]
+                "roles": ["worker"]
+            },
+            {
+                "id": client_a_kp.member_id(),
+                "name": "client-a",
+                "public_key": client_a_kp.public_key().to_hex(),
+                "roles": ["client"]
             }
         ]
     });
@@ -273,7 +286,7 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
     assert!(
         wait_for(Duration::from_secs(20), || {
             let out = seen.run(with(
-                worker_a_home.path(),
+                client_a_home.path(),
                 &[
                     "status",
                     "--workers",
@@ -296,9 +309,43 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         worker_b.log()
     );
 
+    // 4b. Worker-only key (worker-a) is refused when attempting `submit`.
+    let worker_only_submit = seen.run(with(
+        worker_a_home.path(),
+        &[
+            "submit",
+            "--master",
+            &addr,
+            "--master-key",
+            &master_pub_hex,
+            "--wait",
+            "--",
+            "echo",
+            "must-not-run",
+        ],
+    ));
+    assert!(
+        !worker_only_submit.status.success(),
+        "worker-only key must not be allowed to submit tasks:\n{}\n{}",
+        text(&worker_only_submit.stdout),
+        text(&worker_only_submit.stderr)
+    );
+    assert!(
+        text(&worker_only_submit.stderr).contains("member does not have the client role"),
+        "expected missing client role refusal in stderr, got: {}",
+        text(&worker_only_submit.stderr)
+    );
+    assert!(
+        master
+            .log()
+            .contains("Refusing client connection from v3 member without the client role"),
+        "master log must record client role refusal:\n{}",
+        master.log()
+    );
+
     // 5. Each worker runs a task pinned to it.
     let sub_a = seen.run(with(
-        worker_a_home.path(),
+        client_a_home.path(),
         &[
             "submit",
             "--master",
@@ -384,7 +431,7 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
     );
 
     let status_out = seen.run(with(
-        worker_a_home.path(),
+        client_a_home.path(),
         &[
             "status",
             "--workers",
@@ -475,7 +522,7 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
 
     // Meanwhile, enrolled v3 client succeeds against `--auth members`.
     let v3_status = seen.run(with(
-        worker_a_home.path(),
+        client_a_home.path(),
         &[
             "status",
             "--master",
@@ -499,6 +546,10 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         .unwrap()
         .trim()
         .to_string();
+    let client_a_priv_hex = fs::read_to_string(&client_a_key_path)
+        .unwrap()
+        .trim()
+        .to_string();
     let worker_c_priv_hex = fs::read_to_string(&worker_c_key_path)
         .unwrap()
         .trim()
@@ -509,6 +560,7 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
             &secret_hex,
             &master_priv_hex,
             &worker_a_priv_hex,
+            &client_a_priv_hex,
             &worker_c_priv_hex,
         ] {
             assert!(
