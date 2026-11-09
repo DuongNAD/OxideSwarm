@@ -1,8 +1,7 @@
 # Grid benchmarks (BENCH-1)
 
 `bench_grid.py` measures the OxideSwarm grid on loopback with the binary you built. It uses only the
-Python 3 standard library and runs on macOS, Linux and Windows (the Windows path is written but has
-not been run yet; only macOS is recorded below).
+Python 3 standard library and runs on macOS, Linux and Windows (macOS and Windows are recorded below).
 
 ```bash
 cargo build --release --locked --bin oxideswarm
@@ -72,6 +71,21 @@ from other processes. A rerun on an idle machine is welcome and goes next to thi
 | One file changed | 0.142 (0.136 to 19.4) | 2 of 501 | 55102 |
 
 The 501st blob is the tree manifest. Changing one file sends that file and the new manifest only.
+
+Record: [`results/2026-11-09-windows-amd64-13th-gen-intel-core-i7-1355u.json`](results/2026-11-09-windows-amd64-13th-gen-intel-core-i7-1355u.json). 2026-11-09 (UTC), 13th Gen Intel(R) Core(TM) i7-1355U (10 cores, 12 threads), 16 GiB, Windows 11 Home (10.0.26300), AC power (`Win32_Battery` `BatteryStatus=2`, 100 %), release build of `4181a6d`. Loopback.
+
+| Workers | Throughput, tasks/s (median, range) | p50 ms (median, range) | p99 ms (median, range) | Client floor: calls/s, p50 ms |
+|---|---|---|---|---|
+| 1 | 50.9 (48.9 to 52.4) | 69.0 (68.5 to 77.3) | 113.5 (101.1 to 116.8) | 146.7, 30.9 |
+| 2 | 45.4 (38.4 to 50.1) | 73.7 (66.1 to 91.8) | 146.9 (128.7 to 170.7) | 138.6, 26.5 |
+| 3 | 47.9 (42.9 to 50.4) | 88.3 (62.6 to 90.9) | 213.6 (106.5 to 237.5) | 145.1, 28.0 |
+| 4 | 48.4 (45.8 to 52.1) | 88.7 (77.5 to 93.0) | 169.6 (136.4 to 273.0) | 170.2, 25.8 |
+
+| Upload of the 500-file tree | Wall time, s (median, range) | Blobs sent | Store growth, bytes |
+|---|---|---|---|
+| First | 10.85 (10.73 to 13.66) | 501 of 501 | 16864821 |
+| Same tree again | 1.790 (1.565 to 1.889) | 0 of 501 | 0 |
+| One file changed | 1.722 (1.421 to 1.808) | 2 of 501 | 55102 |
 
 **(c) Two-machine `cargo test` workspace offload (`--offload-master`).** Connects from the client machine
 to a running two-machine cluster (`--offload-master <HOST:PORT_OR_TICKET>`, authenticating with
