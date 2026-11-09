@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Machine identity and OXS-AUTH v3 (`ENROLL-1a`): per-machine X25519 static keys (`~/.oxideswarm/node.key` and `master_noise.key`, or in `--state-dir` when set, stored as private files and printed with key fingerprint on master startup), Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication with cleartext `HELLO` prologue and `Split()` key derivation into the `0x04` ChaCha20-Poly1305 record layer, `members.json` read at master startup with worker-role enforcement on `Register`, `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`) ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
+- `packaging/usb/make_kit.sh --no-autostart` writes a trial kit: its installers add no start at login. The kit's workers use half of the CPU cores ([design 0053](docs/design/0053-usb-setup-kit.md)).
+
+### Fixed
+- The Windows USB installer passes a P2P ticket intact under Windows PowerShell 5.1, which dropped its double quotes, and the installers' checks no longer break on log lines that release 0.1.x writes to standard output.
 
 ## [0.1.1] - 2026-11-10
 
