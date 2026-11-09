@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 5 Partial and 28 Planned. Five items
+On 2026-11-10, at `master` `4c45b1a` plus FEAT-3d: 64 items Implemented, 4 Partial and 28 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -213,7 +213,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
-| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
@@ -1988,11 +1988,18 @@ Add one dated line per finished item, newest last.
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
   and 29 Planned.
-- 2026-11-09: Implemented FEAT-3d (pull request 183, open): enabled `cargo build --offline` and
+- 2026-11-10: BENCH-1 is Implemented. Its "Done when" passes:
+  - `benchmarks/grid/bench_grid.py` ran on macOS (pull request 162), Windows (187) and Linux (189,
+    arm64 in a Docker Desktop VM, labelled as such);
+  - (c) is recorded on two machines (pull request 175 and the live run of 2026-11-09);
+  - `README.md` links the page.
+
+  The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
+- 2026-11-10: Implemented FEAT-3d (pull request 183, open): enabled `cargo build --offline` and
   `--workspaces` under `--isolation fs|fs+net` on non-elevated Windows workers without Object
   Manager DACL edits (`get_or_init_worker_lua_token` using `CreateRestrictedToken` with `LUA_TOKEN`
   + `CreateProcessAsUserW`, per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` on
   `<ws>/tree` and `<ws>/tmp`, default `%TEMP%\rusty_grid\sandboxes` accepted under `host.user_home`
   in `validate_sandbox_base_safe`, and a startup `WARN` + `tool:cargo` tag removal when a Windows
   worker runs elevated with isolation). Verified in CI run `42678349017` across all 22 jobs and
-  locally on Windows 11. The Index counts are now 63 Implemented, 5 Partial and 28 Planned.
+  locally on Windows 11. The Index counts are now 64 Implemented, 4 Partial and 28 Planned.

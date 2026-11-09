@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Windows AppContainer support for offline `cargo` builds and `--workspaces` under `--isolation fs|fs+net` on non-elevated workers (`FEAT-3d`, [design 0033](docs/design/0033-os-level-task-isolation.md) D4, [design 0039](docs/design/0039-agent-workspaces.md)): `<ws>/tree` and `<ws>/tmp` are confined to the per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` while `<ws>/state.json`, `<ws>/lock`, and sibling workspaces stay unreadable and unwritable; `validate_sandbox_base_safe` accepts the default `%TEMP%\rusty_grid\sandboxes` directory under `host.user_home`; and a Windows worker started elevated with `--isolation fs|fs+net` logs a startup warning and omits `tool:cargo` from its advertised capability tags because elevated logon sessions disallow opening `NUL` inside an AppContainer (`crates/worker/src/isolation.rs`, `crates/worker/src/client.rs`, `crates/worker/src/runner.rs`).
 
+## [0.1.1] - 2026-11-10
+
+A patch release with fixes found while running 0.1.0 on real desktops. The protocol is still
+version 7, so 0.1.0 and 0.1.1 machines work together; upgrade in any order.
+
+### Added
+- The USB setup kit (`packaging/usb/`, [design 0053](docs/design/0053-usb-setup-kit.md)) also works where machines cannot reach each other directly, as on school or office Wi-Fi with client isolation. When the join token carries a P2P ticket (`secret join-token --p2p-ticket-file ...`, from a master started with `--p2p`), the installers run their checks through that ticket, as the worker does.
+
 ### Fixed
 - `oxideswarm workers` printed every registered worker under "Connected Workers", including workers that had disconnected, and `status` counted them as connected. Both now count only workers whose `state:` tag is `connected`, and `workers` marks the others, for example `[disconnected]`. Use `workers --json` in scripts.
 - Stop raising modal pop-up dialogs and Windows Firewall prompts on Windows desktops: workers now call `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)` at start-up (and before bounded capability probes) so child task processes inherit it even with `--isolation off` instead of hanging on 16-bit/64-bit incompatibility or crash dialogs (`crates/core/src/capabilities.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`); a master listening on loopback now binds its UDP discovery socket to that loopback address (`127.0.0.1:<discovery_port>`) instead of `0.0.0.0:<discovery_port>` and answers local unicast probes without sending broadcast beacons (`crates/master/src/server.rs`); and a worker targeting a loopback master binds its standby HTTP portal to `127.0.0.1` instead of `0.0.0.0` (`crates/worker/src/client.rs`).

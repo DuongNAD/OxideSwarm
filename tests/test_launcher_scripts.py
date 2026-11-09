@@ -549,7 +549,15 @@ case "$1" in
   --version) echo "rusty-grid 9.9.9"; exit 0 ;;
   join)
     tok=$(cat)
-    case "$tok" in oxs1-join:*) touch "$OXIDESWARM_HOME/joined"; exit 0 ;; *) echo "bad token" >&2; exit 3 ;; esac ;;
+    case "$tok" in
+      oxs1-join:*)
+        touch "$OXIDESWARM_HOME/joined"
+        if [ -n "${FAKE_TICKET:-}" ]; then
+          printf "[worker]\\np2p_ticket = '%s'\\n" "$FAKE_TICKET" > "$OXIDESWARM_HOME/rusty-grid.toml"
+        fi
+        exit 0 ;;
+      *) echo "bad token" >&2; exit 3 ;;
+    esac ;;
   worker)
     shift
     while [ $# -gt 0 ]; do [ "$1" = "--name" ] && echo "$2" > "$OXIDESWARM_HOME/fake_worker_name"; shift; done
@@ -673,6 +681,24 @@ class UsbKitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertFalse(os.path.exists(root))
         self.assertTrue(wait_until(lambda: not pid_alive(pid), timeout=10), "the worker kept running")
+
+    def test_install_uses_the_saved_p2p_ticket_for_its_checks(self):
+        # On a network where the machines cannot reach each other (client isolation), the worker
+        # goes through the ticket that join saved, and so must the installer's checks.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        ticket = '{"id":"00ff","addrs":[]}'
+        env = dict(self.env(), FAKE_TICKET=ticket)
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-p2p"],
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("P2P ticket", res.stdout)
+        calls = [line for line in read(self.args_log).splitlines() if line.strip()]
+        self.assertIn("workers --json --master " + ticket, calls)
+        self.assertIn("doctor --master " + ticket, calls)
 
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)
