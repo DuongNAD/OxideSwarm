@@ -19,6 +19,8 @@ function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
 $TokenFile = Join-Path $Kit 'join.token'
+# A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
+if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
 if (-not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
@@ -118,7 +120,9 @@ if ($ticket) { $checkArgs = @('--master', $ticket); Write-Host "  link:    P2P t
 
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
-$workerArgs = "worker --name $Name --no-portal"
+# Use at most half of the CPU cores, so the machine stays responsive for its owner.
+$slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
+$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots"
 if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
 $log = Join-Path $LogDir 'worker.log'
 

@@ -50,6 +50,8 @@ if [ -z "$ROOT" ]; then
 fi
 
 [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+# A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
+[ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
 
 ARCHIVE=""
@@ -142,7 +144,10 @@ if [ -z "$NAME" ]; then
   NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
   [ -n "$NAME" ] || NAME=worker
 fi
-WORKER_ARGS="worker --name $NAME --no-portal"
+# Use at most half of the CPU cores, so the machine stays responsive for its owner.
+if [ "$OS" = Darwin ]; then CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 2); else CORES=$(nproc 2>/dev/null || echo 2); fi
+SLOTS=$((CORES / 2)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi

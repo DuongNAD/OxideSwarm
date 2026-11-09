@@ -700,6 +700,23 @@ class UsbKitTests(unittest.TestCase):
         self.assertIn("workers --json --master " + ticket, calls)
         self.assertIn("doctor --master " + ticket, calls)
 
+    def test_trial_kit_adds_no_autostart_and_caps_concurrency(self):
+        # A kit for someone else's machine (make_kit.sh --no-autostart) must not add a start at
+        # login, and the worker must leave half the cores free.
+        self.assertEqual(self.make_kit(extra=["--no-autostart"]).returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        self.assertTrue(os.path.isfile(os.path.join(kit, "no-autostart")))
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--name", "kit-trial"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("autostart: skipped", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library", "LaunchAgents")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "systemd")))
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--max-concurrency " in worker_calls[0], worker_calls)
+
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)
         kit = os.path.join(self.stick, "OxideSwarm")
