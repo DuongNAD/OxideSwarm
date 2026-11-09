@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `980946e` plus `ENROLL-1b`: 63 items Implemented, 5 Partial and 36 Planned. Five items
+On 2026-11-10, at `master` `cf664ee` plus `ENROLL-1b`: 64 items Implemented, 5 Partial and 35 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -198,7 +198,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
-| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Planned |  |
+| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented | 183 (open) |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
@@ -214,7 +214,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
-| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190 |
+| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 (open) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
@@ -1255,6 +1255,8 @@ Each item below needs a design record before code.
   `test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home` pass un-ignored in
   `test_feat3_os_isolation` on `windows-latest`, and workspaces with `--isolation fs|fs+net` work on
   Windows.
+  - *Verified (PR 183, CI run `42678349017`):* On a non-elevated Windows worker (`TokenElevation == 0`), `\Sessions\<S>\DosDevices\<UserLogonId>` carries `(A;;CCDCLCSWSDRCWDWO;;;<CurrentUser>)` and `cargo build --offline` (including cached registry dependencies under a denied `USERPROFILE`) and `--workspaces` (`<ws>/tree` and `<ws>/tmp` confined to the per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>`, with non-inherited traverse-only for `oxideswarm.toolchain` on `<workspace_root>` and `<workspace_root>/<ws_name>`) pass under `--isolation fs` and `--isolation fs+net`, both locally and on `windows-latest` (via a non-elevated scheduled task `InteractiveToken` / `LeastPrivilege`), and a worker with default sandbox settings (`%TEMP%\rusty_grid\sandboxes` inside `host.user_home`) starts cleanly.
+  - *Residual limitation:* On an **elevated** Windows worker (`TokenElevation != 0`), UAC creates `\Sessions\<S>\DosDevices\<AdminLogonId>` with `TokenOwner = BUILTIN\Administrators` (`O:BA D:(A;OICI;...;;;SY)(A;OICI;...;;;BA)`) and no ACE for `CurrentUser`, and `ntoskrnl.exe!SeIsTokenAssignableToProcess` refuses switching to a fresh logon session via `CreateProcessAsUserW` without `SeAssignPrimaryTokenPrivilege` (`os error 1314`), so `cargo` and other programs that open `NUL` fail with `os error 5` inside the AppContainer. Workers must run non-elevated; when an elevated Windows worker starts with `--isolation fs|fs+net`, it logs a startup `WARN` and drops `tool:cargo` from its advertised capability tags.
 
 ### FEAT-4: Remote workspaces for coding agents
 
@@ -2021,12 +2023,20 @@ Add one dated line per finished item, newest last.
 - 2026-11-10: Phase 9 added with NET-1 to NET-8, all Planned, from Phase H of the roadmap and design
   0054 (Draft): the owner's long-term goal of an open compute network. The Index counts are now
   63 Implemented, 4 Partial and 37 Planned.
+- 2026-11-10: Implemented FEAT-3d (pull request 183, open): enabled `cargo build --offline` and
+  `--workspaces` under `--isolation fs|fs+net` on non-elevated Windows workers without Object
+  Manager DACL edits (`get_or_init_worker_lua_token` using `CreateRestrictedToken` with `LUA_TOKEN`
+  + `CreateProcessAsUserW`, per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` on
+  `<ws>/tree` and `<ws>/tmp`, default `%TEMP%\rusty_grid\sandboxes` accepted under `host.user_home`
+  in `validate_sandbox_base_safe`, and a startup `WARN` + `tool:cargo` tag removal when a Windows
+  worker runs elevated with isolation). Verified in CI run `42678349017` across all 22 jobs and
+  locally on Windows 11. The Index counts are now 64 Implemented, 4 Partial and 36 Planned.
 - 2026-11-10: ENROLL-1 is Partial: `ENROLL-1a` merged in pull request 190 (per-machine X25519 keys,
   OXS-AUTH v3 Noise `IK` handshake and `Split()` record layer, `members.json` loaded at startup,
   `--master-key`, `master --auth secret|members|both`, `tests/enroll_v3_e2e.rs`), and `ENROLL-1b` is
-  implemented (`oxs1-invite:` invites, `oxideswarm invite`, `oxideswarm members`, `oxideswarm join`
-  with invites and 6-digit pairing check confirmation, pending enrollment requests with use deducted
-  at approval, auto-enrolment of the master's host `node.key` as `admin`, worker-id ownership per
-  member, protocol version 8, `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live revocation across all
-  lanes and task cancellation/requeue) and `ENROLL-1d` (dashboard members page and docs/guide) are
-  Planned. The Index counts are now 63 Implemented, 5 Partial and 36 Planned.
+  implemented in pull request 201 (`oxs1-invite:` invites, `oxideswarm invite`, `oxideswarm members`,
+  `oxideswarm join` with invites and 6-digit pairing check confirmation, pending enrollment requests
+  with use deducted at approval, auto-enrolment of the master's host `node.key` as `admin`,
+  worker-id ownership per member, protocol version 8, `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live
+  revocation across all lanes and task cancellation/requeue) and `ENROLL-1d` (dashboard members page
+  and docs/guide) are Planned. The Index counts are now 64 Implemented, 5 Partial and 35 Planned.

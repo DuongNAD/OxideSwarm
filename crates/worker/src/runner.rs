@@ -943,10 +943,26 @@ impl TaskRunner {
         }
         let root = self.config.workspace_root.clone();
         let limits = self.config.workspace_limits;
-        let store = tokio::task::spawn_blocking(move || WorkspaceStore::open(root, limits))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let validate_for_isolation =
+            (self.config.isolation != IsolationLevel::Off).then(|| self.config.host_dirs.clone());
+        let store = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            if let Some(ref host_dirs) = validate_for_isolation {
+                if let Some(ref r) = root.clone().or_else(crate::workspace::default_root) {
+                    crate::isolation::windows::validate_workspace_root_safe(r, host_dirs).map_err(
+                        |reason| WorkspaceError::Root {
+                            path: r.clone(),
+                            reason,
+                        },
+                    )?;
+                }
+            }
+            WorkspaceStore::open(root, limits)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
         let mut slot = self
             .workspace_store
             .write()
@@ -1881,13 +1897,6 @@ impl TaskRunner {
                 Some(msg),
             )
         };
-
-        if cfg!(windows) && self.config.isolation != IsolationLevel::Off {
-            return fail(
-                "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet; start the worker with --isolation off or without --workspaces"
-                    .to_string(),
-            );
-        }
 
         if !task.inputs.is_empty() || !task.staged_files.is_empty() {
             return fail(
@@ -3454,17 +3463,55 @@ impl TaskRunner {
         // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
         // that is impossible the task fails, it never runs plain.
         let ws_root_fallback = self.workspace_root_if_open();
+        #[cfg(windows)]
+        let (eff_extra_writable_dir, eff_workspace_root) = if self.config.isolation
+            != IsolationLevel::Off
+        {
+            let extra = workspace_ctx.as_ref().map(|w| {
+                if w.tmp_dir.exists() && !crate::isolation::windows::is_reparse_point(w.tmp_dir) {
+                    crate::isolation::windows::normalize_win_path(w.tmp_dir)
+                } else {
+                    w.tmp_dir.to_path_buf()
+                }
+            });
+            let ws_r = workspace_ctx
+                .as_ref()
+                .map(|w| w.workspace_root)
+                .or(ws_root_fallback.as_deref())
+                .map(|r| {
+                    if r.exists() && !crate::isolation::windows::is_reparse_point(r) {
+                        crate::isolation::windows::normalize_win_path(r)
+                    } else {
+                        r.to_path_buf()
+                    }
+                });
+            (extra, ws_r)
+        } else {
+            (
+                workspace_ctx.as_ref().map(|w| w.tmp_dir.to_path_buf()),
+                workspace_ctx
+                    .as_ref()
+                    .map(|w| w.workspace_root.to_path_buf())
+                    .or(ws_root_fallback.clone()),
+            )
+        };
+        #[cfg(not(windows))]
+        let (eff_extra_writable_dir, eff_workspace_root) = (
+            workspace_ctx.as_ref().map(|w| w.tmp_dir.to_path_buf()),
+            workspace_ctx
+                .as_ref()
+                .map(|w| w.workspace_root.to_path_buf())
+                .or(ws_root_fallback.clone()),
+        );
+
         let jail = (self.config.isolation != IsolationLevel::Off).then(|| crate::isolation::Jail {
             level: self.config.isolation,
             host: &self.config.host_dirs,
             protected_files: &self.config.protected_files,
             sandbox_base: &eff_sandbox_base,
             sandbox_dir: &eff_sandbox_path,
-            extra_writable_dir: workspace_ctx.as_ref().map(|w| w.tmp_dir),
-            workspace_root: workspace_ctx
-                .as_ref()
-                .map(|w| w.workspace_root)
-                .or(ws_root_fallback.as_deref()),
+            extra_writable_dir: eff_extra_writable_dir.as_deref(),
+            workspace_root: eff_workspace_root.as_deref(),
         });
         let isolation_failure = |e: &str| {
             TaskResult::failure(
@@ -3542,9 +3589,8 @@ impl TaskRunner {
         );
 
         if self.config.isolation != IsolationLevel::Off {
-            let home_and_tmp = workspace_ctx
-                .as_ref()
-                .map(|w| w.tmp_dir)
+            let home_and_tmp = eff_extra_writable_dir
+                .as_deref()
                 .unwrap_or(&eff_sandbox_path);
             let plan =
                 crate::isolation::prepare_environment(&self.config.host_dirs, env, home_and_tmp);
@@ -3563,12 +3609,20 @@ impl TaskRunner {
         }
 
         if let Some(ref ws_ctx) = workspace_ctx {
-            let tmp_str = ws_ctx.tmp_dir.to_string_lossy().to_string();
+            let tmp_str = eff_extra_writable_dir
+                .as_deref()
+                .unwrap_or(ws_ctx.tmp_dir)
+                .to_string_lossy()
+                .to_string();
             for name in ["TMPDIR", "TEMP", "TMP"] {
                 cmd.env(name, &tmp_str);
             }
             for (k, v) in &ws_ctx.task_env {
-                cmd.env(k, v);
+                if *k == crate::workspace::ENV_WORKSPACE_DIR {
+                    cmd.env(k, eff_sandbox_path.to_string_lossy().to_string());
+                } else {
+                    cmd.env(k, v);
+                }
             }
         }
 
@@ -3601,6 +3655,8 @@ impl TaskRunner {
             let protected_files = self.config.protected_files.clone();
             let sandbox_base = eff_sandbox_base.clone();
             let sandbox_dir = eff_sandbox_path.clone();
+            let extra_writable = eff_extra_writable_dir.clone();
+            let ws_root = eff_workspace_root.clone();
             let run_token = configured.run_token();
             let std_cmd = cmd.as_std();
             let prog_for_setup = std_cmd.get_program().to_string_lossy().to_string();
@@ -3626,8 +3682,8 @@ impl TaskRunner {
                     protected_files: &protected_files,
                     sandbox_base: &sandbox_base,
                     sandbox_dir: &sandbox_dir,
-                    extra_writable_dir: None,
-                    workspace_root: None,
+                    extra_writable_dir: extra_writable.as_deref(),
+                    workspace_root: ws_root.as_deref(),
                 };
                 crate::isolation::windows::WindowsAppContainerGuard::create_blocking(
                     run_token,
