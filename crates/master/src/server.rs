@@ -1139,24 +1139,31 @@ impl MasterServer {
 
         // 5. Spawn UDP Master Discovery Broadcaster & Active Probe Responder
         if enable_discovery {
-            let disc_shutdown_rx = shutdown_rx.clone();
             let listen_ip = server_addr.ip();
-            let cluster_port = server_addr.port();
+            if listen_ip.to_canonical().is_loopback() {
+                info!(
+                    listen_addr = %server_addr,
+                    "Master UDP discovery is off for loopback listen address"
+                );
+            } else {
+                let disc_shutdown_rx = shutdown_rx.clone();
+                let cluster_port = server_addr.port();
 
-            let disc_registry = handle.registry().clone();
-            let disc_secret = config.cluster_secret.clone();
-            tokio::spawn(async move {
-                spawn_master_discovery_service(
-                    listen_ip,
-                    cluster_port,
-                    dashboard_addr,
-                    discovery_port,
-                    disc_registry,
-                    disc_secret,
-                    disc_shutdown_rx,
-                )
-                .await;
-            });
+                let disc_registry = handle.registry().clone();
+                let disc_secret = config.cluster_secret.clone();
+                tokio::spawn(async move {
+                    spawn_master_discovery_service(
+                        listen_ip,
+                        cluster_port,
+                        dashboard_addr,
+                        discovery_port,
+                        disc_registry,
+                        disc_secret,
+                        disc_shutdown_rx,
+                    )
+                    .await;
+                });
+            }
         }
 
         // 6. Spawn Rendezvous Registry Periodic Registration (if configured)
@@ -4334,9 +4341,15 @@ async fn spawn_master_discovery_service(
     cluster_secret: Option<ClusterSecret>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let local_ip = if listen_ip.is_loopback() {
-        listen_ip
-    } else if listen_ip.is_unspecified() {
+    if listen_ip.to_canonical().is_loopback() {
+        info!(
+            listen_ip = %listen_ip,
+            cluster_port = cluster_port,
+            "Master UDP discovery is off for loopback listen address"
+        );
+        return;
+    }
+    let local_ip = if listen_ip.is_unspecified() {
         rusty_grid_core::discovery::get_local_ip_or_loopback()
     } else {
         listen_ip
@@ -4530,7 +4543,7 @@ mod tests {
     #[tokio::test]
     async fn test_master_server_discovery_service() {
         let disc_port = 18089;
-        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        let config = ServerConfig::new("0.0.0.0:0".parse().unwrap())
             .with_discovery(true)
             .with_discovery_port(disc_port);
 
@@ -4554,6 +4567,42 @@ mod tests {
         assert!(beacon
             .cluster_addr
             .ends_with(&format!(":{}", handle.server_addr().port())));
+
+        let _ = handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_loopback_master_starts_no_discovery_socket() {
+        let probe_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let disc_port = probe_sock.local_addr().unwrap().port();
+        drop(probe_sock);
+
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_discovery(true)
+            .with_discovery_port(disc_port);
+
+        let handle = MasterServer::spawn(config).await.unwrap();
+        assert!(handle.server_addr().ip().is_loopback());
+
+        // Give any background task a moment to run if it were mistakenly spawned.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Because the master listens on loopback, it must not bind 0.0.0.0:<disc_port>.
+        let check_bind = std::net::UdpSocket::bind(("0.0.0.0", disc_port));
+        assert!(
+            check_bind.is_ok(),
+            "Loopback master must not bind UDP discovery port 0.0.0.0:{disc_port}: {:?}",
+            check_bind.err()
+        );
+        drop(check_bind);
+
+        let discovered =
+            rusty_grid_core::discovery::discover_master(Duration::from_millis(250), disc_port)
+                .await;
+        assert!(
+            discovered.is_none(),
+            "Loopback master must not advertise a UDP discovery beacon: {discovered:?}"
+        );
 
         let _ = handle.shutdown();
     }
@@ -4592,7 +4641,7 @@ mod tests {
     #[tokio::test]
     async fn test_beacon_of_a_master_with_a_loopback_dashboard_advertises_no_dashboard() {
         let disc_port = 18091;
-        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        let config = ServerConfig::new("0.0.0.0:0".parse().unwrap())
             .with_web_ui(true)
             .with_web_ui_addr("127.0.0.1:0".parse().unwrap())
             .with_discovery(true)

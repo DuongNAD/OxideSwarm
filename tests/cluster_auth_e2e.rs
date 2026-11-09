@@ -566,7 +566,7 @@ async fn test_discovery_beacon_is_signed_only_for_authenticated_probes() {
         .local_addr()
         .unwrap()
         .port();
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+    let config = ServerConfig::new("0.0.0.0:0".parse().unwrap())
         .with_discovery(true)
         .with_discovery_port(udp_port)
         .with_cluster_secret(secret.clone());
