@@ -20,41 +20,130 @@ pub const STREAM_CLIENT: u8 = 0x03;
 #[cfg(feature = "p2p")]
 pub use iroh;
 
+#[cfg(feature = "p2p")]
+static PENDING_P2P_CLIENT_CLOSES: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "p2p")]
+fn register_pending_p2p_client_close(handle: tokio::task::JoinHandle<()>) {
+    if let Ok(mut pending) = PENDING_P2P_CLIENT_CLOSES.lock() {
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
+    }
+}
+
+/// Awaits any in-flight background `iroh::Endpoint::close()` tasks spawned when a
+/// [`P2pClientGuard`] was dropped inside a Tokio runtime, ensuring every ephemeral client
+/// endpoint finishes closing cleanly before the runtime shuts down.
+#[cfg(feature = "p2p")]
+pub async fn drain_pending_p2p_client_closes() {
+    // A close that does not finish in time must not keep the process from exiting: past the
+    // deadline the remaining close tasks are aborted, and the endpoints drop ungracefully.
+    let deadline = tokio::time::Instant::now() + P2P_CLIENT_CLOSE_TIMEOUT;
+    loop {
+        let batch: Vec<tokio::task::JoinHandle<()>> = match PENDING_P2P_CLIENT_CLOSES.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for mut handle in batch {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Upper bound on waiting for client P2P endpoints to close, in [`P2pClientGuard::close`] and in
+/// [`drain_pending_p2p_client_closes`].
+#[cfg(feature = "p2p")]
+pub const P2P_CLIENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(not(feature = "p2p"))]
+pub async fn drain_pending_p2p_client_closes() {}
+
 /// Keeps a client's ephemeral `iroh::Endpoint` and `iroh::endpoint::Connection` alive for the
-/// lifetime of its `GridStream::P2p`, closing both when the stream (or both of its
-/// [`BiStream::into_split`] halves) drops.
+/// lifetime of its `GridStream::P2p`, closing both when [`P2pClientGuard::close`] is called or
+/// when the stream (or both of its [`BiStream::into_split`] halves) drops.
 ///
-/// When dropped inside a Tokio runtime, `endpoint.close()` is spawned asynchronously; when
-/// dropped outside a Tokio runtime, a temporary current-thread runtime drives `endpoint.close()`
-/// synchronously so the endpoint still shuts down cleanly.
+/// When closed or dropped inside a Tokio runtime, `endpoint.close()` is spawned onto the runtime
+/// and registered with [`drain_pending_p2p_client_closes`]; when dropped outside a Tokio runtime,
+/// a temporary current-thread runtime drives `endpoint.close()` synchronously so the endpoint
+/// still shuts down cleanly.
 #[cfg(feature = "p2p")]
 pub struct P2pClientGuard {
     conn: iroh::endpoint::Connection,
     endpoint: iroh::Endpoint,
+    close_started: std::sync::atomic::AtomicBool,
+    closed_tx: tokio::sync::watch::Sender<bool>,
+    closed_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 #[cfg(feature = "p2p")]
 impl P2pClientGuard {
     pub fn new(conn: iroh::endpoint::Connection, endpoint: iroh::Endpoint) -> Self {
-        Self { conn, endpoint }
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        Self {
+            conn,
+            endpoint,
+            close_started: std::sync::atomic::AtomicBool::new(false),
+            closed_tx,
+            closed_rx,
+        }
+    }
+
+    /// Initiates graceful shutdown of the QUIC connection and underlying [`iroh::Endpoint`]
+    /// without awaiting directly: spawns `endpoint.close()` onto the active Tokio runtime
+    /// (registering its handle with [`drain_pending_p2p_client_closes`]), or drives it
+    /// synchronously on a temporary current-thread runtime when no Tokio runtime is active.
+    pub fn start_close(&self) {
+        if self
+            .close_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        self.conn.close(0u32.into(), b"client done");
+        if self.endpoint.is_closed() {
+            let _ = self.closed_tx.send(true);
+            return;
+        }
+        let ep = self.endpoint.clone();
+        let closed_tx = self.closed_tx.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let join = handle.spawn(async move {
+                ep.close().await;
+                let _ = closed_tx.send(true);
+            });
+            register_pending_p2p_client_close(join);
+        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(ep.close());
+            let _ = closed_tx.send(true);
+        }
+    }
+
+    /// Closes the QUIC connection and awaits graceful shutdown of the underlying
+    /// [`iroh::Endpoint`]. Safe to call multiple times; subsequent calls and [`Drop`] are no-ops
+    /// once the endpoint is closed.
+    pub async fn close(&self) {
+        self.start_close();
+        let mut rx = self.closed_rx.clone();
+        let _ = tokio::time::timeout(P2P_CLIENT_CLOSE_TIMEOUT, rx.wait_for(|closed| *closed)).await;
     }
 }
 
 #[cfg(feature = "p2p")]
 impl Drop for P2pClientGuard {
     fn drop(&mut self) {
-        self.conn.close(0u32.into(), b"client done");
-        let ep = self.endpoint.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                ep.close().await;
-            });
-        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            rt.block_on(ep.close());
-        }
+        self.start_close();
     }
 }
 
@@ -227,6 +316,18 @@ impl<R, W> BiStream<R, W> {
     pub fn writer(&self) -> &W {
         &self.writer
     }
+
+    #[cfg(feature = "p2p")]
+    pub fn p2p_guard(&self) -> Option<std::sync::Arc<P2pClientGuard>> {
+        self.p2p_guard.clone()
+    }
+
+    #[cfg(feature = "p2p")]
+    pub async fn close_p2p(&self) {
+        if let Some(ref guard) = self.p2p_guard {
+            guard.close().await;
+        }
+    }
 }
 
 impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for BiStream<R, W> {
@@ -263,6 +364,25 @@ pub enum GridStream {
     Mock(tokio::io::DuplexStream),
     #[cfg(feature = "p2p")]
     P2p(BiStream<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>),
+}
+
+impl GridStream {
+    #[cfg(feature = "p2p")]
+    pub fn p2p_guard(&self) -> Option<std::sync::Arc<P2pClientGuard>> {
+        match self {
+            GridStream::P2p(bi) => bi.p2p_guard(),
+            _ => None,
+        }
+    }
+
+    /// Gracefully closes the underlying client P2P endpoint (if this is a [`GridStream::P2p`]
+    /// with an attached [`P2pClientGuard`]). No-op for TCP and in-memory streams.
+    pub async fn close(&mut self) {
+        #[cfg(feature = "p2p")]
+        if let GridStream::P2p(bi) = self {
+            bi.close_p2p().await;
+        }
+    }
 }
 
 impl AsyncRead for GridStream {

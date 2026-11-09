@@ -1139,7 +1139,11 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     );
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let is_mcp = matches!(cli.command, Commands::Mcp(_));
-    let _ = if is_mcp {
+    let info_to_stdout = matches!(
+        cli.command,
+        Commands::Master(_) | Commands::Worker(_) | Commands::Mode(_)
+    );
+    let _ = if !info_to_stdout {
         builder.with_writer(std::io::stderr).try_init()
     } else {
         builder
@@ -1166,7 +1170,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     let secret_opts = cli.secret_opts();
     crate::connect::set_cli_master_key_flag(cli.master_key.clone());
     rusty_grid_core::mode::set_mode_runner_hook(crate::mode_cli::execute_mode_action);
-    match cli.command {
+    let exit_code = match cli.command {
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
         Commands::Submit(args) => run_submit_with_secret(args, config_file, secret_opts).await,
@@ -1196,7 +1200,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
             }
         }
         Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
-    }
+    };
+    rusty_grid_core::transport::drain_pending_p2p_client_closes().await;
+    exit_code
 }
 
 /// Resolve `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` / `[master].max_active_mb`
@@ -4529,12 +4535,14 @@ async fn run_result_inner(
                             .await
                         {
                             Ok(connection) => {
-                                crate::blobs::download_outputs(
+                                let res = crate::blobs::download_outputs(
                                     &connection,
                                     &result.outputs,
                                     output_dir,
                                 )
-                                .await
+                                .await;
+                                connection.close().await;
+                                res
                             }
                             Err(e) => Err(e.to_string()),
                         };

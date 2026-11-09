@@ -515,6 +515,14 @@ off by default until FEAT-3 is Implemented.
   the cold runs took 210.7 s and 207.4 s and the warm runs 6.9 s and 6.6 s, with no `Compiling`
   line and nothing uploaded. The run found that closing standard input cancels a running MCP call,
   and the guide's MCP example now keeps the pipe open.
+- 2026-11-09: LOG-1 follow-up for W7 P2P client commands (`crates/core/src/transport.rs`,
+  `crates/cli/src/blobs.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/doctor.rs`,
+  `crates/cli/src/mcp.rs`): client P2P endpoints (`P2pClientGuard` and `BlobConnection`) now close
+  gracefully and drain before process exit so `iroh::socket` no longer logs
+  `Endpoint dropped without calling Endpoint::close. Aborting ungracefully.` on `stderr`, and
+  `run_cli_with` routes all tracing of client commands (`submit`, `status`, `result`, `cancel`,
+  `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`, `mcp`) to `stderr` so `iroh`
+  `INFO` lines over a P2P ticket do not precede `--json` output on `stdout`.
 - 2026-11-09: Windows AppContainer isolation + `--workspaces` completed (`FEAT-3d`). Removed the
   Windows `--workspaces` + `--isolation fs|fs+net` start-up and runner refusals (`client.rs`,
   `runner.rs`), validated `workspace_root` with `validate_workspace_root_safe` (`isolation.rs`),
