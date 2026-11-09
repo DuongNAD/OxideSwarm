@@ -122,6 +122,20 @@ if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
   fail "join failed (see the message above); nothing was started"
 fi
 
+# The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
+# machines cannot reach each other directly (school or office Wi-Fi with client isolation), the
+# client checks below must use that ticket too. A ticket is an address, not a credential.
+TICKET=$(awk '
+  /^\[/ { in_worker = ($0 ~ /^\[worker\][[:space:]]*$/) }
+  in_worker && /^[[:space:]]*p2p_ticket[[:space:]]*=/ {
+    v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+    if (v ~ /^'"'"'.*'"'"'$/ || v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+    print v; exit
+  }' "$STATE/rusty-grid.toml" 2>/dev/null || true)
+if [ -n "$TICKET" ]; then
+  say "  link:    P2P ticket (the worker and the checks connect through iroh)"
+fi
+
 # 5. Worker options.
 if [ -z "$NAME" ]; then
   NAME=$(hostname -s 2>/dev/null || hostname)
@@ -157,7 +171,7 @@ CONNECTED=0
 i=0
 while [ $i -lt 30 ]; do
   # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-  if "$BIN" workers --json 2>/dev/null | awk -v n="$NAME" '
+  if { if [ -n "$TICKET" ]; then "$BIN" workers --json --master "$TICKET"; else "$BIN" workers --json; fi; } 2>/dev/null | awk -v n="$NAME" '
       /"name":/ { v = $2; gsub(/[",]/, "", v); cur = v }
       /"state:connected"/ && cur == n { found = 1 }
       END { exit !found }'; then
@@ -224,7 +238,7 @@ fi
 # 9. Check the cluster.
 say ""
 say "Checking the cluster (oxideswarm doctor) ..."
-if "$BIN" doctor; then
+if { if [ -n "$TICKET" ]; then "$BIN" doctor --master "$TICKET"; else "$BIN" doctor; fi; }; then
   DOCTOR="passed"
 else
   DOCTOR="reported a problem (see above)"

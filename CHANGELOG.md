@@ -6,9 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- On Windows, `oxideswarm worker --isolation fs` (or `fs+net`) without `--sandbox-base-dir` refused to start because `validate_sandbox_base_safe` (`crates/worker/src/isolation.rs`) allowed subdirectories of `%TEMP%` in its `USERPROFILE` check but only `<user_home>\.oxideswarm\sandboxes` in its `host.user_home` check, rejecting the default `%TEMP%\rusty_grid\sandboxes` (`<user_home>\AppData\Local\Temp\rusty_grid\sandboxes`). Both checks now accept dedicated OxideSwarm subdirectories inside `%TEMP%` / `<user_home>\AppData\Local\Temp` while still refusing `%TEMP%` itself, user folders, and directories containing non-OxideSwarm entries ([design 0033](docs/design/0033-os-level-task-isolation.md)).
+
+## [0.1.1] - 2026-11-10
+
+A patch release with fixes found while running 0.1.0 on real desktops. The protocol is still
+version 7, so 0.1.0 and 0.1.1 machines work together; upgrade in any order.
+
+### Added
+- The USB setup kit (`packaging/usb/`, [design 0053](docs/design/0053-usb-setup-kit.md)) also works where machines cannot reach each other directly, as on school or office Wi-Fi with client isolation. When the join token carries a P2P ticket (`secret join-token --p2p-ticket-file ...`, from a master started with `--p2p`), the installers run their checks through that ticket, as the worker does.
+
+### Fixed
 - `oxideswarm workers` printed every registered worker under "Connected Workers", including workers that had disconnected, and `status` counted them as connected. Both now count only workers whose `state:` tag is `connected`, and `workers` marks the others, for example `[disconnected]`. Use `workers --json` in scripts.
 - Stop raising modal pop-up dialogs and Windows Firewall prompts on Windows desktops: workers now call `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)` at start-up (and before bounded capability probes) so child task processes inherit it even with `--isolation off` instead of hanging on 16-bit/64-bit incompatibility or crash dialogs (`crates/core/src/capabilities.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`); a master listening on loopback now binds its UDP discovery socket to that loopback address (`127.0.0.1:<discovery_port>`) instead of `0.0.0.0:<discovery_port>` and answers local unicast probes without sending broadcast beacons (`crates/master/src/server.rs`); and a worker targeting a loopback master binds its standby HTTP portal to `127.0.0.1` instead of `0.0.0.0` (`crates/worker/src/client.rs`).
-- On Windows, `oxideswarm worker --isolation fs` (or `fs+net`) without `--sandbox-base-dir` refused to start because `validate_sandbox_base_safe` (`crates/worker/src/isolation.rs`) allowed subdirectories of `%TEMP%` in its `USERPROFILE` check but only `<user_home>\.oxideswarm\sandboxes` in its `host.user_home` check, rejecting the default `%TEMP%\rusty_grid\sandboxes` (`<user_home>\AppData\Local\Temp\rusty_grid\sandboxes`). Both checks now accept dedicated OxideSwarm subdirectories inside `%TEMP%` / `<user_home>\AppData\Local\Temp` while still refusing `%TEMP%` itself, user folders, and directories containing non-OxideSwarm entries ([design 0033](docs/design/0033-os-level-task-isolation.md)).
 
 ## [0.1.0] - 2026-11-09
 
