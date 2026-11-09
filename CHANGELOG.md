@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Stop raising modal pop-up dialogs and Windows Firewall prompts on Windows desktops: workers now call `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)` at start-up (and before bounded capability probes) so child task processes inherit it even with `--isolation off` instead of hanging on 16-bit/64-bit incompatibility or crash dialogs (`crates/core/src/capabilities.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`); a master listening on loopback no longer binds the `0.0.0.0:<discovery_port>` UDP discovery socket (`crates/master/src/server.rs`); and a worker targeting a loopback master binds its standby HTTP portal to `127.0.0.1` instead of `0.0.0.0` (`crates/worker/src/client.rs`).
+
 ## [0.1.0] - 2026-11-09
 
 The first tagged release: archives for Linux, macOS and Windows, with and without `gpu-wgpu`, and
