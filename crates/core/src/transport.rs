@@ -37,6 +37,9 @@ fn register_pending_p2p_client_close(handle: tokio::task::JoinHandle<()>) {
 /// endpoint finishes closing cleanly before the runtime shuts down.
 #[cfg(feature = "p2p")]
 pub async fn drain_pending_p2p_client_closes() {
+    // A close that does not finish in time must not keep the process from exiting: past the
+    // deadline the remaining close tasks are aborted, and the endpoints drop ungracefully.
+    let deadline = tokio::time::Instant::now() + P2P_CLIENT_CLOSE_TIMEOUT;
     loop {
         let batch: Vec<tokio::task::JoinHandle<()>> = match PENDING_P2P_CLIENT_CLOSES.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
@@ -45,11 +48,21 @@ pub async fn drain_pending_p2p_client_closes() {
         if batch.is_empty() {
             break;
         }
-        for handle in batch {
-            let _ = handle.await;
+        for mut handle in batch {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
         }
     }
 }
+
+/// Upper bound on waiting for client P2P endpoints to close, in [`P2pClientGuard::close`] and in
+/// [`drain_pending_p2p_client_closes`].
+#[cfg(feature = "p2p")]
+pub const P2P_CLIENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(not(feature = "p2p"))]
 pub async fn drain_pending_p2p_client_closes() {}
@@ -123,7 +136,7 @@ impl P2pClientGuard {
     pub async fn close(&self) {
         self.start_close();
         let mut rx = self.closed_rx.clone();
-        let _ = rx.wait_for(|closed| *closed).await;
+        let _ = tokio::time::timeout(P2P_CLIENT_CLOSE_TIMEOUT, rx.wait_for(|closed| *closed)).await;
     }
 }
 

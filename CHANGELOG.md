@@ -12,8 +12,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - The Windows USB installer passes a P2P ticket intact under Windows PowerShell 5.1, which dropped its double quotes, and the installers' checks no longer break on log lines that release 0.1.x writes to standard output.
-
-### Fixed
 - CLI client commands (`doctor`, `workers`, `submit`, `status`, `result`, `cancel`, `workspaces`, `mapreduce`, `join`, `secret`, `mcp`) now close their ephemeral `iroh::Endpoint`s (`P2pClientGuard` and `BlobConnection`) gracefully before exiting instead of logging `ERROR iroh::socket: Endpoint dropped without calling Endpoint::close. Aborting ungracefully.` to `stderr`, and route all client-command tracing to `stderr` so `iroh` `INFO` lines over a P2P ticket never land on `stdout` ahead of `--json` output (`LOG-1`, [design 0039](docs/design/0039-agent-workspaces.md)).
 
 ## [0.1.1] - 2026-11-10
