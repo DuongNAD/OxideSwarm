@@ -164,8 +164,14 @@ pub(crate) struct Jail<'a> {
     /// the Seatbelt profile names it: on Linux everything outside the sandbox is denied anyway.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub sandbox_base: &'a Path,
-    /// The task's own sandbox directory.
+    /// The task's own sandbox directory (or workspace tree directory).
     pub sandbox_dir: &'a Path,
+    /// An optional second writable directory for the task (the per-task `<workspace>/tmp`
+    /// directory when running inside a workspace).
+    pub extra_writable_dir: Option<&'a Path>,
+    /// The worker's workspace root directory when `--workspaces` is active, so other workspaces
+    /// and workspace metadata (`state.json`, `lock`) are denied.
+    pub workspace_root: Option<&'a Path>,
 }
 
 /// The program and arguments to spawn so that the task runs confined at `jail.level`.
@@ -362,16 +368,20 @@ mod macos {
     ];
 
     /// The Seatbelt profile text. All paths arrive as `-D` parameters (`SANDBOX_DIR`,
-    /// `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`, `CARGO_HOME`, `CARGO_CRED`,
-    /// `CARGO_CRED_TOML`, `ANCESTOR_<n>` for `ancestors` entries), so no path is ever spliced into
-    /// the profile text.
+    /// `EXTRA_WRITABLE_DIR`, `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`,
+    /// `CARGO_HOME`, `CARGO_CRED`, `CARGO_CRED_TOML`, `ANCESTOR_<n>` for `ancestors` entries),
+    /// so no path is ever spliced into the profile text.
     pub(super) fn profile(
         level: IsolationLevel,
+        has_extra_writable: bool,
         ancestors: usize,
         extra_denied: usize,
         protected: usize,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n");
+        if has_extra_writable {
+            p.push_str("    (subpath (param \"EXTRA_WRITABLE_DIR\"))\n");
+        }
         for dev in WRITABLE_DEVICES {
             p.push_str(&format!("    (literal \"{dev}\")\n"));
         }
@@ -383,8 +393,12 @@ mod macos {
             p.push_str(&format!("\n    (subpath (param \"DENIED_{i}\"))"));
         }
         p.push_str(")\n");
+        p.push_str("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n");
+        if has_extra_writable {
+            p.push_str("    (subpath (param \"EXTRA_WRITABLE_DIR\"))\n");
+        }
         p.push_str(
-            "(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"RUSTUP_HOME\"))\n    (subpath (param \"CARGO_HOME\")))\n",
+            "    (subpath (param \"RUSTUP_HOME\"))\n    (subpath (param \"CARGO_HOME\")))\n",
         );
         p.push_str(
             "(deny file-read*\n    (literal (param \"CARGO_CRED\"))\n    (literal (param \"CARGO_CRED_TOML\")))\n",
@@ -504,6 +518,8 @@ mod macos {
     /// Everything `sandbox-exec` is told: `-p <profile> -D name=value ...`.
     pub(super) fn arguments(jail: &Jail<'_>) -> Vec<String> {
         let sandbox_dir = canonical(jail.sandbox_dir);
+        let extra_writable = jail.extra_writable_dir.map(canonical);
+        let workspace_root = jail.workspace_root.map(canonical);
         let base = canonical(jail.sandbox_base);
         let home = canonical(&jail.host.user_home);
         let rustup = canonical(&jail.host.rustup_home);
@@ -512,13 +528,15 @@ mod macos {
 
         // Further places whose reads are denied: the account's real home (it differs from
         // `$HOME` when the worker runs with another one), the user temp directory (other tasks'
-        // and tools' scratch files, Blender's temp dirs), and the shared areas a task has no
-        // business in. The task's own sandbox is re-allowed after them.
+        // and tools' scratch files, Blender's temp dirs), the workspace root (other workspaces
+        // and workspace metadata), and the shared areas a task has no business in. The task's
+        // own sandbox (or workspace tree and tmp) is re-allowed after them.
         let mut extra: Vec<PathBuf> = Vec::new();
         let candidates = [
             account_home(),
             user_temp_dir(),
             user_cache_dir(),
+            workspace_root.clone(),
             Some(PathBuf::from("/Users/Shared")),
             Some(PathBuf::from("/private/tmp")),
             Some(PathBuf::from("/private/var/tmp")),
@@ -551,7 +569,11 @@ mod macos {
             .chain(extra.iter())
             .collect();
         let mut ancestors: Vec<PathBuf> = Vec::new();
-        for target in [&sandbox_dir, &rustup, &cargo] {
+        let mut targets = vec![&sandbox_dir, &rustup, &cargo];
+        if let Some(ref extra_dir) = extra_writable {
+            targets.push(extra_dir);
+        }
+        for target in targets {
             for dir in target.ancestors().skip(1) {
                 if dir.as_os_str().is_empty() || dir == Path::new("/") {
                     continue;
@@ -569,13 +591,22 @@ mod macos {
 
         let mut args = vec![
             "-p".to_string(),
-            profile(jail.level, ancestors.len(), extra.len(), protected.len()),
+            profile(
+                jail.level,
+                extra_writable.is_some(),
+                ancestors.len(),
+                extra.len(),
+                protected.len(),
+            ),
         ];
         let mut define = |name: &str, value: &Path| {
             args.push("-D".to_string());
             args.push(format!("{name}={}", value.to_string_lossy()));
         };
         define("SANDBOX_DIR", &sandbox_dir);
+        if let Some(ref extra_dir) = extra_writable {
+            define("EXTRA_WRITABLE_DIR", extra_dir);
+        }
         define("USER_HOME", &home);
         define("SANDBOX_BASE", &base);
         define("CACHE_DIR", &cache);
@@ -638,6 +669,8 @@ mod macos {
                 protected_files: &[],
                 sandbox_base,
                 sandbox_dir: &probe_dir,
+                extra_writable_dir: None,
+                workspace_root: None,
             };
             // Write inside: must work. Write beside the sandbox: must not.
             let script = "echo ok > \"$1/inside\" || exit 2; if echo no > \"$2/outside\" 2>/dev/null; then rm -f \"$2/outside\"; exit 3; fi";
@@ -800,7 +833,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_seatbelt_profile_orders_deny_allow_deny_and_adds_network_rule_for_fs_net() {
-        let fs = macos::profile(IsolationLevel::Fs, 2, 1, 1);
+        let fs = macos::profile(IsolationLevel::Fs, false, 2, 1, 1);
         let at = |needle: &str| {
             fs.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing in\n{fs}"))
@@ -813,6 +846,7 @@ mod tests {
         assert!(fs.contains("(deny file-write* (subpath \"/\"))"));
         assert!(fs.contains("(literal (param \"ANCESTOR_1\"))"));
         assert!(!fs.contains("ANCESTOR_2"));
+        assert!(!fs.contains("EXTRA_WRITABLE_DIR"));
         assert!(
             !fs.contains("(deny network*)"),
             "fs does not close the network, only the Unix sockets"
@@ -830,7 +864,10 @@ mod tests {
         ] {
             assert!(fs.contains(rule), "{rule} missing in\n{fs}");
         }
-        let net = macos::profile(IsolationLevel::FsNet, 0, 0, 0);
+        let ws = macos::profile(IsolationLevel::Fs, true, 1, 1, 0);
+        assert!(ws.contains("(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
+        assert!(ws.contains("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
+        let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));
     }
@@ -849,6 +886,8 @@ mod tests {
             protected_files: &[],
             sandbox_base: Path::new("/nonexistent-base"),
             sandbox_dir: Path::new("/nonexistent-base/t1"),
+            extra_writable_dir: None,
+            workspace_root: None,
         };
         let args = macos::arguments(&jail);
         assert_eq!(args[0], "-p");
@@ -904,6 +943,8 @@ mod tests {
             protected_files: &[],
             sandbox_base: Path::new("/sb"),
             sandbox_dir: Path::new("/sb/t"),
+            extra_writable_dir: None,
+            workspace_root: None,
         };
         let err = wrap_program(&jail, "sh", &[], "/bin").unwrap_err();
         assert!(err.contains("not implemented yet"), "{err}");

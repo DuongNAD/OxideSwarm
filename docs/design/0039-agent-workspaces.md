@@ -334,7 +334,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
-| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | W2a done (store, sync, locks, bounds and tests in `workspace.rs`); W2b pending (wiring into `runner.rs` and `client.rs`, options, advertising `WORKSPACES`) |
+| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/worker/src/isolation.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Done (W2a + W2b; Windows isolation + workspaces deferred until FEAT-3c) |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Done |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Done (`workspaces` lists the master's affinity map only, not the workspaces stored on workers, which needs W2b; `submit --workspace` warns when no connected worker advertises `WORKSPACES` yet) |
@@ -467,3 +467,26 @@ off by default until FEAT-3 is Implemented.
   client endpoint alive for the lifetime of the `GridStream::P2p` via `P2pClientGuard`, requiring a
   cluster secret unless `--insecure`, and mapping an older master's stream close after `STREAM_CLIENT`
   to the protocol version upgrade hint.
+- 2026-11-09: W2b done. `crates/cli/src/cli_app.rs` and `crates/cli/src/config.rs` add `--workspaces`
+  (`RUSTY_GRID_WORKSPACES`, `[worker].workspaces`, off by default), `--workspace-root`
+  (`RUSTY_GRID_WORKSPACE_ROOT`, `[worker].workspace_root`), `--workspace-limit-mb`
+  (`RUSTY_GRID_WORKSPACE_LIMIT_MB`, `[worker].workspace_limit_mb`, default `20480`) and
+  `--max-workspaces` (`RUSTY_GRID_MAX_WORKSPACES`, `[worker].max_workspaces`, default `8`), passed
+  through `WorkerConfig` (`crates/worker/src/client.rs`) and `RunnerConfig`
+  (`crates/worker/src/runner.rs`). Only with `--workspaces` does the worker open `WorkspaceStore` at
+  start-up (refusing to start with `GridError::Config` if the root fails the private-dir checks) and
+  advertise `ProtocolCapabilities::WORKSPACES` in `Register` (`WORKSPACES` remains out of
+  `ProtocolCapabilities::all_supported()`). For a task with `Task::workspace`, `fetch_task_inputs`
+  (`crates/worker/src/blob_client.rs`) fetches and pins the `WorkspaceSource::Tree` manifest and its
+  referenced blobs into `BlobCache` (which implements `workspace::BlobSource`), and
+  `TaskRunner::execute_workspace_workload` acquires the workspace lock (`DEFAULT_LOCK_WAIT`), syncs
+  the tree (or requires `is_ready()` when `source` is `None`), prepares `tmp/`, runs the command or
+  shell script with `cwd = tree_dir()` joined with the validated relative `working_dir`,
+  `TMPDIR`/`TMP`/`TEMP = tmp_dir()`, and `task_env()` (`RUSTY_GRID_WORKSPACE`,
+  `RUSTY_GRID_WORKSPACE_DIR`), copies `output_globs` from `tree_dir()` without moving files out of
+  the tree, calls `finish()` in `spawn_blocking` and appends any quota warning to `stderr`. Under
+  `--isolation fs|fs+net` on macOS (`sandbox-exec`) and Linux (`Landlock`), `Jail` grants read/write
+  access to `<ws>/tree` and `<ws>/tmp` while denying `<workspace_root>` (other workspaces and
+  `<ws>/state.json`), sandboxes, and the owner's home/secrets. Windows isolation + workspaces is
+  deferred until FEAT-3c (`WorkerClient::run` refuses `--workspaces` together with
+  `--isolation fs|fs+net` on Windows at start-up).

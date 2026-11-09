@@ -196,6 +196,203 @@ fn assert_fs_policy_holds(result: &TaskResult, what: &str) {
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn assert_workspace_confinement(level: IsolationLevel, ws_in_home: bool) {
+    use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+    use rusty_grid_core::task::WorkspaceRef;
+
+    let home = tempfile::tempdir().expect("home");
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::create_dir_all(home.path().join(".oxideswarm")).unwrap();
+    std::fs::write(home.path().join(".oxideswarm/cluster.secret"), SECRET).unwrap();
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::write(home.path().join(".ssh/test_key"), KEY).unwrap();
+
+    let sandbox_base = outside.path().join("sandboxes");
+    let ws_root = if ws_in_home {
+        home.path().join(".cache/oxideswarm/workspaces")
+    } else {
+        outside.path().join("workspaces")
+    };
+
+    let real = HostDirs::detect();
+    let host = HostDirs::from_home(
+        home.path().to_path_buf(),
+        Some(real.rustup_home),
+        Some(real.cargo_home),
+    );
+    let config = RunnerConfig::new(SandboxConfig::new(sandbox_base.clone()))
+        .with_isolation(level)
+        .with_host_dirs(host)
+        .with_workspaces(true)
+        .with_workspace_root(Some(ws_root.clone()));
+    let caps = WorkerCapabilities::new("feat3-ws", 4, 8192, false, false, None);
+    let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, config);
+    let cache = runner.blob_cache().expect("blob cache");
+
+    let file_data = b"manifest-hello";
+    let file_id = BlobId::of(file_data);
+    let tmp_file = cache.temp_path();
+    std::fs::write(&tmp_file, file_data).unwrap();
+    cache
+        .adopt(&tmp_file, file_id, file_data.len() as u64)
+        .unwrap();
+    let manifest = TreeManifest::new(vec![BlobFile {
+        path: "src/in.txt".into(),
+        id: file_id,
+        size: file_data.len() as u64,
+        executable: false,
+    }])
+    .unwrap();
+    let m_bytes = manifest.encode();
+    let m_id = BlobId::of(&m_bytes);
+    let tmp_m = cache.temp_path();
+    std::fs::write(&tmp_m, &m_bytes).unwrap();
+    cache.adopt(&tmp_m, m_id, m_bytes.len() as u64).unwrap();
+    let m_size = m_bytes.len() as u64;
+
+    // Populate a sibling workspace `other_ws` first so `<ws_root>/other_ws/tree/secret.txt` exists.
+    let seed_other = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'other-ws-secret' > secret.txt".into()],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("other_ws").with_tree(m_id, m_size));
+    let seed_res = runner.execute_task(&seed_other, None, None).await;
+    assert!(
+        seed_res.is_success(),
+        "seeding other_ws failed: {:?} / {}",
+        seed_res.error,
+        seed_res.stderr_str()
+    );
+    let other_secret_path = ws_root.join("other_ws/tree/secret.txt");
+    let other_planted_path = ws_root.join("other_ws/tree/planted.txt");
+    let active_state_json = ws_root.join("active_ws/state.json");
+    assert!(other_secret_path.exists());
+
+    // Now run a confined task in `active_ws` and verify it can read/write its own tree and tmp,
+    // but cannot read or write `other_ws`, `state.json`, `ws_root`, or the owner's home/secrets.
+    let script = r#"
+[ "$(cat src/in.txt)" = "manifest-hello" ] && echo READ_TREE_OK
+echo built-v1 > "$RUSTY_GRID_WORKSPACE_DIR/built.txt" && echo WRITE_TREE_OK
+[ "$(cat "$RUSTY_GRID_WORKSPACE_DIR/built.txt")" = "built-v1" ] && echo READ_BUILT_OK
+echo scratch > "$TMPDIR/scratch.txt" && echo WRITE_TMP_OK
+[ "$(cat "$TMPDIR/scratch.txt")" = "scratch" ] && echo READ_TMP_OK
+cat "$T_OTHER_SECRET" > /dev/null 2>&1 && echo LEAK_READ_OTHER_WS || echo DENY_READ_OTHER_WS
+( echo pwn > "$T_OTHER_PLANTED" ) 2>/dev/null && echo LEAK_WRITE_OTHER_WS || echo DENY_WRITE_OTHER_WS
+cat "$T_STATE_JSON" > /dev/null 2>&1 && echo LEAK_STATE_JSON || echo DENY_STATE_JSON
+ls "$T_WS_ROOT" > /dev/null 2>&1 && echo LEAK_WS_ROOT_LIST || echo DENY_WS_ROOT_LIST
+cat "$T_SECRET" > /dev/null 2>&1 && echo LEAK_SECRET || echo DENY_SECRET
+cat "$T_KEY" > /dev/null 2>&1 && echo LEAK_KEY || echo DENY_KEY
+( echo x > "$T_HOME/planted.txt" ) 2>/dev/null && echo LEAK_WRITE_HOME || echo DENY_WRITE_HOME
+"#;
+    let env = HashMap::from([
+        (
+            "T_OTHER_SECRET".into(),
+            other_secret_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "T_OTHER_PLANTED".into(),
+            other_planted_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "T_STATE_JSON".into(),
+            active_state_json.to_string_lossy().into_owned(),
+        ),
+        ("T_WS_ROOT".into(), ws_root.to_string_lossy().into_owned()),
+        (
+            "T_SECRET".into(),
+            home.path()
+                .join(".oxideswarm/cluster.secret")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "T_KEY".into(),
+            home.path()
+                .join(".ssh/test_key")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("T_HOME".into(), home.path().to_string_lossy().into_owned()),
+    ]);
+    let task1 = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env,
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("active_ws").with_tree(m_id, m_size));
+
+    let res1 = runner.execute_task(&task1, None, None).await;
+    assert!(
+        res1.is_success(),
+        "{level} (ws_in_home={ws_in_home}): {:?} / {}",
+        res1.error,
+        res1.stderr_str()
+    );
+    let got = lines(&res1);
+    for expected in [
+        "READ_TREE_OK",
+        "WRITE_TREE_OK",
+        "READ_BUILT_OK",
+        "WRITE_TMP_OK",
+        "READ_TMP_OK",
+        "DENY_READ_OTHER_WS",
+        "DENY_WRITE_OTHER_WS",
+        "DENY_STATE_JSON",
+        "DENY_WS_ROOT_LIST",
+        "DENY_SECRET",
+        "DENY_KEY",
+        "DENY_WRITE_HOME",
+    ] {
+        assert!(
+            got.iter().any(|l| l == expected),
+            "{level} (ws_in_home={ws_in_home}): missing {expected}; output was {got:?}"
+        );
+    }
+    assert!(
+        !got.iter().any(|l| l.starts_with("LEAK_")),
+        "{level} (ws_in_home={ws_in_home}): forbidden access succeeded: {got:?}"
+    );
+    assert!(!other_planted_path.exists());
+    assert!(!home.path().join("planted.txt").exists());
+
+    // Second task in `active_ws` sees `built.txt` and a fresh `$TMPDIR`.
+    let task2 = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"[ "$(cat built.txt)" = "built-v1" ] && [ ! -e "$TMPDIR/scratch.txt" ] && echo SECOND_OK"#
+                    .into(),
+            ],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 60),
+    )
+    .with_workspace(WorkspaceRef::new("active_ws"));
+    let res2 = runner.execute_task(&task2, None, None).await;
+    assert!(
+        res2.is_success() && res2.stdout_str().contains("SECOND_OK"),
+        "{level} second task: {:?} / {} / {}",
+        res2.error,
+        res2.stdout_str(),
+        res2.stderr_str()
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
@@ -238,6 +435,14 @@ mod macos {
         let rig = Rig::new(IsolationLevel::Fs, true);
         let result = rig.run(FS_SCRIPT).await;
         assert_fs_policy_holds(&result, "base inside home");
+    }
+
+    #[tokio::test]
+    async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_workspace_confinement(level, false).await;
+        }
+        assert_workspace_confinement(IsolationLevel::Fs, true).await;
     }
 
     #[tokio::test]
@@ -2024,6 +2229,15 @@ cargo build --offline 2>&1
             "{}",
             result.stderr_str()
         );
+    }
+
+    #[tokio::test]
+    async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
+        require_landlock!();
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_workspace_confinement(level, false).await;
+        }
+        assert_workspace_confinement(IsolationLevel::Fs, true).await;
     }
 }
 

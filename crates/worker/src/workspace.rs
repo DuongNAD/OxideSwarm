@@ -571,6 +571,7 @@ pub struct WorkspaceGuard {
 
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
+        let _ = self._file.unlock();
         in_process_held()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

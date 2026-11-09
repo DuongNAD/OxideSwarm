@@ -630,13 +630,29 @@ mod sys {
             let access = access_for(Want::ReadWrite, is_dir(&fd), handled);
             rules.push(Rule { fd, access });
 
+            if let Some(extra_dir) = jail.extra_writable_dir {
+                let extra = canonical(extra_dir);
+                let fd = open_path(&extra).ok_or_else(|| {
+                    format!(
+                        "cannot open the task temp directory {} for the policy",
+                        extra.display()
+                    )
+                })?;
+                let access = access_for(Want::ReadWrite, is_dir(&fd), handled);
+                rules.push(Rule { fd, access });
+            }
+
             for device in WRITABLE_DEVICES {
                 if let Some(fd) = open_path(Path::new(device)) {
                     let access = access_for(Want::Device, is_dir(&fd), handled);
                     rules.push(Rule { fd, access });
                 }
             }
-            for path in read_only_grants(jail.host, jail.protected_files) {
+            let mut protected = jail.protected_files.to_vec();
+            if let Some(ws_root) = jail.workspace_root {
+                protected.push(ws_root.to_path_buf());
+            }
+            for path in read_only_grants(jail.host, &protected) {
                 if let Some(fd) = open_path(&path) {
                     let access = access_for(Want::ReadExec, is_dir(&fd), handled);
                     rules.push(Rule { fd, access });
@@ -882,6 +898,8 @@ exit 0"#;
             protected_files: &[],
             sandbox_base: base,
             sandbox_dir: dir,
+            extra_writable_dir: None,
+            workspace_root: None,
         };
         let confinement = Confinement::build(&jail).map_err(fail)?;
         let inside = canonical(dir);

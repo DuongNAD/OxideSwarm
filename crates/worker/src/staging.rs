@@ -127,7 +127,7 @@ pub fn collect_outputs(
     limits: OutputLimits,
     process_failed: bool,
 ) -> Result<Vec<BlobFile>, String> {
-    collect_outputs_inner(root, patterns, cache, limits, process_failed, None)
+    collect_outputs_inner(root, patterns, cache, limits, process_failed, true, None)
 }
 
 /// Like [`collect_outputs`], and pins each file in `cache` at the moment it enters the cache so
@@ -140,6 +140,19 @@ pub fn collect_outputs_pinned(
     limits: OutputLimits,
     process_failed: bool,
 ) -> Result<(Vec<BlobFile>, CachePin), String> {
+    collect_outputs_from_dir_pinned(root, patterns, cache, limits, process_failed, true)
+}
+
+/// Like [`collect_outputs_pinned`], with `allow_move` controlling whether `cache` may move files
+/// out of `root` (pass `false` for persistent workspace trees so outputs remain in place).
+pub fn collect_outputs_from_dir_pinned(
+    root: &Path,
+    patterns: &[String],
+    cache: &Arc<BlobCache>,
+    limits: OutputLimits,
+    process_failed: bool,
+    allow_move: bool,
+) -> Result<(Vec<BlobFile>, CachePin), String> {
     let mut pin = cache.pin(std::iter::empty());
     let outputs = collect_outputs_inner(
         root,
@@ -147,6 +160,7 @@ pub fn collect_outputs_pinned(
         cache,
         limits,
         process_failed,
+        allow_move,
         Some(&mut pin),
     )?;
     Ok((outputs, pin))
@@ -158,6 +172,7 @@ fn collect_outputs_inner(
     cache: &BlobCache,
     limits: OutputLimits,
     process_failed: bool,
+    allow_move: bool,
     mut pin: Option<&mut CachePin>,
 ) -> Result<Vec<BlobFile>, String> {
     let patterns = patterns
@@ -276,8 +291,8 @@ fn collect_outputs_inner(
     for (rel, file) in found {
         let executable = is_executable(&file.path);
         let (id, size) = match pin.as_deref_mut() {
-            Some(pin) => cache.insert_file_pinned(&file.path, true, pin),
-            None => cache.insert_file(&file.path, true),
+            Some(pin) => cache.insert_file_pinned(&file.path, allow_move, pin),
+            None => cache.insert_file(&file.path, allow_move),
         }
         .map_err(|e| format!("output '{rel}': {e}"))?;
         outputs.push(BlobFile {
