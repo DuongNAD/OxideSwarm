@@ -518,7 +518,10 @@ off by default until FEAT-3 is Implemented.
 - 2026-11-09: Windows AppContainer isolation + `--workspaces` completed (`FEAT-3d`). Removed the
   Windows `--workspaces` + `--isolation fs|fs+net` start-up and runner refusals (`client.rs`,
   `runner.rs`), validated `workspace_root` with `validate_workspace_root_safe` (`isolation.rs`),
-  denied `<workspace_root>` (`(OI)(CI)`) to `oxideswarm.workspace.deny` while granting `<ws>/tree`
-  and `<ws>/tmp` to the per-task `oxideswarm.sandbox.<task_id>` SID without `DELETE` on the `tree`
-  and `tmp` directory nodes themselves, and added Windows workspace confinement and tree-swap
-  regression tests in `crates/worker/tests/test_feat3_os_isolation.rs`.
+  granted `oxideswarm.toolchain` non-inherited traverse-only (`FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`,
+  `NO_INHERITANCE`) on `<workspace_root>` and `<workspace_root>/<ws_name>`, protected
+  `<ws>/state.json` and `<ws>/lock` with `owner_only_entries`, and granted `<ws>/tree` and
+  `<ws>/tmp` to the per-task AppContainer SID `oxideswarm.task.<worker8>.<run_token>` without
+  `DELETE` on the `tree` and `tmp` directory nodes themselves (restoring `owner_only_entries` on
+  task cleanup), with Windows workspace confinement and tree-swap regression tests in
+  `crates/worker/tests/test_feat3_os_isolation.rs`.

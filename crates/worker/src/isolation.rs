@@ -2704,31 +2704,43 @@ pub mod windows {
         }
         // Refuse to rewrite the DACL of a folder inside the user's home directory (such as
         // `C:\Users\me\Documents` or `C:\Users\me\Desktop`) unless it is inside OxideSwarm's own
-        // `<user_home>\.oxideswarm\sandboxes` directory.
+        // `<user_home>\.oxideswarm\sandboxes` directory or a dedicated subdirectory under `%TEMP%`
+        // (such as the default `%TEMP%\rusty_grid\sandboxes`).
+        let is_allowed_under_home = |home: &Path| -> bool {
+            let allowed_ox = home.join(".oxideswarm").join("sandboxes");
+            let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
+            let in_home_temp = path_starts_with_ci(sandbox_base, &allowed_home_temp)
+                && !path_starts_with_ci(&allowed_home_temp, sandbox_base);
+            let temp_is_inside_home = !temp_root.as_os_str().is_empty()
+                && path_starts_with_ci(&temp_root, home)
+                && !path_starts_with_ci(home, &temp_root);
+            let in_env_temp = temp_is_inside_home
+                && path_starts_with_ci(sandbox_base, &temp_root)
+                && !path_starts_with_ci(&temp_root, sandbox_base);
+            path_starts_with_ci(sandbox_base, &allowed_ox) || in_home_temp || in_env_temp
+        };
         if !host.user_home.as_os_str().is_empty()
             && path_starts_with_ci(sandbox_base, &host.user_home)
+            && !is_allowed_under_home(&host.user_home)
         {
             let allowed_ox = host.user_home.join(".oxideswarm").join("sandboxes");
-            if !path_starts_with_ci(sandbox_base, &allowed_ox) {
+            return Err(format!(
+                "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
+                sandbox_base.display(),
+                allowed_ox.display()
+            ));
+        }
+        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if !env_up.as_os_str().is_empty()
+                && path_starts_with_ci(sandbox_base, &env_up)
+                && !is_allowed_under_home(&env_up)
+            {
+                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
                 return Err(format!(
                     "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
                     sandbox_base.display(),
                     allowed_ox.display()
                 ));
-            }
-        }
-        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-            if !env_up.as_os_str().is_empty() && path_starts_with_ci(sandbox_base, &env_up) {
-                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
-                let in_ox_sandboxes = path_starts_with_ci(sandbox_base, &allowed_ox);
-                let in_temp = path_starts_with_ci(sandbox_base, &temp_root);
-                if !in_ox_sandboxes && !in_temp {
-                    return Err(format!(
-                        "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
-                        sandbox_base.display(),
-                        allowed_ox.display()
-                    ));
-                }
             }
         }
         // If `sandbox_base` already exists on disk, refuse to rewrite its DACL if it contains any
@@ -3652,20 +3664,56 @@ pub mod windows {
             }
             self.cleaned_up = true;
             if !self.workspace_dirs_to_restore.is_empty() {
-                if let (Ok(user_sid), Ok(system_sid), Ok(admins_sid)) = (
+                match (
                     OwnedSid::current_user(),
                     OwnedSid::from_well_known(WinLocalSystemSid),
                     OwnedSid::from_well_known(WinBuiltinAdministratorsSid),
                 ) {
-                    let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-                    let owner_only_entries = [
-                        explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-                        explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-                        explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-                    ];
-                    for dir in self.workspace_dirs_to_restore.drain(..) {
-                        if dir.exists() && !is_reparse_point(&dir) {
-                            let _ = set_protected_dacl_on_path(&dir, &owner_only_entries);
+                    (Ok(user_sid), Ok(system_sid), Ok(admins_sid)) => {
+                        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+                        let owner_only_entries = [
+                            explicit_access(
+                                user_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                system_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                admins_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                        ];
+                        for dir in self.workspace_dirs_to_restore.drain(..) {
+                            if dir.exists() && !is_reparse_point(&dir) {
+                                if let Err(err) =
+                                    set_protected_dacl_on_path(&dir, &owner_only_entries)
+                                {
+                                    tracing::warn!(
+                                        path = %dir.display(),
+                                        error = %err,
+                                        "Failed to restore owner-only DACL on workspace directory during AppContainer cleanup"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (u_res, s_res, a_res) => {
+                        for dir in self.workspace_dirs_to_restore.drain(..) {
+                            tracing::warn!(
+                                path = %dir.display(),
+                                user_sid_err = ?u_res.as_ref().err(),
+                                system_sid_err = ?s_res.as_ref().err(),
+                                admins_sid_err = ?a_res.as_ref().err(),
+                                "Failed to resolve owner-only SIDs to restore workspace directory DACL during AppContainer cleanup"
+                            );
                         }
                     }
                 }
@@ -4948,6 +4996,18 @@ mod tests {
         std::fs::create_dir_all(&ox_sandboxes).unwrap();
         windows::validate_sandbox_base_safe(&ox_sandboxes, &host)
             .expect("<user_home>\\.oxideswarm\\sandboxes must be accepted");
+
+        let home_temp_root = fake_home.path().join("AppData").join("Local").join("Temp");
+        std::fs::create_dir_all(&home_temp_root).unwrap();
+        let err_temp_root = windows::validate_sandbox_base_safe(&home_temp_root, &host)
+            .expect_err("must reject <user_home>\\AppData\\Local\\Temp itself");
+        assert!(err_temp_root.contains("user folder"), "{err_temp_root}");
+
+        let default_temp_sandboxes = home_temp_root.join("rusty_grid").join("sandboxes");
+        std::fs::create_dir_all(&default_temp_sandboxes).unwrap();
+        windows::validate_sandbox_base_safe(&default_temp_sandboxes, &host).expect(
+            "default <user_home>\\AppData\\Local\\Temp\\rusty_grid\\sandboxes must be accepted",
+        );
 
         let outside = tempfile::tempdir().unwrap();
         let non_empty = outside.path().join("operator_folder");

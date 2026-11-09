@@ -5841,6 +5841,80 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             assert_windows_workspace_tree_swap_regression(level).await;
         }
     }
+
+    #[tokio::test]
+    async fn test_worker_with_default_sandbox_base_inside_user_home_starts_and_runs_under_fs() {
+        require_appcontainer!();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let rustup_home = temp_home.path().join(".rustup");
+        let cargo_home = temp_home.path().join(".cargo");
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(temp_home.path().join(".oxideswarm")).unwrap();
+        std::fs::write(
+            temp_home.path().join(".oxideswarm").join("cluster.secret"),
+            SECRET,
+        )
+        .unwrap();
+
+        let temp_dir_in_home = temp_home.path().join("AppData").join("Local").join("Temp");
+        std::fs::create_dir_all(&temp_dir_in_home).unwrap();
+        let default_sandbox_cfg = SandboxConfig::default_under(temp_dir_in_home.clone());
+        assert_eq!(
+            default_sandbox_cfg.base_dir,
+            temp_dir_in_home.join("rusty_grid").join("sandboxes")
+        );
+
+        let host = HostDirs::from_home(
+            temp_home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+
+        rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &default_sandbox_cfg.base_dir,
+            &host,
+            &[],
+        )
+        .await
+        .expect(
+            "worker with --isolation fs and default sandbox base under <user_home>\\AppData\\Local\\Temp\\rusty_grid\\sandboxes must pass startup check",
+        );
+
+        let runner_cfg = RunnerConfig::new(default_sandbox_cfg)
+            .with_isolation(IsolationLevel::Fs)
+            .with_host_dirs(host.clone());
+        let caps = WorkerCapabilities::new("feat3-default-sb", 2, 4096, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_cfg);
+        let task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    "echo DEFAULT_SB_OK > out.txt & type out.txt".into(),
+                ],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        let manifest_path = temp_home
+            .path()
+            .join(".oxideswarm")
+            .join("windows_acl_grants.txt");
+        let _ =
+            rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(&manifest_path);
+        assert!(
+            res.is_success() && res.stdout_str().contains("DEFAULT_SB_OK"),
+            "task under default sandbox base must succeed: {:?} / {} / {}",
+            res.error,
+            res.stdout_str(),
+            res.stderr_str()
+        );
+    }
 }
 
 /// Where there is no implementation on an unsupported OS, isolation is refused
