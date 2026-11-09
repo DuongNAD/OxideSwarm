@@ -3436,7 +3436,6 @@ try {
     }
 
     #[tokio::test]
-    #[ignore = "cargo inside a Windows AppContainer is not supported yet: opening NUL (Stdio::null()) from inside an AppContainer under an elevated administrator session on Windows Server returns ERROR_ACCESS_DENIED (os error 5) before CreateProcessW when cargo spawns rustc -vV"]
     async fn test_cargo_build_offline_works_under_fs() {
         let staged = staged_toolchain();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
@@ -3491,7 +3490,6 @@ try {
     }
 
     #[tokio::test]
-    #[ignore = "cargo inside a Windows AppContainer is not supported yet: opening NUL (Stdio::null()) from inside an AppContainer under an elevated administrator session on Windows Server returns ERROR_ACCESS_DENIED (os error 5) before CreateProcessW when cargo spawns rustc -vV"]
     async fn test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home() {
         let staged = staged_toolchain();
         let mut rig = Rig::new(IsolationLevel::Fs, false);
@@ -5345,6 +5343,476 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
                 stdout.contains(&expected_prefix),
                 "DryRun output missing `{expected_prefix}`:\n{stdout}"
             );
+        }
+    }
+
+    async fn assert_windows_workspace_confinement(level: IsolationLevel, ws_in_home: bool) {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(home.path().join(".oxideswarm")).unwrap();
+        std::fs::write(
+            home.path().join(".oxideswarm").join("cluster.secret"),
+            SECRET,
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh").join("test_key"), KEY).unwrap();
+
+        let sandbox_base = outside.path().join("sandboxes");
+        let ws_root = if ws_in_home {
+            home.path()
+                .join(".cache")
+                .join("oxideswarm")
+                .join("workspaces")
+        } else {
+            outside.path().join("workspaces")
+        };
+
+        let rustup_home = home.path().join(".rustup");
+        let cargo_home = home.path().join(".cargo");
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let host = HostDirs::from_home(
+            home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+        let config = RunnerConfig::new(SandboxConfig::new(sandbox_base.clone()))
+            .with_isolation(level)
+            .with_host_dirs(host)
+            .with_workspaces(true)
+            .with_workspace_root(Some(ws_root.clone()));
+        let caps = WorkerCapabilities::new("feat3-ws", 4, 8192, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, config);
+        let cache = runner.blob_cache().expect("blob cache");
+
+        let file_data = b"manifest-hello";
+        let file_id = BlobId::of(file_data);
+        let tmp_file = cache.temp_path();
+        std::fs::write(&tmp_file, file_data).unwrap();
+        cache
+            .adopt(&tmp_file, file_id, file_data.len() as u64)
+            .unwrap();
+        let manifest = TreeManifest::new(vec![BlobFile {
+            path: "src/in.txt".into(),
+            id: file_id,
+            size: file_data.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let m_bytes = manifest.encode();
+        let m_id = BlobId::of(&m_bytes);
+        let tmp_m = cache.temp_path();
+        std::fs::write(&tmp_m, &m_bytes).unwrap();
+        cache.adopt(&tmp_m, m_id, m_bytes.len() as u64).unwrap();
+        let m_size = m_bytes.len() as u64;
+
+        let seed_other = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), "(echo other-ws-secret)>secret.txt".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("other_ws").with_tree(m_id, m_size));
+        let seed_res = runner.execute_task(&seed_other, None, None).await;
+        assert!(
+            seed_res.is_success(),
+            "seeding other_ws failed: {:?} / {}",
+            seed_res.error,
+            seed_res.stderr_str()
+        );
+        let other_tree_path = ws_root.join("other_ws").join("tree");
+        let other_secret_path = other_tree_path.join("secret.txt");
+        let other_planted_path = other_tree_path.join("planted.txt");
+        let active_state_json = ws_root.join("active_ws").join("state.json");
+        assert!(other_secret_path.exists());
+
+        let script = r#"
+(findstr manifest-hello src\in.txt >NUL 2>NUL && echo READ_TREE_OK) &
+((echo built-v1)>%RUSTY_GRID_WORKSPACE_DIR%\built.txt && echo WRITE_TREE_OK) &
+(findstr built-v1 %RUSTY_GRID_WORKSPACE_DIR%\built.txt >NUL 2>NUL && echo READ_BUILT_OK) &
+((echo scratch)>%TMPDIR%\scratch.txt && echo WRITE_TMP_OK) &
+(findstr scratch %TMPDIR%\scratch.txt >NUL 2>NUL && echo READ_TMP_OK) &
+(type %T_OTHER_SECRET% >NUL 2>NUL && echo LEAK_READ_OTHER_WS || echo DENY_READ_OTHER_WS) &
+((echo pwn>%T_OTHER_PLANTED%) >NUL 2>NUL & if exist %T_OTHER_PLANTED% (echo LEAK_WRITE_OTHER_WS) else (echo DENY_WRITE_OTHER_WS)) &
+(type %T_STATE_JSON% >NUL 2>NUL && echo LEAK_STATE_JSON || echo DENY_STATE_JSON) &
+(dir /b %T_WS_ROOT% >NUL 2>NUL && echo LEAK_WS_ROOT_LIST || echo DENY_WS_ROOT_LIST) &
+(type ..\state.json >NUL 2>NUL && echo LEAK_DOTDOT_STATE || echo DENY_DOTDOT_STATE) &
+(type ..\..\other_ws\tree\secret.txt >NUL 2>NUL && echo LEAK_DOTDOT_OTHER_WS || echo DENY_DOTDOT_OTHER_WS) &
+((mklink /J %RUSTY_GRID_WORKSPACE_DIR%\sym_other %T_OTHER_TREE% >NUL 2>NUL && type %RUSTY_GRID_WORKSPACE_DIR%\sym_other\secret.txt >NUL 2>NUL) && echo LEAK_SYMLINK_OTHER_WS || echo DENY_SYMLINK_OTHER_WS) &
+(rmdir %RUSTY_GRID_WORKSPACE_DIR%\sym_other >NUL 2>NUL) &
+((mklink /H %RUSTY_GRID_WORKSPACE_DIR%\hard_other %T_OTHER_SECRET% >NUL 2>NUL && type %RUSTY_GRID_WORKSPACE_DIR%\hard_other >NUL 2>NUL) && echo LEAK_HARDLINK_OTHER_WS || echo DENY_HARDLINK_OTHER_WS) &
+(del /f /q %RUSTY_GRID_WORKSPACE_DIR%\hard_other >NUL 2>NUL) &
+(type %T_SECRET% >NUL 2>NUL && echo LEAK_SECRET || echo DENY_SECRET) &
+(type %T_KEY% >NUL 2>NUL && echo LEAK_KEY || echo DENY_KEY) &
+((echo x>%T_HOME%\planted.txt) >NUL 2>NUL & if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))
+"#
+        .replace('\n', " ");
+
+        let env = HashMap::from([
+            (
+                "T_OTHER_TREE".into(),
+                other_tree_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "T_OTHER_SECRET".into(),
+                other_secret_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "T_OTHER_PLANTED".into(),
+                other_planted_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "T_STATE_JSON".into(),
+                active_state_json.to_string_lossy().into_owned(),
+            ),
+            ("T_WS_ROOT".into(), ws_root.to_string_lossy().into_owned()),
+            (
+                "T_SECRET".into(),
+                home.path()
+                    .join(".oxideswarm")
+                    .join("cluster.secret")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "T_KEY".into(),
+                home.path()
+                    .join(".ssh")
+                    .join("test_key")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("T_HOME".into(), home.path().to_string_lossy().into_owned()),
+        ]);
+        let task1 = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), script],
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("active_ws").with_tree(m_id, m_size));
+
+        let res1 = runner.execute_task(&task1, None, None).await;
+        assert!(
+            res1.is_success(),
+            "{level} (ws_in_home={ws_in_home}): {:?} / {}",
+            res1.error,
+            res1.stderr_str()
+        );
+        let got = lines(&res1);
+        for expected in [
+            "READ_TREE_OK",
+            "WRITE_TREE_OK",
+            "READ_BUILT_OK",
+            "WRITE_TMP_OK",
+            "READ_TMP_OK",
+        ] {
+            assert!(
+                got.iter().any(|l| l == expected),
+                "{level} (ws_in_home={ws_in_home}): missing {expected}; output was {got:?}"
+            );
+        }
+
+        let probes = [
+            "READ_OTHER_WS",
+            "WRITE_OTHER_WS",
+            "STATE_JSON",
+            "WS_ROOT_LIST",
+            "DOTDOT_STATE",
+            "DOTDOT_OTHER_WS",
+            "SYMLINK_OTHER_WS",
+            "HARDLINK_OTHER_WS",
+            "SECRET",
+            "KEY",
+            "WRITE_HOME",
+        ];
+        if level == IsolationLevel::Off {
+            for probe in probes {
+                let expected = format!("LEAK_{probe}");
+                assert!(
+                    got.contains(&expected),
+                    "unconfined control (ws_in_home={ws_in_home}): {expected} must succeed so the confined tests prove something; output was {got:?}"
+                );
+            }
+            return;
+        }
+
+        for probe in probes {
+            let expected = format!("DENY_{probe}");
+            assert!(
+                got.contains(&expected),
+                "{level} (ws_in_home={ws_in_home}): missing {expected}; output was {got:?}"
+            );
+        }
+        assert!(
+            !got.iter().any(|l| l.starts_with("LEAK_")),
+            "{level} (ws_in_home={ws_in_home}): forbidden access succeeded: {got:?}"
+        );
+        assert!(!other_planted_path.exists());
+        assert!(!home.path().join("planted.txt").exists());
+
+        // Second task in `active_ws` sees `built.txt` and a fresh `%TMPDIR%`.
+        let task2 = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    r#"findstr built-v1 built.txt >NUL 2>NUL && if not exist %TMPDIR%\scratch.txt echo SECOND_OK"#
+                        .into(),
+                ],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("active_ws"));
+        let res2 = runner.execute_task(&task2, None, None).await;
+        assert!(
+            res2.is_success() && res2.stdout_str().contains("SECOND_OK"),
+            "{level} second task: {:?} / {} / {}",
+            res2.error,
+            res2.stdout_str(),
+            res2.stderr_str()
+        );
+    }
+
+    async fn assert_windows_workspace_tree_swap_regression(level: IsolationLevel) {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim_dir = home.path().join("victim");
+        let victim_sub = victim_dir.join("victim_only");
+        std::fs::create_dir_all(&victim_sub).unwrap();
+        let victim_secret = victim_dir.join("secret.txt");
+        let victim_planted = victim_sub.join("pwned.txt");
+        std::fs::write(&victim_secret, "dummy-victim-secret").unwrap();
+
+        let sandbox_base = outside.path().join("sandboxes");
+        let ws_root = outside.path().join("workspaces");
+
+        let rustup_home = home.path().join(".rustup");
+        let cargo_home = home.path().join(".cargo");
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let host = HostDirs::from_home(
+            home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+        let config = RunnerConfig::new(SandboxConfig::new(sandbox_base))
+            .with_isolation(level)
+            .with_host_dirs(host)
+            .with_workspaces(true)
+            .with_workspace_root(Some(ws_root.clone()));
+        let caps = WorkerCapabilities::new("feat3-ws-swap", 4, 8192, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, config);
+        let cache = runner.blob_cache().expect("blob cache");
+
+        let file_data = b"hello";
+        let file_id = BlobId::of(file_data);
+        let tmp_file = cache.temp_path();
+        std::fs::write(&tmp_file, file_data).unwrap();
+        cache
+            .adopt(&tmp_file, file_id, file_data.len() as u64)
+            .unwrap();
+        let manifest = TreeManifest::new(vec![BlobFile {
+            path: "in.txt".into(),
+            id: file_id,
+            size: file_data.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let m_bytes = manifest.encode();
+        let m_id = BlobId::of(&m_bytes);
+        let tmp_m = cache.temp_path();
+        std::fs::write(&tmp_m, &m_bytes).unwrap();
+        cache.adopt(&tmp_m, m_id, m_bytes.len() as u64).unwrap();
+        let m_size = m_bytes.len() as u64;
+
+        let swap_script = r#"cd /d %TMPDIR% & (rmdir /s /q %RUSTY_GRID_WORKSPACE_DIR% >NUL 2>NUL && mklink /J %RUSTY_GRID_WORKSPACE_DIR% %T_VICTIM% >NUL 2>NUL && echo SWAP_OK || echo SWAP_DENIED)"#;
+        let task1 = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), swap_script.into()],
+                env: HashMap::from([(
+                    "T_VICTIM".into(),
+                    victim_dir.to_string_lossy().into_owned(),
+                )]),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("swap_ws").with_tree(m_id, m_size));
+        let res1 = runner.execute_task(&task1, None, None).await;
+
+        let probe_victim_script = r#"(type secret.txt 2>NUL && echo LEAK_VICTIM_READ) & ((echo pwn>victim_only\pwned.txt) 2>NUL & if exist victim_only\pwned.txt echo LEAK_VICTIM_WRITE) & echo TASK2_RAN"#;
+        let task2 = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), probe_victim_script.into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("swap_ws"));
+        let res2 = runner.execute_task(&task2, None, None).await;
+
+        let swap_denied = res1.stdout_str().contains("SWAP_DENIED");
+        let task2_refused = !res2.is_success() && !res2.stdout_str().contains("TASK2_RAN");
+        assert!(
+            swap_denied || task2_refused,
+            "{level}: either task 1's tree swap must be denied or task 2 must be refused; res1={:?}/{}, res2={:?}/{}",
+            res1.error,
+            res1.stdout_str(),
+            res2.error,
+            res2.stdout_str()
+        );
+        assert!(
+            !res2.stdout_str().contains("LEAK_VICTIM_READ")
+                && !res2.stdout_str().contains("LEAK_VICTIM_WRITE")
+                && !res2.stdout_str().contains("dummy-victim-secret"),
+            "{level}: task 2 touched or read the victim directory: {}",
+            res2.stdout_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_secret).unwrap(),
+            "dummy-victim-secret"
+        );
+        assert!(!victim_planted.exists());
+
+        // Pre-run junction check (defense in depth): if `<ws>/tree` is replaced with a junction on
+        // disk outside the sandbox, the next workspace run (without or with a source) refuses to
+        // run, never touches the victim, and repairs the workspace.
+        let seed = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), "echo ok".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("tamper_ws").with_tree(m_id, m_size));
+        assert!(runner.execute_task(&seed, None, None).await.is_success());
+
+        let tamper_tree = ws_root.join("tamper_ws").join("tree");
+        std::fs::remove_dir_all(&tamper_tree).unwrap();
+        let j_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &tamper_tree.to_string_lossy(),
+                &victim_dir.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J");
+        assert!(j_status.success());
+
+        let no_source_task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), probe_victim_script.into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("tamper_ws"));
+        let no_source_res = runner.execute_task(&no_source_task, None, None).await;
+        assert!(
+            !no_source_res.is_success() && !no_source_res.stdout_str().contains("TASK2_RAN"),
+            "{level}: task without source must be refused when tree is a junction: {:?} / {} / {}",
+            no_source_res.error,
+            no_source_res.stdout_str(),
+            no_source_res.stderr_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_secret).unwrap(),
+            "dummy-victim-secret"
+        );
+        assert!(!victim_planted.exists());
+        assert!(
+            !rusty_grid_worker::isolation::windows::is_reparse_point(&tamper_tree),
+            "tampered tree junction must be wiped/repaired under the workspace lock"
+        );
+
+        std::fs::remove_dir_all(&tamper_tree).unwrap();
+        let j_status2 = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &tamper_tree.to_string_lossy(),
+                &victim_dir.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J");
+        assert!(j_status2.success());
+        let with_source_task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), probe_victim_script.into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 35),
+        )
+        .with_workspace(WorkspaceRef::new("tamper_ws").with_tree(m_id, m_size));
+        let with_source_res = runner.execute_task(&with_source_task, None, None).await;
+        assert!(
+            !with_source_res.is_success() && !with_source_res.stdout_str().contains("TASK2_RAN"),
+            "{level}: task with source must be refused when tree is a junction: {:?} / {}",
+            with_source_res.error,
+            with_source_res.stderr_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_secret).unwrap(),
+            "dummy-victim-secret"
+        );
+        assert!(!victim_planted.exists());
+        assert!(
+            !rusty_grid_worker::isolation::windows::is_reparse_point(&tamper_tree),
+            "tampered tree junction must be wiped/repaired under the workspace lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
+        require_appcontainer!();
+        assert_windows_workspace_confinement(IsolationLevel::Off, false).await;
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_windows_workspace_confinement(level, false).await;
+        }
+        assert_windows_workspace_confinement(IsolationLevel::Fs, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_workspace_tree_swap_is_denied_and_never_touches_victim() {
+        require_appcontainer!();
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_windows_workspace_tree_swap_regression(level).await;
         }
     }
 }

@@ -1954,14 +1954,6 @@ impl WorkerClient {
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.
         if self.config.isolation != IsolationLevel::Off {
-            if cfg!(windows) && self.config.workspaces {
-                let err = GridError::Config(
-                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (FEAT-3c is not implemented); start the worker with --isolation off or without --workspaces"
-                        .to_string(),
-                );
-                error!(worker_id = %self.worker_id, error = %err, "Task isolation with workspaces cannot be enforced on Windows");
-                return Err(err);
-            }
             if let Err(err) = crate::isolation::verify_isolation_support_with_config(
                 self.config.isolation,
                 &self.runner.config().sandbox_config.base_dir,
