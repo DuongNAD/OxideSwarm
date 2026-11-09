@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `3ce2a65` plus the live two-machine run: 64 items Implemented, 4 Partial and 37 Planned. Five items
+On 2026-11-10, at `master` `cf664ee` plus TEST-21, TEST-22, DOC-8 and LOG-1: 68 items Implemented, 4 Partial and 36 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -162,7 +162,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
-| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
+| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
+| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
+| TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -170,6 +172,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 |  | Implemented | 70 |
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
+| DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 (open) |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
@@ -768,6 +771,13 @@ The full suite must pass on a clean machine before CI can require it.
   3. Set `.with_ram_mb(4096)` in `WorkerClient::for_testing` and `spawn_test_worker`.
 - **Done when:** `cargo test -p rusty_grid_master --test m4_challenger_2_stress --locked` passes 20 times in a row on Windows inside the full-suite lock, and `runner::tests::test_runner_pre_cancelled_task_does_not_spawn_child` verifies that a pre-cancelled task does not spawn a child process.
 
+### TEST-22: Ignore UUID and metric `4090` tokens in `workflow_modes_test`
+
+- **Evidence:** CI failure on `macos-latest` (run `42690928796`, job `129410135311`) in `tests/workflow_modes_test.rs:313` (`test_research_mode_distributed_and_report`): `output must not print invented RTX / worker-gpu-rtx4090 hardware or node names`.
+- **Problem:** `generate_research_report` writes `expected_task_id` and `codec_decoded_task_id` (random UUIDv4 strings `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`) plus integer RAM/timing metrics into `target/research_report.json`. `contains_standalone_number` only checked `c.is_ascii_digit() || c == '.'` on the characters immediately before and after `"4090"`, so a UUIDv4 with `-4090-` in its third hyphen-delimited group (or `4090` adjacent to hex digits `'a'..='f'`), or a JSON/unit-labelled metric equal to `4090`, was mistaken for an `"RTX 4090"` GPU model name.
+- **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
+- **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
+
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
@@ -868,6 +878,27 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Add `docs/guides/mcp-client-setup.md` with snippets for Claude Code, Codex and Cursor. Add
   an MCP row to `docs/SECURITY.md`.
 - **Done when:** Each snippet was run once, and the guide follows the guide template.
+
+### DOC-8: Update `CLAUDE.md` and `SECURITY.md` for Windows isolation
+
+- **Evidence:** Read after pull request 152 (`FEAT-3c`) merged.
+- **Problem:** Two documents still described the state before pull request 152 (`FEAT-3c`):
+  - `CLAUDE.md` omitted that `cargo` under the Windows AppContainer (`--isolation fs|fs+net`) is
+    `Planned` as `FEAT-3d` and that a Windows worker refuses `--workspaces` with isolation inside the
+    `isolation.rs` summary;
+  - `docs/SECURITY.md` listed task sandboxing only under "Not considered / not provided" (section 2)
+    and omitted `--isolation off|fs|fs+net` (`crates/worker/src/isolation.rs`, design 0033) from
+    section 7 ("Who runs the tasks").
+- **Do:** Update `CLAUDE.md` and `docs/SECURITY.md` to match `crates/worker/src/isolation.rs`:
+  Windows `--isolation fs|fs+net` uses a per-task Win32 AppContainer (`FEAT-3c`), `cargo` under it is
+  `Planned` as `FEAT-3d`, and a Windows worker refuses `--workspaces` with `--isolation fs|fs+net`.
+- **Done when:** Neither `CLAUDE.md` nor `docs/SECURITY.md` claims that Windows AppContainer
+  isolation is unimplemented or that task sandboxing is not provided when `--isolation fs|fs+net` is
+  enabled, and both state the `FEAT-3d` (`cargo`) and `--workspaces` limits on Windows.
+
+- **Note (2026-11-10):** FEAT-3d (pull request 183) merged before DOC-8, so the merged documents
+  state the FEAT-3d behaviour (cargo and workspaces under the Windows AppContainer on a worker that
+  is not elevated) instead of the limits above.
 
 ### REL-1: Restore the Apache licence text
 
@@ -2034,7 +2065,7 @@ Add one dated line per finished item, newest last.
   on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
   passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
   29 Planned.
-- 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
+- 2026-11-09: Added and implemented TEST-20 (pull request 181): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
@@ -2051,13 +2082,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-10: Phase 9 added with NET-1 to NET-8, all Planned, from Phase H of the roadmap and design
   0054 (Draft): the owner's long-term goal of an open compute network. The Index counts are now
   63 Implemented, 4 Partial and 37 Planned.
-- 2026-11-10: Added and implemented LOG-1 (pull request 194, open): client P2P endpoints in
-  `crates/core/src/transport.rs` and `crates/cli/src/blobs.rs` now close gracefully before process
-  exit (with `drain_pending_p2p_client_closes` awaited before `run_doctor`, `McpState::close` and
-  `run_cli_with` return), and `run_cli_with` routes all tracing of client commands (`submit`,
-  `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
-  `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
-  Index counts are now 64 Implemented, 4 Partial and 37 Planned.
 - 2026-11-10: Implemented FEAT-3d (pull request 183, open): enabled `cargo build --offline` and
   `--workspaces` under `--isolation fs|fs+net` on non-elevated Windows workers without Object
   Manager DACL edits (`get_or_init_worker_lua_token` using `CreateRestrictedToken` with `LUA_TOKEN`
@@ -2066,3 +2090,32 @@ Add one dated line per finished item, newest last.
   in `validate_sandbox_base_safe`, and a startup `WARN` + `tool:cargo` tag removal when a Windows
   worker runs elevated with isolation). Verified in CI run `42678349017` across all 22 jobs and
   locally on Windows 11. The Index counts are now 64 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented TEST-22 (pull request 200, open): updated `contains_standalone_number` in
+  `tests/workflow_modes_test.rs` so UUIDv4 hex groups (`-4090-`, `4090a...`) and JSON/unit-labelled
+  numeric measurements (`: 4090`, `4090 ms`, `4090 MB`) in `research_report.json` are not mistaken
+  for an invented RTX 4090 GPU model name. The Index counts are now 65 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented TEST-21 (pull request 198, open): fixed the Windows CI flakes in
+  `tests/m6_challenger_1_stress.rs` and `crates/agent_mesh/tests/test_sec6_mesh_sandbox.rs` by
+  delegating Windows task process termination on drop to `ProcessTree` (`#[cfg(not(windows))]
+  cmd.kill_on_drop(true)` in `runner.rs` with leader-PID fallback in `ProcessTree::drop`) so
+  `tokio::process::Child::drop` does not call `TerminateProcess` synchronously ahead of
+  `MIN_LIVE_KILL_AGE`, keeping `shutdown_tx` alive across `ChallengerTestCluster::abort_worker`,
+  aborting the actual assigned worker (`info.assigned_worker_id`) with `SINGLE_TASK_TIMEOUT` in
+  `test_adversarial_unexpected_tcp_eof_during_active_task_execution`, summing numbers in pure POSIX
+  shell before `sleep` in `test_adversarial_mapreduce_worker_drop_during_reduce_phase`, and retrying
+  transient socket buffer/port exhaustion (`WSAENOBUFS` `10055`, `WSAEADDRINUSE` `10048`) in
+  `AgentMeshClient::connect` and `AgentMeshHub::start`. `m6_challenger_1_stress` passed 20/20
+  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 66 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented DOC-8 (pull request 196, open): updated `CLAUDE.md` and
+  `docs/SECURITY.md` to match `crates/worker/src/isolation.rs` after pull request 152 (`FEAT-3c`),
+  recording that `--isolation fs|fs+net` confines tasks on macOS (`sandbox-exec`), Linux (Landlock,
+  seccomp, namespaces) and Windows (per-task AppContainer + NTFS DACLs + private Desktop), that
+  `cargo` under the Windows AppContainer is `Planned` as `FEAT-3d`, and that a Windows worker
+  refuses `--workspaces` with `--isolation fs|fs+net`. The Index counts are now 67 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented LOG-1 (pull request 194, open): client P2P endpoints in
+  `crates/core/src/transport.rs` and `crates/cli/src/blobs.rs` now close gracefully before process
+  exit (with `drain_pending_p2p_client_closes` awaited before `run_doctor`, `McpState::close` and
+  `run_cli_with` return), and `run_cli_with` routes all tracing of client commands (`submit`,
+  `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
+  `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
+  Index counts are now 68 Implemented, 4 Partial and 36 Planned.
