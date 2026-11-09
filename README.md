@@ -155,8 +155,8 @@ installed and does the work. Neither machine has to build OxideSwarm.
    oxideswarm worker --workspaces                                   # on B
    ```
 
-4. **Check from A** that B offers workspaces and Cargo: `oxideswarm workers` lists B with
-   `feat:workspaces` and `tool:cargo` among its tags.
+4. **Check from A** that B offers workspaces and Cargo: in `oxideswarm workers --json`, B's `tags`
+   include `feat:workspaces` and `tool:cargo`.
 5. **Offload** from the root of a Rust project on A:
 
    ```bash

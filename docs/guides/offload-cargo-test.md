@@ -36,10 +36,10 @@ On macOS and Linux, `--isolation fs` ([design 0033](../design/0033-os-level-task
 On the client machine:
 
 ```bash
-./target/release/oxideswarm workers --master <MASTER_IP>:8088
+./target/release/oxideswarm workers --master <MASTER_IP>:8088 --json
 ```
 
-Expected: the remote worker is `connected` and its `TAGS` column includes `feat:workspaces` and `tool:cargo` (`crates/cli/src/cli_app.rs`).
+Expected: the remote worker's `tags` include `state:connected`, `feat:workspaces` and `tool:cargo` (the plain `workers` listing shows the worker and its link, but not its tags).
 
 ### 3. Offload cargo test from the command line
 
