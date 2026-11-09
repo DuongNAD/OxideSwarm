@@ -87,11 +87,13 @@ use crate::protocol::{MessageTransport, ProtocolError};
 
 pub use crate::protocol::WIRE_FORMAT_AUTH;
 
-/// Handshake protocol version carried in HELLO. Version 2 is the first one that guarantees the
-/// AEAD record layer after the handshake; it is the only version accepted.
+/// Handshake protocol version carried in HELLO for shared-secret auth (OXS-AUTH v2).
+/// Version 2 is the first one that guarantees the AEAD record layer after the handshake.
 pub const AUTH_VERSION: u8 = 2;
+/// Handshake protocol version carried in HELLO for per-machine Noise IK auth (OXS-AUTH v3).
+pub const AUTH_VERSION_V3: u8 = 3;
 /// The previous version, used by builds with and without the record layer alike; refused.
-const AUTH_VERSION_V1: u8 = 1;
+pub(crate) const AUTH_VERSION_V1: u8 = 1;
 /// Minimum accepted secret length in bytes (32 hex characters).
 pub const MIN_SECRET_BYTES: usize = 16;
 /// Length in bytes of secrets produced by [`ClusterSecret::generate`].
@@ -142,15 +144,18 @@ pub const REJECT_AUTH_FAILED: &str = "authentication failed";
 pub const REJECT_AUTH_REQUIRED: &str = "authentication required";
 pub const REJECT_NO_SECRET: &str = "server has no secret configured";
 pub const REJECT_UNSUPPORTED_VERSION: &str = "unsupported auth version";
+pub const REJECT_MEMBERS_ONLY: &str =
+    "this master admits enrolled machines only; join with an invite";
+pub const REJECT_WRONG_MASTER_KEY: &str = "master public key mismatch";
 
 /// Actionable text of [`GridError::AuthRequired`] when a master demands the secret.
 pub const AUTH_REQUIRED_HINT: &str = "master requires the cluster secret; copy ~/.oxideswarm/cluster.secret from the master or set OXIDESWARM_SECRET";
 
-const KIND_HELLO: u8 = 0x01;
+pub(crate) const KIND_HELLO: u8 = 0x01;
 const KIND_CHALLENGE: u8 = 0x02;
 const KIND_PROOF: u8 = 0x03;
 const KIND_OK: u8 = 0x04;
-const KIND_REJECT: u8 = 0x05;
+pub(crate) const KIND_REJECT: u8 = 0x05;
 
 // Version 2 labels; version 1 used the same scheme with an `oxs1-` prefix.
 const LABEL_SERVER: &[u8] = b"oxs2-srv";
@@ -473,7 +478,7 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Message of a `GridError::Config`, without the "Configuration error:" prefix.
-fn config_detail(e: &GridError) -> String {
+pub(crate) fn config_detail(e: &GridError) -> String {
     match e {
         GridError::Config(msg) => msg.clone(),
         other => other.to_string(),
@@ -482,7 +487,7 @@ fn config_detail(e: &GridError) -> String {
 
 /// Creates `path` exclusively (mode 0600 on Unix, a protected owner/SYSTEM/Administrators DACL on
 /// Windows) and writes `data` to it.
-fn write_private_new(path: &Path, data: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private_new(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
     #[cfg(windows)]
     let mut file = crate::private_file::create_private_new(path)?;
@@ -545,7 +550,7 @@ pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
 // Handshake
 // ---------------------------------------------------------------------------------------------
 
-fn auth_frame(kind: u8, parts: &[&[u8]]) -> Bytes {
+pub(crate) fn auth_frame(kind: u8, parts: &[&[u8]]) -> Bytes {
     let mut buf = Vec::with_capacity(2 + parts.iter().map(|p| p.len()).sum::<usize>());
     buf.push(WIRE_FORMAT_AUTH);
     buf.push(kind);
@@ -556,15 +561,23 @@ fn auth_frame(kind: u8, parts: &[&[u8]]) -> Bytes {
 }
 
 /// Splits `[0x03][kind][body]` into `(kind, body)`.
-fn split_auth_frame(frame: &[u8]) -> Option<(u8, &[u8])> {
+pub(crate) fn split_auth_frame(frame: &[u8]) -> Option<(u8, &[u8])> {
     match frame {
         [WIRE_FORMAT_AUTH, kind, body @ ..] => Some((*kind, body)),
         _ => None,
     }
 }
 
+/// If `frame` is an authentication `HELLO` (`[0x03][KIND_HELLO][ver][..]`), returns `Some(ver)`.
+pub fn peek_hello_version(frame: &[u8]) -> Option<u8> {
+    match split_auth_frame(frame) {
+        Some((KIND_HELLO, [ver, ..])) => Some(*ver),
+        _ => None,
+    }
+}
+
 /// Reads one pre-authentication frame (capped at [`PRE_AUTH_MAX_FRAME`]).
-async fn recv_auth_frame<T>(t: &mut MessageTransport<T>) -> Result<Option<Bytes>, ProtocolError>
+pub async fn recv_auth_frame<T>(t: &mut MessageTransport<T>) -> Result<Option<Bytes>, ProtocolError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -589,9 +602,9 @@ where
 
 /// Fails a server-side handshake: waits [`FAILURE_DELAY`], sends a generic REJECT best effort,
 /// and returns the internal `detail` as an [`GridError::AuthFailed`] for the caller to log.
-async fn reject_peer<T>(
+pub async fn reject_peer<T>(
     t: &mut MessageTransport<T>,
-    reason: &'static str,
+    reason: &str,
     detail: impl Into<String>,
 ) -> GridError
 where
@@ -605,7 +618,7 @@ where
 }
 
 /// Turns a REJECT body from a peer into an error, sanitising the untrusted text.
-fn error_from_reject(body: &[u8]) -> GridError {
+pub(crate) fn error_from_reject(body: &[u8]) -> GridError {
     let body = &body[..body.len().min(MAX_REJECT_REASON)];
     let reason: String = String::from_utf8_lossy(body)
         .chars()
@@ -634,12 +647,20 @@ fn error_from_reject(body: &[u8]) -> GridError {
              {AUTH_VERSION}, with an encrypted connection); run the same OxideSwarm release on \
              the master and on this node"
         )),
+        REJECT_WRONG_MASTER_KEY => GridError::AuthFailed(
+            "the master's public key does not match the pinned --master-key; check the master's v3 \
+             public key or re-join the cluster"
+                .to_string(),
+        ),
+        r if r.starts_with("Incompatible protocol version ") => {
+            GridError::IncompatibleVersion(reason)
+        }
         other => GridError::AuthFailed(format!("the master rejected authentication: {other}")),
     }
 }
 
 /// Maps a transport error seen while reading a handshake frame.
-fn handshake_read_error(e: ProtocolError) -> GridError {
+pub(crate) fn handshake_read_error(e: ProtocolError) -> GridError {
     match e {
         ProtocolError::FrameTooLarge { max, .. } => GridError::AuthFailed(format!(
             "peer sent a handshake frame larger than {max} bytes"
@@ -761,7 +782,19 @@ where
         Err(e) => return Err(e.into()),
     };
 
-    let body = match split_auth_frame(&hello) {
+    server_handshake_from_hello(t, &hello, secret).await
+}
+
+/// Completes the v2 server-side handshake after the initial `hello` frame has been read.
+pub async fn server_handshake_from_hello<T>(
+    t: &mut MessageTransport<T>,
+    hello: &[u8],
+    secret: &ClusterSecret,
+) -> GridResult<[u8; MAC_LEN]>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let body = match split_auth_frame(hello) {
         Some((KIND_HELLO, body)) => body,
         _ => {
             return Err(reject_peer(

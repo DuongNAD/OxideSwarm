@@ -25,8 +25,9 @@ chrono = { workspace = true, features = ["serde"] }
 sysinfo = { workspace = true }
 iroh = { workspace = true, optional = true }
 
-# Cluster authentication (HMAC-SHA256, CSPRNG) and TCP socket options; both already in Cargo.lock.
+# Cluster authentication (HMAC-SHA256, CSPRNG, Noise IK v3) and TCP socket options.
 ring = "0.17"
+snow = { version = "0.10", features = ["risky-raw-split"] }
 socket2 = { version = "0.6", features = ["all"] }
 
 # Content-addressed blob ids (already in Cargo.lock via iroh).
