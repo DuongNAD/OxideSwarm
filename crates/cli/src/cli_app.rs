@@ -515,6 +515,33 @@ pub struct WorkerArgs {
 
     #[arg(
         long,
+        help = "Enable persistent named workspaces on this worker (off by default; opens the workspace store at start-up and advertises ProtocolCapabilities::WORKSPACES / feat:workspaces; env RUSTY_GRID_WORKSPACES, config [worker].workspaces)"
+    )]
+    pub workspaces: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Root directory for persistent named workspaces (default: <cache dir>/oxideswarm/workspaces; env RUSTY_GRID_WORKSPACE_ROOT, config [worker].workspace_root)"
+    )]
+    pub workspace_root: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Per-workspace disk quota in MiB; exceeding it prints a warning on task stderr and marks the workspace first to evict (default 20480; env RUSTY_GRID_WORKSPACE_LIMIT_MB, config [worker].workspace_limit_mb)"
+    )]
+    pub workspace_limit_mb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum number of persistent workspaces kept on disk before idle LRU eviction (default 8; env RUSTY_GRID_MAX_WORKSPACES, config [worker].max_workspaces)"
+    )]
+    pub max_workspaces: Option<usize>,
+
+    #[arg(
+        long,
         help = "Do not serve the standby portal (HTTP on 0.0.0.0:8080 that sends a browser to the master's dashboard); env RUSTY_GRID_NO_PORTAL. Useful for a second worker on one machine"
     )]
     pub no_portal: bool,
@@ -2252,9 +2279,45 @@ async fn run_worker(
         worker_cfg.as_ref().and_then(|w| w.output_limit_mb),
         rusty_grid_worker::DEFAULT_OUTPUT_LIMIT_BYTES / MIB,
     );
+    let workspaces = resolve_bool(
+        args.workspaces.then_some(true),
+        &["RUSTY_GRID_WORKSPACES"],
+        worker_cfg.as_ref().and_then(|w| w.workspaces),
+        false,
+    );
+    let workspace_root = resolve_opt_string(
+        args.workspace_root.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_WORKSPACE_ROOT"],
+        worker_cfg.as_ref().and_then(|w| w.workspace_root.clone()),
+    )
+    .map(PathBuf::from);
+    let workspace_limit_mb = resolve_u64(
+        args.workspace_limit_mb,
+        &["RUSTY_GRID_WORKSPACE_LIMIT_MB"],
+        worker_cfg.as_ref().and_then(|w| w.workspace_limit_mb),
+        rusty_grid_worker::DEFAULT_WORKSPACE_LIMIT_MB,
+    );
+    if workspace_limit_mb == 0 {
+        eprintln!("--workspace-limit-mb / workspace_limit_mb must be at least 1 MiB (got 0)");
+        return ExitCode::FAILURE;
+    }
+    let max_workspaces = resolve_usize(
+        args.max_workspaces,
+        &["RUSTY_GRID_MAX_WORKSPACES"],
+        worker_cfg.as_ref().and_then(|w| w.max_workspaces),
+        rusty_grid_worker::DEFAULT_MAX_WORKSPACES,
+    );
+    if max_workspaces == 0 {
+        eprintln!("--max-workspaces / max_workspaces must be at least 1 (got 0)");
+        return ExitCode::FAILURE;
+    }
     config = config
         .with_blob_cache_bytes(blob_cache_mb.saturating_mul(MIB))
-        .with_output_limit_bytes(output_limit_mb.saturating_mul(MIB));
+        .with_output_limit_bytes(output_limit_mb.saturating_mul(MIB))
+        .with_workspaces(workspaces)
+        .with_workspace_root(workspace_root)
+        .with_workspace_limit_mb(workspace_limit_mb)
+        .with_max_workspaces(max_workspaces);
     config = config.with_redirection_portal(!no_portal);
     // A restarted worker is the same machine, not a new one: keep its id (see `identity`), when it
     // knows which machine it is. Otherwise every unnamed worker under this HOME would share one
@@ -7700,6 +7763,94 @@ relay_url = "https://cfg-client.relay.example.com"
             };
             assert_eq!(
                 run_status(st_args, None, secret_opts.clone()).await,
+                ExitCode::FAILURE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_workspace_options_parsing_precedence_and_validation() {
+        // 1. Default values when nothing is set.
+        let cli_default = Cli::try_parse_from(["oxideswarm", "worker"]).unwrap();
+        let Commands::Worker(w_default) = cli_default.command else {
+            panic!("expected Worker");
+        };
+        assert!(!w_default.workspaces);
+        assert!(w_default.workspace_root.is_none());
+        assert!(w_default.workspace_limit_mb.is_none());
+        assert!(w_default.max_workspaces.is_none());
+
+        // 2. CLI flags parse cleanly.
+        let cli_flags = Cli::try_parse_from([
+            "oxideswarm",
+            "worker",
+            "--workspaces",
+            "--workspace-root",
+            "/tmp/custom-ws",
+            "--workspace-limit-mb",
+            "4096",
+            "--max-workspaces",
+            "12",
+        ])
+        .unwrap();
+        let Commands::Worker(w_flags) = cli_flags.command else {
+            panic!("expected Worker");
+        };
+        assert!(w_flags.workspaces);
+        assert_eq!(
+            w_flags.workspace_root.as_deref(),
+            Some(Path::new("/tmp/custom-ws"))
+        );
+        assert_eq!(w_flags.workspace_limit_mb, Some(4096));
+        assert_eq!(w_flags.max_workspaces, Some(12));
+
+        // 3. Config file TOML deserialization for [worker] workspace keys.
+        let parsed_cfg: ConfigFile = toml::from_str(
+            r#"
+[worker]
+workspaces = true
+workspace_root = "/var/tmp/ox-ws"
+workspace_limit_mb = 10240
+max_workspaces = 4
+"#,
+        )
+        .expect("parse TOML");
+        let w_cfg = parsed_cfg.worker.as_ref().expect("worker section");
+        assert_eq!(w_cfg.workspaces, Some(true));
+        assert_eq!(w_cfg.workspace_root.as_deref(), Some("/var/tmp/ox-ws"));
+        assert_eq!(w_cfg.workspace_limit_mb, Some(10240));
+        assert_eq!(w_cfg.max_workspaces, Some(4));
+
+        // 4. Zero limits are rejected before network connect.
+        let secret = ClusterSecret::from_bytes(&[0x44; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(SecretText(secret.to_hex())),
+            file: None,
+        };
+        for bad_args in [
+            vec![
+                "oxideswarm",
+                "worker",
+                "--master",
+                "127.0.0.1:1",
+                "--workspace-limit-mb",
+                "0",
+            ],
+            vec![
+                "oxideswarm",
+                "worker",
+                "--master",
+                "127.0.0.1:1",
+                "--max-workspaces",
+                "0",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(bad_args).unwrap();
+            let Commands::Worker(args) = cli.command else {
+                panic!("expected Worker");
+            };
+            assert_eq!(
+                run_worker(args, None, secret_opts.clone()).await,
                 ExitCode::FAILURE
             );
         }

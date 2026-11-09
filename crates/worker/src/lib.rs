@@ -42,6 +42,9 @@ pub use runner::{
 };
 pub use sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 pub use staging::{OutputLimits, DEFAULT_MAX_OUTPUT_FILES, DEFAULT_OUTPUT_LIMIT_BYTES};
+pub use workspace::{
+    WorkspaceLimits, WorkspaceStore, DEFAULT_MAX_WORKSPACES, DEFAULT_WORKSPACE_LIMIT_MB,
+};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

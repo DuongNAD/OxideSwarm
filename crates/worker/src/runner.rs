@@ -61,13 +61,15 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use rusty_grid_core::blob::{TreeManifest, MAX_MANIFEST_BYTES};
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 #[cfg(feature = "3d")]
 use rusty_grid_core::task::Engine3D;
 use rusty_grid_core::task::{
     sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
-    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+    TaskSpec, WorkspaceRef, WorkspaceSource, MAX_AGGREGATE_ARTIFACT_BYTES,
+    MAX_OUTPUT_ARTIFACT_BYTES,
 };
 
 use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
@@ -75,8 +77,11 @@ use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
 use crate::isolation::{HostDirs, IsolationLevel};
 use crate::process_tree::{configure_command, ProcessPriority, ProcessTree};
-use crate::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
-use crate::staging::{collect_outputs_pinned, materialize_inputs, OutputLimits};
+use crate::sandbox::{
+    sanitize_relative_path, set_permissions, Sandbox, SandboxConfig, SandboxError,
+};
+use crate::staging::{collect_outputs_from_dir_pinned, materialize_inputs, OutputLimits};
+use crate::workspace::{WorkspaceError, WorkspaceLimits, WorkspaceStore};
 
 /// Exit code emitted on successful completion.
 pub const EXIT_CODE_SUCCESS: i32 = 0;
@@ -109,6 +114,9 @@ const POST_KILL_DRAIN: Duration = Duration::from_millis(500);
 /// How long to wait for the killed leader to be reaped.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Default maximum time a task waits to acquire its named workspace lock before failing.
+pub const DEFAULT_WORKSPACE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 /// Variables of the worker's own environment that task processes must never inherit: they hold
 /// the cluster secret or the agent-mesh token. (A task can still be handed one explicitly through
 /// its own `env`.)
@@ -140,6 +148,16 @@ pub struct RunnerConfig {
     /// Files denied to confined tasks wherever they are (the cluster secret file, the config
     /// file in use).
     pub protected_files: Vec<PathBuf>,
+    /// Whether persistent named workspaces (`--workspaces`, design 0039) are enabled.
+    pub workspaces: bool,
+    /// Custom workspace root directory (`--workspace-root`). `None` uses [`crate::workspace::default_root`].
+    pub workspace_root: Option<PathBuf>,
+    /// Size and count bounds for the workspace store (`--workspace-limit-mb`, `--max-workspaces`).
+    pub workspace_limits: WorkspaceLimits,
+    /// Optional pre-opened workspace store (for tests with custom clock or limits).
+    pub workspace_store: Option<WorkspaceStore>,
+    /// Maximum time a task waits to acquire a workspace lock before failing as busy.
+    pub workspace_lock_wait: Duration,
 }
 
 impl Default for RunnerConfig {
@@ -162,6 +180,11 @@ impl RunnerConfig {
             isolation: IsolationLevel::Off,
             host_dirs: HostDirs::detect(),
             protected_files: Vec::new(),
+            workspaces: false,
+            workspace_root: None,
+            workspace_limits: WorkspaceLimits::default(),
+            workspace_store: None,
+            workspace_lock_wait: DEFAULT_WORKSPACE_LOCK_WAIT,
         }
     }
 
@@ -180,6 +203,34 @@ impl RunnerConfig {
 
     pub fn with_host_dirs(mut self, host_dirs: HostDirs) -> Self {
         self.host_dirs = host_dirs;
+        self
+    }
+
+    pub fn with_workspaces(mut self, enabled: bool) -> Self {
+        self.workspaces = enabled;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: Option<PathBuf>) -> Self {
+        self.workspace_root = root;
+        self
+    }
+
+    pub fn with_workspace_limits(mut self, limits: WorkspaceLimits) -> Self {
+        self.workspace_limits = limits;
+        self
+    }
+
+    pub fn with_workspace_store(mut self, store: WorkspaceStore) -> Self {
+        self.workspaces = true;
+        self.workspace_root = Some(store.root().to_path_buf());
+        self.workspace_limits = store.limits();
+        self.workspace_store = Some(store);
+        self
+    }
+
+    pub fn with_workspace_lock_wait(mut self, wait: Duration) -> Self {
+        self.workspace_lock_wait = wait;
         self
     }
 
@@ -788,6 +839,9 @@ pub struct TaskRunner {
     config: RunnerConfig,
     /// The blob cache, opened on first use (see [`TaskRunner::blob_cache`]).
     blob_cache: std::sync::OnceLock<Result<Arc<BlobCache>, String>>,
+    /// Persistent named workspace store, opened at worker start-up or on first workspace task
+    /// when `config.workspaces` is true.
+    workspace_store: std::sync::RwLock<Option<WorkspaceStore>>,
     /// Where GPU-class tasks get their engine; rebuilds it after a device loss.
     #[cfg(feature = "gpu-wgpu")]
     gpu_engine: Arc<crate::wgpu_engine::EngineProvider>,
@@ -795,11 +849,13 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(worker_id: Uuid, capabilities: WorkerCapabilities, config: RunnerConfig) -> Self {
+        let initial_store = config.workspace_store.clone();
         Self {
             worker_id,
             capabilities,
             config,
             blob_cache: std::sync::OnceLock::new(),
+            workspace_store: std::sync::RwLock::new(initial_store),
             #[cfg(feature = "gpu-wgpu")]
             gpu_engine: crate::wgpu_engine::EngineProvider::shared(),
         }
@@ -852,6 +908,55 @@ impl TaskRunner {
         }
     }
 
+    /// Opens (creating and checking privacy on) the worker's persistent workspace store when
+    /// `config.workspaces` is true, and caches it for subsequent tasks. Returns `Ok(None)` when
+    /// `config.workspaces` is false.
+    pub async fn ensure_workspace_store(&self) -> Result<Option<WorkspaceStore>, String> {
+        if !self.config.workspaces {
+            return Ok(None);
+        }
+        if let Some(store) = self
+            .workspace_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Ok(Some(store));
+        }
+        let root = self.config.workspace_root.clone();
+        let limits = self.config.workspace_limits;
+        let store = tokio::task::spawn_blocking(move || WorkspaceStore::open(root, limits))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let mut slot = self
+            .workspace_store
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = slot.clone() {
+            return Ok(Some(existing));
+        }
+        *slot = Some(store.clone());
+        Ok(Some(store))
+    }
+
+    /// Returns the workspace root directory if workspaces are enabled and the store is open (or a
+    /// root path was configured).
+    fn workspace_root_if_open(&self) -> Option<PathBuf> {
+        if let Some(store) = self
+            .workspace_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return Some(store.root().to_path_buf());
+        }
+        self.config
+            .workspaces
+            .then(|| self.config.workspace_root.clone())
+            .flatten()
+    }
+
     /// Primary execution dispatcher with checkpoint resumption and mid-task checkpoint emission.
     pub async fn execute_task_with_checkpoint(
         &self,
@@ -892,6 +997,34 @@ impl TaskRunner {
                     outputs: Vec::new(),
                 };
             }
+        }
+
+        if let Some(ref ws) = task.workspace {
+            if !matches!(
+                task.spec,
+                TaskSpec::Command { .. } | TaskSpec::ShellScript { .. }
+            ) {
+                let msg = "workspace tasks only support Command and ShellScript workloads";
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Execution Error: {msg}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(msg.to_string()),
+                );
+            }
+            return self
+                .execute_workspace_workload(
+                    task,
+                    ws,
+                    timeout_duration,
+                    child_pid,
+                    cancel_rx,
+                    start_time,
+                )
+                .await;
         }
 
         // 2. Dispatch in-memory workloads (BuiltinTest, GpuCompute) or process-based workloads
@@ -1443,11 +1576,29 @@ impl TaskRunner {
         task_id: TaskId,
         process_failed: bool,
     ) -> Result<Vec<OutputArtifact>, String> {
+        self.harvest_output_artifacts_from_dir(
+            sandbox.path(),
+            expected_outputs,
+            task_id,
+            process_failed,
+        )
+        .await
+    }
+
+    /// Extracts declared expected output artifacts from `root_dir` (either a task sandbox or a
+    /// workspace tree directory).
+    async fn harvest_output_artifacts_from_dir(
+        &self,
+        root_dir: &Path,
+        expected_outputs: &[String],
+        task_id: TaskId,
+        process_failed: bool,
+    ) -> Result<Vec<OutputArtifact>, String> {
         let mut collected = Vec::new();
         let mut total_bytes: usize = 0;
 
         for expected in expected_outputs {
-            let target = match sanitize_relative_path(sandbox.path(), Path::new(expected)) {
+            let target = match sanitize_relative_path(root_dir, Path::new(expected)) {
                 Ok(p) => p,
                 Err(err) => {
                     warn!(task_id = %task_id, path = %expected, error = %err, "Ignoring illegal expected output path");
@@ -1502,7 +1653,7 @@ impl TaskRunner {
             // Ensure canonical path resolves strictly within the sandbox root
             if let (Ok(canonical_target), Ok(canonical_sandbox)) = (
                 tokio::fs::canonicalize(&target).await,
-                tokio::fs::canonicalize(sandbox.path()).await,
+                tokio::fs::canonicalize(root_dir).await,
             ) {
                 if !canonical_target.starts_with(&canonical_sandbox) {
                     warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path resolves outside sandbox root");
@@ -1544,6 +1695,17 @@ impl TaskRunner {
         &self,
         sandbox: &Sandbox,
         task: &Task,
+        result: TaskResult,
+        process_failed: bool,
+    ) -> TaskResult {
+        self.harvest_and_apply_artifacts_from_dir(sandbox.path(), task, result, process_failed)
+            .await
+    }
+
+    async fn harvest_and_apply_artifacts_from_dir(
+        &self,
+        root_dir: &Path,
+        task: &Task,
         mut result: TaskResult,
         process_failed: bool,
     ) -> TaskResult {
@@ -1552,7 +1714,12 @@ impl TaskRunner {
         }
 
         match self
-            .harvest_output_artifacts(sandbox, &task.expected_outputs, task.id, process_failed)
+            .harvest_output_artifacts_from_dir(
+                root_dir,
+                &task.expected_outputs,
+                task.id,
+                process_failed,
+            )
             .await
         {
             Ok(artifacts) => {
@@ -1610,8 +1777,20 @@ impl TaskRunner {
         &self,
         sandbox: &Sandbox,
         task: &Task,
+        result: TaskResult,
+        extra_patterns: &[String],
+    ) -> TaskResult {
+        self.collect_blob_outputs_from_dir(sandbox.path(), task, result, extra_patterns, true)
+            .await
+    }
+
+    async fn collect_blob_outputs_from_dir(
+        &self,
+        root_dir: &Path,
+        task: &Task,
         mut result: TaskResult,
         extra_patterns: &[String],
+        allow_move: bool,
     ) -> TaskResult {
         let patterns: Vec<String> = task
             .output_globs
@@ -1624,13 +1803,19 @@ impl TaskRunner {
         }
         let collected = match self.blob_cache() {
             Ok(cache) => {
-                let root = sandbox.path().to_path_buf();
+                let root = root_dir.to_path_buf();
                 let limits = self.config.output_limits;
                 let process_failed = !result.is_success();
                 let task_id = task.id;
                 tokio::task::spawn_blocking(move || {
-                    let (outputs, pin) =
-                        collect_outputs_pinned(&root, &patterns, &cache, limits, process_failed)?;
+                    let (outputs, pin) = collect_outputs_from_dir_pinned(
+                        &root,
+                        &patterns,
+                        &cache,
+                        limits,
+                        process_failed,
+                        allow_move,
+                    )?;
                     cache.keep_task_outputs(task_id, pin);
                     Ok(outputs)
                 })
@@ -1652,6 +1837,309 @@ impl TaskRunner {
                     Some(error) => format!("{error}; {message}"),
                     None => message,
                 });
+            }
+        }
+        result
+    }
+
+    /// Executes a `Command` or `ShellScript` task inside a persistent named workspace (`design 0039`).
+    async fn execute_workspace_workload(
+        &self,
+        task: &Task,
+        ws: &WorkspaceRef,
+        timeout: Duration,
+        child_pid: Option<Arc<AtomicU32>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let fail = |msg: String| {
+            TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Workspace error: {msg}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(msg),
+            )
+        };
+
+        if cfg!(windows) && self.config.isolation != IsolationLevel::Off {
+            return fail(
+                "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet; start the worker with --isolation off or without --workspaces"
+                    .to_string(),
+            );
+        }
+
+        if !task.inputs.is_empty() || !task.staged_files.is_empty() {
+            return fail(
+                "a task with a workspace cannot also declare per-task inputs or staged_files; use the workspace source tree".to_string(),
+            );
+        }
+
+        let store = match self.ensure_workspace_store().await {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                return fail(
+                    "this worker was started without --workspaces, so it cannot run workspace tasks"
+                        .to_string(),
+                );
+            }
+            Err(e) => return fail(format!("cannot open workspace store: {e}")),
+        };
+
+        let cache = if ws.source.is_some() {
+            match self.blob_cache() {
+                Ok(c) => Some(c),
+                Err(e) => return fail(e),
+            }
+        } else {
+            None
+        };
+
+        // Poll the workspace lock in short intervals and check task cancellation between attempts
+        // so a wait on a busy workspace never delays cancellation by up to `workspace_lock_wait`.
+        let wait = self.config.workspace_lock_wait.min(timeout);
+        let lock_deadline = tokio::time::Instant::now() + wait;
+        let guard = loop {
+            if let Some(rx) = cancel_rx.as_mut() {
+                if let Ok(reason) = rx.try_recv() {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_CANCELLED,
+                        "",
+                        "",
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Cancelled: {reason}")),
+                    );
+                }
+            }
+            let store_try = store.clone();
+            let name_try = ws.name.clone();
+            let attempt =
+                tokio::task::spawn_blocking(move || store_try.acquire(&name_try, Duration::ZERO))
+                    .await;
+            match attempt {
+                Ok(Ok(guard)) => break guard,
+                Ok(Err(WorkspaceError::Busy(_))) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= lock_deadline {
+                        return fail(WorkspaceError::Busy(ws.name.clone()).to_string());
+                    }
+                    let step = Duration::from_millis(20).min(lock_deadline - now);
+                    tokio::select! {
+                        reason = cancellation(&mut cancel_rx) => {
+                            return TaskResult::failure(
+                                self.worker_id,
+                                task.id,
+                                EXIT_CODE_CANCELLED,
+                                "",
+                                "",
+                                start_time.elapsed().as_millis() as u64,
+                                Some(format!("Cancelled: {reason}")),
+                            );
+                        }
+                        _ = tokio::time::sleep(step) => {}
+                    }
+                }
+                Ok(Err(e)) => return fail(e.to_string()),
+                Err(e) => return fail(format!("workspace lock task panicked: {e}")),
+            }
+        };
+
+        let ws_clone = ws.clone();
+        let spec_clone = task.spec.clone();
+
+        let prepared = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            // Pre-run symlink / canonical path check on `<ws>/tree` and `<ws>/tmp` before every
+            // workspace run (with or without a source).
+            guard
+                .check_existing_dirs()
+                .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
+            if let Some(WorkspaceSource::Tree {
+                manifest,
+                manifest_size,
+            }) = &ws_clone.source
+            {
+                if *manifest_size > MAX_MANIFEST_BYTES {
+                    return Err(format!(
+                        "workspace '{}': directory manifest size ({manifest_size} bytes) exceeds limit ({MAX_MANIFEST_BYTES} bytes)",
+                        ws_clone.name
+                    ));
+                }
+                let cache = cache.as_ref().expect("cache opened for tree source");
+                let bytes = cache
+                    .read_verified(manifest, MAX_MANIFEST_BYTES)
+                    .map_err(|e| format!("workspace '{}': directory manifest: {e}", ws_clone.name))?;
+                let tree = TreeManifest::decode(&bytes)
+                    .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
+                if let Err(err) = guard.sync(&tree, cache.as_ref()) {
+                    if let WorkspaceError::Integrity { ref path } = err {
+                        if let Some(f) = tree.files().iter().find(|f| f.path == *path) {
+                            cache.drop_corrupt(&f.id);
+                        }
+                    }
+                    return Err(err.to_string());
+                }
+            } else if !guard.is_ready() {
+                return Err(format!(
+                    "workspace '{}' has no synced tree on this worker (run once without --no-sync first)",
+                    ws_clone.name
+                ));
+            }
+            guard.prepare_tmp().map_err(|e| e.to_string())?;
+            guard
+                .verify_run_dirs()
+                .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
+
+            let tree_dir = guard.tree_dir();
+            let tmp_dir = guard.tmp_dir();
+
+            match spec_clone {
+                TaskSpec::Command {
+                    program,
+                    args,
+                    env,
+                    working_dir,
+                    stdin,
+                } => {
+                    let effective_cwd = match working_dir {
+                        Some(ref sub) => resolve_workspace_cwd(&tree_dir, sub)?,
+                        None => tree_dir.clone(),
+                    };
+                    Ok((
+                        guard,
+                        program,
+                        args,
+                        effective_cwd,
+                        env,
+                        stdin.map(|b| b.to_vec()),
+                    ))
+                }
+                TaskSpec::ShellScript {
+                    script,
+                    interpreter,
+                    env,
+                } => {
+                    let script_path = tmp_dir.join("task_script.sh");
+                    std::fs::write(&script_path, script.as_bytes()).map_err(|e| {
+                        format!("cannot write shell script to workspace tmp: {e}")
+                    })?;
+                    let _ = set_permissions(&script_path, 0o700);
+
+                    #[cfg(windows)]
+                    let (prog, args) = if let Some(interp) = interpreter {
+                        (
+                            interp,
+                            vec![script_path.to_string_lossy().to_string()],
+                        )
+                    } else {
+                        let base = env
+                            .get("PATH")
+                            .cloned()
+                            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+                        let effective_path = augment_windows_path(&base);
+                        let sh_resolved = resolve_windows_executable("sh", &effective_path);
+                        if Path::new(&sh_resolved).is_file() {
+                            (sh_resolved, vec![script_path.to_string_lossy().to_string()])
+                        } else {
+                            (
+                                "cmd.exe".to_string(),
+                                vec![
+                                    "/C".to_string(),
+                                    script_path.to_string_lossy().to_string(),
+                                ],
+                            )
+                        }
+                    };
+
+                    #[cfg(not(windows))]
+                    let (prog, args) = if let Some(interp) = interpreter {
+                        (
+                            interp,
+                            vec![script_path.to_string_lossy().to_string()],
+                        )
+                    } else {
+                        let path = env
+                            .get("PATH")
+                            .cloned()
+                            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+                        (
+                            resolve_default_shell(&path),
+                            vec![script_path.to_string_lossy().to_string()],
+                        )
+                    };
+
+                    Ok((guard, prog, args, tree_dir, env, None))
+                }
+                _ => unreachable!("checked before execute_workspace_workload"),
+            }
+        })
+        .await;
+
+        let (guard, program, args, effective_cwd, env, stdin_data) = match prepared {
+            Ok(Ok(tuple)) => tuple,
+            Ok(Err(e)) => return fail(e),
+            Err(e) => return fail(format!("workspace preparation panicked: {e}")),
+        };
+
+        let tree_dir = guard.tree_dir();
+        let tmp_dir = guard.tmp_dir();
+        let ws_task_env = guard.task_env();
+        let ws_ctx = WorkspaceProcessCtx {
+            tmp_dir: &tmp_dir,
+            workspace_root: store.root(),
+            task_env: ws_task_env,
+        };
+
+        let result = self
+            .execute_process_supervised_with_workspace(
+                task.id,
+                &tree_dir,
+                &program,
+                &args,
+                &effective_cwd,
+                &env,
+                stdin_data,
+                timeout,
+                child_pid,
+                cancel_rx,
+                start_time,
+                Some(ws_ctx),
+            )
+            .await;
+
+        let process_failed = !result.is_success();
+        let result = self
+            .harvest_and_apply_artifacts_from_dir(&tree_dir, task, result, process_failed)
+            .await;
+        let mut result = self
+            .collect_blob_outputs_from_dir(&tree_dir, task, result, &[], false)
+            .await;
+
+        let finish_res = tokio::task::spawn_blocking(move || {
+            let res = guard.finish();
+            drop(guard);
+            res
+        })
+        .await;
+        match finish_res {
+            Ok(Ok(report)) => {
+                if let Some(warning) = report.warning {
+                    result.stderr =
+                        append_note(result.stderr, &format!("[rusty_grid: {warning}]\n"));
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(task_id = %task.id, workspace = %ws.name, error = %e, "Workspace finish failed");
+                result.stderr = append_note(
+                    result.stderr,
+                    &format!("[rusty_grid: workspace finish failed: {e}]\n"),
+                );
+            }
+            Err(e) => {
+                warn!(task_id = %task.id, workspace = %ws.name, error = %e, "Workspace finish task failed");
             }
         }
         result
@@ -2771,8 +3259,41 @@ impl TaskRunner {
         stdin_data: Option<Vec<u8>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        self.execute_process_supervised_with_workspace(
+            task_id,
+            sandbox_path,
+            program,
+            args,
+            cwd,
+            env,
+            stdin_data,
+            timeout,
+            child_pid,
+            cancel_rx,
+            start_time,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_process_supervised_with_workspace(
+        &self,
+        task_id: TaskId,
+        sandbox_path: &Path,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        stdin_data: Option<Vec<u8>>,
+        timeout: Duration,
+        child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
+        workspace_ctx: Option<WorkspaceProcessCtx<'_>>,
     ) -> TaskResult {
         let effective_path = match env.get("PATH") {
             Some(p) => {
@@ -2866,12 +3387,18 @@ impl TaskRunner {
         // Under `--isolation fs|fs+net` the task is confined by the platform's mechanism (macOS:
         // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
         // that is impossible the task fails, it never runs plain.
+        let ws_root_fallback = self.workspace_root_if_open();
         let jail = (self.config.isolation != IsolationLevel::Off).then(|| crate::isolation::Jail {
             level: self.config.isolation,
             host: &self.config.host_dirs,
             protected_files: &self.config.protected_files,
             sandbox_base: &eff_sandbox_base,
             sandbox_dir: &eff_sandbox_path,
+            extra_writable_dir: workspace_ctx.as_ref().map(|w| w.tmp_dir),
+            workspace_root: workspace_ctx
+                .as_ref()
+                .map(|w| w.workspace_root)
+                .or(ws_root_fallback.as_deref()),
         });
         let isolation_failure = |e: &str| {
             TaskResult::failure(
@@ -2949,11 +3476,12 @@ impl TaskRunner {
         );
 
         if self.config.isolation != IsolationLevel::Off {
-            let plan = crate::isolation::prepare_environment(
-                &self.config.host_dirs,
-                env,
-                &eff_sandbox_path,
-            );
+            let home_and_tmp = workspace_ctx
+                .as_ref()
+                .map(|w| w.tmp_dir)
+                .unwrap_or(&eff_sandbox_path);
+            let plan =
+                crate::isolation::prepare_environment(&self.config.host_dirs, env, home_and_tmp);
             for (name, value) in &plan.set {
                 cmd.env(name, value);
             }
@@ -2965,6 +3493,16 @@ impl TaskRunner {
                 if let Some((_, msvc_lib)) = crate::isolation::windows::resolve_windows_msvc_env() {
                     cmd.env("LIB", msvc_lib);
                 }
+            }
+        }
+
+        if let Some(ref ws_ctx) = workspace_ctx {
+            let tmp_str = ws_ctx.tmp_dir.to_string_lossy().to_string();
+            for name in ["TMPDIR", "TEMP", "TMP"] {
+                cmd.env(name, &tmp_str);
+            }
+            for (k, v) in &ws_ctx.task_env {
+                cmd.env(k, v);
             }
         }
 
@@ -3022,6 +3560,8 @@ impl TaskRunner {
                     protected_files: &protected_files,
                     sandbox_base: &sandbox_base,
                     sandbox_dir: &sandbox_dir,
+                    extra_writable_dir: None,
+                    workspace_root: None,
                 };
                 crate::isolation::windows::WindowsAppContainerGuard::create_blocking(
                     run_token,
@@ -3226,6 +3766,81 @@ impl TaskRunner {
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
     }
+}
+
+/// Extra process context for a task running inside a persistent named workspace.
+pub(crate) struct WorkspaceProcessCtx<'a> {
+    pub tmp_dir: &'a Path,
+    pub workspace_root: &'a Path,
+    pub task_env: Vec<(&'static str, String)>,
+}
+
+/// Validates and creates `sub` inside `tree_dir`, refusing absolute paths, `..`, NUL, and any
+/// symbolic link (or reparse point) along the path so the task's `cwd` never escapes `tree_dir`.
+fn resolve_workspace_cwd(tree_dir: &Path, sub: &Path) -> Result<PathBuf, String> {
+    let target = sanitize_relative_path(tree_dir, sub)
+        .map_err(|e| format!("illegal working_dir '{}': {e}", sub.display()))?;
+    let rel = target
+        .strip_prefix(tree_dir)
+        .map_err(|_| format!("illegal working_dir '{}'", sub.display()))?;
+    let mut cur = tree_dir.to_path_buf();
+    for component in rel.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "illegal working_dir '{}': only normal relative path components are allowed",
+                sub.display()
+            ));
+        };
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                let is_reparse = {
+                    use std::os::windows::fs::MetadataExt;
+                    (meta.file_attributes() & 0x0400) != 0
+                };
+                #[cfg(not(windows))]
+                let is_reparse = false;
+                if meta.file_type().is_symlink() || is_reparse {
+                    return Err(format!(
+                        "illegal working_dir '{}': '{}' is a symbolic link",
+                        sub.display(),
+                        cur.display()
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(format!(
+                        "illegal working_dir '{}': '{}' is not a directory",
+                        sub.display(),
+                        cur.display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur).map_err(|e| {
+                    format!(
+                        "cannot create working_dir '{}' in workspace tree: {e}",
+                        sub.display()
+                    )
+                })?;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot inspect working_dir '{}' in workspace tree: {e}",
+                    sub.display()
+                ));
+            }
+        }
+    }
+    if let (Ok(canon_tree), Ok(canon_target)) = (tree_dir.canonicalize(), target.canonicalize()) {
+        if !canon_target.starts_with(&canon_tree) {
+            return Err(format!(
+                "illegal working_dir '{}': resolves outside workspace tree",
+                sub.display()
+            ));
+        }
+    }
+    Ok(target)
 }
 
 /// Aborts the wrapped task when dropped.
@@ -5170,5 +5785,307 @@ mod process_tree_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_runner_tests {
+    use super::*;
+    use rusty_grid_core::task::TaskRequirements;
+
+    fn store_manifest_in_cache(
+        cache: &crate::blob_cache::BlobCache,
+        files: &[(&str, &[u8], bool)],
+    ) -> (rusty_grid_core::blob::BlobId, u64) {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        let mut entries = Vec::with_capacity(files.len());
+        for (path, data, executable) in files {
+            let id = BlobId::of(data);
+            let tmp = cache.temp_path();
+            std::fs::write(&tmp, data).expect("write file blob");
+            cache
+                .adopt(&tmp, id, data.len() as u64)
+                .expect("adopt file blob");
+            entries.push(BlobFile {
+                path: (*path).to_string(),
+                id,
+                size: data.len() as u64,
+                executable: *executable,
+            });
+        }
+        let manifest = TreeManifest::new(entries).expect("valid manifest");
+        let manifest_bytes = manifest.encode();
+        let manifest_id = BlobId::of(&manifest_bytes);
+        let tmp = cache.temp_path();
+        std::fs::write(&tmp, &manifest_bytes).expect("write manifest blob");
+        cache
+            .adopt(&tmp, manifest_id, manifest_bytes.len() as u64)
+            .expect("adopt manifest blob");
+        (manifest_id, manifest_bytes.len() as u64)
+    }
+
+    #[tokio::test]
+    async fn test_workspace_task_syncs_persists_build_output_deletes_removed_files_and_uses_tmp() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_dir = tmp.path().join("home");
+        let sandbox_dir = tmp.path().join("sandboxes");
+        let ws_root = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&home_dir).expect("create fake home");
+
+        let real = crate::isolation::HostDirs::detect();
+        let host = crate::isolation::HostDirs::from_home(
+            home_dir,
+            Some(real.rustup_home),
+            Some(real.cargo_home),
+        );
+        let cfg = RunnerConfig::new(SandboxConfig::new(&sandbox_dir))
+            .with_host_dirs(host)
+            .with_workspaces(true)
+            .with_workspace_root(Some(ws_root.clone()));
+        let runner = TaskRunner::new(Uuid::new_v4(), WorkerCapabilities::default(), cfg);
+        let cache = runner.blob_cache().expect("blob cache");
+
+        // Task 1: syncs initial manifest (`src/a.txt`, `src/old.txt`), checks env & tmpdir,
+        // creates untracked build output `target/artifact.txt`, and collects it via `output_globs`.
+        let (m1_id, m1_size) = store_manifest_in_cache(
+            &cache,
+            &[
+                ("src/a.txt", b"v1-alpha", false),
+                ("src/old.txt", b"remove-me", false),
+            ],
+        );
+        let script1 = r#"
+set -e
+echo "WS=$RUSTY_GRID_WORKSPACE"
+echo "WS_DIR=$RUSTY_GRID_WORKSPACE_DIR"
+echo "TMP=$TMPDIR"
+echo "A=$(cat src/a.txt)"
+echo "OLD=$(cat src/old.txt)"
+mkdir -p target
+printf 'built-artifact-v1' > target/artifact.txt
+printf 'temp-scratch' > "$TMPDIR/scratch.tmp"
+[ -f "$TMPDIR/scratch.tmp" ] && echo "TMP_WRITE_OK"
+"#;
+        let task1 = Task::new(
+            TaskSpec::shell_script(script1),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("my_proj").with_tree(m1_id, m1_size))
+        .with_output_globs(vec!["target/artifact.txt".to_string()]);
+
+        let res1 = runner.execute_task(&task1, None, None).await;
+        assert!(
+            res1.is_success(),
+            "task 1 failed: {:?} / {}",
+            res1.error,
+            res1.stderr_str()
+        );
+        let out1 = res1.stdout_str();
+        assert!(out1.contains("WS=my_proj"), "stdout: {out1}");
+        assert!(out1.contains("A=v1-alpha"), "stdout: {out1}");
+        assert!(out1.contains("OLD=remove-me"), "stdout: {out1}");
+        assert!(out1.contains("TMP_WRITE_OK"), "stdout: {out1}");
+        assert_eq!(res1.outputs.len(), 1);
+        assert_eq!(res1.outputs[0].path, "target/artifact.txt");
+        assert_eq!(
+            std::fs::read_to_string(ws_root.join("my_proj/tree/target/artifact.txt")).unwrap(),
+            "built-artifact-v1",
+            "output collection from a workspace must copy, not move/delete files out of the tree"
+        );
+        runner.release_task_outputs(task1.id);
+
+        // Task 2: syncs updated manifest (`src/a.txt` updated, `src/old.txt` removed).
+        // Untracked `target/artifact.txt` must survive, `src/old.txt` must be gone, and `$TMPDIR`
+        // must have been wiped fresh by `prepare_tmp`.
+        let (m2_id, m2_size) = store_manifest_in_cache(&cache, &[("src/a.txt", b"v2-beta", false)]);
+        let script2 = r#"
+set -e
+echo "A=$(cat src/a.txt)"
+[ ! -e src/old.txt ] && echo "OLD_DELETED"
+echo "KEPT=$(cat target/artifact.txt)"
+[ ! -e "$TMPDIR/scratch.tmp" ] && echo "TMP_WIPED"
+"#;
+        let task2 = Task::new(
+            TaskSpec::shell_script(script2),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("my_proj").with_tree(m2_id, m2_size));
+        let res2 = runner.execute_task(&task2, None, None).await;
+        assert!(
+            res2.is_success(),
+            "task 2 failed: {:?} / {}",
+            res2.error,
+            res2.stderr_str()
+        );
+        let out2 = res2.stdout_str();
+        assert!(out2.contains("A=v2-beta"), "stdout: {out2}");
+        assert!(out2.contains("OLD_DELETED"), "stdout: {out2}");
+        assert!(out2.contains("KEPT=built-artifact-v1"), "stdout: {out2}");
+        assert!(out2.contains("TMP_WIPED"), "stdout: {out2}");
+
+        // Task 3: runs in the already-ready workspace with no `source` and relative `working_dir`.
+        let cmd3 = TaskSpec::Command {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat a.txt && cat ../target/artifact.txt".into(),
+            ],
+            env: HashMap::new(),
+            working_dir: Some("src".into()),
+            stdin: None,
+        };
+        let task3 = Task::new(cmd3, TaskRequirements::generic(1, 30))
+            .with_workspace(WorkspaceRef::new("my_proj"));
+        let res3 = runner.execute_task(&task3, None, None).await;
+        assert!(
+            res3.is_success(),
+            "task 3 failed: {:?} / {}",
+            res3.error,
+            res3.stderr_str()
+        );
+        assert!(res3.stdout_str().contains("v2-beta"));
+        assert!(res3.stdout_str().contains("built-artifact-v1"));
+    }
+
+    #[tokio::test]
+    async fn test_workspace_task_error_cases_and_over_limit_warning() {
+        use crate::workspace::WorkspaceLimits;
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_dir = tmp.path().join("home");
+        let sandbox_dir = tmp.path().join("sandboxes");
+        let ws_root = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&home_dir).expect("create fake home");
+
+        let real = crate::isolation::HostDirs::detect();
+        let host = crate::isolation::HostDirs::from_home(
+            home_dir,
+            Some(real.rustup_home),
+            Some(real.cargo_home),
+        );
+
+        // 1. Runner without `--workspaces` refuses a workspace task clearly.
+        let disabled_runner = TaskRunner::new(
+            Uuid::new_v4(),
+            WorkerCapabilities::default(),
+            RunnerConfig::new(SandboxConfig::new(&sandbox_dir)).with_host_dirs(host.clone()),
+        );
+        let ws_task = Task::new(
+            TaskSpec::shell_script("echo hi"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("proj"));
+        let disabled_res = disabled_runner.execute_task(&ws_task, None, None).await;
+        assert!(!disabled_res.is_success());
+        assert!(
+            disabled_res.stderr_str().contains("--workspaces"),
+            "stderr: {}",
+            disabled_res.stderr_str()
+        );
+
+        // 2. Runner with `--workspaces` refuses an uninitialized workspace when no tree source is given.
+        let cfg = RunnerConfig::new(SandboxConfig::new(&sandbox_dir))
+            .with_host_dirs(host)
+            .with_workspaces(true)
+            .with_workspace_root(Some(ws_root.clone()))
+            .with_workspace_limits(WorkspaceLimits {
+                limit_mb: 1,
+                max_workspaces: 4,
+                ..WorkspaceLimits::default()
+            });
+        let runner = TaskRunner::new(Uuid::new_v4(), WorkerCapabilities::default(), cfg);
+        let unready_res = runner.execute_task(&ws_task, None, None).await;
+        assert!(!unready_res.is_success());
+        assert!(
+            unready_res.stderr_str().contains("has no synced tree"),
+            "stderr: {}",
+            unready_res.stderr_str()
+        );
+
+        // 3. Relative working_dir escaping the workspace tree is refused (both via path traversal
+        // and via a symlink inside the workspace tree).
+        let cache = runner.blob_cache().expect("blob cache");
+        let (m_id, m_size) = store_manifest_in_cache(&cache, &[("hello.txt", b"ok", false)]);
+        let bad_cwd_task = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["hi".into()],
+                env: HashMap::new(),
+                working_dir: Some("../outside".into()),
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("proj").with_tree(m_id, m_size));
+        let bad_cwd_res = runner.execute_task(&bad_cwd_task, None, None).await;
+        assert!(!bad_cwd_res.is_success());
+        assert!(
+            bad_cwd_res.stderr_str().contains("Path traversal")
+                || bad_cwd_res
+                    .stderr_str()
+                    .contains("Invalid workspace working_dir"),
+            "stderr: {}",
+            bad_cwd_res.stderr_str()
+        );
+        assert!(resolve_workspace_cwd(&ws_root, Path::new("../outside")).is_err());
+        assert!(resolve_workspace_cwd(&ws_root, Path::new("/abs/path")).is_err());
+
+        // 4. Exceeding `limit_mb` (1 MiB) appends `finish()`'s warning to the task's stderr.
+        let big = vec![b'x'; 1_200_000];
+        let (big_m_id, big_m_size) = store_manifest_in_cache(&cache, &[("big.bin", &big, false)]);
+        let over_limit_task = Task::new(
+            TaskSpec::shell_script("echo done"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("proj").with_tree(big_m_id, big_m_size));
+        let over_res = runner.execute_task(&over_limit_task, None, None).await;
+        assert!(
+            over_res.is_success(),
+            "over-limit workspace task must still succeed: {:?} / {}",
+            over_res.error,
+            over_res.stderr_str()
+        );
+        assert!(
+            over_res
+                .stderr_str()
+                .contains("above the limit of 1 MiB; it was evicted"),
+            "stderr should include finish() warning: {}",
+            over_res.stderr_str()
+        );
+
+        // 5. Cancellation while waiting on a busy workspace lock finishes promptly instead of
+        //    blocking for the full `workspace_lock_wait` (5s).
+        let store = runner
+            .ensure_workspace_store()
+            .await
+            .expect("open store")
+            .expect("store enabled");
+        let held = store
+            .acquire("busy_ws", Duration::ZERO)
+            .expect("acquire busy_ws");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = cancel_tx.send("cancelled during lock wait".to_string());
+        });
+        let wait_start = Instant::now();
+        let blocked_task = Task::new(
+            TaskSpec::shell_script("echo should-not-run"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("busy_ws").with_tree(m_id, m_size));
+        let cancel_res = runner
+            .execute_task(&blocked_task, None, Some(cancel_rx))
+            .await;
+        assert_eq!(cancel_res.exit_code, EXIT_CODE_CANCELLED);
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(1),
+            "cancellation during lock wait took too long: {:?}",
+            wait_start.elapsed()
+        );
+        drop(held);
     }
 }
