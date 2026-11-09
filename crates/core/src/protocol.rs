@@ -5992,4 +5992,103 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn test_v6_requests_at_a_v7_master_are_refused_as_version_6() {
+        // Every v6 ClientMessage variant (`ListWorkspaces` was appended in v7, nothing moved)
+        // decodes with its v6 version trailer and is refused as IncompatibleVersion(6).
+        for msg in [
+            ClientMessage::Hello,
+            ClientMessage::SubmitTask {
+                task: sample_workspace_task(),
+                wait: true,
+            },
+            ClientMessage::ClusterStatus,
+            ClientMessage::ListWorkers,
+            ClientMessage::GetTaskStatus {
+                task_id: TaskId::new(),
+            },
+            ClientMessage::CancelTask {
+                task_id: TaskId::new(),
+            },
+            ClientMessage::GetTaskResult {
+                task_id: TaskId::new(),
+            },
+        ] {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_client_message_with_version(&msg, 6, codec).unwrap();
+                match deserialize_message::<ClientMessage>(&raw) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        min_compatible_version,
+                    }) => {
+                        assert_eq!(peer_version, 6, "{msg:?} {codec:?}");
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                        assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                    }
+                    other => panic!("expected ClientMessage IncompatibleVersion(6), got {other:?}"),
+                }
+                match deserialize_message::<InboundMessage>(&raw) {
+                    Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                        assert_eq!(peer_version, 6, "{msg:?} {codec:?}");
+                    }
+                    other => {
+                        panic!("expected InboundMessage IncompatibleVersion(6), got {other:?}")
+                    }
+                }
+            }
+        }
+        let formatted = format_incompatible_version_error("client", 6);
+        assert!(
+            formatted.contains("Incompatible protocol version 6")
+                && formatted.contains(&format!("{PROTOCOL_VERSION_CURRENT}")),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn test_v6_responses_at_a_v7_client_are_refused_as_version_6() {
+        // Every v6 ClientResponse variant (`WorkspaceList` was appended in v7, nothing moved)
+        // decodes with its v6 version trailer and is refused as IncompatibleVersion(6).
+        let responses = [
+            ClientResponse::Hello {
+                min_compatible_version: 6,
+            },
+            ClientResponse::ClusterStatus {
+                total_tasks: 1,
+                pending_tasks: 0,
+                running_tasks: 0,
+                completed_tasks: 1,
+                failed_tasks: 0,
+                workers: Vec::new(),
+                active_bytes: 0,
+                max_active_bytes: 1,
+                store_error: None,
+            },
+            ClientResponse::WorkerList {
+                workers: Vec::new(),
+            },
+            ClientResponse::TaskSubmitted {
+                task_id: TaskId::new(),
+            },
+        ];
+        for resp in responses {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_client_response_with_version(&resp, 6, codec).unwrap();
+                match deserialize_message::<ClientResponse>(&raw) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        min_compatible_version,
+                    }) => {
+                        assert_eq!(peer_version, 6, "{resp:?} {codec:?}");
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                        assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                    }
+                    other => panic!("expected IncompatibleVersion(6), got {other:?}"),
+                }
+            }
+        }
+    }
 }

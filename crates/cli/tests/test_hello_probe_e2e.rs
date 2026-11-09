@@ -51,6 +51,15 @@ fn cluster_status_frame(version: u32) -> Vec<u8> {
     raw
 }
 
+fn hello_frame(version: u32) -> Vec<u8> {
+    let mut raw = serialize_message(&ClientMessage::Hello, WireCodec::Bincode)
+        .unwrap()
+        .to_vec();
+    let len = raw.len();
+    raw[len - 4..].copy_from_slice(&version.to_le_bytes());
+    raw
+}
+
 async fn send_raw_expect_error(addr: std::net::SocketAddr, frame: Vec<u8>) -> String {
     let stream = TcpStream::connect(addr).await.unwrap();
     let mut t = MessageTransport::with_codec(stream, WireCodec::Bincode);
@@ -138,11 +147,29 @@ async fn a_v6_client_against_a_master_that_cannot_decode_hello_sees_a_closed_con
     );
 }
 
+#[tokio::test]
+async fn a_v6_client_gets_a_clear_version_error_from_a_v7_master() {
+    let (server, addr) = spawn_master().await;
+    for frame in [
+        hello_frame(6),
+        cluster_status_frame(6),
+        submit_task_frame(6),
+    ] {
+        let message = send_raw_expect_error(addr, frame).await;
+        assert!(
+            message.contains("Incompatible protocol version 6")
+                && message.contains(&format!("{PROTOCOL_VERSION_CURRENT}")),
+            "{message}"
+        );
+    }
+    let _ = server.shutdown();
+}
+
 /// A master that answers the probe with a reply stamped with another version is refused with
 /// `GridError::IncompatibleVersion`, and so is one that sends the error text itself.
 #[tokio::test]
 async fn a_probe_reply_from_another_version_is_an_incompatible_version_error() {
-    for stamped in [5u32, 7] {
+    for stamped in [PROTOCOL_VERSION_CURRENT - 1, PROTOCOL_VERSION_CURRENT + 1] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -183,7 +210,7 @@ async fn a_probe_reply_from_another_version_is_an_incompatible_version_error() {
         let _ = t.recv_msg::<ClientMessage>().await;
         let _ = t
             .send_msg(&ClientResponse::Error {
-                message: "Incompatible protocol version 5 from client (supported: 6..=6)".into(),
+                message: "Incompatible protocol version 7 from client (supported: 6..=6)".into(),
             })
             .await;
     });
