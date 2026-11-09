@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `4c45b1a` plus FEAT-3d: 64 items Implemented, 4 Partial and 36 Planned. Five items
+On 2026-11-10, at `master` `cf664ee` plus TEST-21, TEST-22 and DOC-8: 67 items Implemented, 4 Partial and 36 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -172,6 +172,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 |  | Implemented | 70 |
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
+| DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 (open) |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
@@ -876,6 +877,27 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Add `docs/guides/mcp-client-setup.md` with snippets for Claude Code, Codex and Cursor. Add
   an MCP row to `docs/SECURITY.md`.
 - **Done when:** Each snippet was run once, and the guide follows the guide template.
+
+### DOC-8: Update `CLAUDE.md` and `SECURITY.md` for Windows isolation
+
+- **Evidence:** Read after pull request 152 (`FEAT-3c`) merged.
+- **Problem:** Two documents still described the state before pull request 152 (`FEAT-3c`):
+  - `CLAUDE.md` omitted that `cargo` under the Windows AppContainer (`--isolation fs|fs+net`) is
+    `Planned` as `FEAT-3d` and that a Windows worker refuses `--workspaces` with isolation inside the
+    `isolation.rs` summary;
+  - `docs/SECURITY.md` listed task sandboxing only under "Not considered / not provided" (section 2)
+    and omitted `--isolation off|fs|fs+net` (`crates/worker/src/isolation.rs`, design 0033) from
+    section 7 ("Who runs the tasks").
+- **Do:** Update `CLAUDE.md` and `docs/SECURITY.md` to match `crates/worker/src/isolation.rs`:
+  Windows `--isolation fs|fs+net` uses a per-task Win32 AppContainer (`FEAT-3c`), `cargo` under it is
+  `Planned` as `FEAT-3d`, and a Windows worker refuses `--workspaces` with `--isolation fs|fs+net`.
+- **Done when:** Neither `CLAUDE.md` nor `docs/SECURITY.md` claims that Windows AppContainer
+  isolation is unimplemented or that task sandboxing is not provided when `--isolation fs|fs+net` is
+  enabled, and both state the `FEAT-3d` (`cargo`) and `--workspaces` limits on Windows.
+
+- **Note (2026-11-10):** FEAT-3d (pull request 183) merged before DOC-8, so the merged documents
+  state the FEAT-3d behaviour (cargo and workspaces under the Windows AppContainer on a worker that
+  is not elevated) instead of the limits above.
 
 ### REL-1: Restore the Apache licence text
 
@@ -2015,7 +2037,7 @@ Add one dated line per finished item, newest last.
   on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
   passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
   29 Planned.
-- 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
+- 2026-11-09: Added and implemented TEST-20 (pull request 181): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
@@ -2043,8 +2065,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-10: Added and implemented TEST-22 (pull request 200, open): updated `contains_standalone_number` in
   `tests/workflow_modes_test.rs` so UUIDv4 hex groups (`-4090-`, `4090a...`) and JSON/unit-labelled
   numeric measurements (`: 4090`, `4090 ms`, `4090 MB`) in `research_report.json` are not mistaken
-  for an invented RTX 4090 GPU model name. The Index counts are now 64 Implemented, 4 Partial and
-  37 Planned.
+  for an invented RTX 4090 GPU model name. The Index counts are now 65 Implemented, 4 Partial and 36 Planned.
 - 2026-11-10: Added and implemented TEST-21 (pull request 198, open): fixed the Windows CI flakes in
   `tests/m6_challenger_1_stress.rs` and `crates/agent_mesh/tests/test_sec6_mesh_sandbox.rs` by
   delegating Windows task process termination on drop to `ProcessTree` (`#[cfg(not(windows))]
@@ -2056,5 +2077,10 @@ Add one dated line per finished item, newest last.
   shell before `sleep` in `test_adversarial_mapreduce_worker_drop_during_reduce_phase`, and retrying
   transient socket buffer/port exhaustion (`WSAENOBUFS` `10055`, `WSAEADDRINUSE` `10048`) in
   `AgentMeshClient::connect` and `AgentMeshHub::start`. `m6_challenger_1_stress` passed 20/20
-  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 64 Implemented, 4 Partial
-  and 37 Planned.
+  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 66 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented DOC-8 (pull request 196, open): updated `CLAUDE.md` and
+  `docs/SECURITY.md` to match `crates/worker/src/isolation.rs` after pull request 152 (`FEAT-3c`),
+  recording that `--isolation fs|fs+net` confines tasks on macOS (`sandbox-exec`), Linux (Landlock,
+  seccomp, namespaces) and Windows (per-task AppContainer + NTFS DACLs + private Desktop), that
+  `cargo` under the Windows AppContainer is `Planned` as `FEAT-3d`, and that a Windows worker
+  refuses `--workspaces` with `--isolation fs|fs+net`. The Index counts are now 67 Implemented, 4 Partial and 36 Planned.
