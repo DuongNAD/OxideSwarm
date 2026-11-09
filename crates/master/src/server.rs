@@ -3733,458 +3733,550 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 os,
                 arch,
             } => {
-                let Some(ref peer) = v3_peer else {
-                    let _ = send_client_response(
-                        &mut transport,
-                        &ClientResponse::EnrollRejected {
-                            message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
-                        },
-                    )
-                    .await;
-                    break;
-                };
-                if peer.purpose != HandshakePurpose::Enroll {
-                    let _ = send_client_response(
-                        &mut transport,
-                        &ClientResponse::EnrollRejected {
-                            message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
-                        },
-                    )
-                    .await;
-                    break;
-                }
-                match auth_ctx.members.handle_enroll_request(
-                    peer.public_key,
-                    peer.handshake_hash.as_bytes(),
-                    &peer.master_fingerprint,
-                    &peer.remote_addr,
+                handle_enroll_connection(
+                    &mut transport,
+                    v3_peer.as_ref(),
+                    &auth_ctx,
                     &invite_id,
                     &proof,
                     name,
                     os,
                     arch,
-                ) {
-                    Ok(members::EnrollOutcome::Rejected {
-                        log_reason,
-                        wire_message,
-                    }) => {
-                        warn!(
-                            member_id = %peer.member_id,
-                            reason = %log_reason,
-                            "Refusing v3 enrollment request"
-                        );
-                        let _ = send_client_response(
-                            &mut transport,
-                            &ClientResponse::EnrollRejected {
-                                message: wire_message,
-                            },
-                        )
-                        .await;
-                        let _ =
-                            tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.recv_raw_frame())
-                                .await;
-                    }
-                    Ok(members::EnrollOutcome::ImmediateApproved { member_id, roles }) => {
-                        info!(
-                            member_id = %member_id,
-                            ?roles,
-                            "Enrolled v3 member (--no-approval)"
-                        );
-                        let _ = send_client_response(
-                            &mut transport,
-                            &ClientResponse::Enrolled { member_id, roles },
-                        )
-                        .await;
-                        let _ =
-                            tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.recv_raw_frame())
-                                .await;
-                    }
-                    Ok(members::EnrollOutcome::Pending {
-                        pending_id,
-                        mut decision_rx,
-                    }) => {
-                        info!(
-                            pending_id = %pending_id,
-                            member_id = %peer.member_id,
-                            "Queued v3 enrollment request for admin approval"
-                        );
-                        if send_client_response(
-                            &mut transport,
-                            &ClientResponse::EnrollPending {
-                                pending_id: pending_id.clone(),
-                            },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            auth_ctx.members.remove_pending(&pending_id);
-                            break;
-                        }
-                        let enroll_deadline = tokio::time::Instant::now()
-                            + Duration::from_secs(members::PENDING_ENROLLMENT_TTL_SECS);
-                        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
-                        keepalive_interval
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        keepalive_interval.tick().await;
-                        loop {
-                            tokio::select! {
-                                dec = &mut decision_rx => {
-                                    match dec {
-                                        Ok(members::PendingDecision::Approved { member_id, roles }) => {
-                                            info!(
-                                                pending_id = %pending_id,
-                                                member_id = %member_id,
-                                                ?roles,
-                                                "Admin approved pending v3 enrollment"
-                                            );
-                                            let _ = send_client_response(
-                                                &mut transport,
-                                                &ClientResponse::Enrolled { member_id, roles },
-                                            )
-                                            .await;
-                                        }
-                                        Ok(members::PendingDecision::Rejected { message }) => {
-                                            info!(
-                                                pending_id = %pending_id,
-                                                "Admin rejected pending v3 enrollment"
-                                            );
-                                            let _ = send_client_response(
-                                                &mut transport,
-                                                &ClientResponse::EnrollRejected { message },
-                                            )
-                                            .await;
-                                        }
-                                        Err(_) => {
-                                            let _ = send_client_response(
-                                                &mut transport,
-                                                &ClientResponse::EnrollRejected {
-                                                    message: "enrollment request was closed".into(),
-                                                },
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    let _ = tokio::time::timeout(
-                                        REFUSAL_DRAIN_TIMEOUT,
-                                        transport.recv_raw_frame(),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                                _ = keepalive_interval.tick() => {
-                                    if send_client_response(
-                                        &mut transport,
-                                        &ClientResponse::EnrollKeepalive,
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        debug!(
-                                            pending_id = %pending_id,
-                                            "Pending enrollment peer disconnected during keepalive"
-                                        );
-                                        auth_ctx.members.remove_pending(&pending_id);
-                                        break;
-                                    }
-                                }
-                                peer_frame = transport.recv_raw_frame() => {
-                                    match peer_frame {
-                                        Ok(None) | Err(_) => {
-                                            debug!(
-                                                pending_id = %pending_id,
-                                                "Pending enrollment peer closed connection before approval; dropping pending entry"
-                                            );
-                                        }
-                                        Ok(Some(_)) => {
-                                            warn!(
-                                                pending_id = %pending_id,
-                                                "Pending enrollment peer sent unexpected frame while waiting for approval; dropping pending entry"
-                                            );
-                                        }
-                                    }
-                                    auth_ctx.members.remove_pending(&pending_id);
-                                    break;
-                                }
-                                _ = tokio::time::sleep_until(enroll_deadline) => {
-                                    info!(
-                                        pending_id = %pending_id,
-                                        "Pending enrollment timed out waiting for admin approval"
-                                    );
-                                    auth_ctx.members.remove_pending(&pending_id);
-                                    let _ = send_client_response(
-                                        &mut transport,
-                                        &ClientResponse::EnrollRejected {
-                                            message: "enrollment request timed out waiting for approval".into(),
-                                        },
-                                    )
-                                    .await;
-                                    let _ = tokio::time::timeout(
-                                        REFUSAL_DRAIN_TIMEOUT,
-                                        transport.recv_raw_frame(),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
-                        auth_ctx.members.remove_pending(&pending_id);
-                    }
-                    Err(e) => {
-                        warn!(
-                            member_id = %peer.member_id,
-                            error = %e,
-                            "Failed to process v3 enrollment request"
-                        );
-                        let _ = send_client_response(
-                            &mut transport,
-                            &ClientResponse::EnrollRejected {
-                                message: members::GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                            },
-                        )
-                        .await;
-                        let _ =
-                            tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.recv_raw_frame())
-                                .await;
-                    }
-                }
+                )
+                .await;
                 break;
             }
-            ClientMessage::CreateInvite {
-                roles,
-                max_uses,
-                expires_in_secs,
-                require_approval,
-            } => {
-                let master_key_pub = match auth_ctx.ensure_v3_key_persisted() {
-                    Ok(pk) => pk,
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                match auth_ctx.members.create_invite(
-                    roles,
-                    max_uses,
-                    expires_in_secs,
-                    require_approval,
-                ) {
-                    Ok(rec) => {
-                        info!(
-                            invite_id = %rec.invite_id,
-                            roles = ?rec.roles,
-                            max_uses = rec.max_uses,
-                            expires_at = rec.expires_at,
-                            require_approval = rec.require_approval,
-                            "Created cluster invite"
-                        );
-                        let resp = ClientResponse::InviteCreated {
-                            invite_id: rec.invite_id,
-                            invite_secret: rec.invite_secret,
-                            roles: rec.roles,
-                            max_uses: rec.max_uses,
-                            expires_at: rec.expires_at,
-                            require_approval: rec.require_approval,
-                            master_key: master_key_pub,
-                            p2p_ticket: auth_ctx.p2p_ticket.clone(),
-                        };
-                        send_client_response(&mut transport, &resp).await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::ListInvites => {
-                let invites = auth_ctx.members.list_invites();
-                send_client_response(&mut transport, &ClientResponse::InvitesList { invites })
-                    .await?;
-            }
-            ClientMessage::RevokeInvite { invite_id } => {
-                match auth_ctx.members.revoke_invite(&invite_id) {
-                    Ok(resolved_id) => {
-                        info!(invite_id = %resolved_id, "Revoked cluster invite");
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::InviteRevoked {
-                                invite_id: resolved_id,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::ListMembers => {
-                let members = auth_ctx.members.list_members();
-                send_client_response(&mut transport, &ClientResponse::MembersList { members })
-                    .await?;
-            }
-            ClientMessage::ListPendingEnrollments => {
-                let pending = auth_ctx.members.list_pending();
-                send_client_response(
+            msg @ (ClientMessage::CreateInvite { .. }
+            | ClientMessage::ListInvites
+            | ClientMessage::RevokeInvite { .. }
+            | ClientMessage::ListMembers
+            | ClientMessage::ListPendingEnrollments
+            | ClientMessage::ApproveEnrollment { .. }
+            | ClientMessage::RejectEnrollment { .. }
+            | ClientMessage::RevokeMember { .. }
+            | ClientMessage::RenameMember { .. }) => {
+                handle_member_admin_message(
                     &mut transport,
-                    &ClientResponse::PendingEnrollmentsList { pending },
+                    msg,
+                    &auth_ctx,
+                    &registry,
+                    &queue,
+                    &scheduler_notify,
+                    &waiters,
+                    #[cfg(feature = "dashboard")]
+                    broadcast_tx.as_ref(),
                 )
                 .await?;
-            }
-            ClientMessage::ApproveEnrollment {
-                pending_id,
-                pairing_code,
-            } => {
-                match auth_ctx
-                    .members
-                    .approve_pending(&pending_id, pairing_code.as_str())
-                {
-                    Ok(entry) => {
-                        info!(
-                            pending_id = %pending_id,
-                            member_id = %entry.id,
-                            name = %entry.name,
-                            roles = ?entry.roles,
-                            "Approved pending member enrollment"
-                        );
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::EnrollmentApproved {
-                                pending_id,
-                                member_id: entry.id,
-                                name: entry.name,
-                                roles: entry.roles,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::RejectEnrollment { pending_id } => {
-                match auth_ctx.members.reject_pending(&pending_id) {
-                    Ok(resolved_id) => {
-                        info!(pending_id = %resolved_id, "Rejected pending member enrollment");
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::EnrollmentRejected {
-                                pending_id: resolved_id,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::RevokeMember { target } => {
-                match auth_ctx.members.revoke_member(&target) {
-                    Ok((entry, owned_workers)) => {
-                        let mut disconnected_sessions = 0usize;
-                        for wid in &owned_workers {
-                            handle_worker_disconnect_with_broadcast(
-                                &registry,
-                                &queue,
-                                &scheduler_notify,
-                                Some(&waiters),
-                                wid,
-                                None,
-                                "Member revoked by admin",
-                                true,
-                                #[cfg(feature = "dashboard")]
-                                broadcast_tx.as_ref(),
-                            )
-                            .await;
-                            disconnected_sessions += 1;
-                        }
-                        info!(
-                            member_id = %entry.id,
-                            name = %entry.name,
-                            disconnected_sessions,
-                            "Revoked cluster member"
-                        );
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::MemberRevoked {
-                                member_id: entry.id,
-                                disconnected_sessions,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::RenameMember { target, new_name } => {
-                match auth_ctx.members.rename_member(&target, &new_name) {
-                    Ok(entry) => {
-                        info!(
-                            member_id = %entry.id,
-                            name = %entry.name,
-                            "Renamed cluster member"
-                        );
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::MemberRenamed {
-                                member_id: entry.id,
-                                name: entry.name,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
             }
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_enroll_connection<S>(
+    transport: &mut MessageTransport<S>,
+    v3_peer: Option<&AuthenticatedV3Peer>,
+    auth_ctx: &MasterAuthContext,
+    invite_id: &str,
+    proof: &rusty_grid_core::noise_auth::RedactedBytes32,
+    name: String,
+    os: String,
+    arch: String,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Some(peer) = v3_peer else {
+        let _ = send_client_response(
+            transport,
+            &ClientResponse::EnrollRejected {
+                message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
+            },
+        )
+        .await;
+        return;
+    };
+    if peer.purpose != HandshakePurpose::Enroll {
+        let _ = send_client_response(
+            transport,
+            &ClientResponse::EnrollRejected {
+                message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
+            },
+        )
+        .await;
+        return;
+    }
+    match auth_ctx.members.handle_enroll_request(
+        peer.public_key,
+        peer.handshake_hash.as_bytes(),
+        &peer.master_fingerprint,
+        &peer.remote_addr,
+        invite_id,
+        proof,
+        name,
+        os,
+        arch,
+    ) {
+        Ok(members::EnrollOutcome::Rejected {
+            log_reason,
+            wire_message,
+        }) => {
+            warn!(
+                member_id = %peer.member_id,
+                reason = %log_reason,
+                "Refusing v3 enrollment request"
+            );
+            let _ = send_client_response(
+                transport,
+                &ClientResponse::EnrollRejected {
+                    message: wire_message,
+                },
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+        Ok(members::EnrollOutcome::ImmediateApproved { member_id, roles }) => {
+            info!(
+                member_id = %member_id,
+                ?roles,
+                "Enrolled v3 member (--no-approval)"
+            );
+            let _ = send_client_response(
+                transport,
+                &ClientResponse::Enrolled { member_id, roles },
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+        Ok(members::EnrollOutcome::Pending {
+            pending_id,
+            decision_rx,
+        }) => {
+            wait_for_pending_enrollment(
+                transport,
+                auth_ctx,
+                &peer.member_id,
+                pending_id,
+                decision_rx,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                member_id = %peer.member_id,
+                error = %e,
+                "Failed to process v3 enrollment request"
+            );
+            let _ = send_client_response(
+                transport,
+                &ClientResponse::EnrollRejected {
+                    message: members::GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                },
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+    }
+}
+
+async fn wait_for_pending_enrollment<S>(
+    transport: &mut MessageTransport<S>,
+    auth_ctx: &MasterAuthContext,
+    member_id: &str,
+    pending_id: String,
+    mut decision_rx: tokio::sync::oneshot::Receiver<members::PendingDecision>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    info!(
+        pending_id = %pending_id,
+        member_id = %member_id,
+        "Queued v3 enrollment request for admin approval"
+    );
+    if send_client_response(
+        transport,
+        &ClientResponse::EnrollPending {
+            pending_id: pending_id.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        auth_ctx.members.remove_pending(&pending_id);
+        return;
+    }
+    let enroll_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(members::PENDING_ENROLLMENT_TTL_SECS);
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
+    keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive_interval.tick().await;
+    loop {
+        tokio::select! {
+            dec = &mut decision_rx => {
+                match dec {
+                    Ok(members::PendingDecision::Approved { member_id, roles }) => {
+                        info!(
+                            pending_id = %pending_id,
+                            member_id = %member_id,
+                            ?roles,
+                            "Admin approved pending v3 enrollment"
+                        );
+                        let _ = send_client_response(
+                            transport,
+                            &ClientResponse::Enrolled { member_id, roles },
+                        )
+                        .await;
+                    }
+                    Ok(members::PendingDecision::Rejected { message }) => {
+                        info!(
+                            pending_id = %pending_id,
+                            "Admin rejected pending v3 enrollment"
+                        );
+                        let _ = send_client_response(
+                            transport,
+                            &ClientResponse::EnrollRejected { message },
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        let _ = send_client_response(
+                            transport,
+                            &ClientResponse::EnrollRejected {
+                                message: "enrollment request was closed".into(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                let _ = tokio::time::timeout(
+                    REFUSAL_DRAIN_TIMEOUT,
+                    transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+                )
+                .await;
+                break;
+            }
+            _ = keepalive_interval.tick() => {
+                if send_client_response(
+                    transport,
+                    &ClientResponse::EnrollKeepalive,
+                )
+                .await
+                .is_err()
+                {
+                    debug!(
+                        pending_id = %pending_id,
+                        "Pending enrollment peer disconnected during keepalive"
+                    );
+                    auth_ctx.members.remove_pending(&pending_id);
+                    break;
+                }
+            }
+            peer_frame = transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME) => {
+                match peer_frame {
+                    Ok(None) | Err(_) => {
+                        debug!(
+                            pending_id = %pending_id,
+                            "Pending enrollment peer closed connection before approval; dropping pending entry"
+                        );
+                    }
+                    Ok(Some(_)) => {
+                        warn!(
+                            pending_id = %pending_id,
+                            "Pending enrollment peer sent unexpected frame while waiting for approval; dropping pending entry"
+                        );
+                    }
+                }
+                auth_ctx.members.remove_pending(&pending_id);
+                break;
+            }
+            _ = tokio::time::sleep_until(enroll_deadline) => {
+                info!(
+                    pending_id = %pending_id,
+                    "Pending enrollment timed out waiting for admin approval"
+                );
+                auth_ctx.members.remove_pending(&pending_id);
+                let _ = send_client_response(
+                    transport,
+                    &ClientResponse::EnrollRejected {
+                        message: "enrollment request timed out waiting for approval".into(),
+                    },
+                )
+                .await;
+                let _ = tokio::time::timeout(
+                    REFUSAL_DRAIN_TIMEOUT,
+                    transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+                )
+                .await;
+                break;
+            }
+        }
+    }
+    auth_ctx.members.remove_pending(&pending_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_member_admin_message<S>(
+    transport: &mut MessageTransport<S>,
+    msg: ClientMessage,
+    auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &Arc<tokio::sync::Notify>,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) -> GridResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    match msg {
+        ClientMessage::CreateInvite {
+            roles,
+            max_uses,
+            expires_in_secs,
+            require_approval,
+        } => {
+            let master_key_pub = match auth_ctx.ensure_v3_key_persisted() {
+                Ok(pk) => pk,
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            match auth_ctx.members.create_invite(
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+            ) {
+                Ok(rec) => {
+                    info!(
+                        invite_id = %rec.invite_id,
+                        roles = ?rec.roles,
+                        max_uses = rec.max_uses,
+                        expires_at = rec.expires_at,
+                        require_approval = rec.require_approval,
+                        "Created cluster invite"
+                    );
+                    let resp = ClientResponse::InviteCreated {
+                        invite_id: rec.invite_id,
+                        invite_secret: rec.invite_secret,
+                        roles: rec.roles,
+                        max_uses: rec.max_uses,
+                        expires_at: rec.expires_at,
+                        require_approval: rec.require_approval,
+                        master_key: master_key_pub,
+                        p2p_ticket: auth_ctx.p2p_ticket.clone(),
+                    };
+                    send_client_response(transport, &resp).await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ListInvites => {
+            let invites = auth_ctx.members.list_invites();
+            send_client_response(transport, &ClientResponse::InvitesList { invites }).await?;
+        }
+        ClientMessage::RevokeInvite { invite_id } => {
+            match auth_ctx.members.revoke_invite(&invite_id) {
+                Ok(resolved_id) => {
+                    info!(invite_id = %resolved_id, "Revoked cluster invite");
+                    send_client_response(
+                        transport,
+                        &ClientResponse::InviteRevoked {
+                            invite_id: resolved_id,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ListMembers => {
+            let members = auth_ctx.members.list_members();
+            send_client_response(transport, &ClientResponse::MembersList { members }).await?;
+        }
+        ClientMessage::ListPendingEnrollments => {
+            let pending = auth_ctx.members.list_pending();
+            send_client_response(
+                transport,
+                &ClientResponse::PendingEnrollmentsList { pending },
+            )
+            .await?;
+        }
+        ClientMessage::ApproveEnrollment {
+            pending_id,
+            pairing_code,
+        } => {
+            match auth_ctx
+                .members
+                .approve_pending(&pending_id, pairing_code.as_str())
+            {
+                Ok(entry) => {
+                    info!(
+                        pending_id = %pending_id,
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        roles = ?entry.roles,
+                        "Approved pending member enrollment"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::EnrollmentApproved {
+                            pending_id,
+                            member_id: entry.id,
+                            name: entry.name,
+                            roles: entry.roles,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RejectEnrollment { pending_id } => {
+            match auth_ctx.members.reject_pending(&pending_id) {
+                Ok(resolved_id) => {
+                    info!(pending_id = %resolved_id, "Rejected pending member enrollment");
+                    send_client_response(
+                        transport,
+                        &ClientResponse::EnrollmentRejected {
+                            pending_id: resolved_id,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RevokeMember { target } => {
+            match auth_ctx.members.revoke_member(&target) {
+                Ok((entry, owned_workers)) => {
+                    let mut disconnected_sessions = 0usize;
+                    for wid in &owned_workers {
+                        handle_worker_disconnect_with_broadcast(
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            Some(waiters),
+                            wid,
+                            None,
+                            "Member revoked by admin",
+                            true,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                        )
+                        .await;
+                        disconnected_sessions += 1;
+                    }
+                    info!(
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        disconnected_sessions,
+                        "Revoked cluster member"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::MemberRevoked {
+                            member_id: entry.id,
+                            disconnected_sessions,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RenameMember { target, new_name } => {
+            match auth_ctx.members.rename_member(&target, &new_name) {
+                Ok(entry) => {
+                    info!(
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        "Renamed cluster member"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::MemberRenamed {
+                            member_id: entry.id,
+                            name: entry.name,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => unreachable!("non-admin ClientMessage passed to handle_member_admin_message"),
+    }
     Ok(())
 }
 
