@@ -383,9 +383,14 @@ async fn test_write_to_closed_peer_socket() {
 
     let mut client_writer = MessageWriter::new(client_stream);
 
-    // Write messages until failure
+    // Write messages until failure. The first writes after the peer closed usually succeed: they
+    // only fill the local send buffer, and the error appears once the peer's RST has arrived. A
+    // tight loop of a fixed number of writes can finish before that on a busy machine, so keep
+    // writing, with a short pause, until a deadline.
     let mut error_encountered = None;
-    for i in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut i = 0u64;
+    while tokio::time::Instant::now() < deadline {
         let msg = WorkerMessage::Heartbeat {
             worker_id: Uuid::new_v4(),
             timestamp: i,
@@ -397,6 +402,8 @@ async fn test_write_to_closed_peer_socket() {
             error_encountered = Some(e);
             break;
         }
+        i += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     assert!(
