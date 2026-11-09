@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-benchmarks/grid/bench_grid.py - loopback benchmarks of the OxideSwarm grid (BENCH-1 a and b).
+benchmarks/grid/bench_grid.py - benchmarks of the OxideSwarm grid (BENCH-1 a, b and c).
 
-  (a) no-op task throughput and submit-to-result latency with 1..4 workers;
-  (b) a first and a repeated upload of the same input tree (bytes sent, time).
+  (a) no-op task throughput and submit-to-result latency with 1..4 workers (loopback);
+  (b) a first and a repeated upload of the same input tree (bytes sent, time, loopback);
+  (c) end-to-end offload of `cargo test` in a named workspace, cold and warm, against a two-machine
+      cluster (`--offload-master <ADDR_OR_TICKET>`).
 
 Standard library only. Drives the built `oxideswarm` binary; starts its own master and workers on
-127.0.0.1 with ephemeral ports, a private HOME/USERPROFILE per process (the real ~/.oxideswarm is
-never read or written), stops them by the PIDs it started, and removes its temporary directory.
+127.0.0.1 with ephemeral ports for (a) and (b), gives every process a private HOME/USERPROFILE (the
+real ~/.oxideswarm is never read or written unless `--secret-file` explicitly names a file to copy),
+stops spawned processes by their PIDs, and removes its temporary directory.
 Read benchmarks/grid/README.md for what each number means and what it does not show.
 
   python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm
   python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm --quick   # smoke run
+  python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm \\
+      --offload-master <HOST:PORT_OR_TICKET> --secret-file ~/.oxideswarm/cluster.secret
 """
 
 import argparse
@@ -75,6 +80,86 @@ def parse_inputs_line(text):
         "bytes_sent_reported": m.group(5),
         "blobs_already_on_master": int(m.group(6)),
     }
+
+
+WORKSPACE_RE = re.compile(
+    r"Workspace '([^']*)': (\d+) files \(([^)]*)\); sent (\d+) of (\d+) blobs \(([^)]*)\), (\d+) already on the master"
+)
+
+EXEC_TIME_RE = re.compile(r"Execution Time:\s*(\d+)ms")
+
+
+def parse_workspace_line(text):
+    """Parse the `Workspace '<name>': ...` line `submit --workspace` prints on stderr; None when absent."""
+    m = WORKSPACE_RE.search(text)
+    if not m:
+        return None
+    return {
+        "workspace": m.group(1),
+        "files": int(m.group(2)),
+        "tree_size": m.group(3),
+        "blobs_sent": int(m.group(4)),
+        "blobs_total": int(m.group(5)),
+        "bytes_sent_reported": m.group(6),
+        "blobs_already_on_master": int(m.group(7)),
+    }
+
+
+def parse_execution_time_ms(text):
+    """Parse `Execution Time: <N>ms` from `submit --wait` stdout; None when absent."""
+    m = EXEC_TIME_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def sanitize_worker_caps(worker):
+    """Extract non-identifying hardware/link facts from a `workers --json` entry (never `name` or `id`)."""
+    tags = worker.get("tags") or []
+    tag_map = {}
+    tools = []
+    features = []
+    for t in tags:
+        if not isinstance(t, str) or ":" not in t:
+            continue
+        k, v = t.split(":", 1)
+        if k == "tool":
+            tools.append(v)
+        elif k == "feat":
+            features.append(v)
+        elif k in ("os", "arch", "link", "iso", "state"):
+            tag_map[k] = v
+    return {
+        "os": tag_map.get("os", "unknown"),
+        "arch": tag_map.get("arch", "unknown"),
+        "link": worker.get("link") or tag_map.get("link", "unknown"),
+        "isolation": tag_map.get("iso", "off"),
+        "cpu_cores": worker.get("cpu_cores"),
+        "ram_mb": worker.get("ram_mb"),
+        "has_gpu": worker.get("has_gpu"),
+        "is_simulated_gpu": worker.get("is_simulated_gpu"),
+        "tools": sorted(tools),
+        "features": sorted(features),
+    }
+
+
+def summarize_c_runs(c_runs):
+    """Aggregate cold and warm workspace offload runs into median/min/max summaries."""
+    summary = {}
+    for phase in ("cold", "warm"):
+        phase_rows = [r[phase] for r in c_runs if phase in r]
+        if not phase_rows:
+            continue
+        entry = {
+            "wall_s": summarize([p["wall_s"] for p in phase_rows]),
+            "blobs_sent": summarize([p["blobs_sent"] for p in phase_rows]),
+            "blobs_total": summarize([p["blobs_total"] for p in phase_rows]),
+        }
+        exec_ms = [p["worker_execution_time_ms"] for p in phase_rows if p.get("worker_execution_time_ms") is not None]
+        if exec_ms:
+            entry["worker_execution_time_ms"] = summarize(exec_ms)
+        if phase == "warm":
+            entry["all_reused_target"] = all(bool(p.get("reused_target")) for p in phase_rows)
+        summary[phase] = entry
+    return summary
 
 
 def dir_bytes(path):
@@ -296,6 +381,91 @@ def measure_b(binary, files, max_size, seed, tmp):
         c.stop()
 
 
+# ---------------------------------------------------------------- (c) two-machine workspace offload
+
+def _client_env(home, empty_config, secret_file=None):
+    os.makedirs(home, exist_ok=True)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("RUSTY_GRID_")
+        and k not in ("OXIDESWARM_SECRET_FILE", "OXIDE_DEV_MODE", "OXIDESWARM_MASTER",
+                      "OXIDESWARM_P2P_TICKET", "OXIDE_SWARM_DASHBOARD_PORT",
+                      "OXIDE_SWARM_DASHBOARD_PORT_FILE")
+    }
+    env.update(
+        HOME=home,
+        USERPROFILE=home,
+        OXIDESWARM_HOME=os.path.join(home, ".oxideswarm"),
+        RUSTY_GRID_CONFIG=empty_config,
+    )
+    if secret_file:
+        env["OXIDESWARM_SECRET_FILE"] = os.path.abspath(secret_file)
+    return env
+
+
+def _run_offload_step(binary, master_addr, crate_dir, ws_name, cargo_args, env, insecure=False, timeout=900):
+    cmd = [binary, "submit", "--master", master_addr]
+    if insecure:
+        cmd.append("--insecure")
+    cmd += [
+        "--workspace", ws_name,
+        "--env", "CARGO_TERM_COLOR=never",
+        "--wait",
+        "--", "cargo",
+    ] + cargo_args
+    t0 = time.perf_counter()
+    r = subprocess.run(cmd, cwd=crate_dir, capture_output=True, text=True, env=env, timeout=timeout)
+    wall = time.perf_counter() - t0
+    if r.returncode != 0:
+        raise SystemExit(
+            "workspace offload failed (exit %d) in %s:\n%s%s"
+            % (r.returncode, ws_name, r.stdout, r.stderr)
+        )
+    parsed = parse_workspace_line(r.stderr)
+    if parsed is None:
+        raise SystemExit("no `Workspace '...'` line in submit output: " + r.stderr)
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    exec_ms = parse_execution_time_ms(r.stdout or "")
+    return {
+        "wall_s": round(wall, 4),
+        "worker_execution_time_ms": exec_ms,
+        "reused_target": "Compiling " not in combined,
+        **parsed,
+    }
+
+
+def query_remote_workers(binary, master_addr, env, insecure=False):
+    cmd = [binary, "workers", "--master", master_addr, "--json"]
+    if insecure:
+        cmd.append("--insecure")
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+    if r.returncode != 0:
+        raise SystemExit("workers --json failed (exit %d): %s%s" % (r.returncode, r.stdout, r.stderr))
+    raw = json.loads(r.stdout)
+    return [sanitize_worker_caps(w) for w in raw if isinstance(w, dict)]
+
+
+def measure_c(binary, master_addr, crate_dir, ws_prefix, cargo_args, run_idx, tmp, secret_file=None, insecure=False):
+    wd = tempfile.mkdtemp(prefix="c%d-" % run_idx, dir=tmp)
+    empty_config = os.path.join(wd, "empty.toml")
+    with open(empty_config, "w") as f:
+        f.write("")
+    env = _client_env(os.path.join(wd, "home-client"), empty_config, secret_file=secret_file)
+    workers = query_remote_workers(binary, master_addr, env, insecure=insecure)
+    suffix = "%06x" % random.SystemRandom().randint(0, 0xFFFFFF)
+    ws_name = "%s-r%d-%s" % (_slug(ws_prefix)[:20] or "bench1c", run_idx, suffix)
+    cold = _run_offload_step(binary, master_addr, crate_dir, ws_name, cargo_args, env, insecure=insecure)
+    warm = _run_offload_step(binary, master_addr, crate_dir, ws_name, cargo_args, env, insecure=insecure)
+    return {
+        "workspace": ws_name,
+        "cargo_args": cargo_args,
+        "workers_snapshot": workers,
+        "cold": cold,
+        "warm": warm,
+    }
+
+
 # ---------------------------------------------------------------- environment record
 
 def sh(cmd):
@@ -401,10 +571,28 @@ def main():
     ap.add_argument("--max-file-bytes", type=int, default=65536)
     ap.add_argument("--seed", type=int, default=20261109)
     ap.add_argument("--quick", action="store_true", help="small smoke run: 1 run, 1 and 2 workers, tiny sizes")
+    ap.add_argument("--only", choices=("ab", "c", "all"),
+                    help="which benchmarks to run (default: 'c' if --offload-master is set, else 'ab')")
+    ap.add_argument("--offload-master",
+                    help="master host:port or P2P ticket for (c) two-machine workspace cargo test offload")
+    ap.add_argument("--offload-dir", default=REPO,
+                    help="crate/workspace directory to sync for (c) (default: repository root)")
+    ap.add_argument("--offload-cargo-args", default="test -p rusty_grid_core --lib --offline",
+                    help="cargo arguments for (c) (default: 'test -p rusty_grid_core --lib --offline')")
+    ap.add_argument("--offload-workspace-prefix", default="bench1c",
+                    help="workspace name prefix for (c) (default: bench1c)")
+    ap.add_argument("--secret-file",
+                    help="cluster.secret path for authenticated two-machine (c) runs")
+    ap.add_argument("--insecure", action="store_true",
+                    help="pass --insecure to client commands in (c)")
     ap.add_argument("--out", help="results file (default benchmarks/grid/results/<date>-<os>-<arch>-<cpu>.json)")
     ap.add_argument("--no-write", action="store_true", help="print the record instead of writing it")
     ap.add_argument("--label", default="", help="free-text note stored in the record")
     args = ap.parse_args()
+
+    mode = args.only or ("c" if args.offload_master else "ab")
+    if mode in ("c", "all") and not args.offload_master:
+        raise SystemExit("--offload-master <HOST:PORT_OR_TICKET> is required when running benchmark (c)")
 
     if args.quick:
         args.runs, args.latency_samples, args.throughput_tasks = 1, 10, 20
@@ -413,20 +601,30 @@ def main():
     if not os.path.isfile(binary):
         raise SystemExit("binary not found: %s (build it: cargo build --release --bin oxideswarm)" % binary)
 
+    offload_dir = os.path.abspath(args.offload_dir)
+    cargo_args = [tok for tok in args.offload_cargo_args.split() if tok]
     tmp = tempfile.mkdtemp(prefix="oxbench-")
     started = datetime.datetime.now(datetime.timezone.utc)
     load_before = load_avg()
     try:
-        a_runs = {k: [] for k in range(1, args.max_workers + 1)}
+        a_runs = {k: [] for k in range(1, args.max_workers + 1)} if mode in ("ab", "all") else {}
         b_runs = []
+        c_runs = []
         # Interleave the repetitions so slow drift (other processes, thermals) spreads over all rows.
         for run in range(args.runs):
-            for k in a_runs:
-                print("[a] run %d/%d, %d worker(s)" % (run + 1, args.runs, k), flush=True)
-                a_runs[k].append(measure_a(binary, k, args.latency_samples, args.throughput_tasks,
-                                           args.concurrency, tmp))
-            print("[b] run %d/%d" % (run + 1, args.runs), flush=True)
-            b_runs.append(measure_b(binary, args.files, args.max_file_bytes, args.seed, tmp))
+            if mode in ("ab", "all"):
+                for k in a_runs:
+                    print("[a] run %d/%d, %d worker(s)" % (run + 1, args.runs, k), flush=True)
+                    a_runs[k].append(measure_a(binary, k, args.latency_samples, args.throughput_tasks,
+                                               args.concurrency, tmp))
+                print("[b] run %d/%d" % (run + 1, args.runs), flush=True)
+                b_runs.append(measure_b(binary, args.files, args.max_file_bytes, args.seed, tmp))
+            if mode in ("c", "all"):
+                print("[c] run %d/%d (cold + warm workspace offload)" % (run + 1, args.runs), flush=True)
+                c_runs.append(measure_c(
+                    binary, args.offload_master, offload_dir, args.offload_workspace_prefix,
+                    cargo_args, run + 1, tmp, secret_file=args.secret_file, insecure=args.insecure
+                ))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -442,22 +640,34 @@ def main():
             "floor_latency_p99_ms": summarize([r["floor_latency_ms"]["p99"] for r in runs]),
         })
     b_summary = {}
-    for key in ("first", "repeat_same", "repeat_one_file_changed"):
-        b_summary[key] = {
-            "wall_s": summarize([r[key]["wall_s"] for r in b_runs]),
-            "blobs_sent": summarize([r[key]["blobs_sent"] for r in b_runs]),
-            "master_blob_store_growth_bytes": summarize([r[key]["master_blob_store_growth_bytes"] for r in b_runs]),
-        }
+    if b_runs:
+        for key in ("first", "repeat_same", "repeat_one_file_changed"):
+            b_summary[key] = {
+                "wall_s": summarize([r[key]["wall_s"] for r in b_runs]),
+                "blobs_sent": summarize([r[key]["blobs_sent"] for r in b_runs]),
+                "master_blob_store_growth_bytes": summarize([r[key]["master_blob_store_growth_bytes"] for r in b_runs]),
+            }
+    c_summary = summarize_c_runs(c_runs) if c_runs else {}
 
     version = sh([binary, "--version"])
+    bench_title = {
+        "ab": "BENCH-1 (a) task overhead and (b) repeated upload",
+        "c": "BENCH-1 (c) two-machine workspace cargo test offload",
+        "all": "BENCH-1 (a) task overhead, (b) repeated upload, and (c) workspace offload",
+    }[mode]
+    network_desc = (
+        "two-machine cluster via client -> master -> workspace worker"
+        if mode == "c"
+        else "loopback (127.0.0.1), master and workers on this machine"
+    )
     record = {
-        "benchmark": "BENCH-1 (a) task overhead and (b) repeated upload",
+        "benchmark": bench_title,
         "date_utc": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git": git_info(),
         "binary": {"version": version, "build_profile": build_profile(binary)},
         "hardware": hardware(),
         "os": os_info(),
-        "network": "loopback (127.0.0.1), master and workers on this machine",
+        "network": network_desc,
         "power": power_state(),
         "load_average_before": load_before,
         "load_average_after": load_avg(),
@@ -466,10 +676,24 @@ def main():
         "parameters": {k: getattr(args, k) for k in ("runs", "latency_samples", "throughput_tasks",
                                                        "concurrency", "max_workers", "files",
                                                        "max_file_bytes", "seed", "quick")},
-        "a_summary": a_summary,
-        "b_summary": b_summary,
-        "raw": {"a": [r for runs in a_runs.values() for r in runs], "b": b_runs},
     }
+    if a_summary:
+        record["a_summary"] = a_summary
+    if b_summary:
+        record["b_summary"] = b_summary
+    if c_summary:
+        record["c_summary"] = c_summary
+        record["remote_workers"] = c_runs[0].get("workers_snapshot", [])
+        record["offload_cargo_args"] = cargo_args
+    raw_block = {}
+    if a_runs:
+        raw_block["a"] = [r for runs in a_runs.values() for r in runs]
+    if b_runs:
+        raw_block["b"] = b_runs
+    if c_runs:
+        raw_block["c"] = c_runs
+    record["raw"] = raw_block
+
     text = json.dumps(record, indent=2)
     if args.no_write:
         print(text)
@@ -488,6 +712,13 @@ def main():
     for key, row in b_summary.items():
         print("(b) %-24s %.3f s, blobs sent %s, store growth %s B" % (
             key, row["wall_s"]["median"], row["blobs_sent"]["median"], row["master_blob_store_growth_bytes"]["median"]))
+    for phase, row in c_summary.items():
+        exec_str = (" (worker %s ms)" % row["worker_execution_time_ms"]["median"]
+                    if "worker_execution_time_ms" in row else "")
+        reused = (", reused_target=%s" % row["all_reused_target"]) if "all_reused_target" in row else ""
+        print("(c) %-24s %.3f s%s, blobs sent %s/%s%s" % (
+            phase, row["wall_s"]["median"], exec_str,
+            row["blobs_sent"]["median"], row["blobs_total"]["median"], reused))
 
 
 if __name__ == "__main__":

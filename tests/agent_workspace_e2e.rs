@@ -10,47 +10,20 @@
 //!   still there.
 //! - The same flow runs through `oxideswarm mcp` over stdio.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rusty_grid_cli::blobs::BlobConnection;
-use rusty_grid_core::blob::{BlobId, TreeManifest};
-use rusty_grid_core::blob_transfer::download_blob;
-use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{
-    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
-};
-use rusty_grid_core::task::{Task, TaskId, TaskSpec, WorkspaceSource};
-use rusty_grid_core::transport::GridStream;
 use rusty_grid_master::{MasterHandle, MasterServer, ServerConfig};
-use rusty_grid_worker::workspace::{BlobSource, WorkspaceError, WorkspaceLimits, WorkspaceStore};
+use rusty_grid_worker::{WorkerClient, WorkerConfig};
 use serde_json::{json, Value};
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use uuid::Uuid;
 
 fn oxideswarm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oxideswarm"))
-}
-
-struct MemBlobSource {
-    blobs: HashMap<BlobId, Vec<u8>>,
-}
-
-impl BlobSource for MemBlobSource {
-    fn open(&self, id: &BlobId) -> std::io::Result<Box<dyn Read + Send>> {
-        let bytes = self.blobs.get(id).cloned().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing blob {}", id.to_hex()),
-            )
-        })?;
-        Ok(Box::new(Cursor::new(bytes)))
-    }
 }
 
 struct HarnessCluster {
@@ -67,6 +40,7 @@ impl HarnessCluster {
     async fn spawn() -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let blob_dir = temp_dir.path().join("master_blobs");
+        let sandbox_dir = temp_dir.path().join("worker_sandboxes");
         let workspace_root = temp_dir.path().join("worker_workspaces");
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -77,75 +51,23 @@ impl HarnessCluster {
         let master_addr = master.server_addr();
 
         let worker_id = Uuid::new_v4();
-        let (worker_shutdown_tx, mut worker_shutdown_rx) = watch::channel(false);
-        let ws_root_for_worker = workspace_root.clone();
-
-        // Until W2b merges `WorkspaceStore` into `WorkerClient` / `TaskRunner`, this harness
-        // worker speaks the real wire protocol (`ProtocolCapabilities::WORKSPACES`) and drives
-        // `rusty_grid_worker::workspace::WorkspaceStore` directly for assigned workspace tasks.
+        let mut worker = WorkerClient::new(
+            WorkerConfig::new(master_addr.to_string())
+                .with_worker_id(worker_id)
+                .with_name("w6-workspace-worker")
+                .with_cores(2)
+                .with_no_battery(true)
+                .with_no_gpu(true)
+                .with_no_blender(true)
+                .with_no_cuda(true)
+                .with_redirection_portal(false)
+                .with_sandbox_base_dir(&sandbox_dir)
+                .with_workspaces(true)
+                .with_workspace_root(Some(workspace_root.clone())),
+        );
+        let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
         let worker_join = tokio::spawn(async move {
-            let tcp = TcpStream::connect(master_addr)
-                .await
-                .expect("connect harness worker to master");
-            let mut transport = MessageTransport::new(GridStream::Tcp(tcp));
-
-            let mut caps =
-                WorkerCapabilities::new("w6-workspace-worker", 2, 4096, false, false, None);
-            caps.tags.push("tool:cargo".to_string());
-            caps.tags.push("tool:rustc".to_string());
-            let features = ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES;
-
-            transport
-                .send_msg(&WorkerMessage::Register {
-                    worker_id,
-                    capabilities: caps,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features,
-                })
-                .await
-                .expect("send Register");
-
-            match transport.recv_msg::<MasterMessage>().await {
-                Ok(Some(MasterMessage::RegisterAck { accepted: true, .. })) => {}
-                other => panic!("expected RegisterAck(accepted=true), got {other:?}"),
-            }
-
-            let mut hb_interval = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                tokio::select! {
-                    _ = worker_shutdown_rx.changed() => {
-                        break;
-                    }
-                    _ = hb_interval.tick() => {
-                        let _ = transport
-                            .send_msg(&WorkerMessage::Heartbeat {
-                                worker_id,
-                                timestamp: 0,
-                                active_tasks: 0,
-                                cpu_usage_pct: 5.0,
-                                ram_available_mb: 4096,
-                            })
-                            .await;
-                    }
-                    msg = transport.recv_msg::<MasterMessage>() => {
-                        match msg {
-                            Ok(Some(MasterMessage::AssignTask { task })) => {
-                                let reply = execute_workspace_task(
-                                    worker_id,
-                                    &task,
-                                    master_addr,
-                                    &ws_root_for_worker,
-                                )
-                                .await;
-                                let _ = transport.send_msg(&reply).await;
-                            }
-                            Ok(Some(MasterMessage::HeartbeatAck { .. })) => {}
-                            Ok(Some(MasterMessage::Shutdown { .. })) | Ok(None) | Err(_) => break,
-                            Ok(Some(_)) => {}
-                        }
-                    }
-                }
-            }
+            let _ = worker.run(worker_shutdown_rx).await;
         });
 
         let start = Instant::now();
@@ -177,209 +99,6 @@ impl HarnessCluster {
         let _ = self.worker_shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), self.worker_join).await;
         let _ = self.master.shutdown();
-    }
-}
-
-fn task_failure_msg(
-    worker_id: Uuid,
-    task_id: TaskId,
-    err: impl Into<String>,
-    duration_ms: u64,
-) -> WorkerMessage {
-    let err_str = err.into();
-    WorkerMessage::TaskResult {
-        worker_id,
-        task_id,
-        exit_code: 1,
-        stdout: Vec::new().into(),
-        stderr: err_str.clone().into_bytes().into(),
-        execution_time_ms: duration_ms,
-        is_gpu_executed: false,
-        device_name: None,
-        error: Some(err_str),
-        asset_bytes: None,
-        artifacts: Vec::new(),
-        outputs: Vec::new(),
-    }
-}
-
-async fn execute_workspace_task(
-    worker_id: Uuid,
-    task: &Task,
-    master_addr: SocketAddr,
-    workspace_root: &Path,
-) -> WorkerMessage {
-    let started = Instant::now();
-    let Some(ws) = &task.workspace else {
-        return task_failure_msg(worker_id, task.id, "expected a workspace task", 1);
-    };
-
-    let store = match WorkspaceStore::open(
-        Some(workspace_root.to_path_buf()),
-        WorkspaceLimits::default(),
-    ) {
-        Ok(s) => s,
-        Err(e) => return task_failure_msg(worker_id, task.id, e.to_string(), 1),
-    };
-
-    let mut blobs = HashMap::new();
-    let manifest_opt = if let Some(WorkspaceSource::Tree {
-        manifest: manifest_blob,
-        manifest_size,
-    }) = &ws.source
-    {
-        let conn = match BlobConnection::connect(&master_addr.to_string(), None).await {
-            Ok(c) => c,
-            Err(e) => return task_failure_msg(worker_id, task.id, e.to_string(), 1),
-        };
-        let mut manifest_bytes = Vec::new();
-        if let Err(e) = download_blob(
-            &conn,
-            *manifest_blob,
-            Some(*manifest_size),
-            &mut manifest_bytes,
-        )
-        .await
-        {
-            return task_failure_msg(worker_id, task.id, format!("download manifest: {e}"), 1);
-        }
-        let manifest = match TreeManifest::decode(&manifest_bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                return task_failure_msg(worker_id, task.id, format!("parse manifest: {e}"), 1)
-            }
-        };
-        for file in manifest.files() {
-            if blobs.contains_key(&file.id) {
-                continue;
-            }
-            let mut data = Vec::new();
-            if let Err(e) = download_blob(&conn, file.id, Some(file.size), &mut data).await {
-                return task_failure_msg(
-                    worker_id,
-                    task.id,
-                    format!("download blob {}: {e}", file.path),
-                    1,
-                );
-            }
-            blobs.insert(file.id, data);
-        }
-        Some(manifest)
-    } else {
-        None
-    };
-
-    let ws_clone = ws.clone();
-    let spec = task.spec.clone();
-    let task_id = task.id;
-
-    let run_res =
-        tokio::task::spawn_blocking(move || -> Result<(i32, Vec<u8>, Vec<u8>), WorkspaceError> {
-            let guard = store.acquire(&ws_clone.name, Duration::from_secs(10))?;
-            if let Some(manifest) = &manifest_opt {
-                let source = MemBlobSource { blobs };
-                guard.sync(manifest, &source)?;
-            } else if !guard.is_ready() {
-                return Err(WorkspaceError::Path {
-                    path: ws_clone.name.clone(),
-                    reason: "workspace is not ready for --no-sync".to_string(),
-                });
-            }
-            guard.prepare_tmp()?;
-
-            let mut work_dir = guard.tree_dir();
-            let mut cmd = match &spec {
-                TaskSpec::Command {
-                    program,
-                    args,
-                    env,
-                    working_dir,
-                    ..
-                } => {
-                    if let Some(cwd) = working_dir {
-                        work_dir = work_dir.join(cwd);
-                    }
-                    let mut c = Command::new(program);
-                    c.args(args);
-                    for (k, v) in env {
-                        c.env(k, v);
-                    }
-                    c
-                }
-                TaskSpec::ShellScript { script, env, .. } => {
-                    #[cfg(windows)]
-                    let mut c = {
-                        let mut c = Command::new("cmd.exe");
-                        c.arg("/C").arg(script);
-                        c
-                    };
-                    #[cfg(not(windows))]
-                    let mut c = {
-                        let mut c = Command::new("sh");
-                        c.arg("-c").arg(script);
-                        c
-                    };
-                    for (k, v) in env {
-                        c.env(k, v);
-                    }
-                    c
-                }
-                other => {
-                    return Err(WorkspaceError::Path {
-                        path: ws_clone.name.clone(),
-                        reason: format!("unsupported workspace spec: {other:?}"),
-                    });
-                }
-            };
-
-            cmd.current_dir(&work_dir);
-            cmd.env("CARGO_TARGET_DIR", work_dir.join("target"));
-            for (k, v) in guard.task_env() {
-                cmd.env(k, v);
-            }
-            cmd.env("TMPDIR", guard.tmp_dir());
-            cmd.env("TEMP", guard.tmp_dir());
-            cmd.env("TMP", guard.tmp_dir());
-            cmd.env("CARGO_TERM_COLOR", "never");
-
-            let output = cmd.output().map_err(|e| WorkspaceError::Io {
-                context: "spawning workspace command".to_string(),
-                source: e,
-            })?;
-            let mut stderr = output.stderr;
-            let finish = guard.finish()?;
-            if let Some(warn) = finish.warning {
-                if !stderr.is_empty() && !stderr.ends_with(b"\n") {
-                    stderr.push(b'\n');
-                }
-                stderr.extend_from_slice(warn.as_bytes());
-                stderr.push(b'\n');
-            }
-            Ok((output.status.code().unwrap_or(1), output.stdout, stderr))
-        })
-        .await;
-
-    let duration_ms = started.elapsed().as_millis() as u64;
-    match run_res {
-        Ok(Ok((code, stdout, stderr))) => {
-            let error = (code != 0).then(|| String::from_utf8_lossy(&stderr).into_owned());
-            WorkerMessage::TaskResult {
-                worker_id,
-                task_id,
-                exit_code: code,
-                stdout: stdout.into(),
-                stderr: stderr.into(),
-                execution_time_ms: duration_ms,
-                is_gpu_executed: false,
-                device_name: None,
-                error,
-                asset_bytes: None,
-                artifacts: Vec::new(),
-                outputs: Vec::new(),
-            }
-        }
-        Ok(Err(e)) => task_failure_msg(worker_id, task_id, e.to_string(), duration_ms),
-        Err(join_err) => task_failure_msg(worker_id, task_id, join_err.to_string(), duration_ms),
     }
 }
 
