@@ -42,8 +42,12 @@ pub const MAX_PATH_SEGMENT_BYTES: usize = 255;
 /// The [`TaskInput::path`] of a tree placed at the sandbox root itself.
 pub const SANDBOX_ROOT: &str = ".";
 
-/// First bytes of every encoded [`TreeManifest`].
-const MANIFEST_MAGIC: &[u8] = b"oxideswarm-tree/1\n";
+/// First bytes of a legacy v1 encoded [`TreeManifest`].
+const MANIFEST_MAGIC_V1: &[u8] = b"oxideswarm-tree/1\n";
+/// First bytes of every encoded [`TreeManifest`] (`oxideswarm-tree/2`, design 0039 W11).
+const MANIFEST_MAGIC: &[u8] = b"oxideswarm-tree/2\n";
+/// Maximum symbolic link hops followed when validating in-tree link targets.
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// BLAKE3 hash of a blob's content, its name everywhere. Text form: 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -295,27 +299,128 @@ pub struct BlobFile {
     pub executable: bool,
 }
 
-/// A directory tree as a list of its regular files, sorted by path. Directories exist only as
-/// the parents of files (an empty directory is not represented) and symbolic links are not
-/// represented at all.
+/// One symbolic link of a [`TreeManifest`] (`oxideswarm-tree/2`, design 0039 W11).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BlobSymlink {
+    /// Relative, canonical path of the link inside the tree ([`validate_blob_path`]).
+    pub path: String,
+    /// Relative `/`-separated link target that stays inside the tree
+    /// ([`validate_symlink_target`]).
+    pub target: String,
+}
+
+/// Checks that `target` is a safe relative symbolic link target for a link at `link_path` inside
+/// a tree, and returns the lexically resolved tree-relative path. Refuses empty targets, absolute
+/// targets, backslashes, colons, NUL bytes, segments longer than [`MAX_PATH_SEGMENT_BYTES`], and
+/// any `..` traversal that leaves the tree root or resolves to the tree root itself.
+pub fn validate_symlink_target(link_path: &str, target: &str) -> Result<String, String> {
+    validate_blob_path(link_path)?;
+    if target.is_empty() {
+        return Err(format!("symbolic link '{link_path}' has an empty target"));
+    }
+    if target.len() > MAX_BLOB_PATH_BYTES {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{}…' is longer than {MAX_BLOB_PATH_BYTES} bytes",
+            truncate_for_message(target)
+        ));
+    }
+    if target.starts_with('/') {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{target}' is absolute and leaves the tree"
+        ));
+    }
+    if let Some(c) = target.chars().find(|c| matches!(c, '\\' | ':' | '\0')) {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{}' contains {:?}, which is not allowed in a relative link target",
+            target.escape_debug(),
+            c
+        ));
+    }
+    let mut resolved: Vec<&str> = link_path.split('/').collect();
+    resolved.pop();
+    for segment in target.split('/') {
+        match segment {
+            "" => {
+                return Err(format!(
+                    "symbolic link '{link_path}' target '{target}' has an empty segment"
+                ))
+            }
+            "." => {}
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(format!(
+                        "symbolic link '{link_path}' target '{target}' leaves the tree"
+                    ));
+                }
+            }
+            s if s.len() > MAX_PATH_SEGMENT_BYTES => {
+                return Err(format!(
+                    "symbolic link '{link_path}' target '{target}' has a segment longer than {MAX_PATH_SEGMENT_BYTES} bytes"
+                ))
+            }
+            s => resolved.push(s),
+        }
+    }
+    if resolved.is_empty() {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{target}' points to the tree root itself"
+        ));
+    }
+    let joined = resolved.join("/");
+    if joined == link_path {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{target}' points to itself"
+        ));
+    }
+    Ok(joined)
+}
+
+/// A directory tree (`oxideswarm-tree/2`, design 0039 W11) as sorted lists of its regular files,
+/// in-tree symbolic links, and empty directories. Non-empty directories exist as the parents of
+/// files, symbolic links, or empty directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeManifest {
     files: Vec<BlobFile>,
+    symlinks: Vec<BlobSymlink>,
+    empty_dirs: Vec<String>,
 }
 
 impl TreeManifest {
-    /// Builds a manifest from `files` in any order. Fails on an invalid or duplicate path, on a
-    /// file that is also the parent directory of another file, and on more than
-    /// [`MAX_TREE_FILES`] files.
-    pub fn new(mut files: Vec<BlobFile>) -> Result<Self, String> {
+    /// Builds a manifest from `files` in any order (with no symbolic links or empty directories).
+    /// Fails on an invalid or duplicate path, on a file that is also the parent directory of
+    /// another entry, and on more than [`MAX_TREE_FILES`] entries.
+    pub fn new(files: Vec<BlobFile>) -> Result<Self, String> {
+        Self::with_entries(files, Vec::new(), Vec::new())
+    }
+
+    /// Builds a manifest from `files`, `symlinks`, and `empty_dirs` in any order.
+    pub fn with_entries(
+        mut files: Vec<BlobFile>,
+        mut symlinks: Vec<BlobSymlink>,
+        mut empty_dirs: Vec<String>,
+    ) -> Result<Self, String> {
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let manifest = Self { files };
+        symlinks.sort_by(|a, b| a.path.cmp(&b.path));
+        empty_dirs.sort();
+        let manifest = Self {
+            files,
+            symlinks,
+            empty_dirs,
+        };
         manifest.validate()?;
         Ok(manifest)
     }
 
     pub fn files(&self) -> &[BlobFile] {
         &self.files
+    }
+
+    pub fn symlinks(&self) -> &[BlobSymlink] {
+        &self.symlinks
+    }
+
+    pub fn empty_dirs(&self) -> &[String] {
+        &self.empty_dirs
     }
 
     pub fn into_files(self) -> Vec<BlobFile> {
@@ -327,11 +432,11 @@ impl TreeManifest {
         self.files.iter().map(|f| f.size).sum()
     }
 
-    /// The canonical encoding (a fixed header, then bincode), which is what the manifest's blob
-    /// id names.
+    /// The canonical `oxideswarm-tree/2` encoding (a fixed header, then bincode), which is what
+    /// the manifest's blob id names.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = MANIFEST_MAGIC.to_vec();
-        bincode::serialize_into(&mut out, &self.files)
+        bincode::serialize_into(&mut out, &(&self.files, &self.symlinks, &self.empty_dirs))
             .expect("serializing a manifest into memory cannot fail");
         out
     }
@@ -341,8 +446,9 @@ impl TreeManifest {
         BlobId::of(&self.encode())
     }
 
-    /// Reads an encoded manifest and checks it like [`TreeManifest::new`] does, and that it is
-    /// in canonical order. Anything that arrived over the network goes through here.
+    /// Reads an encoded manifest (`oxideswarm-tree/2` or legacy `oxideswarm-tree/1`) and checks
+    /// it like [`TreeManifest::with_entries`] does, and that it is in canonical order. Anything
+    /// that arrived over the network goes through here.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() as u64 > MAX_MANIFEST_BYTES {
             return Err(format!(
@@ -350,50 +456,155 @@ impl TreeManifest {
                 bytes.len()
             ));
         }
-        let body = bytes
-            .strip_prefix(MANIFEST_MAGIC)
-            .ok_or_else(|| "not a directory manifest (unknown header)".to_string())?;
         use bincode::Options;
-        let files: Vec<BlobFile> = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(body.len() as u64)
-            .deserialize(body)
-            .map_err(|e| format!("corrupt directory manifest: {e}"))?;
-        if files.windows(2).any(|w| w[0].path >= w[1].path) {
+        let (files, symlinks, empty_dirs): (Vec<BlobFile>, Vec<BlobSymlink>, Vec<String>) =
+            if let Some(body) = bytes.strip_prefix(MANIFEST_MAGIC) {
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(body.len() as u64)
+                    .deserialize(body)
+                    .map_err(|e| format!("corrupt directory manifest: {e}"))?
+            } else if let Some(body) = bytes.strip_prefix(MANIFEST_MAGIC_V1) {
+                let files: Vec<BlobFile> = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(body.len() as u64)
+                    .deserialize(body)
+                    .map_err(|e| format!("corrupt directory manifest: {e}"))?;
+                (files, Vec::new(), Vec::new())
+            } else {
+                return Err("not a directory manifest (unknown header)".to_string());
+            };
+        if files.windows(2).any(|w| w[0].path >= w[1].path)
+            || symlinks.windows(2).any(|w| w[0].path >= w[1].path)
+            || empty_dirs.windows(2).any(|w| w[0] >= w[1])
+        {
             return Err("directory manifest is not sorted by path".to_string());
         }
-        let manifest = Self { files };
+        let manifest = Self {
+            files,
+            symlinks,
+            empty_dirs,
+        };
         manifest.validate()?;
         Ok(manifest)
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.files.len() > MAX_TREE_FILES {
+        let total = self
+            .files
+            .len()
+            .saturating_add(self.symlinks.len())
+            .saturating_add(self.empty_dirs.len());
+        if total > MAX_TREE_FILES {
             return Err(format!(
-                "directory has {} files; at most {MAX_TREE_FILES} can be sent",
-                self.files.len()
+                "directory has {total} files; at most {MAX_TREE_FILES} can be sent",
+                total = total
             ));
         }
-        let mut paths = HashSet::with_capacity(self.files.len());
+        let mut all_paths = HashSet::with_capacity(total);
+        let mut leaf_paths = HashSet::with_capacity(self.files.len() + self.symlinks.len());
+        let mut empty_dir_set = HashSet::with_capacity(self.empty_dirs.len());
+        let mut link_map = std::collections::HashMap::with_capacity(self.symlinks.len());
+
         for file in &self.files {
             validate_blob_path(&file.path)?;
-            if !paths.insert(file.path.as_str()) {
+            if !all_paths.insert(file.path.as_str()) {
                 return Err(format!("path '{}' is listed twice", file.path));
             }
+            leaf_paths.insert(file.path.as_str());
         }
-        for file in &self.files {
-            for (pos, _) in file.path.match_indices('/') {
-                let parent = &file.path[..pos];
-                if paths.contains(parent) {
+        for link in &self.symlinks {
+            validate_blob_path(&link.path)?;
+            validate_symlink_target(&link.path, &link.target)?;
+            if !all_paths.insert(link.path.as_str()) {
+                return Err(format!("path '{}' is listed twice", link.path));
+            }
+            leaf_paths.insert(link.path.as_str());
+            link_map.insert(link.path.as_str(), link.target.as_str());
+        }
+        for dir in &self.empty_dirs {
+            validate_blob_path(dir)?;
+            if !all_paths.insert(dir.as_str()) {
+                return Err(format!("path '{dir}' is listed twice"));
+            }
+            empty_dir_set.insert(dir.as_str());
+        }
+        let all_entry_paths = self
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .chain(self.symlinks.iter().map(|s| s.path.as_str()))
+            .chain(self.empty_dirs.iter().map(|d| d.as_str()));
+        for entry_path in all_entry_paths {
+            for (pos, _) in entry_path.match_indices('/') {
+                let parent = &entry_path[..pos];
+                if leaf_paths.contains(parent) {
                     return Err(format!(
-                        "'{parent}' is listed as a file and as the directory of '{}'",
-                        file.path
+                        "'{parent}' is listed as a file and as the directory of '{entry_path}'"
+                    ));
+                }
+                if empty_dir_set.contains(parent) {
+                    return Err(format!(
+                        "'{parent}' is listed as an empty directory and as the parent of '{entry_path}'"
                     ));
                 }
             }
         }
+        for link in &self.symlinks {
+            resolve_symlink_chain_in_tree(&link.path, &link.target, &link_map)?;
+        }
         Ok(())
     }
+}
+
+fn resolve_symlink_chain_in_tree(
+    link_path: &str,
+    target: &str,
+    link_map: &std::collections::HashMap<&str, &str>,
+) -> Result<String, String> {
+    let mut cur: Vec<&str> = link_path.split('/').collect();
+    cur.pop();
+    let mut queue: std::collections::VecDeque<&str> = target.split('/').collect();
+    let mut hops = 0usize;
+    while let Some(seg) = queue.pop_front() {
+        match seg {
+            "" => {
+                return Err(format!(
+                    "symbolic link '{link_path}' target '{target}' has an empty segment"
+                ))
+            }
+            "." => {}
+            ".." => {
+                if cur.pop().is_none() {
+                    return Err(format!(
+                        "symbolic link '{link_path}' target '{target}' leaves the tree"
+                    ));
+                }
+            }
+            s => {
+                cur.push(s);
+                let candidate = cur.join("/");
+                if let Some(&next_target) = link_map.get(candidate.as_str()) {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(format!(
+                            "symbolic link '{link_path}' exceeds maximum symbolic link depth ({MAX_SYMLINK_HOPS})"
+                        ));
+                    }
+                    cur.pop();
+                    for next_seg in next_target.split('/').rev() {
+                        queue.push_front(next_seg);
+                    }
+                }
+            }
+        }
+    }
+    if cur.is_empty() {
+        return Err(format!(
+            "symbolic link '{link_path}' target '{target}' points to the tree root itself"
+        ));
+    }
+    Ok(cur.join("/"))
 }
 
 /// Where a [`TaskInput`] comes from.
@@ -799,15 +1010,25 @@ mod tests {
     fn manifest_decode_refuses_tampered_input() {
         let manifest = TreeManifest::new(vec![file("x", b"1"), file("y", b"2")]).unwrap();
         let encoded = manifest.encode();
+        assert!(encoded.starts_with(b"oxideswarm-tree/2\n"));
 
         assert!(TreeManifest::decode(b"not a manifest").is_err());
         assert!(TreeManifest::decode(&encoded[..encoded.len() - 3]).is_err());
+
+        // Legacy v1 manifests still decode cleanly.
+        let mut v1 = MANIFEST_MAGIC_V1.to_vec();
+        bincode::serialize_into(&mut v1, &manifest.files()).unwrap();
+        assert_eq!(TreeManifest::decode(&v1).unwrap(), manifest);
 
         // Unsorted lists are refused, so one tree has exactly one id.
         let mut unsorted = MANIFEST_MAGIC.to_vec();
         bincode::serialize_into(
             &mut unsorted,
-            &vec![manifest.files()[1].clone(), manifest.files()[0].clone()],
+            &(
+                vec![manifest.files()[1].clone(), manifest.files()[0].clone()],
+                Vec::<BlobSymlink>::new(),
+                Vec::<String>::new(),
+            ),
         )
         .unwrap();
         assert!(TreeManifest::decode(&unsorted)
@@ -816,8 +1037,118 @@ mod tests {
 
         // A path that escapes is refused even when it arrives encoded.
         let mut escaping = MANIFEST_MAGIC.to_vec();
-        bincode::serialize_into(&mut escaping, &vec![file("../../etc/passwd", b"x")]).unwrap();
+        bincode::serialize_into(
+            &mut escaping,
+            &(
+                vec![file("../../etc/passwd", b"x")],
+                Vec::<BlobSymlink>::new(),
+                Vec::<String>::new(),
+            ),
+        )
+        .unwrap();
         assert!(TreeManifest::decode(&escaping).is_err());
+    }
+
+    #[test]
+    fn manifest_v2_symlinks_and_empty_dirs_round_trip_and_refuse_escapes() {
+        let m = TreeManifest::with_entries(
+            vec![file("src/lib.rs", b"pub fn f() {}")],
+            vec![
+                BlobSymlink {
+                    path: "src/alias.rs".to_string(),
+                    target: "lib.rs".to_string(),
+                },
+                BlobSymlink {
+                    path: "sub/deep/up.rs".to_string(),
+                    target: "../../src/lib.rs".to_string(),
+                },
+            ],
+            vec!["empty/leaf".to_string(), "scratch".to_string()],
+        )
+        .unwrap();
+        let encoded = m.encode();
+        assert!(encoded.starts_with(b"oxideswarm-tree/2\n"));
+        let decoded = TreeManifest::decode(&encoded).unwrap();
+        assert_eq!(decoded, m);
+        assert_eq!(decoded.symlinks().len(), 2);
+        assert_eq!(decoded.empty_dirs(), &["empty/leaf", "scratch"]);
+
+        // Links that leave the tree are refused.
+        for (link_path, bad_target) in [
+            ("escape", "../outside"),
+            ("a/b/escape", "../../../outside"),
+            ("abs", "/etc/passwd"),
+            ("win", "C:/Windows/System32"),
+            ("backslash", "..\\outside"),
+            ("root_self", "."),
+            ("sub/root", ".."),
+            ("self_link", "self_link"),
+            ("sub/self_link", "../sub/self_link"),
+        ] {
+            let res = TreeManifest::with_entries(
+                vec![],
+                vec![BlobSymlink {
+                    path: link_path.to_string(),
+                    target: bad_target.to_string(),
+                }],
+                vec![],
+            );
+            assert!(
+                res.is_err(),
+                "expected ({link_path} -> {bad_target}) to be refused"
+            );
+        }
+
+        // Multi-hop symlink chain that escapes when followed step-by-step is refused.
+        let chain_escape = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "a/b/up".to_string(),
+                    target: "..".to_string(), // resolves to "a" (depth 1)
+                },
+                BlobSymlink {
+                    path: " hop".trim().to_string(),
+                    target: "a/b/up/../..".to_string(), // follows "a/b/up" -> "a", then "../.." leaves tree
+                },
+            ],
+            vec![],
+        );
+        assert!(chain_escape.is_err(), "multi-hop escape must be refused");
+
+        // Symlink loop is refused.
+        let loop_res = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "a".to_string(),
+                    target: "b".to_string(),
+                },
+                BlobSymlink {
+                    path: "b".to_string(),
+                    target: "a".to_string(),
+                },
+            ],
+            vec![],
+        );
+        assert!(loop_res.is_err(), "symlink loop must be refused");
+
+        // Non-empty directory listed in empty_dirs or colliding with file/symlink is refused.
+        assert!(TreeManifest::with_entries(
+            vec![file("dir/file.txt", b"x")],
+            vec![],
+            vec!["dir".to_string()],
+        )
+        .is_err());
+        assert!(TreeManifest::with_entries(
+            vec![file("same", b"x")],
+            vec![BlobSymlink {
+                path: "same".to_string(),
+                target: "other".to_string(),
+            }],
+            vec![],
+        )
+        .is_err());
     }
 
     #[test]

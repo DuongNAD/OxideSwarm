@@ -21,8 +21,8 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 
 use rusty_grid_core::blob::{
-    hash_reader, open_regular_file_nofollow, validate_blob_path, validate_task_inputs, BlobFile,
-    BlobId, TaskInput, TreeManifest, SANDBOX_ROOT,
+    hash_reader, open_regular_file_nofollow, validate_blob_path, validate_symlink_target,
+    validate_task_inputs, BlobFile, BlobId, BlobSymlink, TaskInput, TreeManifest, SANDBOX_ROOT,
 };
 use rusty_grid_core::blob_transfer::{
     download_blob, for_each_concurrently, missing_blobs, upload_blob, BlobChannel, BlobError,
@@ -495,12 +495,13 @@ pub struct WorkspaceScan {
     pub prepared: PreparedInputs,
 }
 
-/// Walks `root` and hashes the files a workspace sync should send. It honours `.gitignore`,
-/// `.ignore` and `.git/info/exclude` (also outside a git repository, and only those found inside
-/// `root`: no parent directory and no global excludes, so the result does not depend on the
-/// machine), includes hidden files and always leaves out `.git`. Symbolic links and special files
-/// are never followed or sent; they are listed in `prepared.skipped`. Fails when a limit of
-/// `limits` is exceeded.
+/// Walks `root` and hashes the files a workspace sync should send (`oxideswarm-tree/2`, design
+/// 0039 W11). It honours `.gitignore`, `.ignore` and `.git/info/exclude` (also outside a git
+/// repository, and only those found inside `root`: no parent directory and no global excludes, so
+/// the result does not depend on the machine), includes hidden files and empty directories, and
+/// always leaves out `.git`. Relative symbolic links whose target stays inside `root` are included
+/// in the manifest; a symbolic link that leaves `root` (or is absolute) is refused. Special files
+/// are skipped and listed in `prepared.skipped`. Fails when a limit of `limits` is exceeded.
 pub fn scan_workspace_source(
     root: &Path,
     limits: WorkspaceLimits,
@@ -515,6 +516,8 @@ pub fn scan_workspace_source(
     }
     let mut prepared = PreparedInputs::default();
     let mut files = Vec::new();
+    let mut symlinks = Vec::new();
+    let mut seen_dirs = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .parents(false)
@@ -533,21 +536,6 @@ pub fn scan_workspace_source(
         let file_type = entry
             .file_type()
             .ok_or_else(|| format!("workspace source {}: unreadable entry", path.display()))?;
-        if file_type.is_dir() {
-            continue;
-        }
-        if file_type.is_symlink() {
-            prepared
-                .skipped
-                .push(format!("{} (symbolic links are not sent)", path.display()));
-            continue;
-        }
-        if !file_type.is_file() {
-            prepared
-                .skipped
-                .push(format!("{} (not a regular file)", path.display()));
-            continue;
-        }
         let rel_path = path
             .strip_prefix(root)
             .map_err(|e| format!("workspace source {}: {e}", path.display()))?;
@@ -571,6 +559,35 @@ pub fn scan_workspace_source(
         let rel = parts.join("/");
         if let Err(e) = validate_blob_path(&rel) {
             prepared.skipped.push(format!("{} ({e})", path.display()));
+            continue;
+        }
+        if file_type.is_dir() {
+            seen_dirs.push(rel);
+            continue;
+        }
+        if file_type.is_symlink() {
+            let raw_target = std::fs::read_link(path)
+                .map_err(|e| format!("workspace source {}: {e}", path.display()))?;
+            let Some(raw_str) = raw_target.to_str() else {
+                return Err(format!(
+                    "workspace source {}: symbolic link '{}' target is not UTF-8",
+                    root.display(),
+                    rel
+                ));
+            };
+            #[cfg(windows)]
+            let target = raw_str.replace('\\', "/");
+            #[cfg(not(windows))]
+            let target = raw_str.to_string();
+            validate_symlink_target(&rel, &target)
+                .map_err(|e| format!("workspace source {}: {e}", root.display()))?;
+            symlinks.push(BlobSymlink { path: rel, target });
+            continue;
+        }
+        if !file_type.is_file() {
+            prepared
+                .skipped
+                .push(format!("{} (not a regular file)", path.display()));
             continue;
         }
         if prepared.files >= limits.max_files {
@@ -611,7 +628,22 @@ pub fn scan_workspace_source(
             executable,
         });
     }
-    let manifest = TreeManifest::new(files)
+    let mut non_empty_dirs = std::collections::HashSet::new();
+    for entry_path in files
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(symlinks.iter().map(|s| s.path.as_str()))
+        .chain(seen_dirs.iter().map(|d| d.as_str()))
+    {
+        for (pos, _) in entry_path.match_indices('/') {
+            non_empty_dirs.insert(entry_path[..pos].to_string());
+        }
+    }
+    let empty_dirs: Vec<String> = seen_dirs
+        .into_iter()
+        .filter(|d| !non_empty_dirs.contains(d))
+        .collect();
+    let manifest = TreeManifest::with_entries(files, symlinks, empty_dirs)
         .map_err(|e| format!("workspace source {}: {e}", root.display()))?;
     let encoded = manifest.encode();
     let manifest_id = BlobId::of(&encoded);
@@ -1394,24 +1426,69 @@ mod tests {
             assert!(scan_workspace_source(&r.join("a"), WorkspaceLimits::default()).is_err());
         }
 
-        #[cfg(unix)]
         #[test]
-        fn links_are_skipped_and_listed_and_executable_bit_is_kept() {
-            use std::os::unix::fs::PermissionsExt;
+        fn in_tree_links_and_empty_dirs_are_kept_and_escaping_links_are_refused() {
             let dir = tempfile::tempdir().unwrap();
             let r = dir.path();
             write(r, "run.sh", "#!/bin/sh");
-            fs::set_permissions(r.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-            write(r, "plain", "p");
-            let outside = tempfile::tempdir().unwrap();
-            write(outside.path(), "secret", "s");
-            std::os::unix::fs::symlink(outside.path().join("secret"), r.join("link")).unwrap();
-            std::os::unix::fs::symlink(outside.path(), r.join("dirlink")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(r.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            write(r, "sub/plain.txt", "p");
+            fs::create_dir_all(r.join("empty/leaf")).unwrap();
+
+            let scan_no_links = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(paths(&scan_no_links), vec!["run.sh", "sub/plain.txt"]);
+            assert_eq!(scan_no_links.manifest.empty_dirs(), &["empty/leaf"]);
+            #[cfg(unix)]
+            assert!(scan_no_links.manifest.files()[0].executable);
+            assert!(!scan_no_links.manifest.files()[1].executable);
+
+            if !rusty_grid_worker::sandbox::try_create_test_symlink_file(
+                Path::new("../run.sh"),
+                &r.join("sub/alias.sh"),
+            ) {
+                return;
+            }
             let scan = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
-            assert_eq!(paths(&scan), vec!["plain", "run.sh"]);
-            assert!(scan.manifest.files()[1].executable);
-            assert!(!scan.manifest.files()[0].executable);
-            assert_eq!(scan.prepared.skipped.len(), 2);
+            assert_eq!(
+                scan.manifest.symlinks(),
+                &[BlobSymlink {
+                    path: "sub/alias.sh".to_string(),
+                    target: "../run.sh".to_string(),
+                }]
+            );
+            assert_eq!(scan.manifest.empty_dirs(), &["empty/leaf"]);
+            assert!(scan.prepared.skipped.is_empty());
+
+            // Relative link that leaves the tree is refused.
+            assert!(rusty_grid_worker::sandbox::try_create_test_symlink_file(
+                Path::new("../../outside"),
+                &r.join("sub/escape"),
+            ));
+            let err = scan_workspace_source(r, WorkspaceLimits::default())
+                .err()
+                .expect("link leaving the tree must be refused");
+            assert!(err.contains("leaves the tree"), "{err}");
+            let _ = fs::remove_file(r.join("sub/escape"));
+
+            // Absolute link is refused.
+            let outside = tempfile::tempdir().unwrap();
+            let outside_secret = outside.path().join("secret");
+            fs::write(&outside_secret, "s").unwrap();
+            assert!(rusty_grid_worker::sandbox::try_create_test_symlink_file(
+                &outside_secret,
+                &r.join("abs_link"),
+            ));
+            let abs_err = scan_workspace_source(r, WorkspaceLimits::default())
+                .err()
+                .expect("absolute link must be refused");
+            assert!(
+                abs_err.contains("leaves the tree") || abs_err.contains("not allowed"),
+                "{abs_err}"
+            );
         }
     }
 }

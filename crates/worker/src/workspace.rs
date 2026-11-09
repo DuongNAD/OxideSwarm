@@ -20,7 +20,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::blob::{
-    open_regular_file_nofollow, validate_blob_path, BlobFile, BlobHasher, BlobId, TreeManifest,
+    open_regular_file_nofollow, validate_blob_path, validate_symlink_target, BlobFile, BlobHasher,
+    BlobId, BlobSymlink, TreeManifest,
 };
 use rusty_grid_core::task::validate_workspace_name;
 use serde::{Deserialize, Serialize};
@@ -169,13 +170,21 @@ struct FileRecord {
     mtime_ns: u64,
 }
 
-/// The content of `state.json` (D2, D3).
+/// The content of `state.json` (D2, D3, W11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     version: u32,
     pub state: SyncState,
     records: BTreeMap<String, FileRecord>,
     pending: BTreeSet<String>,
+    #[serde(default)]
+    symlinks: BTreeMap<String, String>,
+    #[serde(default)]
+    pending_symlinks: BTreeSet<String>,
+    #[serde(default)]
+    empty_dirs: BTreeSet<String>,
+    #[serde(default)]
+    pending_dirs: BTreeSet<String>,
     /// Milliseconds since the Unix epoch.
     pub last_used_ms: u64,
     pub size_bytes: u64,
@@ -188,6 +197,10 @@ impl WorkspaceState {
             state: SyncState::Syncing,
             records: BTreeMap::new(),
             pending: BTreeSet::new(),
+            symlinks: BTreeMap::new(),
+            pending_symlinks: BTreeSet::new(),
+            empty_dirs: BTreeSet::new(),
+            pending_dirs: BTreeSet::new(),
             last_used_ms: 0,
             size_bytes: 0,
         }
@@ -818,11 +831,58 @@ impl WorkspaceGuard {
         for f in manifest.files() {
             targets.push((f, checked_path(&tree, &f.path)?));
         }
-        let new_paths: BTreeSet<&str> = manifest.files().iter().map(|f| f.path.as_str()).collect();
+        let mut link_targets: Vec<(&BlobSymlink, PathBuf, String)> =
+            Vec::with_capacity(manifest.symlinks().len());
+        for s in manifest.symlinks() {
+            let link_path = checked_path(&tree, &s.path)?;
+            let resolved = validate_symlink_target(&s.path, &s.target).map_err(|reason| {
+                WorkspaceError::Path {
+                    path: s.path.clone(),
+                    reason,
+                }
+            })?;
+            checked_path(&tree, &resolved).map_err(|e| WorkspaceError::Path {
+                path: s.path.clone(),
+                reason: format!("symbolic link target '{resolved}': {e}"),
+            })?;
+            link_targets.push((s, link_path, resolved));
+        }
+        let mut empty_dir_targets: Vec<(&str, PathBuf)> =
+            Vec::with_capacity(manifest.empty_dirs().len());
+        for d in manifest.empty_dirs() {
+            empty_dir_targets.push((d.as_str(), checked_path(&tree, d)?));
+        }
+
+        let new_file_paths: BTreeSet<&str> =
+            manifest.files().iter().map(|f| f.path.as_str()).collect();
+        let new_symlink_paths: BTreeSet<&str> = manifest
+            .symlinks()
+            .iter()
+            .map(|s| s.path.as_str())
+            .collect();
+        let new_empty_dirs: BTreeSet<&str> =
+            manifest.empty_dirs().iter().map(|d| d.as_str()).collect();
+        let mut manifest_dirs: HashSet<&str> = new_empty_dirs.iter().copied().collect();
+        for p in new_file_paths
+            .iter()
+            .copied()
+            .chain(new_symlink_paths.iter().copied())
+            .chain(new_empty_dirs.iter().copied())
+        {
+            for (pos, _) in p.match_indices('/') {
+                manifest_dirs.insert(&p[..pos]);
+            }
+        }
 
         // 1. pending paths, Syncing, flush.
-        for p in &new_paths {
+        for p in &new_file_paths {
             st.pending.insert((*p).to_string());
+        }
+        for p in &new_symlink_paths {
+            st.pending_symlinks.insert((*p).to_string());
+        }
+        for p in &new_empty_dirs {
+            st.pending_dirs.insert((*p).to_string());
         }
         st.state = SyncState::Syncing;
         st.last_used_ms = (self.store.clock)();
@@ -845,18 +905,37 @@ impl WorkspaceGuard {
 
         let mut report = SyncReport::default();
 
-        // 4. delete tracked paths the manifest dropped (regular files only), then empty dirs.
-        let stale: Vec<String> = st
+        // 4. delete tracked paths the manifest dropped (regular files, tracked symlinks, and
+        //    tracked empty directories), then remove directories left empty.
+        let stale_files: Vec<String> = st
             .records
             .keys()
             .chain(st.pending.iter())
-            .filter(|p| !new_paths.contains(p.as_str()))
+            .filter(|p| !new_file_paths.contains(p.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stale_symlinks: Vec<String> = st
+            .symlinks
+            .keys()
+            .chain(st.pending_symlinks.iter())
+            .filter(|p| !new_symlink_paths.contains(p.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stale_dirs: Vec<String> = st
+            .empty_dirs
+            .iter()
+            .chain(st.pending_dirs.iter())
+            .filter(|p| !manifest_dirs.contains(p.as_str()))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for p in &stale {
+        for p in &stale_files {
             let Ok(path) = checked_path(&tree, p) else {
                 continue;
             };
@@ -879,12 +958,60 @@ impl WorkspaceGuard {
                 cur = d.parent();
             }
         }
+        for p in &stale_symlinks {
+            let Ok(path) = checked_path(&tree, p) else {
+                continue;
+            };
+            if !parents_are_real_dirs(&tree, &path) {
+                continue;
+            }
+            if let Ok(m) = fs::symlink_metadata(&path) {
+                if is_link_like(&m) {
+                    remove_symlink(&path).map_err(io_err(format!("deleting symbolic link {p}")))?;
+                    report.deleted += 1;
+                }
+            }
+            let mut cur = path.parent();
+            while let Some(d) = cur {
+                if d == tree {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
+        for p in &stale_dirs {
+            let Ok(path) = checked_path(&tree, p) else {
+                continue;
+            };
+            if !parents_are_real_dirs(&tree, &path) {
+                continue;
+            }
+            let mut cur = Some(path.as_path());
+            while let Some(d) = cur {
+                if d == tree {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
         // Deepest first; remove_dir fails on a non-empty directory, which is the point.
         for d in dirs.iter().rev() {
-            let _ = fs::remove_dir(d);
+            if let Ok(m) = fs::symlink_metadata(d) {
+                if m.is_dir()
+                    && !is_link_like(&m)
+                    && fs::remove_dir(d).is_ok()
+                    && stale_dirs
+                        .iter()
+                        .any(|sd| d.strip_prefix(&tree).ok() == Some(Path::new(sd)))
+                {
+                    report.deleted += 1;
+                }
+            }
         }
 
-        // 2 and 3. add or replace.
+        // 2 and 3. add or replace regular files, empty directories, and in-tree symbolic links.
         let mut records = BTreeMap::new();
         for (file, path) in &targets {
             ensure_parents(&tree, path, &file.path)?;
@@ -951,9 +1078,93 @@ impl WorkspaceGuard {
             );
         }
 
+        let mut empty_dirs_out = BTreeSet::new();
+        for (dir_rel, dir_path) in &empty_dir_targets {
+            ensure_parents(&tree, dir_path, dir_rel)?;
+            match fs::symlink_metadata(dir_path) {
+                Ok(m) if m.is_dir() && !is_link_like(&m) => {}
+                Ok(m) => {
+                    let what = if is_link_like(&m) {
+                        "a symbolic link"
+                    } else {
+                        "a file"
+                    };
+                    return Err(WorkspaceError::Path {
+                        path: (*dir_rel).to_string(),
+                        reason: format!("the tree has {what} here"),
+                    });
+                }
+                Err(_) => {
+                    fs::create_dir(dir_path)
+                        .map_err(io_err(format!("creating empty directory {dir_rel}")))?;
+                }
+            }
+            empty_dirs_out.insert((*dir_rel).to_string());
+        }
+
+        let mut symlinks_out = BTreeMap::new();
+        for (link, path, resolved) in &link_targets {
+            ensure_parents(&tree, path, &link.path)?;
+            let target_is_dir =
+                manifest_dirs.contains(resolved.as_str()) || is_real_dir(&tree.join(resolved));
+            let tracked =
+                st.symlinks.contains_key(&link.path) || st.pending_symlinks.contains(&link.path);
+            let kept = match fs::symlink_metadata(path) {
+                Ok(m) if is_link_like(&m) => {
+                    let existing = fs::read_link(path)
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.replace('\\', "/")));
+                    if existing.as_deref() == Some(link.target.as_str()) {
+                        true
+                    } else if tracked {
+                        remove_symlink(path)
+                            .map_err(io_err(format!("replacing symbolic link {}", link.path)))?;
+                        false
+                    } else {
+                        return Err(WorkspaceError::Path {
+                            path: link.path.clone(),
+                            reason: "the tree already has a different symbolic link here"
+                                .to_string(),
+                        });
+                    }
+                }
+                Ok(m) if m.is_dir() => {
+                    return Err(WorkspaceError::Path {
+                        path: link.path.clone(),
+                        reason: "the tree has a directory here".to_string(),
+                    })
+                }
+                Ok(_) => {
+                    if tracked {
+                        fs::remove_file(path)
+                            .map_err(io_err(format!("replacing {}", link.path)))?;
+                        false
+                    } else {
+                        return Err(WorkspaceError::Path {
+                            path: link.path.clone(),
+                            reason: "the tree has a file here".to_string(),
+                        });
+                    }
+                }
+                Err(_) => false,
+            };
+            if kept {
+                report.unchanged += 1;
+            } else {
+                create_in_tree_symlink(&link.target, path, target_is_dir)
+                    .map_err(io_err(format!("creating symbolic link {}", link.path)))?;
+                report.written += 1;
+            }
+            symlinks_out.insert(link.path.clone(), link.target.clone());
+        }
+
         // 5. records := new manifest, clear pending, Ready, flush.
         st.records = records;
         st.pending.clear();
+        st.symlinks = symlinks_out;
+        st.pending_symlinks.clear();
+        st.empty_dirs = empty_dirs_out;
+        st.pending_dirs.clear();
         st.state = SyncState::Ready;
         self.write_state(&st)?;
         Ok(report)
@@ -1014,20 +1225,63 @@ fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> 
              on macOS and Windows"
         ),
     };
-    for f in manifest.files() {
-        let folded = f.path.to_lowercase();
+    for p in manifest
+        .files()
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(manifest.symlinks().iter().map(|s| s.path.as_str()))
+    {
+        let folded = p.to_lowercase();
         if dirs.contains(&folded) || !files.insert(folded.clone()) {
-            return Err(clash(&f.path, &folded));
+            return Err(clash(p, &folded));
         }
         for (pos, _) in folded.match_indices('/') {
             let d = &folded[..pos];
             if files.contains(d) {
-                return Err(clash(&f.path, d));
+                return Err(clash(p, d));
+            }
+            dirs.insert(d.to_string());
+        }
+    }
+    for d_path in manifest.empty_dirs() {
+        let folded = d_path.to_lowercase();
+        if files.contains(&folded) || !dirs.insert(folded.clone()) {
+            return Err(clash(d_path, &folded));
+        }
+        for (pos, _) in folded.match_indices('/') {
+            let d = &folded[..pos];
+            if files.contains(d) {
+                return Err(clash(d_path, d));
             }
             dirs.insert(d.to_string());
         }
     }
     Ok(())
+}
+
+fn create_in_tree_symlink(
+    target: &str,
+    link_path: &Path,
+    target_is_dir: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::os::unix::fs::symlink(target, link_path)
+    }
+    #[cfg(windows)]
+    {
+        let win_target = target.replace('/', "\\");
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(&win_target, link_path)
+        } else {
+            std::os::windows::fs::symlink_file(&win_target, link_path)
+        }
+    }
+}
+
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path).or_else(|_| fs::remove_dir(path))
 }
 
 /// `tree` joined with the manifest path `rel`, after the checks of design 0021 and the blob path
@@ -2072,5 +2326,95 @@ mod tests {
         assert!(g.tree_dir().join("sub").is_symlink());
         assert!(g.sync(&manifest(v1), &Mem::new(v1)).is_err());
         assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn w11_empty_directories_are_materialized_and_cleaned_up_when_dropped() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("src/main.rs", "fn main() {}", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["empty/nested".to_string(), "fixtures".to_string()],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert!(g.tree_dir().join("empty/nested").is_dir());
+        assert!(g.tree_dir().join("fixtures").is_dir());
+
+        // Dropping "empty/nested" removes both "empty/nested" and "empty".
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["fixtures".to_string()],
+        )
+        .unwrap();
+        let r = g.sync(&m2, &Mem::new(v1_files)).unwrap();
+        assert!(r.deleted >= 1);
+        assert!(!g.tree_dir().join("empty").exists());
+        assert!(g.tree_dir().join("fixtures").is_dir());
+    }
+
+    #[test]
+    fn w11_in_tree_symlinks_arrive_as_links_and_update_or_delete_cleanly() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[
+            ("scripts/mode.sh", "#!/bin/sh\necho ok\n", true),
+            ("scripts/alt.sh", "#!/bin/sh\necho alt\n", true),
+        ];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "ox-mode".to_string(),
+                target: "scripts/mode.sh".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let r1 = g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r1.written, 3);
+        let link_meta = fs::symlink_metadata(g.tree_dir().join("ox-mode")).unwrap();
+        assert!(is_link_like(&link_meta), "ox-mode must arrive as a symlink");
+        let link_target = fs::read_link(g.tree_dir().join("ox-mode"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        assert_eq!(link_target, "scripts/mode.sh");
+        assert_eq!(read(&g, "ox-mode"), "#!/bin/sh\necho ok\n");
+
+        // Second sync with unchanged symlink keeps it without rewriting.
+        let r2 = g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!((r2.written, r2.unchanged), (0, 3));
+
+        // Updating the symlink target replaces the link.
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "ox-mode".to_string(),
+                target: "scripts/alt.sh".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let r3 = g.sync(&m2, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r3.written, 1);
+        assert_eq!(read(&g, "ox-mode"), "#!/bin/sh\necho alt\n");
+
+        // Dropping the symlink removes it from the tree.
+        let m3 = manifest(v1_files);
+        let r4 = g.sync(&m3, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r4.deleted, 1);
+        assert!(fs::symlink_metadata(g.tree_dir().join("ox-mode")).is_err());
     }
 }

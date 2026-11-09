@@ -1,6 +1,6 @@
 # 0039: Persistent workspaces for coding agents
 
-Status: Accepted. W1 to W10 are built and recorded live; W11 (optional) is open
+Status: Implemented. W1 to W11 are built and W10 is recorded live
 Created: 2026-11-07    Updated: 2026-11-09
 
 ## Summary
@@ -343,7 +343,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Implemented |
 | W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
 | W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Done |
-| W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Planned |
+| W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Done |
 
 Order: W1, then W2 to W5 in parallel, then W6 and W10. W7 to W9 and W11 can follow in any order.
 The roadmap keeps Phase B (FEAT-1, FEAT-2, FEAT-3) before Phase C ships, and `--workspaces` stays
@@ -515,3 +515,19 @@ off by default until FEAT-3 is Implemented.
   the cold runs took 210.7 s and 207.4 s and the warm runs 6.9 s and 6.6 s, with no `Compiling`
   line and nothing uploaded. The run found that closing standard input cancels a running MCP call,
   and the guide's MCP example now keeps the pipe open.
+- 2026-11-09: W11 done (`oxideswarm-tree/2`). `TreeManifest` (`crates/core/src/blob.rs`,
+  `MANIFEST_FORMAT_V2 = "oxideswarm-tree/2"`, while still accepting `"oxideswarm-tree/1"`) adds
+  `links: Vec<TreeSymlink>` (`TreeSymlink { path, target }`) and `dirs: Vec<String>` (empty
+  directories). `validate_manifest` enforces sorted unique paths across `files`, `links` and `dirs`,
+  no path overlap or ancestor/descendant conflict with a link or empty directory, and that every
+  `TreeSymlink::target` is a relative `/` path (`.`, `..` and normal components only, no NUL or `\`)
+  whose lexical resolution from `path`'s parent stays strictly inside the tree root and does not
+  traverse through another `links` entry. `scan_workspace_source` (`crates/cli/src/blobs.rs`)
+  records in-tree relative symbolic links in `manifest.links`, refuses links whose target is
+  absolute or resolves outside the tree root, and records empty non-ignored directories in
+  `manifest.dirs`. `WorkspaceGuard::sync` (`crates/worker/src/workspace.rs`) tracks `links` and
+  `dirs` in `state.json`, removes stale tracked links and empty directories before creating new
+  entries, creates empty directories and symbolic links after verifying non-symlink parents, and on
+  Windows maps `ERROR_PRIVILEGE_NOT_HELD` (`1314`) when creating a symbolic link to a clear hint to
+  enable Windows Developer Mode. Windows symlink tests skip cleanly when symlink creation returns
+  OS error `1314` unless `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
