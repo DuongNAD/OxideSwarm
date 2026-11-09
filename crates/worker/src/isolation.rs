@@ -2270,11 +2270,27 @@ pub mod windows {
         }
     }
 
-    /// Creates and caches a primary LUA-filtered token (`CreateRestrictedToken` with `LUA_TOKEN`
-    /// and `DuplicateTokenEx` with `TokenPrimary`) when the worker runs elevated
-    /// (`is_process_elevated() == true`), with `TokenOwner = CurrentUser` and `TokenDefaultDacl`
-    /// granting `CurrentUser` (in addition to `SYSTEM` and `Administrators`, never `BUILTIN\Users`
-    /// or `Everyone`). Returns `None` when the worker is not elevated.
+    /// Creates and caches a primary LUA-filtered child token (`CreateRestrictedToken` with
+    /// `LUA_TOKEN` + `DuplicateTokenEx` with `TokenPrimary`, `TokenOwner = CurrentUser`, and
+    /// `TokenDefaultDacl` granting `CurrentUser`, `SYSTEM`, and `Administrators` — never
+    /// `BUILTIN\Users` or `Everyone`) when the worker runs elevated (`is_process_elevated() == true`).
+    ///
+    /// Note on elevated sessions (`runneradmin` on GitHub Actions `windows-latest`):
+    /// - `CreateProcessAsUserW` without `SeAssignPrimaryTokenPrivilege` is only permitted by
+    ///   `ntoskrnl.exe!SeIsTokenAssignableToProcess` when the primary token is a restricted child
+    ///   token sharing the calling process's `AuthenticationId` (`AdminLogonId`); a token with a
+    ///   different `AuthenticationId` (such as `LogonUserW`) is rejected with
+    ///   `ERROR_PRIVILEGE_NOT_HELD (os error 1314)`.
+    /// - Under an elevated split-token logon session, `\Sessions\<S>\DosDevices\<AdminLogonId>` is
+    ///   created by the kernel before the worker starts with `TokenOwner = BUILTIN\Administrators`
+    ///   (`O:BA D:(A;OICI;...;;;SY)(A;OICI;...;;;BA)`), which has no ACE for `CurrentUser`. Because
+    ///   OxideSwarm never edits Object Manager DACLs (`\??`, `\GLOBAL??`, `\Device\Null`) or grants
+    ///   broad SIDs, opening `\??\NUL` inside an AppContainer under an elevated runner returns
+    ///   `ERROR_ACCESS_DENIED (5)`, whereas on normal non-elevated Windows workers
+    ///   `\Sessions\<S>\DosDevices\<LogonId>` has `(A;;CCDCLCSWSDRCWDWO;;;<CurrentUser>)` and
+    ///   `\??\NUL` works natively.
+    ///
+    /// Returns `None` when the worker is not elevated.
     fn get_or_init_worker_lua_token() -> Option<HANDLE> {
         static WORKER_LUA_TOKEN: OnceLock<Option<usize>> = OnceLock::new();
         WORKER_LUA_TOKEN
@@ -2334,7 +2350,7 @@ pub mod windows {
                     Some(primary_token as usize)
                 }
             })
-            .map(|raw| raw as HANDLE)
+            .map(|primary| primary as HANDLE)
     }
 
     /// When the worker process runs under an elevated Administrator token (such as `runneradmin`
@@ -2688,31 +2704,43 @@ pub mod windows {
         }
         // Refuse to rewrite the DACL of a folder inside the user's home directory (such as
         // `C:\Users\me\Documents` or `C:\Users\me\Desktop`) unless it is inside OxideSwarm's own
-        // `<user_home>\.oxideswarm\sandboxes` directory.
+        // `<user_home>\.oxideswarm\sandboxes` directory or a dedicated subdirectory under `%TEMP%`
+        // (such as the default `%TEMP%\rusty_grid\sandboxes`).
+        let is_allowed_under_home = |home: &Path| -> bool {
+            let allowed_ox = home.join(".oxideswarm").join("sandboxes");
+            let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
+            let in_home_temp = path_starts_with_ci(sandbox_base, &allowed_home_temp)
+                && !path_starts_with_ci(&allowed_home_temp, sandbox_base);
+            let temp_is_inside_home = !temp_root.as_os_str().is_empty()
+                && path_starts_with_ci(&temp_root, home)
+                && !path_starts_with_ci(home, &temp_root);
+            let in_env_temp = temp_is_inside_home
+                && path_starts_with_ci(sandbox_base, &temp_root)
+                && !path_starts_with_ci(&temp_root, sandbox_base);
+            path_starts_with_ci(sandbox_base, &allowed_ox) || in_home_temp || in_env_temp
+        };
         if !host.user_home.as_os_str().is_empty()
             && path_starts_with_ci(sandbox_base, &host.user_home)
+            && !is_allowed_under_home(&host.user_home)
         {
             let allowed_ox = host.user_home.join(".oxideswarm").join("sandboxes");
-            if !path_starts_with_ci(sandbox_base, &allowed_ox) {
+            return Err(format!(
+                "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
+                sandbox_base.display(),
+                allowed_ox.display()
+            ));
+        }
+        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if !env_up.as_os_str().is_empty()
+                && path_starts_with_ci(sandbox_base, &env_up)
+                && !is_allowed_under_home(&env_up)
+            {
+                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
                 return Err(format!(
                     "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
                     sandbox_base.display(),
                     allowed_ox.display()
                 ));
-            }
-        }
-        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-            if !env_up.as_os_str().is_empty() && path_starts_with_ci(sandbox_base, &env_up) {
-                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
-                let in_ox_sandboxes = path_starts_with_ci(sandbox_base, &allowed_ox);
-                let in_temp = path_starts_with_ci(sandbox_base, &temp_root);
-                if !in_ox_sandboxes && !in_temp {
-                    return Err(format!(
-                        "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
-                        sandbox_base.display(),
-                        allowed_ox.display()
-                    ));
-                }
             }
         }
         // If `sandbox_base` already exists on disk, refuse to rewrite its DACL if it contains any
@@ -2736,6 +2764,137 @@ pub mod windows {
                             sandbox_base.display(),
                             s
                         ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates that `ws_root` is a dedicated OxideSwarm workspace root directory and not a
+    /// drive root, home directory, toolchain directory, shared system `%TEMP%` root, or arbitrary
+    /// user directory.
+    pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(), String> {
+        let norm = normalize_win_path(ws_root);
+        if norm.parent().is_none()
+            || matches!(
+                norm.components().next_back(),
+                Some(Component::RootDir | Component::Prefix(_))
+            )
+        {
+            return Err(format!(
+                "refusing to use drive root '{}' as workspace_root; point --workspace-root at a dedicated subdirectory",
+                ws_root.display()
+            ));
+        }
+        for (label, dir) in [
+            ("USERPROFILE", &host.user_home),
+            ("RUSTUP_HOME", &host.rustup_home),
+            ("CARGO_HOME", &host.cargo_home),
+        ] {
+            if !dir.as_os_str().is_empty() && path_starts_with_ci(dir, ws_root) {
+                return Err(format!(
+                    "refusing to rewrite the DACL of '{}' as workspace_root because {} ('{}') is equal to or inside it; point --workspace-root at a dedicated OxideSwarm workspace directory",
+                    ws_root.display(),
+                    label,
+                    dir.display()
+                ));
+            }
+        }
+        let temp_root = normalize_win_path(&std::env::temp_dir());
+        if norm.as_os_str().eq_ignore_ascii_case(temp_root.as_os_str()) {
+            return Err(format!(
+                "refusing to rewrite the DACL of the shared system temp directory '{}' as workspace_root; use a subdirectory",
+                ws_root.display()
+            ));
+        }
+        for env_var in [
+            "SystemRoot",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramData",
+            "PUBLIC",
+            "LOCALAPPDATA",
+            "APPDATA",
+        ] {
+            if let Some(sys_dir) = std::env::var_os(env_var).map(PathBuf::from) {
+                if !sys_dir.as_os_str().is_empty() && path_starts_with_ci(&sys_dir, ws_root) {
+                    return Err(format!(
+                        "refusing to rewrite the DACL of '{}' as workspace_root because system directory %{env_var}% ('{}') is equal to or inside it",
+                        ws_root.display(),
+                        sys_dir.display()
+                    ));
+                }
+            }
+        }
+        let is_allowed_under_home = |home: &Path| -> bool {
+            let allowed1 = home.join(".oxideswarm").join("workspaces");
+            let allowed2 = home.join(".cache").join("oxideswarm").join("workspaces");
+            let allowed3 = home
+                .join("AppData")
+                .join("Local")
+                .join("oxideswarm")
+                .join("workspaces");
+            path_starts_with_ci(ws_root, &allowed1)
+                || path_starts_with_ci(ws_root, &allowed2)
+                || path_starts_with_ci(ws_root, &allowed3)
+                || path_starts_with_ci(ws_root, &temp_root)
+        };
+        if !host.user_home.as_os_str().is_empty()
+            && path_starts_with_ci(ws_root, &host.user_home)
+            && !is_allowed_under_home(&host.user_home)
+        {
+            return Err(format!(
+                "refusing to rewrite the DACL of user folder '{}' as workspace_root; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
+                ws_root.display()
+            ));
+        }
+        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if !env_up.as_os_str().is_empty()
+                && path_starts_with_ci(ws_root, &env_up)
+                && !is_allowed_under_home(&env_up)
+            {
+                return Err(format!(
+                    "refusing to rewrite the DACL of user folder '{}' as workspace_root; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
+                    ws_root.display()
+                ));
+            }
+        }
+        if ws_root.exists() {
+            if let Ok(entries) = std::fs::read_dir(ws_root) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let s = name.to_string_lossy();
+                    let is_ws_entry = s == "store.lock"
+                        || s == ".locks"
+                        || rusty_grid_core::task::validate_workspace_name(&s).is_ok();
+                    if !is_ws_entry {
+                        return Err(format!(
+                            "refusing to rewrite the DACL of existing folder '{}' containing non-workspace entry '{}'; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
+                            ws_root.display(),
+                            s
+                        ));
+                    }
+                    let entry_path = entry.path();
+                    if s != "store.lock" && s != ".locks" && entry_path.is_dir() {
+                        if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                            for sub in sub_entries.flatten() {
+                                let sub_name = sub.file_name();
+                                let sub_s = sub_name.to_string_lossy();
+                                let valid_sub = matches!(
+                                    sub_s.as_ref(),
+                                    "tree" | "tmp" | "state.json" | "state.json.tmp" | "lock"
+                                );
+                                if !valid_sub {
+                                    return Err(format!(
+                                        "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' contains non-workspace entry '{}'",
+                                        ws_root.display(),
+                                        s,
+                                        sub_s
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3076,6 +3235,7 @@ pub mod windows {
         _capability_sids: Vec<OwnedSid>,
         _capability_attrs: Vec<SID_AND_ATTRIBUTES>,
         security_capabilities: Box<SECURITY_CAPABILITIES>,
+        workspace_dirs_to_restore: Vec<PathBuf>,
         cleaned_up: bool,
     }
 
@@ -3118,8 +3278,9 @@ pub mod windows {
         /// - Never modifies any directory named by the task's `CARGO_HOME`, `RUSTUP_HOME`,
         ///   `program`, or `Cargo.lock`.
         /// - Never modifies `<user_home>` or any directory outside `<sandbox_base>` and
-        ///   `<sandbox_dir>`.
-        /// - Refuses if `<sandbox_dir>` or `<sandbox_base>` is a symlink/junction.
+        ///   `<sandbox_dir>` (or `<workspace_root>/<ws_name>/{tree,tmp}`).
+        /// - Refuses if `<sandbox_dir>`, `<sandbox_base>`, `<extra_writable_dir>`, or
+        ///   `<workspace_root>` is a symlink/junction.
         /// - Creates a per-worker, per-task AppContainer profile
         ///   `oxideswarm.task.<worker8>.<run_token_simple>` (N3).
         /// - Creates a per-task private Desktop granting `DESKTOP_TASK_MASK` only to `CurrentUser`
@@ -3143,12 +3304,37 @@ pub mod windows {
                     "refusing to configure AppContainer on a reparse-point sandbox path",
                 ));
             }
+            if let Some(extra) = jail.extra_writable_dir {
+                if is_reparse_point(extra) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "refusing to configure AppContainer on a reparse-point workspace tmp path",
+                    ));
+                }
+            }
+            if let Some(ws_root) = jail.workspace_root {
+                validate_workspace_root_safe(ws_root, jail.host)
+                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                if is_reparse_point(ws_root) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "refusing to configure AppContainer on a reparse-point workspace root path",
+                    ));
+                }
+            }
+
+            let in_task_writable = |p: &Path| -> bool {
+                path_starts_with_ci(p, jail.sandbox_dir)
+                    || jail
+                        .extra_writable_dir
+                        .is_some_and(|extra| path_starts_with_ci(p, extra))
+            };
 
             // Requirement 2: A task's `CARGO_HOME` or `RUSTUP_HOME` may point only to the worker's
             // own configured toolchain directory or a directory inside the task's sandbox.
             if let Some(ch) = cmd_cargo_home {
                 if !ch.as_os_str().is_empty()
-                    && !path_starts_with_ci(ch, jail.sandbox_dir)
+                    && !in_task_writable(ch)
                     && (jail.host.cargo_home.as_os_str().is_empty()
                         || normalize_win_path(ch) != normalize_win_path(&jail.host.cargo_home))
                 {
@@ -3164,7 +3350,7 @@ pub mod windows {
             }
             if let Some(rh) = cmd_rustup_home {
                 if !rh.as_os_str().is_empty()
-                    && !path_starts_with_ci(rh, jail.sandbox_dir)
+                    && !in_task_writable(rh)
                     && (jail.host.rustup_home.as_os_str().is_empty()
                         || normalize_win_path(rh) != normalize_win_path(&jail.host.rustup_home))
                 {
@@ -3186,7 +3372,7 @@ pub mod windows {
             // AppContainers can already read (`C:\Windows`, `C:\Program Files`, etc.).
             let prog_path = Path::new(program);
             if prog_path.is_absolute() {
-                let in_sandbox = path_starts_with_ci(prog_path, jail.sandbox_dir);
+                let in_sandbox = in_task_writable(prog_path);
                 let in_cargo = !jail.host.cargo_home.as_os_str().is_empty()
                     && path_starts_with_ci(prog_path, &jail.host.cargo_home);
                 let in_rustup = !jail.host.rustup_home.as_os_str().is_empty()
@@ -3258,7 +3444,8 @@ pub mod windows {
                 ));
             }
 
-            let setup_res = (|| -> io::Result<(HANDLE, Vec<u16>, Vec<OwnedSid>)> {
+            type SetupOut = (HANDLE, Vec<u16>, Vec<OwnedSid>, Vec<PathBuf>);
+            let setup_res = (|| -> io::Result<SetupOut> {
                 let user_sid = OwnedSid::current_user()?;
                 let system_sid = OwnedSid::from_well_known(WinLocalSystemSid)?;
                 let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)?;
@@ -3316,21 +3503,79 @@ pub mod windows {
                         Some(manifest.as_path())
                     };
                     protect_sandbox_base(jail.sandbox_base, toolchain_sid.as_psid(), manifest_opt)?;
+                    if let Some(ws_root) = jail.workspace_root {
+                        protect_sandbox_base(ws_root, toolchain_sid.as_psid(), manifest_opt)?;
+                    }
                 }
 
-                // Set a single inheritable protected DACL on `<sandbox_dir>` root granting access
-                // only to CurrentUser, SYSTEM, Administrators, and this task's specific
-                // `app_container_sid` (omitting `WRITE_DAC` and `WRITE_OWNER` so the task cannot
-                // alter its own sandbox ACL). Win32 `SetNamedSecurityInfoW` propagates `(I)` to
-                // staged children inside `<sandbox_dir>` automatically without walking (N6).
-                let task_sandbox_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
-                let sandbox_entries = [
-                    owner_only_entries[0],
-                    owner_only_entries[1],
-                    owner_only_entries[2],
-                    explicit_access(app_container_sid, task_sandbox_mask, SET_ACCESS, inherit),
-                ];
-                set_protected_dacl_on_path(jail.sandbox_dir, &sandbox_entries)?;
+                let mut workspace_dirs_to_restore = Vec::new();
+                if jail.workspace_root.is_some() {
+                    let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+                    if let Some(ws_dir) = jail.sandbox_dir.parent() {
+                        if ws_dir.exists() && !is_reparse_point(ws_dir) {
+                            let ws_parent_entries = [
+                                owner_only_entries[0],
+                                owner_only_entries[1],
+                                owner_only_entries[2],
+                                explicit_access(
+                                    toolchain_sid.as_psid(),
+                                    traverse_mask,
+                                    SET_ACCESS,
+                                    NO_INHERITANCE,
+                                ),
+                            ];
+                            set_protected_dacl_on_path(ws_dir, &ws_parent_entries)?;
+                            for meta_name in ["state.json", "lock"] {
+                                let meta_path = ws_dir.join(meta_name);
+                                if meta_path.exists() && !is_reparse_point(&meta_path) {
+                                    let _ =
+                                        set_protected_dacl_on_path(&meta_path, &owner_only_entries);
+                                }
+                            }
+                        }
+                    }
+                    const DELETE_ACCESS: u32 = 0x0001_0000;
+                    let task_child_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
+                    let task_root_mask =
+                        FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER | DELETE_ACCESS);
+                    let ws_dir_entries = [
+                        owner_only_entries[0],
+                        owner_only_entries[1],
+                        owner_only_entries[2],
+                        explicit_access(
+                            app_container_sid,
+                            task_child_mask,
+                            SET_ACCESS,
+                            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+                        ),
+                        explicit_access(
+                            app_container_sid,
+                            task_root_mask,
+                            GRANT_ACCESS,
+                            NO_INHERITANCE,
+                        ),
+                    ];
+                    set_protected_dacl_on_path(jail.sandbox_dir, &ws_dir_entries)?;
+                    workspace_dirs_to_restore.push(jail.sandbox_dir.to_path_buf());
+                    if let Some(extra) = jail.extra_writable_dir {
+                        set_protected_dacl_on_path(extra, &ws_dir_entries)?;
+                        workspace_dirs_to_restore.push(extra.to_path_buf());
+                    }
+                } else {
+                    // Set a single inheritable protected DACL on `<sandbox_dir>` root granting access
+                    // only to CurrentUser, SYSTEM, Administrators, and this task's specific
+                    // `app_container_sid` (omitting `WRITE_DAC` and `WRITE_OWNER` so the task cannot
+                    // alter its own sandbox ACL). Win32 `SetNamedSecurityInfoW` propagates `(I)` to
+                    // staged children inside `<sandbox_dir>` automatically without walking (N6).
+                    let task_sandbox_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
+                    let sandbox_entries = [
+                        owner_only_entries[0],
+                        owner_only_entries[1],
+                        owner_only_entries[2],
+                        explicit_access(app_container_sid, task_sandbox_mask, SET_ACCESS, inherit),
+                    ];
+                    set_protected_dacl_on_path(jail.sandbox_dir, &sandbox_entries)?;
+                }
 
                 // Create a dedicated per-task private Desktop on the worker's non-interactive
                 // Window Station granting `DESKTOP_TASK_MASK` only to `CurrentUser` and this
@@ -3346,20 +3591,26 @@ pub mod windows {
                     capability_sids.push(net_client);
                     capability_sids.push(net_private);
                 }
-                Ok((desktop_handle, desktop_name_wide, capability_sids))
+                Ok((
+                    desktop_handle,
+                    desktop_name_wide,
+                    capability_sids,
+                    workspace_dirs_to_restore,
+                ))
             })();
 
-            let (desktop_handle, desktop_name_wide, capability_sids) = match setup_res {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe {
-                        FreeSid(app_container_sid);
-                        let _ = DeleteAppContainerProfile(wide_profile_name.as_ptr());
+            let (desktop_handle, desktop_name_wide, capability_sids, workspace_dirs_to_restore) =
+                match setup_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        unsafe {
+                            FreeSid(app_container_sid);
+                            let _ = DeleteAppContainerProfile(wide_profile_name.as_ptr());
+                        }
+                        release_worker_prefix_guard(&worker_prefix);
+                        return Err(e);
                     }
-                    release_worker_prefix_guard(&worker_prefix);
-                    return Err(e);
-                }
-            };
+                };
 
             let mut capability_attrs: Vec<SID_AND_ATTRIBUTES> = capability_sids
                 .iter()
@@ -3389,6 +3640,7 @@ pub mod windows {
                 _capability_sids: capability_sids,
                 _capability_attrs: capability_attrs,
                 security_capabilities,
+                workspace_dirs_to_restore,
                 cleaned_up: false,
             })
         }
@@ -3411,6 +3663,61 @@ pub mod windows {
                 return;
             }
             self.cleaned_up = true;
+            if !self.workspace_dirs_to_restore.is_empty() {
+                match (
+                    OwnedSid::current_user(),
+                    OwnedSid::from_well_known(WinLocalSystemSid),
+                    OwnedSid::from_well_known(WinBuiltinAdministratorsSid),
+                ) {
+                    (Ok(user_sid), Ok(system_sid), Ok(admins_sid)) => {
+                        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+                        let owner_only_entries = [
+                            explicit_access(
+                                user_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                system_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                admins_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                inherit,
+                            ),
+                        ];
+                        for dir in self.workspace_dirs_to_restore.drain(..) {
+                            if dir.exists() && !is_reparse_point(&dir) {
+                                if let Err(err) =
+                                    set_protected_dacl_on_path(&dir, &owner_only_entries)
+                                {
+                                    tracing::warn!(
+                                        path = %dir.display(),
+                                        error = %err,
+                                        "Failed to restore owner-only DACL on workspace directory during AppContainer cleanup"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (u_res, s_res, a_res) => {
+                        for dir in self.workspace_dirs_to_restore.drain(..) {
+                            tracing::warn!(
+                                path = %dir.display(),
+                                user_sid_err = ?u_res.as_ref().err(),
+                                system_sid_err = ?s_res.as_ref().err(),
+                                admins_sid_err = ?a_res.as_ref().err(),
+                                "Failed to resolve owner-only SIDs to restore workspace directory DACL during AppContainer cleanup"
+                            );
+                        }
+                    }
+                }
+            }
             unsafe {
                 if !self.desktop_handle.is_null() {
                     let _ = CloseDesktop(self.desktop_handle);
@@ -3946,12 +4253,8 @@ pub mod windows {
             let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)
                 .map_err(|e| e.to_string())?;
             unsafe {
-                // Always open/create the logon session's built-in non-interactive Window Station
-                // (`NULL` -> `Service-0x0-<LogonId>$`). Unlike custom-named stations under
-                // `\Sessions\<N>\Windows\WindowStations` (whose parent directory only grants
-                // traversal to `SYSTEM` and `BUILTIN\Administrators`), `Service-0x0-<LogonId>$`
-                // is accessible to the logon session's LUA-filtered token (`S-1-5-5-0-<LogonId>`)
-                // when `BUILTIN\Administrators` is stripped (`SE_GROUP_USE_FOR_DENY_ONLY`).
+                // Open/create the logon session's built-in non-interactive Window Station
+                // (`NULL` -> `Service-0x0-<LogonId>$`).
                 let alt_winsta =
                     CreateWindowStationW(std::ptr::null(), 0, 0x000F_037F, std::ptr::null());
                 if alt_winsta.is_null() {
@@ -4693,6 +4996,18 @@ mod tests {
         std::fs::create_dir_all(&ox_sandboxes).unwrap();
         windows::validate_sandbox_base_safe(&ox_sandboxes, &host)
             .expect("<user_home>\\.oxideswarm\\sandboxes must be accepted");
+
+        let home_temp_root = fake_home.path().join("AppData").join("Local").join("Temp");
+        std::fs::create_dir_all(&home_temp_root).unwrap();
+        let err_temp_root = windows::validate_sandbox_base_safe(&home_temp_root, &host)
+            .expect_err("must reject <user_home>\\AppData\\Local\\Temp itself");
+        assert!(err_temp_root.contains("user folder"), "{err_temp_root}");
+
+        let default_temp_sandboxes = home_temp_root.join("rusty_grid").join("sandboxes");
+        std::fs::create_dir_all(&default_temp_sandboxes).unwrap();
+        windows::validate_sandbox_base_safe(&default_temp_sandboxes, &host).expect(
+            "default <user_home>\\AppData\\Local\\Temp\\rusty_grid\\sandboxes must be accepted",
+        );
 
         let outside = tempfile::tempdir().unwrap();
         let non_empty = outside.path().join("operator_folder");
