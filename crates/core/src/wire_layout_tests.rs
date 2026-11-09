@@ -613,6 +613,65 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ),
         ("Hello", ClientMessage::Hello),
         ("ListWorkspaces", ClientMessage::ListWorkspaces),
+        (
+            "Enroll",
+            ClientMessage::Enroll {
+                invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
+                proof: crate::noise_auth::RedactedBytes32([0xab; 32]),
+                name: "dev-box".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
+        ),
+        (
+            "CreateInvite",
+            ClientMessage::CreateInvite {
+                roles: vec![
+                    crate::noise_auth::MemberRole::Worker,
+                    crate::noise_auth::MemberRole::Client,
+                ],
+                max_uses: 3,
+                expires_in_secs: 86_400,
+                require_approval: true,
+            },
+        ),
+        ("ListInvites", ClientMessage::ListInvites),
+        (
+            "RevokeInvite",
+            ClientMessage::RevokeInvite {
+                invite_id: "01020304".into(),
+            },
+        ),
+        ("ListMembers", ClientMessage::ListMembers),
+        (
+            "ListPendingEnrollments",
+            ClientMessage::ListPendingEnrollments,
+        ),
+        (
+            "ApproveEnrollment",
+            ClientMessage::ApproveEnrollment {
+                pending_id: "aabbccdd".into(),
+            },
+        ),
+        (
+            "RejectEnrollment",
+            ClientMessage::RejectEnrollment {
+                pending_id: "aabbccdd".into(),
+            },
+        ),
+        (
+            "RevokeMember",
+            ClientMessage::RevokeMember {
+                target: "dev-box".into(),
+            },
+        ),
+        (
+            "RenameMember",
+            ClientMessage::RenameMember {
+                target: "dev-box".into(),
+                new_name: "gpu-rig".into(),
+            },
+        ),
     ];
     check_instances("ClientMessage", &all, |msg| match msg {
         ClientMessage::SubmitTask { .. } => "SubmitTask",
@@ -625,6 +684,16 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ClientMessage::BlobRequest { .. } => "BlobRequest",
         ClientMessage::Hello => "Hello",
         ClientMessage::ListWorkspaces => "ListWorkspaces",
+        ClientMessage::Enroll { .. } => "Enroll",
+        ClientMessage::CreateInvite { .. } => "CreateInvite",
+        ClientMessage::ListInvites => "ListInvites",
+        ClientMessage::RevokeInvite { .. } => "RevokeInvite",
+        ClientMessage::ListMembers => "ListMembers",
+        ClientMessage::ListPendingEnrollments => "ListPendingEnrollments",
+        ClientMessage::ApproveEnrollment { .. } => "ApproveEnrollment",
+        ClientMessage::RejectEnrollment { .. } => "RejectEnrollment",
+        ClientMessage::RevokeMember { .. } => "RevokeMember",
+        ClientMessage::RenameMember { .. } => "RenameMember",
     });
     all
 }
@@ -721,6 +790,120 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 }],
             },
         ),
+        (
+            "EnrollPending",
+            ClientResponse::EnrollPending {
+                pending_id: "0011223344556677".into(),
+            },
+        ),
+        ("EnrollKeepalive", ClientResponse::EnrollKeepalive),
+        (
+            "Enrolled",
+            ClientResponse::Enrolled {
+                member_id: "0123456789abcdef".into(),
+                roles: vec![crate::noise_auth::MemberRole::Worker],
+            },
+        ),
+        (
+            "EnrollRejected",
+            ClientResponse::EnrollRejected {
+                message: "invite has expired".into(),
+            },
+        ),
+        (
+            "InviteCreated",
+            ClientResponse::InviteCreated {
+                invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
+                invite_secret: crate::noise_auth::RedactedBytes32([0x5a; 32]),
+                roles: vec![crate::noise_auth::MemberRole::Worker],
+                max_uses: 1,
+                expires_at: EPOCH_SECS + 3600,
+                require_approval: true,
+                master_key: crate::noise_auth::PublicKey::from_bytes([0x11; 32]),
+                p2p_ticket: Some("node-ticket-example".into()),
+            },
+        ),
+        (
+            "InvitesList",
+            ClientResponse::InvitesList {
+                invites: vec![crate::noise_auth::InviteSummary {
+                    invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
+                    roles: vec![crate::noise_auth::MemberRole::Worker],
+                    uses_remaining: 1,
+                    max_uses: 1,
+                    expires_at: EPOCH_SECS + 3600,
+                    require_approval: true,
+                    revoked: false,
+                }],
+            },
+        ),
+        (
+            "InviteRevoked",
+            ClientResponse::InviteRevoked {
+                invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
+            },
+        ),
+        (
+            "MembersList",
+            ClientResponse::MembersList {
+                members: vec![crate::noise_auth::MemberEntry {
+                    id: "0123456789abcdef".into(),
+                    name: "dev-box".into(),
+                    public_key: crate::noise_auth::PublicKey::from_bytes([0x22; 32]),
+                    roles: vec![crate::noise_auth::MemberRole::Worker],
+                    enrolled_at: Some(EPOCH_SECS),
+                    last_seen: Some(EPOCH_SECS + 10),
+                    via_invite: Some("01020304".into()),
+                }],
+            },
+        ),
+        (
+            "PendingEnrollmentsList",
+            ClientResponse::PendingEnrollmentsList {
+                pending: vec![crate::noise_auth::PendingEnrollmentInfo {
+                    pending_id: "0011223344556677".into(),
+                    member_id: "0123456789abcdef".into(),
+                    public_key: crate::noise_auth::PublicKey::from_bytes([0x22; 32]),
+                    name: "dev-box".into(),
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    roles: vec![crate::noise_auth::MemberRole::Worker],
+                    invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
+                    pairing_code: crate::noise_auth::RedactedString("123456".into()),
+                    requested_at: EPOCH_SECS,
+                    expires_at: EPOCH_SECS + 600,
+                }],
+            },
+        ),
+        (
+            "EnrollmentApproved",
+            ClientResponse::EnrollmentApproved {
+                pending_id: "0011223344556677".into(),
+                member_id: "0123456789abcdef".into(),
+                name: "dev-box".into(),
+                roles: vec![crate::noise_auth::MemberRole::Worker],
+            },
+        ),
+        (
+            "EnrollmentRejected",
+            ClientResponse::EnrollmentRejected {
+                pending_id: "0011223344556677".into(),
+            },
+        ),
+        (
+            "MemberRevoked",
+            ClientResponse::MemberRevoked {
+                member_id: "0123456789abcdef".into(),
+                disconnected_sessions: 2,
+            },
+        ),
+        (
+            "MemberRenamed",
+            ClientResponse::MemberRenamed {
+                member_id: "0123456789abcdef".into(),
+                name: "gpu-rig".into(),
+            },
+        ),
     ];
     check_instances("ClientResponse", &all, |msg| match msg {
         ClientResponse::TaskSubmitted { .. } => "TaskSubmitted",
@@ -735,6 +918,19 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         ClientResponse::BlobReply { .. } => "BlobReply",
         ClientResponse::Hello { .. } => "Hello",
         ClientResponse::Workspaces { .. } => "Workspaces",
+        ClientResponse::EnrollPending { .. } => "EnrollPending",
+        ClientResponse::EnrollKeepalive => "EnrollKeepalive",
+        ClientResponse::Enrolled { .. } => "Enrolled",
+        ClientResponse::EnrollRejected { .. } => "EnrollRejected",
+        ClientResponse::InviteCreated { .. } => "InviteCreated",
+        ClientResponse::InvitesList { .. } => "InvitesList",
+        ClientResponse::InviteRevoked { .. } => "InviteRevoked",
+        ClientResponse::MembersList { .. } => "MembersList",
+        ClientResponse::PendingEnrollmentsList { .. } => "PendingEnrollmentsList",
+        ClientResponse::EnrollmentApproved { .. } => "EnrollmentApproved",
+        ClientResponse::EnrollmentRejected { .. } => "EnrollmentRejected",
+        ClientResponse::MemberRevoked { .. } => "MemberRevoked",
+        ClientResponse::MemberRenamed { .. } => "MemberRenamed",
     });
     all
 }

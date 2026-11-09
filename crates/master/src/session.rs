@@ -420,8 +420,8 @@ impl<
         // Authenticated (or rejected): release the pre-auth handshake slot immediately.
         drop(handshake_permit);
 
-        let (first_msg, detected_codec) = match first_res {
-            Ok(pair) => pair,
+        let (first_msg, detected_codec, v3_peer) = match first_res {
+            Ok(triple) => triple,
             Err(e) => {
                 if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
                     match pre_auth {
@@ -504,6 +504,8 @@ impl<
                         waiters,
                         mapreduce_parallelism,
                         blob_store,
+                        auth_ctx,
+                        v3_peer,
                         #[cfg(feature = "dashboard")]
                         broadcast_tx,
                         #[cfg(feature = "p2p")]

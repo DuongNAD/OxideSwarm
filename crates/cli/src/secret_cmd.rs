@@ -148,23 +148,101 @@ impl SecretOpts {
 
     /// Resolves the OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for `section`:
     /// when a `master_key` is configured, loads (or generates on first run) the private key at
-    /// `~/.oxideswarm/node.key`.
+    /// `~/.oxideswarm/node.key`. When no explicit `master_key` or shared secret is configured on
+    /// the master's own host, falls back to the local host admin identity if `node.key`,
+    /// `master_noise.key`, and `members.json` (containing `node.key`) exist on disk.
     pub fn resolve_v3_auth(
         &self,
         config: Option<&ConfigFile>,
         section: SecretSection,
     ) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
-        let Some(master_pub) = self.resolve_master_key(config, section)? else {
+        if let Some(master_pub) = self.resolve_master_key(config, section)? {
+            let Some(node_key_path) = default_node_key_path() else {
+                return Err(GridError::Config(
+                    "cannot determine the home directory for ~/.oxideswarm/node.key".into(),
+                ));
+            };
+            let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
+            return Ok(Some((node_key, master_pub)));
+        }
+
+        let has_explicit_secret = self.value.is_some()
+            || self.file.is_some()
+            || std::env::var_os(ENV_SECRET).is_some()
+            || std::env::var_os(ENV_SECRET_FILE).is_some()
+            || config.is_some_and(|c| {
+                let (val, file) = c.secret_keys(section);
+                val.is_some() || file.is_some()
+            });
+        if has_explicit_secret {
             return Ok(None);
-        };
-        let Some(node_key_path) = default_node_key_path() else {
-            return Err(GridError::Config(
-                "cannot determine the home directory for ~/.oxideswarm/node.key".into(),
-            ));
-        };
-        let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
-        Ok(Some((node_key, master_pub)))
+        }
+
+        resolve_local_host_v3_auth(config)
     }
+}
+
+fn resolve_local_host_v3_auth(
+    config: Option<&ConfigFile>,
+) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
+    if std::env::var("RUSTY_GRID_AUTH")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("secret"))
+    {
+        return Ok(None);
+    }
+    if config
+        .and_then(|c| c.master.as_ref())
+        .and_then(|m| m.auth.as_deref())
+        .is_some_and(|a| a.trim().eq_ignore_ascii_case("secret"))
+    {
+        return Ok(None);
+    }
+
+    let state_dir = std::env::var("RUSTY_GRID_STATE_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .and_then(|c| c.master.as_ref())
+                .and_then(|m| m.state_dir.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        });
+
+    let Some(node_key_path) = default_node_key_path() else {
+        return Ok(None);
+    };
+    let Some(master_key_path) =
+        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(members_path) =
+        rusty_grid_master::server::MemberStore::resolve_path(state_dir.as_deref())
+    else {
+        return Ok(None);
+    };
+    if !node_key_path.is_file() || !master_key_path.is_file() || !members_path.is_file() {
+        return Ok(None);
+    }
+
+    let Ok(node_key) = NodeKeypair::load_file(&node_key_path) else {
+        return Ok(None);
+    };
+    let Ok(master_key) = NodeKeypair::load_file(&master_key_path) else {
+        return Ok(None);
+    };
+    let Ok(store) = rusty_grid_master::server::MemberStore::load_file(&members_path) else {
+        return Ok(None);
+    };
+    if !store.contains(node_key.public_key()) {
+        return Ok(None);
+    }
+    Ok(Some((node_key, *master_key.public_key())))
 }
 
 fn config_key_error(key: &str, err: &GridError) -> GridError {

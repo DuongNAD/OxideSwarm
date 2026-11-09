@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Machine identity and OXS-AUTH v3 (`ENROLL-1a`): per-machine X25519 static keys (`~/.oxideswarm/node.key` and `master_noise.key`, or in `--state-dir` when set, stored as private files and printed with key fingerprint on master startup), Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication with cleartext `HELLO` prologue and `Split()` key derivation into the `0x04` ChaCha20-Poly1305 record layer, `members.json` read at master startup with worker-role enforcement on `Register`, `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`) ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
+- Cluster invites, enrollment approval, and member management (`ENROLL-1b`): `oxideswarm invite` (`oxs1-invite:<base64url payload>.<check>`, `--roles`, `--uses`, `--expires`, `--no-approval`, `--list`, `--revoke`), `oxideswarm members` (`list`, `pending`, `approve`, `reject`, `revoke`, `rename`), `oxideswarm join` with invites over OXS-AUTH v3 (`HandshakePurpose::Enroll`) with session-bound proof (`HMAC-SHA256(invite_secret, "oxs3-enroll" || handshake_hash)`), live connection-bound pending requests (up to 32, 10-minute expiry, keepalives, use deducted at approval), 6-digit pairing check and code-execution warning confirmation (`[y/N]`) before saving `node.key` or `rusty-grid.toml`, role-aware post-join checks, auto-enrolment of the master's host `node.key` as `admin`, and worker-id ownership per member ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
+
+### Changed
+- Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`): adds `ClientMessage` and `ClientResponse` variants for OXS-AUTH v3 enrollment, invites, and member management ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 
 ## [0.1.1] - 2026-11-10
 

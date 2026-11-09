@@ -168,8 +168,14 @@ pub enum Commands {
     /// Generate or show the shared cluster secret, or create a join token for another machine
     Secret(SecretCliArgs),
 
-    /// Join this machine to a cluster with a join token read from standard input
+    /// Join this machine to a cluster with a join token or invite read from standard input
     Join(crate::join::JoinArgs),
+
+    /// Create, list, or revoke OXS-AUTH v3 machine enrollment invites
+    Invite(crate::members_cmd::InviteArgs),
+
+    /// List, approve, reject, revoke, or rename enrolled cluster members
+    Members(crate::members_cmd::MembersCliArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
@@ -1175,6 +1181,12 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Join(args) => {
             crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
         }
+        Commands::Invite(args) => {
+            crate::members_cmd::run_invite(args, config_file, secret_opts).await
+        }
+        Commands::Members(args) => {
+            crate::members_cmd::run_members(args, config_file, secret_opts).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -1751,6 +1763,25 @@ async fn run_master_inner(
                 return ExitCode::FAILURE;
             }
         };
+    let insecure = resolve_bool(
+        if args.insecure { Some(true) } else { None },
+        &["RUSTY_GRID_INSECURE"],
+        master_cfg.as_ref().and_then(|m| m.insecure),
+        false,
+    );
+    let secret_outcome = match secret_opts
+        .resolve(config_file.as_ref(), SecretSection::Master)
+        .and_then(|resolved| {
+            let exposed = (!server_config.bind_addr.ip().is_loopback() || enable_p2p)
+                && auth_mode.allows_secret();
+            decide_master_secret(resolved, exposed, insecure, ClusterSecret::default_path())
+        }) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let members = match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref())
     {
         Ok(store) => store,
@@ -1759,13 +1790,36 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
-    // The v3 key is written to disk only when OXS-AUTH v3 can be used: a state directory was
-    // given, members exist, or the master admits members only. A loopback or `--insecure`
-    // master without members must not create `~/.oxideswarm`; an in-memory key costs nothing
-    // there, because no member has pinned it.
-    let persist_noise_key = state_dir.is_some()
-        || !members.is_empty()
-        || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members);
+    // The v3 key is written to disk only when OXS-AUTH v3 is persisted: a state directory was
+    // given, members exist, the master admits members only, or the master uses the default
+    // `~/.oxideswarm/cluster.secret` under `--auth both`. A bare loopback master, an `--insecure`
+    // master, or a master given an explicit `--secret`/`--secret-file` without `~/.oxideswarm`
+    // must not create `~/.oxideswarm`.
+    let has_explicit_secret = secret_opts.value.is_some()
+        || secret_opts.file.is_some()
+        || std::env::var_os(rusty_grid_core::cluster_auth::ENV_SECRET).is_some()
+        || std::env::var_os(rusty_grid_core::cluster_auth::ENV_SECRET_FILE).is_some()
+        || config_file.as_ref().is_some_and(|c| {
+            let (val, file) = c.secret_keys(SecretSection::Master);
+            val.is_some() || file.is_some()
+        });
+    let uses_default_secret = matches!(
+        secret_outcome,
+        crate::secret_cmd::MasterSecretOutcome::Generated { .. }
+    ) || (matches!(
+        secret_outcome,
+        crate::secret_cmd::MasterSecretOutcome::Configured(_)
+    ) && !has_explicit_secret);
+    let in_unisolated_unit_test = cfg!(test)
+        && state_dir.is_none()
+        && std::env::var_os("OXIDESWARM_HOME").is_none()
+        && members.is_empty()
+        && !matches!(auth_mode, rusty_grid_master::server::AuthMode::Members);
+    let persist_noise_key = !in_unisolated_unit_test
+        && (state_dir.is_some()
+            || !members.is_empty()
+            || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members)
+            || (auth_mode.allows_members() && uses_default_secret));
     let master_noise_key = if (ephemeral_key && state_dir.is_none()) || !persist_noise_key {
         match rusty_grid_core::noise_auth::NodeKeypair::generate() {
             Ok(kp) => kp,
@@ -1793,30 +1847,33 @@ async fn run_master_inner(
             }
         }
     };
+    if persist_noise_key && !(ephemeral_key && state_dir.is_none()) && auth_mode.allows_members() {
+        if let Some(node_key_path) = rusty_grid_core::noise_auth::default_node_key_path() {
+            match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(&node_key_path) {
+                Ok((host_node_kp, _)) => {
+                    if let Err(e) = members.ensure_local_host_admin(
+                        *host_node_kp.public_key(),
+                        "local-host",
+                        true,
+                    ) {
+                        eprintln!("Failed to enrol local master host in members.json: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to load or generate {}: {e}",
+                        node_key_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
     server_config = server_config
         .with_auth_mode(auth_mode)
         .with_members(members)
         .with_master_noise_key(master_noise_key);
-
-    let insecure = resolve_bool(
-        if args.insecure { Some(true) } else { None },
-        &["RUSTY_GRID_INSECURE"],
-        master_cfg.as_ref().and_then(|m| m.insecure),
-        false,
-    );
-    let secret_outcome = match secret_opts
-        .resolve(config_file.as_ref(), SecretSection::Master)
-        .and_then(|resolved| {
-            let exposed = (!server_config.bind_addr.ip().is_loopback() || enable_p2p)
-                && auth_mode.allows_secret();
-            decide_master_secret(resolved, exposed, insecure, ClusterSecret::default_path())
-        }) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
     if auth_mode == rusty_grid_master::server::AuthMode::Members {
         println!("Cluster authentication: members only (enrolled machines via OXS-AUTH v3)");
     } else {
