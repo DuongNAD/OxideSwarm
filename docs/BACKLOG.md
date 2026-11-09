@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 5 Partial and 29 Planned. Five items
+On 2026-11-09, at `master` `a804e5b` plus the live two-machine run: 63 items Implemented, 5 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -162,7 +162,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
-| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
+| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -170,6 +170,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 |  | Implemented | 70 |
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
+| DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 (open) |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
@@ -859,6 +860,23 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Add `docs/guides/mcp-client-setup.md` with snippets for Claude Code, Codex and Cursor. Add
   an MCP row to `docs/SECURITY.md`.
 - **Done when:** Each snippet was run once, and the guide follows the guide template.
+
+### DOC-8: Update `CLAUDE.md` and `SECURITY.md` for Windows isolation
+
+- **Evidence:** Read after pull request 152 (`FEAT-3c`) merged.
+- **Problem:** Two documents still described the state before pull request 152 (`FEAT-3c`):
+  - `CLAUDE.md` omitted that `cargo` under the Windows AppContainer (`--isolation fs|fs+net`) is
+    `Planned` as `FEAT-3d` and that a Windows worker refuses `--workspaces` with isolation inside the
+    `isolation.rs` summary;
+  - `docs/SECURITY.md` listed task sandboxing only under "Not considered / not provided" (section 2)
+    and omitted `--isolation off|fs|fs+net` (`crates/worker/src/isolation.rs`, design 0033) from
+    section 7 ("Who runs the tasks").
+- **Do:** Update `CLAUDE.md` and `docs/SECURITY.md` to match `crates/worker/src/isolation.rs`:
+  Windows `--isolation fs|fs+net` uses a per-task Win32 AppContainer (`FEAT-3c`), `cargo` under it is
+  `Planned` as `FEAT-3d`, and a Windows worker refuses `--workspaces` with `--isolation fs|fs+net`.
+- **Done when:** Neither `CLAUDE.md` nor `docs/SECURITY.md` claims that Windows AppContainer
+  isolation is unimplemented or that task sandboxing is not provided when `--isolation fs|fs+net` is
+  enabled, and both state the `FEAT-3d` (`cargo`) and `--workspaces` limits on Windows.
 
 ### REL-1: Restore the Apache licence text
 
@@ -1979,10 +1997,17 @@ Add one dated line per finished item, newest last.
   on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
   passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
   29 Planned.
-- 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
+- 2026-11-09: Added and implemented TEST-20 (pull request 181): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
   and 29 Planned.
+- 2026-11-09: Added and implemented DOC-8 (pull request 196, open): updated `CLAUDE.md` and
+  `docs/SECURITY.md` to match `crates/worker/src/isolation.rs` after pull request 152 (`FEAT-3c`),
+  recording that `--isolation fs|fs+net` confines tasks on macOS (`sandbox-exec`), Linux (Landlock,
+  seccomp, namespaces) and Windows (per-task AppContainer + NTFS DACLs + private Desktop), that
+  `cargo` under the Windows AppContainer is `Planned` as `FEAT-3d`, and that a Windows worker
+  refuses `--workspaces` with `--isolation fs|fs+net`. The Index counts are now 63 Implemented, 5
+  Partial and 29 Planned.
