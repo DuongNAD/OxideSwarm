@@ -188,3 +188,7 @@ path = "../../tests/m5c_challenger_2_stress.rs"
 [[test]]
 name = "cli_join_e2e"
 path = "../../tests/cli_join_e2e.rs"
+
+[[test]]
+name = "agent_workspace_e2e"
+path = "../../tests/agent_workspace_e2e.rs"
