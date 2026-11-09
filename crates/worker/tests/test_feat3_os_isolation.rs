@@ -2222,11 +2222,18 @@ function Compile-CSharp([string]$code) {
         let script = r#"
 [Console]::Out.WriteLine('TASK_STARTED')
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\secret.txt", 'secret-from-t1')
-[System.Threading.Thread]::Sleep(400)
+for ($i = 0; $i -lt 300; $i++) {
+    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { break }
+    [System.Threading.Thread]::Sleep(50)
+}
 try { $null = [System.IO.File]::ReadAllText("$env:T_SIB_SANDBOX\secret.txt"); [Console]::Out.WriteLine('LEAK_SIBLING_READ') } catch { [Console]::Out.WriteLine('DENY_SIBLING_READ') }
 try { $null = [System.IO.Directory]::GetFileSystemEntries($env:T_SIB_SANDBOX); [Console]::Out.WriteLine('LEAK_SIBLING_LIST') } catch { [Console]::Out.WriteLine('DENY_SIBLING_LIST') }
 try { [System.IO.File]::WriteAllText("$env:T_SIB_SANDBOX\planted.txt", 'x'); [Console]::Out.WriteLine('LEAK_SIBLING_WRITE') } catch { [Console]::Out.WriteLine('DENY_SIBLING_WRITE') }
-[System.Threading.Thread]::Sleep(300)
+[System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\done.txt", '1')
+for ($i = 0; $i -lt 300; $i++) {
+    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\exit.txt")) { break }
+    [System.Threading.Thread]::Sleep(50)
+}
 "#;
         let task1 = win_task(&rig, script, &[], 60);
         let mut task2 = task1.clone();
@@ -2246,9 +2253,49 @@ try { [System.IO.File]::WriteAllText("$env:T_SIB_SANDBOX\planted.txt", 'x'); [Co
 
         let r1 = Arc::clone(&rig);
         let r2 = Arc::clone(&rig);
-        let (res1, res2) = tokio::join!(
+        let sb1_b = sb1.clone();
+        let sb2_b = sb2.clone();
+        let barrier = async move {
+            let mut both_secrets_existed = false;
+            for _ in 0..300 {
+                if sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file() {
+                    both_secrets_existed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                both_secrets_existed,
+                "both sibling sandbox secret.txt files must exist on disk before either task probes the other ({}, {})",
+                sb1_b.display(),
+                sb2_b.display()
+            );
+            std::fs::write(sb1_b.join("go.txt"), "go").unwrap();
+            std::fs::write(sb2_b.join("go.txt"), "go").unwrap();
+
+            let mut both_done = false;
+            for _ in 0..300 {
+                if sb1_b.join("done.txt").is_file() && sb2_b.join("done.txt").is_file() {
+                    both_done = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                both_done,
+                "both tasks must complete their sibling probes while both sandboxes are still present"
+            );
+            assert!(
+                sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file(),
+                "both sibling secret.txt files must still exist when probes finish"
+            );
+            let _ = std::fs::write(sb1_b.join("exit.txt"), "exit");
+            let _ = std::fs::write(sb2_b.join("exit.txt"), "exit");
+        };
+        let (res1, res2, ()) = tokio::join!(
             async move { r1.runner.execute_task(&t1, None, None).await },
             async move { r2.runner.execute_task(&t2, None, None).await },
+            barrier,
         );
 
         for (label, res) in [("task1", &res1), ("task2", &res2)] {
@@ -2892,10 +2939,10 @@ try {
                 result.stdout_str(),
                 result.stderr_str()
             );
+            let got = lines(&result);
             assert!(
-                result.stdout_str().contains("TASK_STARTED")
-                    && result.stdout_str().contains("tiny-ran"),
-                "stdout:\n{}\nstderr:\n{}",
+                got.contains(&"TASK_STARTED".to_string()) && got.contains(&"tiny-ran".to_string()),
+                "stdout lines: {got:?}\nstdout:\n{}\nstderr:\n{}",
                 result.stdout_str(),
                 result.stderr_str()
             );
@@ -2959,17 +3006,17 @@ try {
             result.stdout_str(),
             result.stderr_str()
         );
+        let got = lines(&result);
         assert!(
-            result.stdout_str().contains("TASK_STARTED") && result.stdout_str().contains("dep-ran"),
-            "stdout:\n{}\nstderr:\n{}",
+            got.contains(&"TASK_STARTED".to_string()) && got.contains(&"dep-ran".to_string()),
+            "stdout lines: {got:?}\nstdout:\n{}\nstderr:\n{}",
             result.stdout_str(),
             result.stderr_str()
         );
         assert!(
-            result.stdout_str().contains("DENY_DENIED_SECRET")
-                && !result.stdout_str().contains("LEAK_DENIED_SECRET"),
-            "sibling secret inside denied user_home must remain unreadable: {}",
-            result.stdout_str()
+            got.contains(&"DENY_DENIED_SECRET".to_string())
+                && !got.contains(&"LEAK_DENIED_SECRET".to_string()),
+            "sibling secret inside denied user_home must remain unreadable: {got:?}",
         );
     }
 
@@ -3235,7 +3282,8 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
             let self_got = lines(&self_res);
             assert!(
                 self_got.contains(&"TASK_STARTED".to_string())
-                    && !self_got.contains(&"HOST_PIPE_CONNECTED".to_string()),
+                    && self_got.contains(&"PIPE_REFUSED".to_string())
+                    && !self_got.contains(&"PIPE_CONNECTED".to_string()),
                 "{level}: {self_got:?} (stderr: {})",
                 self_res.stderr_str()
             );
@@ -3771,43 +3819,53 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
         );
     }
 
-    /// Design 0033 D4.1 + D4.6: the per-attempt AppContainer profile is named by the FEAT-2
-    /// per-attempt run token (`oxideswarm.task.<run_token>`) so a retried task with the same
-    /// `TaskId` gets a fresh profile that cannot collide, and `DeleteAppContainerProfile` deletes
-    /// `%LOCALAPPDATA%\Packages\oxideswarm.task.<run_token>` when each attempt finishes.
+    /// Design 0033 D4.1 + D4.6: the per-attempt AppContainer profile is named by the worker
+    /// instance prefix and the FEAT-2 per-attempt run token
+    /// (`oxideswarm.task.<worker8>.<run_token>`) so a retried task with the same `TaskId` gets a
+    /// fresh profile that cannot collide, and `DeleteAppContainerProfile` deletes
+    /// `%LOCALAPPDATA%\Packages\oxideswarm.task.<worker8>.<run_token>` when each attempt finishes.
     #[tokio::test]
     async fn test_appcontainer_profile_is_deleted_on_cleanup() {
         let rig = Rig::new(IsolationLevel::Fs, false);
         let task = win_cmd_task(
             &rig,
-            r#"echo TASK_STARTED& echo RUN_TOKEN=%RUSTY_GRID_RUN_TOKEN%"#,
+            r#"echo TASK_STARTED& echo RUN_TOKEN=%RUSTY_GRID_RUN_TOKEN%& echo TASK_TEMP=%TEMP%& (if exist "%TEMP%\." (echo PROFILE_TEMP_EXISTS=1) else (echo PROFILE_TEMP_EXISTS=0))"#,
             &[],
             60,
         );
         let result1 = rig.runner.execute_task(&task, None, None).await;
         assert!(
-            result1.is_success() && lines(&result1).contains(&"TASK_STARTED".to_string()),
-            "{:?} {}",
+            result1.is_success()
+                && lines(&result1).contains(&"TASK_STARTED".to_string())
+                && lines(&result1).contains(&"PROFILE_TEMP_EXISTS=1".to_string()),
+            "{:?} / {:?} / {}",
             result1.error,
+            lines(&result1),
             result1.stderr_str()
         );
         // Retry the exact same `Task` (same `TaskId`): must get a distinct per-attempt run token.
         let result2 = rig.runner.execute_task(&task, None, None).await;
         assert!(
-            result2.is_success() && lines(&result2).contains(&"TASK_STARTED".to_string()),
-            "{:?} {}",
+            result2.is_success()
+                && lines(&result2).contains(&"TASK_STARTED".to_string())
+                && lines(&result2).contains(&"PROFILE_TEMP_EXISTS=1".to_string()),
+            "{:?} / {:?} / {}",
             result2.error,
+            lines(&result2),
             result2.stderr_str()
         );
 
-        let extract_token = |res: &rusty_grid_core::TaskResult| -> String {
+        let extract_field = |res: &rusty_grid_core::TaskResult, key: &str| -> String {
+            let prefix = format!("{key}=");
             lines(res)
                 .iter()
-                .find_map(|l| l.strip_prefix("RUN_TOKEN=").map(str::to_string))
-                .expect("RUN_TOKEN line")
+                .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
+                .unwrap_or_else(|| panic!("missing {key}= line in {:?}", lines(res)))
         };
-        let token1 = extract_token(&result1);
-        let token2 = extract_token(&result2);
+        let token1 = extract_field(&result1, "RUN_TOKEN");
+        let token2 = extract_field(&result2, "RUN_TOKEN");
+        let temp1 = PathBuf::from(extract_field(&result1, "TASK_TEMP"));
+        let temp2 = PathBuf::from(extract_field(&result2, "TASK_TEMP"));
         assert_ne!(
             token1, token2,
             "retried task with the same TaskId must get a fresh per-attempt run token"
@@ -3815,10 +3873,16 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
 
         let prefix = rusty_grid_worker::isolation::windows::worker_profile_prefix(&rig.base);
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-            for token in [&token1, &token2] {
+            for (token, task_temp) in [(&token1, &temp1), (&token2, &temp2)] {
                 let token_simple: String = token.chars().filter(|c| *c != '-').collect();
                 let moniker = format!("{prefix}.{token_simple}");
                 let pkg_dir = local_app_data.join("Packages").join(&moniker);
+                assert!(
+                    rusty_grid_worker::isolation::windows::path_starts_with_ci(task_temp, &pkg_dir),
+                    "task %TEMP% ('{}') must reside inside per-attempt profile folder '{}' that existed during the task",
+                    task_temp.display(),
+                    pkg_dir.display()
+                );
                 for _ in 0..20 {
                     if !pkg_dir.exists() {
                         break;
