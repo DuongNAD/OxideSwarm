@@ -11,6 +11,7 @@
 #   --version V      release to put on the kit (default: the version of `oxideswarm --version`)
 #   --archives DIR   take the archives and SHA256SUMS from DIR instead of downloading them
 #   --replace        replace an existing <DIR>/OxideSwarm folder
+#   --no-autostart   the installers on this kit add no start at login (a trial on someone else's machine)
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -20,6 +21,7 @@ DEST=""
 VERSION=""
 ARCHIVES=""
 REPLACE=0
+NO_AUTOSTART=0
 REPO="DuongNAD/OxideSwarm"
 TARGETS="aarch64-apple-darwin.tar.gz x86_64-apple-darwin.tar.gz x86_64-pc-windows-msvc.zip x86_64-unknown-linux-gnu.tar.gz"
 
@@ -30,6 +32,7 @@ while [ $# -gt 0 ]; do
     --version) [ $# -ge 2 ] || fail "--version needs a value"; VERSION=${2#v}; shift ;;
     --archives) [ $# -ge 2 ] || fail "--archives needs a value"; ARCHIVES=$2; shift ;;
     --replace) REPLACE=1 ;;
+    --no-autostart) NO_AUTOSTART=1 ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     -*) fail "unknown option: $1" ;;
     *) [ -z "$DEST" ] || fail "only one destination folder"; DEST=$1 ;;
@@ -99,6 +102,9 @@ for t in $TARGETS; do
 done
 
 (umask 077; printf '%s\n' "$TOKEN" > "$KIT/join.token")
+if [ "$NO_AUTOSTART" = 1 ]; then
+  printf 'The installers on this kit add no start at login.\n' > "$KIT/no-autostart"
+fi
 sync 2>/dev/null || true
 printf 'Kit written to %s (OxideSwarm %s).\n' "$KIT" "$VERSION"
 printf 'The stick now holds a join token: keep it with people you trust.\n'

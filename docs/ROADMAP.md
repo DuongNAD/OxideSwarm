@@ -215,7 +215,7 @@ Goal: someone without Rust installed follows the README and reaches the user sto
 | Item | Work | State on 2026-11-09 |
 |---|---|---|
 | REL-4 | Release workflow on `v*` tags with Linux, macOS and Windows archives, with and without `gpu-wgpu`, and `SHA256SUMS`. An install section in `README.md` | Implemented (pull request 155). The first tag is `v0.1.0` |
-| Quick start | From install to the first offloaded `cargo test`, linking [guides/mcp-client-setup.md](guides/mcp-client-setup.md) and the WS-7 guide | Implemented (`README.md`, section 4) |
+| Quick start | From install to the first offloaded `cargo test`, linking [guides/mcp-client-setup.md](guides/mcp-client-setup.md) and the WS-7 guide | Implemented (`README.md`, Quick start) |
 | Release notes | A `CHANGELOG.md` entry for the release, with the upgrade order for mixed versions | Implemented: `CHANGELOG.md` `[0.1.0]` with the upgrade order |
 | JOIN-1 | One join token that carries the master's address or ticket and the cluster secret, read from standard input (decision Q7) | Partial (pull request 163, design 0048). Checked live on Windows on 2026-11-09. The QR code step waits for AND-1 |
 | LINK-1 | `doctor` shows whether each worker is direct or relayed, and the owner can name a relay of their own (decision Q7) | Partial (pull request 159: `LINK` column, checks C7 and C8; pull request 173: `--relay-url` and the [relay guide](guides/self-hosted-relay.md)). A live run through a self-hosted relay is not recorded yet |
