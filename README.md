@@ -23,29 +23,33 @@ coding agents can send work to: `cargo test`, scripts, compile jobs, file proces
 - **A second machine for your test suite.** `oxideswarm submit --workspace myproject -- cargo test`
   syncs your project to another machine and runs it there. The next run sends only the files that
   changed, and the remote `target/` directory is reused, so Cargo builds incrementally.
-- **Made for coding agents.** `oxideswarm mcp` is a Model Context Protocol server. Claude Code,
+- **Made for coding agents.** `oxideswarm mcp` is a Model Context Protocol server with the tools
+  `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`. Claude Code,
   Codex, Cursor and other MCP clients can submit tasks, wait for results and use workspaces
   ([setup guide](docs/guides/mcp-client-setup.md)).
-- **No broker, no cloud account.** There is one master and any number of workers. They talk over
-  TCP on your LAN, or over iroh QUIC across networks and NATs without opening router ports.
-- **Secure by default off your machine.** A master that other machines can reach requires a shared
-  cluster secret. Traffic is encrypted (ChaCha20-Poly1305), and workers can confine each task to its
-  own folder (`--isolation fs`) on macOS, Linux and Windows.
-- **Easy to add a machine.** You can join a machine with a single token (`oxideswarm join`), or set
-  it up from a [USB stick](packaging/usb/README.md) with one double-click. `oxideswarm doctor`
-  checks the whole cluster.
+- **No broker, no cloud account.** One master and the workers you add talk over TCP on your LAN.
+  Across networks they use iroh QUIC through NATs, so no router ports need opening.
+- **Authenticated and encrypted beyond loopback.** A master that other machines can reach requires
+  a shared cluster secret, and cluster traffic is encrypted (ChaCha20-Poly1305). On macOS, Linux and
+  Windows, a worker started with `--isolation fs` limits what each task can write, and keeps the
+  task out of your home directory and away from the secret.
+- **Easy to add a machine.** Join a machine with a single token (`oxideswarm join`), or set it up
+  from a [USB stick](packaging/usb/README.md): one double-click on macOS and Windows, or
+  `bash install.sh` on Linux. `oxideswarm doctor` checks the whole cluster.
 
 ### Measured
 
 | What | Result | Record |
 |---|---|---|
-| `cargo test -p rusty_grid_core --lib` offloaded from a Mac to a Windows laptop | **210.7 s** on the first run, **6.9 s** on the second (249 tests, `target/` reused) | [offload guide](docs/guides/offload-cargo-test.md#recorded-two-machine-run) |
+| `cargo test -p rusty_grid_core --lib` offloaded from a Mac to a Windows laptop, by hand | **210.7 s** on the first run, **6.9 s** on the second (249 tests, `target/` reused) | [offload guide](docs/guides/offload-cargo-test.md#recorded-two-machine-run) |
 | The same over MCP, as a coding agent calls it | 207.4 s, then **6.6 s** | [offload guide](docs/guides/offload-cargo-test.md#recorded-two-machine-run) |
-| Repeated upload of a 500-file, 16 MB tree | 0 of 501 blobs sent again; one changed file sends 2 blobs | [benchmarks](benchmarks/grid/README.md) |
-| Overhead of an empty task, submit to result, 1 worker, p50 | 6.3 ms on Linux (a VM), 26 ms on macOS (loaded), 69 ms on Windows | [benchmarks](benchmarks/grid/README.md) |
+| The same offload, scripted, median of 3 fresh workspaces | 209.6 s cold, **7.6 s** warm | [benchmarks, (c)](benchmarks/grid/README.md) |
+| Repeated upload of a 500-file, 16 MB tree, on loopback | 0 of 501 blobs sent again; one changed file sends 2 blobs | [benchmarks, (b)](benchmarks/grid/README.md) |
+| `submit --wait` of an empty task, whole CLI process, 1 worker, on loopback, p50 | 6.3 ms on Linux (arm64 VM), 26 ms on macOS (under load), 69 ms on Windows | [benchmarks, (a)](benchmarks/grid/README.md) |
 
-Every number comes from a dated run whose script is in the repository. The records state their
-machines, load and limits.
+Each number links to the dated record of its run. The first two rows come from a run by hand, and
+the others from `benchmarks/grid/bench_grid.py`. Each record states its machines, its load and its
+limits.
 
 ## Quick start
 
@@ -83,8 +87,9 @@ installed and does the work. Neither machine has to build OxideSwarm.
    again: only changed files travel, and B reuses its `target/` directory.
 
 To set up several machines, a USB stick can carry the program for every system and the token:
-see [packaging/usb/README.md](packaging/usb/README.md). It installs, joins and starts the worker
-with one double-click.
+see [packaging/usb/README.md](packaging/usb/README.md). The stick installs, joins and starts the
+worker with one double-click on macOS and Windows, or `bash install.sh` on Linux. The kit scripts are
+in the repository; they came after `v0.1.0`.
 
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
@@ -152,11 +157,15 @@ flowchart LR
     W3 --> M
 ```
 
-- **Master.** One master holds the task queue. A task moves through these states: submitted,
-  queued, scheduled, running, then completed, failed, retrying or cancelled. The master places each
-  task on a worker that fits it: OS, architecture, tags, GPU, tools such as `cargo`, a workspace,
-  and free slots. With `--state-dir` it keeps its queue in a journal, so a restart loses no tasks
-  ([design 0046](docs/design/0046-master-durability.md)).
+- **Master.** One master holds the task queue.
+  - A task goes from submitted to queued, scheduled and running, and ends completed, failed or
+    cancelled. A failed attempt with retries left waits in retrying, then goes back to queued.
+  - The master places each task on a worker that fits it: OS, architecture, tags, GPU, tools such
+    as `cargo`, a workspace, and free slots.
+  - When a worker is lost, its tasks are requeued and run elsewhere (`run_chaos_test.sh` checks
+    this).
+  - With `--state-dir`, the queue is kept in a journal, so a master restart loses no tasks
+    ([design 0046](docs/design/0046-master-durability.md)).
 - **Workers.** Workers connect out to the master, so they need no open port. A worker runs tasks as
   its own OS user, with a timeout, bounded output and the whole process tree killed at the end. With
   `--isolation fs`, a task can write only its own sandbox and cannot read the cluster secret
@@ -168,14 +177,15 @@ flowchart LR
   server all speak the same protocol. Before they change anything, they check that the master runs
   a compatible version ([design 0040](docs/design/0040-protocol-versioning.md)).
 - **Network.** On a LAN everything uses TCP port `8088`. Across networks, `master --p2p` publishes
-  an iroh ticket: machines then connect directly through NAT, or through a relay, which can be your
-  own (`--relay-url`, [guide](docs/guides/self-hosted-relay.md)).
+  an iroh ticket, and machines then connect directly through NAT or through a relay. That needs
+  outbound Internet access to the public n0 relays, or to your own relay (`--relay-url`,
+  [guide](docs/guides/self-hosted-relay.md)).
 
 **Also included:**
 - **Map/reduce:** `oxideswarm mapreduce` has built-in kernels, or it ships your own scripts
   ([design 0016](docs/design/0016-mapreduce-cli-script-shipping.md)).
-- **Web dashboard:** live workers, tasks and links. It listens on loopback by default and needs a
-  token.
+- **Web dashboard:** live workers, tasks and links over plain HTTP. It listens on loopback by
+  default, and needs a token once the master has a secret.
 - **Discovery:** `--master auto` finds a master on the LAN through an authenticated UDP beacon. An
   HTTP probe and a rendezvous registry exist, with gaps that FEAT-7 tracks.
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker
@@ -184,16 +194,19 @@ flowchart LR
   log still ends with its summary ([design 0022](docs/design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` multiplies matrices on Metal, Vulkan or
   DirectX 12 and checks every result against a CPU sample. It is a benchmark, not a general GPU
-  runtime.
-- **3D tasks:** procedural mesh generation and auto-rigging, available when the worker is built with
-  the Cargo feature `3d` ([details](#generative-3d-and-auto-rigging-3d-feature)).
-- **Agent Mesh:** a separate WebSocket hub for agents on several machines to message each other
+  runtime. `--simulate-gpu` is a labelled CPU mode for tests, and the scheduler prefers real GPUs
+  over it.
+- **3D tasks:** procedural mesh generation and auto-rigging. They are available only in a worker
+  built from source with the Cargo feature `3d`; the release archives do not include it
+  ([details](#generative-3d-and-auto-rigging-3d-feature)).
+- **Agent Mesh:** a separate WebSocket hub through which agents on several machines exchange
+  messages and run each other's advertised commands, including `shell_exec`
   ([below](#agent-mesh-agent-mesh)).
 
 | Port | Used for |
 |---|---|
 | `8088/tcp` | Cluster port: workers and clients connect here. It is the only valid `--master` target |
-| `8080/tcp` | Dashboard, REST and WebSocket (loopback unless you ask), and a worker's standby portal |
+| `8080/tcp` | Dashboard, REST and WebSocket (loopback unless you ask). Also a worker's standby portal, which listens on all interfaces without authentication unless the worker runs with `--no-portal` |
 | `8089/udp` | LAN discovery beacon (`--master auto`) |
 
 Details and the full table: [Network port topology](#network-port-topology) and
@@ -323,10 +336,11 @@ Start with `oxideswarm doctor --expect-workers <N>` on any machine that holds th
 
 | Platform | Release archive | Checked by | Notes |
 |---|---|---|---|
-| macOS, Apple Silicon and Intel | `aarch64-apple-darwin`, `x86_64-apple-darwin` | CI on every pull request (fmt, clippy, all tests); live two-machine runs on 2026-11-09 | `--isolation fs` uses `sandbox-exec` |
-| Windows 11, x86_64 | `x86_64-pc-windows-msvc` | CI on every pull request; live runs on Windows 11 on 2026-11-09 (worker, USB kit, released archive) | `--isolation fs` uses an AppContainer; `cargo` cannot run inside it yet (FEAT-3d) |
+| macOS, Apple Silicon | `aarch64-apple-darwin` | CI on every pull request (clippy and the full test suite); live two-machine runs on 2026-11-09 | `--isolation fs` uses `sandbox-exec` |
+| macOS, Intel | `x86_64-apple-darwin` | Release build only; not tested | |
+| Windows 11, x86_64 | `x86_64-pc-windows-msvc` | CI on every pull request; live runs on Windows 11 on 2026-11-09 (worker, USB kit, released archive) | `--isolation fs` uses an AppContainer, and `cargo` cannot run inside it yet (FEAT-3d). The `.ps1`, `.cmd` and `.vbs` launchers are checked as text only |
 | Linux, x86_64 | `x86_64-unknown-linux-gnu` (glibc 2.35 or newer) | CI on every pull request; benchmark in an arm64 VM | `--isolation fs` uses Landlock and seccomp, plus a network namespace with `fs+net` |
-| Android, ARM64 | none | Host-side unit tests; Termux scripts tested with fake binaries | A Termux worker works; the Android app does not build yet (AND-1) |
+| Android, ARM64 | none (cross-compile with the NDK) | Host-side unit tests; Termux scripts tested with fake binaries | Not run on a device. The Android app does not build yet (AND-1) |
 
 Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
@@ -336,12 +350,12 @@ OxideSwarm `0.1.0` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
-| Delivery is at least once | A task can run twice after a worker is lost, so tasks with side effects must be idempotent | `--state-dir` (FEAT-1) and session resume shrink the window |
+| Delivery is at least once | A task can run twice after a worker is lost, so tasks with side effects must be idempotent | None; session resume (FEAT-1) and crash containment (FEAT-2) shrink the window |
 | One master, no automatic failover | The master is a single point of failure; `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 ([design 0050](docs/design/0050-scale-out-architecture.md)) |
 | Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1: a key per machine and invites ([design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `cargo` does not run under Windows isolation | A Windows workspace worker runs with `--isolation off` | FEAT-3d |
 | Workspace trees skip symbolic links and empty directories | A project that relies on a link inside its tree may not build remotely | W11 ([design 0039](docs/design/0039-agent-workspaces.md)) |
-| Checkpoints resume only a few built-in task types | Most tasks restart from the beginning after a worker loss | FEAT-5 |
+| Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | GPU support is a verified matrix-multiply benchmark | No user workload runs on the GPU yet | FEAT-9 |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
 
@@ -354,8 +368,13 @@ evidence and its "done when", is in [docs/BACKLOG.md](docs/BACKLOG.md).
   `~/.oxideswarm/cluster.secret` and refuses peers without it. Workers and clients refuse a remote
   master without a secret unless you pass `--insecure`.
 - The handshake authenticates both sides, and every later frame is a ChaCha20-Poly1305 record.
-- The dashboard listens on loopback by default and needs a token
+- The dashboard listens on loopback by default. Once the master has a secret, it needs a token
   (`oxideswarm secret show --dashboard-token`).
+- `--insecure` turns off the secret requirement; use it only on a network you fully control. The
+  current handshake (OXS-AUTH v2) has no forward secrecy.
+- Every machine of a cluster must run the same release: the oldest protocol version a peer accepts
+  is the current one. Upgrade and restart the master first, then the workers and clients
+  ([CHANGELOG](CHANGELOG.md), [DEPLOYMENT.md](DEPLOYMENT.md) section 3.5).
 - **Anyone who holds the secret can run commands on every worker.** Share it only with machines you
   trust. Run workers with `--isolation fs` where you can, and never run a worker as root or SYSTEM.
 
@@ -950,7 +969,7 @@ The worker executes two 3D asset pipeline task types (architecture and limits in
 
 ### Tests and verification
 
-`cargo test --workspace` runs the unit, integration and stress tests of every crate, and CI runs it on Linux, macOS and Windows for every pull request. Tests that use the public iroh relays need outbound Internet access.
+`cargo test --workspace` runs the unit, integration and stress tests of every crate, and CI runs it on Linux, macOS and Windows for every pull request. Tests that need the public iroh relays are `#[ignore]` by default and run weekly in the CI job `p2p-wan-relay`. Targets that need the `3d` or `gpu-wgpu` features run in their own CI jobs.
 
 ```bash
 # Rust unit and integration tests (slow: many stress tests)
