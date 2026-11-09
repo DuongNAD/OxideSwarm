@@ -1788,27 +1788,43 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
-    let members = match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref())
-    {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("Failed to load members.json: {e}");
-            return ExitCode::FAILURE;
+    let in_unisolated_unit_test =
+        cfg!(test) && state_dir.is_none() && std::env::var_os("OXIDESWARM_HOME").is_none();
+    let members = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+        rusty_grid_master::server::MemberStore::new()
+    } else {
+        match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref()) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Failed to load members.json: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
-    // The v3 key is written to disk only when OXS-AUTH v3 is persisted: a state directory was
-    // given, members exist, the master admits members only, or the master uses the default
-    // `~/.oxideswarm/cluster.secret` under `--auth both`. A bare loopback master, an `--insecure`
-    // master, or a master given an explicit `--secret`/`--secret-file` without `~/.oxideswarm`
-    // must not create `~/.oxideswarm`.
-    let has_explicit_secret = secret_opts.value.is_some()
-        || secret_opts.file.is_some()
-        || std::env::var_os(rusty_grid_core::cluster_auth::ENV_SECRET).is_some()
-        || std::env::var_os(rusty_grid_core::cluster_auth::ENV_SECRET_FILE).is_some()
-        || config_file.as_ref().is_some_and(|c| {
-            let (val, file) = c.secret_keys(SecretSection::Master);
-            val.is_some() || file.is_some()
-        });
+    let key_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+        None
+    } else {
+        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
+    };
+    let members_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+        None
+    } else {
+        rusty_grid_master::server::MemberStore::resolve_path(state_dir.as_deref())
+    };
+    let local_node_key_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+        None
+    } else {
+        rusty_grid_core::noise_auth::default_node_key_path()
+    };
+    let existing_v3_files = key_path.as_ref().is_some_and(|p| p.is_file())
+        || members_path.as_ref().is_some_and(|p| p.is_file());
+    // The v3 key is written to disk at startup when OXS-AUTH v3 is persisted: a state directory
+    // was given, `master_noise.key` or `members.json` already exists on disk, members exist, the
+    // master admits members only, or the master uses the default `~/.oxideswarm/cluster.secret`
+    // under `--auth both`. When started with an explicit `--secret-file`, `--insecure`, or bare
+    // loopback without existing v3 files, `master_noise.key` and `local-host` are persisted on
+    // demand if `CreateInvite` is called.
+    let has_explicit_secret = secret_opts.has_explicit_secret(config_file.as_ref(), SecretSection::Master);
     let uses_default_secret = matches!(
         secret_outcome,
         crate::secret_cmd::MasterSecretOutcome::Generated { .. }
@@ -1816,17 +1832,14 @@ async fn run_master_inner(
         secret_outcome,
         crate::secret_cmd::MasterSecretOutcome::Configured(_)
     ) && !has_explicit_secret);
-    let in_unisolated_unit_test = cfg!(test)
-        && state_dir.is_none()
-        && std::env::var_os("OXIDESWARM_HOME").is_none()
-        && members.is_empty()
-        && !matches!(auth_mode, rusty_grid_master::server::AuthMode::Members);
     let persist_noise_key = !in_unisolated_unit_test
+        && !(ephemeral_key && state_dir.is_none())
         && (state_dir.is_some()
+            || existing_v3_files
             || !members.is_empty()
             || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members)
             || (auth_mode.allows_members() && uses_default_secret));
-    let master_noise_key = if (ephemeral_key && state_dir.is_none()) || !persist_noise_key {
+    let master_noise_key = if !persist_noise_key {
         match rusty_grid_core::noise_auth::NodeKeypair::generate() {
             Ok(kp) => kp,
             Err(e) => {
@@ -1834,13 +1847,11 @@ async fn run_master_inner(
                 return ExitCode::FAILURE;
             }
         }
-    } else if let Some(key_path) =
-        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
-    {
-        match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(&key_path) {
+    } else if let Some(ref kp_path) = key_path {
+        match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(kp_path) {
             Ok((kp, _)) => kp,
             Err(e) => {
-                eprintln!("Failed to load or generate {}: {e}", key_path.display());
+                eprintln!("Failed to load or generate {}: {e}", kp_path.display());
                 return ExitCode::FAILURE;
             }
         }
@@ -1853,9 +1864,9 @@ async fn run_master_inner(
             }
         }
     };
-    if persist_noise_key && !(ephemeral_key && state_dir.is_none()) && auth_mode.allows_members() {
-        if let Some(node_key_path) = rusty_grid_core::noise_auth::default_node_key_path() {
-            match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(&node_key_path) {
+    if persist_noise_key && auth_mode.allows_members() {
+        if let Some(ref node_key_path) = local_node_key_path {
+            match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(node_key_path) {
                 Ok((host_node_kp, _)) => {
                     if let Err(e) = members.ensure_local_host_admin(
                         *host_node_kp.public_key(),
@@ -1879,7 +1890,9 @@ async fn run_master_inner(
     server_config = server_config
         .with_auth_mode(auth_mode)
         .with_members(members)
-        .with_master_noise_key(master_noise_key);
+        .with_master_noise_key(master_noise_key)
+        .with_master_noise_key_path(key_path)
+        .with_local_node_key_path(local_node_key_path);
     if auth_mode == rusty_grid_master::server::AuthMode::Members {
         println!("Cluster authentication: members only (enrolled machines via OXS-AUTH v3)");
     } else {
@@ -5915,11 +5928,15 @@ max_active_mb = 768
     async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes(
     ) {
         // 1. `--max-active-mb 0` is refused at startup with `ExitCode::FAILURE`.
+        let tmp_blob = tempfile::tempdir().unwrap();
+        let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
         let zero_cli = Cli::try_parse_from([
             "oxideswarm",
             "master",
             "--listen",
             "127.0.0.1:0",
+            "--state-dir",
+            &blob_dir_str,
             "--max-active-mb",
             "0",
         ])
@@ -5945,12 +5962,10 @@ max_active_mb = 768
         //    reports `active_bytes` and `max_active_bytes` in `ClusterStatus`, and refuses
         //    the second 600 KiB task with `task requires ... bytes`, `bytes in use`,
         //    `limit 1048576 bytes`, and `--max-active-mb`.
-        let tmp_blob = tempfile::tempdir().unwrap();
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let run_master_addr = probe_listener.local_addr().unwrap();
         drop(probe_listener);
         let run_master_addr_str = run_master_addr.to_string();
-        let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
         let cli = Cli::try_parse_from([
             "oxideswarm",
             "master",
@@ -5960,6 +5975,8 @@ max_active_mb = 768
             "127.0.0.1:0",
             "--max-active-mb",
             "1",
+            "--state-dir",
+            &blob_dir_str,
             "--blob-dir",
             &blob_dir_str,
         ])
@@ -6489,6 +6506,8 @@ max_active_mb = 768
             "2",
             "--scheduler-policy",
             "round-robin",
+            "--state-dir",
+            &blob_dir_str,
             "--blob-dir",
             &blob_dir_str,
         ])
@@ -6888,6 +6907,8 @@ fail_unfulfillable_tasks = false
             "127.0.0.1:0",
             "--scheduler-policy",
             "round-robin",
+            "--state-dir",
+            &rr_blob_str,
             "--blob-dir",
             &rr_blob_str,
         ])
@@ -7968,6 +7989,8 @@ relay_url = "https://cfg-client.relay.example.com"
             file: None,
         };
 
+        let tmp_state = tempfile::tempdir().unwrap();
+        let state_dir_str = tmp_state.path().to_str().unwrap().to_string();
         for bad in [
             "http://relay.example.com",
             "https://user:secret@relay.example.com",
@@ -7978,6 +8001,8 @@ relay_url = "https://cfg-client.relay.example.com"
                 "master",
                 "--listen",
                 "127.0.0.1:0",
+                "--state-dir",
+                &state_dir_str,
                 "--relay-url",
                 bad,
             ])

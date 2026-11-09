@@ -188,6 +188,12 @@ pub struct ServerConfig {
     pub auth_mode: AuthMode,
     /// Static X25519 key pair for OXS-AUTH v3 (`master_noise.key`).
     pub master_noise_key: Option<NodeKeypair>,
+    /// Optional path where `master_noise.key` is persisted before `CreateInvite` hands out the
+    /// master's v3 public key (when not already saved at startup).
+    pub master_noise_key_path: Option<PathBuf>,
+    /// Optional path to the local host's `node.key` to auto-enrol as `local-host` (`admin`) when
+    /// `CreateInvite` first persists `master_noise.key`.
+    pub local_node_key_path: Option<PathBuf>,
     /// Enrolled member list (`members.json`).
     pub members: Arc<MemberStore>,
     /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
@@ -245,6 +251,8 @@ impl Default for ServerConfig {
             session_resume_hold_explicit: false,
             auth_mode: AuthMode::default(),
             master_noise_key: None,
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::new(MemberStore::new()),
             members_explicit: false,
         }
@@ -542,6 +550,19 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the path where `master_noise.key` is persisted on demand (e.g. before `CreateInvite`).
+    pub fn with_master_noise_key_path(mut self, path: Option<PathBuf>) -> Self {
+        self.master_noise_key_path = path;
+        self
+    }
+
+    /// Sets the local host's `node.key` path to auto-enrol as `local-host` (`admin`) when OXS-AUTH
+    /// v3 persistence is triggered on demand.
+    pub fn with_local_node_key_path(mut self, path: Option<PathBuf>) -> Self {
+        self.local_node_key_path = path;
+        self
+    }
+
     /// Sets the enrolled member store for OXS-AUTH v3 handshakes.
     pub fn with_members(mut self, members: MemberStore) -> Self {
         self.members = Arc::new(members);
@@ -642,6 +663,11 @@ impl MasterServer {
         if !config.members_explicit {
             if let Some(ref state_dir) = config.state_dir {
                 config.members = Arc::new(MemberStore::load_from_dir(Some(state_dir))?);
+            }
+        }
+        if config.master_noise_key_path.is_none() && !config.ephemeral_key {
+            if let Some(ref state_dir) = config.state_dir {
+                config.master_noise_key_path = master_noise_key_path(Some(state_dir));
             }
         }
         if config.master_noise_key.is_none() {
@@ -1597,6 +1623,8 @@ impl MasterServer {
         let auth_ctx = MasterAuthContext {
             auth_mode: self.config.auth_mode,
             master_noise_key: self.config.master_noise_key.clone(),
+            master_noise_key_path: self.config.master_noise_key_path.clone(),
+            local_node_key_path: self.config.local_node_key_path.clone(),
             members: Arc::clone(&self.config.members),
             p2p_ticket: self.p2p_ticket.clone(),
         };
@@ -3925,16 +3953,18 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 expires_in_secs,
                 require_approval,
             } => {
-                let Some(ref master_key) = auth_ctx.master_noise_key else {
-                    send_client_response(
-                        &mut transport,
-                        &ClientResponse::Error {
-                            message: "Master has no OXS-AUTH v3 key (master_noise.key) configured"
-                                .into(),
-                        },
-                    )
-                    .await?;
-                    continue;
+                let master_key_pub = match auth_ctx.ensure_v3_key_persisted() {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        send_client_response(
+                            &mut transport,
+                            &ClientResponse::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
                 };
                 match auth_ctx.members.create_invite(
                     roles,
@@ -3958,7 +3988,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                             max_uses: rec.max_uses,
                             expires_at: rec.expires_at,
                             require_approval: rec.require_approval,
-                            master_key: *master_key.public_key(),
+                            master_key: master_key_pub,
                             p2p_ticket: auth_ctx.p2p_ticket.clone(),
                         };
                         send_client_response(&mut transport, &resp).await?;
@@ -4154,8 +4184,41 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 pub(crate) struct MasterAuthContext {
     pub auth_mode: AuthMode,
     pub master_noise_key: Option<NodeKeypair>,
+    pub master_noise_key_path: Option<PathBuf>,
+    pub local_node_key_path: Option<PathBuf>,
     pub members: Arc<MemberStore>,
     pub p2p_ticket: Option<String>,
+}
+
+impl MasterAuthContext {
+    /// Ensures `master_noise.key` is persisted on disk and the local host `node.key` is enrolled as
+    /// `local-host` (`admin`) before `CreateInvite` hands out the master's v3 public key.
+    pub fn ensure_v3_key_persisted(&self) -> GridResult<PublicKey> {
+        let Some(ref master_key) = self.master_noise_key else {
+            return Err(GridError::Config(
+                "Master has no OXS-AUTH v3 key (master_noise.key) configured".into(),
+            ));
+        };
+        if self.members.has_save_path() && self.master_noise_key_path.is_none() {
+            return Err(GridError::Config(
+                "cannot create an invite when the master is running with --ephemeral-key and no --state-dir".into(),
+            ));
+        }
+        if let Some(ref key_path) = self.master_noise_key_path {
+            if !key_path.is_file() {
+                master_key.save_file(key_path, false)?;
+            }
+        }
+        if let Some(ref node_key_path) = self.local_node_key_path {
+            let (host_node_kp, _) = NodeKeypair::load_or_generate_file(node_key_path)?;
+            self.members.ensure_local_host_admin(
+                *host_node_kp.public_key(),
+                "local-host",
+                true,
+            )?;
+        }
+        Ok(*master_key.public_key())
+    }
 }
 
 fn check_v3_client_message_role(

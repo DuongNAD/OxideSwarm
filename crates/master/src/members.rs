@@ -651,6 +651,15 @@ impl MemberStore {
         self.len() == 0
     }
 
+    /// Returns `true` if this store has a disk persistence path configured.
+    pub fn has_save_path(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_path
+            .is_some()
+    }
+
     /// Returns `true` if there is any member other than the auto-enrolled local host admin.
     pub fn has_non_host_members(&self) -> bool {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());

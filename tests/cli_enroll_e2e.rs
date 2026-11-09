@@ -870,3 +870,180 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
         text(&status_out.stderr)
     );
 }
+
+fn start_master(home: &Path, extra_args: &[&str]) -> (Service, String) {
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let port_file = home.join(format!("master-{id}.port"));
+    let log_file = home.join(format!("master-{id}.log"));
+    let mut master_cmd = cli(home);
+    master_cmd
+        .args(extra_args)
+        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .arg(&port_file);
+    let master = Service::spawn(master_cmd, log_file);
+    let mut port = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            port = fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok());
+            port.is_some()
+        }),
+        "master did not start; log:\n{}",
+        master.log()
+    );
+    (master, format!("127.0.0.1:{}", port.unwrap()))
+}
+
+#[test]
+fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
+    // Repro A: `'secret generate'`, `'master'`, then `'worker --master 127.0.0.1:PORT'` in the
+    // same home. The worker must authenticate via v2 `cluster.secret` (not `local-host` admin-only
+    // v3) and register cleanly.
+    let home_b = TempDir::new().unwrap();
+    let gen_out = run_cmd(with(home_b.path(), &["secret", "generate"]));
+    assert!(gen_out.status.success());
+
+    let (master_b, addr_b) = start_master(home_b.path(), &[]);
+    let mut worker_b_cmd = cli(home_b.path());
+    worker_b_cmd
+        .args([
+            "worker",
+            "--name",
+            "same-home-worker",
+            "--master",
+            &addr_b,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(home_b.path().join("sandbox-b"));
+    let worker_b = Service::spawn(worker_b_cmd, home_b.path().join("worker-b.log"));
+
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                home_b.path(),
+                &["workers", "--master", &addr_b, "--json"],
+            ));
+            out.status.success() && text(&out.stdout).contains("\"same-home-worker\"")
+        }),
+        "Repro A failed: worker in master's home did not register:\n{}",
+        worker_b.log()
+    );
+    drop(worker_b);
+    drop(master_b);
+
+    // Repro B: `home_b` once ran a master (so `home_b/.oxideswarm` has `node.key`,
+    // `master_noise.key` for B, `members.json`, and `cluster.secret`). Now `home_b` connects
+    // `workers` and `worker` to another master (`home_a`) that shares the same `cluster.secret`.
+    let home_a = TempDir::new().unwrap();
+    let secret_bytes = fs::read(home_b.path().join(".oxideswarm").join("cluster.secret")).unwrap();
+    let secret_file_a = home_a.path().join("shared.secret");
+    fs::write(&secret_file_a, &secret_bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_file_a, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Start Master A with `--secret-file` (and no `--state-dir` or `~/.oxideswarm/cluster.secret`).
+    let secret_file_str = secret_file_a.to_str().unwrap();
+    let (master_a, addr_a) =
+        start_master(home_a.path(), &["--secret-file", secret_file_str]);
+
+    let workers_from_b = run_cmd(with(
+        home_b.path(),
+        &["workers", "--master", &addr_a, "--json"],
+    ));
+    assert!(
+        workers_from_b.status.success(),
+        "Repro B failed: `workers` on host B rejected by Master A:\n{}\n{}",
+        text(&workers_from_b.stdout),
+        text(&workers_from_b.stderr)
+    );
+
+    let mut worker_b_to_a_cmd = cli(home_b.path());
+    worker_b_to_a_cmd
+        .args([
+            "worker",
+            "--name",
+            "host-b-worker",
+            "--master",
+            &addr_a,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(home_b.path().join("sandbox-b-to-a"));
+    let worker_b_to_a = Service::spawn(worker_b_to_a_cmd, home_b.path().join("worker-b-to-a.log"));
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                home_b.path(),
+                &["workers", "--master", &addr_a, "--json"],
+            ));
+            out.status.success() && text(&out.stdout).contains("\"host-b-worker\"")
+        }),
+        "Repro B failed: `worker` on host B did not register with Master A:\n{}",
+        worker_b_to_a.log()
+    );
+    drop(worker_b_to_a);
+
+    // Item 2: Master A (started with `--secret-file` and no `--state-dir`) creates an invite,
+    // a member joins, Master A restarts with `--secret-file`, and the member still connects with
+    // the same pinned `master_key`.
+    let inv_out = run_cmd(with(
+        home_a.path(),
+        &[
+            "--secret-file",
+            secret_file_str,
+            "invite",
+            "--master",
+            &addr_a,
+            "--roles",
+            "worker,client",
+            "--no-approval",
+        ],
+    ));
+    assert!(
+        inv_out.status.success(),
+        "invite with --secret-file failed:\n{}\n{}",
+        text(&inv_out.stdout),
+        text(&inv_out.stderr)
+    );
+    let invite_str = text(&inv_out.stdout).trim().to_string();
+
+    let member_home = TempDir::new().unwrap();
+    let mut join_cmd = with(member_home.path(), &["join", "--no-doctor"]);
+    join_cmd.env("RUSTY_GRID_WORKER_NAME", "secret-file-member");
+    let join_out = run_with_stdin(join_cmd, &format!("{invite_str}\ny\n"));
+    assert!(
+        join_out.status.success(),
+        "join failed:\n{}\n{}",
+        text(&join_out.stdout),
+        text(&join_out.stderr)
+    );
+
+    // Restart Master A with `--secret-file` on a new port; the persisted `master_noise.key` and
+    // `members.json` must be loaded so `member_home` connects with its pinned `master_key`.
+    drop(master_a);
+    let (_master_a2, addr_a2) =
+        start_master(home_a.path(), &["--secret-file", secret_file_str]);
+
+    let status_after_restart = run_cmd(with(
+        member_home.path(),
+        &["status", "--master", &addr_a2, "--json"],
+    ));
+    assert!(
+        status_after_restart.status.success(),
+        "Item 2 regression: enrolled member failed to connect after master restart with --secret-file:\n{}\n{}",
+        text(&status_after_restart.stdout),
+        text(&status_after_restart.stderr)
+    );
+}

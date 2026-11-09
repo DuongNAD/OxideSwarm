@@ -30,6 +30,8 @@ use rusty_grid_core::transport::{configure_tcp_stream, GridStream};
 static CLIENT_P2P_MINIMAL_FOR_TESTING: AtomicBool = AtomicBool::new(false);
 static DEFAULT_CLIENT_V3_AUTH: std::sync::Mutex<Option<(NodeKeypair, PublicKey)>> =
     std::sync::Mutex::new(None);
+static DEFAULT_CLIENT_LOCAL_V3_FALLBACK: std::sync::Mutex<Option<(NodeKeypair, PublicKey)>> =
+    std::sync::Mutex::new(None);
 static CLI_MASTER_KEY_FLAG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Environment variable naming the Master's pinned static X25519 public key (64 hex chars).
@@ -58,6 +60,22 @@ pub fn set_default_client_v3_auth(v3: Option<(NodeKeypair, PublicKey)>) {
     if let Ok(mut guard) = DEFAULT_CLIENT_V3_AUTH.lock() {
         *guard = v3;
     }
+}
+
+/// Sets the process-wide loopback local-host OXS-AUTH v3 fallback credentials resolved by
+/// `client_secret` when targeting a loopback master without an explicit `master_key` or secret flag.
+pub fn set_default_client_local_v3_fallback(v3: Option<(NodeKeypair, PublicKey)>) {
+    if let Ok(mut guard) = DEFAULT_CLIENT_LOCAL_V3_FALLBACK.lock() {
+        *guard = v3;
+    }
+}
+
+/// Returns the loopback local-host OXS-AUTH v3 fallback credentials, if any.
+pub fn active_client_local_v3_fallback() -> Option<(NodeKeypair, PublicKey)> {
+    DEFAULT_CLIENT_LOCAL_V3_FALLBACK
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
 }
 
 /// Scopes a resolved client OXS-AUTH v3 identity (`(node_key, pinned_master_key)`) across a client
@@ -415,20 +433,101 @@ pub async fn connect_master_with_relay(
                 operation: "cluster_authentication".into(),
                 duration_secs: AUTH_TIMEOUT.as_secs(),
             })?;
-        let session_key = match hs_res {
-            Ok(key) => key,
-            Err(GridError::HandshakeFailed(detail)) if via_p2p => {
-                return Err(upgrade_hint(&detail));
+        match hs_res {
+            Ok(session_key) => {
+                transport.enable_encryption(&session_key, EndpointRole::Client);
             }
-            Err(GridError::ConnectionClosed) if via_p2p => {
-                return Err(upgrade_hint("connection closed by peer"));
+            Err(v2_err) => {
+                if !via_p2p
+                    && !master_requires_secret(&addr, false)
+                    && matches!(v2_err, GridError::AuthFailed(_))
+                {
+                    if let Some((node_key, master_pub)) = active_client_local_v3_fallback() {
+                        if let Ok(Ok(stream2)) =
+                            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await
+                        {
+                            let _ = configure_tcp_stream(&stream2);
+                            let mut transport2 =
+                                MessageTransport::with_codec(GridStream::Tcp(stream2), codec);
+                            if let Ok(Ok(v3_key)) = tokio::time::timeout(
+                                AUTH_TIMEOUT,
+                                v3_client_handshake(
+                                    &mut transport2,
+                                    &node_key,
+                                    &master_pub,
+                                    HandshakePurpose::Member,
+                                ),
+                            )
+                            .await
+                            {
+                                transport2.enable_encryption(&v3_key, EndpointRole::Client);
+                                transport = transport2;
+                            } else {
+                                return Err(v2_err);
+                            }
+                        } else {
+                            return Err(v2_err);
+                        }
+                    } else {
+                        return Err(v2_err);
+                    }
+                } else {
+                    return match v2_err {
+                        GridError::HandshakeFailed(detail) if via_p2p => Err(upgrade_hint(&detail)),
+                        GridError::ConnectionClosed if via_p2p => {
+                            Err(upgrade_hint("connection closed by peer"))
+                        }
+                        GridError::Io(e) if via_p2p => Err(upgrade_hint(&e.to_string())),
+                        other => Err(other),
+                    };
+                }
             }
-            Err(GridError::Io(e)) if via_p2p => {
-                return Err(upgrade_hint(&e.to_string()));
+        }
+    } else if !via_p2p && !master_requires_secret(&addr, false) {
+        if let Some((node_key, master_pub)) = active_client_local_v3_fallback() {
+            let hs_res = tokio::time::timeout(
+                AUTH_TIMEOUT,
+                v3_client_handshake(
+                    &mut transport,
+                    &node_key,
+                    &master_pub,
+                    HandshakePurpose::Member,
+                ),
+            )
+            .await
+            .map_err(|_| GridError::Timeout {
+                operation: "cluster_authentication".into(),
+                duration_secs: AUTH_TIMEOUT.as_secs(),
+            })?;
+            match hs_res {
+                Ok(session_key) => {
+                    transport.enable_encryption(&session_key, EndpointRole::Client);
+                }
+                Err(GridError::AuthFailed(ref detail))
+                    if detail.contains("no cluster secret configured") =>
+                {
+                    let stream2 =
+                        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                return Err(GridError::ConnectionFailed(format!(
+                                    "Failed to connect to Master at {addr}: {e}"
+                                )))
+                            }
+                            Err(_) => {
+                                return Err(GridError::ConnectionFailed(format!(
+                                    "Failed to connect to Master at {addr}: timed out after {}s",
+                                    CONNECT_TIMEOUT.as_secs()
+                                )))
+                            }
+                        };
+                    let _ = configure_tcp_stream(&stream2);
+                    transport = MessageTransport::with_codec(GridStream::Tcp(stream2), codec);
+                }
+                Err(other) => return Err(other),
             }
-            Err(other) => return Err(other),
-        };
-        transport.enable_encryption(&session_key, EndpointRole::Client);
+        }
     }
 
     // Verify protocol version compatibility with a side-effect-free Hello request before any

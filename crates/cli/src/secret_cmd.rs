@@ -27,7 +27,8 @@ use rusty_grid_core::noise_auth::{default_node_key_path, NodeKeypair, PublicKey,
 
 use crate::config::{resolve_bool, ConfigFile, SecretSection, SecretText};
 use crate::connect::{
-    cli_master_key_flag, master_requires_secret, set_default_client_v3_auth, AUTH_EXIT_CODE,
+    cli_master_key_flag, master_requires_secret, set_default_client_local_v3_fallback,
+    set_default_client_v3_auth, AUTH_EXIT_CODE,
 };
 
 /// The secret-related command line flags, as given.
@@ -146,11 +147,9 @@ impl SecretOpts {
         Ok(None)
     }
 
-    /// Resolves the OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for `section`:
-    /// when a `master_key` is configured, loads (or generates on first run) the private key at
-    /// `~/.oxideswarm/node.key`. When no explicit `master_key` or shared secret is configured on
-    /// the master's own host, falls back to the local host admin identity if `node.key`,
-    /// `master_noise.key`, and `members.json` (containing `node.key`) exist on disk.
+    /// Resolves the explicit OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for
+    /// `section` when `--master-key`, `RUSTY_GRID_MASTER_KEY`, or config `master_key` is set,
+    /// loading (or generating on first run) the private key at `~/.oxideswarm/node.key`.
     pub fn resolve_v3_auth(
         &self,
         config: Option<&ConfigFile>,
@@ -165,20 +164,20 @@ impl SecretOpts {
             let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
             return Ok(Some((node_key, master_pub)));
         }
+        Ok(None)
+    }
 
-        let has_explicit_secret = self.value.is_some()
+    /// Returns `true` when an explicit shared secret flag, environment variable, or config key
+    /// (tiers 1..5, excluding the default `~/.oxideswarm/cluster.secret` file) is configured.
+    pub fn has_explicit_secret(&self, config: Option<&ConfigFile>, section: SecretSection) -> bool {
+        self.value.is_some()
             || self.file.is_some()
             || std::env::var_os(ENV_SECRET).is_some()
             || std::env::var_os(ENV_SECRET_FILE).is_some()
             || config.is_some_and(|c| {
                 let (val, file) = c.secret_keys(section);
                 val.is_some() || file.is_some()
-            });
-        if has_explicit_secret {
-            return Ok(None);
-        }
-
-        resolve_local_host_v3_auth(config)
+            })
     }
 }
 
@@ -783,8 +782,16 @@ pub fn client_secret(
         eprintln!("{e}");
         ExitCode::FAILURE
     })?;
+    let local_v3_fallback = if v3_auth.is_none()
+        && !master_requires_secret(master_addr, false)
+        && !secret_opts.has_explicit_secret(config_file, section)
+    {
+        resolve_local_host_v3_auth(config_file).ok().flatten()
+    } else {
+        None
+    };
     match decide_peer_credential(
-        secret.is_some() || v3_auth.is_some(),
+        secret.is_some() || v3_auth.is_some() || local_v3_fallback.is_some(),
         master_addr,
         false,
         insecure,
@@ -792,6 +799,7 @@ pub fn client_secret(
     ) {
         Ok(outcome) => {
             set_default_client_v3_auth(v3_auth);
+            set_default_client_local_v3_fallback(local_v3_fallback);
             announce_peer_secret(outcome, PeerRole::Client, master_addr);
             Ok(secret)
         }
