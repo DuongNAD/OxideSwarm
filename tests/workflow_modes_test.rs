@@ -232,14 +232,59 @@ fn test_research_mode_profile_and_bench() {
     );
 }
 
-/// True when `needle` occurs in `text` and is not just a run of digits inside a longer number. The
-/// report carries measured timings, so a float such as `0.74090` must not read as a GPU model name.
+/// True when `needle` occurs in `text` and is not part of a longer number, a hex/UUID token, or a
+/// measured metric value (`: 4090`, `4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`). The
+/// report carries measured timings, RAM sizes, and UUIDv4 task IDs, so values such as `0.74090`,
+/// `a1b2c3d4-e5f6-4090-89ab-cdef01234567`, or `"total_benchmark_duration_ms": 4090` must not read
+/// as a GPU model name.
 fn contains_standalone_number(text: &str, needle: &str) -> bool {
-    let is_number_char = |c: char| c.is_ascii_digit() || c == '.';
+    let is_num_or_hex = |c: char| c.is_ascii_hexdigit() || c == '.';
     text.match_indices(needle).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + needle.len()..].chars().next();
-        !before.is_some_and(is_number_char) && !after.is_some_and(is_number_char)
+        let prefix = &text[..at];
+        let suffix = &text[at + needle.len()..];
+        let before = prefix.chars().next_back();
+        let after = suffix.chars().next();
+        if before.is_some_and(is_num_or_hex) || after.is_some_and(is_num_or_hex) {
+            return false;
+        }
+        // Hyphen-delimited hex group inside a UUID (e.g. `...-e5f6-4090-89ab-...`).
+        let hyphen_hex_before = before == Some('-')
+            && prefix[..prefix.len() - 1]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_hexdigit());
+        let hyphen_hex_after = after == Some('-')
+            && suffix[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_hexdigit());
+        if hyphen_hex_before || hyphen_hex_after {
+            return false;
+        }
+        // JSON numeric field value (e.g. `"ram_available_mb": 4090`) or unit-labelled measurement.
+        if prefix.ends_with(": ") {
+            return false;
+        }
+        let suffix_lower = suffix.to_ascii_lowercase();
+        if [
+            " ms",
+            " mb",
+            " gb",
+            " kb",
+            " ops/sec",
+            " tasks",
+            " µs",
+            " us",
+            " bytes",
+            " iterations",
+            "%",
+        ]
+        .iter()
+        .any(|unit| suffix_lower.starts_with(unit))
+        {
+            return false;
+        }
+        true
     })
 }
 
@@ -250,7 +295,25 @@ fn test_standalone_number_check_ignores_digits_inside_measurements() {
         "4090"
     ));
     assert!(!contains_standalone_number("1.4090e-3", "4090"));
+    assert!(!contains_standalone_number(
+        "\"expected_task_id\": \"a1b2c3d4-e5f6-4090-89ab-cdef01234567\"",
+        "4090"
+    ));
+    assert!(!contains_standalone_number(
+        "\"expected_task_id\": \"4090a1b2-e5f6-4123-89ab-cdef01234567\"",
+        "4090"
+    ));
+    assert!(!contains_standalone_number(
+        "\"total_benchmark_duration_ms\": 4090,\n\"ram_available_mb\": 4090",
+        "4090"
+    ));
+    assert!(!contains_standalone_number(
+        "Total Duration: 4090 ms\nAvailable RAM: 4090 MB\nThroughput: 4090 tasks/sec",
+        "4090"
+    ));
     assert!(contains_standalone_number("gpu: geforce 4090 ti", "4090"));
+    assert!(contains_standalone_number("nvidia rtx 4090", "4090"));
+    assert!(contains_standalone_number("worker-gpu-rtx4090", "4090"));
     assert!(contains_standalone_number("4090", "4090"));
 }
 
