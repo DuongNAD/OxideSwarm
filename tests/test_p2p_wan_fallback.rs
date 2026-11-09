@@ -721,3 +721,77 @@ async fn test_p2p_client_stream_closed_by_older_master_reports_protocol_version_
     endpoint.close().await;
     let _ = GRID_ALPN;
 }
+
+/// Regression test (W7 security probe): a ticket-only iroh peer without the cluster secret that
+/// opens `STREAM_CLIENT` (`0x03`) directly and sends a plaintext `ClientMessage::ClusterStatus`
+/// must never receive a `ClientResponse::ClusterStatus` from a secret-protected master.
+#[tokio::test]
+async fn test_p2p_ticket_only_peer_sending_plaintext_cluster_status_gets_no_status_response() {
+    use rusty_grid_core::cluster_auth::ClusterSecret;
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+    use rusty_grid_core::transport::{connect_p2p_client_stream, parse_p2p_ticket};
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let ticket_file = temp_dir.path().join("w7_probe_master.ticket");
+    let secret = ClusterSecret::from_bytes(&[0x73u8; 32]).expect("cluster secret");
+
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = ServerConfig::new(master_bind)
+        .with_p2p(true)
+        .with_p2p_minimal_preset(true)
+        .with_ephemeral_key(true)
+        .with_p2p_ticket_file(&ticket_file)
+        .with_cluster_secret(secret);
+
+    let master_handle = MasterServer::spawn(config)
+        .await
+        .expect("Failed to spawn master");
+
+    let raw_ticket = tokio::fs::read_to_string(&ticket_file)
+        .await
+        .expect("read master ticket");
+    let node_addr = parse_p2p_ticket(raw_ticket.trim()).expect("parse ticket");
+
+    // Case A: raw STREAM_CLIENT sending plaintext `ClientMessage::ClusterStatus` as the first frame.
+    let stream_a = connect_p2p_client_stream(node_addr.clone(), Duration::from_secs(5), true)
+        .await
+        .expect("open raw STREAM_CLIENT stream A");
+    let mut transport_a = MessageTransport::new(stream_a);
+    let _ = transport_a.send_msg(&ClientMessage::ClusterStatus).await;
+    let reply_a = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport_a.recv_msg::<ClientResponse>(),
+    )
+    .await;
+    assert!(
+        !matches!(reply_a, Ok(Ok(Some(ClientResponse::ClusterStatus { .. })))),
+        "ticket-only peer sending raw ClusterStatus must never receive ClusterStatus response, got {reply_a:?}"
+    );
+    drop(transport_a);
+
+    // Case B: raw STREAM_CLIENT sending `ClientMessage::Hello {}` and then `ClientMessage::ClusterStatus`
+    // without running the cluster-auth handshake.
+    let stream_b = connect_p2p_client_stream(node_addr, Duration::from_secs(5), true)
+        .await
+        .expect("open raw STREAM_CLIENT stream B");
+    let mut transport_b = MessageTransport::new(stream_b);
+    let _ = transport_b.send_msg(&ClientMessage::Hello {}).await;
+    let _ = transport_b.send_msg(&ClientMessage::ClusterStatus).await;
+    let reply_b = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport_b.recv_msg::<ClientResponse>(),
+    )
+    .await;
+    assert!(
+        !matches!(
+            reply_b,
+            Ok(Ok(Some(
+                ClientResponse::Hello { .. } | ClientResponse::ClusterStatus { .. }
+            )))
+        ),
+        "ticket-only peer sending Hello + ClusterStatus must never receive Hello or ClusterStatus, got {reply_b:?}"
+    );
+    drop(transport_b);
+
+    let _ = master_handle.shutdown();
+}

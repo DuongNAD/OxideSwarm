@@ -21,7 +21,12 @@ pub const STREAM_CLIENT: u8 = 0x03;
 pub use iroh;
 
 /// Keeps a client's ephemeral `iroh::Endpoint` and `iroh::endpoint::Connection` alive for the
-/// lifetime of its `GridStream::P2p`, closing both when the stream drops.
+/// lifetime of its `GridStream::P2p`, closing both when the stream (or both of its
+/// [`BiStream::into_split`] halves) drops.
+///
+/// When dropped inside a Tokio runtime, `endpoint.close()` is spawned asynchronously; when
+/// dropped outside a Tokio runtime, a temporary current-thread runtime drives `endpoint.close()`
+/// synchronously so the endpoint still shuts down cleanly.
 #[cfg(feature = "p2p")]
 pub struct P2pClientGuard {
     conn: iroh::endpoint::Connection,
@@ -44,6 +49,11 @@ impl Drop for P2pClientGuard {
             handle.spawn(async move {
                 ep.close().await;
             });
+        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(ep.close());
         }
     }
 }
@@ -90,13 +100,79 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     nodelay.and(keepalive)
 }
 
+/// Read half produced by [`BiStream::into_split`], retaining a shared reference to any
+/// [`P2pClientGuard`] so a client P2P connection stays open until both halves drop.
+pub struct BiStreamReadHalf<R> {
+    reader: R,
+    #[cfg(feature = "p2p")]
+    #[allow(dead_code)]
+    p2p_guard: Option<std::sync::Arc<P2pClientGuard>>,
+}
+
+impl<R> BiStreamReadHalf<R> {
+    pub fn inner(&self) -> &R {
+        &self.reader
+    }
+
+    pub fn inner_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for BiStreamReadHalf<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+/// Write half produced by [`BiStream::into_split`], retaining a shared reference to any
+/// [`P2pClientGuard`] so a client P2P connection stays open until both halves drop.
+pub struct BiStreamWriteHalf<W> {
+    writer: W,
+    #[cfg(feature = "p2p")]
+    #[allow(dead_code)]
+    p2p_guard: Option<std::sync::Arc<P2pClientGuard>>,
+}
+
+impl<W> BiStreamWriteHalf<W> {
+    pub fn inner(&self) -> &W {
+        &self.writer
+    }
+
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for BiStreamWriteHalf<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
 /// A bidirectional stream adapter combining separate `AsyncRead` and `AsyncWrite` handles.
 pub struct BiStream<R, W> {
     reader: R,
     writer: W,
     #[cfg(feature = "p2p")]
     #[allow(dead_code)]
-    p2p_guard: Option<P2pClientGuard>,
+    p2p_guard: Option<std::sync::Arc<P2pClientGuard>>,
 }
 
 impl<R, W> BiStream<R, W> {
@@ -119,12 +195,29 @@ impl<R, W> BiStream<R, W> {
         Self {
             reader,
             writer,
-            p2p_guard: Some(P2pClientGuard::new(conn, endpoint)),
+            p2p_guard: Some(std::sync::Arc::new(P2pClientGuard::new(conn, endpoint))),
         }
     }
 
-    pub fn into_split(self) -> (R, W) {
-        (self.reader, self.writer)
+    /// Splits the stream into independent read and write halves while keeping any attached
+    /// [`P2pClientGuard`] alive until both halves are dropped.
+    pub fn into_split(self) -> (BiStreamReadHalf<R>, BiStreamWriteHalf<W>) {
+        #[cfg(feature = "p2p")]
+        let read_guard = self.p2p_guard.clone();
+        #[cfg(feature = "p2p")]
+        let write_guard = self.p2p_guard;
+        (
+            BiStreamReadHalf {
+                reader: self.reader,
+                #[cfg(feature = "p2p")]
+                p2p_guard: read_guard,
+            },
+            BiStreamWriteHalf {
+                writer: self.writer,
+                #[cfg(feature = "p2p")]
+                p2p_guard: write_guard,
+            },
+        )
     }
 
     pub fn reader(&self) -> &R {
@@ -476,6 +569,66 @@ mod tests {
             assert!(!ticket.is_empty());
             let parsed = parse_p2p_ticket(&ticket).unwrap();
             assert_eq!(addr, parsed);
+            endpoint.close().await;
         });
+    }
+
+    #[cfg(feature = "p2p")]
+    #[test]
+    fn test_bistream_into_split_preserves_p2p_guard_and_closes_outside_runtime() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (read_half, write_half, server_ep, server_task) = rt.block_on(async {
+            let server_ep = bind_p2p_endpoint(true).await.unwrap();
+            let addr = server_ep.addr();
+            let server_ep_clone = server_ep.clone();
+            let server_task = tokio::spawn(async move {
+                let incoming = server_ep_clone.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let mut tag = [0u8; 1];
+                tokio::io::AsyncReadExt::read_exact(&mut recv, &mut tag)
+                    .await
+                    .unwrap();
+                assert_eq!(tag[0], STREAM_CLIENT);
+                let mut buf = [0u8; 5];
+                tokio::io::AsyncReadExt::read_exact(&mut recv, &mut buf)
+                    .await
+                    .unwrap();
+                assert_eq!(&buf, b"hello");
+                tokio::io::AsyncWriteExt::write_all(&mut send, b"world")
+                    .await
+                    .unwrap();
+                tokio::io::AsyncWriteExt::flush(&mut send).await.unwrap();
+                conn
+            });
+
+            let stream = connect_p2p_client_stream(addr, Duration::from_secs(5), true)
+                .await
+                .unwrap();
+            let GridStream::P2p(bi) = stream else {
+                panic!("expected GridStream::P2p");
+            };
+            let (mut r, mut w) = bi.into_split();
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"hello")
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut w).await.unwrap();
+            let mut reply = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut r, &mut reply)
+                .await
+                .unwrap();
+            assert_eq!(&reply, b"world");
+            (r, w, server_ep, server_task)
+        });
+
+        let server_conn = rt.block_on(server_task).unwrap();
+        rt.block_on(server_ep.close());
+        drop(rt);
+        drop(server_conn);
+
+        // Dropping the split halves outside any Tokio runtime must still cleanly close the
+        // client's P2pClientGuard without panicking.
+        drop(read_half);
+        drop(write_half);
     }
 }
