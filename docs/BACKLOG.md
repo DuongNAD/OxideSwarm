@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 61 items Implemented, 5 Partial and 29 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 5 Partial and 29 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -162,6 +162,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
+| TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -744,6 +745,19 @@ The full suite must pass on a clean machine before CI can require it.
   task timeout, and keeps every assertion. No production code changed.
 - **Done when:** Each test passes 50 times in a row under a CPU load, and the Windows jobs pass
   on three runs.
+
+### TEST-20: Fix Windows disconnect stress timeouts
+
+- **Evidence:** CI failures on `windows-latest` in `tests/m4_challenger_2_stress.rs` (for example `master` `5c9e126`, job `129153917725`): `test_adversarial_worker_disconnect_multi_tasks_in_flight` and `test_adversarial_cascading_worker_disconnects_failover` timed out after 12 s in `wait_task` while all nine other tests in the binary finished in under 5 s.
+- **Problem:**
+  1. `WorkerClient::handle_assign_task_with_checkpoint` emits `TaskProgress { status: TaskStatus::Running }` before `Sandbox::create` and before `configured.spawn`. When a disconnect test aborts the worker as soon as `TaskState::Running` is observed, `WorkerClient::drop` sends `"WorkerClient dropped"` on the task cancellation channel, but `execute_command_workload`, `execute_shell_script_workload`, `execute_rust_compilation_workload`, and `execute_process_supervised_with_workspace` did not check `cancel_rx` before spawning the child process. The dropped worker therefore still spawned `sh.exe` and immediately terminated its Job Object milliseconds later.
+  2. When `sh.exe -c "sleep ..."` was already running at abort time, `TreeInner::kill_and_release_once` waited only `MIN_LIVE_KILL_AGE = 80 ms` (and `TreeInner::drop` passed `child_already_exited = true`, skipping the wait altogether). Under 11-way parallel test load on Windows, `80 ms` lands while `sh.exe` is inside MSYS2 `child_info_spawn` starting `sleep.exe` (`msys-2.0.dll` `dll_crt0_1`), stalling MSYS2's global shared-memory initialization lock for 15 s and freezing the surviving `sh.exe` children on the failover workers past the 12 s `wait_task` budget.
+  3. `spawn_test_worker` in `tests/m4_challenger_2_stress.rs` and `WorkerClient::for_testing` did not pass `.with_ram_mb(...)`, so every worker spawn ran `sysinfo::System::new()` + `refresh_memory()` synchronously on the single-threaded test runtime.
+- **Do:**
+  1. Check `cancel_rx` via `check_cancelled_now` before `Sandbox::create` in `execute_command_workload`, `execute_shell_script_workload`, and `execute_rust_compilation_workload`, and both at entry and immediately before `configured.spawn` in `execute_process_supervised_with_workspace`.
+  2. Raise `MIN_LIVE_KILL_AGE` in `crates/worker/src/process_tree.rs` from `80 ms` to `250 ms` so both `sh.exe` and its immediate MSYS2 child finish `dll_crt0_1` before `TerminateJobObject`, and pass `child_already_exited = false` in `TreeInner::drop`.
+  3. Set `.with_ram_mb(4096)` in `WorkerClient::for_testing` and `spawn_test_worker`.
+- **Done when:** `cargo test -p rusty_grid_master --test m4_challenger_2_stress --locked` passes 20 times in a row on Windows inside the full-suite lock, and `runner::tests::test_runner_pre_cancelled_task_does_not_spawn_child` verifies that a pre-cancelled task does not spawn a child process.
 
 ## Phase 3: make the documents true
 
@@ -1965,3 +1979,10 @@ Add one dated line per finished item, newest last.
   on macOS and on Windows 11 against a demo cluster. `usb create`, with an invite encrypted by a
   passphrase, still waits for ENROLL-1b. The Index counts are now 61 Implemented, 5 Partial and
   29 Planned.
+- 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
+  `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
+  before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
+  honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
+  `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
+  locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
+  and 29 Planned.
