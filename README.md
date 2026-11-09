@@ -133,10 +133,49 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 Ports: **8088** is the cluster port (workers and `submit` / `status` talk to it), **8080** is the dashboard
 (never a valid `--master` target), **8089/udp** is discovery. Details: [docs/SECURITY.md](docs/SECURITY.md#4-what-each-port-exposes).
 
+### Quick start: offload `cargo test` to a second machine
+
+Two machines on one network: on **A** you edit code (with or without a coding agent), **B** has Rust
+installed and does the work. Neither machine has to build OxideSwarm.
+
+1. **Install** the release archive for each system on both machines ([Install](#install)).
+2. **Start the master on A.** The first start creates `~/.oxideswarm/cluster.secret`:
+
+   ```bash
+   oxideswarm master --listen 0.0.0.0:8088
+   ```
+
+3. **Join B with one token** ([design 0048](docs/design/0048-join-token.md)). The token carries the
+   secret: move it over a channel you trust (never chat or e-mail), and pipe it in rather than
+   typing it as an argument:
+
+   ```bash
+   oxideswarm secret join-token --master <A_IP>:8088 > join.token   # on A
+   oxideswarm join < join.token                                     # on B: saves the secret and the address, runs the doctor checks
+   oxideswarm worker --workspaces                                   # on B
+   ```
+
+4. **Check from A** that B offers workspaces and Cargo: `oxideswarm workers` lists B with
+   `feat:workspaces` and `tool:cargo` among its tags.
+5. **Offload** from the root of a Rust project on A:
+
+   ```bash
+   oxideswarm submit --workspace myproject --require-tool cargo --wait -- cargo test
+   ```
+
+   The first run sends every file that `.gitignore` does not exclude and builds from scratch. Run it
+   again: only changed files travel, and B reuses its `target/` directory.
+
+A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
+its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
+expected output, the MCP calls and troubleshooting, is
+[guides/offload-cargo-test.md](docs/guides/offload-cargo-test.md), and measured times are in
+[benchmarks/grid/README.md](benchmarks/grid/README.md).
+
 ### Install
 
-> No release exists yet: the first archives appear on the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-> when the owner pushes a `v*` tag. Until then, build from source (Step 0 below).
+Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
+(the first release is `v0.1.0`), or build from source (Step 0 below).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
