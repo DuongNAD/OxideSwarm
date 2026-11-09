@@ -967,7 +967,7 @@ pub mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
-        HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        HANDLE_FLAG_INHERIT, HLOCAL, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -1002,20 +1002,6 @@ pub mod windows {
         fn SetErrorMode(umode: u32) -> u32;
     }
 
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn LogonUserW(
-            lpszusername: *const u16,
-            lpszdomain: *const u16,
-            lpszpassword: *const u16,
-            dwlogontype: u32,
-            dwlogonprovider: u32,
-            phtoken: *mut HANDLE,
-        ) -> i32;
-        fn ImpersonateLoggedOnUser(htoken: HANDLE) -> i32;
-        fn RevertToSelf() -> i32;
-    }
-
     #[link(name = "user32")]
     extern "system" {
         fn GetProcessWindowStation() -> HANDLE;
@@ -1044,10 +1030,9 @@ pub mod windows {
         ) -> i32;
     }
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE, WRITE_DAC,
-        WRITE_OWNER,
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
+        WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::{
@@ -2285,30 +2270,30 @@ pub mod windows {
         }
     }
 
-    /// Creates and caches `(primary_lua_token, logon_token)` when the worker runs elevated
-    /// (`is_process_elevated() == true`):
-    /// 1. Calls `LogonUserW("OxideTask", ".", "unused", LOGON32_LOGON_NEW_CREDENTIALS (9),
-    ///    LOGON32_PROVIDER_WINNT50 (3))` under the worker process token (without prior
-    ///    impersonation) so LSASS allocates a fresh logon session (`NewLogonId`) whose per-logon
-    ///    DosDevices directory `\Sessions\<S>\DosDevices\<NewLogonId>` does not exist yet
-    ///    (`pDeviceMap == NULL`).
-    /// 2. Sets `TokenOwner = CurrentUser` and `TokenDefaultDacl` granting `CurrentUser` on
-    ///    `logon_token` while `BUILTIN\Administrators` is still enabled on `logon_token`.
-    /// 3. Impersonates `logon_token` and opens `"NUL"` via `CreateFileW`. Inside the kernel,
-    ///    `SeGetTokenDeviceMap` -> `ObpCreateDosDevicesDirectory` calls `ZwCreateDirectoryObject`
-    ///    with `SecurityDescriptor = NULL` while the effective token's `TokenOwner` is
-    ///    `CurrentUser`, so `SeAssignSecurityEx` expands the parent `\Sessions\<S>\DosDevices`
-    ///    `CREATOR OWNER` (`CO`) ACE into `(A;;CCDCLCSWSDRCWDWO;;;<CurrentUser>)` on
-    ///    `\Sessions\<S>\DosDevices\<NewLogonId>` without editing any Object Manager DACL.
-    /// 4. Filters `logon_token` with `CreateRestrictedToken(..., LUA_TOKEN, ...)` and duplicates
-    ///    it to a `TokenPrimary` token with `TokenOwner = CurrentUser` and `TokenDefaultDacl`
-    ///    granting `CurrentUser` (in addition to `SYSTEM` and `Administrators`, never
-    ///    `BUILTIN\Users` or `Everyone`).
+    /// Creates and caches a primary LUA-filtered child token (`CreateRestrictedToken` with
+    /// `LUA_TOKEN` + `DuplicateTokenEx` with `TokenPrimary`, `TokenOwner = CurrentUser`, and
+    /// `TokenDefaultDacl` granting `CurrentUser`, `SYSTEM`, and `Administrators` — never
+    /// `BUILTIN\Users` or `Everyone`) when the worker runs elevated (`is_process_elevated() == true`).
+    ///
+    /// Note on elevated sessions (`runneradmin` on GitHub Actions `windows-latest`):
+    /// - `CreateProcessAsUserW` without `SeAssignPrimaryTokenPrivilege` is only permitted by
+    ///   `ntoskrnl.exe!SeIsTokenAssignableToProcess` when the primary token is a restricted child
+    ///   token sharing the calling process's `AuthenticationId` (`AdminLogonId`); a token with a
+    ///   different `AuthenticationId` (such as `LogonUserW`) is rejected with
+    ///   `ERROR_PRIVILEGE_NOT_HELD (os error 1314)`.
+    /// - Under an elevated split-token logon session, `\Sessions\<S>\DosDevices\<AdminLogonId>` is
+    ///   created by the kernel before the worker starts with `TokenOwner = BUILTIN\Administrators`
+    ///   (`O:BA D:(A;OICI;...;;;SY)(A;OICI;...;;;BA)`), which has no ACE for `CurrentUser`. Because
+    ///   OxideSwarm never edits Object Manager DACLs (`\??`, `\GLOBAL??`, `\Device\Null`) or grants
+    ///   broad SIDs, opening `\??\NUL` inside an AppContainer under an elevated runner returns
+    ///   `ERROR_ACCESS_DENIED (5)`, whereas on normal non-elevated Windows workers
+    ///   `\Sessions\<S>\DosDevices\<LogonId>` has `(A;;CCDCLCSWSDRCWDWO;;;<CurrentUser>)` and
+    ///   `\??\NUL` works natively.
     ///
     /// Returns `None` when the worker is not elevated.
-    fn get_or_init_worker_lua_tokens() -> Option<(HANDLE, HANDLE)> {
-        static WORKER_LUA_TOKENS: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-        WORKER_LUA_TOKENS
+    fn get_or_init_worker_lua_token() -> Option<HANDLE> {
+        static WORKER_LUA_TOKEN: OnceLock<Option<usize>> = OnceLock::new();
+        WORKER_LUA_TOKEN
             .get_or_init(|| {
                 if !is_process_elevated() {
                     return None;
@@ -2316,79 +2301,6 @@ pub mod windows {
                 ensure_process_token_default_dacl_grants_current_user();
                 let user_sid = OwnedSid::current_user().ok()?;
                 unsafe {
-                    let wide_user = to_wide(OsStr::new("OxideTask"));
-                    let wide_domain = to_wide(OsStr::new("."));
-                    let wide_pass = to_wide(OsStr::new("unused"));
-                    let mut logon_token: HANDLE = std::ptr::null_mut();
-                    // LOGON32_LOGON_NEW_CREDENTIALS = 9, LOGON32_PROVIDER_WINNT50 = 3
-                    let logon_ok = LogonUserW(
-                        wide_user.as_ptr(),
-                        wide_domain.as_ptr(),
-                        wide_pass.as_ptr(),
-                        9,
-                        3,
-                        &mut logon_token,
-                    );
-                    if logon_ok != 0 && !logon_token.is_null() {
-                        apply_current_user_owner_and_default_dacl(logon_token, user_sid.as_psid());
-                        if ImpersonateLoggedOnUser(logon_token) != 0 {
-                            let wide_nul = to_wide(OsStr::new("NUL"));
-                            let h_nul = CreateFileW(
-                                wide_nul.as_ptr(),
-                                FILE_READ_ATTRIBUTES,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                std::ptr::null(),
-                                OPEN_EXISTING,
-                                0,
-                                std::ptr::null_mut(),
-                            );
-                            if !h_nul.is_null() && h_nul != INVALID_HANDLE_VALUE {
-                                CloseHandle(h_nul);
-                            }
-                            let _ = RevertToSelf();
-                        }
-                        let mut lua_logon: HANDLE = std::ptr::null_mut();
-                        let ok = CreateRestrictedToken(
-                            logon_token,
-                            LUA_TOKEN,
-                            0,
-                            std::ptr::null(),
-                            0,
-                            std::ptr::null(),
-                            0,
-                            std::ptr::null(),
-                            &mut lua_logon,
-                        );
-                        if ok != 0 && !lua_logon.is_null() {
-                            apply_current_user_owner_and_default_dacl(
-                                lua_logon,
-                                user_sid.as_psid(),
-                            );
-                            let mut primary_token: HANDLE = std::ptr::null_mut();
-                            let dup_ok = DuplicateTokenEx(
-                                lua_logon,
-                                TOKEN_ASSIGN_PRIMARY
-                                    | TOKEN_DUPLICATE
-                                    | TOKEN_QUERY
-                                    | TOKEN_ADJUST_DEFAULT
-                                    | TOKEN_ADJUST_SESSIONID,
-                                std::ptr::null(),
-                                SecurityImpersonation,
-                                TokenPrimary,
-                                &mut primary_token,
-                            );
-                            CloseHandle(lua_logon);
-                            if dup_ok != 0 && !primary_token.is_null() {
-                                apply_current_user_owner_and_default_dacl(
-                                    primary_token,
-                                    user_sid.as_psid(),
-                                );
-                                return Some((primary_token as usize, logon_token as usize));
-                            }
-                        }
-                        CloseHandle(logon_token);
-                    }
-
                     let mut proc_token: HANDLE = std::ptr::null_mut();
                     if OpenProcessToken(
                         GetCurrentProcess(),
@@ -2435,14 +2347,10 @@ pub mod windows {
                         return None;
                     }
                     apply_current_user_owner_and_default_dacl(primary_token, user_sid.as_psid());
-                    Some((primary_token as usize, 0))
+                    Some(primary_token as usize)
                 }
             })
-            .map(|(primary, logon)| (primary as HANDLE, logon as HANDLE))
-    }
-
-    fn get_or_init_worker_lua_token() -> Option<HANDLE> {
-        get_or_init_worker_lua_tokens().map(|(primary, _)| primary)
+            .map(|primary| primary as HANDLE)
     }
 
     /// When the worker process runs under an elevated Administrator token (such as `runneradmin`
@@ -4297,33 +4205,15 @@ pub mod windows {
             let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)
                 .map_err(|e| e.to_string())?;
             unsafe {
-                // Always open/create the logon session's built-in non-interactive Window Station
-                // (`NULL` -> `Service-0x0-<LogonId>$`). When the worker runs elevated and uses a
-                // fresh `LOGON32_LOGON_NEW_CREDENTIALS` logon token for AppContainer spawning,
-                // impersonate that logon token around `CreateWindowStationW(NULL, ...)` so
-                // `win32kbase!GetProcessLuid` resolves the new logon session's Window Station
-                // `Service-0x0-<NewLogonId>$` (matching the `AuthenticationId` of the spawned task
-                // and any console grandchildren that resolve `Service-0x0-<NewLogonId>$\Default`).
-                let lua_logon_token = get_or_init_worker_lua_tokens()
-                    .map(|(_, logon)| logon)
-                    .filter(|h| !h.is_null());
-                let impersonated = if let Some(h_logon) = lua_logon_token {
-                    ImpersonateLoggedOnUser(h_logon) != 0
-                } else {
-                    false
-                };
+                // Open/create the logon session's built-in non-interactive Window Station
+                // (`NULL` -> `Service-0x0-<LogonId>$`).
                 let alt_winsta =
                     CreateWindowStationW(std::ptr::null(), 0, 0x000F_037F, std::ptr::null());
-                let winsta_err = if alt_winsta.is_null() {
-                    Some(io::Error::last_os_error())
-                } else {
-                    None
-                };
-                if impersonated {
-                    let _ = RevertToSelf();
-                }
-                if let Some(e) = winsta_err {
-                    return Err(format!("CreateWindowStationW failed: {e}"));
+                if alt_winsta.is_null() {
+                    return Err(format!(
+                        "CreateWindowStationW failed: {}",
+                        io::Error::last_os_error()
+                    ));
                 }
 
                 let mut buf = vec![0u16; 256];

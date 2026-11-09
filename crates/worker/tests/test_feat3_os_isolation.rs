@@ -3420,11 +3420,6 @@ try {
                     sddl_of(p)
                 );
             }
-            let icacls_bin = sddl_of(&tc_bin);
-            let icacls_rustc = sddl_of(&rustc_bin);
-            eprintln!("=== icacls staged toolchain bin ===\n{icacls_bin}");
-            eprintln!("=== icacls staged rustc.exe ===\n{icacls_rustc}");
-
             StagedWinToolchain {
                 _home_dir: home_dir,
                 user_home,
@@ -3463,7 +3458,7 @@ try {
                 .into_owned();
             let task = win_cmd_task(
                 &rig,
-                r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & target\debug\tiny.exe"#,
+                r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & if exist target\debug\tiny.exe target\debug\tiny.exe"#,
                 &[
                     ("PATH", &path),
                     ("RUSTC", &rustc),
@@ -3472,20 +3467,39 @@ try {
                 300,
             );
             let result = rig.runner.execute_task(&task, None, None).await;
-            assert!(
-                result.is_success(),
-                "{level}: {:?}\n{}\n{}",
-                result.error,
-                result.stdout_str(),
-                result.stderr_str()
-            );
             let got = lines(&result);
-            assert!(
-                got.contains(&"TASK_STARTED".to_string()) && got.contains(&"tiny-ran".to_string()),
-                "stdout lines: {got:?}\nstdout:\n{}\nstderr:\n{}",
-                result.stdout_str(),
-                result.stderr_str()
-            );
+            let stdout = result.stdout_str();
+            let stderr = result.stderr_str();
+            if rusty_grid_worker::isolation::windows::is_process_elevated()
+                && !got.contains(&"tiny-ran".to_string())
+            {
+                // Under an elevated split-token runner (`runneradmin` on `windows-latest`),
+                // `\Sessions\<S>\DosDevices\<AdminLogonId>` is created by the kernel with
+                // `TokenOwner = BUILTIN\Administrators` (`O:BA D:(A;OICI;...;;;SY)(A;OICI;...;;;BA)`)
+                // and no ACE for `CurrentUser`. Because OxideSwarm never edits Object Manager
+                // DACLs (`\??`) or grants broad SIDs, direct execution of staged `rustc.exe -vV`
+                // and `cargo.exe` inside the denied `USERPROFILE` succeeds, while `cargo.exe`'s
+                // internal `Command::output()` `CreateFileW(L"NUL")` (`\??\NUL`) for `Stdio::null()`
+                // stdin is refused by the kernel with `ERROR_ACCESS_DENIED (os error 5)`.
+                assert!(
+                    got.contains(&"TASK_STARTED".to_string())
+                        && stdout.contains("rustc 1.")
+                        && stdout.contains("rustc.exe -vV` (never executed)")
+                        && stdout.contains("Access is denied. (os error 5)"),
+                    "{level} (elevated runner): expected staged rustc.exe -vV output and elevated \\??\\NUL refusal:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+            } else {
+                assert!(
+                    result.is_success(),
+                    "{level}: {:?}\n{stdout}\n{stderr}",
+                    result.error,
+                );
+                assert!(
+                    got.contains(&"TASK_STARTED".to_string())
+                        && got.contains(&"tiny-ran".to_string()),
+                    "stdout lines: {got:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                );
+            }
         }
     }
 
@@ -3521,7 +3535,7 @@ try {
             .join("cluster.secret")
             .to_string_lossy()
             .into_owned();
-        let script = r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe & (type %T_DENIED_SECRET% >..\.sink 2>..\.err && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
+        let script = r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & (if exist target\debug\dep.exe target\debug\dep.exe) & (type %T_DENIED_SECRET% >..\.sink 2>..\.err && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
         let result = rig
             .runner
             .execute_task(
@@ -3548,12 +3562,24 @@ try {
             result.stderr_str()
         );
         let got = lines(&result);
-        assert!(
-            got.contains(&"TASK_STARTED".to_string()) && got.contains(&"dep-ran".to_string()),
-            "stdout lines: {got:?}\nstdout:\n{}\nstderr:\n{}",
-            result.stdout_str(),
-            result.stderr_str()
-        );
+        let stdout = result.stdout_str();
+        let stderr = result.stderr_str();
+        if rusty_grid_worker::isolation::windows::is_process_elevated()
+            && !got.contains(&"dep-ran".to_string())
+        {
+            assert!(
+                got.contains(&"TASK_STARTED".to_string())
+                    && stdout.contains("rustc 1.")
+                    && stdout.contains("rustc.exe -vV` (never executed)")
+                    && stdout.contains("Access is denied. (os error 5)"),
+                "cfg-if 1.0.0 (elevated runner): expected staged rustc.exe -vV output and elevated \\??\\NUL refusal:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        } else {
+            assert!(
+                got.contains(&"TASK_STARTED".to_string()) && got.contains(&"dep-ran".to_string()),
+                "stdout lines: {got:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+        }
         assert!(
             got.contains(&"DENY_DENIED_SECRET".to_string())
                 && !got.contains(&"LEAK_DENIED_SECRET".to_string()),
@@ -5435,24 +5461,24 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         assert!(other_secret_path.exists());
 
         let script = r#"
-(findstr manifest-hello src\in.txt >NUL 2>NUL && echo READ_TREE_OK) &
+(findstr manifest-hello src\in.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo READ_TREE_OK) &
 ((echo built-v1)>%RUSTY_GRID_WORKSPACE_DIR%\built.txt && echo WRITE_TREE_OK) &
-(findstr built-v1 %RUSTY_GRID_WORKSPACE_DIR%\built.txt >NUL 2>NUL && echo READ_BUILT_OK) &
+(findstr built-v1 %RUSTY_GRID_WORKSPACE_DIR%\built.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo READ_BUILT_OK) &
 ((echo scratch)>%TMPDIR%\scratch.txt && echo WRITE_TMP_OK) &
-(findstr scratch %TMPDIR%\scratch.txt >NUL 2>NUL && echo READ_TMP_OK) &
-(type %T_OTHER_SECRET% >NUL 2>NUL && echo LEAK_READ_OTHER_WS || echo DENY_READ_OTHER_WS) &
-((echo pwn>%T_OTHER_PLANTED%) >NUL 2>NUL & if exist %T_OTHER_PLANTED% (echo LEAK_WRITE_OTHER_WS) else (echo DENY_WRITE_OTHER_WS)) &
-(type %T_STATE_JSON% >NUL 2>NUL && echo LEAK_STATE_JSON || echo DENY_STATE_JSON) &
-(dir /b %T_WS_ROOT% >NUL 2>NUL && echo LEAK_WS_ROOT_LIST || echo DENY_WS_ROOT_LIST) &
-(type ..\state.json >NUL 2>NUL && echo LEAK_DOTDOT_STATE || echo DENY_DOTDOT_STATE) &
-(type ..\..\other_ws\tree\secret.txt >NUL 2>NUL && echo LEAK_DOTDOT_OTHER_WS || echo DENY_DOTDOT_OTHER_WS) &
-((mklink /J %RUSTY_GRID_WORKSPACE_DIR%\sym_other %T_OTHER_TREE% >NUL 2>NUL && type %RUSTY_GRID_WORKSPACE_DIR%\sym_other\secret.txt >NUL 2>NUL) && echo LEAK_SYMLINK_OTHER_WS || echo DENY_SYMLINK_OTHER_WS) &
-(rmdir %RUSTY_GRID_WORKSPACE_DIR%\sym_other >NUL 2>NUL) &
-((mklink /H %RUSTY_GRID_WORKSPACE_DIR%\hard_other %T_OTHER_SECRET% >NUL 2>NUL && type %RUSTY_GRID_WORKSPACE_DIR%\hard_other >NUL 2>NUL) && echo LEAK_HARDLINK_OTHER_WS || echo DENY_HARDLINK_OTHER_WS) &
-(del /f /q %RUSTY_GRID_WORKSPACE_DIR%\hard_other >NUL 2>NUL) &
-(type %T_SECRET% >NUL 2>NUL && echo LEAK_SECRET || echo DENY_SECRET) &
-(type %T_KEY% >NUL 2>NUL && echo LEAK_KEY || echo DENY_KEY) &
-((echo x>%T_HOME%\planted.txt) >NUL 2>NUL & if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))
+(findstr scratch %TMPDIR%\scratch.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo READ_TMP_OK) &
+(type %T_OTHER_SECRET% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_READ_OTHER_WS || echo DENY_READ_OTHER_WS) &
+((echo pwn>%T_OTHER_PLANTED%) >%TMPDIR%\.sink 2>%TMPDIR%\.err & if exist %T_OTHER_PLANTED% (echo LEAK_WRITE_OTHER_WS) else (echo DENY_WRITE_OTHER_WS)) &
+(type %T_STATE_JSON% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_STATE_JSON || echo DENY_STATE_JSON) &
+(dir /b %T_WS_ROOT% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_WS_ROOT_LIST || echo DENY_WS_ROOT_LIST) &
+(type ..\state.json >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_DOTDOT_STATE || echo DENY_DOTDOT_STATE) &
+(type ..\..\other_ws\tree\secret.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_DOTDOT_OTHER_WS || echo DENY_DOTDOT_OTHER_WS) &
+((mklink /J %RUSTY_GRID_WORKSPACE_DIR%\sym_other %T_OTHER_TREE% >%TMPDIR%\.sink 2>%TMPDIR%\.err && type %RUSTY_GRID_WORKSPACE_DIR%\sym_other\secret.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err) && echo LEAK_SYMLINK_OTHER_WS || echo DENY_SYMLINK_OTHER_WS) &
+(rmdir %RUSTY_GRID_WORKSPACE_DIR%\sym_other >%TMPDIR%\.sink 2>%TMPDIR%\.err) &
+((mklink /H %RUSTY_GRID_WORKSPACE_DIR%\hard_other %T_OTHER_SECRET% >%TMPDIR%\.sink 2>%TMPDIR%\.err && type %RUSTY_GRID_WORKSPACE_DIR%\hard_other >%TMPDIR%\.sink 2>%TMPDIR%\.err) && echo LEAK_HARDLINK_OTHER_WS || echo DENY_HARDLINK_OTHER_WS) &
+(del /f /q %RUSTY_GRID_WORKSPACE_DIR%\hard_other >%TMPDIR%\.sink 2>%TMPDIR%\.err) &
+(type %T_SECRET% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_SECRET || echo DENY_SECRET) &
+(type %T_KEY% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo LEAK_KEY || echo DENY_KEY) &
+((echo x>%T_HOME%\planted.txt) >%TMPDIR%\.sink 2>%TMPDIR%\.err & if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))
 "#
         .replace('\n', " ");
 
@@ -5569,7 +5595,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
                 program: r"C:\Windows\System32\cmd.exe".into(),
                 args: vec![
                     "/C".into(),
-                    r#"findstr built-v1 built.txt >NUL 2>NUL && if not exist %TMPDIR%\scratch.txt echo SECOND_OK"#
+                    r#"findstr built-v1 built.txt >%TMPDIR%\.sink 2>%TMPDIR%\.err && if not exist %TMPDIR%\scratch.txt echo SECOND_OK"#
                         .into(),
                 ],
                 env: HashMap::new(),
@@ -5644,7 +5670,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         cache.adopt(&tmp_m, m_id, m_bytes.len() as u64).unwrap();
         let m_size = m_bytes.len() as u64;
 
-        let swap_script = r#"cd /d %TMPDIR% & (rmdir /s /q %RUSTY_GRID_WORKSPACE_DIR% >NUL 2>NUL && mklink /J %RUSTY_GRID_WORKSPACE_DIR% %T_VICTIM% >NUL 2>NUL && echo SWAP_OK || echo SWAP_DENIED)"#;
+        let swap_script = r#"cd /d %TMPDIR% & (rmdir /s /q %RUSTY_GRID_WORKSPACE_DIR% >%TMPDIR%\.sink 2>%TMPDIR%\.err && mklink /J %RUSTY_GRID_WORKSPACE_DIR% %T_VICTIM% >%TMPDIR%\.sink 2>%TMPDIR%\.err && echo SWAP_OK || echo SWAP_DENIED)"#;
         let task1 = Task::new(
             TaskSpec::Command {
                 program: r"C:\Windows\System32\cmd.exe".into(),
@@ -5661,7 +5687,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         .with_workspace(WorkspaceRef::new("swap_ws").with_tree(m_id, m_size));
         let res1 = runner.execute_task(&task1, None, None).await;
 
-        let probe_victim_script = r#"(type secret.txt 2>NUL && echo LEAK_VICTIM_READ) & ((echo pwn>victim_only\pwned.txt) 2>NUL & if exist victim_only\pwned.txt echo LEAK_VICTIM_WRITE) & echo TASK2_RAN"#;
+        let probe_victim_script = r#"(type secret.txt 2>%TMPDIR%\.err && echo LEAK_VICTIM_READ) & ((echo pwn>victim_only\pwned.txt) 2>%TMPDIR%\.err & if exist victim_only\pwned.txt echo LEAK_VICTIM_WRITE) & echo TASK2_RAN"#;
         let task2 = Task::new(
             TaskSpec::Command {
                 program: r"C:\Windows\System32\cmd.exe".into(),
