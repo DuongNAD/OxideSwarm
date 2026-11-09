@@ -1,7 +1,7 @@
 # Grid benchmarks (BENCH-1)
 
 `bench_grid.py` measures the OxideSwarm grid on loopback with the binary you built. It uses only the
-Python 3 standard library and runs on macOS, Linux and Windows (macOS and Windows are recorded below).
+Python 3 standard library and runs on macOS, Linux and Windows (all three are recorded below).
 
 ```bash
 cargo build --release --locked --bin oxideswarm
@@ -86,6 +86,27 @@ Record: [`results/2026-11-09-windows-amd64-13th-gen-intel-core-i7-1355u.json`](r
 | First | 10.85 (10.73 to 13.66) | 501 of 501 | 16864821 |
 | Same tree again | 1.790 (1.565 to 1.889) | 0 of 501 | 0 |
 | One file changed | 1.722 (1.421 to 1.808) | 2 of 501 | 55102 |
+
+Record: [`results/2026-11-09-linux-arm64-docker-on-apple-m5.json`](results/2026-11-09-linux-arm64-docker-on-apple-m5.json). 2026-11-09 (UTC). Linux arm64 (kernel `7.0.14-linuxkit`) **in the Docker Desktop VM on the Apple M5 Mac** of the macOS record: 10 virtual CPUs, 8 GiB. This is not a dedicated Linux machine. The run used a release build of `92d329a`, built in a `rust:1.96-bookworm` container, and was on loopback. The load average inside the VM was 3.6 before and 2.7 after. A build was running on the Mac at the same time.
+
+| Workers | Throughput, tasks/s (median, range) | p50 ms (median, range) | p99 ms (median, range) | Client floor: calls/s, p50 ms |
+|---|---|---|---|---|
+| 1 | 866.4 (767.8 to 906.5) | 6.3 (6.2 to 6.5) | 8.8 (7.9 to 17.7) | 1978.2, 1.4 |
+| 2 | 1088.4 (1086.6 to 1089.7) | 6.3 (6.2 to 6.4) | 8.3 (8.1 to 11.8) | 2105.8, 1.4 |
+| 3 | 1054.9 (1053.2 to 1083.9) | 6.4 (6.1 to 6.4) | 7.8 (7.1 to 8.0) | 2097.0, 1.3 |
+| 4 | 1106.4 (1041.0 to 1108.9) | 6.3 (6.3 to 6.4) | 7.8 (7.3 to 9.1) | 2121.7, 1.3 |
+
+| Upload of the 500-file tree | Wall time, s (median, range) | Blobs sent | Store growth, bytes |
+|---|---|---|---|
+| First | 0.222 (0.216 to 0.309) | 501 of 501 | 16864821 |
+| Same tree again | 0.047 (0.045 to 0.048) | 0 of 501 | 0 |
+| One file changed | 0.047 (0.047 to 0.049) | 2 of 501 | 55102 |
+
+**Why the three records differ.** Linux starts a process and accepts a connection in about 1 ms (the
+client floor). Under its loaded run, macOS took 5 to 11 ms for the same, and Windows took 26 to 31
+ms. The no-op task, the CLI process per call and the worker's process start all pay that cost, so
+the task overhead follows the client floor. The records also differ in hardware and in load, so they
+compare machines in the state they were in, not operating systems in general.
 
 **(c) Two-machine `cargo test` workspace offload (`--offload-master`).** Connects from the client machine
 to a running two-machine cluster (`--offload-master <HOST:PORT_OR_TICKET>`, authenticating with

@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 5 Partial and 37 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 4 Partial and 37 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -213,7 +213,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
-| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
@@ -2011,6 +2011,13 @@ Add one dated line per finished item, newest last.
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 5 Partial
   and 29 Planned.
+- 2026-11-10: BENCH-1 is Implemented. Its "Done when" passes:
+  - `benchmarks/grid/bench_grid.py` ran on macOS (pull request 162), Windows (187) and Linux (189,
+    arm64 in a Docker Desktop VM, labelled as such);
+  - (c) is recorded on two machines (pull request 175 and the live run of 2026-11-09);
+  - `README.md` links the page.
+
+  The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
 - 2026-11-10: Phase 9 added with NET-1 to NET-8, all Planned, from Phase H of the roadmap and design
   0054 (Draft): the owner's long-term goal of an open compute network. The Index counts are now
-  62 Implemented, 5 Partial and 37 Planned.
+  63 Implemented, 4 Partial and 37 Planned.
