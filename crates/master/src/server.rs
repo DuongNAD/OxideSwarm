@@ -56,6 +56,13 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// anything, so they get a much smaller budget than established connections.
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 64;
 
+/// Default session-resume hold duration in seconds (`master --session-resume-hold-secs`, default: 30).
+pub const DEFAULT_SESSION_RESUME_HOLD_SECS: u64 = 30;
+
+/// Default session-resume hold duration (`Duration::from_secs(30)`).
+pub const DEFAULT_SESSION_RESUME_HOLD: Duration =
+    Duration::from_secs(DEFAULT_SESSION_RESUME_HOLD_SECS);
+
 /// Configuration options for initializing and running a `MasterServer`.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -151,6 +158,13 @@ pub struct ServerConfig {
     /// `journal.bin`; see [`crate::store::TaskStore`]). `None` (the default) keeps the queue
     /// purely in memory.
     pub state_dir: Option<PathBuf>,
+    /// How long the master holds tasks of a `SESSION_RESUME`-capable worker on disconnect or
+    /// restart before releasing or charging failover (`Duration::ZERO` disables session resume;
+    /// defaults to 30 s when `state_dir` is set or in the CLI).
+    pub session_resume_hold: Duration,
+    /// True when `with_session_resume_hold` was called explicitly so `with_state_dir` does not
+    /// overwrite an explicit `Duration::ZERO`.
+    session_resume_hold_explicit: bool,
 }
 
 impl Default for ServerConfig {
@@ -199,6 +213,8 @@ impl Default for ServerConfig {
             rendezvous_url: None,
             blob_store: None,
             state_dir: None,
+            session_resume_hold: Duration::ZERO,
+            session_resume_hold_explicit: false,
         }
     }
 }
@@ -437,9 +453,35 @@ impl ServerConfig {
 
     /// Configures the durable task queue state directory (`store.lock`, `snapshot.bin`,
     /// `journal.bin`). When `blob_store` is not configured explicitly, it defaults to
-    /// `<dir>/blobs`.
+    /// `<dir>/blobs`, and when `session_resume_hold` was not set explicitly, it defaults to
+    /// [`DEFAULT_SESSION_RESUME_HOLD`] (30 s).
     pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
+        if !self.session_resume_hold_explicit {
+            self.session_resume_hold = DEFAULT_SESSION_RESUME_HOLD;
+        }
+        self
+    }
+
+    /// Configures the session-resume hold duration advertised in `RegisterAck` and applied to
+    /// disconnected or restarted workers (`Duration::ZERO` disables session resume; clamped to
+    /// [`rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS`]).
+    pub fn with_session_resume_hold(mut self, hold: Duration) -> Self {
+        let max_secs = rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS;
+        let max_hold = Duration::from_secs(max_secs);
+        if hold > max_hold {
+            warn!(
+                requested_secs = hold.as_secs(),
+                max_secs = max_secs,
+                "Requested session-resume hold exceeds maximum; clamping to {max_secs}s"
+            );
+        }
+        self.session_resume_hold = if hold.is_zero() {
+            Duration::ZERO
+        } else {
+            hold.min(max_hold)
+        };
+        self.session_resume_hold_explicit = true;
         self
     }
 }
@@ -567,9 +609,13 @@ impl MasterServer {
             None => None,
         };
 
+        queue
+            .set_session_resume_hold(config.session_resume_hold)
+            .await;
+
         if let Some((store, recovered)) = opened_task_store {
             queue
-                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .attach_store_and_replay(store, recovered, config.session_resume_hold)
                 .await?;
             if let Some(ref bstore) = blob_store {
                 queue.repin_recovered_blobs(bstore).await;
@@ -1873,11 +1919,26 @@ const NO_BLOB_STORE: &str = "this master has no blob store, so it cannot move ta
 const BLOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Admits a task that moves files through the blob store: every input blob (and every file of
-/// every input tree) must already be in the store, and they are pinned there until the task
-/// finishes, so the bound cannot evict them before a worker fetched them. Tasks without inputs
-/// or output patterns pass untouched.
+/// every input tree or workspace source tree) must already be in the store, and they are pinned
+/// there until the task finishes, so the bound cannot evict them before a worker fetched them.
+/// Tasks without inputs, output patterns, or a workspace source tree pass untouched.
 async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<(), String> {
-    if !task.uses_blobs() {
+    let workspace_tree = task
+        .workspace
+        .as_ref()
+        .and_then(|ws| match ws.source.as_ref()? {
+            rusty_grid_core::task::WorkspaceSource::Tree {
+                manifest,
+                manifest_size,
+            } => Some(rusty_grid_core::blob::TaskInput {
+                path: format!("workspace:{}", ws.name),
+                source: rusty_grid_core::blob::InputSource::Tree {
+                    manifest: *manifest,
+                    manifest_size: *manifest_size,
+                },
+            }),
+        });
+    if !task.uses_blobs() && workspace_tree.is_none() {
         return Ok(());
     }
     let Some(store) = blob_store else {
@@ -1887,7 +1948,11 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
         ));
     };
     task.validate()?;
-    let ids = store.resolve_inputs(&task.inputs).await?;
+    let mut inputs = task.inputs.clone();
+    if let Some(ws_input) = workspace_tree {
+        inputs.push(ws_input);
+    }
+    let ids = store.resolve_inputs(&inputs).await?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -2068,11 +2133,19 @@ pub(crate) async fn serve_worker_blob_request(
 }
 
 /// The `RegisterAck` message announcing the optional features of this master.
-pub(crate) fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
+pub(crate) fn feature_announcement(
+    blob_store: Option<&Arc<BlobStore>>,
+    session_resume_hold_secs: u64,
+) -> String {
     use rusty_grid_core::protocol::master_features;
     let mut features = master_features::SUPPORTED.to_vec();
     if blob_store.is_some() {
         features.push(master_features::BLOBS);
+    }
+    let session_resume_token;
+    if session_resume_hold_secs > 0 {
+        session_resume_token = master_features::session_resume_feature(session_resume_hold_secs);
+        features.push(&session_resume_token);
     }
     master_features::announcement(&features)
 }
@@ -2286,12 +2359,16 @@ async fn apply_task_result_inner(
     }
 
     // 2. Release the worker's slot immediately and keep its circuit breaker current
-    let _ = registry.decrement_active_tasks(&worker_id).await;
+    if !outcome.adopted_from_hold {
+        let _ = registry.decrement_active_tasks(&worker_id).await;
+    }
     if outcome.rejected {
         let _ = registry.record_rejection(&worker_id, session_id).await;
     } else if outcome.disposition != ResultDisposition::Late {
         registry.clear_rejections(&worker_id).await;
     }
+    let send_ack = queue.session_resume_hold_secs() > 0;
+    let ack_token = rusty_grid_core::protocol::master_features::result_ack_token(&result);
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
     //    task (rejection, execution retry) will still produce its real result and keeps its
@@ -2307,6 +2384,7 @@ async fn apply_task_result_inner(
         if spawn_waiter_ack {
             if let Some(ack) = durable_ack {
                 let waiters = Arc::clone(waiters);
+                let ack_registry = registry.clone();
                 tokio::spawn(async move {
                     if let Err(err) = ack.await {
                         warn!(
@@ -2314,6 +2392,11 @@ async fn apply_task_result_inner(
                             error = %err,
                             "Failed to sync TaskTerminal journal record for task result"
                         );
+                    }
+                    if send_ack {
+                        ack_registry
+                            .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                            .await;
                     }
                     let mut lock = waiters.write().await;
                     if let Some(senders) = lock.remove(&task_id) {
@@ -2323,6 +2406,11 @@ async fn apply_task_result_inner(
                     }
                 });
             } else {
+                if send_ack {
+                    registry
+                        .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                        .await;
+                }
                 let mut lock = waiters.write().await;
                 if let Some(senders) = lock.remove(&task_id) {
                     for tx in senders {
@@ -2340,6 +2428,11 @@ async fn apply_task_result_inner(
                     );
                 }
             }
+            if send_ack {
+                registry
+                    .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                    .await;
+            }
             let mut lock = waiters.write().await;
             if let Some(senders) = lock.remove(&task_id) {
                 for tx in senders {
@@ -2347,6 +2440,19 @@ async fn apply_task_result_inner(
                 }
             }
         }
+    } else if send_ack {
+        if let Some(ack) = durable_ack {
+            if let Err(err) = ack.await {
+                warn!(
+                    task_id = %task_id.0,
+                    error = %err,
+                    "Failed to sync journal record for non-terminal task result"
+                );
+            }
+        }
+        registry
+            .send_result_ack(&worker_id, session_id, task_id, ack_token)
+            .await;
     }
 
     // 4. Wake scheduler loop to assign pending tasks
@@ -2782,6 +2888,9 @@ pub async fn handle_worker_disconnect_with_broadcast(
         debug!(worker_id = %worker_id, "Worker unregister skipped (stale session or already handled)");
         return;
     }
+    if let Some(sid) = session_id {
+        queue.set_worker_session_resume_connected(*worker_id, sid, false);
+    }
 
     warn!(
         worker_id = %worker_id,
@@ -2839,6 +2948,9 @@ pub async fn handle_worker_evacuate_with_broadcast(
     if !unregistered {
         debug!(worker_id = %worker_id, "Worker drain unregister skipped (stale session or already handled)");
         return;
+    }
+    if let Some(sid) = session_id {
+        queue.set_worker_session_resume_connected(*worker_id, sid, false);
     }
 
     info!(
@@ -7284,7 +7396,8 @@ mod tests {
             let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
                 .with_web_ui(false)
                 .with_discovery(false)
-                .with_state_dir(&round_dir);
+                .with_state_dir(&round_dir)
+                .with_session_resume_hold(Duration::ZERO);
             let h = MasterServer::spawn(cfg).await.unwrap();
             let addr = h.server_addr().to_string();
             let (wtx, wrx) = tokio::sync::watch::channel(false);
@@ -7613,5 +7726,53 @@ mod tests {
         );
 
         h.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admit_blob_task_pins_workspace_tree_manifest_and_files() {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(&crate::blob_store::BlobStoreConfig::new(
+            dir.path(),
+            64 * 1024 * 1024,
+        ))
+        .unwrap();
+
+        let file_bytes = b"fn main() {}\n";
+        let file_id = store.put(file_bytes).await.unwrap();
+        let manifest = TreeManifest::new(vec![BlobFile {
+            path: "src/main.rs".into(),
+            id: file_id,
+            size: file_bytes.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let manifest_bytes = manifest.encode();
+        let manifest_id = store.put(&manifest_bytes).await.unwrap();
+
+        let task = Task::new(
+            rusty_grid_core::TaskSpec::new_command("cargo", vec!["check".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("oxide-ws").with_tree(manifest_id, manifest_bytes.len() as u64),
+        );
+
+        admit_blob_task(Some(&store), &task).await.unwrap();
+        assert_eq!(store.pinned_tasks().len(), 1);
+        store.unpin_task(&task.id).await;
+        assert_eq!(store.pinned_tasks().len(), 0);
+
+        // Missing workspace manifest blob is rejected.
+        let missing_manifest_id = BlobId::of(b"not-uploaded");
+        let bad_task = Task::new(
+            rusty_grid_core::TaskSpec::new_command("cargo", vec!["check".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("oxide-ws").with_tree(missing_manifest_id, 12));
+        let err = admit_blob_task(Some(&store), &bad_task).await.unwrap_err();
+        assert!(err.contains("is not on the master"), "got: {err}");
     }
 }

@@ -236,15 +236,34 @@ instead, for four reasons:
 
 ### D8 Tools on workers, and FEAT-10
 
-`crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`:
+`crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`,
+`crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`:
 
 - At start-up the worker probes `cargo --version`, `rustc --version` and `git --version`, each
-  bounded by `HOST_PROBE_TIMEOUT` (design 0020). It advertises `tool:cargo`, `tool:rustc` and
-  `tool:git` for the tools it found.
-- `tool:` becomes the seventh reserved tag prefix. A new placement entry `require:tool=<name>`
-  matches it. The CLI takes `--require-tool NAME`, and MCP `submit` takes `tools: [NAME]`.
+  bounded by `HOST_PROBE_TIMEOUT` (`3 s`, design 0020). On Windows the probe uses
+  `augment_windows_path` and `resolve_windows_executable` (`crates/core/src/capabilities.rs`),
+  shared with `TaskRunner`, so start-up probing and task execution agree on tool paths. The worker
+  advertises `tool:cargo`, `tool:rustc` and `tool:git` for the tools it found.
+- `tool:` becomes the eighth reserved tag prefix (alongside `os:`, `arch:`, `slots:`, `iso:`,
+  `id:`, `state:` and `link:`). A new placement entry `require:tool=<name>` matches it. The CLI
+  takes `--require-tool NAME`, and MCP `submit` takes `tools: [NAME]`. When a `RustCompilation`
+  task (`submit --type compile` or MCP `submit` with `type: "compile"`) has no explicit tool
+  requirement, the client automatically adds `require:tool=cargo` when `Cargo.toml` is present in
+  the task's sources/inputs and `require:tool=rustc` otherwise.
 - `RustCompilation` runs `cargo build --offline` when its sources contain `Cargo.toml`, as FEAT-10
   asks. Workspace tasks do not need this: they run `cargo` as a `Command`.
+- **Hardening for `cargo build --offline` in `RustCompilation`:**
+  - `compiler_flags` are validated against an allowlist of safe `cargo build` flags before spawning
+    `cargo`; `--config`, `-Z`, `--manifest-path`, `--online`, and any `--target-dir` that resolves
+    outside the task sandbox are refused.
+  - `CARGO_HOME` and `RUSTUP_HOME` are set to the worker's `HostDirs` (`CARGO_NET_OFFLINE=true`) so
+    `cargo build --offline` can read pre-warmed crate caches in `$CARGO_HOME/registry` and
+    `$CARGO_HOME/git`. Under `--isolation fs|fs+net` (design 0038), `CARGO_HOME` and `RUSTUP_HOME`
+    are mounted/ACL'd read-only while `$CARGO_HOME/credentials.toml` is denied.
+  - Any `rust-toolchain` or `rust-toolchain.toml` file materialized in the sandbox root is removed
+    before invoking `cargo`, `RUSTUP_TOOLCHAIN` is pinned to the worker's active toolchain (from
+    `RUSTUP_TOOLCHAIN` or `default_toolchain` in `<rustup_home>/settings.toml`), and
+    `RUSTUP_AUTO_INSTALL=0` is set so `rustup` never attempts network access.
 
 ## Compatibility
 
@@ -260,7 +279,7 @@ instead, for four reasons:
   then waits as `ClusterLacksCapability`, or fails when the master is configured to fail
   unplaceable tasks (SCHED-3).
 - `tool:` becomes a reserved tag prefix (D8). A user tag that starts with `tool:` is then refused,
-  as tags with the other six prefixes are. Such a tag must be renamed before the upgrade.
+  as tags with the other seven prefixes are. Such a tag must be renamed before the upgrade.
 - A P2P client sends `STREAM_CLIENT` (D7). An older master reads it as an invalid first tag and
   closes the connection, so the client says the master may be older.
 - Upgrade order as in `DEPLOYMENT.md` 3.5: the master first, then workers and clients.
@@ -273,6 +292,10 @@ instead, for four reasons:
   that user reads, including `cluster.secret` and other workspaces. This is no wider than any task
   today. With FEAT-3, a workspace task runs at least at level `fs`, with write access to
   `<root>/<name>/` only and no access to other workspaces.
+- **Cargo `build.rs` and procedural macros.** During `cargo build`, build scripts (`build.rs`) and
+  procedural macros execute arbitrary code on the worker host. A Cargo `RustCompilation` task is
+  therefore security-equivalent to a `Command` task and relies on `--isolation fs|fs+net` (FEAT-3 /
+  design 0038) for filesystem and network confinement.
 - **Paths.** Names cannot form paths (D1). Sync never follows a symbolic link, and deletes only
   files an earlier manifest listed. The root is private to the worker's user (D2).
 - **Bounds.** Workspace size and count (D2), files and bytes per source (D5), and the manifest
@@ -312,12 +335,12 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 |---|---|---|---|---|
 | W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
 | W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | W2a done (store, sync, locks, bounds and tests in `workspace.rs`); W2b pending (wiring into `runner.rs` and `client.rs`, options, advertising `WORKSPACES`) |
-| W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Planned |
+| W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Done |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Planned |
 | W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Planned |
-| W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Planned |
+| W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Implemented |
 | W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
 | W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Planned |
 | W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Planned |
@@ -389,4 +412,27 @@ off by default until FEAT-3 is Implemented.
   its mode. A workspace with a missing or malformed `state.json` is listed as `Syncing` with its
   measured size, `finish` writes a record for it, and eviction removes the whole `<name>/`
   directory except a held lock.
-
+- 2026-11-09: W3 done. `required_features` (`crates/master/src/queue.rs`) adds `WORKSPACES` for any
+  workspace task and `BLOB_TRANSFER` when `workspace.source.is_some()`. `TaskQueueInner` tracks per
+  workspace name the worker that last finished (`Completed` or `Failed`, excluding worker rejections)
+  a task in it (`MAX_WORKSPACE_AFFINITIES = 4,096`, oldest evicted) and refuses to transition a
+  second task of the same workspace name to `Scheduled` while one is already `Scheduled` or `Running`.
+  `Engine::place` (`crates/master/src/scheduler.rs`) skips a workspace task without reserving a seat
+  when another task of that workspace is active or placed earlier in the pass, and `Engine::rank`
+  places the affinity worker first when it is among the eligible `candidates` (so `require:worker=`
+  in `candidates` wins over affinity). `admit_blob_task` (`crates/master/src/server.rs`) and
+  `repin_recovered_blobs` (`crates/master/src/queue.rs`) resolve and pin `WorkspaceSource::Tree`
+  manifests and their listed file blobs.
+- 2026-11-09: W8 and FEAT-10 implemented. Workers probe `cargo --version`, `rustc --version` and
+  `git --version` at start-up under `HOST_PROBE_TIMEOUT` (`crates/core/src/capabilities.rs`) and
+  advertise `tool:cargo`, `tool:rustc` and `tool:git` (`crates/worker/src/client.rs`). `tool:` is now
+  a reserved tag prefix alongside `os:`, `arch:`, `slots:`, `link:`, `id:`, `state:` and `iso:`, and
+  `Placement` (`crates/core/src/placement.rs`) parses, validates and matches `require:tool=<name>`
+  (exposed as `submit --require-tool <TOOL>` in `crates/cli/src/cli_app.rs` and `tools: [...]` on the
+  MCP `submit` tool in `crates/cli/src/mcp.rs`; `submit --type compile` and MCP `submit`
+  `type: "compile"` automatically add `require:tool=cargo` when `Cargo.toml` is present and
+  `require:tool=rustc` otherwise). `TaskSpec::RustCompilation` (`crates/worker/src/runner.rs`)
+  runs `cargo build --offline` with validated `compiler_flags`, pinned `RUSTUP_TOOLCHAIN`, and the
+  worker's `CARGO_HOME` / `RUSTUP_HOME` when `Cargo.toml` is present in the sandbox, collects the
+  built binary into `result.outputs`, and `submit --type compile --source <PATH>` builds a crate
+  with a local dependency and downloads the binary to the client.

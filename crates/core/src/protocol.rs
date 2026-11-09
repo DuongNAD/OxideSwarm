@@ -101,8 +101,6 @@ impl ProtocolCapabilities {
     pub const THREE_D: Self = Self(1 << 11);
     /// Worker session resumption across transient master restarts or network drops
     /// (`WorkerMessage::ResumeSession`, `master_features::SESSION_RESUME_PREFIX`).
-    /// Not advertised in [`ProtocolCapabilities::all_supported`] until master task adoption and
-    /// worker session resume are wired (`docs/design/0046-master-durability.md` D4.1).
     pub const SESSION_RESUME: Self = Self(1 << 12);
 
     pub const fn all_supported() -> Self {
@@ -116,7 +114,8 @@ impl ProtocolCapabilities {
                 | Self::FILE_STAGING.0
                 | Self::ADAPTIVE_KEEPALIVE.0
                 | Self::BLOB_TRANSFER.0
-                | Self::THREE_D.0,
+                | Self::THREE_D.0
+                | Self::SESSION_RESUME.0,
         )
     }
 
@@ -1461,10 +1460,97 @@ pub mod master_features {
     /// [`parse_session_resume_hold_secs`], preventing `Instant + Duration` overflow on bogus input.
     pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;
 
+    /// `MasterMessage::CancelTask { task_id, reason: Some(format_result_ack_reason(token)) }`
+    /// prefix sent by the Master on the control lane after it has accepted and durably recorded a
+    /// `WorkerMessage::TaskResult` from a `SESSION_RESUME`-capable Worker. The Worker retains
+    /// the completed result (and its pinned output files) in `pending_resume_outbox` until it
+    /// receives this acknowledgment for the matching attempt token (or a regular `CancelTask` for
+    /// `task_id`), preventing result loss if the Master shuts down gracefully or the session drops
+    /// mid-flush without letting an earlier attempt's acknowledgment evict a later retry's result.
+    pub const RESULT_ACK_REASON: &str = "oxs:result-ack";
+
     /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 
     const PREFIX: &str = "features=";
+
+    /// Computes a deterministic 64-bit BLAKE3 token for a [`crate::task::TaskResult`] over a
+    /// canonical little-endian encoding of `task_id`, `worker_id`, `exit_code`,
+    /// `execution_time_ms`, `is_gpu_executed`, `device_name`, `stdout`, `stderr`, `error`,
+    /// `asset_bytes`, `artifacts`, and `outputs`, taking the first 8 digest bytes in little-endian
+    /// order so a result acknowledgment (`"oxs:result-ack:<token>"`) is stable across Rust versions
+    /// and builds and only ever acknowledges the matching attempt's buffered result.
+    pub fn result_ack_token(result: &crate::task::TaskResult) -> u64 {
+        fn put_bytes(h: &mut blake3::Hasher, bytes: &[u8]) {
+            h.update(&(bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        fn put_opt_bytes(h: &mut blake3::Hasher, opt: Option<&[u8]>) {
+            match opt {
+                Some(bytes) => {
+                    h.update(&[1u8]);
+                    put_bytes(h, bytes);
+                }
+                None => {
+                    h.update(&[0u8]);
+                }
+            }
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(result.task_id.0.as_bytes());
+        hasher.update(result.worker_id.as_bytes());
+        hasher.update(&result.exit_code.to_le_bytes());
+        hasher.update(&result.execution_time_ms.to_le_bytes());
+        hasher.update(&[u8::from(result.is_gpu_executed)]);
+        put_opt_bytes(
+            &mut hasher,
+            result.device_name.as_deref().map(str::as_bytes),
+        );
+        put_bytes(&mut hasher, result.stdout.as_bytes());
+        put_bytes(&mut hasher, result.stderr.as_bytes());
+        put_opt_bytes(&mut hasher, result.error.as_deref().map(str::as_bytes));
+        put_opt_bytes(
+            &mut hasher,
+            result.asset_bytes.as_ref().map(|b| b.as_bytes()),
+        );
+        hasher.update(&(result.artifacts.len() as u64).to_le_bytes());
+        for a in &result.artifacts {
+            put_bytes(&mut hasher, a.path.as_bytes());
+            hasher.update(&a.size.to_le_bytes());
+            hasher.update(&a.sha256);
+            put_bytes(&mut hasher, a.data.as_bytes());
+        }
+        hasher.update(&(result.outputs.len() as u64).to_le_bytes());
+        for o in &result.outputs {
+            put_bytes(&mut hasher, o.path.as_bytes());
+            hasher.update(&o.id.0);
+            hasher.update(&o.size.to_le_bytes());
+            hasher.update(&[u8::from(o.executable)]);
+        }
+        let digest = hasher.finalize();
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(out)
+    }
+
+    /// Formats a `MasterMessage::CancelTask` reason string acknowledging `result` (`token`).
+    pub fn format_result_ack_reason(token: u64) -> String {
+        format!("{RESULT_ACK_REASON}:{token:016x}")
+    }
+
+    /// Parses a `MasterMessage::CancelTask` reason string to check whether it is a result
+    /// acknowledgment (`"oxs:result-ack"` or `"oxs:result-ack:<hex-token>"`).
+    ///
+    /// Returns `Some(Some(token))` for a token-keyed acknowledgment, `Some(None)` for a bare
+    /// [`RESULT_ACK_REASON`], or `None` for an ordinary cancellation reason.
+    pub fn parse_result_ack_reason(reason: &str) -> Option<Option<u64>> {
+        if reason == RESULT_ACK_REASON {
+            return Some(None);
+        }
+        let hex = reason.strip_prefix(RESULT_ACK_REASON)?.strip_prefix(':')?;
+        u64::from_str_radix(hex, 16).ok().map(Some)
+    }
 
     /// Formats the `session-resume=<hold_secs>` feature token.
     pub fn session_resume_feature(hold_secs: u64) -> String {
@@ -4902,8 +4988,8 @@ mod tests {
 
         assert_eq!(ProtocolCapabilities::SESSION_RESUME.bits(), 1 << 12);
         assert!(
-            !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
-            "SESSION_RESUME must not be advertised in all_supported() until adoption and worker resume are wired"
+            ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
+            "SESSION_RESUME must be advertised in all_supported()"
         );
         assert_eq!(SESSION_RESUME_PREFIX, "session-resume=");
         assert_eq!(MAX_SESSION_RESUME_HOLD_SECS, 3_600);
@@ -5850,5 +5936,32 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_result_ack_token_is_blake3_canonical_and_includes_worker_id() {
+        let tid = TaskId(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
+        let wid1 = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let wid2 = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8889);
+
+        let mut base = TaskResult::success(wid1, tid, "out-payload", 42, false);
+        base.stderr = crate::task::Bytes::from_static(b"err-payload");
+        let token1 = master_features::result_ack_token(&base);
+        // Deterministic BLAKE3 LE u64 across builds and platforms:
+        assert_eq!(token1, 12_561_239_036_294_283_620_u64);
+
+        // Changing worker_id must change the token (D4 / N2):
+        let mut other_worker = base.clone();
+        other_worker.worker_id = wid2;
+        assert_ne!(master_features::result_ack_token(&other_worker), token1);
+
+        // Changing execution_time_ms, stdout, or outputs must change the token:
+        let mut other_time = base.clone();
+        other_time.execution_time_ms = 43;
+        assert_ne!(master_features::result_ack_token(&other_time), token1);
+
+        let mut other_out = base.clone();
+        other_out.stdout = crate::task::Bytes::from_static(b"changed");
+        assert_ne!(master_features::result_ack_token(&other_out), token1);
     }
 }

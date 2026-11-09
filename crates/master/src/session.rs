@@ -48,8 +48,8 @@ use crate::server::{
     failover_superseded_session, feature_announcement, handle_client_connection,
     handle_oversized_master_message, handle_session_task_message,
     handle_worker_disconnect_with_broadcast, handle_worker_evacuate_with_broadcast,
-    reject_master_role_claim, send_refusal_and_drain, serve_worker_blob_request, AbortOnDrop,
-    BlobService, WaiterMap,
+    reject_master_role_claim, resolve_terminal_waiters, send_refusal_and_drain,
+    serve_worker_blob_request, AbortOnDrop, BlobService, WaiterMap,
 };
 
 /// Which inbound lane delivered a [`WorkerMessage`].
@@ -325,6 +325,7 @@ pub(crate) struct WorkerSession<
 > {
     worker_id: Uuid,
     session_id: u64,
+    negotiated_features: ProtocolCapabilities,
     lanes: ActiveLanes<C, D>,
     outbound_tx: mpsc::Sender<MasterMessage>,
     blob_service: Option<BlobService>,
@@ -585,6 +586,9 @@ impl<
 
         // 3. Register in WorkerRegistry
         let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
+        let worker_supports_resume =
+            negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
+
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
         let registration = registry
             .register_session(
@@ -596,7 +600,9 @@ impl<
                 abort_handle,
             )
             .await?;
+        queue.set_worker_session_resume(worker_id, worker_supports_resume);
         let session_id = registration.session_id;
+        queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
         registry
             .set_rx_clock(&worker_id, session_id, rx_clock)
             .await;
@@ -615,6 +621,18 @@ impl<
                 broadcast_tx.as_ref(),
             )
             .await;
+        }
+        if !worker_supports_resume {
+            let outcome = queue.adopt_session_tasks(worker_id, session_id, &[]).await;
+            if !outcome.newly_failed.is_empty() {
+                if let Some(ref bstore) = blob_store {
+                    for tid in &outcome.newly_failed {
+                        bstore.unpin_task(tid).await;
+                    }
+                }
+                resolve_terminal_waiters(&queue, &waiters, &outcome.newly_failed, Some(worker_id))
+                    .await;
+            }
         }
 
         #[cfg(feature = "p2p")]
@@ -643,7 +661,10 @@ impl<
             heartbeat_interval_secs,
             protocol_version: PROTOCOL_VERSION_CURRENT,
             features: negotiated_features,
-            message: Some(feature_announcement(blob_store.as_ref())),
+            message: Some(feature_announcement(
+                blob_store.as_ref(),
+                queue.session_resume_hold_secs(),
+            )),
         };
         if let Err(e) = pre_auth.send_register_ack(&ack).await {
             handle_worker_disconnect_with_broadcast(
@@ -899,6 +920,7 @@ impl<
         Ok(Some(Self {
             worker_id,
             session_id,
+            negotiated_features,
             lanes,
             outbound_tx,
             blob_service,
@@ -1171,13 +1193,108 @@ impl<
             }
             (
                 LaneKind::Unified | LaneKind::Control,
-                WorkerMessage::ResumeSession { ref running, .. },
+                WorkerMessage::ResumeSession {
+                    worker_id: claimed,
+                    running,
+                },
             ) => {
-                debug!(
-                    worker_id = %worker_id,
-                    running_count = running.len(),
-                    "Ignoring ResumeSession message (session resumption not active)"
-                );
+                if !self
+                    .negotiated_features
+                    .contains(ProtocolCapabilities::SESSION_RESUME)
+                {
+                    warn!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        "Refusing ResumeSession from a session that did not negotiate SESSION_RESUME"
+                    );
+                    handle_worker_disconnect_with_broadcast(
+                        &self.registry,
+                        &self.queue,
+                        &self.scheduler_notify,
+                        Some(&self.waiters),
+                        &worker_id,
+                        Some(session_id),
+                        "ResumeSession sent without negotiated SESSION_RESUME feature",
+                        false,
+                        #[cfg(feature = "dashboard")]
+                        self.broadcast_tx.as_ref(),
+                    )
+                    .await;
+                    return false;
+                }
+                if claimed != worker_id {
+                    warn!(
+                        expected = %worker_id,
+                        got = %claimed,
+                        "ResumeSession worker_id mismatch; disconnecting session"
+                    );
+                    handle_worker_disconnect_with_broadcast(
+                        &self.registry,
+                        &self.queue,
+                        &self.scheduler_notify,
+                        Some(&self.waiters),
+                        &worker_id,
+                        Some(session_id),
+                        "ResumeSession worker_id mismatch",
+                        false,
+                        #[cfg(feature = "dashboard")]
+                        self.broadcast_tx.as_ref(),
+                    )
+                    .await;
+                    return false;
+                }
+                let outcome = self
+                    .queue
+                    .adopt_session_tasks(worker_id, session_id, &running)
+                    .await;
+                if !outcome.adopted.is_empty() {
+                    self.registry
+                        .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
+                        .await;
+                    info!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        adopted = ?outcome.adopted,
+                        "Worker resumed session and adopted in-flight task(s)"
+                    );
+                }
+                for stale_id in outcome.stale_to_cancel {
+                    let _ = self
+                        .outbound_tx
+                        .send(MasterMessage::CancelTask {
+                            task_id: stale_id,
+                            reason: Some("Task is no longer assigned to this worker".into()),
+                        })
+                        .await;
+                }
+                if !outcome.newly_failed.is_empty() {
+                    if let Some(ref bstore) = self.blob_store {
+                        for tid in &outcome.newly_failed {
+                            bstore.unpin_task(tid).await;
+                        }
+                    }
+                    resolve_terminal_waiters(
+                        &self.queue,
+                        &self.waiters,
+                        &outcome.newly_failed,
+                        Some(worker_id),
+                    )
+                    .await;
+                }
+                #[cfg(feature = "dashboard")]
+                if let Some(ref b_tx) = self.broadcast_tx {
+                    for tid in outcome.adopted.iter().chain(outcome.newly_failed.iter()) {
+                        if let Some(info) = self.queue.get_task(tid).await {
+                            let _ = b_tx.send(
+                                crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                            );
+                        }
+                    }
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                        self.queue.stats().await,
+                    ));
+                }
+                self.scheduler_notify.notify_one();
                 true
             }
             (LaneKind::Unified, WorkerMessage::UnknownVariant { tag, ref raw_bytes }) => {
@@ -1840,5 +1957,189 @@ mod tests {
 
         let _ = stop_tx.send(true);
         session1_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rv158_probe_quic_buffered_result_races_resume_session() {
+        let mut lost = 0usize;
+        let mut completed = 0usize;
+        let rounds = 60usize;
+        for _ in 0..rounds {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            queue.set_session_resume_hold(Duration::from_secs(30)).await;
+            let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+            let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let worker_id = Uuid::new_v4();
+            let register = || WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new("rv158", 2, 4096, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            };
+
+            let (c1m, c1w) = tokio::io::duplex(64 * 1024);
+            let (d1m, d1w) = tokio::io::duplex(64 * 1024);
+            let s1 = spawn_test_multiplexed_session(
+                c1m,
+                d1m,
+                registry.clone(),
+                queue.clone(),
+                Arc::clone(&scheduler_notify),
+                Arc::clone(&waiters),
+                stop_rx.clone(),
+                None,
+            );
+            let mut ctrl1 = MessageTransport::new(c1w);
+            ctrl1.send_msg(&register()).await.unwrap();
+            match ctrl1.recv_msg::<MasterMessage>().await.unwrap() {
+                Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+                other => panic!("expected RegisterAck, got {other:?}"),
+            }
+            let sid1 = registry.get_worker(worker_id).await.unwrap().session_id;
+            let task = Task::new(
+                TaskSpec::command("echo", vec!["rv158".into()]),
+                TaskRequirements::generic(1, 64),
+            );
+            let task_id = queue.submit(task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(task_id, worker_id, sid1)])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(sid1), &task_id)
+                .await
+                .unwrap();
+            drop(ctrl1);
+            drop(d1w);
+            let _ = tokio::time::timeout(Duration::from_secs(2), s1).await;
+            let held = queue.get_task(&task_id).await.unwrap();
+            assert_eq!(
+                held.state,
+                TaskState::Queued,
+                "task must be held after drop"
+            );
+
+            let (c2m, c2w) = tokio::io::duplex(64 * 1024);
+            let (d2m, d2w) = tokio::io::duplex(64 * 1024);
+            let s2 = spawn_test_multiplexed_session(
+                c2m,
+                d2m,
+                registry.clone(),
+                queue.clone(),
+                Arc::clone(&scheduler_notify),
+                Arc::clone(&waiters),
+                stop_rx.clone(),
+                None,
+            );
+            let mut ctrl2 = MessageTransport::new(c2w);
+            let mut data2 = MessageTransport::new(d2w);
+            ctrl2.send_msg(&register()).await.unwrap();
+            match ctrl2.recv_msg::<MasterMessage>().await.unwrap() {
+                Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+                other => panic!("expected RegisterAck, got {other:?}"),
+            }
+            ctrl2
+                .send_msg(&WorkerMessage::ResumeSession {
+                    worker_id,
+                    running: vec![task_id],
+                })
+                .await
+                .unwrap();
+            data2
+                .send_msg(&WorkerMessage::TaskResult {
+                    worker_id,
+                    task_id,
+                    exit_code: 0,
+                    stdout: Bytes::from_static(b"done-while-disconnected"),
+                    stderr: Bytes::new(),
+                    execution_time_ms: 5,
+                    is_gpu_executed: false,
+                    device_name: None,
+                    error: None,
+                    asset_bytes: None,
+                    artifacts: vec![],
+                    outputs: vec![],
+                })
+                .await
+                .unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            let mut state = queue.get_task(&task_id).await.unwrap().state;
+            while state != TaskState::Completed && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                state = queue.get_task(&task_id).await.unwrap().state;
+            }
+            match state {
+                TaskState::Completed => completed += 1,
+                TaskState::Running => lost += 1,
+                other => panic!("unexpected state {other:?}"),
+            }
+            drop(ctrl2);
+            drop(data2);
+            s2.abort();
+        }
+        eprintln!(
+            "RV158 PROBE P1: rounds={rounds} completed={completed} stuck_running_result_lost={lost}"
+        );
+        assert_eq!(
+            lost, 0,
+            "a buffered TaskResult flushed after ResumeSession was dropped as stale in {lost}/{rounds} rounds; the adopted task stays Running forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resume_session_rejected_when_capability_not_negotiated() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        queue.set_session_resume_hold(Duration::from_secs(30)).await;
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let worker_id = Uuid::new_v4();
+
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
+        let session_task = spawn_test_multiplexed_session(
+            c_master,
+            d_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            None,
+        );
+        let mut ctrl = MessageTransport::new(c_worker);
+        let mut features = ProtocolCapabilities::all_supported();
+        features.remove(ProtocolCapabilities::SESSION_RESUME);
+        ctrl.send_msg(&WorkerMessage::Register {
+            worker_id,
+            capabilities: WorkerCapabilities::new("no-resume", 2, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features,
+        })
+        .await
+        .unwrap();
+        match ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+        ctrl.send_msg(&WorkerMessage::ResumeSession {
+            worker_id,
+            running: vec![],
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(2), session_task)
+            .await
+            .expect("session must terminate when ResumeSession is sent without SESSION_RESUME")
+            .unwrap();
+        assert!(res.is_ok());
+        assert_eq!(
+            registry.get_worker(worker_id).await.unwrap().status,
+            crate::registry::WorkerStatus::Disconnected
+        );
     }
 }
