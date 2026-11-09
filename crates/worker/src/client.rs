@@ -65,6 +65,7 @@ use crate::runner::{
 };
 use crate::sandbox::SandboxConfig;
 use crate::staging::{OutputLimits, DEFAULT_OUTPUT_LIMIT_BYTES};
+use crate::workspace::{WorkspaceLimits, DEFAULT_MAX_WORKSPACES, DEFAULT_WORKSPACE_LIMIT_MB};
 
 /// Execution handle for an actively running task on this worker.
 pub struct TaskExecutionHandle {
@@ -554,6 +555,19 @@ pub struct WorkerConfig {
     /// Master's advertised `session-resume=<secs>` bounded by the worker's dead-peer inequality;
     /// `Some(Duration::ZERO)` disables keeping tasks alive across disconnects.
     pub session_resume_grace_cap: Option<Duration>,
+    /// Opt-in flag enabling persistent named workspaces (CLI `--workspaces`, design 0039).
+    /// Off by default; only when `true` does the worker open its [`crate::workspace::WorkspaceStore`]
+    /// at start-up and advertise [`ProtocolCapabilities::WORKSPACES`] in `Register`.
+    pub workspaces: bool,
+    /// Root directory of the persistent workspace store (CLI `--workspace-root`). When `None`,
+    /// uses [`crate::workspace::default_root`].
+    pub workspace_root: Option<PathBuf>,
+    /// Maximum disk size per workspace in MiB (CLI `--workspace-limit-mb`, default:
+    /// [`DEFAULT_WORKSPACE_LIMIT_MB`]).
+    pub workspace_limit_mb: u64,
+    /// Maximum number of workspaces kept on disk before LRU eviction (CLI `--max-workspaces`,
+    /// default: [`DEFAULT_MAX_WORKSPACES`]).
+    pub max_workspaces: usize,
 }
 
 impl WorkerConfig {
@@ -583,6 +597,10 @@ impl WorkerConfig {
             no_cuda: false,
             no_battery: false,
             session_resume_grace_cap: None,
+            workspaces: false,
+            workspace_root: None,
+            workspace_limit_mb: DEFAULT_WORKSPACE_LIMIT_MB,
+            max_workspaces: DEFAULT_MAX_WORKSPACES,
             max_concurrency: None,
             process_priority: None,
             isolation: IsolationLevel::Off,
@@ -831,6 +849,30 @@ impl WorkerConfig {
     /// advertised window bounded by the worker's dead-peer inequality).
     pub fn with_session_resume_grace_cap(mut self, cap: Option<Duration>) -> Self {
         self.session_resume_grace_cap = cap;
+        self
+    }
+
+    /// Enables or disables persistent named workspaces on this worker (`--workspaces`).
+    pub fn with_workspaces(mut self, enable: bool) -> Self {
+        self.workspaces = enable;
+        self
+    }
+
+    /// Overrides the root directory of the persistent workspace store (`--workspace-root`).
+    pub fn with_workspace_root(mut self, root: Option<PathBuf>) -> Self {
+        self.workspace_root = root;
+        self
+    }
+
+    /// Sets the per-workspace disk quota in MiB (`--workspace-limit-mb`).
+    pub fn with_workspace_limit_mb(mut self, limit_mb: u64) -> Self {
+        self.workspace_limit_mb = limit_mb;
+        self
+    }
+
+    /// Sets the maximum number of workspaces kept on disk before LRU eviction (`--max-workspaces`).
+    pub fn with_max_workspaces(mut self, max: usize) -> Self {
+        self.max_workspaces = max;
         self
     }
 }
@@ -1509,7 +1551,14 @@ impl WorkerClient {
         }
         runner_cfg = runner_cfg
             .with_isolation(config.isolation)
-            .with_protected_files(config.protected_files.clone());
+            .with_protected_files(config.protected_files.clone())
+            .with_workspaces(config.workspaces)
+            .with_workspace_root(config.workspace_root.clone())
+            .with_workspace_limits(WorkspaceLimits {
+                limit_mb: config.workspace_limit_mb,
+                max_workspaces: config.max_workspaces,
+                ..WorkspaceLimits::default()
+            });
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
@@ -1557,6 +1606,14 @@ impl WorkerClient {
             "Worker client initialized"
         );
 
+        let mut initial_features = advertised_protocol_capabilities();
+        if config.session_resume_grace_cap == Some(Duration::ZERO) {
+            initial_features.remove(ProtocolCapabilities::SESSION_RESUME);
+        }
+        if config.workspaces {
+            initial_features.insert(ProtocolCapabilities::WORKSPACES);
+        }
+
         Self {
             config,
             worker_id,
@@ -1578,7 +1635,7 @@ impl WorkerClient {
             master_shutdown_announced: false,
             master_takes_mobile_telemetry: AtomicBool::new(false),
             master_has_blobs: AtomicBool::new(false),
-            negotiated_features: AtomicU64::new(advertised_protocol_capabilities().bits()),
+            negotiated_features: AtomicU64::new(initial_features.bits()),
             blob_client: Arc::new(std::sync::RwLock::new(None)),
             session_data_tx: Arc::new(std::sync::RwLock::new(None)),
             current_session_hold_secs: Arc::new(AtomicU64::new(0)),
@@ -1764,11 +1821,15 @@ impl WorkerClient {
     }
 
     /// Protocol capabilities advertised by this worker instance in `WorkerMessage::Register`.
-    /// Omits `SESSION_RESUME` when `--session-resume-grace-secs 0` was configured.
-    fn advertised_features(&self) -> ProtocolCapabilities {
+    /// Omits `SESSION_RESUME` when `--session-resume-grace-secs 0` was configured, and adds
+    /// `WORKSPACES` only when `--workspaces` (`WorkerConfig::workspaces`) is enabled.
+    pub fn advertised_features(&self) -> ProtocolCapabilities {
         let mut caps = advertised_protocol_capabilities();
         if self.config.session_resume_grace_cap == Some(Duration::ZERO) {
             caps.remove(ProtocolCapabilities::SESSION_RESUME);
+        }
+        if self.config.workspaces {
+            caps.insert(ProtocolCapabilities::WORKSPACES);
         }
         caps
     }
@@ -1893,6 +1954,14 @@ impl WorkerClient {
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.
         if self.config.isolation != IsolationLevel::Off {
+            if cfg!(windows) && self.config.workspaces {
+                let err = GridError::Config(
+                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (FEAT-3c is not implemented); start the worker with --isolation off or without --workspaces"
+                        .to_string(),
+                );
+                error!(worker_id = %self.worker_id, error = %err, "Task isolation with workspaces cannot be enforced on Windows");
+                return Err(err);
+            }
             if let Err(err) = crate::isolation::verify_isolation_support(
                 self.config.isolation,
                 &self.runner.config().sandbox_config.base_dir,
@@ -1900,6 +1969,30 @@ impl WorkerClient {
             .await
             {
                 error!(worker_id = %self.worker_id, error = %err, "Task isolation cannot be enforced");
+                return Err(err);
+            }
+        }
+
+        // Only with `--workspaces` does the worker open the persistent workspace store at start-up
+        // (and refuse to start with a clear error if its root fails the private-dir checks).
+        if self.config.workspaces {
+            if self.config.workspace_limit_mb == 0 {
+                let err = GridError::Config(
+                    "Invalid --workspace-limit-mb: must be greater than 0".to_string(),
+                );
+                error!(worker_id = %self.worker_id, error = %err, "Workspace configuration invalid");
+                return Err(err);
+            }
+            if self.config.max_workspaces == 0 {
+                let err = GridError::Config(
+                    "Invalid --max-workspaces: must be greater than 0".to_string(),
+                );
+                error!(worker_id = %self.worker_id, error = %err, "Workspace configuration invalid");
+                return Err(err);
+            }
+            if let Err(e) = self.runner.ensure_workspace_store().await {
+                let err = GridError::Config(format!("Workspace store cannot be opened: {e}"));
+                error!(worker_id = %self.worker_id, error = %err, "Persistent workspaces cannot be initialized");
                 return Err(err);
             }
         }
@@ -2146,6 +2239,31 @@ impl WorkerClient {
         }
 
         let negotiated = self.negotiated_features();
+        if task.workspace.is_some()
+            && (!self.config.workspaces || !negotiated.contains(ProtocolCapabilities::WORKSPACES))
+        {
+            warn!(
+                task_id = %task_id,
+                "Refusing task with workspace: WORKSPACES is not enabled on this worker or was not negotiated in RegisterAck"
+            );
+            let result = TaskResult::failure(
+                worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                "Task requires WORKSPACES capability, which is not enabled on this worker (start the worker with --workspaces)",
+                0,
+                Some("WORKSPACES capability not enabled or negotiated".to_string()),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+            return;
+        }
+
+        let has_workspace_tree = task
+            .workspace
+            .as_ref()
+            .is_some_and(|ws| ws.source.is_some());
+
         if (!task.staged_files.is_empty() || !task.expected_outputs.is_empty())
             && !negotiated.contains(ProtocolCapabilities::FILE_STAGING)
         {
@@ -2168,12 +2286,12 @@ impl WorkerClient {
             return;
         }
 
-        if (!task.inputs.is_empty() || !task.output_globs.is_empty())
+        if (!task.inputs.is_empty() || !task.output_globs.is_empty() || has_workspace_tree)
             && !negotiated.contains(ProtocolCapabilities::BLOB_TRANSFER)
         {
             warn!(
                 task_id = %task_id,
-                "Refusing task with blob inputs/output_globs: BLOB_TRANSFER was not acknowledged in RegisterAck"
+                "Refusing task with blob inputs/output_globs/workspace tree: BLOB_TRANSFER was not acknowledged in RegisterAck"
             );
             let result = TaskResult::failure(
                 worker_id,
@@ -2337,9 +2455,10 @@ impl WorkerClient {
                 return;
             }
 
-            // Every blob the inputs need is in the cache (and pinned) before the run starts.
+            // Every blob the inputs (and workspace tree, if any) need is in the cache (and pinned)
+            // before the run starts.
             let mut cancel_slot = Some(cancel_rx);
-            let _inputs = if task.inputs.is_empty() {
+            let _inputs = if task.inputs.is_empty() && !has_workspace_tree {
                 None
             } else {
                 let current_blob_client = blob_client_slot
@@ -7488,5 +7607,278 @@ mod tests {
         );
         assert!(outbox.results.len() < 5);
         assert_eq!(outbox.results.last().unwrap().result.task_id, ids[4]);
+    }
+
+    #[tokio::test]
+    async fn test_workspaces_capability_advertised_only_when_enabled() {
+        assert!(!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::WORKSPACES));
+        assert!(!advertised_protocol_capabilities().contains(ProtocolCapabilities::WORKSPACES));
+
+        let default_client = WorkerClient::for_testing("127.0.0.1:9999", None, Some(1), false);
+        assert!(!default_client
+            .advertised_features()
+            .contains(ProtocolCapabilities::WORKSPACES));
+
+        let ws_client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_no_battery(true)
+                .with_no_gpu(true)
+                .with_no_blender(true)
+                .with_no_cuda(true)
+                .with_redirection_portal(false)
+                .with_workspaces(true),
+        );
+        assert!(ws_client
+            .advertised_features()
+            .contains(ProtocolCapabilities::WORKSPACES));
+
+        // Verify Register wire message with and without --workspaces over an in-memory duplex stream.
+        for (enable_ws, client) in [(false, &default_client), (true, &ws_client)] {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let mut client_tx = MessageTransport::new(client_io);
+            let mut server_tx = MessageTransport::new(server_io);
+            let wid = client.worker_id();
+            let server_task = tokio::spawn(async move {
+                let msg = server_tx
+                    .recv_msg::<WorkerMessage>()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let features = match msg {
+                    WorkerMessage::Register { features, .. } => features,
+                    other => panic!("expected Register, got {other:?}"),
+                };
+                server_tx
+                    .send_msg(&MasterMessage::RegisterAck {
+                        accepted: true,
+                        worker_id: wid,
+                        heartbeat_interval_secs: 3,
+                        message: None,
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features,
+                    })
+                    .await
+                    .unwrap();
+                features
+            });
+            client.perform_handshake(&mut client_tx).await.unwrap();
+            let sent_features = server_task.await.unwrap();
+            assert_eq!(
+                sent_features.contains(ProtocolCapabilities::WORKSPACES),
+                enable_ws,
+                "enable_ws={enable_ws}"
+            );
+            assert_eq!(
+                client
+                    .negotiated_features()
+                    .contains(ProtocolCapabilities::WORKSPACES),
+                enable_ws,
+                "enable_ws={enable_ws}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_client_workspace_startup_validation_and_blob_fetch_execution() {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
+        use rusty_grid_core::task::{TaskRequirements, TaskSpec, WorkspaceRef};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sandbox_dir = tmp.path().join("sandboxes");
+        let ws_root = tmp.path().join("workspaces");
+
+        // 1. If workspace_root is a symlink, `WorkerClient::run` refuses to start at startup.
+        #[cfg(unix)]
+        {
+            let real_target = tmp.path().join("real_ws_target");
+            std::fs::create_dir_all(&real_target).unwrap();
+            let symlink_root = tmp.path().join("symlink_ws_root");
+            std::os::unix::fs::symlink(&real_target, &symlink_root).unwrap();
+
+            let mut bad_client = WorkerClient::new(
+                WorkerConfig::new("127.0.0.1:9999")
+                    .with_no_battery(true)
+                    .with_no_gpu(true)
+                    .with_no_blender(true)
+                    .with_no_cuda(true)
+                    .with_redirection_portal(false)
+                    .with_sandbox_base_dir(&sandbox_dir)
+                    .with_workspaces(true)
+                    .with_workspace_root(Some(symlink_root)),
+            );
+            let (_tx, rx) = watch::channel(false);
+            let err = bad_client
+                .run(rx)
+                .await
+                .expect_err("must reject symlink workspace root");
+            match err {
+                GridError::Config(msg) => {
+                    assert!(msg.contains("Workspace store cannot be opened"), "{msg}");
+                }
+                other => panic!("expected GridError::Config, got {other:?}"),
+            }
+        }
+
+        // 2. Worker without `--workspaces` refuses an assigned workspace task.
+        let disabled_client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_no_battery(true)
+                .with_no_gpu(true)
+                .with_no_blender(true)
+                .with_no_cuda(true)
+                .with_redirection_portal(false)
+                .with_sandbox_base_dir(&sandbox_dir),
+        );
+        let (tx_dis, mut rx_dis) = mpsc::channel(16);
+        let ws_task_dis = Task::new(
+            TaskSpec::shell_script("echo should-not-run"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("ws1"));
+        disabled_client
+            .handle_assign_task(ws_task_dis, tx_dis)
+            .await;
+        match rx_dis.recv().await.expect("rejection frame") {
+            WorkerMessage::TaskResult {
+                exit_code, stderr, ..
+            } => {
+                assert_eq!(exit_code, EXIT_CODE_GENERAL_ERROR);
+                let stderr_str = String::from_utf8_lossy(stderr.as_bytes());
+                assert!(stderr_str.contains("WORKSPACES"), "{stderr_str}");
+            }
+            other => panic!("expected TaskResult failure, got {other:?}"),
+        }
+
+        // 3. Worker with `--workspaces` fetches missing manifest + file blobs via BlobClient,
+        // syncs the workspace, runs task 1, and preserves build output for task 2.
+        let ws_client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_no_battery(true)
+                .with_no_gpu(true)
+                .with_no_blender(true)
+                .with_no_cuda(true)
+                .with_redirection_portal(false)
+                .with_sandbox_base_dir(&sandbox_dir)
+                .with_workspaces(true)
+                .with_workspace_root(Some(ws_root.clone())),
+        );
+
+        let file_bytes = b"hello-from-remote-blob".to_vec();
+        let file_id = BlobId::of(&file_bytes);
+        let manifest = TreeManifest::new(vec![BlobFile {
+            path: "input.txt".into(),
+            id: file_id,
+            size: file_bytes.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let manifest_bytes = manifest.encode();
+        let manifest_id = BlobId::of(&manifest_bytes);
+        let blobs: HashMap<BlobId, Vec<u8>> =
+            HashMap::from([(file_id, file_bytes), (manifest_id, manifest_bytes.clone())]);
+
+        let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(32);
+        let blob_client = BlobClient::new(out_tx.clone());
+        *ws_client.blob_client.write().unwrap() = Some(Arc::clone(&blob_client));
+
+        let responder_blobs = blobs.clone();
+        let responder_bc = Arc::clone(&blob_client);
+        let collect_result = |mut rx: mpsc::Receiver<WorkerMessage>| async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WorkerMessage::BlobRequest {
+                        request_id,
+                        request:
+                            BlobRequest::Read {
+                                id,
+                                offset,
+                                max_len,
+                            },
+                    } => {
+                        let bytes = responder_blobs.get(&id).expect("known blob");
+                        let start = offset as usize;
+                        let end = (start + max_len as usize).min(bytes.len());
+                        responder_bc.deliver(
+                            request_id,
+                            BlobReply::Chunk {
+                                id,
+                                total_size: bytes.len() as u64,
+                                offset,
+                                data: rusty_grid_core::task::Bytes::from(
+                                    bytes[start..end].to_vec(),
+                                ),
+                            },
+                        );
+                    }
+                    WorkerMessage::TaskResult {
+                        exit_code,
+                        stdout,
+                        stderr,
+                        error,
+                        ..
+                    } => {
+                        return (exit_code, stdout, stderr, error);
+                    }
+                    _ => {}
+                }
+            }
+            panic!("channel closed before TaskResult");
+        };
+
+        let task1 = Task::new(
+            TaskSpec::shell_script(
+                "cat input.txt && printf ':built-1' >> build.out && cat build.out",
+            ),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("ws1").with_tree(manifest_id, manifest_bytes.len() as u64),
+        );
+        let assign_fut = ws_client.handle_assign_task(task1, out_tx.clone());
+        let ((), (exit1, stdout1, stderr1, err1)) =
+            tokio::join!(assign_fut, collect_result(out_rx));
+        assert_eq!(
+            exit1,
+            0,
+            "task 1 failed: {err1:?} / {}",
+            String::from_utf8_lossy(stderr1.as_bytes())
+        );
+        assert!(
+            String::from_utf8_lossy(stdout1.as_bytes()).contains("hello-from-remote-blob:built-1")
+        );
+
+        let (out_tx2, mut out_rx2) = mpsc::channel::<WorkerMessage>(32);
+        let task2 = Task::new(
+            TaskSpec::shell_script("cat build.out"),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("ws1"));
+        ws_client.handle_assign_task(task2, out_tx2).await;
+        let mut res2 = None;
+        while let Some(msg) = out_rx2.recv().await {
+            if let WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                ..
+            } = msg
+            {
+                res2 = Some((exit_code, stdout, stderr, error));
+                break;
+            }
+        }
+        let (exit2, stdout2, stderr2, err2) = res2.expect("task 2 result");
+        assert_eq!(
+            exit2,
+            0,
+            "task 2 failed: {err2:?} / {}",
+            String::from_utf8_lossy(stderr2.as_bytes())
+        );
+        assert_eq!(
+            String::from_utf8_lossy(stdout2.as_bytes()).trim(),
+            ":built-1"
+        );
     }
 }

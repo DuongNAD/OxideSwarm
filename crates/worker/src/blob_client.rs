@@ -22,7 +22,7 @@ use rusty_grid_core::blob_transfer::{
     BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS,
 };
 use rusty_grid_core::protocol::WorkerMessage;
-use rusty_grid_core::task::{Task, TaskResult};
+use rusty_grid_core::task::{Task, TaskResult, WorkspaceSource};
 
 use crate::blob_cache::{BlobCache, CachePin};
 use crate::runner::{append_note, EXIT_CODE_GENERAL_ERROR};
@@ -117,16 +117,16 @@ impl BlobChannel for BlobClient {
     }
 }
 
-/// Makes sure every blob `task`'s inputs need is in `cache`, fetching the missing ones through
-/// `client`, and pins them all for the run (the returned guard). Tree manifests are fetched
-/// first, then the files they list.
+/// Makes sure every blob `task`'s inputs (and workspace source tree, if any) need is in `cache`,
+/// fetching the missing ones through `client`, and pins them all for the run (the returned guard).
+/// Tree manifests are fetched first, then the files they list.
 pub async fn fetch_task_inputs(
     task: &Task,
     client: Option<&BlobClient>,
     cache: &Arc<BlobCache>,
 ) -> Result<CachePin, String> {
     let mut pin = cache.pin([]);
-    let top: Vec<(BlobId, u64)> = task
+    let mut top: Vec<(BlobId, u64)> = task
         .inputs
         .iter()
         .map(|input| match input.source {
@@ -137,6 +137,21 @@ pub async fn fetch_task_inputs(
             } => (manifest, manifest_size),
         })
         .collect();
+    if let Some(ws) = &task.workspace {
+        if let Some(WorkspaceSource::Tree {
+            manifest,
+            manifest_size,
+        }) = &ws.source
+        {
+            if *manifest_size > MAX_MANIFEST_BYTES {
+                return Err(format!(
+                    "workspace '{}': directory manifest size ({manifest_size} bytes) exceeds limit ({MAX_MANIFEST_BYTES} bytes)",
+                    ws.name
+                ));
+            }
+            top.push((*manifest, *manifest_size));
+        }
+    }
     pin.extend(top.iter().map(|(id, _)| *id));
     fetch_missing(top, client, cache).await?;
 
@@ -158,6 +173,26 @@ pub async fn fetch_task_inputs(
         fetch_missing(files, client, cache)
             .await
             .map_err(|e| format!("input '{}': {e}", input.path))?;
+    }
+
+    if let Some(ws) = &task.workspace {
+        if let Some(WorkspaceSource::Tree { manifest, .. }) = &ws.source {
+            let manifest = *manifest;
+            let reader = Arc::clone(cache);
+            let bytes = tokio::task::spawn_blocking(move || {
+                reader.read_verified(&manifest, MAX_MANIFEST_BYTES)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("workspace '{}': directory manifest: {e}", ws.name))?;
+            let tree = TreeManifest::decode(&bytes)
+                .map_err(|e| format!("workspace '{}': {e}", ws.name))?;
+            let files: Vec<(BlobId, u64)> = tree.files().iter().map(|f| (f.id, f.size)).collect();
+            pin.extend(files.iter().map(|(id, _)| *id));
+            fetch_missing(files, client, cache)
+                .await
+                .map_err(|e| format!("workspace '{}': {e}", ws.name))?;
+        }
     }
     Ok(pin)
 }
