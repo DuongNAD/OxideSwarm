@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `oxideswarm workers` printed every registered worker under "Connected Workers", including workers that had disconnected, and `status` counted them as connected. Both now count only workers whose `state:` tag is `connected`, and `workers` marks the others, for example `[disconnected]`. Use `workers --json` in scripts.
+
 ## [0.1.0] - 2026-11-09
 
 The first tagged release: archives for Linux, macOS and Windows, with and without `gpu-wgpu`, and

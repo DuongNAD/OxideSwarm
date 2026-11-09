@@ -120,13 +120,14 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D5 | Rewrite git history to remove owner data? | No, scrub the current tree only | REL-2 |
 | D6 | Is a user GPU kernel in scope? | No, label GPU compute as a benchmark | FEAT-9 |
 | D7 | Keep `scripts/agent_bridge.py serve-secret`? | Delete it | SEC-4 |
+| Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 
 ## Index
 
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `bd27111` plus the live two-machine run: 62 items Implemented, 4 Partial and 27 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 62 items Implemented, 4 Partial and 30 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -213,6 +214,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
+| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
+| JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
+| USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Planned | (design 0053) |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
@@ -1495,6 +1499,58 @@ Each item below needs a design record before code.
 - **Done when:** The script runs on macOS, Linux and Windows. Dated records of (a) and (b) on one
   machine, and of (c) on two machines, are committed, and `README.md` links them.
 
+## Phase 6b: machines anywhere
+
+Added on 2026-11-09 after the owner chose ecosystem model A (Q13): each person or team runs a
+cluster, and trusted people add their machines to it from any network. Order: ENROLL-1 first,
+then JOIN-2 and USB-1 in parallel.
+
+### ENROLL-1: A key per machine, invites and revocation
+
+- **Evidence:** Read, on 2026-11-09 at `master` `bd27111`. The cluster secret is the only credential
+  (`crates/core/src/cluster_auth.rs`, OXS-AUTH v2). Every machine holds it, a join token carries it
+  (design 0048), removing one machine means a new secret everywhere (`docs/SECURITY.md` section 5),
+  and the v2 handshake has no forward secrecy.
+- **Problem:** A machine of a friend or a teammate, or a machine on another network, can only join
+  if the owner sends it the secret. That channel must not be chat or e-mail, and the secret cannot
+  be taken back from one machine.
+- **Do:** [Design 0051](design/0051-machine-identity-and-invites.md): a key per machine, OXS-AUTH v3
+  (Noise `IK`) with the master's key pinned, invites that work once, expire and need approval,
+  `oxideswarm invite`, `oxideswarm members`, `join` with invites and a pairing check that both sides
+  confirm, roles per message, worker ids owned by their member, revocation across every connection
+  lane, and `--auth secret|members|both`. Work items ENROLL-1a to 1d, in that order.
+- **Done when:** `tests/cli_enroll_e2e.rs` and `tests/cli_revoke_e2e.rs` pass on Linux, macOS and
+  Windows. A revoked member loses every connection, its submitted tasks are cancelled, and a task on
+  its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
+  machine on another network joins through `--p2p` with an invite sent by chat, and the run is
+  recorded with its date.
+
+### JOIN-2: Join on a LAN with a short code
+
+- **Evidence:** Read. An invite (ENROLL-1) is a long string, which is hard to type on a fresh
+  machine.
+- **Problem:** On a LAN, the owner wants to read a code aloud or type it from another screen.
+- **Do:** [Design 0052](design/0052-short-code-pairing.md): `invite --code` prints
+  `<nameplate>-<word>-<word>`, `join --code <CODE>` finds the inviter with a broadcast query to UDP
+  port 8087, and SPAKE2 delivers an invite. The joiner confirms first, and any session that does
+  not confirm cancels the code. Approval stays.
+- **Done when:** `tests/cli_pair_e2e.rs` passes on Linux, macOS and Windows, and a live LAN run
+  between Windows and macOS is recorded.
+
+### USB-1: Set up machines from a USB stick
+
+- **Evidence:** Read. A new machine needs a binary (`README.md` Install), a credential and a
+  background start (`scripts/`, `windows/`, `packaging/`), from three places.
+- **Problem:** Setting up a friend's laptop or a lab PC takes several commands and some terminal
+  knowledge.
+- **Do:** [Design 0053](design/0053-usb-setup-kit.md): `usb create <DIR> --machines N` writes the
+  release archives with `SHA256SUMS`, an invite for N machines encrypted with a passphrase, and
+  installers for macOS, Windows and Linux that install for the current user, join, start at
+  login and run the doctor checks. Work items USB-1a, 1b and 1c. USB-1b can start before
+  ENROLL-1b against a fake `join`.
+- **Done when:** `tests/cli_usb_kit_e2e.rs` and the installer launcher tests pass, and a stick made
+  on one system sets up a machine of another system, recorded with its date.
+
 ## Phase 7: scale out
 
 Draft, added on 2026-11-09 with Phase F of [ROADMAP.md](ROADMAP.md). The design is
@@ -1915,10 +1971,13 @@ Add one dated line per finished item, newest last.
   gained the dated (c) record; it stays Partial until the script is run on Linux and Windows.
   JOIN-1 was checked live on Windows (`join` exit 0, 8 doctor checks passed) and stays Partial for
   the QR code step. The Index counts are now 61 Implemented, 4 Partial and 27 Planned.
+- 2026-11-09: Phase 6b added after decision Q13 (ecosystem model A): ENROLL-1 (design 0051),
+  JOIN-2 (design 0052) and USB-1 (design 0053), all Planned. The Index counts are now 61
+  Implemented, 4 Partial and 30 Planned.
 - 2026-11-09: Added and implemented TEST-20 (pull request 181, open): fixed the Windows
   `m4_challenger_2_stress` failover timeouts by checking `cancel_rx` before sandbox creation and
   before process spawn, raising `MIN_LIVE_KILL_AGE` in `process_tree.rs` from 80 ms to 250 ms (and
   honouring it in `TreeInner::drop`), and setting `.with_ram_mb(4096)` in
   `WorkerClient::for_testing` and `spawn_test_worker`. `m4_challenger_2_stress` passed 20/20
   locally inside `Global\OxideSwarmFullSuite`. The Index counts are now 62 Implemented, 4 Partial
-  and 27 Planned.
+  and 30 Planned.
