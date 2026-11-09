@@ -1965,6 +1965,17 @@ pub enum WorkspaceSource {
     },
 }
 
+/// The Master's remembered worker affinity for a named workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAffinity {
+    /// The workspace name.
+    pub name: String,
+    /// The worker that last ran or was scheduled for a task in this workspace.
+    pub worker: Uuid,
+    /// When the workspace was last scheduled or finished on `worker` (Unix seconds).
+    pub last_used_utc: u64,
+}
+
 impl WorkspaceRef {
     /// A reference to workspace `name` that runs in it as it is.
     pub fn new(name: impl Into<String>) -> Self {

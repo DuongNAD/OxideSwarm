@@ -585,7 +585,8 @@ impl<
         let is_multiplexed = pre_auth.is_multiplexed();
 
         // 3. Register in WorkerRegistry
-        let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
+        let negotiated_features = worker_features
+            & (ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES);
         let worker_supports_resume =
             negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
 

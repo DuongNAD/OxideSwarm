@@ -20,6 +20,7 @@
 //! 4. `task_result`: Query task outcome, logs, exit code, and artifacts with optional blocking poll.
 //! 5. `cancel`: Cancel a queued or running task by its UUID.
 //! 6. `doctor`: Run cluster diagnostics (checks C1-C6) and return a structured report.
+//! 7. `workspaces`: List persistent agent workspaces and their worker affinities.
 //!
 //! # Stdout Hygiene
 //!
@@ -42,8 +43,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, IsolationLevel, Placement, ARCH_TAG_PREFIX, OS_TAG_PREFIX,
-    REQUIRE_PREFIX, STATE_TAG_PREFIX,
+    listed_supports_workspaces, listed_worker_id, tag_value, IsolationLevel, Placement,
+    ARCH_TAG_PREFIX, OS_TAG_PREFIX, REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -78,6 +79,18 @@ pub struct McpArgs {
         help = "Continue WITHOUT a cluster secret although the master is remote or auto-discovered"
     )]
     pub insecure: bool,
+
+    #[arg(
+        long,
+        help = "Maximum file count scanned when syncing a workspace via MCP submit (default 100000)"
+    )]
+    pub workspace_max_files: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Maximum total MiB scanned when syncing a workspace via MCP submit (default 2048)"
+    )]
+    pub workspace_max_mb: Option<u64>,
 }
 
 // ============================================================================
@@ -208,6 +221,7 @@ pub const DEFAULT_WAIT_MARGIN_SECS: u64 = 5;
 pub struct McpState {
     pub master_addr: String,
     pub secret: Option<ClusterSecret>,
+    pub workspace_limits: crate::blobs::WorkspaceLimits,
     resolved_master_addr: Mutex<Option<String>>,
     transport: Mutex<Option<MessageTransport<TcpStream>>>,
 }
@@ -217,9 +231,15 @@ impl McpState {
         Self {
             master_addr,
             secret,
+            workspace_limits: crate::blobs::WorkspaceLimits::default(),
             resolved_master_addr: Mutex::new(None),
             transport: Mutex::new(None),
         }
+    }
+
+    pub fn with_workspace_limits(mut self, limits: crate::blobs::WorkspaceLimits) -> Self {
+        self.workspace_limits = limits;
+        self
     }
 
     /// Resolves `self.master_addr` (running 3-tier LAN/HTTP/rendezvous discovery when `auto`)
@@ -544,7 +564,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Task timeout in seconds (default: 60)"
+                        "description": "Task timeout in seconds (default: 60, or 1800 with workspace)"
                     },
                     "wait_secs": {
                         "type": "integer",
@@ -570,6 +590,25 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Local files or directories inside the working directory to stage into the sandbox via content-addressed blobs: 'LOCAL_PATH' or 'LOCAL_PATH:SANDBOX_PATH' (symbolic links and paths outside the working directory are refused)"
+                    },
+                    "workspace": {
+                        "type": "object",
+                        "description": "Run the task inside a persistent named workspace on the worker (mutually exclusive with 'files')",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Workspace name ([A-Za-z0-9][A-Za-z0-9._-]{0,63})"
+                            },
+                            "sync_dir": {
+                                "type": "string",
+                                "description": "Directory inside the MCP server's working directory to sync into the workspace before execution (default: '.', or null for no sync)"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Relative working directory inside the workspace for command tasks"
+                            }
+                        },
+                        "required": ["name"]
                     },
                     "outputs": {
                         "type": "array",
@@ -671,6 +710,15 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "description": "Skip the blob throughput probe C8 (default: false)"
                     }
                 },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "workspaces",
+            description: "List the master's workspace affinity map (does not list workspaces stored on workers).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "required": []
             }),
         },
@@ -937,7 +985,54 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             check_opt_bool(obj, "wait")?;
             check_opt_u64(obj, "matrix_dim")?;
             check_opt_u64(obj, "work_group_size")?;
-            check_opt_str_array(obj, "files")?;
+            let files_opt = check_opt_str_array(obj, "files")?;
+            if let Some(ws_val) = obj.get("workspace") {
+                if !ws_val.is_null() {
+                    let ws_obj = ws_val
+                        .as_object()
+                        .ok_or_else(|| "Property 'workspace' must be an object".to_string())?;
+                    if files_opt.is_some() {
+                        return Err(
+                            "Property 'workspace' cannot be used together with 'files'".to_string()
+                        );
+                    }
+                    if task_type == "gpu" {
+                        return Err(
+                            "Property 'workspace' is only supported for 'command' or 'shell' tasks"
+                                .to_string(),
+                        );
+                    }
+                    for key in ws_obj.keys() {
+                        if !matches!(key.as_str(), "name" | "sync_dir" | "cwd") {
+                            return Err(format!("Unknown property 'workspace.{key}'"));
+                        }
+                    }
+                    let ws_name = check_opt_str(ws_obj, "name")?
+                        .ok_or_else(|| "Missing required property 'workspace.name'".to_string())?;
+                    rusty_grid_core::task::validate_workspace_name(ws_name)?;
+                    if let Some(sync_dir) = check_opt_str(ws_obj, "sync_dir")? {
+                        if sync_dir.trim().is_empty() {
+                            return Err("Property 'workspace.sync_dir' cannot be empty".to_string());
+                        }
+                        if std::path::Path::new(sync_dir)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                        {
+                            return Err(format!(
+                                "Property 'workspace.sync_dir' ('{sync_dir}') must not contain '..'"
+                            ));
+                        }
+                    }
+                    if let Some(cwd_rel) = check_opt_str(ws_obj, "cwd")? {
+                        if task_type != "command" {
+                            return Err(
+                                "Property 'workspace.cwd' requires task type 'command'".to_string()
+                            );
+                        }
+                        crate::cli_app::normalize_workspace_cwd(cwd_rel)?;
+                    }
+                }
+            }
             if let Some(outputs) = check_opt_str_array(obj, "outputs")? {
                 if !outputs.is_empty() {
                     rusty_grid_core::blob::validate_output_patterns(&outputs)
@@ -975,6 +1070,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             check_opt_bool(obj, "skip_throughput")?;
             Ok(())
         }
+        "workspaces" => Ok(()),
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1000,6 +1096,7 @@ pub async fn call_tool_with_context(
         "task_result" => tool_task_result(state, args, ctx).await,
         "cancel" => tool_cancel(state, args).await,
         "doctor" => tool_doctor(state, args).await,
+        "workspaces" => tool_workspaces(state).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1345,6 +1442,94 @@ pub fn scan_mcp_inputs_in_dir(
     crate::blobs::scan_input_paths_with_limits(&checked_specs, crate::blobs::InputLimits::default())
 }
 
+/// Validates that `raw_sync_dir` stays inside `cwd`, contains no `..`, and neither is nor
+/// traverses a symbolic link along the path from `cwd` to `raw_sync_dir`, then scans the
+/// workspace tree via [`crate::blobs::scan_workspace_source`].
+pub fn scan_mcp_workspace_in_dir(
+    cwd: &std::path::Path,
+    raw_sync_dir: &str,
+    limits: crate::blobs::WorkspaceLimits,
+) -> Result<crate::blobs::WorkspaceScan, String> {
+    use std::path::Component;
+
+    let trimmed = raw_sync_dir.trim();
+    if trimmed.is_empty() {
+        return Err("workspace.sync_dir cannot be empty".to_string());
+    }
+    let sync_path = std::path::Path::new(trimmed);
+    if sync_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!(
+            "workspace.sync_dir '{}' must not contain '..' or leave the working directory",
+            sync_path.display()
+        ));
+    }
+
+    let canon_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory '{}': {e}", cwd.display()))?;
+
+    let rel_path = rel_path_within_cwd(cwd, &canon_cwd, sync_path).ok_or_else(|| {
+        format!(
+            "workspace.sync_dir '{}' is outside the working directory '{}'",
+            sync_path.display(),
+            cwd.display()
+        )
+    })?;
+
+    let mut cur = cwd.to_path_buf();
+    for comp in rel_path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                cur.push(part);
+                let meta = std::fs::symlink_metadata(&cur)
+                    .map_err(|e| format!("'{}': {e}", sync_path.display()))?;
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "'{}' is or traverses a symbolic link ('{}'), which is refused in MCP workspace.sync_dir",
+                        sync_path.display(),
+                        cur.display()
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "workspace.sync_dir '{}' is not a relative path inside the working directory",
+                    sync_path.display()
+                ));
+            }
+        }
+    }
+
+    let target_meta =
+        std::fs::symlink_metadata(&cur).map_err(|e| format!("'{}': {e}", sync_path.display()))?;
+    if target_meta.file_type().is_symlink() {
+        return Err(format!(
+            "'{}' is a symbolic link, which is refused in MCP workspace.sync_dir",
+            sync_path.display()
+        ));
+    }
+    if !target_meta.is_dir() {
+        return Err(format!(
+            "workspace.sync_dir '{}' is not a directory",
+            sync_path.display()
+        ));
+    }
+    let canon_target =
+        std::fs::canonicalize(&cur).map_err(|e| format!("'{}': {e}", sync_path.display()))?;
+    if !canon_target.starts_with(&canon_cwd) {
+        return Err(format!(
+            "workspace.sync_dir '{}' resolves outside the working directory '{}'",
+            sync_path.display(),
+            cwd.display()
+        ));
+    }
+
+    crate::blobs::scan_workspace_source(&cur, limits)
+}
+
 /// Validates that `raw` stays inside `cwd`, contains no `..`, and neither is nor traverses a
 /// symbolic link, creating missing directory components one by one and returning the checked
 /// directory path.
@@ -1613,17 +1798,24 @@ async fn format_completed_task_result(
                 Ok(addr) => addr,
                 Err(e) => return ToolCallResult::error(e),
             };
-            let conn =
-                match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return ToolCallResult::error(format!(
-                            "Failed to connect to Master for output download: {e}"
-                        ))
-                    }
-                };
+            let conn = match tokio::time::timeout(
+                DEFAULT_MASTER_RPC_TIMEOUT,
+                crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to connect to Master for output download: {e}"
+                    ))
+                }
+                Err(_) => {
+                    return ToolCallResult::error(format!(
+                        "Timed out connecting to Master at {target_addr} for output download"
+                    ))
+                }
+            };
             match crate::blobs::download_outputs(&conn, &result.outputs, &out_dir).await {
                 Ok(paths) => saved_outputs = Some(paths),
                 Err(e) => {
@@ -1732,10 +1924,46 @@ async fn format_completed_task_result(
 // Tool: submit
 // ----------------------------------------------------------------------------
 
+struct WorkspaceSubmitMeta {
+    name: String,
+    spec: rusty_grid_core::task::WorkspaceRef,
+    files: usize,
+    uploaded_bytes: u64,
+    skipped: usize,
+}
+
+fn attach_workspace_summary(
+    res: ToolCallResult,
+    ws_meta: Option<&WorkspaceSubmitMeta>,
+    worker: Option<Uuid>,
+) -> ToolCallResult {
+    let Some(meta) = ws_meta else {
+        return res;
+    };
+    if res.is_error {
+        return res;
+    }
+    let Some(ToolContent::Text { text }) = res.content.first() else {
+        return res;
+    };
+    let Ok(mut body) = serde_json::from_str::<Value>(text) else {
+        return res;
+    };
+    body["workspace"] = json!({
+        "name": meta.name,
+        "worker": worker.filter(|w| !w.is_nil()).map(|w| w.to_string()),
+        "files": meta.files,
+        "uploaded_bytes": meta.uploaded_bytes,
+        "skipped": meta.skipped,
+    });
+    ToolCallResult::ok_json(&body)
+}
+
 async fn check_matching_worker_warning(
     state: &McpState,
     placement: &Placement,
     requirements: &TaskRequirements,
+    has_workspace: bool,
     timeout: Duration,
 ) -> Option<String> {
     let Ok(ClientResponse::WorkerList { workers }) = state
@@ -1744,6 +1972,18 @@ async fn check_matching_worker_warning(
     else {
         return None;
     };
+
+    if has_workspace
+        && !workers.iter().any(|w| {
+            let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
+            connected && listed_supports_workspaces(w)
+        })
+    {
+        let msg =
+            "Warning: no connected worker supports workspaces yet; the task will wait".to_string();
+        eprintln!("[mcp] {msg}");
+        return Some(msg);
+    }
 
     let any_matches = workers.iter().any(|w| {
         let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
@@ -1857,11 +2097,24 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 .and_then(Value::as_str)
                 .map(|s| s.as_bytes().to_vec());
 
+            let working_dir = match args
+                .get("workspace")
+                .and_then(Value::as_object)
+                .and_then(|ws| ws.get("cwd"))
+                .and_then(Value::as_str)
+            {
+                Some(raw_cwd) => match crate::cli_app::normalize_workspace_cwd(raw_cwd) {
+                    Ok(dir) => dir,
+                    Err(e) => return ToolCallResult::error(e),
+                },
+                None => None,
+            };
+
             TaskSpec::Command {
                 program,
                 args: cmd_args,
                 env: env_map,
-                working_dir: None,
+                working_dir,
                 stdin,
             }
         }
@@ -1924,10 +2177,12 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         .get("gpu")
         .and_then(Value::as_bool)
         .unwrap_or(task_type == "gpu");
+    let has_workspace = args.get("workspace").is_some_and(|v| !v.is_null());
+    let default_timeout_secs = if has_workspace { 1800 } else { 60 };
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
-        .unwrap_or(60);
+        .unwrap_or(default_timeout_secs);
     let wait_secs = args
         .get("wait_secs")
         .and_then(Value::as_u64)
@@ -2043,9 +2298,77 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         }
     }
 
+    // Persistent workspace sync (mutually exclusive with `files`)
+    let mut ws_meta: Option<WorkspaceSubmitMeta> = None;
+    let mut ws_uploads: Option<crate::blobs::PreparedInputs> = None;
+    if let Some(ws_obj) = args.get("workspace").and_then(Value::as_object) {
+        let ws_name = match ws_obj.get("name").and_then(Value::as_str) {
+            Some(n) => n.to_string(),
+            None => return ToolCallResult::error("Missing required property 'workspace.name'"),
+        };
+        if let Err(e) = rusty_grid_core::task::validate_workspace_name(&ws_name) {
+            return ToolCallResult::error(e);
+        }
+        let sync_dir_opt: Option<String> = match ws_obj.get("sync_dir") {
+            None => Some(".".to_string()),
+            Some(Value::Null) => None,
+            Some(v) => match v.as_str() {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    return ToolCallResult::error("Property 'workspace.sync_dir' must be a string")
+                }
+            },
+        };
+        if let Some(sync_dir_str) = sync_dir_opt {
+            let cwd = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Workspace sync error: cannot determine working directory: {e}"
+                    ))
+                }
+            };
+            let limits = state.workspace_limits;
+            let scan_res = tokio::task::spawn_blocking(move || {
+                scan_mcp_workspace_in_dir(&cwd, &sync_dir_str, limits)
+            })
+            .await
+            .map_err(|e| format!("workspace scan task failed: {e}"))
+            .and_then(|r| r);
+            let prepared_ws = match scan_res {
+                Ok(ws) => ws,
+                Err(e) => return ToolCallResult::error(format!("Workspace sync error: {e}")),
+            };
+            let files = prepared_ws.prepared.files;
+            let skipped = prepared_ws.prepared.skipped.len();
+            let manifest_id = prepared_ws.manifest_id;
+            let manifest_len = prepared_ws.manifest_len;
+            ws_uploads = Some(prepared_ws.prepared);
+            ws_meta = Some(WorkspaceSubmitMeta {
+                name: ws_name.clone(),
+                spec: rusty_grid_core::task::WorkspaceRef::new(ws_name)
+                    .with_tree(manifest_id, manifest_len),
+                files,
+                uploaded_bytes: 0,
+                skipped,
+            });
+        } else {
+            ws_meta = Some(WorkspaceSubmitMeta {
+                name: ws_name.clone(),
+                spec: rusty_grid_core::task::WorkspaceRef::new(ws_name),
+                files: 0,
+                uploaded_bytes: 0,
+                skipped: 0,
+            });
+        }
+    }
+
     let mut task = Task::new(spec, requirements.clone()).with_placement(&placement);
     if !prepared_inputs.inputs.is_empty() {
         task = task.with_inputs(prepared_inputs.inputs.clone());
+    }
+    if let Some(ref meta) = ws_meta {
+        task = task.with_workspace(meta.spec.clone());
     }
     if !output_globs.is_empty() {
         task = task.with_output_globs(output_globs);
@@ -2068,14 +2391,25 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
+    let blob_connect_timeout =
+        Duration::from_secs(wait_secs.max(1)).min(DEFAULT_MASTER_RPC_TIMEOUT);
+
     if !prepared_inputs.inputs.is_empty() {
-        let conn = match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
-            .await
+        let conn = match tokio::time::timeout(
+            blob_connect_timeout,
+            crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 return ToolCallResult::error(format!(
                     "Failed to connect to Master for input blob upload: {e}"
+                ))
+            }
+            Err(_) => {
+                return ToolCallResult::error(format!(
+                    "Timed out connecting to Master at {target_addr} for input blob upload"
                 ))
             }
         };
@@ -2084,11 +2418,48 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         }
     }
 
+    if let Some(ref uploads) = ws_uploads {
+        let conn = match tokio::time::timeout(
+            blob_connect_timeout,
+            crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                return ToolCallResult::error(format!(
+                    "Failed to connect to Master for workspace blob upload: {e}"
+                ))
+            }
+            Err(_) => {
+                return ToolCallResult::error(format!(
+                    "Timed out connecting to Master at {target_addr} for workspace blob upload"
+                ))
+            }
+        };
+        match crate::blobs::upload_inputs(&conn, uploads).await {
+            Ok(stats) => {
+                if let Some(ref mut meta) = ws_meta {
+                    meta.uploaded_bytes = stats.bytes;
+                }
+            }
+            Err(e) => {
+                return ToolCallResult::error(format!("Failed to upload workspace files: {e}"))
+            }
+        }
+    }
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
     let preflight_timeout =
         Duration::from_millis(500).min(Duration::from_secs(wait_secs.max(1)) / 2);
-    let warning =
-        check_matching_worker_warning(state, &placement, &requirements, preflight_timeout).await;
+    let warning = check_matching_worker_warning(
+        state,
+        &placement,
+        &requirements,
+        ws_meta.is_some(),
+        preflight_timeout,
+    )
+    .await;
 
     if ctx.is_cancelled() {
         ctx.aborted_by_cancel = true;
@@ -2187,7 +2558,9 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                     Some(step + 1),
                     format!("Task {task_id} completed"),
                 );
-                format_completed_task_result(state, &result, args, warning).await
+                let worker_id = result.worker_id;
+                let res = format_completed_task_result(state, &result, args, warning).await;
+                attach_workspace_summary(res, ws_meta.as_ref(), Some(worker_id))
             }
             Some(Ok(Some(ClientResponse::Error { message }))) => ToolCallResult::error(message),
             Some(Ok(Some(other))) => {
@@ -2220,7 +2593,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 if let Some(w) = warning {
                     body["warning"] = Value::String(w);
                 }
-                ToolCallResult::ok_json(&body)
+                attach_workspace_summary(ToolCallResult::ok_json(&body), ws_meta.as_ref(), None)
             }
         }
     } else {
@@ -2256,7 +2629,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 if let Some(w) = warning {
                     body["warning"] = Value::String(w);
                 }
-                ToolCallResult::ok_json(&body)
+                attach_workspace_summary(ToolCallResult::ok_json(&body), ws_meta.as_ref(), None)
             }
             Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
             Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
@@ -2323,7 +2696,11 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                                 if let Some(w) = warning {
                                     body["warning"] = Value::String(w);
                                 }
-                                return ToolCallResult::ok_json(&body);
+                                return attach_workspace_summary(
+                                    ToolCallResult::ok_json(&body),
+                                    ws_meta.as_ref(),
+                                    None,
+                                );
                             }
                             Ok(ClientResponse::Error { ref message })
                                 if message.contains("already exists") =>
@@ -2348,7 +2725,11 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                                 if let Some(w) = warning {
                                     body["warning"] = Value::String(w);
                                 }
-                                return ToolCallResult::ok_json(&body);
+                                return attach_workspace_summary(
+                                    ToolCallResult::ok_json(&body),
+                                    ws_meta.as_ref(),
+                                    None,
+                                );
                             }
                             Ok(ClientResponse::Error { message }) => {
                                 return ToolCallResult::error(message);
@@ -2382,13 +2763,14 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 if let Some(w) = warning {
                     body["warning"] = Value::String(w);
                 }
-                ToolCallResult {
+                let res = ToolCallResult {
                     content: vec![ToolContent::Text {
                         text: serde_json::to_string_pretty(&body)
                             .unwrap_or_else(|_| body.to_string()),
                     }],
                     is_error,
-                }
+                };
+                attach_workspace_summary(res, ws_meta.as_ref(), None)
             }
             Err(e) => ToolCallResult::error(e),
         }
@@ -2705,6 +3087,31 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
             }
         }
         Err(e) => ToolCallResult::error(format!("Failed to serialize doctor report: {e}")),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Tool: workspaces
+// ----------------------------------------------------------------------------
+
+async fn tool_workspaces(state: &McpState) -> ToolCallResult {
+    match state.request(&ClientMessage::ListWorkspaces).await {
+        Ok(ClientResponse::Workspaces { workspaces }) => {
+            let list: Vec<Value> = workspaces
+                .into_iter()
+                .map(|ws| {
+                    json!({
+                        "name": ws.name,
+                        "worker": ws.worker.to_string(),
+                        "last_used_utc": ws.last_used_utc,
+                    })
+                })
+                .collect();
+            ToolCallResult::ok_json(&Value::Array(list))
+        }
+        Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
+        Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
+        Err(e) => ToolCallResult::error(e),
     }
 }
 
@@ -3200,7 +3607,18 @@ pub async fn run_mcp(
         Err(code) => return code,
     };
 
-    let state = Arc::new(McpState::new(master_addr, secret));
+    let workspace_limits = crate::blobs::WorkspaceLimits {
+        max_files: args
+            .workspace_max_files
+            .unwrap_or(crate::blobs::DEFAULT_WORKSPACE_MAX_FILES),
+        max_bytes: args
+            .workspace_max_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(crate::blobs::DEFAULT_WORKSPACE_MAX_BYTES),
+    };
+
+    let state =
+        Arc::new(McpState::new(master_addr, secret).with_workspace_limits(workspace_limits));
 
     run_stdio_server(state).await
 }
@@ -3528,7 +3946,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),
@@ -3560,6 +3978,85 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_tool_arguments("submit", &json!({"type": "gpu"})).is_ok());
+
+        // Workspace validation in submit and workspaces tool
+        assert!(validate_tool_arguments("workspaces", &json!({})).is_ok());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "cargo",
+                "args": ["test"],
+                "workspace": {
+                    "name": "oxideswarm",
+                    "sync_dir": ".",
+                    "cwd": "crates/core"
+                }
+            })
+        )
+        .is_ok());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "cargo",
+                "workspace": {
+                    "name": "oxideswarm",
+                    "sync_dir": null
+                }
+            })
+        )
+        .is_ok());
+        // Combining workspace with files is rejected (-32602).
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "echo",
+                "files": ["a.txt"],
+                "workspace": { "name": "oxideswarm" }
+            })
+        )
+        .is_err());
+        // Invalid workspace name, parent traversal in sync_dir/cwd, or cwd on shell/gpu rejected.
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "echo",
+                "workspace": { "name": "../bad" }
+            })
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "echo",
+                "workspace": { "name": "ok", "sync_dir": "../outside" }
+            })
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "command": "echo",
+                "workspace": { "name": "ok", "cwd": "../outside" }
+            })
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "type": "shell",
+                "script": "echo hi",
+                "workspace": { "name": "ok", "cwd": "sub" }
+            })
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({
+                "type": "gpu",
+                "workspace": { "name": "ok" }
+            })
+        )
+        .is_err());
 
         // Unknown tool, invalid UUIDs, and negative integers are rejected.
         assert!(validate_tool_arguments("unknown_tool", &json!({})).is_err());
