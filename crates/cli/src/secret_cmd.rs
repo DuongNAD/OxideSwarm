@@ -23,9 +23,12 @@ use clap::{Parser, Subcommand};
 
 use rusty_grid_core::cluster_auth::{ClusterSecret, ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::error::{GridError, GridResult};
+use rusty_grid_core::noise_auth::{default_node_key_path, NodeKeypair, PublicKey, ENV_MASTER_KEY};
 
 use crate::config::{resolve_bool, ConfigFile, SecretSection, SecretText};
-use crate::connect::{master_requires_secret, AUTH_EXIT_CODE};
+use crate::connect::{
+    cli_master_key_flag, master_requires_secret, set_default_client_v3_auth, AUTH_EXIT_CODE,
+};
 
 /// The secret-related command line flags, as given.
 #[derive(Debug, Clone, Default)]
@@ -93,6 +96,75 @@ impl SecretOpts {
         // Tier 6: the default file, if present.
         ClusterSecret::resolve_with(None, None, |_| None, default_file)
     }
+
+    /// Resolves the pinned master X25519 public key (`--master-key` > `RUSTY_GRID_MASTER_KEY` >
+    /// config `master_key` > `None`).
+    pub fn resolve_master_key(
+        &self,
+        config: Option<&ConfigFile>,
+        section: SecretSection,
+    ) -> GridResult<Option<PublicKey>> {
+        let flag = cli_master_key_flag();
+        self.resolve_master_key_with(flag.as_deref(), config, section, |name| {
+            std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+        })
+    }
+
+    /// [`SecretOpts::resolve_master_key`] with the CLI flag and environment lookup injected.
+    pub fn resolve_master_key_with(
+        &self,
+        flag: Option<&str>,
+        config: Option<&ConfigFile>,
+        section: SecretSection,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> GridResult<Option<PublicKey>> {
+        if let Some(flag_val) = flag {
+            let trimmed = flag_val.trim();
+            if trimmed.is_empty() {
+                return Err(GridError::Config("--master-key is set but empty".into()));
+            }
+            return PublicKey::from_hex(trimmed)
+                .map(Some)
+                .map_err(|e| GridError::Config(format!("--master-key: {e}")));
+        }
+        if let Some(env_val) = env(ENV_MASTER_KEY) {
+            let trimmed = env_val.trim();
+            if trimmed.is_empty() {
+                return Err(GridError::Config(format!(
+                    "{ENV_MASTER_KEY} is set but empty"
+                )));
+            }
+            return PublicKey::from_hex(trimmed)
+                .map(Some)
+                .map_err(|e| GridError::Config(format!("{ENV_MASTER_KEY}: {e}")));
+        }
+        if let Some(cfg_hex) = config.and_then(|c| c.master_key(section)) {
+            return PublicKey::from_hex(&cfg_hex)
+                .map(Some)
+                .map_err(|e| config_key_error("master_key", &e));
+        }
+        Ok(None)
+    }
+
+    /// Resolves the OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for `section`:
+    /// when a `master_key` is configured, loads (or generates on first run) the private key at
+    /// `~/.oxideswarm/node.key`.
+    pub fn resolve_v3_auth(
+        &self,
+        config: Option<&ConfigFile>,
+        section: SecretSection,
+    ) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
+        let Some(master_pub) = self.resolve_master_key(config, section)? else {
+            return Ok(None);
+        };
+        let Some(node_key_path) = default_node_key_path() else {
+            return Err(GridError::Config(
+                "cannot determine the home directory for ~/.oxideswarm/node.key".into(),
+            ));
+        };
+        let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
+        Ok(Some((node_key, master_pub)))
+    }
 }
 
 fn config_key_error(key: &str, err: &GridError) -> GridError {
@@ -149,6 +221,7 @@ pub fn secret_files_to_protect(
         files.extend(config.source_path.0.clone());
     }
     files.extend(ClusterSecret::default_path());
+    files.extend(default_node_key_path());
     files.sort();
     files.dedup();
     files
@@ -526,8 +599,26 @@ pub fn decide_peer_secret(
     insecure: bool,
     role: PeerRole,
 ) -> GridResult<PeerSecretOutcome> {
+    decide_peer_credential(
+        secret.is_some(),
+        master_addr,
+        via_p2p_ticket,
+        insecure,
+        role,
+    )
+}
+
+/// Like [`decide_peer_secret`], accepting any authentication credential (a shared cluster secret
+/// or a pinned OXS-AUTH v3 `master_key` enrolment).
+pub fn decide_peer_credential(
+    has_credential: bool,
+    master_addr: &str,
+    via_p2p_ticket: bool,
+    insecure: bool,
+    role: PeerRole,
+) -> GridResult<PeerSecretOutcome> {
     let via_p2p_ticket = via_p2p_ticket || crate::connect::is_p2p_ticket(master_addr);
-    if secret.is_some() {
+    if has_credential {
         return Ok(PeerSecretOutcome::Authenticated);
     }
     if !master_requires_secret(master_addr, via_p2p_ticket) {
@@ -604,18 +695,25 @@ pub fn client_secret(
     master_addr: &str,
     insecure: bool,
 ) -> Result<Option<ClusterSecret>, ExitCode> {
+    let v3_auth = secret_opts
+        .resolve_v3_auth(config_file, section)
+        .map_err(|e| {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        })?;
     let secret = secret_opts.resolve(config_file, section).map_err(|e| {
         eprintln!("{e}");
         ExitCode::FAILURE
     })?;
-    match decide_peer_secret(
-        secret.as_ref(),
+    match decide_peer_credential(
+        secret.is_some() || v3_auth.is_some(),
         master_addr,
         false,
         insecure,
         PeerRole::Client,
     ) {
         Ok(outcome) => {
+            set_default_client_v3_auth(v3_auth);
             announce_peer_secret(outcome, PeerRole::Client, master_addr);
             Ok(secret)
         }
@@ -686,7 +784,7 @@ mod exposure_tests {
         assert!(
             secret_files_to_protect(&SecretOpts::default(), None, |_| None)
                 .iter()
-                .all(|p| p.ends_with("cluster.secret"))
+                .all(|p| p.ends_with("cluster.secret") || p.ends_with("node.key"))
         );
     }
 
@@ -996,6 +1094,59 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{config:?}").contains(HEX_B));
+    }
+
+    #[test]
+    fn test_resolve_master_key_precedence() {
+        let config = ConfigFile {
+            master_key: Some(HEX_E.into()),
+            worker: Some(WorkerFileConfig {
+                master_key: Some(HEX_C.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env_set = env_of(&[(ENV_MASTER_KEY, HEX_B)]);
+        let empty_env = env_of(&[]);
+        let none = SecretOpts::default();
+
+        // 1. --master-key beats env and config.
+        assert_eq!(
+            none.resolve_master_key_with(
+                Some(HEX_A),
+                Some(&config),
+                SecretSection::Worker,
+                &env_set
+            )
+            .unwrap(),
+            Some(PublicKey::from_hex(HEX_A).unwrap())
+        );
+
+        // 2. RUSTY_GRID_MASTER_KEY beats config.
+        assert_eq!(
+            none.resolve_master_key_with(None, Some(&config), SecretSection::Worker, &env_set)
+                .unwrap(),
+            Some(PublicKey::from_hex(HEX_B).unwrap())
+        );
+
+        // 3. Section config beats top-level config.
+        assert_eq!(
+            none.resolve_master_key_with(None, Some(&config), SecretSection::Worker, &empty_env)
+                .unwrap(),
+            Some(PublicKey::from_hex(HEX_C).unwrap())
+        );
+        assert_eq!(
+            none.resolve_master_key_with(None, Some(&config), SecretSection::Submit, &empty_env)
+                .unwrap(),
+            Some(PublicKey::from_hex(HEX_E).unwrap())
+        );
+
+        // 4. Default is None.
+        assert_eq!(
+            none.resolve_master_key_with(None, None, SecretSection::Worker, &empty_env)
+                .unwrap(),
+            None
+        );
     }
 
     // --- secret generate / show -------------------------------------------------------------

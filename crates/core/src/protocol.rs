@@ -3877,12 +3877,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     pub async fn recv_msg_with_codec<M: DeserializeOwned + 'static>(
         &mut self,
     ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
+        self.recv_msg_with_codec_max(MAX_FRAME_SIZE).await
+    }
+
+    /// Reads the next framed message with a temporary frame-length cap `max_len`, restoring
+    /// [`MAX_FRAME_SIZE`] only after the frame is read and (when encryption is active) decrypted.
+    pub async fn recv_msg_with_codec_max<M: DeserializeOwned + 'static>(
+        &mut self,
+        max_len: usize,
+    ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
+        let limit = max_len.min(MAX_FRAME_SIZE);
+        self.inner.codec_mut().set_max_frame_length(limit);
         match self.inner.next().await {
             Some(Ok(bytes)) => {
                 let plaintext = match self.aead_reader.as_mut() {
                     Some(r) => r.decrypt_frame(&bytes)?,
                     None => bytes.freeze(),
                 };
+                self.inner.codec_mut().set_max_frame_length(MAX_FRAME_SIZE);
                 if let Some(detected) = peek_wire_codec(&plaintext) {
                     self.last_detected_codec = Some(detected);
                 }
@@ -3896,7 +3908,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
                 } else if e.kind() == std::io::ErrorKind::InvalidData {
                     Err(ProtocolError::FrameTooLarge {
                         size: 0,
-                        max: MAX_FRAME_SIZE,
+                        max: limit,
                     })
                 } else {
                     Err(ProtocolError::Io(e))
@@ -3904,6 +3916,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
             }
             None => Ok(None),
         }
+    }
+
+    /// Returns the current capacity of the underlying frame reader buffer.
+    pub fn read_buffer_capacity(&self) -> usize {
+        self.inner.read_buffer().capacity()
     }
 
     /// Sends raw bytes as a framed message.

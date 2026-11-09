@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod error;
 pub mod mapreduce;
 pub mod mode;
+pub mod noise_auth;
 pub mod placement;
 pub mod private_file;
 pub mod protocol;
