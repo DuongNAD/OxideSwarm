@@ -163,6 +163,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 (open) |
+| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -766,6 +767,13 @@ The full suite must pass on a clean machine before CI can require it.
   2. Raise `MIN_LIVE_KILL_AGE` in `crates/worker/src/process_tree.rs` from `80 ms` to `250 ms` so both `sh.exe` and its immediate MSYS2 child finish `dll_crt0_1` before `TerminateJobObject`, and pass `child_already_exited = false` in `TreeInner::drop`.
   3. Set `.with_ram_mb(4096)` in `WorkerClient::for_testing` and `spawn_test_worker`.
 - **Done when:** `cargo test -p rusty_grid_master --test m4_challenger_2_stress --locked` passes 20 times in a row on Windows inside the full-suite lock, and `runner::tests::test_runner_pre_cancelled_task_does_not_spawn_child` verifies that a pre-cancelled task does not spawn a child process.
+
+### TEST-22: Ignore UUID and metric `4090` tokens in `workflow_modes_test`
+
+- **Evidence:** CI failure on `macos-latest` (run `42690928796`, job `129410135311`) in `tests/workflow_modes_test.rs:313` (`test_research_mode_distributed_and_report`): `output must not print invented RTX / worker-gpu-rtx4090 hardware or node names`.
+- **Problem:** `generate_research_report` writes `expected_task_id` and `codec_decoded_task_id` (random UUIDv4 strings `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`) plus integer RAM/timing metrics into `target/research_report.json`. `contains_standalone_number` only checked `c.is_ascii_digit() || c == '.'` on the characters immediately before and after `"4090"`, so a UUIDv4 with `-4090-` in its third hyphen-delimited group (or `4090` adjacent to hex digits `'a'..='f'`), or a JSON/unit-labelled metric equal to `4090`, was mistaken for an `"RTX 4090"` GPU model name.
+- **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
+- **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
 
 ## Phase 3: make the documents true
 
@@ -2031,3 +2039,8 @@ Add one dated line per finished item, newest last.
   in `validate_sandbox_base_safe`, and a startup `WARN` + `tool:cargo` tag removal when a Windows
   worker runs elevated with isolation). Verified in CI run `42678349017` across all 22 jobs and
   locally on Windows 11. The Index counts are now 64 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented TEST-22 (pull request 200, open): updated `contains_standalone_number` in
+  `tests/workflow_modes_test.rs` so UUIDv4 hex groups (`-4090-`, `4090a...`) and JSON/unit-labelled
+  numeric measurements (`: 4090`, `4090 ms`, `4090 MB`) in `research_report.json` are not mistaken
+  for an invented RTX 4090 GPU model name. The Index counts are now 64 Implemented, 4 Partial and
+  37 Planned.
