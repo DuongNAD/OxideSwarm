@@ -57,7 +57,7 @@ Run a local cluster by hand (loopback: no cluster secret needed):
 ./target/debug/rusty-grid master                        # = --listen 127.0.0.1:8088, dashboard 127.0.0.1:8080
 ./target/debug/rusty-grid worker --simulate-gpu         # --master defaults to 127.0.0.1:8088
 ./target/debug/rusty-grid submit --command echo --wait -- hi   # add --gpu to require a GPU worker
-./target/debug/rusty-grid submit --os windows --wait -- hostname   # also --arch, --worker NAME|ID, --require-tag TAG
+./target/debug/rusty-grid submit --os windows --wait -- hostname   # also --arch, --worker NAME|ID, --require-tag TAG, --require-isolation fs|fs+net
 ./target/debug/rusty-grid submit --input input.txt --output out.txt --command sh -- -c 'wc -l input.txt > out.txt'  # files in and out (blobs)
 ./target/debug/rusty-grid doctor                        # checks C1-C6 against the master; exit 1 on a failed check
 ./target/debug/rusty-grid mcp                           # Model Context Protocol server over stdio
