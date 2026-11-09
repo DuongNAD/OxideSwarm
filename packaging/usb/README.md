@@ -27,6 +27,28 @@ oxideswarm secret join-token --master <MASTER_IP>:8088 | bash packaging/usb/make
 `SHA256SUMS`. `--archives <DIR>` takes them from a folder instead, and `--replace` replaces an
 existing kit.
 
+## Networks where machines cannot see each other
+
+On school, office or café Wi-Fi, the machines often cannot reach each other directly (client
+isolation). In that case, connect through iroh P2P instead of a LAN address:
+
+1. Start the master with P2P. It needs outbound Internet access to the public relays:
+
+   ```bash
+   oxideswarm master --listen 0.0.0.0:8088 --p2p --p2p-ticket-file ~/.oxideswarm/master_ticket.txt
+   ```
+
+2. Make the kit from a token that carries the ticket. With no `--master`, the token holds only the
+   ticket:
+
+   ```bash
+   oxideswarm secret join-token --p2p-ticket-file ~/.oxideswarm/master_ticket.txt | bash packaging/usb/make_kit.sh /Volumes/<STICK> --version <VERSION>
+   ```
+
+The installer saves the ticket, and the worker and the installer's checks connect through it, either
+directly or through a relay. The master keeps the same ticket across restarts as long as
+`master_key.bin` is kept. Check the network's rules before you run a cluster on it.
+
 ## Use it on a new machine
 
 - **macOS:** double-click `Install OxideSwarm.command`.
