@@ -522,13 +522,7 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     features
 }
 
-/// Last worker that finished a task in a named workspace, and when (design 0039 D4, D6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceAffinity {
-    pub name: String,
-    pub worker_id: Uuid,
-    pub last_used_utc: u64,
-}
+pub use rusty_grid_core::task::WorkspaceAffinity;
 
 /// Upper bound on in-memory workspace affinity entries so ephemeral workspace names cannot grow
 /// the map without bound.
@@ -1069,7 +1063,7 @@ impl TaskQueueInner {
             name.to_string(),
             WorkspaceAffinity {
                 name: name.to_string(),
-                worker_id,
+                worker: worker_id,
                 last_used_utc,
             },
         );
@@ -2861,7 +2855,7 @@ impl TaskQueue {
         let affinities = inner
             .workspace_affinity
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.worker_id))
+            .map(|(name, entry)| (name.clone(), entry.worker))
             .collect();
         let active = inner
             .workspace_active_tasks
@@ -2878,7 +2872,7 @@ impl TaskQueue {
         inner
             .workspace_affinity
             .get(workspace_name)
-            .map(|e| e.worker_id)
+            .map(|e| e.worker)
     }
 
     /// Returns all known workspace affinity entries sorted by workspace name.
@@ -8635,7 +8629,7 @@ mod tests {
         let workspaces = q.list_workspaces().await;
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].name, "ws-ts");
-        assert_eq!(workspaces[0].worker_id, w1);
+        assert_eq!(workspaces[0].worker, w1);
         assert_eq!(
             workspaces[0].last_used_utc, 2_500,
             "replay must record workspace affinity with the TaskTerminal finish timestamp"
