@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agent_mesh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3405,7 +3405,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_grid_android_bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jni 0.22.4",
  "rusty_grid_core",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent_mesh",
  "base64 0.23.1",
@@ -3448,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_master"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bincode",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_worker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "chrono",
