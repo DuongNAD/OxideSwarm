@@ -27,6 +27,9 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   runs at scale, with many workers, many submitters and standard tools around it. Phase F (scale
   out) and Phase G (product and ecosystem) carry this work. They follow the core, and the
   architecture is in [design 0050](design/0050-scale-out-architecture.md).
+- Long-term goal (Draft, 2026-11-10): an open compute network where anyone can offer and use idle
+  compute, safely and with checkable results. Phase H carries it, and the architecture is in
+  [design 0054](design/0054-open-compute-network.md).
 
 ## Where the project stands
 
@@ -315,6 +318,35 @@ manager and runs the quick start (ECO-5), a Prometheus scrape of a running maste
 design 0050 series (ECO-4), and a second tenant is refused when over quota (ECO-3). Each result is
 recorded with its date.
 
+### Phase H: an open compute network (long term)
+
+Draft, set by the owner on 2026-11-10 as the long-term goal: grow OxideSwarm into an open network
+where anyone can offer idle compute and anyone can use it, safely and with checkable results. It is
+an operating system for a planet-sized cluster, not a desktop OS. The architecture is
+[design 0054](design/0054-open-compute-network.md).
+
+It takes years. Each stage is useful alone:
+
+| Stage | Items | What it adds |
+|---|---|---|
+| H0 | NET-1 | A WebAssembly task type in today's trusted clusters: one binary for every OS, a first sandbox |
+| H1 | NET-2 | Federation between trusted clusters with signed credit accounting (builds on SCALE-6) |
+| H2 | NET-3, NET-4 | Public pool alpha: WebAssembly only, redundancy and spot checks, reputation, contributor controls |
+| H3 | NET-5 | Native tasks in lightweight VMs; public beta |
+| H4 | NET-6, NET-7 | Distributed directory and scheduler; open specification and a neutral steward |
+| later | NET-8 | Trusted execution environments for confidential tasks |
+
+The hard problems are not the network. They are:
+- trusting strangers' code (sandboxes, design 0054 D2);
+- trusting strangers' results (verification, D4);
+- fair exchange (credits, D6);
+- abuse and governance (D7).
+
+H0 can start after ENROLL-1, because it is useful inside trusted clusters. H1 needs SCALE-6. H2
+needs ECO-3 and an independent security review of its threat model.
+
+**Exit check per stage:** the stage table of design 0054, each result recorded with its date.
+
 ## What waits, and why
 
 | Area | Items | Why it waits | Plan |
@@ -327,8 +359,9 @@ recorded with its date.
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
 | Distributed training | TRAIN-1 to TRAIN-5 ([design 0045](design/0045-distributed-training.md)) | It does not serve the user story. Until FEAT-3 a training task can read the worker's `cluster.secret`, and long rounds need FEAT-1 and FEAT-5 | After the Phase D exit check (decision Q6). TRAIN-1, independent runs, comes first |
 
-LLM inference, training, Android and 3D become Phase H candidates once Phase F lands. This makes
-no commitment: each still needs its own owner decision.
+LLM inference, training, Android and 3D become candidates for a later phase once Phase F lands.
+This makes no commitment: each still needs its own owner decision. Workloads that split well, such
+as TRAIN-1's independent runs, may also run in the open network of Phase H.
 
 ## Decisions for the owner
 
@@ -350,6 +383,11 @@ answers.
 | Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | The own API and MCP first, REAPI cache-only next, remote execution last |
 | Q11 | Which licence and is there a commercial or hosted offering? | Keep `MIT OR Apache-2.0`. No hosted offering decided; revisit after the first release |
 | Q12 | Which autoscaling providers does SCALE-5 build first? | SSH pool, then Kubernetes, then one cloud |
+| Q14 | How does the open network (Phase H) count contribution: credits, money or tokens, or nothing? | Open. Recommended: plain credits, earned by verified work and spent on running work; no cryptocurrency |
+| Q15 | Which sandbox for strangers' code comes first: WebAssembly or lightweight VMs? | Open. Recommended: WebAssembly first (one binary for every OS, deterministic, cheap to verify), VMs in H3 |
+| Q16 | Which workloads does the public pool take first? | Open. Recommended: open-source CI builds and tests, Monte Carlo and parameter sweeps, rendering; all split well and can be checked |
+| Q17 | Who governs the network once it has outside users? | Open. Recommended: the owner until then, then a neutral steward with an open specification |
+| Q18 | When does Phase H start? | Open. Recommended: H0 after ENROLL-1; H1 after SCALE-6; H2 after ECO-3 and an external security review |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -408,3 +446,6 @@ answers.
   laptop (details under Phase D). Phases A to D, the core, are complete.
 - 2026-11-09: The owner chose ecosystem model A (Q13) and asked for machines on any network and a
   USB setup kit. ENROLL-1, JOIN-2 and USB-1 (designs 0051 to 0053) head Phase E.
+- 2026-11-10: The owner set a long-term goal: an open, worldwide compute network on top of
+  OxideSwarm. Phase H (NET-1 to NET-8) is added from [design 0054](design/0054-open-compute-network.md)
+  (Draft), with open decisions Q14 to Q18. Nothing in Phases E to G moved.

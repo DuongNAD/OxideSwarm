@@ -48,6 +48,7 @@ before adding or changing a document.
 | [design/0051-machine-identity-and-invites.md](design/0051-machine-identity-and-invites.md) | Accepted, not built: a key per machine, OXS-AUTH v3 (Noise `IK`), invites that work once, expire and need approval, roles, `invite` / `members`, revocation across all lanes (`ENROLL-1`) | Contributors |
 | [design/0052-short-code-pairing.md](design/0052-short-code-pairing.md) | Accepted, not built: `invite --code` and `join --code` on a LAN with SPAKE2, discovery on UDP 8087 (`JOIN-2`) | Contributors |
 | [design/0053-usb-setup-kit.md](design/0053-usb-setup-kit.md) | Accepted, not built: `usb create`, an encrypted invite for N machines and per-user installers for macOS, Windows and Linux (`USB-1`) | Contributors |
+| [design/0054-open-compute-network.md](design/0054-open-compute-network.md) | Draft, long-term vision: an open compute network (WebAssembly and VM sandboxes, result verification, federation, credits, governance), stages H0 to H4 (`NET-1` to `NET-8`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
