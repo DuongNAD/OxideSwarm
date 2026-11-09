@@ -1438,7 +1438,18 @@ fn resolve_worker_target(
     (master_addr, p2p_ticket)
 }
 
+/// Runs the master. The body's future is large (the server, the auth context and the P2P
+/// endpoint), so it is boxed: a caller on a default 2 MiB thread stack, such as a
+/// `#[tokio::test]`, would otherwise overflow it in a debug build.
 async fn run_master(
+    args: MasterArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    Box::pin(run_master_inner(args, config_file, secret_opts)).await
+}
+
+async fn run_master_inner(
     args: MasterArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
@@ -1748,7 +1759,14 @@ async fn run_master(
             return ExitCode::FAILURE;
         }
     };
-    let master_noise_key = if ephemeral_key && state_dir.is_none() {
+    // The v3 key is written to disk only when OXS-AUTH v3 can be used: a state directory was
+    // given, members exist, or the master admits members only. A loopback or `--insecure`
+    // master without members must not create `~/.oxideswarm`; an in-memory key costs nothing
+    // there, because no member has pinned it.
+    let persist_noise_key = state_dir.is_some()
+        || !members.is_empty()
+        || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members);
+    let master_noise_key = if (ephemeral_key && state_dir.is_none()) || !persist_noise_key {
         match rusty_grid_core::noise_auth::NodeKeypair::generate() {
             Ok(kp) => kp,
             Err(e) => {
@@ -6136,8 +6154,29 @@ max_active_mb = 768
         );
     }
 
-    #[tokio::test]
-    async fn test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket() {
+    /// Runs on its own thread with a 16 MiB stack: this test drives `run_master`, `run_worker`
+    /// and the client commands in one future, which overflowed the default 2 MiB test-thread
+    /// stack in Linux debug builds.
+    #[test]
+    fn test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket() {
+        std::thread::Builder::new()
+            .name("sched2-big-stack".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(
+                        sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket(),
+                    )
+            })
+            .expect("spawn the test thread")
+            .join()
+            .expect("the test thread panicked");
+    }
+
+    async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket() {
         use crate::config::{MasterFileConfig, SubmitFileConfig, WorkerFileConfig};
         use rusty_grid_master::scheduler::SchedulingPolicy;
 
