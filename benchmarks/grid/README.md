@@ -6,8 +6,10 @@ not been run yet; only macOS is recorded below).
 
 ```bash
 cargo build --release --locked --bin oxideswarm
-python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm          # about 10 minutes
+python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm          # (a) and (b), about 10 minutes
 python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm --quick  # smoke run, under a minute
+python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm \
+    --offload-master <HOST:PORT_OR_TICKET> --secret-file ~/.oxideswarm/cluster.secret  # (c) two-machine offload
 python3 tests/test_bench_grid.py                                               # helper checks, no binary
 ```
 
@@ -71,6 +73,22 @@ from other processes. A rerun on an idle machine is welcome and goes next to thi
 
 The 501st blob is the tree manifest. Changing one file sends that file and the new manifest only.
 
+**(c) Two-machine `cargo test` workspace offload (`--offload-master`).** Connects from the client machine
+to a running two-machine cluster (`--offload-master <HOST:PORT_OR_TICKET>`, authenticating with
+`--secret-file <PATH>` or `OXIDESWARM_SECRET` inside a private temporary `HOME`). For each repetition it
+picks a fresh workspace name (`<prefix>-r<N>-<hex>`) and runs `oxideswarm submit --workspace <name> --wait
+-- cargo <offload-cargo-args>` (default: `test -p rusty_grid_core --lib --offline`) twice from
+`--offload-dir` (default: repository root):
+
+- *Cold:* first run in the fresh workspace (syncs the tree, compiles from scratch, and runs the tests).
+- *Warm:* second run in the same workspace (syncs 0 new file blobs, reuses `target/`, and prints no
+  `Compiling` line).
+
+The JSON record captures client wall clock (`wall_s`), worker-side execution time
+(`worker_execution_time_ms` from `Execution Time: <N>ms`), `blobs_sent` and `blobs_total` from the
+`Workspace '<name>': ...` summary line, `reused_target` on the warm run, and sanitized worker hardware/OS/link
+capabilities from `oxideswarm workers --json` (omitting worker names and IDs so no host names are recorded).
+
 ## Limits
 
 - One machine, loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
@@ -83,5 +101,5 @@ The 501st blob is the tree manifest. Changing one file sends that file and the n
 - Workers use the default below-normal task priority and a fresh sandbox per task; a no-op task is the
   cheapest possible task. Real tasks add their own run time.
 - No other scheduler was run, so these figures are not a comparison with any other system.
-- (c), the offload of `cargo test` between two machines, is not measured yet; it waits for the workspace
-  design (BACKLOG, BENCH-1 step 2).
+- (c), the offload of `cargo test` between two machines, is implemented in `bench_grid.py --offload-master`
+  and waits for a live two-machine run once worker workspace wiring (Design 0039 W2b / W10) lands.
