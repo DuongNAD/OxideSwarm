@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 4 Partial and 29 Planned. Five items
+On 2026-11-09, at `master` `3ce2a65` plus the live two-machine run: 63 items Implemented, 4 Partial and 37 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -231,6 +231,14 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ECO-6 | Client SDKs and a versioned public API | P3 | L | FEAT-8 |  | Planned |  |
 | ECO-7 | Integrations for coding agents and CI | P2 | M | DOC-7 |  | Planned |  |
 | ECO-8 | Documentation site and community | P3 | M | REL-5 | Yes | Planned |  |
+| NET-1 | WebAssembly task type with limits and a deterministic mode | P3 | L | ENROLL-1 | Yes | Planned | (design 0054) |
+| NET-2 | Federation and signed credit accounting between clusters | P3 | L | SCALE-6 | Yes | Planned | (design 0054) |
+| NET-3 | Result verification: redundancy, spot checks, reputation | P3 | L | NET-1 |  | Planned | (design 0054) |
+| NET-4 | Contributor controls: opt-in, caps, stop switch, task-class policy | P3 | M | NET-1 |  | Planned | (design 0054) |
+| NET-5 | Lightweight VM sandboxes on Linux, macOS and Windows | P3 | L | NET-3 |  | Planned | (design 0054) |
+| NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | (design 0054) |
+| NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | (design 0054) |
+| NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | (design 0054) |
 
 ## Phase 0: integrate open work
 
@@ -1782,6 +1790,23 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
 - **Done when:** The site builds in CI and is reachable, `README.md` links the governance and the
   security policy, and a test report of a vulnerability reaches the named contact.
 
+## Phase 9: an open compute network
+
+Draft, added on 2026-11-10 from Phase H of [ROADMAP.md](ROADMAP.md). The architecture and the stage
+exit checks are in [design 0054](design/0054-open-compute-network.md). Decisions Q14 to Q18 of the
+roadmap are open. Each item starts with a threat model of its own and an independent review.
+
+| ID | Do | Done when |
+|---|---|---|
+| NET-1 | `TaskSpec::Wasm` run by a WebAssembly runtime with memory, CPU fuel, file and network grants, and a deterministic mode | The same `.wasm` task gives byte-identical output on macOS, Windows and Linux workers |
+| NET-2 | A versioned protocol between clusters to lend workers, with credit records that both sides sign | Cluster A runs a task on a worker that cluster B lends it, and both credit logs agree |
+| NET-3 | k-of-n redundancy for deterministic tasks, unannounced spot checks, reputation per key | A planted cheating contributor is caught, and its results are never accepted |
+| NET-4 | Opt-in per machine, CPU, hours and battery caps, metered networks off, a local stop switch, a task-class policy | A contributor's stop switch ends every task within 5 s, and caps hold under load |
+| NET-5 | Throw-away VMs per task: Firecracker or Cloud Hypervisor, Virtualization.framework, Hyper-V | Attack tests cannot read host files or reach the network beyond the grant |
+| NET-6 | Clusters publish capacity and task classes through gossip or a DHT over iroh | Clusters find each other with no central server |
+| NET-7 | A written protocol specification, a conformance test suite, a security process and a neutral steward | Two independent implementations pass the suite together |
+| NET-8 | Optional trusted execution (AMD SEV-SNP, Intel TDX, GPU confidential computing) with attestation | A task's attestation is checked before its inputs are released |
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -1993,3 +2018,6 @@ Add one dated line per finished item, newest last.
   - `README.md` links the page.
 
   The Index counts are now 63 Implemented, 4 Partial and 29 Planned.
+- 2026-11-10: Phase 9 added with NET-1 to NET-8, all Planned, from Phase H of the roadmap and design
+  0054 (Draft): the owner's long-term goal of an open compute network. The Index counts are now
+  63 Implemented, 4 Partial and 37 Planned.
