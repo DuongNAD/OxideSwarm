@@ -26,16 +26,44 @@ use rusty_grid_core::transport::{configure_tcp_stream, GridStream};
 
 static CLIENT_P2P_MINIMAL_FOR_TESTING: AtomicBool = AtomicBool::new(false);
 
+tokio::task_local! {
+    static CLIENT_RELAY_URL: Option<String>;
+}
+
+/// Scopes a resolved client `relay_url` (`--relay-url` > `RUSTY_GRID_RELAY_URL` > config
+/// `relay_url`) across a client command's async execution so every inner [`connect_master`] call
+/// (including blob transfers and `doctor` probes) uses it.
+pub async fn with_client_relay_url<F>(relay_url: Option<String>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CLIENT_RELAY_URL.scope(relay_url, fut).await
+}
+
+/// Returns the active client `relay_url` from the task-local scope, or falls back to
+/// `RUSTY_GRID_RELAY_URL` from the environment when called outside [`with_client_relay_url`].
+pub fn active_client_relay_url() -> Option<String> {
+    match CLIENT_RELAY_URL.try_with(|v| v.clone()) {
+        Ok(val) => val,
+        Err(_) => std::env::var(rusty_grid_core::transport::RELAY_URL_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    }
+}
+
 /// Forces client P2P connections in [`connect_master`] to use `iroh::endpoint::presets::Minimal`
 /// during in-process integration tests.
 pub fn set_client_p2p_minimal_preset_for_testing(enabled: bool) {
     CLIENT_P2P_MINIMAL_FOR_TESTING.store(enabled, Ordering::Relaxed);
 }
 
+pub(crate) fn client_p2p_minimal_requested() -> bool {
+    CLIENT_P2P_MINIMAL_FOR_TESTING.load(Ordering::Relaxed) || crate::cli_app::resolve_p2p_minimal()
+}
+
 fn client_p2p_minimal_preset() -> bool {
-    cfg!(test)
-        || CLIENT_P2P_MINIMAL_FOR_TESTING.load(Ordering::Relaxed)
-        || crate::cli_app::resolve_p2p_minimal()
+    cfg!(test) || client_p2p_minimal_requested()
 }
 
 /// TCP port of the Master's grid listener (workers and clients).
@@ -213,17 +241,36 @@ pub async fn connect_master(
     addr: &str,
     secret: Option<&ClusterSecret>,
 ) -> GridResult<MessageTransport<GridStream>> {
+    let relay_url = active_client_relay_url();
+    connect_master_with_relay(addr, secret, relay_url.as_deref()).await
+}
+
+/// Like [`connect_master`], but with an explicit optional `relay_url` (`https://...`) for P2P
+/// client connections. Validates `relay_url` and checks for conflicts with P2P minimal mode before
+/// any network activity.
+pub async fn connect_master_with_relay(
+    addr: &str,
+    secret: Option<&ClusterSecret>,
+    relay_url: Option<&str>,
+) -> GridResult<MessageTransport<GridStream>> {
+    let minimal = if relay_url.is_some() {
+        client_p2p_minimal_requested()
+    } else {
+        client_p2p_minimal_preset()
+    };
+    rusty_grid_core::transport::resolve_p2p_relay_mode(minimal, relay_url)?;
+
     let codec = resolve_client_wire_codec()?;
     let trimmed = addr.trim();
 
     let (addr, stream, via_p2p) = if is_p2p_ticket(trimmed) {
         let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(trimmed)?;
         let label = format!("iroh://{}", endpoint_addr.id);
-        let minimal = client_p2p_minimal_preset();
-        let stream = rusty_grid_core::transport::connect_p2p_client_stream(
+        let stream = rusty_grid_core::transport::connect_p2p_client_stream_with_relay(
             endpoint_addr,
             CONNECT_TIMEOUT,
             minimal,
+            relay_url,
         )
         .await
         .map_err(|e| match e {
@@ -803,6 +850,7 @@ mod tests {
         let submit_with_ticket = crate::config::SubmitFileConfig {
             master: None,
             p2p_ticket: Some(json_ticket.to_string()),
+            relay_url: None,
             timeout_secs: None,
             secret_file: None,
             secret: None,
@@ -828,6 +876,51 @@ mod tests {
         assert_eq!(
             submit_with_master_only.target_master().as_deref(),
             Some("10.0.0.1:8088")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_master_refuses_invalid_relay_url_and_minimal_conflict_before_network() {
+        for bad_url in [
+            "http://relay.example.com",
+            "https://alice:secret@relay.example.com",
+            "not-a-valid-url",
+        ] {
+            let err = connect_master_with_relay("127.0.0.1:1", None, Some(bad_url))
+                .await
+                .err()
+                .expect("invalid relay URL must fail")
+                .to_string();
+            assert!(
+                err.contains("Invalid relay URL"),
+                "expected invalid relay URL error for '{bad_url}', got: {err}"
+            );
+            assert!(!err.contains("secret"), "must not echo password: {err}");
+        }
+
+        // Scoped task-local relay URL is also validated before any network activity.
+        let scoped_err = with_client_relay_url(
+            Some("http://relay.example.com".to_string()),
+            connect_master("127.0.0.1:1", None),
+        )
+        .await
+        .err()
+        .expect("scoped http relay URL must fail")
+        .to_string();
+        assert!(scoped_err.contains("https"), "got: {scoped_err}");
+
+        // Combining minimal preset with a custom relay URL is refused before network activity.
+        set_client_p2p_minimal_preset_for_testing(true);
+        let conflict_res =
+            connect_master_with_relay("127.0.0.1:1", None, Some("https://relay.example.com")).await;
+        set_client_p2p_minimal_preset_for_testing(false);
+        let conflict_err = conflict_res
+            .err()
+            .expect("minimal + custom relay URL must fail")
+            .to_string();
+        assert!(
+            conflict_err.contains("minimal") && conflict_err.contains("relay"),
+            "got: {conflict_err}"
         );
     }
 }

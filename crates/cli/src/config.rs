@@ -41,14 +41,28 @@ pub struct ConfigFile {
     /// leak through backups and version control.
     #[serde(default)]
     pub secret: Option<SecretText>,
+    /// Optional custom iroh relay URL (`https://...`) used as a top-level fallback when a role
+    /// section (`[master]`, `[worker]`, `[client]`, `[submit]`, `[status]`) does not set its own.
+    #[serde(default)]
+    pub relay_url: Option<String>,
     #[serde(default)]
     pub master: Option<MasterFileConfig>,
     #[serde(default)]
     pub worker: Option<WorkerFileConfig>,
     #[serde(default)]
+    pub client: Option<ClientFileConfig>,
+    #[serde(default)]
     pub submit: Option<SubmitFileConfig>,
     #[serde(default)]
     pub status: Option<StatusFileConfig>,
+}
+
+/// Client P2P configuration section (`[client]`), shared by client commands (`submit`, `status`,
+/// `workers`, `workspaces`, `result`, `cancel`, `mapreduce`, `doctor`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClientFileConfig {
+    /// Custom iroh relay URL (`https://...`) for client P2P connections.
+    pub relay_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -67,6 +81,8 @@ pub struct MasterFileConfig {
     pub p2p: Option<bool>,
     pub p2p_ticket_file: Option<String>,
     pub p2p_key_file: Option<String>,
+    /// Custom iroh relay URL (`https://...`) for the master's P2P endpoint (`master --relay-url`).
+    pub relay_url: Option<String>,
     pub wire_codec: Option<String>,
     pub dashboard_port: Option<u16>,
     pub dashboard_port_file: Option<String>,
@@ -117,6 +133,8 @@ pub struct WorkerHardwareConfig {
 pub struct WorkerFileConfig {
     pub master: Option<String>,
     pub p2p_ticket: Option<String>,
+    /// Custom iroh relay URL (`https://...`) for the worker's P2P endpoint (`worker --relay-url`).
+    pub relay_url: Option<String>,
     pub name: Option<String>,
     /// User tags the worker advertises (`worker --tag`).
     pub tags: Option<Vec<String>>,
@@ -160,6 +178,8 @@ pub struct WorkerFileConfig {
 pub struct SubmitFileConfig {
     pub master: Option<String>,
     pub p2p_ticket: Option<String>,
+    /// Custom iroh relay URL (`https://...`) for client P2P connections (`submit --relay-url`).
+    pub relay_url: Option<String>,
     pub timeout_secs: Option<u64>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
@@ -189,6 +209,8 @@ impl SubmitFileConfig {
 pub struct StatusFileConfig {
     pub master: Option<String>,
     pub p2p_ticket: Option<String>,
+    /// Custom iroh relay URL (`https://...`) for client P2P connections (`status --relay-url`).
+    pub relay_url: Option<String>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
     /// Allow talking to a remote / `auto` master without a cluster secret.
@@ -288,6 +310,54 @@ impl ConfigFile {
             non_empty(text(sec_value)).or_else(|| non_empty(text(self.secret.clone()))),
             non_empty(sec_file).or_else(|| non_empty(self.secret_file.clone())),
         )
+    }
+
+    /// Resolves the `[master]` section's `relay_url` (falling back to top-level `relay_url`).
+    pub fn master_relay_url(&self) -> Option<String> {
+        let non_empty = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        non_empty(self.master.as_ref().and_then(|m| m.relay_url.as_deref()))
+            .or_else(|| non_empty(self.relay_url.as_deref()))
+    }
+
+    /// Resolves the `[worker]` section's `relay_url` (falling back to top-level `relay_url`).
+    pub fn worker_relay_url(&self) -> Option<String> {
+        let non_empty = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        non_empty(self.worker.as_ref().and_then(|w| w.relay_url.as_deref()))
+            .or_else(|| non_empty(self.relay_url.as_deref()))
+    }
+
+    /// Resolves `relay_url` for `submit` / `mapreduce`: `[submit]` > `[client]` > top-level `relay_url`.
+    pub fn submit_relay_url(&self) -> Option<String> {
+        let non_empty = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        non_empty(self.submit.as_ref().and_then(|s| s.relay_url.as_deref()))
+            .or_else(|| non_empty(self.client.as_ref().and_then(|c| c.relay_url.as_deref())))
+            .or_else(|| non_empty(self.relay_url.as_deref()))
+    }
+
+    /// Resolves `relay_url` for `status` / `workers` / `workspaces` / `result` / `cancel` / `doctor`:
+    /// `[status]` > `[client]` > `[submit]` > top-level `relay_url`.
+    pub fn status_relay_url(&self) -> Option<String> {
+        let non_empty = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        non_empty(self.status.as_ref().and_then(|s| s.relay_url.as_deref()))
+            .or_else(|| non_empty(self.client.as_ref().and_then(|c| c.relay_url.as_deref())))
+            .or_else(|| non_empty(self.submit.as_ref().and_then(|s| s.relay_url.as_deref())))
+            .or_else(|| non_empty(self.relay_url.as_deref()))
     }
 }
 
@@ -797,5 +867,63 @@ master = "10.0.0.5:8088"
         std::env::remove_var(env_key);
         let res = resolve_opt_u16(None, &[env_key], None);
         assert_eq!(res, None);
+    }
+
+    #[test]
+    fn test_relay_url_parses_across_master_worker_client_sections() {
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+relay_url = "https://top.relay.example.com"
+
+[master]
+relay_url = "https://master.relay.example.com"
+
+[worker]
+relay_url = "https://worker.relay.example.com"
+
+[client]
+relay_url = "https://client.relay.example.com"
+
+[submit]
+relay_url = "https://submit.relay.example.com"
+
+[status]
+relay_url = "https://status.relay.example.com"
+"#,
+        )
+        .expect("parse toml");
+
+        assert_eq!(
+            parsed.master_relay_url().as_deref(),
+            Some("https://master.relay.example.com")
+        );
+        assert_eq!(
+            parsed.worker_relay_url().as_deref(),
+            Some("https://worker.relay.example.com")
+        );
+        assert_eq!(
+            parsed.submit_relay_url().as_deref(),
+            Some("https://submit.relay.example.com")
+        );
+        assert_eq!(
+            parsed.status_relay_url().as_deref(),
+            Some("https://status.relay.example.com")
+        );
+
+        let client_fallback: ConfigFile = toml::from_str(
+            r#"
+[client]
+relay_url = "https://client.relay.example.com:8443"
+"#,
+        )
+        .expect("parse client section");
+        assert_eq!(
+            client_fallback.submit_relay_url().as_deref(),
+            Some("https://client.relay.example.com:8443")
+        );
+        assert_eq!(
+            client_fallback.status_relay_url().as_deref(),
+            Some("https://client.relay.example.com:8443")
+        );
     }
 }

@@ -208,7 +208,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
-| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 |
+| LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 |
 
 ## Phase 0: integrate open work
@@ -1399,7 +1399,10 @@ Each item below needs a design record before code.
   4. Write a guide in `docs/guides/` for running a self-hosted relay.
 - **Done when:** A `doctor` unit test renders the link column and a warning for a relayed worker. A
   test resolves the relay option to a custom relay map. A live run through a self-hosted relay is
-  recorded with its date.
+  recorded with its date (steps 1 and 2 done in pull request 159; steps 3 and 4 done in
+  [design 0049](design/0049-custom-relay.md) and
+  [docs/guides/self-hosted-relay.md](guides/self-hosted-relay.md); the live relay run is pending
+  for the owner).
 
 ### BENCH-1: Publish benchmarks with the scripts that measured them
 
@@ -1593,3 +1596,9 @@ Add one dated line per finished item, newest last.
 - 2026-11-09: SEC-9 (pull request 154, design 0047) and TEST-19 (pull request 161) were already
   Implemented in the Index; this log records them. REL-4, LINK-1 and BENCH-1 rows no longer say
   "(open)" because their pull requests 155, 159 and 162 are merged.
+- 2026-11-09: LINK-1 steps 3 and 4 are done on branch `claude/link-1-relay`: `--relay-url <URL>`,
+  `RUSTY_GRID_RELAY_URL`, and `relay_url` in `[master]`, `[worker]`, and `[client]` / `[submit]` /
+  `[status]` select `iroh::RelayMode::Custom` on `presets::Minimal` with `https://` and credential
+  validation ([design 0049](design/0049-custom-relay.md)), and
+  [docs/guides/self-hosted-relay.md](guides/self-hosted-relay.md) documents running `iroh-relay`.
+  LINK-1 stays Partial until a live run through a self-hosted relay is recorded by the owner.
