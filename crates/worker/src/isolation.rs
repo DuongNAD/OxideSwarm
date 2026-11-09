@@ -1002,6 +1002,20 @@ pub mod windows {
         fn SetErrorMode(umode: u32) -> u32;
     }
 
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn LogonUserW(
+            lpsz_username: *const u16,
+            lpsz_domain: *const u16,
+            lpsz_password: *const u16,
+            dw_logon_type: u32,
+            dw_logon_provider: u32,
+            ph_token: *mut HANDLE,
+        ) -> i32;
+        fn ImpersonateLoggedOnUser(h_token: HANDLE) -> i32;
+        fn RevertToSelf() -> i32;
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn GetProcessWindowStation() -> HANDLE;
@@ -2312,9 +2326,61 @@ pub mod windows {
                         return None;
                     }
                     apply_current_user_owner_and_default_dacl(restricted_token, user_sid.as_psid());
+
+                    // Allocate a fresh logon session (`LOGON32_LOGON_NEW_CREDENTIALS = 9`,
+                    // `LOGON32_PROVIDER_WINNT50 = 3`) while impersonating `restricted_token`
+                    // (`TokenOwner = CurrentUser`, `BA` deny-only) so `ntoskrnl!ObpCreateDosDevicesDirectory`
+                    // initializes the new logon session's `\Sessions\0\DosDevices\<NewLogonId>`
+                    // (`\??`) with `CurrentUser` in its DACL (unlike the boot-time elevated
+                    // `DosDevices` directory on `windows-latest`, which was created when
+                    // `TokenOwner` was `BUILTIN\Administrators`), without modifying any Object
+                    // Manager DACL.
+                    let u_wide = to_wide(OsStr::new("OxideTask"));
+                    let d_wide = to_wide(OsStr::new("."));
+                    let p_wide = to_wide(OsStr::new("unused"));
+                    let mut logon_token: HANDLE = std::ptr::null_mut();
+                    let _ = ImpersonateLoggedOnUser(restricted_token);
+                    let logon_ok = LogonUserW(
+                        u_wide.as_ptr(),
+                        d_wide.as_ptr(),
+                        p_wide.as_ptr(),
+                        9,
+                        3,
+                        &mut logon_token,
+                    );
+                    let _ = RevertToSelf();
+                    let base_lua_token = if logon_ok != 0 && !logon_token.is_null() {
+                        apply_current_user_owner_and_default_dacl(logon_token, user_sid.as_psid());
+                        let mut lua_logon: HANDLE = std::ptr::null_mut();
+                        let ok2 = CreateRestrictedToken(
+                            logon_token,
+                            LUA_TOKEN,
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            &mut lua_logon,
+                        );
+                        CloseHandle(logon_token);
+                        if ok2 != 0 && !lua_logon.is_null() {
+                            CloseHandle(restricted_token);
+                            apply_current_user_owner_and_default_dacl(
+                                lua_logon,
+                                user_sid.as_psid(),
+                            );
+                            lua_logon
+                        } else {
+                            restricted_token
+                        }
+                    } else {
+                        restricted_token
+                    };
+
                     let mut primary_token: HANDLE = std::ptr::null_mut();
                     let dup_ok = DuplicateTokenEx(
-                        restricted_token,
+                        base_lua_token,
                         TOKEN_ASSIGN_PRIMARY
                             | TOKEN_DUPLICATE
                             | TOKEN_QUERY
@@ -2325,7 +2391,7 @@ pub mod windows {
                         TokenPrimary,
                         &mut primary_token,
                     );
-                    CloseHandle(restricted_token);
+                    CloseHandle(base_lua_token);
                     if dup_ok == 0 || primary_token.is_null() {
                         return None;
                     }
