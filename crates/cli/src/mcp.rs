@@ -310,66 +310,101 @@ impl McpState {
                         let mut guard = self.transport.lock().await;
                         if guard.is_none() {
                             *guard = Some(transport);
+                        } else {
+                            drop(guard);
+                            transport.close().await;
                         }
                         return Ok((resp, false));
                     }
                     Err(rusty_grid_core::protocol::ProtocolError::Io(ref io_err))
                         if !is_idempotent && io_err.kind() == std::io::ErrorKind::TimedOut =>
                     {
+                        transport.close().await;
                         return Err(format!(
                             "Timed out waiting for response from Master at {}",
                             self.master_addr
                         ));
                     }
                     Ok(None) if !is_idempotent => {
+                        transport.close().await;
                         return Err("Master closed connection unexpectedly".to_string());
                     }
                     Err(e) if !is_idempotent => {
+                        transport.close().await;
                         return Err(format!("Failed to receive response from Master: {e}"));
                     }
                     Ok(None) | Err(_) => {
                         // Pooled idle connection was closed, reset, or timed out before replying
                         // to an idempotent request; fall through to open a fresh connection.
+                        transport.close().await;
                         retried_after_pooled_write = true;
                     }
                 }
+            } else {
+                transport.close().await;
             }
         }
 
         // Fresh connection (discovery runs outside `timeout`, connect/handshake bounded by `timeout`)
         let mut transport = self.connect_dedicated_with_timeout(timeout).await?;
 
-        transport
-            .send_msg_with_idle_timeout(message, timeout)
-            .await
-            .map_err(|e| {
-                if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut) {
-                    format!("Timed out sending request to Master at {}", self.master_addr)
-                } else {
-                    format!("Failed to send request to Master: {e}")
-                }
-            })?;
-
-        let response = transport
-            .recv_msg_with_idle_timeout::<ClientResponse>(timeout)
-            .await
-            .map_err(|e| {
-                if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut) {
+        if let Err(e) = transport.send_msg_with_idle_timeout(message, timeout).await {
+            transport.close().await;
+            return Err(
+                if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut)
+                {
                     format!(
-                        "Timed out waiting for response from Master at {}",
+                        "Timed out sending request to Master at {}",
                         self.master_addr
                     )
                 } else {
-                    format!("Failed to receive response from Master: {e}")
-                }
-            })?
-            .ok_or_else(|| "Master closed connection unexpectedly".to_string())?;
+                    format!("Failed to send request to Master: {e}")
+                },
+            );
+        }
+
+        let response = match transport
+            .recv_msg_with_idle_timeout::<ClientResponse>(timeout)
+            .await
+        {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                transport.close().await;
+                return Err("Master closed connection unexpectedly".to_string());
+            }
+            Err(e) => {
+                transport.close().await;
+                return Err(
+                    if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut)
+                    {
+                        format!(
+                            "Timed out waiting for response from Master at {}",
+                            self.master_addr
+                        )
+                    } else {
+                        format!("Failed to receive response from Master: {e}")
+                    },
+                );
+            }
+        };
 
         let mut guard = self.transport.lock().await;
         if guard.is_none() {
             *guard = Some(transport);
+        } else {
+            drop(guard);
+            transport.close().await;
         }
         Ok((response, retried_after_pooled_write))
+    }
+
+    /// Gracefully closes any pooled client connection and drains pending P2P endpoint closes.
+    pub async fn close(&self) {
+        let pooled = self.transport.lock().await.take();
+        if let Some(mut transport) = pooled {
+            transport.close().await;
+        }
+        rusty_grid_core::transport::drain_pending_p2p_client_closes().await;
     }
 
     /// Obtains a dedicated one-off connection (e.g. for long-running streaming/waiting operations).
@@ -1816,7 +1851,9 @@ async fn format_completed_task_result(
                     ))
                 }
             };
-            match crate::blobs::download_outputs(&conn, &result.outputs, &out_dir).await {
+            let dl_res = crate::blobs::download_outputs(&conn, &result.outputs, &out_dir).await;
+            conn.close().await;
+            match dl_res {
                 Ok(paths) => saved_outputs = Some(paths),
                 Err(e) => {
                     return ToolCallResult::error(format!(
@@ -2413,7 +2450,9 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 ))
             }
         };
-        if let Err(e) = crate::blobs::upload_inputs(&conn, &prepared_inputs).await {
+        let up_res = crate::blobs::upload_inputs(&conn, &prepared_inputs).await;
+        conn.close().await;
+        if let Err(e) = up_res {
             return ToolCallResult::error(format!("Failed to upload input files: {e}"));
         }
     }
@@ -2437,7 +2476,9 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 ))
             }
         };
-        match crate::blobs::upload_inputs(&conn, uploads).await {
+        let ws_up_res = crate::blobs::upload_inputs(&conn, uploads).await;
+        conn.close().await;
+        match ws_up_res {
             Ok(stats) => {
                 if let Some(ref mut meta) = ws_meta {
                     meta.uploaded_bytes = stats.bytes;
@@ -3570,6 +3611,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
     }
     drop(out_tx);
     let _ = writer_handle.await;
+    state.close().await;
 
     eprintln!("[mcp] Stdio stream closed, exiting cleanly");
     ExitCode::SUCCESS

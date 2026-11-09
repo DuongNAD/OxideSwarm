@@ -37,7 +37,9 @@ pub async fn with_client_relay_url<F>(relay_url: Option<String>, fut: F) -> F::O
 where
     F: std::future::Future,
 {
-    CLIENT_RELAY_URL.scope(relay_url, fut).await
+    let out = CLIENT_RELAY_URL.scope(relay_url, fut).await;
+    rusty_grid_core::transport::drain_pending_p2p_client_closes().await;
+    out
 }
 
 /// Returns the active client `relay_url` from the task-local scope, or falls back to
@@ -312,69 +314,81 @@ pub async fn connect_master_with_relay(
     };
 
     let mut transport = MessageTransport::with_codec(stream, codec);
-    if let Some(secret) = secret {
-        let hs_res = tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
+    let handshake_and_probe: GridResult<()> = async {
+        if let Some(secret) = secret {
+            let hs_res =
+                tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
+                    .await
+                    .map_err(|_| GridError::Timeout {
+                        operation: "cluster_authentication".into(),
+                        duration_secs: AUTH_TIMEOUT.as_secs(),
+                    })?;
+            let session_key = match hs_res {
+                Ok(key) => key,
+                Err(GridError::HandshakeFailed(detail)) if via_p2p => {
+                    return Err(upgrade_hint(&detail));
+                }
+                Err(GridError::ConnectionClosed) if via_p2p => {
+                    return Err(upgrade_hint("connection closed by peer"));
+                }
+                Err(GridError::Io(e)) if via_p2p => {
+                    return Err(upgrade_hint(&e.to_string()));
+                }
+                Err(other) => return Err(other),
+            };
+            transport.enable_encryption(&session_key, EndpointRole::Client);
+        }
+
+        // Verify protocol version compatibility with a side-effect-free Hello request before any
+        // caller sends a state-changing message (such as SubmitTask or CancelTask). A Master older
+        // than protocol version 6 cannot decode Hello and closes the connection (`ConnectionClosed`,
+        // or a bincode/IO framing error when it dies mid-frame). Those failures of the probe, and
+        // only of the probe, are reported with the "older or newer build" upgrade hint.
+        let probe_future = async {
+            transport
+                .send_msg(&rusty_grid_core::protocol::ClientMessage::Hello)
+                .await?;
+            transport
+                .recv_msg::<rusty_grid_core::protocol::ClientResponse>()
+                .await
+        };
+        let probe_reply = tokio::time::timeout(AUTH_TIMEOUT, probe_future)
             .await
             .map_err(|_| GridError::Timeout {
-                operation: "cluster_authentication".into(),
+                operation: "protocol_version_check".into(),
                 duration_secs: AUTH_TIMEOUT.as_secs(),
+            })?
+            .map_err(|e| match GridError::from(e) {
+                GridError::Framing(detail) => upgrade_hint(&detail),
+                GridError::ConnectionClosed if via_p2p => upgrade_hint("connection closed by peer"),
+                GridError::Io(io_err) if via_p2p => upgrade_hint(&io_err.to_string()),
+                other => other,
             })?;
-        let session_key = match hs_res {
-            Ok(key) => key,
-            Err(GridError::HandshakeFailed(detail)) if via_p2p => {
-                return Err(upgrade_hint(&detail));
+        match probe_reply {
+            Some(rusty_grid_core::protocol::ClientResponse::Hello { .. }) => Ok(()),
+            Some(rusty_grid_core::protocol::ClientResponse::Error { message }) => {
+                if message.contains("Incompatible protocol version") {
+                    Err(GridError::IncompatibleVersion(message))
+                } else {
+                    Err(GridError::ConnectionFailed(message))
+                }
             }
-            Err(GridError::ConnectionClosed) if via_p2p => {
-                return Err(upgrade_hint("connection closed by peer"));
-            }
-            Err(GridError::Io(e)) if via_p2p => {
-                return Err(upgrade_hint(&e.to_string()));
-            }
-            Err(other) => return Err(other),
-        };
-        transport.enable_encryption(&session_key, EndpointRole::Client);
-    }
-
-    // Verify protocol version compatibility with a side-effect-free Hello request before any
-    // caller sends a state-changing message (such as SubmitTask or CancelTask). A Master older
-    // than protocol version 6 cannot decode Hello and closes the connection (`ConnectionClosed`,
-    // or a bincode/IO framing error when it dies mid-frame). Those failures of the probe, and only
-    // of the probe, are reported with the "older or newer build" upgrade hint.
-    let probe_future = async {
-        transport
-            .send_msg(&rusty_grid_core::protocol::ClientMessage::Hello)
-            .await?;
-        transport
-            .recv_msg::<rusty_grid_core::protocol::ClientResponse>()
-            .await
-    };
-    let probe_reply = tokio::time::timeout(AUTH_TIMEOUT, probe_future)
-        .await
-        .map_err(|_| GridError::Timeout {
-            operation: "protocol_version_check".into(),
-            duration_secs: AUTH_TIMEOUT.as_secs(),
-        })?
-        .map_err(|e| match GridError::from(e) {
-            GridError::Framing(detail) => upgrade_hint(&detail),
-            GridError::ConnectionClosed if via_p2p => upgrade_hint("connection closed by peer"),
-            GridError::Io(io_err) if via_p2p => upgrade_hint(&io_err.to_string()),
-            other => other,
-        })?;
-    match probe_reply {
-        Some(rusty_grid_core::protocol::ClientResponse::Hello { .. }) => Ok(transport),
-        Some(rusty_grid_core::protocol::ClientResponse::Error { message }) => {
-            if message.contains("Incompatible protocol version") {
-                Err(GridError::IncompatibleVersion(message))
-            } else {
-                Err(GridError::ConnectionFailed(message))
-            }
+            Some(other) => Err(GridError::UnexpectedMessage {
+                expected: "Hello".into(),
+                actual: format!("{other:?}"),
+            }),
+            None if via_p2p => Err(upgrade_hint("connection closed by peer")),
+            None => Err(GridError::ConnectionClosed),
         }
-        Some(other) => Err(GridError::UnexpectedMessage {
-            expected: "Hello".into(),
-            actual: format!("{other:?}"),
-        }),
-        None if via_p2p => Err(upgrade_hint("connection closed by peer")),
-        None => Err(GridError::ConnectionClosed),
+    }
+    .await;
+
+    match handshake_and_probe {
+        Ok(()) => Ok(transport),
+        Err(err) => {
+            transport.close().await;
+            Err(err)
+        }
     }
 }
 
