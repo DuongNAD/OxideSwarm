@@ -632,7 +632,7 @@ where
     let mut payload_buf = [0u8; PRE_AUTH_MAX_FRAME];
     hs.read_message(body, &mut payload_buf).map_err(|_| {
         GridError::AuthFailed(
-            "the master did not prove knowledge of the pinned --master-key (public key mismatch)"
+            "the master could not be authenticated (wrong pinned key or altered handshake)"
                 .to_string(),
         )
     })?;
@@ -819,7 +819,7 @@ where
         return Err(reject_peer(
             t,
             REJECT_WRONG_MASTER_KEY,
-            "Noise IK message 1 decryption failed (peer's pinned master key does not match this master)",
+            "Noise IK message 1 decryption failed (wrong pinned key or altered handshake)",
         )
         .await);
     }
@@ -1178,11 +1178,83 @@ mod tests {
             "{client_err:?}"
         );
         assert!(
-            client_err.to_string().contains("master-key")
-                || client_err.to_string().contains("public key"),
-            "error must clearly mention master key mismatch: {client_err}"
+            client_err.to_string().contains(
+                "the master could not be authenticated (wrong pinned key or altered handshake)"
+            ),
+            "error must use neutral authentication failure wording: {client_err}"
         );
+        assert!(!client_err.to_string().contains("re-join"), "{client_err}");
         assert!(matches!(srv_err, GridError::AuthFailed(_)), "{srv_err:?}");
+    }
+
+    #[tokio::test]
+    async fn hello_altered_in_transit_fails_at_message_1() {
+        let master_kp = keypair(25);
+        let worker_kp = keypair(26);
+        let allowed_pub = *worker_kp.public_key();
+        let master_pub = *master_kp.public_key();
+
+        let (mut real_client, mut proxy_c) = pair();
+        let (mut proxy_s, mut real_server) = pair();
+
+        let client_task = tokio::spawn(async move {
+            v3_client_handshake(
+                &mut real_client,
+                &worker_kp,
+                &master_pub,
+                HandshakePurpose::Member,
+            )
+            .await
+        });
+        let server_task = tokio::spawn(async move {
+            v3_server_handshake(&mut real_server, &master_kp, |pk| *pk == allowed_pub).await
+        });
+
+        let orig_hello = proxy_c.recv_raw_frame().await.unwrap().unwrap();
+        let msg1 = proxy_c.recv_raw_frame().await.unwrap().unwrap();
+
+        // Alter the cleartext HELLO in transit into another syntactically valid v3 Member HELLO
+        // (`[0x01]` instead of `b"member"` for purpose), so the server's prologue differs from
+        // the client's prologue and Noise IK message 1 must fail AEAD verification.
+        let ver_bytes = PROTOCOL_VERSION_CURRENT.to_be_bytes();
+        let altered_hello = auth_frame(KIND_HELLO, &[&[AUTH_VERSION_V3], &ver_bytes, &[0x01]]);
+        assert_ne!(orig_hello, altered_hello);
+        assert_eq!(
+            parse_v3_hello_body(&altered_hello[2..]),
+            Some((PROTOCOL_VERSION_CURRENT, HandshakePurpose::Member))
+        );
+
+        proxy_s.send_raw_frame(altered_hello).await.unwrap();
+        proxy_s.send_raw_frame(msg1).await.unwrap();
+
+        let reject = proxy_s.recv_raw_frame().await.unwrap().unwrap();
+        proxy_c.send_raw_frame(reject).await.unwrap();
+
+        let srv_err = server_task
+            .await
+            .unwrap()
+            .expect_err("server must reject message 1 when HELLO was altered in transit");
+        assert!(
+            srv_err
+                .to_string()
+                .contains("Noise IK message 1 decryption failed"),
+            "unexpected server error: {srv_err}"
+        );
+
+        let client_err = client_task
+            .await
+            .unwrap()
+            .expect_err("client must fail when HELLO was altered in transit");
+        assert!(
+            client_err.to_string().contains(
+                "the master could not be authenticated (wrong pinned key or altered handshake)"
+            ),
+            "expected neutral authentication failure wording, got: {client_err}"
+        );
+        assert!(
+            !client_err.to_string().contains("re-join"),
+            "must not blame wrong key / re-join when handshake may be altered: {client_err}"
+        );
     }
 
     #[tokio::test]

@@ -200,11 +200,19 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         ]
     });
     let members_path = master_home.path().join(".oxideswarm").join("members.json");
-    fs::write(
-        &members_path,
-        serde_json::to_string_pretty(&members_json).unwrap(),
-    )
-    .unwrap();
+    let members_raw = serde_json::to_string_pretty(&members_json).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&members_path, &members_raw).unwrap();
+        fs::set_permissions(&members_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        rusty_grid_core::private_file::write_private_replace(&members_path, members_raw.as_bytes())
+            .unwrap();
+    }
+    assert_private(&members_path);
 
     // 3. Start Master (default --auth both) on 127.0.0.1:0.
     let port_file = master_home.path().join("master.port");
@@ -419,15 +427,18 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         .arg(worker_c_home.path().join("sandbox"));
     let worker_c = Service::spawn(worker_c_cmd, worker_c_home.path().join("worker-c.log"));
 
+    let expected_c_reason = format!(
+        "peer member {} (public key {}) is not in members.json",
+        worker_c_kp.member_id(),
+        worker_c_kp.public_key().to_hex()
+    );
     assert!(
         wait_for(Duration::from_secs(15), || {
-            let log = worker_c.log();
-            log.contains("not an enrolled member of this cluster")
-                || log.contains("Authentication failed")
+            master.log().contains(&expected_c_reason)
         }),
-        "worker-c was not refused; worker-c log:\n{}\nmaster log:\n{}",
-        worker_c.log(),
-        master.log()
+        "master log did not record worker-c's 'not in members.json' refusal:\nmaster log:\n{}\nworker-c log:\n{}",
+        master.log(),
+        worker_c.log()
     );
 
     let status_out = seen.run(with(
@@ -448,6 +459,11 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         text(&status_out.stdout)
     );
 
+    let master_log = master.log();
+    let worker_a_log = worker_a.log();
+    let worker_b_log = worker_b.log();
+    let worker_c_log = worker_c.log();
+
     drop(worker_c);
     drop(worker_b);
     drop(worker_a);
@@ -455,7 +471,7 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
 
     // 7. Start a master with `--auth members` and verify Worker B (v2 shared secret) is refused
     //    with the distinct reason "this master admits enrolled machines only; join with an invite",
-    //    while Worker A (v3 enrolled member) is admitted.
+    //    while Worker A (v3 enrolled member) registers and runs a task.
     let port_file_2 = master_home.path().join("master2.port");
     let mut master2_cmd = cli(master_home.path());
     master2_cmd
@@ -520,21 +536,73 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         text(&v2_status.stderr)
     );
 
-    // Meanwhile, enrolled v3 client succeeds against `--auth members`.
-    let v3_status = seen.run(with(
-        client_a_home.path(),
-        &[
-            "status",
+    // Meanwhile, under `--auth members`, Worker A (v3) registers and executes a task.
+    let mut worker_a2_cmd = cli(worker_a_home.path());
+    worker_a2_cmd
+        .args([
+            "worker",
+            "--name",
+            "worker-a",
             "--master",
             &addr2,
             "--master-key",
             &master_pub_hex,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(worker_a_home.path().join("sandbox2"));
+    let worker_a2 = Service::spawn(worker_a2_cmd, worker_a_home.path().join("worker-a2.log"));
+
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let out = seen.run(with(
+                client_a_home.path(),
+                &[
+                    "status",
+                    "--workers",
+                    "--json",
+                    "--master",
+                    &addr2,
+                    "--master-key",
+                    &master_pub_hex,
+                ],
+            ));
+            out.status.success() && text(&out.stdout).contains("\"worker-a\"")
+        }),
+        "worker-a did not register under --auth members:\nmaster2 log:\n{}\nworker-a2 log:\n{}",
+        master2.log(),
+        worker_a2.log()
+    );
+
+    let sub_a2 = seen.run(with(
+        client_a_home.path(),
+        &[
+            "submit",
+            "--master",
+            &addr2,
+            "--master-key",
+            &master_pub_hex,
+            "--worker",
+            "worker-a",
+            "--wait",
+            "--json",
+            "--",
+            "echo",
+            "ran-on-worker-a-members-only",
         ],
     ));
     assert!(
-        v3_status.status.success(),
-        "enrolled v3 client failed against --auth members:\n{}",
-        text(&v3_status.stderr)
+        sub_a2.status.success(),
+        "submit to worker-a under --auth members failed:\n{}\n{}",
+        text(&sub_a2.stdout),
+        text(&sub_a2.stderr)
+    );
+    assert!(
+        text(&sub_a2.stdout).contains("ran-on-worker-a-members-only"),
+        "expected task output from worker-a under --auth members, got: {}",
+        text(&sub_a2.stdout)
     );
 
     // 8. Ensure no secret or private key material ever appeared in any output or log.
@@ -555,7 +623,16 @@ fn test_enroll_v3_and_v2_coexistence_and_members_only_mode() {
         .trim()
         .to_string();
 
-    for output in seen.0.iter().chain([&master2.log(), &worker_b2.log()]) {
+    let service_logs = [
+        master_log,
+        worker_a_log,
+        worker_b_log,
+        worker_c_log,
+        master2.log(),
+        worker_a2.log(),
+        worker_b2.log(),
+    ];
+    for output in seen.0.iter().chain(service_logs.iter()) {
         for sensitive in [
             &secret_hex,
             &master_priv_hex,

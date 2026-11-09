@@ -648,8 +648,7 @@ pub(crate) fn error_from_reject(body: &[u8]) -> GridError {
              the master and on this node"
         )),
         REJECT_WRONG_MASTER_KEY => GridError::AuthFailed(
-            "the master's public key does not match the pinned --master-key; check the master's v3 \
-             public key or re-join the cluster"
+            "the master could not be authenticated (wrong pinned key or altered handshake)"
                 .to_string(),
         ),
         r if r.starts_with("Incompatible protocol version ") => {
