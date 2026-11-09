@@ -50,6 +50,8 @@ if [ -z "$ROOT" ]; then
 fi
 
 [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+# A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
+[ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
 
 ARCHIVE=""
@@ -122,13 +124,30 @@ if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
   fail "join failed (see the message above); nothing was started"
 fi
 
+# The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
+# machines cannot reach each other directly (school or office Wi-Fi with client isolation), the
+# client checks below must use that ticket too. A ticket is an address, not a credential.
+TICKET=$(awk '
+  /^\[/ { in_worker = ($0 ~ /^\[worker\][[:space:]]*$/) }
+  in_worker && /^[[:space:]]*p2p_ticket[[:space:]]*=/ {
+    v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+    if (v ~ /^'"'"'.*'"'"'$/ || v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+    print v; exit
+  }' "$STATE/rusty-grid.toml" 2>/dev/null || true)
+if [ -n "$TICKET" ]; then
+  say "  link:    P2P ticket (the worker and the checks connect through iroh)"
+fi
+
 # 5. Worker options.
 if [ -z "$NAME" ]; then
   NAME=$(hostname -s 2>/dev/null || hostname)
   NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
   [ -n "$NAME" ] || NAME=worker
 fi
-WORKER_ARGS="worker --name $NAME --no-portal"
+# Use at most half of the CPU cores, so the machine stays responsive for its owner.
+if [ "$OS" = Darwin ]; then CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 2); else CORES=$(nproc 2>/dev/null || echo 2); fi
+SLOTS=$((CORES / 2)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi
@@ -152,12 +171,13 @@ if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
   kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
 fi
 
-# 7. Wait until the master lists it.
+# 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
+# informational logs to standard output, and iroh logs an error line when a client exits.
 CONNECTED=0
 i=0
 while [ $i -lt 30 ]; do
   # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-  if "$BIN" workers --json 2>/dev/null | awk -v n="$NAME" '
+  if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" workers --json --master "$TICKET"; else RUST_LOG=off "$BIN" workers --json; fi; } 2>/dev/null | awk -v n="$NAME" '
       /"name":/ { v = $2; gsub(/[",]/, "", v); cur = v }
       /"state:connected"/ && cur == n { found = 1 }
       END { exit !found }'; then
@@ -224,7 +244,7 @@ fi
 # 9. Check the cluster.
 say ""
 say "Checking the cluster (oxideswarm doctor) ..."
-if "$BIN" doctor; then
+if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" doctor --master "$TICKET"; else RUST_LOG=off "$BIN" doctor; fi; }; then
   DOCTOR="passed"
 else
   DOCTOR="reported a problem (see above)"

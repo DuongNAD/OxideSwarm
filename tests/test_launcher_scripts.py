@@ -545,11 +545,20 @@ class ShellLauncherTests(unittest.TestCase):
 # the worker it runs, in the layout the installer parses.
 FAKE_KIT_BINARY = """#!/bin/bash
 echo "$*" >> "${FAKE_ARGS_LOG:?}"
+case "$1" in workers|doctor) echo "$1 RUST_LOG=${RUST_LOG:-}" >> "$FAKE_ARGS_LOG.env" ;; esac
 case "$1" in
   --version) echo "rusty-grid 9.9.9"; exit 0 ;;
   join)
     tok=$(cat)
-    case "$tok" in oxs1-join:*) touch "$OXIDESWARM_HOME/joined"; exit 0 ;; *) echo "bad token" >&2; exit 3 ;; esac ;;
+    case "$tok" in
+      oxs1-join:*)
+        touch "$OXIDESWARM_HOME/joined"
+        if [ -n "${FAKE_TICKET:-}" ]; then
+          printf "[worker]\\np2p_ticket = '%s'\\n" "$FAKE_TICKET" > "$OXIDESWARM_HOME/rusty-grid.toml"
+        fi
+        exit 0 ;;
+      *) echo "bad token" >&2; exit 3 ;;
+    esac ;;
   worker)
     shift
     while [ $# -gt 0 ]; do [ "$1" = "--name" ] && echo "$2" > "$OXIDESWARM_HOME/fake_worker_name"; shift; done
@@ -673,6 +682,71 @@ class UsbKitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertFalse(os.path.exists(root))
         self.assertTrue(wait_until(lambda: not pid_alive(pid), timeout=10), "the worker kept running")
+
+    def test_install_uses_the_saved_p2p_ticket_for_its_checks(self):
+        # On a network where the machines cannot reach each other (client isolation), the worker
+        # goes through the ticket that join saved, and so must the installer's checks.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        ticket = '{"id":"00ff","addrs":[]}'
+        env = dict(self.env(), FAKE_TICKET=ticket)
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-p2p"],
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("P2P ticket", res.stdout)
+        calls = [line for line in read(self.args_log).splitlines() if line.strip()]
+        self.assertIn("workers --json --master " + ticket, calls)
+        self.assertIn("doctor --master " + ticket, calls)
+
+    def test_install_checks_run_without_log_lines(self):
+        # Release 0.1.x writes informational logs to standard output: the installer's checks
+        # must run with RUST_LOG=off, or the JSON listing and the doctor output carry log lines.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-quiet"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        calls = [line for line in read(self.args_log + ".env").splitlines() if line.strip()]
+        self.assertTrue(any(c.startswith("workers ") for c in calls), calls)
+        self.assertTrue(any(c.startswith("doctor ") for c in calls), calls)
+        for call in calls:
+            self.assertTrue(call.endswith("RUST_LOG=off"), call)
+
+    def test_windows_installer_escapes_the_ticket_and_silences_logs(self):
+        # Windows PowerShell 5.1 drops the inner double quotes of a native argument, which turns
+        # the JSON ticket into an unreadable master address. The fix is static text here; the
+        # live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("PSNativeCommandArgumentPassing", text)
+        self.assertIn("$ticket.Replace('\"', '\\\"')", text)
+        self.assertIn("$checkArgs = @('--master', $ticketArg)", text)
+        start = text.index("Start-Process -FilePath 'wscript.exe'")
+        quiet = text.index("$env:RUST_LOG = 'off'")
+        listing = text.index("workers --json @checkArgs")
+        self.assertTrue(start < quiet < listing, "RUST_LOG=off must be set after the worker starts and before the checks")
+
+    def test_trial_kit_adds_no_autostart_and_caps_concurrency(self):
+        # A kit for someone else's machine (make_kit.sh --no-autostart) must not add a start at
+        # login, and the worker must leave half the cores free.
+        self.assertEqual(self.make_kit(extra=["--no-autostart"]).returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        self.assertTrue(os.path.isfile(os.path.join(kit, "no-autostart")))
+        root = os.path.join(self.tmp, "install-root")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--name", "kit-trial"],
+                             env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("autostart: skipped", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library", "LaunchAgents")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "systemd")))
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--max-concurrency " in worker_calls[0], worker_calls)
 
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)

@@ -41,6 +41,7 @@ use rusty_grid_core::capabilities::{
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
+use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose, NodeKeypair, PublicKey};
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, is_protocol_version_compatible, master_features,
     EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
@@ -503,11 +504,18 @@ pub struct WorkerConfig {
     /// re-established. `None` (default): [`DEAD_PEER_HEARTBEAT_FACTOR`] heartbeat intervals, at
     /// least [`MIN_DEAD_PEER_TIMEOUT`].
     pub dead_peer_timeout: Option<Duration>,
-    /// Shared cluster secret. When set, the worker proves knowledge of it to the Master
-    /// (`rusty_grid_core::cluster_auth`) on every connect and reconnect, TCP and P2P alike, before
-    /// it sends `Register`, and refuses a Master that cannot prove it holds the same secret. A
-    /// worker without a secret only joins masters that run without one.
+    /// Shared cluster secret. When set (and `master_public_key` is not set), the worker proves
+    /// knowledge of it to the Master (`rusty_grid_core::cluster_auth`) on every connect and
+    /// reconnect, TCP and P2P alike, before it sends `Register`, and refuses a Master that cannot
+    /// prove it holds the same secret. A worker without a secret or pinned master key only joins
+    /// masters that run without authentication.
     pub cluster_secret: Option<ClusterSecret>,
+    /// Static per-machine X25519 key pair (`~/.oxideswarm/node.key`) used for the OXS-AUTH v3
+    /// (Noise `IK`) handshake when `master_public_key` is configured.
+    pub node_key: Option<NodeKeypair>,
+    /// Pinned static X25519 public key of the Master (`--master-key`, `RUSTY_GRID_MASTER_KEY`, or
+    /// `master_key` in config). When set, the worker authenticates with OXS-AUTH v3 instead of v2.
+    pub master_public_key: Option<PublicKey>,
     /// Live battery / thermal state shared with whoever can read it (the Android app, via the JNI
     /// bridge). When set, the worker neither polls the OS itself nor trusts the snapshot taken at
     /// startup: it registers with the handle's state, gates incoming tasks on it, and reports every
@@ -610,6 +618,8 @@ impl WorkerConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             dead_peer_timeout: None,
             cluster_secret: None,
+            node_key: None,
+            master_public_key: None,
             mobile_telemetry: None,
             tags: Vec::new(),
             sandbox_base_dir: None,
@@ -800,6 +810,25 @@ impl WorkerConfig {
     /// Makes the worker authenticate to the Master with `secret` before registering.
     pub fn with_cluster_secret(mut self, secret: ClusterSecret) -> Self {
         self.cluster_secret = Some(secret);
+        self
+    }
+
+    /// Sets the worker's static X25519 key pair for OXS-AUTH v3 (Noise `IK`).
+    pub fn with_node_key(mut self, node_key: NodeKeypair) -> Self {
+        self.node_key = Some(node_key);
+        self
+    }
+
+    /// Sets the Master's pinned static X25519 public key for OXS-AUTH v3 (Noise `IK`).
+    pub fn with_master_public_key(mut self, master_public_key: PublicKey) -> Self {
+        self.master_public_key = Some(master_public_key);
+        self
+    }
+
+    /// Configures both the worker's `node.key` and the Master's pinned public key for OXS-AUTH v3.
+    pub fn with_v3_auth(mut self, node_key: NodeKeypair, master_public_key: PublicKey) -> Self {
+        self.node_key = Some(node_key);
+        self.master_public_key = Some(master_public_key);
         self
     }
 
@@ -1418,12 +1447,19 @@ impl Drop for WorkerClient {
 /// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
 /// level (`iso:<level>`), its probed host tools (`tool:<name>`), then the
 /// configured user tags that are not among them.
+///
+/// On Windows, when the worker process is elevated (`elevated_on_windows`) and `isolation` is
+/// `Fs` or `FsNet`, `"tool:cargo"` is omitted because opening `NUL` (`\??\NUL`, used by
+/// `Stdio::null()` inside `cargo`) fails with `Access is denied (os error 5)` inside an
+/// AppContainer under an elevated logon session (design 0033 D4).
 fn advertised_tags(
     user_tags: &[String],
     slots: usize,
     isolation: IsolationLevel,
     tool_tags: &[String],
+    elevated_on_windows: bool,
 ) -> Vec<String> {
+    let drop_cargo = elevated_on_windows && isolation != IsolationLevel::Off;
     let mut tags = rusty_grid_core::placement::system_tags();
     tags.push(format!(
         "{}{}",
@@ -1432,6 +1468,9 @@ fn advertised_tags(
     ));
     tags.push(isolation.tag());
     for tag in tool_tags {
+        if drop_cargo && tag == "tool:cargo" {
+            continue;
+        }
         if tag.starts_with(rusty_grid_core::placement::TOOL_TAG_PREFIX) && !tags.contains(tag) {
             tags.push(tag.clone());
         }
@@ -1489,11 +1528,30 @@ impl WorkerClient {
             })
             .max(1);
         let tool_tags = capabilities.tags.clone();
+        let elevated_on_windows = {
+            #[cfg(windows)]
+            {
+                crate::isolation::windows::is_process_elevated()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        if elevated_on_windows && config.isolation != IsolationLevel::Off {
+            warn!(
+                worker_id = %worker_id,
+                isolation = %config.isolation,
+                "Worker is running under an elevated Windows token with --isolation {}; cargo and other programs that open NUL (\\??\\NUL) will fail with Access is denied (os error 5) because the elevated logon session's DosDevices directory has no ACE for CurrentUser. Run the worker non-elevated; dropping tool:cargo from advertised tags",
+                config.isolation
+            );
+        }
         capabilities = capabilities.with_tags(advertised_tags(
             &config.tags,
             concurrency_permits,
             config.isolation,
             &tool_tags,
+            elevated_on_windows,
         ));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
@@ -1956,14 +2014,6 @@ impl WorkerClient {
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.
         if self.config.isolation != IsolationLevel::Off {
-            if cfg!(windows) && self.config.workspaces {
-                let err = GridError::Config(
-                    "--workspaces cannot be combined with --isolation fs|fs+net on Windows yet (cargo under Windows isolation is FEAT-3d); start the worker with --isolation off or without --workspaces"
-                        .to_string(),
-                );
-                error!(worker_id = %self.worker_id, error = %err, "Task isolation with workspaces cannot be enforced on Windows");
-                return Err(err);
-            }
             if let Err(err) = crate::isolation::verify_isolation_support_with_config(
                 self.config.isolation,
                 &self.runner.config().sandbox_config.base_dir,
@@ -3629,7 +3679,28 @@ impl WorkerClient {
         &self,
         transport: &mut MessageTransport<S>,
     ) -> GridResult<Duration> {
-        if let Some(secret) = self.config.cluster_secret.as_ref() {
+        if let Some(master_pub) = self.config.master_public_key.as_ref() {
+            let node_key = self.config.node_key.as_ref().ok_or_else(|| {
+                GridError::Config(
+                    "master_public_key is set on WorkerConfig without node_key; pass both via WorkerConfig::with_v3_auth".into(),
+                )
+            })?;
+            let session_key = tokio::time::timeout(
+                self.config.handshake_timeout,
+                v3_client_handshake(transport, node_key, master_pub, HandshakePurpose::Member),
+            )
+            .await
+            .map_err(|_| GridError::Timeout {
+                operation: "cluster_authentication".into(),
+                duration_secs: self.config.handshake_timeout.as_secs(),
+            })??;
+            debug!(
+                worker_id = %self.worker_id,
+                member_id = %node_key.member_id(),
+                "Master authenticated via OXS-AUTH v3 (Noise IK)"
+            );
+            transport.enable_encryption(&session_key, EndpointRole::Client);
+        } else if let Some(secret) = self.config.cluster_secret.as_ref() {
             // Upgrade transport to AEAD record layer upon successful authentication.
             let session_key = tokio::time::timeout(
                 self.config.handshake_timeout,
@@ -7927,6 +7998,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_perform_handshake_master_public_key_without_node_key_returns_config_error() {
+        let master_kp = NodeKeypair::generate().unwrap();
+        let mut config =
+            WorkerConfig::new("127.0.0.1:8088").with_master_public_key(*master_kp.public_key());
+        config.node_key = None;
+        let client = WorkerClient::new(config);
+        let (a, _b) = tokio::io::duplex(4096);
+        let mut transport = MessageTransport::new(a);
+        let err = client
+            .perform_handshake(&mut transport)
+            .await
+            .expect_err("master_public_key without node_key must return GridError::Config");
+        assert!(matches!(err, GridError::Config(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("with_v3_auth"),
+            "unexpected error message: {err}"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn test_windows_worker_task_running_junk_exe_fails_fast_without_error_dialog() {
@@ -8104,5 +8195,58 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), portal_handle).await;
+    }
+
+    #[test]
+    fn test_advertised_tags_drops_tool_cargo_on_elevated_windows_worker_with_isolation() {
+        let tool_tags = vec![
+            "tool:cargo".to_string(),
+            "tool:rustc".to_string(),
+            "tool:git".to_string(),
+        ];
+        let user_tags = vec!["custom-tag".to_string()];
+
+        // Non-elevated with isolation Fs or FsNet keeps tool:cargo.
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            let tags = advertised_tags(&user_tags, 4, level, &tool_tags, false);
+            assert!(
+                tags.iter().any(|t| t == "tool:cargo"),
+                "non-elevated worker with isolation {level} must keep tool:cargo: {tags:?}"
+            );
+            assert!(tags.iter().any(|t| t == "tool:rustc"));
+            assert!(tags.iter().any(|t| t == "tool:git"));
+        }
+
+        // Elevated with IsolationLevel::Off keeps tool:cargo.
+        let off_elevated = advertised_tags(&user_tags, 4, IsolationLevel::Off, &tool_tags, true);
+        assert!(
+            off_elevated.iter().any(|t| t == "tool:cargo"),
+            "elevated worker with --isolation off must keep tool:cargo: {off_elevated:?}"
+        );
+
+        // Elevated with IsolationLevel::Fs or IsolationLevel::FsNet drops tool:cargo while keeping
+        // tool:rustc, tool:git, iso:<level>, slots:4, and custom user tags.
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let tags = advertised_tags(&user_tags, 4, level, &tool_tags, true);
+            assert!(
+                !tags.iter().any(|t| t == "tool:cargo"),
+                "elevated worker with --isolation {level} must drop tool:cargo: {tags:?}"
+            );
+            assert!(
+                tags.iter().any(|t| t == "tool:rustc"),
+                "elevated worker with --isolation {level} must retain tool:rustc: {tags:?}"
+            );
+            assert!(
+                tags.iter().any(|t| t == "tool:git"),
+                "elevated worker with --isolation {level} must retain tool:git: {tags:?}"
+            );
+            assert!(tags.iter().any(|t| t == &level.tag()));
+            assert!(tags.iter().any(|t| t == "slots:4"));
+            assert!(tags.iter().any(|t| t == "custom-tag"));
+        }
     }
 }

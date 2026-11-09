@@ -27,6 +27,32 @@ oxideswarm secret join-token --master <MASTER_IP>:8088 | bash packaging/usb/make
 `SHA256SUMS`. `--archives <DIR>` takes them from a folder instead, and `--replace` replaces an
 existing kit.
 
+For a trial on someone else's machine, add `--no-autostart`. The kit then holds a `no-autostart`
+file, and its installers add no start at login: the worker stops at logout or shutdown, and nothing
+stays behind once the uninstaller has run.
+
+## Networks where machines cannot see each other
+
+On school, office or café Wi-Fi, the machines often cannot reach each other directly (client
+isolation). In that case, connect through iroh P2P instead of a LAN address:
+
+1. Start the master with P2P. It needs outbound Internet access to the public relays:
+
+   ```bash
+   oxideswarm master --listen 0.0.0.0:8088 --p2p --p2p-ticket-file ~/.oxideswarm/master_ticket.txt
+   ```
+
+2. Make the kit from a token that carries the ticket. With no `--master`, the token holds only the
+   ticket:
+
+   ```bash
+   oxideswarm secret join-token --p2p-ticket-file ~/.oxideswarm/master_ticket.txt | bash packaging/usb/make_kit.sh /Volumes/<STICK> --version <VERSION>
+   ```
+
+The installer saves the ticket, and the worker and the installer's checks connect through it, either
+directly or through a relay. The master keeps the same ticket across restarts as long as
+`master_key.bin` is kept. Check the network's rules before you run a cluster on it.
+
 ## Use it on a new machine
 
 - **macOS:** double-click `Install OxideSwarm.command`.
@@ -42,6 +68,8 @@ Each installer does the following, without administrator rights:
    changed.
 4. It starts the worker:
    - with the machine's name and `--no-portal`;
+   - with `--max-concurrency` set to half of the CPU cores (at least 1), so the machine stays
+     responsive for its owner;
    - with `--workspaces` when `cargo` is on `PATH`;
    - with `--isolation fs` on macOS and Linux, falling back to `off` if the worker cannot start with
      it.
@@ -49,8 +77,13 @@ Each installer does the following, without administrator rights:
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.
 
-`install.sh --no-autostart` and `install.ps1 -NoAutostart` skip the start at login. `--name` and
-`--install-root` (`-Name` and `-InstallRoot` on Windows) change the defaults.
+`install.sh --no-autostart` and `install.ps1 -NoAutostart` skip the start at login, as does a
+`no-autostart` file in the kit. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
+Windows) change the defaults.
+
+The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
+logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P
+ticket before it passes the ticket to `oxideswarm`, because PowerShell 5.1 drops them.
 
 ## Security
 
@@ -67,3 +100,5 @@ Each installer does the following, without administrator rights:
 `python3 tests/test_launcher_scripts.py` (class `UsbKitTests`) runs `make_kit.sh`, `install.sh` and
 `uninstall.sh` against fake binaries in a private home directory, on Linux and macOS. The Windows
 scripts were run by hand from a stick on Windows 11 on 2026-11-09: `install.ps1` joined the worker, and `uninstall.ps1` stopped it.
+On 2026-11-10, a P2P-only trial kit made with `--no-autostart` passed under Windows PowerShell 5.1
+through `Install OxideSwarm.cmd` with no manual change, and from a stick on macOS.

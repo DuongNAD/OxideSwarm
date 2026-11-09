@@ -26,10 +26,10 @@ On a macOS or Linux worker machine:
 On a Windows worker machine (PowerShell):
 
 ```powershell
-.\target\release\oxideswarm.exe worker --master <MASTER_IP>:8088 --workspaces
+.\target\release\oxideswarm.exe worker --master <MASTER_IP>:8088 --workspaces --isolation fs
 ```
 
-On macOS and Linux, `--isolation fs` ([design 0033](../design/0033-os-level-task-isolation.md)) confines each workspace task to `<workspace_root>/<WORKSPACE>/tree` and `<workspace_root>/<WORKSPACE>/tmp` while mounting the host's `RUSTUP_HOME` and `CARGO_HOME` read-only (`$CARGO_HOME/credentials.toml` is denied). On Windows, `cargo` cannot run inside the task AppContainer yet (`FEAT-3d`), so a worker started with both `--workspaces` and `--isolation fs|fs+net` refuses to start: a Windows workspace worker runs with `--isolation off`.
+`--isolation fs` ([design 0033](../design/0033-os-level-task-isolation.md)) confines each workspace task to `<workspace_root>/<WORKSPACE>/tree` and `<workspace_root>/<WORKSPACE>/tmp` while granting read-only access to the host's `RUSTUP_HOME` and `CARGO_HOME` (`$CARGO_HOME/credentials.toml` is denied).
 
 ### 2. Check that the worker advertises workspaces and cargo
 
@@ -222,4 +222,3 @@ The run also found that a pipe which closes standard input cancels a running MCP
 | `invalid workspace name '...'` | The workspace name uses uppercase letters, path separators, leading punctuation, or a reserved Windows device name (`con`, `nul`, `com1`, ...) | Use 1 to 64 lowercase ASCII characters from `[a-z0-9][a-z0-9._-]{0,63}` without a trailing `.` or space (`validate_workspace_name` in `crates/core/src/task.rs`). |
 | A second `submit --workspace <NAME>` waits in `Queued` while the first is still running | The scheduler allows at most one active (`Scheduled` or `Running`) task per workspace name at a time so two Cargo processes do not contend on `target/` | Wait for the running task in `<NAME>` to finish, or use a second workspace name (`<NAME>-2`) if you want an independent build tree. |
 | Cargo fails with `attempt to download ...` when `--offline` or `--isolation fs+net` is used | Crate dependencies are not cached in the worker's `$CARGO_HOME` or vendored in the workspace tree | Run once without `--offline` (under `--isolation fs` or `off`) so Cargo populates `$CARGO_HOME/registry`, or vendor dependencies in the repository before running under `--isolation fs+net`. |
-| Windows worker refuses to start when given `--workspaces --isolation fs` | `cargo` cannot run inside the Windows task AppContainer yet (`FEAT-3d`) | Start the Windows workspace worker without `--isolation fs` (`--isolation off`, the default). |

@@ -2658,9 +2658,9 @@ mod tests {
         g.sync(&m1, &Mem::new(v1_files)).unwrap();
         assert_eq!(read(&g, "alias"), "file-body");
 
-        // Sync 2: `ITEM/sub.txt` is a file inside directory `ITEM`, and `alias -> item` (differing
-        // in case from `ITEM`, and changing target kind from file to directory).
-        let v2_files: Files = &[("ITEM/sub.txt", "inside-dir", false)];
+        // Sync 2: `item/sub.txt` is a file inside directory `item`, and `alias -> item` changes
+        // target kind from regular file to directory without changing its target string.
+        let v2_files: Files = &[("item/sub.txt", "inside-dir", false)];
         let m2 = TreeManifest::with_entries(
             manifest(v2_files).into_files(),
             vec![BlobSymlink {
@@ -2674,6 +2674,26 @@ mod tests {
         let meta = fs::symlink_metadata(g.tree_dir().join("alias")).unwrap();
         assert!(symlink_kind_matches(&meta, true));
         assert_eq!(read(&g, "alias/sub.txt"), "inside-dir");
+
+        // Sync 3: `ITEM/sub.txt` differs in case from `alias_folded -> item`; `target_is_dir`
+        // folds case when choosing the symlink kind on Windows, and resolves through
+        // `alias_folded/sub.txt` on case-insensitive filesystems.
+        let v3_files: Files = &[("ITEM/sub.txt", "inside-dir-folded", false)];
+        let m3 = TreeManifest::with_entries(
+            manifest(v3_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias_folded".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m3, &Mem::new(v3_files)).unwrap();
+        let meta = fs::symlink_metadata(g.tree_dir().join("alias_folded")).unwrap();
+        assert!(symlink_kind_matches(&meta, true));
+        if g.tree_dir().join("item").exists() {
+            assert_eq!(read(&g, "alias_folded/sub.txt"), "inside-dir-folded");
+        }
     }
 
     #[test]

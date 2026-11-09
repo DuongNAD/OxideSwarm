@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Machine identity and OXS-AUTH v3 (`ENROLL-1a`): per-machine X25519 static keys (`~/.oxideswarm/node.key` and `master_noise.key`, or in `--state-dir` when set, stored as private files and printed with key fingerprint on master startup), Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication with cleartext `HELLO` prologue and `Split()` key derivation into the `0x04` ChaCha20-Poly1305 record layer, `members.json` read at master startup with worker-role enforcement on `Register`, `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`) ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
+- Windows AppContainer support for offline `cargo` builds and `--workspaces` under `--isolation fs|fs+net` on non-elevated workers (`FEAT-3d`, [design 0033](docs/design/0033-os-level-task-isolation.md) D4, [design 0039](docs/design/0039-agent-workspaces.md)): `<ws>/tree` and `<ws>/tmp` are confined to the per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` while `<ws>/state.json`, `<ws>/lock`, and sibling workspaces stay unreadable and unwritable; `validate_sandbox_base_safe` accepts the default `%TEMP%\rusty_grid\sandboxes` directory under `host.user_home`; and a Windows worker started elevated with `--isolation fs|fs+net` logs a startup warning and omits `tool:cargo` from its advertised capability tags because elevated logon sessions disallow opening `NUL` inside an AppContainer (`crates/worker/src/isolation.rs`, `crates/worker/src/client.rs`, `crates/worker/src/runner.rs`).
+- `packaging/usb/make_kit.sh --no-autostart` writes a trial kit: its installers add no start at login. The kit's workers use half of the CPU cores ([design 0053](docs/design/0053-usb-setup-kit.md)).
+
+### Fixed
+- The Windows USB installer passes a P2P ticket intact under Windows PowerShell 5.1, which dropped its double quotes, and the installers' checks no longer break on log lines that release 0.1.x writes to standard output.
+
+## [0.1.1] - 2026-11-10
+
+A patch release with fixes found while running 0.1.0 on real desktops. The protocol is still
+version 7, so 0.1.0 and 0.1.1 machines work together; upgrade in any order.
+
+### Added
+- The USB setup kit (`packaging/usb/`, [design 0053](docs/design/0053-usb-setup-kit.md)) also works where machines cannot reach each other directly, as on school or office Wi-Fi with client isolation. When the join token carries a P2P ticket (`secret join-token --p2p-ticket-file ...`, from a master started with `--p2p`), the installers run their checks through that ticket, as the worker does.
+
 ### Fixed
 - `oxideswarm workers` printed every registered worker under "Connected Workers", including workers that had disconnected, and `status` counted them as connected. Both now count only workers whose `state:` tag is `connected`, and `workers` marks the others, for example `[disconnected]`. Use `workers --json` in scripts.
 - Stop raising modal pop-up dialogs and Windows Firewall prompts on Windows desktops: workers now call `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)` at start-up (and before bounded capability probes) so child task processes inherit it even with `--isolation off` instead of hanging on 16-bit/64-bit incompatibility or crash dialogs (`crates/core/src/capabilities.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`); a master listening on loopback now binds its UDP discovery socket to that loopback address (`127.0.0.1:<discovery_port>`) instead of `0.0.0.0:<discovery_port>` and answers local unicast probes without sending broadcast beacons (`crates/master/src/server.rs`); and a worker targeting a loopback master binds its standby HTTP portal to `127.0.0.1` instead of `0.0.0.0` (`crates/worker/src/client.rs`).
