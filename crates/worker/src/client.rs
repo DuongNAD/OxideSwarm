@@ -41,9 +41,7 @@ use rusty_grid_core::capabilities::{
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
-use rusty_grid_core::noise_auth::{
-    default_node_key_path, v3_client_handshake, HandshakePurpose, NodeKeypair, PublicKey,
-};
+use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose, NodeKeypair, PublicKey};
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, is_protocol_version_compatible, master_features,
     EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
@@ -3659,20 +3657,14 @@ impl WorkerClient {
         transport: &mut MessageTransport<S>,
     ) -> GridResult<Duration> {
         if let Some(master_pub) = self.config.master_public_key.as_ref() {
-            let node_key = match self.config.node_key.as_ref() {
-                Some(k) => k.clone(),
-                None => {
-                    let path = default_node_key_path().ok_or_else(|| {
-                        GridError::Config(
-                            "Could not determine home directory for ~/.oxideswarm/node.key".into(),
-                        )
-                    })?;
-                    NodeKeypair::load_or_generate_file(&path)?.0
-                }
-            };
+            let node_key = self.config.node_key.as_ref().ok_or_else(|| {
+                GridError::Config(
+                    "master_public_key is set on WorkerConfig without node_key; pass both via WorkerConfig::with_v3_auth".into(),
+                )
+            })?;
             let session_key = tokio::time::timeout(
                 self.config.handshake_timeout,
-                v3_client_handshake(transport, &node_key, master_pub, HandshakePurpose::Member),
+                v3_client_handshake(transport, node_key, master_pub, HandshakePurpose::Member),
             )
             .await
             .map_err(|_| GridError::Timeout {
@@ -7939,6 +7931,26 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(stdout2.as_bytes()).trim(),
             ":built-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_perform_handshake_master_public_key_without_node_key_returns_config_error() {
+        let master_kp = NodeKeypair::generate().unwrap();
+        let mut config =
+            WorkerConfig::new("127.0.0.1:8088").with_master_public_key(*master_kp.public_key());
+        config.node_key = None;
+        let client = WorkerClient::new(config);
+        let (a, _b) = tokio::io::duplex(4096);
+        let mut transport = MessageTransport::new(a);
+        let err = client
+            .perform_handshake(&mut transport)
+            .await
+            .expect_err("master_public_key without node_key must return GridError::Config");
+        assert!(matches!(err, GridError::Config(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("with_v3_auth"),
+            "unexpected error message: {err}"
         );
     }
 }
