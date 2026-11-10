@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `4a07fcb`: 70 items Implemented, 4 Partial and 37 Planned. Five items
+On 2026-11-10, at `master` `a67a3eb`: 70 items Implemented, 4 Partial and 39 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -224,8 +224,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
+| USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Planned |  |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
+| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Planned | (design 0060) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned |  |
@@ -1708,6 +1710,36 @@ owner's decisions Q8, Q9 and Q12 are open.
 - **Done when:** A task submitted at one site runs at a worker of another, and its input blob is not
   sent twice. A site without the forward permission is refused.
 
+### SCHED-4: Place tasks by measured worker speed and re-run stragglers
+
+- **Evidence:** Reproduced on 2026-11-10 on a two-worker cluster over direct P2P links: a desktop
+  (Intel Core i5-14600KF, 20 threads, 10 slots) and a laptop (Intel Core i7-1355U, 2 performance
+  and 8 efficient cores, 12 threads, 6 slots). One PowerShell task that sums 1 to 2,000,000 takes
+  about 2.3 s on the desktop and 3.5 s on the laptop when run alone. A batch of 32 such tasks with no
+  worker pinned put 26 on the desktop (2.4 to 4.6 s each) and 6 on the laptop (about 51 s each), so
+  the batch took 52 s; the desktop alone would have finished in about 12 s. Pinned to the laptop,
+  2, 4 and 6 concurrent tasks took 2.9 s, 12.5 s and 39.6 s each (about 112 MB per task, so not
+  memory). GPU work shows the same gap: a verified 8192 GEMM took 855 ms on an RTX 5060 Ti and
+  11.9 s on an MX550, and 12 unpinned 4096 GEMMs went 9 and 3.
+- **Problem:** `Engine::rank` (`crates/master/src/scheduler.rs`) orders candidates by load per core
+  and reported CPU use; it knows nothing about how fast a worker actually runs a task. Every free
+  slot is filled, so one slow or overloaded worker sets the finish time of a whole batch, and a task
+  stuck on it is never moved while faster workers sit idle.
+- **Do:** follow [design 0060](design/0060-speed-aware-placement.md):
+  1. Record per worker an exponential moving average of the run time of each task key (task type,
+     program and arguments), bounded in size, from the results the master already receives.
+  2. In placement, when a worker's expected run time for the key is at least 1.5 times what a
+     faster matching worker would take, counting the time until that worker frees a slot, leave the
+     task queued for the faster worker. Keys with no history keep today's placement.
+  3. Opt-in straggler re-run: a task the submitter marks as safe to repeat runs a second copy on an
+     idle faster worker once it runs past 3 times the expected time; the first result wins and the
+     other copy is cancelled.
+  4. Show each worker's measured speed in `workers --json` and the dashboard.
+- **Done when:** a scheduler test with one fast and one slow simulated worker shows a batch of
+  identical tasks finishing at least 30 % sooner than with today's placement, unknown keys keep
+  today's placement exactly (the existing scheduler tests pass unchanged), and a live two-machine
+  batch like the one above finishes within 1.5 times the fast machine's own time.
+
 ## Phase 8: product and ecosystem
 
 Draft, added on 2026-11-09 with Phase G of [ROADMAP.md](ROADMAP.md). The items start after the
@@ -1897,6 +1929,24 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
   workspace root never equal `default_root_with(Platform::Windows, ..)` for any case spelling, and a
   live Windows run with a normal worker using the default root plus the USB kit installed and then
   uninstalled leaves the normal worker's workspaces intact.
+
+### USB-4: Size the kit's task slots to the machine's fast cores
+
+- **Evidence:** Measured on 2026-11-10 (see SCHED-4): the kit gives a worker half of the logical
+  processors as task slots (`packaging/usb/install.ps1`, `[Environment]::ProcessorCount / 2`, and
+  the same rule in `install.sh`). On an Intel Core i7-1355U laptop that is 6 slots, and 6 concurrent
+  CPU tasks took 39.6 s each against 2.9 s for 2.
+- **Problem:** Laptop processors with few performance cores, a low power limit and the owner's own
+  programs running slow down far more than linearly when every slot is busy, so the kit's default
+  makes a borrowed laptop both slow for the cluster and sluggish for its owner.
+- **Do:**
+  1. On Windows, count the performance cores (`GetSystemCpuSetInformation`, highest
+     `EfficiencyClass`) and on macOS the performance level (`sysctl hw.perflevel0.logicalcpu`); use
+     their logical processors, at most half of all, as the default slots. Fall back to a quarter of
+     the logical processors when the count is unavailable and the machine has a battery.
+  2. Let `-Slots N` / `--slots N` override it, keep it on `-Update`, and print the chosen value.
+- **Done when:** `tests/test_launcher_scripts.py` covers the rule with fake processor data, and on
+  the i7-1355U laptop the kit picks 4 slots or fewer.
 
 ## Phase 9: an open compute network
 
@@ -2182,3 +2232,7 @@ Add one dated line per finished item, newest last.
   SDDL and leaves no `oxideswarm.toolchain` ACE. Release 0.1.1 lacks BUG-18, and `install.ps1`
   keeps `--workspaces` off under isolation for 0.1.0 and 0.1.1, so a kit needs 0.1.2 or later to
   use both. Added USB-3 (Planned). The Index counts are now 70 Implemented, 4 Partial and 37 Planned.
+- 2026-11-10: Added SCHED-4 ([design 0060](design/0060-speed-aware-placement.md)) and USB-4 (both
+  Planned) from a two-machine trial: a 32-task batch took 52 s because 6 tasks landed on a slow
+  laptop, while the desktop alone would have taken about 12 s. The Index counts are now
+  70 Implemented, 4 Partial and 39 Planned.
