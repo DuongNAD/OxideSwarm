@@ -821,6 +821,16 @@ class UsbKitTests(unittest.TestCase):
         self.assertIn("$settings['slots']", text)
         self.assertNotIn("[Environment]::ProcessorCount / 2", text)
 
+    def test_windows_installers_compare_full_paths_of_localappdata(self):
+        # Windows PowerShell 5.1's GetFullPath expands 8.3 short names (a CI runner's
+        # C:\\Users\\RUNNER~1), so %LOCALAPPDATA% must go through it before any comparison with an
+        # install folder that did; otherwise a folder in %LOCALAPPDATA% looked like one outside it.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("$LocalAppDataFull = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\\')", text)
+        self.assertIn("$InstallRoot.StartsWith($LocalAppDataFull + '\\'", text)
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("[IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm'))", uninstall)
+
     def install(self, *args):
         root = os.path.join(self.tmp, "install-root")
         return root, subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,

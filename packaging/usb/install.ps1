@@ -36,7 +36,10 @@ $Kit = $PSScriptRoot
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 if ($PSBoundParameters.ContainsKey('Slots') -and ($Slots -lt 1 -or $Slots -gt 256)) { Fail "-Slots needs a number from 1 to 256 (got: $Slots)" }
 $slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
-$DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
+# Full form of %LOCALAPPDATA%: GetFullPath on Windows PowerShell 5.1 expands 8.3 short names (a CI
+# runner's C:\Users\RUNNER~1), so both sides of every comparison below go through it.
+$LocalAppDataFull = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
+$DefaultRoot = Join-Path $LocalAppDataFull 'OxideSwarm'
 $PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
@@ -252,7 +255,7 @@ if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected)
     }
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
-$PrivateRoot = $InstallRoot.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+$PrivateRoot = $InstallRoot.StartsWith($LocalAppDataFull + '\', [StringComparison]::OrdinalIgnoreCase)
 if (-not $PrivateRoot) {
     if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
     if (-not $Update) {
