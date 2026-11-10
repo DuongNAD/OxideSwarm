@@ -205,10 +205,11 @@ if (-not $connected) { Fail "the worker runs but the master does not list it yet
 Write-Host "  connected (isolation: $Isolation)"
 
 # 8. Start at logon (current user only, no administrator rights).
+$runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
 if (-not $NoAutostart) {
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    Set-ItemProperty -Path $runKey -Name 'OxideSwarmUsbWorker' -Value ('wscript.exe "' + $vbs + '"')
-    Write-Host "  autostart: HKCU Run entry OxideSwarmUsbWorker"
+    Set-ItemProperty -Path $runKey -Name $runValueName -Value ('wscript.exe "' + $vbs + '"')
+    Write-Host "  autostart: HKCU Run entry $runValueName"
 } else {
     Write-Host "  autostart: skipped (-NoAutostart)"
 }

@@ -16,7 +16,8 @@ if (-not $Yes) {
     $ans = Read-Host "Remove the OxideSwarm worker installed in $InstallRoot? [y/N]"
     if ($ans -notmatch '^(y|yes)$') { Write-Host "Nothing removed."; exit 0 }
 }
-Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OxideSwarmUsbWorker' -ErrorAction SilentlyContinue
+$runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $runValueName -ErrorAction SilentlyContinue
 # Stop the worker by the exact path of this install's binary (never by process name).
 $pidsToWait = @()
 Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $Exe } | ForEach-Object {

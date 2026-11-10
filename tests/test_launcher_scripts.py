@@ -870,6 +870,25 @@ class StaticRepositoryChecks(unittest.TestCase):
             self.assertNotEqual(bad_iso.returncode, 0, bad_iso.stdout)
 
             tmp = tempfile.mkdtemp(prefix="ox_win_usb_test_")
+            tmp_home = os.path.join(tmp, "userprofile")
+            tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
+            tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
+            tmp_temp = os.path.join(tmp_localappdata, "Temp")
+            for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+                os.makedirs(d, exist_ok=True)
+            test_run_val = f"OxideSwarmUsbWorkerTest_{os.getpid()}"
+            ps_env = dict(
+                ps_env,
+                USERPROFILE=tmp_home,
+                HOME=tmp_home,
+                LOCALAPPDATA=tmp_localappdata,
+                APPDATA=tmp_appdata,
+                TEMP=tmp_temp,
+                TMP=tmp_temp,
+                OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            )
+            pids_log = os.path.join(tmp, "spawned_workers.pids")
+            ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
             try:
                 # 1. Verify uninstall.ps1 is idempotent when no manifest file exists in $InstallRoot\home.
                 fake_install = os.path.join(tmp, "win-fake-install")
@@ -905,6 +924,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                 fake_exe = os.path.join(tmp, "oxideswarm.exe")
                 cs_code = r"""
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 public class Program {
@@ -923,6 +943,10 @@ public class Program {
             return 0;
         }
         if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
             if (joined.Contains("--isolation fs") && !string.IsNullOrEmpty(home)) {
                 string dummyTarget = Path.Combine(home, "dummy_toolchain_dir");
                 Directory.CreateDirectory(dummyTarget);
@@ -984,6 +1008,7 @@ public class Program {
                 self.assertIn("connected (isolation: fs)", inst_fs.stdout)
                 vbs_text = read(os.path.join(inst_root_fs, "start-worker.vbs"))
                 self.assertIn("--isolation fs", vbs_text)
+                self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", vbs_text)
                 self.assertTrue(os.path.isfile(os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")))
 
                 uninst_fs = subprocess.run(
@@ -1029,6 +1054,29 @@ public class Program {
                 self.assertIn("No isolation ACL grant manifest", uninst_off.stdout)
                 self.assertFalse(os.path.exists(inst_root_off))
             finally:
+                for pid_candidate in (
+                    pids_log,
+                    os.path.join(tmp, "installed-fs", "run", "worker.pid"),
+                    os.path.join(tmp, "installed-off", "run", "worker.pid"),
+                ):
+                    if os.path.isfile(pid_candidate):
+                        try:
+                            for line in read(pid_candidate).splitlines():
+                                p_str = line.strip()
+                                if p_str.isdigit():
+                                    subprocess.run(
+                                        ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {p_str} -Force -ErrorAction SilentlyContinue"],
+                                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                    )
+                        except Exception:
+                            pass
+                subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-Command",
+                        f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                )
                 shutil.rmtree(tmp, ignore_errors=True)
 
     def test_gitattributes_pins_line_endings(self):
