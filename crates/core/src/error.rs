@@ -324,9 +324,74 @@ impl From<ProtocolError> for GridError {
     }
 }
 
+/// Formats `err` followed by its chain of causes (`source()`), outermost first:
+/// `outer: cause: root cause`. A cause whose text is already part of the message is skipped,
+/// because some errors print their source themselves. Many library errors (iroh's
+/// `BindError::Sockets` prints only "Failed to bind sockets") keep the operating system's
+/// reason in a source, so formatting them with `{e}` alone drops the part a user can act on.
+pub fn display_with_sources(err: &(dyn std::error::Error + 'static)) -> String {
+    /// More causes than this means a broken `source()` implementation, not a useful message.
+    const MAX_CAUSES: usize = 16;
+    let mut out = err.to_string();
+    let mut current = err.source();
+    let mut depth = 0;
+    while let Some(cause) = current {
+        if depth == MAX_CAUSES {
+            break;
+        }
+        let text = cause.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        current = cause.source();
+        depth += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("Failed to bind sockets")]
+    struct BindLike {
+        #[source]
+        source: io::Error,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapper: {source}")]
+    struct PrintsItsSource {
+        #[source]
+        source: io::Error,
+    }
+
+    #[test]
+    fn display_with_sources_appends_the_os_reason() {
+        let err = BindLike {
+            source: io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "Can't assign requested address",
+            ),
+        };
+        assert_eq!(err.to_string(), "Failed to bind sockets");
+        assert_eq!(
+            display_with_sources(&err),
+            "Failed to bind sockets: Can't assign requested address"
+        );
+    }
+
+    #[test]
+    fn display_with_sources_skips_a_cause_already_in_the_message() {
+        let err = PrintsItsSource {
+            source: io::Error::other("permission denied"),
+        };
+        assert_eq!(display_with_sources(&err), "wrapper: permission denied");
+        let plain = io::Error::other("no cause");
+        assert_eq!(display_with_sources(&plain), "no cause");
+    }
 
     #[test]
     fn test_error_display_and_codes() {

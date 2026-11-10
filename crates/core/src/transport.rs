@@ -593,7 +593,10 @@ pub async fn bind_p2p_endpoint_with_relay(
         .bind()
         .await
         .map_err(|e| {
-            crate::GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
+            crate::GridError::ConnectionFailed(format!(
+                "Failed to bind iroh endpoint: {}",
+                crate::error::display_with_sources(&e)
+            ))
         })
 }
 
@@ -607,7 +610,8 @@ pub async fn dial_p2p_endpoint(
     match tokio::time::timeout(connect_timeout, endpoint.connect(node_addr, GRID_ALPN)).await {
         Ok(Ok(c)) => Ok(c),
         Ok(Err(e)) => Err(crate::GridError::ConnectionFailed(format!(
-            "P2P connect failed: {e}"
+            "P2P connect failed: {}",
+            crate::error::display_with_sources(&e)
         ))),
         Err(_) => Err(crate::GridError::Timeout {
             operation: "p2p_connect".into(),
@@ -625,7 +629,8 @@ pub async fn open_p2p_tagged_stream(
 ) -> crate::GridResult<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     let (mut send, recv) = conn.open_bi().await.map_err(|e| {
         crate::GridError::ConnectionFailed(format!(
-            "Failed to open bidirectional {label} stream: {e}"
+            "Failed to open bidirectional {label} stream: {}",
+            crate::error::display_with_sources(&e)
         ))
     })?;
     tokio::io::AsyncWriteExt::write_all(&mut send, &[tag])
@@ -838,6 +843,31 @@ mod tests {
             let parsed = parse_p2p_ticket(&ticket).unwrap();
             assert_eq!(addr, parsed);
             endpoint.close().await;
+        });
+    }
+
+    /// iroh's `BindError` prints only "Failed to bind sockets"; the reason (here: the address
+    /// belongs to no interface of this machine) sits in its source and must reach the message.
+    #[cfg(feature = "p2p")]
+    #[test]
+    fn test_bind_error_message_keeps_the_os_reason() {
+        use iroh::endpoint::presets::Minimal;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a local interface.
+            let err = iroh::Endpoint::builder(Minimal)
+                .clear_ip_transports()
+                .bind_addr("192.0.2.1:0")
+                .unwrap()
+                .bind()
+                .await
+                .expect_err("binding to an address of no local interface must fail");
+            let plain = err.to_string();
+            let full = crate::error::display_with_sources(&err);
+            assert!(
+                full.len() > plain.len() && full.starts_with(&plain),
+                "the OS reason is missing: plain={plain:?} full={full:?}"
+            );
         });
     }
 

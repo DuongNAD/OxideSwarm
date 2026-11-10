@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `packaging/usb/make_kit.sh --no-autostart` writes a trial kit: its installers add no start at login. The kit's workers use half of the CPU cores ([design 0053](docs/design/0053-usb-setup-kit.md)).
 
 ### Fixed
+- P2P errors now include the operating system's reason. A worker or client that could not open its P2P sockets (seen with a VPN active on the machine) only printed `Failed to bind iroh endpoint: Failed to bind sockets`; the message now ends with the cause, for example `: Can't assign requested address`. The same applies to `P2P connect failed` and to opening a QUIC stream (`rusty_grid_core::error::display_with_sources`).
 - The Windows USB installer passes a P2P ticket intact under Windows PowerShell 5.1, which dropped its double quotes, and the installers' checks no longer break on log lines that release 0.1.x writes to standard output.
 - CLI client commands (`doctor`, `workers`, `submit`, `status`, `result`, `cancel`, `workspaces`, `mapreduce`, `join`, `secret`, `mcp`) now close their ephemeral `iroh::Endpoint`s (`P2pClientGuard` and `BlobConnection`) gracefully before exiting instead of logging `ERROR iroh::socket: Endpoint dropped without calling Endpoint::close. Aborting ungracefully.` to `stderr`, and route all client-command tracing to `stderr` so `iroh` `INFO` lines over a P2P ticket never land on `stdout` ahead of `--json` output (`LOG-1`, [design 0039](docs/design/0039-agent-workspaces.md)).
 
