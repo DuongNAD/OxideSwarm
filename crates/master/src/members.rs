@@ -161,12 +161,22 @@ impl Default for MembersFile {
     }
 }
 
+/// Snapshot needed to roll back an approved enrollment if the joining machine subsequently
+/// declines the `[y/N]` pairing confirmation or disconnects before confirming.
+#[derive(Debug, Clone)]
+pub struct ApprovedEnrollmentRollback {
+    pub public_key: PublicKey,
+    pub previous_member: Option<MemberEntry>,
+    pub invite_id: String,
+}
+
 /// Decision delivered to a waiting `ENROLL` connection when an admin approves or rejects it.
 #[derive(Debug, Clone)]
 pub enum PendingDecision {
     Approved {
         member_id: String,
         roles: Vec<MemberRole>,
+        rollback: Box<ApprovedEnrollmentRollback>,
     },
     Rejected {
         message: String,
@@ -194,6 +204,7 @@ pub enum EnrollOutcome {
 
 struct PendingEnrollmentEntry {
     info: PendingEnrollmentInfo,
+    pairing_code: rusty_grid_core::noise_auth::RedactedString,
     decision_tx: oneshot::Sender<PendingDecision>,
 }
 
@@ -1105,7 +1116,6 @@ impl MemberStore {
             arch: clean_arch,
             roles: invite.roles.clone(),
             invite_id: invite.invite_id.clone(),
-            pairing_code,
             master_fingerprint: sanitize_display_field(master_fingerprint, 64),
             remote_addr: sanitize_display_field(remote_addr, 128),
             requested_at: now,
@@ -1114,7 +1124,11 @@ impl MemberStore {
         let (decision_tx, decision_rx) = oneshot::channel();
         guard.pending.insert(
             pending_id.clone(),
-            PendingEnrollmentEntry { info, decision_tx },
+            PendingEnrollmentEntry {
+                info,
+                pairing_code,
+                decision_tx,
+            },
         );
         Ok(EnrollOutcome::Pending {
             pending_id,
@@ -1160,7 +1174,7 @@ impl MemberStore {
         let expected_code_matches = guard
             .pending
             .get(&id)
-            .is_some_and(|e| verify_pairing_code(e.info.pairing_code.as_str(), pairing_code));
+            .is_some_and(|e| verify_pairing_code(e.pairing_code.as_str(), pairing_code));
         if !expected_code_matches {
             return Err(GridError::Config(format!(
                 "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
@@ -1208,7 +1222,7 @@ impl MemberStore {
             return Err(GridError::Config(
                 "cannot approve: the invite for this request has been revoked".into(),
             ));
-        }
+        };
         if now >= guard.state.invites[inv_idx].expires_at {
             if let Some(pending) = guard.pending.remove(&id) {
                 let _ = pending.decision_tx.send(PendingDecision::Rejected {
@@ -1230,6 +1244,7 @@ impl MemberStore {
             ));
         }
 
+        let previous_member = guard.state.by_pubkey.get(&pending_info.public_key).cloned();
         let entry = guard.mutate_and_persist(|staged| {
             staged.invites[inv_idx].uses_remaining -= 1;
             Ok(staged.upsert_member(
@@ -1240,13 +1255,46 @@ impl MemberStore {
                 now,
             ))
         })?;
+        let rollback = ApprovedEnrollmentRollback {
+            public_key: pending_info.public_key,
+            previous_member,
+            invite_id: pending_info.invite_id,
+        };
         if let Some(pending) = guard.pending.remove(&id) {
             let _ = pending.decision_tx.send(PendingDecision::Approved {
                 member_id: entry.id.clone(),
                 roles: entry.roles.clone(),
+                rollback: Box::new(rollback),
             });
         }
         Ok(entry)
+    }
+
+    /// Rolls back an approved enrollment when the joining machine subsequently declines the
+    /// `[y/N]` confirmation prompt or disconnects before confirming.
+    pub fn rollback_approved_enrollment(
+        &self,
+        rollback: ApprovedEnrollmentRollback,
+    ) -> GridResult<()> {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard.mutate_and_persist(|staged| {
+            match rollback.previous_member {
+                Some(prev) => {
+                    staged.by_pubkey.insert(rollback.public_key, prev);
+                }
+                None => {
+                    staged.by_pubkey.remove(&rollback.public_key);
+                }
+            }
+            if let Some(inv) = staged
+                .invites
+                .iter_mut()
+                .find(|i| i.invite_id == rollback.invite_id)
+            {
+                inv.uses_remaining = inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+            }
+            Ok(())
+        })
     }
 
     /// Rejects a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)

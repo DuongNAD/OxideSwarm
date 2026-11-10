@@ -649,6 +649,9 @@ pub struct InviteSummary {
 }
 
 /// Summary of a pending enrollment request returned by `ListPendingEnrollments`.
+///
+/// Intentionally omits `pairing_code` so the cluster administrator must obtain the 6-digit
+/// pairing code out-of-band from the joining machine before running `oxideswarm members approve`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEnrollmentInfo {
     pub pending_id: String,
@@ -659,7 +662,6 @@ pub struct PendingEnrollmentInfo {
     pub arch: String,
     pub roles: Vec<MemberRole>,
     pub invite_id: String,
-    pub pairing_code: RedactedString,
     pub master_fingerprint: String,
     pub remote_addr: String,
     pub requested_at: u64,

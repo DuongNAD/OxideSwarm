@@ -870,7 +870,6 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                     arch: "x86_64".into(),
                     roles: vec![crate::noise_auth::MemberRole::Worker],
                     invite_id: "0102030405060708090a0b0c0d0e0f10".into(),
-                    pairing_code: crate::noise_auth::RedactedString("123456".into()),
                     master_fingerprint: "1111-2222-3333-4444".into(),
                     remote_addr: "192.0.2.10:54321".into(),
                     requested_at: EPOCH_SECS,

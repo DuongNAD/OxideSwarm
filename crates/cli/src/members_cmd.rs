@@ -914,6 +914,13 @@ pub struct MembersApproveArgs {
 
     #[arg(
         long,
+        value_name = "XXXX-XXXX-XXXX-XXXX",
+        help = "Optional 16-hex-character master key fingerprint shown on the joining machine"
+    )]
+    pub fingerprint: Option<String>,
+
+    #[arg(
+        long,
         value_name = "HOST:PORT",
         help = "Address of the Master's grid port (default 127.0.0.1:8088)"
     )]
@@ -1029,6 +1036,15 @@ async fn run_members_inner(
             );
             return ExitCode::FAILURE;
         }
+        if let Some(ref fp) = a.fingerprint {
+            let clean_fp: String = fp.trim().chars().filter(|c| *c != '-').collect();
+            if clean_fp.len() != 16 || !clean_fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+                eprintln!(
+                    "--fingerprint: expected the 16-hex-character master key fingerprint shown on the joining machine (for example --fingerprint 1234-5678-9abc-def0)"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let (cli_master, _, json, insecure_flag) = args.action.common_opts();
@@ -1061,6 +1077,56 @@ async fn run_members_inner(
             )
         }
     };
+
+    if let MembersAction::Approve(ref a) = args.action {
+        if let Some(ref fp) = a.fingerprint {
+            let expected_clean: String = fp
+                .trim()
+                .chars()
+                .filter(|c| *c != '-')
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if let Err(e) = transport
+                .send_msg(&ClientMessage::ListPendingEnrollments)
+                .await
+            {
+                eprintln!("Failed to query pending enrollments: {e}");
+                return ExitCode::FAILURE;
+            }
+            match transport.recv_msg::<ClientResponse>().await {
+                Ok(Some(ClientResponse::PendingEnrollmentsList { pending })) => {
+                    if let Some(first) = pending.first() {
+                        let actual_clean: String = first
+                            .master_fingerprint
+                            .chars()
+                            .filter(|c| *c != '-')
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        if actual_clean != expected_clean {
+                            eprintln!(
+                                "Error: master key fingerprint mismatch (joining machine showed {}, master has {})",
+                                sanitize_terminal_text(fp.trim()),
+                                sanitize_terminal_text(&first.master_fingerprint)
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                Ok(Some(ClientResponse::Error { message })) => {
+                    eprintln!("Error: {}", sanitize_terminal_text(&message));
+                    return ExitCode::FAILURE;
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response from Master: {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Failed to read response from Master: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
 
     let req = match &args.action {
         MembersAction::List(_) => ClientMessage::ListMembers,
@@ -1245,10 +1311,8 @@ fn render_pending_list(pending: &[PendingEnrollmentInfo], json: bool) {
             String::new()
         };
         println!(
-            "{}  code={}  master_fingerprint={}  from={}  name={}  os={}/{}  member_id={}  roles={}  invite={}{}",
+            "{}  from={}  name={}  os={}/{}  member_id={}  roles={}  invite={}{}",
             sanitize_terminal_text(&p.pending_id),
-            sanitize_terminal_text(p.pairing_code.as_str()),
-            sanitize_terminal_text(&p.master_fingerprint),
             sanitize_terminal_text(&p.remote_addr),
             sanitize_terminal_text(&p.name),
             sanitize_terminal_text(&p.os),

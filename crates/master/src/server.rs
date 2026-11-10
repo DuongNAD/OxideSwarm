@@ -3926,18 +3926,72 @@ async fn wait_for_pending_enrollment<S>(
         tokio::select! {
             dec = &mut decision_rx => {
                 match dec {
-                    Ok(members::PendingDecision::Approved { member_id, roles }) => {
+                    Ok(members::PendingDecision::Approved {
+                        member_id,
+                        roles,
+                        rollback,
+                    }) => {
                         info!(
                             pending_id = %pending_id,
                             member_id = %member_id,
                             ?roles,
-                            "Admin approved pending v3 enrollment"
+                            "Admin approved pending v3 enrollment; waiting for joining machine confirmation"
                         );
-                        let _ = send_client_response(
+                        if send_client_response(
                             transport,
-                            &ClientResponse::Enrolled { member_id, roles },
+                            &ClientResponse::Enrolled {
+                                member_id: member_id.clone(),
+                                roles,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            info!(
+                                pending_id = %pending_id,
+                                member_id = %member_id,
+                                "Joining machine disconnected while sending Enrolled; rolling back enrollment"
+                            );
+                            let _ = auth_ctx.members.rollback_approved_enrollment(*rollback);
+                            break;
+                        }
+                        let confirm_res = tokio::time::timeout_at(
+                            enroll_deadline,
+                            transport.recv_msg::<ClientMessage>(),
                         )
                         .await;
+                        match confirm_res {
+                            Ok(Ok(Some(ClientMessage::Hello))) => {
+                                info!(
+                                    pending_id = %pending_id,
+                                    member_id = %member_id,
+                                    "Joining machine confirmed v3 enrollment"
+                                );
+                                let _ = send_client_response(
+                                    transport,
+                                    &ClientResponse::Hello {
+                                        min_compatible_version:
+                                            rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                                    },
+                                )
+                                .await;
+                            }
+                            _ => {
+                                info!(
+                                    pending_id = %pending_id,
+                                    member_id = %member_id,
+                                    "Joining machine declined confirmation or disconnected after approval; rolling back enrollment"
+                                );
+                                let _ = auth_ctx.members.rollback_approved_enrollment(*rollback);
+                                let _ = send_client_response(
+                                    transport,
+                                    &ClientResponse::EnrollRejected {
+                                        message: "enrollment cancelled by joining machine".into(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Ok(members::PendingDecision::Rejected { message }) => {
                         info!(
@@ -9487,9 +9541,11 @@ mod tests {
             *member_kp.public_key(),
             vec![super::members::MemberRole::Worker],
         )]);
-        let mut caps = WorkerCapabilities::default();
-        caps.cpu_cores = 2;
-        caps.ram_mb = 2048;
+        let caps = WorkerCapabilities {
+            cpu_cores: 2,
+            ram_mb: 2048,
+            ..Default::default()
+        };
         let mut config = ServerConfig::default()
             .with_cluster_secret(secret.clone())
             .with_auth_mode(AuthMode::Both)

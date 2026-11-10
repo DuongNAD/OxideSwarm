@@ -179,6 +179,23 @@ impl InteractiveJoin {
         })
     }
 
+    fn pairing_code(&self) -> String {
+        assert!(
+            self.wait_for_pairing_prompt(Duration::from_secs(15)),
+            "join did not print pairing code before pairing_code();\nstdout:\n{}\nstderr:\n{}",
+            self.stdout(),
+            self.stderr()
+        );
+        let out = self.stdout();
+        let after = out
+            .split_once("Pairing code: ")
+            .expect("stdout contains Pairing code:")
+            .1;
+        let code: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        assert_eq!(code.len(), 6, "expected 6-digit pairing code in:\n{out}");
+        code
+    }
+
     fn confirm(&mut self, answer: &str) {
         assert!(
             self.wait_for_pairing_prompt(Duration::from_secs(15)),
@@ -416,10 +433,11 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         InviteToken::decode(text(&short_inv_out.stdout).trim()).expect("decode short invite");
     skewed_expired.expires_at += 3600;
     std::thread::sleep(Duration::from_millis(1200));
-    let master_exp_out = run_with_stdin(
+    let master_exp_out = InteractiveJoin::spawn(
         with(expired_home.path(), &["join"]),
-        &format!("{}\n", skewed_expired.encode()),
-    );
+        &skewed_expired.encode(),
+    )
+    .wait_output(Duration::from_secs(10));
     assert!(
         !master_exp_out.status.success(),
         "master-side expired invite must fail"
@@ -440,8 +458,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     );
     let inv_decline = text(&inv_decline_out.stdout).trim().to_string();
 
-    // Item 9: piping both the invite and `y` on stdin (`printf '%s\ny\n' "$INVITE" | oxideswarm join`)
-    // is rejected as invalid input before connecting or writing anything.
+    // Item 9 & N12: piping both the invite and `y` on stdin (`printf '%s\ny\n' "$INVITE" | oxideswarm join`)
+    // is rejected with a specific multi-line error before connecting or writing anything.
     let prestuffed_out = run_with_stdin(
         with(declined_home.path(), &["join"]),
         &format!("{inv_decline}\ny\n"),
@@ -450,7 +468,61 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         !prestuffed_out.status.success(),
         "pre-stuffed multi-line piped stdin must be rejected"
     );
+    assert!(
+        text(&prestuffed_out.stderr).contains("multiple lines"),
+        "expected multi-line input error (N12), got: {}",
+        text(&prestuffed_out.stderr)
+    );
     assert!(!declined_home.path().join(".oxideswarm").exists());
+
+    // N3(a): Declining `[y/N]` on a 1-use `--no-approval` invite neither enrolls the machine nor
+    // consumes the invite's use on the master.
+    let inv_no_app_dec_out = run_cmd(with(
+        master_home.path(),
+        &["invite", "--master", &addr, "--no-approval", "--uses", "1"],
+    ));
+    assert!(inv_no_app_dec_out.status.success());
+    let inv_no_app_dec = text(&inv_no_app_dec_out.stdout).trim().to_string();
+    let inv_no_app_dec_id = InviteToken::decode(&inv_no_app_dec).unwrap().invite_id;
+
+    let mut dec_no_app =
+        InteractiveJoin::spawn(with(declined_home.path(), &["join"]), &inv_no_app_dec);
+    dec_no_app.confirm("n");
+    let dec_no_app_out = dec_no_app.wait_output(Duration::from_secs(10));
+    assert!(
+        !dec_no_app_out.status.success(),
+        "declining confirmation on --no-approval invite must fail"
+    );
+    assert!(!declined_home.path().join(".oxideswarm").exists());
+
+    let members_after_no_app_dec = run_cmd(with(
+        master_home.path(),
+        &["members", "list", "--master", &addr, "--json"],
+    ));
+    let members_json_no_app: serde_json::Value =
+        serde_json::from_slice(&members_after_no_app_dec.stdout).unwrap();
+    assert_eq!(
+        members_json_no_app.as_array().unwrap().len(),
+        1,
+        "N3 regression: declining --no-approval invite must not enroll the member on the master: {members_json_no_app}"
+    );
+    let inv_list_no_app = run_cmd(with(
+        master_home.path(),
+        &["invite", "--list", "--master", &addr, "--json"],
+    ));
+    let inv_list_no_app_json: serde_json::Value =
+        serde_json::from_slice(&inv_list_no_app.stdout).unwrap();
+    let no_app_entry = inv_list_no_app_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["invite_id"].as_str() == Some(&inv_no_app_dec_id))
+        .expect("--no-approval invite must still be active");
+    assert_eq!(
+        no_app_entry["uses_remaining"].as_u64(),
+        Some(1),
+        "N3 regression: declining --no-approval invite must leave uses_remaining == 1"
+    );
 
     let mut dec_join = InteractiveJoin::spawn(with(declined_home.path(), &["join"]), &inv_decline);
     dec_join.confirm("n");
@@ -498,6 +570,72 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         "disconnected pending request must not consume an invite use: {decline_entry}"
     );
 
+    // N3(b): Admin runs `members approve` FIRST while the joining machine is at `[y/N]`, and the
+    // joining machine THEN declines `n`. The master must roll back the enrollment and restore
+    // `uses_remaining == 1` on `inv_decline`.
+    let mut dec_after_approve =
+        InteractiveJoin::spawn(with(declined_home.path(), &["join"]), &inv_decline);
+    let dec_after_code = dec_after_approve.pairing_code();
+    let mut dec_pending_id = String::new();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            let out = run_cmd(with(
+                master_home.path(),
+                &["members", "pending", "--master", &addr, "--json"],
+            ));
+            if !out.status.success() {
+                return false;
+            }
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            if let Some(item) = v.as_array().and_then(|a| a.first()) {
+                dec_pending_id = item["pending_id"].as_str().unwrap_or_default().to_string();
+                !dec_pending_id.is_empty()
+            } else {
+                false
+            }
+        }),
+        "dec_after_approve did not appear in members pending"
+    );
+    let approve_then_decline = run_cmd(with(
+        master_home.path(),
+        &[
+            "members",
+            "approve",
+            &dec_pending_id,
+            "--code",
+            &dec_after_code,
+            "--fingerprint",
+            &master_fp,
+            "--master",
+            &addr,
+        ],
+    ));
+    assert!(
+        approve_then_decline.status.success(),
+        "approve before decline failed: {}",
+        text(&approve_then_decline.stderr)
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    dec_after_approve.confirm("n");
+    let dec_after_out = dec_after_approve.wait_output(Duration::from_secs(10));
+    assert!(
+        !dec_after_out.status.success(),
+        "declining after approval must fail"
+    );
+    assert!(!declined_home.path().join(".oxideswarm").exists());
+
+    let members_after_rollback = run_cmd(with(
+        master_home.path(),
+        &["members", "list", "--master", &addr, "--json"],
+    ));
+    let members_rollback_json: serde_json::Value =
+        serde_json::from_slice(&members_after_rollback.stdout).unwrap();
+    assert_eq!(
+        members_rollback_json.as_array().unwrap().len(),
+        1,
+        "N3 regression: declining after admin approval must roll back the member on the master: {members_rollback_json}"
+    );
+
     // Also test killing a live `join` process while it is waiting in `pending`:
     let mut drop_join = InteractiveJoin::spawn(with(drop_home.path(), &["join"]), &inv_decline);
     assert!(
@@ -535,12 +673,14 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let mut join_1_cmd = with(worker_1_home.path(), &["join"]);
     join_1_cmd.env("RUSTY_GRID_WORKER_NAME", "worker-one");
     let mut join_1 = InteractiveJoin::spawn(join_1_cmd, &inv_decline);
+    let pending_1_code = join_1.pairing_code();
 
     // Wait for `worker-one` to appear in `members pending`, then approve it.
+    // N4: `members pending` (both `--json` and human output) must NOT expose `pairing_code`!
     let mut pending_1_id = String::new();
-    let mut pending_1_code = String::new();
     let mut pending_1_fp = String::new();
     let mut pending_1_remote = String::new();
+    let mut pending_1_raw_json = String::new();
     assert!(
         wait_for(Duration::from_secs(15), || {
             let out = run_cmd(with(
@@ -550,13 +690,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
             if !out.status.success() {
                 return false;
             }
+            pending_1_raw_json = text(&out.stdout);
             let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
             if let Some(item) = v.as_array().and_then(|a| a.first()) {
                 pending_1_id = item["pending_id"].as_str().unwrap_or_default().to_string();
-                pending_1_code = item["pairing_code"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
                 pending_1_fp = item["master_fingerprint"]
                     .as_str()
                     .unwrap_or_default()
@@ -569,6 +706,19 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         }),
         "worker-one did not appear in members pending"
     );
+    assert!(
+        !pending_1_raw_json.contains("pairing_code"),
+        "N4 regression: members pending --json must not expose pairing_code:\n{pending_1_raw_json}"
+    );
+    let pending_1_human = run_cmd(with(
+        master_home.path(),
+        &["members", "pending", "--master", &addr],
+    ));
+    assert!(
+        !text(&pending_1_human.stdout).contains("code="),
+        "N4 regression: members pending human output must not expose pairing code:\n{}",
+        text(&pending_1_human.stdout)
+    );
     assert_eq!(pending_1_code.len(), 6, "6-digit pairing code");
     assert_eq!(
         pending_1_fp, master_fp,
@@ -579,7 +729,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         "pending entry carries remote_addr: {pending_1_remote}"
     );
 
-    // Item 3: wrong `--code` is refused and leaves the pending request and invite use intact.
+    // Item 3 & N4: wrong `--code` or wrong `--fingerprint` is refused and leaves the pending
+    // request and invite use intact.
     let wrong_code = if pending_1_code == "000000" {
         "999999"
     } else {
@@ -607,6 +758,35 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         text(&bad_approve.stderr)
     );
 
+    let wrong_fp = if master_fp == "0000-0000-0000-0000" {
+        "ffff-ffff-ffff-ffff"
+    } else {
+        "0000-0000-0000-0000"
+    };
+    let bad_fp_approve = run_cmd(with(
+        master_home.path(),
+        &[
+            "members",
+            "approve",
+            &pending_1_id,
+            "--code",
+            &pending_1_code,
+            "--fingerprint",
+            wrong_fp,
+            "--master",
+            &addr,
+        ],
+    ));
+    assert!(
+        !bad_fp_approve.status.success(),
+        "members approve with wrong --fingerprint must fail"
+    );
+    assert!(
+        text(&bad_fp_approve.stderr).contains("master key fingerprint mismatch"),
+        "expected fingerprint mismatch error, got: {}",
+        text(&bad_fp_approve.stderr)
+    );
+
     let approve_1 = run_cmd(with(
         master_home.path(),
         &[
@@ -615,6 +795,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
             &pending_1_id,
             "--code",
             &pending_1_code,
+            "--fingerprint",
+            &master_fp,
             "--master",
             &addr,
         ],
@@ -739,10 +921,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let mut join_b_cmd = with(contender_b_home.path(), &["join", "--no-doctor"]);
     join_b_cmd.env("RUSTY_GRID_WORKER_NAME", "contender-b");
     let mut join_b = InteractiveJoin::spawn(join_b_cmd, &shared_inv);
+    let pending_b_code = join_b.pairing_code();
 
     let mut pending_a_id = String::new();
     let mut pending_b_id = String::new();
-    let mut pending_b_code = String::new();
     assert!(
         wait_for(Duration::from_secs(15), || {
             let out = run_cmd(with(
@@ -763,10 +945,6 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
                     }
                     Some("contender-b") => {
                         pending_b_id = item["pending_id"].as_str().unwrap_or_default().to_string();
-                        pending_b_code = item["pairing_code"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string();
                     }
                     _ => {}
                 }
@@ -1175,6 +1353,30 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
         worker_b.log()
     );
     drop(worker_b);
+
+    // N10: Create an invite on `master_b` so `home_b/.oxideswarm` genuinely holds `node.key`,
+    // `master_noise.key`, and `members.json` (in addition to `cluster.secret`) before Repro B
+    // runs `workers` and `worker` from `home_b` against `master_a`.
+    let inv_b_out = run_cmd(with(
+        home_b.path(),
+        &["invite", "--master", &addr_b, "--no-approval"],
+    ));
+    assert!(
+        inv_b_out.status.success(),
+        "invite on master_b failed:\n{}\n{}",
+        text(&inv_b_out.stdout),
+        text(&inv_b_out.stderr)
+    );
+    let home_b_oxs = home_b.path().join(".oxideswarm");
+    assert!(home_b_oxs.join("node.key").is_file(), "home_b node.key");
+    assert!(
+        home_b_oxs.join("master_noise.key").is_file(),
+        "home_b master_noise.key"
+    );
+    assert!(
+        home_b_oxs.join("members.json").is_file(),
+        "home_b members.json"
+    );
     drop(master_b);
 
     // Repro B: `home_b` once ran a master (so `home_b/.oxideswarm` has `node.key`,
