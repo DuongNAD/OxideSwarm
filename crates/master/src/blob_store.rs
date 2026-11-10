@@ -294,16 +294,6 @@ impl BlobStore {
         for id in &victims {
             let _ = std::fs::remove_file(object_path(&objects, id));
         }
-        for (&id, entry) in &inner.entries {
-            if entry.size >= 18 && entry.size <= MAX_MANIFEST_BYTES {
-                let mut hdr = [0u8; 18];
-                if let Ok(mut f) = File::open(object_path(&objects, &id)) {
-                    if f.read_exact(&mut hdr).is_ok() && TreeManifest::is_v2_bytes(&hdr) {
-                        rusty_grid_core::blob::register_v2_manifest_blob(id);
-                    }
-                }
-            }
-        }
         info!(
             dir = %config.dir.display(),
             blobs = inner.entries.len(),
@@ -635,9 +625,6 @@ impl BlobStore {
         if let Err(e) = upload.file.write_all(data) {
             return abandon(upload, failed(format!("cannot store blob {id}: {e}")));
         }
-        if offset == 0 && TreeManifest::is_v2_bytes(data) {
-            rusty_grid_core::blob::register_v2_manifest_blob(id);
-        }
         upload.hasher.update(data);
         upload.received += data.len() as u64;
         upload.last_chunk = Instant::now();
@@ -875,7 +862,20 @@ impl BlobStore {
         self: &Arc<Self>,
         inputs: &[TaskInput],
     ) -> Result<Vec<BlobId>, String> {
+        self.resolve_inputs_with_features(inputs)
+            .await
+            .map(|(ids, _)| ids)
+    }
+
+    /// Like [`BlobStore::resolve_inputs`], also returning whether any decoded [`TreeManifest`]
+    /// uses `oxideswarm-tree/2` features (`symlinks` or `empty_dirs`) so the queue entry can
+    /// require [`rusty_grid_core::protocol::ProtocolCapabilities::TREE_V2`].
+    pub async fn resolve_inputs_with_features(
+        self: &Arc<Self>,
+        inputs: &[TaskInput],
+    ) -> Result<(Vec<BlobId>, bool), String> {
         let mut ids = Vec::new();
+        let mut needs_tree_v2 = false;
         for input in inputs {
             match &input.source {
                 InputSource::File { id, size, .. } => {
@@ -888,8 +888,16 @@ impl BlobStore {
                 } => {
                     self.check_present(*manifest, *manifest_size, &input.path)?;
                     let bytes = self.read_all(*manifest, MAX_MANIFEST_BYTES).await?;
-                    let tree = TreeManifest::decode(&bytes)
-                        .map_err(|e| format!("input '{}': {e}", input.path))?;
+                    let input_path = input.path.clone();
+                    let tree = tokio::task::spawn_blocking(move || {
+                        TreeManifest::decode(&bytes)
+                            .map_err(|e| format!("input '{input_path}': {e}"))
+                    })
+                    .await
+                    .map_err(|e| format!("input '{}': {e}", input.path))??;
+                    if tree.is_v2() {
+                        needs_tree_v2 = true;
+                    }
                     ids.push(*manifest);
                     for file in tree.files() {
                         self.check_present(
@@ -904,7 +912,7 @@ impl BlobStore {
         }
         ids.sort();
         ids.dedup();
-        Ok(ids)
+        Ok((ids, needs_tree_v2))
     }
 
     fn check_present(&self, id: BlobId, size: u64, path: &str) -> Result<(), String> {
@@ -1695,29 +1703,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopened_store_preserves_v2_manifest_registration() {
-        use rusty_grid_core::blob::{BlobFile, BlobSymlink, TreeManifest};
+    async fn resolve_inputs_with_features_detects_v2_manifest_even_after_reopen() {
+        use rusty_grid_core::blob::{BlobFile, BlobSymlink, InputSource, TaskInput, TreeManifest};
 
         let dir = tempfile::tempdir().unwrap();
         let store = open(dir.path(), 64 * 1024);
+        let file_bytes = b"hello";
+        let file_id = store.put(file_bytes).await.unwrap();
 
         let v1_manifest = TreeManifest::new(vec![BlobFile {
             path: "a.txt".into(),
-            id: BlobId::of(b"hello"),
-            size: 5,
+            id: file_id,
+            size: file_bytes.len() as u64,
             executable: false,
         }])
         .unwrap();
         let v1_bytes = v1_manifest.encode();
-        let v1_id = BlobId::of(&v1_bytes);
-        assert!(!TreeManifest::is_v2_bytes(&v1_bytes));
-        store.put(&v1_bytes).await.unwrap();
+        let v1_id = store.put(&v1_bytes).await.unwrap();
 
         let v2_manifest = TreeManifest::with_entries(
             vec![BlobFile {
                 path: "a.txt".into(),
-                id: BlobId::of(b"hello"),
-                size: 5,
+                id: file_id,
+                size: file_bytes.len() as u64,
                 executable: false,
             }],
             vec![BlobSymlink {
@@ -1728,23 +1736,39 @@ mod tests {
         )
         .unwrap();
         let v2_bytes = v2_manifest.encode();
-        let v2_id = BlobId::of(&v2_bytes);
-        assert!(TreeManifest::is_v2_bytes(&v2_bytes));
-        store.put(&v2_bytes).await.unwrap();
+        let v2_id = store.put(&v2_bytes).await.unwrap();
 
-        assert!(!rusty_grid_core::blob::is_v2_manifest_blob(&v1_id));
-        assert!(rusty_grid_core::blob::is_v2_manifest_blob(&v2_id));
+        let v1_input = [TaskInput {
+            path: "src".into(),
+            source: InputSource::Tree {
+                manifest: v1_id,
+                manifest_size: v1_bytes.len() as u64,
+            },
+        }];
+        let v2_input = [TaskInput {
+            path: "src".into(),
+            source: InputSource::Tree {
+                manifest: v2_id,
+                manifest_size: v2_bytes.len() as u64,
+            },
+        }];
+
+        let (_, v1_needs_v2) = store.resolve_inputs_with_features(&v1_input).await.unwrap();
+        assert!(!v1_needs_v2);
+        let (_, v2_needs_v2) = store.resolve_inputs_with_features(&v2_input).await.unwrap();
+        assert!(v2_needs_v2);
         drop(store);
 
-        // Simulate a fresh process restart by checking an unseen v2 manifest written directly into objects
-        let v2_restart_bytes = b"oxideswarm-tree/2\nd\t0\trestarted_empty\n".to_vec();
-        let v2_restart_id = BlobId::of(&v2_restart_bytes);
-        assert!(!rusty_grid_core::blob::is_v2_manifest_blob(&v2_restart_id));
-        let restart_obj_path = object_path(&dir.path().join("objects"), &v2_restart_id);
-        std::fs::create_dir_all(restart_obj_path.parent().unwrap()).unwrap();
-        std::fs::write(&restart_obj_path, &v2_restart_bytes).unwrap();
-
-        let _reopened = open(dir.path(), 64 * 1024);
-        assert!(rusty_grid_core::blob::is_v2_manifest_blob(&v2_restart_id));
+        let reopened = open(dir.path(), 64 * 1024);
+        let (_, reopened_v1_needs_v2) = reopened
+            .resolve_inputs_with_features(&v1_input)
+            .await
+            .unwrap();
+        assert!(!reopened_v1_needs_v2);
+        let (_, reopened_v2_needs_v2) = reopened
+            .resolve_inputs_with_features(&v2_input)
+            .await
+            .unwrap();
+        assert!(reopened_v2_needs_v2);
     }
 }

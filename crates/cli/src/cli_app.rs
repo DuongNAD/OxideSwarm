@@ -3665,16 +3665,31 @@ async fn run_submit_with_secret_inner(
             };
         match uploaded {
             Ok(report) => {
-                eprintln!(
-                    "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
-                    args.workspace.as_deref().unwrap_or(""),
-                    scan.prepared.files,
-                    rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
-                    report.uploaded,
-                    report.blobs,
-                    rusty_grid_worker::staging::human_bytes(report.bytes),
-                    report.blobs - report.uploaded
-                );
+                if scan.prepared.skipped.is_empty() {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                } else {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}), {} skipped ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        scan.prepared.skipped.len(),
+                        scan.prepared.skipped.join("; "),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                }
                 Some(report)
             }
             Err(e) => {

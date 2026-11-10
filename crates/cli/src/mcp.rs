@@ -1930,6 +1930,7 @@ struct WorkspaceSubmitMeta {
     files: usize,
     uploaded_bytes: u64,
     skipped: usize,
+    skipped_entries: Vec<String>,
 }
 
 fn attach_workspace_summary(
@@ -1949,13 +1950,17 @@ fn attach_workspace_summary(
     let Ok(mut body) = serde_json::from_str::<Value>(text) else {
         return res;
     };
-    body["workspace"] = json!({
+    let mut ws_summary = json!({
         "name": meta.name,
         "worker": worker.filter(|w| !w.is_nil()).map(|w| w.to_string()),
         "files": meta.files,
         "uploaded_bytes": meta.uploaded_bytes,
         "skipped": meta.skipped,
     });
+    if !meta.skipped_entries.is_empty() {
+        ws_summary["skipped_entries"] = json!(meta.skipped_entries);
+    }
+    body["workspace"] = ws_summary;
     ToolCallResult::ok_json(&body)
 }
 
@@ -2341,6 +2346,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             };
             let files = prepared_ws.prepared.files;
             let skipped = prepared_ws.prepared.skipped.len();
+            let skipped_entries = prepared_ws.prepared.skipped.clone();
             let manifest_id = prepared_ws.manifest_id;
             let manifest_len = prepared_ws.manifest_len;
             ws_uploads = Some(prepared_ws.prepared);
@@ -2351,6 +2357,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 files,
                 uploaded_bytes: 0,
                 skipped,
+                skipped_entries,
             });
         } else {
             ws_meta = Some(WorkspaceSubmitMeta {
@@ -2359,6 +2366,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 files: 0,
                 uploaded_bytes: 0,
                 skipped: 0,
+                skipped_entries: Vec::new(),
             });
         }
     }

@@ -639,40 +639,36 @@ pub fn scan_workspace_source(
             executable,
         });
     }
-    let mut folded_links: std::collections::HashMap<String, String> =
-        std::collections::HashMap::with_capacity(symlinks.len());
-    let mut deduplicated_symlinks = Vec::with_capacity(symlinks.len());
-    for (full_path, link) in symlinks {
-        let folded = rusty_grid_core::blob::fold_blob_path(&link.path);
-        if let Some(prev) = folded_links.get(&folded) {
-            prepared.skipped.push(format!(
-                "{} (symbolic link '{}' collides with symbolic link '{prev}' after case/Unicode folding)",
-                full_path.display(),
-                link.path
-            ));
+    let mut folded_links = rusty_grid_core::blob::FoldedSymlinkTrie::new();
+    let mut deduplicated_indices = Vec::with_capacity(symlinks.len());
+    for (idx, (full_path, link)) in symlinks.iter().enumerate() {
+        if let Err(e) = folded_links.insert(&link.path) {
+            prepared
+                .skipped
+                .push(format!("{} ({e})", full_path.display()));
             continue;
         }
-        folded_links.insert(folded, link.path.clone());
-        deduplicated_symlinks.push((full_path, link));
+        deduplicated_indices.push(idx);
     }
-    let folded_link_refs: std::collections::HashMap<String, &str> = folded_links
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_str()))
-        .collect();
-    let mut valid_symlinks = Vec::with_capacity(deduplicated_symlinks.len());
-    for (full_path, link) in deduplicated_symlinks {
+    let mut keep = vec![false; symlinks.len()];
+    for idx in deduplicated_indices {
+        let (full_path, link) = &symlinks[idx];
         match rusty_grid_core::blob::check_no_symlink_traversal(
             &link.path,
             &link.target,
-            &folded_link_refs,
+            &folded_links,
         ) {
-            Ok(()) => valid_symlinks.push(link),
+            Ok(()) => keep[idx] = true,
             Err(e) => prepared
                 .skipped
                 .push(format!("{} ({e})", full_path.display())),
         }
     }
-    let symlinks = valid_symlinks;
+    let symlinks: Vec<BlobSymlink> = symlinks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, (_, link))| keep[idx].then_some(link))
+        .collect();
     let mut non_empty_dirs = std::collections::HashSet::new();
     for entry_path in files
         .iter()
@@ -1481,7 +1477,7 @@ mod tests {
                 #[cfg(windows)]
                 Err(e)
                     if e.raw_os_error() == Some(1314)
-                        && std::env::var_os("OXIDESWARM_TEST_REQUIRE_SYMLINKS").is_none() =>
+                        && std::env::var("RUSTY_GRID_REQUIRE_SYMLINKS").as_deref() != Ok("1") =>
                 {
                     false
                 }
@@ -1587,6 +1583,38 @@ mod tests {
                 scan_chain.prepared.skipped[0].contains("traverses through symbolic link"),
                 "{:?}",
                 scan_chain.prepared.skipped
+            );
+            let _ = fs::remove_file(r.join("sub/chained.sh"));
+
+            // Unicode case-folded chain (`s/b/up -> ..` with `hop -> ſ/b/up/../..` and deeper
+            // `s/b/c/up -> ../..` with `hop_deep -> ſ/b/c/up/../../..`) is also skipped.
+            fs::create_dir_all(r.join("s/b/c")).unwrap();
+            assert!(try_create_test_symlink_file(
+                Path::new(".."),
+                &r.join("s/b/up"),
+            ));
+            assert!(try_create_test_symlink_file(
+                Path::new("ſ/b/up/../.."),
+                &r.join("hop"),
+            ));
+            assert!(try_create_test_symlink_file(
+                Path::new("../.."),
+                &r.join("s/b/c/up"),
+            ));
+            assert!(try_create_test_symlink_file(
+                Path::new("ſ/b/c/up/../../.."),
+                &r.join("hop_deep"),
+            ));
+            let scan_folded = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(scan_folded.prepared.skipped.len(), 2);
+            assert!(
+                scan_folded
+                    .prepared
+                    .skipped
+                    .iter()
+                    .all(|s| s.contains("traverses through symbolic link")),
+                "{:?}",
+                scan_folded.prepared.skipped
             );
         }
     }

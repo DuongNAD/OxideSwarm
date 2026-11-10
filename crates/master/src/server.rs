@@ -2069,7 +2069,8 @@ const BLOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// every input tree or workspace source tree) must already be in the store, and they are pinned
 /// there until the task finishes, so the bound cannot evict them before a worker fetched them.
 /// Tasks without inputs, output patterns, or a workspace source tree pass untouched.
-async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<(), String> {
+/// Returns whether any input or workspace tree manifest uses `oxideswarm-tree/2` (`TREE_V2`).
+async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<bool, String> {
     let workspace_tree = task
         .workspace
         .as_ref()
@@ -2086,7 +2087,7 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
             }),
         });
     if !task.uses_blobs() && workspace_tree.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(store) = blob_store else {
         return Err(format!(
@@ -2099,9 +2100,9 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
     if let Some(ws_input) = workspace_tree {
         inputs.push(ws_input);
     }
-    let ids = store.resolve_inputs(&inputs).await?;
+    let (ids, needs_tree_v2) = store.resolve_inputs_with_features(&inputs).await?;
     if ids.is_empty() {
-        return Ok(());
+        return Ok(needs_tree_v2);
     }
     let gone = store.pin_task(task.id, ids);
     if let Some(id) = gone.first() {
@@ -2111,7 +2112,7 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
              submitted; upload the inputs again (or raise `master --blob-store-mb`)"
         ));
     }
-    Ok(())
+    Ok(needs_tree_v2)
 }
 
 /// Checks that a result's output files are in the store and pins them atomically if present,
@@ -3440,12 +3441,19 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 // A task id the queue already knows is refused by `submit` below; its pins
                 // belong to the original task and must stay untouched.
                 let known = queue.get_task(&task_id).await.is_some();
+                let mut needs_tree_v2 = false;
                 if !known {
-                    if let Err(message) = admit_blob_task(blob_store.as_ref(), &task).await {
-                        warn!(task_id = %task_id, error = %message, "SubmitTask rejected");
-                        send_client_response(&mut transport, &ClientResponse::Error { message })
+                    match admit_blob_task(blob_store.as_ref(), &task).await {
+                        Ok(v2) => needs_tree_v2 = v2,
+                        Err(message) => {
+                            warn!(task_id = %task_id, error = %message, "SubmitTask rejected");
+                            send_client_response(
+                                &mut transport,
+                                &ClientResponse::Error { message },
+                            )
                             .await?;
-                        continue;
+                            continue;
+                        }
                     }
                 }
                 let rx = if wait {
@@ -3457,7 +3465,10 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     None
                 };
 
-                if let Err(e) = queue.submit(task).await {
+                if let Err(e) = queue
+                    .submit_with_priority_and_tree_v2(task, 0, needs_tree_v2)
+                    .await
+                {
                     // Validation failure, queue full, or a task id that is already in use: tell the
                     // client why, keep the connection, and take back the waiter registered above
                     // (it must never be resolved by the result of another task with the same id).
@@ -4495,15 +4506,16 @@ impl MasterHandle {
     }
 
     /// Admits a task for submission through this handle (see `admit_blob_task`); returns
-    /// whether the task id was new, so a refused submission can release its pins.
-    async fn admit(&self, task: &Task) -> GridResult<bool> {
+    /// whether the task id was new (so a refused submission can release its pins) and whether its
+    /// tree manifests require `TREE_V2`.
+    async fn admit(&self, task: &Task) -> GridResult<(bool, bool)> {
         if self.queue.get_task(&task.id).await.is_some() {
-            return Ok(false);
+            return Ok((false, false));
         }
-        admit_blob_task(self.blob_store.as_ref(), task)
+        let needs_tree_v2 = admit_blob_task(self.blob_store.as_ref(), task)
             .await
             .map_err(GridError::Config)?;
-        Ok(true)
+        Ok((true, needs_tree_v2))
     }
 
     /// Releases the pins taken by [`MasterHandle::admit`] for a task the queue refused.
@@ -4575,8 +4587,12 @@ impl MasterHandle {
     /// Submits a task with default priority (0).
     pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
         let task_id = task.id;
-        let admitted = self.admit(&task).await?;
-        let id = match self.queue.submit(task).await {
+        let (admitted, needs_tree_v2) = self.admit(&task).await?;
+        let id = match self
+            .queue
+            .submit_with_priority_and_tree_v2(task, 0, needs_tree_v2)
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 self.release_admission(&task_id, admitted).await;
@@ -4601,8 +4617,12 @@ impl MasterHandle {
     /// Submits a task with explicit priority.
     pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
         let task_id = task.id;
-        let admitted = self.admit(&task).await?;
-        let id = match self.queue.submit_with_priority(task, priority).await {
+        let (admitted, needs_tree_v2) = self.admit(&task).await?;
+        let id = match self
+            .queue
+            .submit_with_priority_and_tree_v2(task, priority, needs_tree_v2)
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 self.release_admission(&task_id, admitted).await;

@@ -1127,81 +1127,14 @@ impl WorkspaceGuard {
             empty_dirs_out.insert((*dir_rel).to_string());
         }
 
-        let mut symlinks_out = BTreeMap::new();
-        let empty_set: HashSet<String> = HashSet::new();
-        for (link, path, resolved) in &link_targets {
-            ensure_parents(&tree, path, &link.path)?;
-            ensure_target_walks_no_on_disk_symlink(&tree, &link.path, &link.target, &empty_set)?;
-            let target_is_dir = folded_manifest_dirs.contains(&fold_blob_path(resolved))
-                || is_real_dir(&tree.join(resolved));
-            let tracked = was_tracked_symlink.contains(&link.path);
-            let kept = match fs::symlink_metadata(path) {
-                Ok(m) if is_link_like(&m) => {
-                    let existing = fs::read_link(path)
-                        .ok()
-                        .and_then(|p| p.to_str().map(|s| s.replace('\\', "/")));
-                    let same_target = existing.as_deref() == Some(link.target.as_str());
-                    if same_target && symlink_kind_matches(&m, target_is_dir) {
-                        true
-                    } else if same_target || tracked {
-                        remove_symlink(path)
-                            .map_err(io_err(format!("replacing symbolic link {}", link.path)))?;
-                        false
-                    } else {
-                        return Err(WorkspaceError::Path {
-                            path: link.path.clone(),
-                            reason: "the tree already has a different symbolic link here"
-                                .to_string(),
-                        });
-                    }
-                }
-                Ok(m) if m.is_dir() => {
-                    return Err(WorkspaceError::Path {
-                        path: link.path.clone(),
-                        reason: "the tree has a directory here".to_string(),
-                    })
-                }
-                Ok(_) => {
-                    if tracked {
-                        fs::remove_file(path)
-                            .map_err(io_err(format!("replacing {}", link.path)))?;
-                        false
-                    } else {
-                        return Err(WorkspaceError::Path {
-                            path: link.path.clone(),
-                            reason: "the tree has a file here".to_string(),
-                        });
-                    }
-                }
-                Err(_) => false,
-            };
-            if kept {
-                report.unchanged += 1;
-                symlinks_out.insert(link.path.clone(), link.target.clone());
-            } else {
-                match create_in_tree_symlink(&link.target, path, target_is_dir) {
-                    Ok(()) => {
-                        report.written += 1;
-                        symlinks_out.insert(link.path.clone(), link.target.clone());
-                    }
-                    Err(e) if (cfg!(windows) || cfg!(test)) && e.raw_os_error() == Some(1314) => {
-                        report.skipped_symlinks += 1;
-                    }
-                    Err(e) => {
-                        return Err(io_err(format!("creating symbolic link {}", link.path))(e));
-                    }
-                }
-            }
-        }
-        if report.skipped_symlinks > 0 {
-            report.warning = Some(format!(
-                "workspace '{}': skipped {} symbolic link(s) because Windows returned \
-                 ERROR_PRIVILEGE_NOT_HELD (1314); enable Developer Mode in Settings -> System -> \
-                 For developers -> Developer Mode (or grant SeCreateSymbolicLinkPrivilege) to \
-                 materialize symbolic links",
-                self.name, report.skipped_symlinks
-            ));
-        }
+        let symlinks_out = materialize_symlinks(
+            &tree,
+            &self.name,
+            &link_targets,
+            &folded_manifest_dirs,
+            &was_tracked_symlink,
+            &mut report,
+        )?;
 
         // 5. records := new manifest, clear pending, Ready, flush.
         st.records = records;
@@ -1557,6 +1490,125 @@ fn set_exec(path: &Path, executable: bool) {
 
 #[cfg(not(unix))]
 fn set_exec(_path: &Path, _executable: bool) {}
+
+fn materialize_symlinks(
+    tree: &Path,
+    workspace_name: &str,
+    link_targets: &[(&BlobSymlink, PathBuf, String)],
+    folded_manifest_dirs: &HashSet<String>,
+    was_tracked_symlink: &HashSet<String>,
+    report: &mut SyncReport,
+) -> Result<BTreeMap<String, String>, WorkspaceError> {
+    let mut symlinks_out = BTreeMap::new();
+    let mut created_symlinks: Vec<&Path> = Vec::new();
+    let empty_set: HashSet<String> = HashSet::new();
+    let rollback_created = |created: &[&Path]| {
+        for p in created {
+            let _ = remove_symlink(p);
+        }
+    };
+    for (link, path, resolved) in link_targets {
+        if let Err(e) = ensure_parents(tree, path, &link.path).and_then(|()| {
+            ensure_target_walks_no_on_disk_symlink(tree, &link.path, &link.target, &empty_set)
+        }) {
+            rollback_created(&created_symlinks);
+            return Err(e);
+        }
+        let target_is_dir = folded_manifest_dirs.contains(&fold_blob_path(resolved))
+            || is_real_dir(&tree.join(resolved));
+        let tracked = was_tracked_symlink.contains(&link.path);
+        let kept = match fs::symlink_metadata(path) {
+            Ok(m) if is_link_like(&m) => {
+                let existing = fs::read_link(path)
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.replace('\\', "/")));
+                let same_target = existing.as_deref() == Some(link.target.as_str());
+                if same_target && symlink_kind_matches(&m, target_is_dir) {
+                    true
+                } else if same_target || tracked {
+                    if let Err(e) = remove_symlink(path)
+                        .map_err(io_err(format!("replacing symbolic link {}", link.path)))
+                    {
+                        rollback_created(&created_symlinks);
+                        return Err(e);
+                    }
+                    false
+                } else {
+                    rollback_created(&created_symlinks);
+                    return Err(WorkspaceError::Path {
+                        path: link.path.clone(),
+                        reason: "the tree already has a different symbolic link here".to_string(),
+                    });
+                }
+            }
+            Ok(m) if m.is_dir() => {
+                rollback_created(&created_symlinks);
+                return Err(WorkspaceError::Path {
+                    path: link.path.clone(),
+                    reason: "the tree has a directory here".to_string(),
+                });
+            }
+            Ok(_) => {
+                if tracked {
+                    if let Err(e) =
+                        fs::remove_file(path).map_err(io_err(format!("replacing {}", link.path)))
+                    {
+                        rollback_created(&created_symlinks);
+                        return Err(e);
+                    }
+                    false
+                } else {
+                    rollback_created(&created_symlinks);
+                    return Err(WorkspaceError::Path {
+                        path: link.path.clone(),
+                        reason: "the tree has a file here".to_string(),
+                    });
+                }
+            }
+            Err(_) => false,
+        };
+        if kept {
+            report.unchanged += 1;
+            symlinks_out.insert(link.path.clone(), link.target.clone());
+        } else {
+            match create_in_tree_symlink(&link.target, path, target_is_dir) {
+                Ok(()) => {
+                    created_symlinks.push(path.as_path());
+                    report.written += 1;
+                    symlinks_out.insert(link.path.clone(), link.target.clone());
+                }
+                Err(e) if (cfg!(windows) || cfg!(test)) && e.raw_os_error() == Some(1314) => {
+                    report.skipped_symlinks += 1;
+                }
+                Err(e) => {
+                    rollback_created(&created_symlinks);
+                    return Err(io_err(format!("creating symbolic link {}", link.path))(e));
+                }
+            }
+        }
+    }
+    // Re-verify every link's target walk on disk after all links of this sync exist, so the
+    // check uses the host filesystem's own case/Unicode folding and does not depend on the
+    // order in which links were created.
+    for (link, _, _) in link_targets {
+        if let Err(e) =
+            ensure_target_walks_no_on_disk_symlink(tree, &link.path, &link.target, &empty_set)
+        {
+            rollback_created(&created_symlinks);
+            return Err(e);
+        }
+    }
+    if report.skipped_symlinks > 0 {
+        report.warning = Some(format!(
+            "workspace '{workspace_name}': skipped {} symbolic link(s) because Windows returned \
+             ERROR_PRIVILEGE_NOT_HELD (1314); enable Developer Mode in Settings -> System -> \
+             For developers -> Developer Mode (or grant SeCreateSymbolicLinkPrivilege) to \
+             materialize symbolic links",
+            report.skipped_symlinks
+        ));
+    }
+    Ok(symlinks_out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2843,25 +2895,33 @@ mod tests {
 
     #[test]
     fn w11_case_folded_symlink_chain_and_task_leftover_link_traversal_are_refused() {
-        // 1. In-manifest case-folded chain (`a/b/up -> ..` and `hop -> A/B/UP/../..`) is refused.
-        let res = TreeManifest::with_entries(
-            vec![],
-            vec![
-                BlobSymlink {
-                    path: "a/b/up".to_string(),
-                    target: "..".to_string(),
-                },
-                BlobSymlink {
-                    path: "hop".to_string(),
-                    target: "A/B/UP/../..".to_string(),
-                },
-            ],
-            vec![],
-        );
-        assert!(
-            res.is_err(),
-            "case-folded chain in manifest must be refused"
-        );
+        // 1. In-manifest case-folded chains (`a/b/up -> ..` + `hop -> A/B/UP/../..`,
+        //    `s/b/up -> ..` + `hop -> ſ/b/up/../..`, and deeper `s/b/c/up -> ../..` +
+        //    `hop -> ſ/b/c/up/../../..`) are refused.
+        for (up_path, up_target, hop_target) in [
+            ("a/b/up", "..", "A/B/UP/../.."),
+            ("s/b/up", "..", "\u{017f}/b/up/../.."),
+            ("s/b/c/up", "../..", "\u{017f}/b/c/up/../../.."),
+        ] {
+            let res = TreeManifest::with_entries(
+                vec![],
+                vec![
+                    BlobSymlink {
+                        path: up_path.to_string(),
+                        target: up_target.to_string(),
+                    },
+                    BlobSymlink {
+                        path: "hop".to_string(),
+                        target: hop_target.to_string(),
+                    },
+                ],
+                vec![],
+            );
+            assert!(
+                res.is_err(),
+                "case-folded chain ({up_path}, {hop_target}) in manifest must be refused"
+            );
+        }
 
         // 2. If a task leaves an untracked symlink `a/b/up -> ..` on disk in `tree/`, a later sync
         //    introducing `hop -> a/b/up/../..` (and `hop -> A/B/UP/../..` on case-insensitive
@@ -2915,6 +2975,50 @@ mod tests {
                 "expected WorkspaceError::Path for case-folded hop traversing on-disk link, got: {err_folded}"
             );
             assert!(fs::symlink_metadata(g.tree_dir().join("hop")).is_err());
+        }
+
+        // 3. Order-independent post-creation verification & rollback in `materialize_symlinks`:
+        //    even when `hop` is created BEFORE `s/b/up` (or deeper `s/b/c/up`), the post-creation
+        //    walk catches `hop`, rolls back all links created in the pass, and fails the sync.
+        let _ = remove_symlink(&g.tree_dir().join("a/b/up"));
+        for (up_rel, up_target, hop_target, hop_resolved) in [
+            ("s/b/up", "..", "s/b/up/../..", "s"),
+            ("s/b/c/up", "../..", "s/b/c/up/../../..", "s"),
+        ] {
+            let l_hop = BlobSymlink {
+                path: "hop".to_string(),
+                target: hop_target.to_string(),
+            };
+            let l_up = BlobSymlink {
+                path: up_rel.to_string(),
+                target: up_target.to_string(),
+            };
+            let targets = vec![
+                (&l_hop, g.tree_dir().join("hop"), hop_resolved.to_string()),
+                (&l_up, g.tree_dir().join(up_rel), "s".to_string()),
+            ];
+            let mut report = SyncReport::default();
+            let err = materialize_symlinks(
+                &g.tree_dir(),
+                "proj",
+                &targets,
+                &HashSet::from(["s".to_string()]),
+                &HashSet::new(),
+                &mut report,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::Path { ref path, .. } if path == "hop"),
+                "expected post-creation failure on 'hop', got: {err}"
+            );
+            assert!(
+                fs::symlink_metadata(g.tree_dir().join("hop")).is_err(),
+                "created 'hop' link must be rolled back on failure"
+            );
+            assert!(
+                fs::symlink_metadata(g.tree_dir().join(up_rel)).is_err(),
+                "created '{up_rel}' link must be rolled back on failure"
+            );
         }
     }
 }
