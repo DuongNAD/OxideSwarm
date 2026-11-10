@@ -12,6 +12,7 @@ works a limited number of times.
 | `make_kit.sh` | Writes `<DIR>/OxideSwarm/`: these installers, the release archives for macOS (arm64 and x86_64), Windows and Linux with `SHA256SUMS`, and the join token read from standard input |
 | `install.sh`, `Install OxideSwarm.command` | Install on Linux and macOS |
 | `install.ps1`, `Install OxideSwarm.cmd` | Install on Windows |
+| `Update OxideSwarm.command`, `Update OxideSwarm.cmd` | Update an install in place (`install.sh --update`, `install.ps1 -Update`) |
 | `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added |
 | `KIT_README.txt` | Becomes `README.txt` on the stick |
 
@@ -87,6 +88,24 @@ Each installer does the following, without administrator rights:
 `install.sh --no-autostart` and `install.ps1 -NoAutostart` skip the start at login, as does a
 `no-autostart` file in the kit. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
 Windows) change the defaults.
+
+### Update a machine
+
+Double-click `Update OxideSwarm.command` (macOS) or `Update OxideSwarm.cmd` (Windows), or run
+`bash install.sh --update` on Linux, from a stick that carries the newer kit. The update:
+
+- finds the install (`--install-root`, else on Windows the folder recorded in
+  `HKCU\Software\OxideSwarm\UsbKit`, else the default folder) and stops if there is none;
+- keeps its name, build (GPU or plain) and workspace choice from `kit-install.conf`
+  (`kit-install.txt` on Windows), which the installer writes; for an older install the name comes
+  from its `home/worker_id.<name>` file and, without a terminal, the plain build is kept;
+- keeps the start at login as it is, and does not join again: the state in `<folder>/home` (cluster
+  secret, worker id) stays;
+- stops the worker (and its LaunchAgent or systemd unit), replaces the binaries after the same
+  checksum check, starts it again and waits until the master lists it. It does not run the doctor.
+
+An install that uses the GPU build is not updated from a kit without one, unless `--no-gpu`
+(`-NoGpu`) asks for the plain build.
 
 ### Another drive on Windows
 

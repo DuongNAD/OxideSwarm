@@ -6,7 +6,11 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--gpu|--no-gpu]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--gpu|--no-gpu] [--update]
+#
+# --update (what "Update OxideSwarm.command" runs) updates an existing install in place: it keeps
+# its folder, name, GPU choice, cluster membership and start at login, asks nothing, does not join
+# again, and only replaces the binaries and restarts the worker.
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -17,6 +21,7 @@ ROOT=""
 AUTOSTART=1
 WORKSPACES=1
 GPU=""
+UPDATE=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -27,9 +32,10 @@ while [ $# -gt 0 ]; do
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-workspaces) WORKSPACES=0 ;;
+    --update) UPDATE=1 ;;
     --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
     --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
   shift
@@ -52,10 +58,39 @@ if [ -z "$ROOT" ]; then
   fi
 fi
 
-[ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+[ "$UPDATE" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
+
+PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
+UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/oxideswarm-usb-worker.service"
+# Whether this install's worker is started at login now (a LaunchAgent or a systemd user unit that
+# runs this install's binary).
+has_autostart() {
+  { [ -f "$PLIST" ] && grep -qF "$ROOT/bin/oxideswarm" "$PLIST"; } ||
+    { [ -f "$UNIT" ] && grep -qF "$ROOT/bin/oxideswarm" "$UNIT"; }
+}
+if [ "$UPDATE" = 1 ]; then
+  [ -x "$ROOT/bin/oxideswarm" ] || fail "there is no OxideSwarm from a USB kit in $ROOT; run the installer first"
+  # Its settings: kit-install.conf (written since the update mode exists), else what is on disk.
+  if [ -f "$ROOT/kit-install.conf" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        name) [ -n "$NAME" ] || NAME=$value ;;
+        gpu) [ -n "$GPU" ] || case "$value" in 0|1) GPU=$value ;; esac ;;
+        workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
+      esac
+    done < "$ROOT/kit-install.conf"
+  fi
+  if [ -z "$NAME" ]; then
+    ID_FILE=$(ls -t "$ROOT"/home/worker_id.* 2>/dev/null | head -n 1 || true)
+    [ -n "$ID_FILE" ] && NAME=${ID_FILE##*/worker_id.}
+  fi
+  case "$NAME" in *[!A-Za-z0-9_.-]*) NAME="" ;; esac
+  # The start at login stays as it is.
+  if has_autostart; then AUTOSTART=1; else AUTOSTART=0; fi
+fi
 
 ARCHIVE=""
 for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
@@ -68,9 +103,12 @@ GPU_ARCHIVE=""
 for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
   [ -f "$f" ] && GPU_ARCHIVE=$f
 done
-[ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ] && fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
+if [ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ]; then
+  [ "$UPDATE" = 1 ] && fail "this install uses the GPU build, which this kit lacks; update from a kit made with make_kit.sh --gpu, or add --no-gpu"
+  fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
+fi
 
-say "OxideSwarm USB installer"
+if [ "$UPDATE" = 1 ]; then say "OxideSwarm USB installer (update)"; else say "OxideSwarm USB installer"; fi
 say "  system:  $OS $ARCH ($TARGET)"
 say "  folder:  $ROOT"
 
@@ -101,6 +139,16 @@ else
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || fail "checksum mismatch for $ARCHIVE_NAME: the copy on the stick is damaged"
 say "  archive: $ARCHIVE_NAME (checksum OK)"
+
+# Stop the worker this install's start-at-login entry keeps alive before its binary changes; step 8
+# puts the entry back.
+if has_autostart; then
+  if [ "$OS" = Darwin ]; then
+    launchctl bootout "gui/$(id -u)/com.oxideswarm.usb-worker" 2>/dev/null || true
+  else
+    systemctl --user stop oxideswarm-usb-worker.service 2>/dev/null || true
+  fi
+fi
 
 # 2. Unpack the binaries.
 BIN_DIR="$ROOT/bin"
@@ -142,11 +190,14 @@ if [ -f "$RUN_DIR/worker.pid" ]; then
   rm -f "$RUN_DIR/worker.pid"
 fi
 
-# 4. Join: the token is read from standard input only, never from the command line.
-say ""
-say "Joining the cluster ..."
-if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
-  fail "join failed (see the message above); nothing was started"
+# 4. Join: the token is read from standard input only, never from the command line. An update keeps
+# the existing membership.
+if [ "$UPDATE" = 0 ]; then
+  say ""
+  say "Joining the cluster ..."
+  if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
+    fail "join failed (see the message above); nothing was started"
+  fi
 fi
 
 # The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
@@ -214,11 +265,14 @@ while [ $i -lt 30 ]; do
 done
 [ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
 say "  connected (isolation: $ISOLATION)"
+# What an update keeps: the name, the build and the workspace choice.
+GPU_USED=0
+if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
+printf 'name=%s\ngpu=%s\nworkspaces=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$OS" = Darwin ]; then
-    PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     {
       printf '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -244,7 +298,7 @@ if [ "$AUTOSTART" = 1 ]; then
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     say "  autostart: LaunchAgent com.oxideswarm.usb-worker"
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    UNIT_DIR=$(dirname "$UNIT")
     mkdir -p "$UNIT_DIR"
     {
       printf '[Unit]\nDescription=OxideSwarm worker (USB kit)\n\n[Service]\n'
@@ -264,6 +318,12 @@ if [ "$AUTOSTART" = 1 ]; then
   fi
 else
   say "  autostart: skipped (--no-autostart); worker PID $(cat "$RUN_DIR/worker.pid")"
+fi
+
+if [ "$UPDATE" = 1 ]; then
+  say ""
+  say "Updated. Worker '$NAME' runs $("$BIN" --version) from $ROOT."
+  exit 0
 fi
 
 # 9. Check the cluster.

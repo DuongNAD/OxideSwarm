@@ -237,3 +237,9 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   skipped only because it reports FAT32, so the installer now also requires a disk partition behind
   the drive letter (`Win32_LogicalDiskToPartition`; a cloud or virtual drive has none) and refuses
   disks on the USB bus. The worker-side fix landed the same day (design 0021 status log).
+- 2026-11-10: Update in place (`install.sh --update`, `install.ps1 -Update`, and the `Update
+  OxideSwarm` launchers). During the trial every new kit meant uninstall and install on each
+  machine. The update keeps the folder, name, build and start at login, does not join again and
+  skips the doctor; the installer now records the name, build and workspace choice in
+  `kit-install.conf` / `kit-install.txt`. The normal installer also stops this install's LaunchAgent
+  or systemd unit before it replaces the binary.

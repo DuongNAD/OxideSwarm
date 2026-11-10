@@ -81,7 +81,8 @@ mkdir -p "$KIT/archives"
 copy() { cat "$1" > "$2"; }
 for f in install.sh uninstall.sh install.ps1 uninstall.ps1 \
          "Install OxideSwarm.command" "Uninstall OxideSwarm.command" \
-         "Install OxideSwarm.cmd" "Uninstall OxideSwarm.cmd"; do
+         "Install OxideSwarm.cmd" "Uninstall OxideSwarm.cmd" \
+         "Update OxideSwarm.command" "Update OxideSwarm.cmd"; do
   copy "$HERE/$f" "$KIT/$f"
 done
 copy "$HERE/KIT_README.txt" "$KIT/README.txt"

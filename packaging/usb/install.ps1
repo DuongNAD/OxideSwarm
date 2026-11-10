@@ -9,18 +9,26 @@
 # at the keyboard picks another fixed NTFS or ReFS drive. Such a folder holds the task folders and
 # the file cache too, and the installer limits it to this user, SYSTEM and Administrators.
 #
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Gpu | -NoGpu]
+# -Update (what "Update OxideSwarm.cmd" runs) updates an existing install in place: it keeps its
+# folder, name, GPU choice, cluster membership and start at logon, asks nothing, does not join again,
+# and only replaces the binaries and restarts the worker.
+#
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Gpu | -NoGpu] [-Update]
 param(
     [string]$Name = "",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm"),
     [switch]$NoAutostart,
     [switch]$NoWorkspaces,
     [switch]$Gpu,
-    [switch]$NoGpu
+    [switch]$NoGpu,
+    [switch]$Update
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+$DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
+$PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
+$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
@@ -28,24 +36,55 @@ $TokenFile = Join-Path $Kit 'join.token'
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
-if (-not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
+if (-not $Update -and -not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
 $Archive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target.zip" | Select-Object -First 1
 if (-not $Archive) { Fail "no archive for $Target in the kit" }
 # A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
 # when it finds one. It is installed only when the person at the keyboard agrees (or -Gpu).
 $GpuArchive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target-gpu.zip" | Select-Object -First 1
+if ($Update) {
+    # The install to update: -InstallRoot, else the one the installer recorded, else the default.
+    if (-not $PSBoundParameters.ContainsKey('InstallRoot')) {
+        $recorded = $null
+        try { $recorded = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $recorded = $null }
+        if ($recorded) { $InstallRoot = $recorded }
+    }
+    $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+    if (-not (Test-Path (Join-Path $InstallRoot 'bin\oxideswarm.exe'))) { Fail "there is no OxideSwarm from a USB kit in $InstallRoot; run 'Install OxideSwarm.cmd' first" }
+    # Its settings: kit-install.txt (written since the update mode exists), else what is on disk.
+    $settings = @{}
+    $conf = Join-Path $InstallRoot 'kit-install.txt'
+    if (Test-Path $conf) { foreach ($l in Get-Content $conf) { if ($l -match '^(\w+)=(.*)$') { $settings[$Matches[1]] = $Matches[2].Trim() } } }
+    if (-not $Name) {
+        if ($settings['name']) { $Name = $settings['name'] }
+        else {
+            $idFile = Get-ChildItem (Join-Path $InstallRoot 'home') -Filter 'worker_id.*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($idFile) { $Name = $idFile.Name.Substring('worker_id.'.Length) }
+        }
+        if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { $Name = "" }
+    }
+    if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
+    if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
+    # The start at logon stays as it is: only an install that has one gets it again.
+    if (-not $PSBoundParameters.ContainsKey('NoAutostart')) {
+        $run = $null
+        try { $run = (Get-ItemProperty -Path $RunKey -Name 'OxideSwarmUsbWorker' -ErrorAction Stop).OxideSwarmUsbWorker } catch { $run = $null }
+        $NoAutostart = -not ($run -and $run.IndexOf($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+}
 if ($Gpu -and $NoGpu) { Fail "-Gpu and -NoGpu cannot be used together" }
-if ($Gpu -and -not $GpuArchive) { Fail "this kit has no GPU build for $Target (make it with make_kit.sh --gpu)" }
+if ($Gpu -and -not $GpuArchive) {
+    if ($Update) { Fail "this install uses the GPU build, which this kit lacks; update from a kit made with make_kit.sh --gpu, or add -NoGpu" }
+    Fail "this kit has no GPU build for $Target (make it with make_kit.sh --gpu)"
+}
 
-Write-Host "OxideSwarm USB installer"
+if ($Update) { Write-Host "OxideSwarm USB installer (update)" } else { Write-Host "OxideSwarm USB installer" }
 
 # The install folder. The default lives in %LOCALAPPDATA%, which only this user can open. Any other
 # folder must be on a fixed NTFS or ReFS drive (FAT and exFAT keep no permissions, and a removable
 # drive can be pulled out mid-task), and is limited to this user, SYSTEM and Administrators below:
 # a new folder at the root of a data drive otherwise lets every local account change its content.
-$DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
-$PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
 $KitDrive = [IO.Path]::GetPathRoot($Kit)
 function Test-InstallDrive($root) {
     # $null when $root may hold an install, else the reason it may not.
@@ -67,7 +106,7 @@ function Test-InstallDrive($root) {
     return $null
 }
 $explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
-if (-not $explicitRoot -and -not [Console]::IsInputRedirected) {
+if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected) {
     $choices = @($DefaultRoot)
     foreach ($d in [IO.DriveInfo]::GetDrives()) {
         if ($d.Name -eq [IO.Path]::GetPathRoot($DefaultRoot)) { continue }
@@ -91,7 +130,7 @@ if (-not $explicitRoot -and -not [Console]::IsInputRedirected) {
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $PrivateRoot = $InstallRoot.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
-if (-not $PrivateRoot) {
+if (-not $PrivateRoot -and -not $Update) {
     if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
     $why = Test-InstallDrive $InstallRoot
     if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
@@ -111,7 +150,7 @@ $pointer = $null
 try { $pointer = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $pointer = $null }
 $previous = $pointer
 if (-not $previous -and (Test-Path (Join-Path $DefaultRoot 'bin\oxideswarm.exe'))) { $previous = $DefaultRoot }
-if ($previous -and $previous -ne $InstallRoot -and (Test-Path (Join-Path $previous 'bin\oxideswarm.exe'))) {
+if (-not $Update -and $previous -and $previous -ne $InstallRoot -and (Test-Path (Join-Path $previous 'bin\oxideswarm.exe'))) {
     if (-not $explicitRoot) { Fail "OxideSwarm from a USB kit is already installed in $previous; run 'Uninstall OxideSwarm.cmd' first" }
     Write-Host "  note:    another install in $previous stays as it is"
 }
@@ -206,11 +245,13 @@ Write-Host "  binary:  $version"
 $env:OXIDESWARM_HOME = $State
 Set-Location $InstallRoot
 
-# 4. Join: the token goes in on standard input only.
-Write-Host ""
-Write-Host "Joining the cluster ..."
-Get-Content -Raw $TokenFile | & $Exe join --no-doctor
-if ($LASTEXITCODE -ne 0) { Fail "join failed (see the message above); nothing was started" }
+# 4. Join: the token goes in on standard input only. An update keeps the existing membership.
+if (-not $Update) {
+    Write-Host ""
+    Write-Host "Joining the cluster ..."
+    Get-Content -Raw $TokenFile | & $Exe join --no-doctor
+    if ($LASTEXITCODE -ne 0) { Fail "join failed (see the message above); nothing was started" }
+}
 
 # The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
 # machines cannot reach each other directly (school or office Wi-Fi with client isolation), the
@@ -295,14 +336,23 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 if (-not $connected) { Fail "the worker runs but the master does not list it yet; see $log" }
 Write-Host "  connected"
+# What an update keeps: the name, the build and the workspace choice.
+$builtWithGpu = if ($GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
+$withWorkspaces = if ($NoWorkspaces) { '0' } else { '1' }
+Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces")
 
 # 8. Start at logon (current user only, no administrator rights).
 if (-not $NoAutostart) {
-    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    Set-ItemProperty -Path $runKey -Name 'OxideSwarmUsbWorker' -Value ('wscript.exe "' + $vbs + '"')
+    Set-ItemProperty -Path $RunKey -Name 'OxideSwarmUsbWorker' -Value ('wscript.exe "' + $vbs + '"')
     Write-Host "  autostart: HKCU Run entry OxideSwarmUsbWorker"
 } else {
     Write-Host "  autostart: skipped (-NoAutostart)"
+}
+
+if ($Update) {
+    Write-Host ""
+    Write-Host "Updated. Worker '$Name' runs $(& $Exe --version) from $InstallRoot."
+    exit 0
 }
 
 # 9. Check the cluster.

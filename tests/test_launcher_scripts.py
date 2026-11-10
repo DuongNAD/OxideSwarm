@@ -648,6 +648,7 @@ class UsbKitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         kit = os.path.join(self.stick, "OxideSwarm")
         for name in ("install.sh", "install.ps1", "Install OxideSwarm.cmd", "Install OxideSwarm.command",
+                     "Update OxideSwarm.cmd", "Update OxideSwarm.command",
                      "README.txt", "archives/SHA256SUMS"):
             self.assertTrue(os.path.isfile(os.path.join(kit, name)), name)
         token_path = os.path.join(kit, "join.token")
@@ -844,6 +845,83 @@ class UsbKitTests(unittest.TestCase):
         choice = text.index("$Archive = $GpuArchive")
         check = text.index("Get-FileHash $Archive.FullName")
         self.assertTrue(choice < check, "the GPU choice must come before the checksum check")
+
+    def update(self, *args):
+        root = os.path.join(self.tmp, "install-root")
+        return subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                               "--update"] + list(args),
+                              env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=90)
+
+    def test_update_keeps_the_name_the_build_and_the_membership(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        old_pid = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        open(self.args_log, "w").close()
+        res = self.update()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("(update)", res.stdout)
+        self.assertIn("Updated. Worker 'kit-gpu'", res.stdout)
+        self.assertIn("-gpu.tar.gz (checksum OK)", res.stdout)
+        self.assertIn("gpu-build", res.stdout)
+        self.assertNotIn("[Y/n]", res.stdout)
+        calls = [c for c in read(self.args_log).splitlines() if c.strip()]
+        self.assertFalse(any(c.startswith("join") for c in calls), calls)
+        self.assertFalse(any(c.startswith("doctor") for c in calls), calls)
+        worker_calls = [c for c in calls if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--name kit-gpu" in worker_calls[0], calls)
+        new_pid = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        self.assertNotEqual(old_pid, new_pid)
+        self.assertTrue(wait_until(lambda: not pid_alive(old_pid), timeout=10), "the old worker kept running")
+        self.assertTrue(pid_alive(new_pid))
+        self.assertIn("gpu=1", read(os.path.join(root, "kit-install.conf")))
+
+    def test_update_of_an_older_install_takes_the_name_from_its_worker_id_file(self):
+        # Installs made before the update mode have no kit-install.conf: the name comes from the
+        # worker's id file, and without a terminal the plain build is kept.
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        os.remove(os.path.join(root, "kit-install.conf"))
+        with open(os.path.join(root, "home", "worker_id.kit-legacy"), "w") as f:
+            f.write("00000000-0000-0000-0000-000000000000\n")
+        open(self.args_log, "w").close()
+        res = self.update()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--name kit-legacy" in worker_calls[0], worker_calls)
+        self.assertNotIn("gpu-build", res.stdout)
+
+    def test_update_needs_an_install(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        res = self.update()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("run the installer first", res.stdout)
+        self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
+
+    def test_update_of_a_gpu_install_refuses_a_kit_without_the_gpu_build(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(self.make_kit(extra=["--replace"]).returncode, 0)
+        res = self.update()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("lacks", res.stdout)
+        self.assertEqual(self.update("--no-gpu").returncode, 0)
+
+    def test_windows_installer_updates_in_place(self):
+        # Static text: the live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("[switch]$Update", "if (-not $Update) {", "kit-install.txt", "worker_id.*",
+                       "Updated. Worker", "if (-not $Update -and -not (Test-Path $TokenFile))"):
+            self.assertIn(needle, text)
+        join = text.index("& $Exe join --no-doctor")
+        self.assertIn("if (-not $Update) {", text[join - 200:join])
+        self.assertTrue(text.index('Write-Host "Updated. Worker') < text.index("& $Exe doctor"),
+                        "an update must end before the doctor check")
+        launcher = read(os.path.join(ROOT, "packaging", "usb", "Update OxideSwarm.cmd"))
+        self.assertIn("install.ps1\" -Update", launcher)
 
     def test_windows_installer_keeps_another_drive_private(self):
         # Static text: the live check runs on a Windows machine. An install outside %LOCALAPPDATA%

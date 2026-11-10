@@ -25,6 +25,10 @@ On Windows with a second NTFS drive (for example D:), the installer asks
 where to keep its files. A folder on that drive also holds the task folders
 and the file cache, and only your Windows account can open it.
 
+To update a computer that already runs the worker, double-click "Update
+OxideSwarm" instead (Linux: bash install.sh --update). It keeps the name, the
+GPU choice and the cluster membership, asks nothing and joins nothing.
+
 It never changes ~/.oxideswarm or any other OxideSwarm installation on the
 computer. To remove it, run "Uninstall OxideSwarm" from the same stick.
 
