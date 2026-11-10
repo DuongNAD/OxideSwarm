@@ -3,12 +3,14 @@
 //! enrolment (`ENROLL-1b`, design record `docs/design/0051-machine-identity-and-invites.md`).
 
 use std::fs;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use rusty_grid_cli::members_cmd::InviteToken;
+#[cfg(unix)]
 use rusty_grid_core::noise_auth::{MemberRole, NodeKeypair, RedactedBytes32};
 use tempfile::TempDir;
 
@@ -56,6 +58,7 @@ fn run_cmd(mut cmd: Command) -> Output {
     cmd.output().expect("run rusty-grid")
 }
 
+#[cfg(unix)]
 fn run_with_stdin(mut cmd: Command, input: &str) -> Output {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -286,6 +289,7 @@ fn assert_private(path: &Path) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let master_home = TempDir::new().unwrap();
@@ -1020,6 +1024,7 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     assert!(text(&host_members_out.stdout).contains("\"worker-one\""));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
     let master_home = TempDir::new().unwrap();
@@ -1251,33 +1256,79 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
         text(&inv_out.stderr)
     );
     let invite_str = text(&inv_out.stdout).trim().to_string();
+    let decoded_before = InviteToken::decode(&invite_str).expect("decode invite before restart");
 
-    let member_home = TempDir::new().unwrap();
-    let mut join_cmd = with(member_home.path(), &["join", "--no-doctor"]);
-    join_cmd.env("RUSTY_GRID_WORKER_NAME", "secret-file-member");
-    let mut join_sess = InteractiveJoin::spawn(join_cmd, &invite_str);
-    join_sess.confirm("y");
-    let join_out = join_sess.wait_output(Duration::from_secs(20));
+    let master_a_noise = home_a.path().join(".oxideswarm").join("master_noise.key");
+    let master_a_members = home_a.path().join(".oxideswarm").join("members.json");
     assert!(
-        join_out.status.success(),
-        "join failed:\n{}\n{}",
-        text(&join_out.stdout),
-        text(&join_out.stderr)
+        master_a_noise.is_file(),
+        "master_noise.key persisted by invite"
     );
+    assert!(
+        master_a_members.is_file(),
+        "members.json persisted by invite"
+    );
+    assert_private(&master_a_noise);
+    assert_private(&master_a_members);
+
+    #[cfg(unix)]
+    let member_home = {
+        let member_home = TempDir::new().unwrap();
+        let mut join_cmd = with(member_home.path(), &["join", "--no-doctor"]);
+        join_cmd.env("RUSTY_GRID_WORKER_NAME", "secret-file-member");
+        let mut join_sess = InteractiveJoin::spawn(join_cmd, &invite_str);
+        join_sess.confirm("y");
+        let join_out = join_sess.wait_output(Duration::from_secs(20));
+        assert!(
+            join_out.status.success(),
+            "join failed:\n{}\n{}",
+            text(&join_out.stdout),
+            text(&join_out.stderr)
+        );
+        member_home
+    };
 
     // Restart Master A with `--secret-file` on a new port; the persisted `master_noise.key` and
-    // `members.json` must be loaded so `member_home` connects with its pinned `master_key`.
+    // `members.json` must be loaded so its `master_key` stays stable and `member_home` connects
+    // with its pinned `master_key`.
     drop(master_a);
     let (_master_a2, addr_a2) = start_master(home_a.path(), &["--secret-file", secret_file_str]);
 
-    let status_after_restart = run_cmd(with(
-        member_home.path(),
-        &["status", "--master", &addr_a2, "--json"],
+    let inv_after_out = run_cmd(with(
+        home_a.path(),
+        &[
+            "--secret-file",
+            secret_file_str,
+            "invite",
+            "--master",
+            &addr_a2,
+            "--no-approval",
+        ],
     ));
     assert!(
-        status_after_restart.status.success(),
-        "Item 2 regression: enrolled member failed to connect after master restart with --secret-file:\n{}\n{}",
-        text(&status_after_restart.stdout),
-        text(&status_after_restart.stderr)
+        inv_after_out.status.success(),
+        "invite after master restart failed:\n{}\n{}",
+        text(&inv_after_out.stdout),
+        text(&inv_after_out.stderr)
     );
+    let decoded_after = InviteToken::decode(text(&inv_after_out.stdout).trim())
+        .expect("decode invite after restart");
+    assert_eq!(
+        decoded_after.master_key, decoded_before.master_key,
+        "Item 2 regression: master_key changed across master restart with --secret-file"
+    );
+
+    #[cfg(unix)]
+    {
+        let status_after_restart = run_cmd(with(
+            member_home.path(),
+            &["status", "--master", &addr_a2, "--json"],
+        ));
+        assert!(
+            status_after_restart.status.success(),
+            "Item 2 regression: enrolled member failed to connect after master restart with --secret-file:\n{}\n{}",
+            text(&status_after_restart.stdout),
+            text(&status_after_restart.stderr)
+        );
+    }
 }
