@@ -1366,12 +1366,14 @@ fn ensure_target_walks_no_on_disk_symlink<'a>(
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(WorkspaceError::Path {
-            path: link_path.to_string(),
-            reason: format!(
+        Err(e) => {
+            return Err(WorkspaceError::Path {
+                path: link_path.to_string(),
+                reason: format!(
                 "cannot inspect workspace tree while checking symbolic link target '{target}': {e}"
             ),
-        }),
+            })
+        }
     }
 
     #[cfg(unix)]
