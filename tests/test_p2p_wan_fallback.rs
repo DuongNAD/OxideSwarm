@@ -795,3 +795,201 @@ async fn test_p2p_ticket_only_peer_sending_plaintext_cluster_status_gets_no_stat
 
     let _ = master_handle.shutdown();
 }
+
+/// Regression test (LOG-1): CLI client commands (`status`, `workers`, `submit` with blob transfer)
+/// connecting over a P2P ticket must close their ephemeral iroh client endpoints gracefully before
+/// process exit so `iroh::socket` never logs
+/// `ERROR iroh::socket: Endpoint dropped without calling Endpoint::close. Aborting ungracefully.`
+/// to `stderr`.
+#[tokio::test]
+async fn test_log_1_cli_client_commands_over_p2p_ticket_close_endpoints_without_stderr_error() {
+    use rusty_grid_core::cluster_auth::ClusterSecret;
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let fake_home = temp_dir.path().join("home");
+    let fake_ox_home = fake_home.join(".oxideswarm");
+    std::fs::create_dir_all(&fake_ox_home).expect("create fake OXIDESWARM_HOME");
+
+    let ticket_file = temp_dir.path().join("log1_master.ticket");
+    let blob_dir = temp_dir.path().join("master_blobs");
+    let secret_file = temp_dir.path().join("cluster.secret");
+    let secret = ClusterSecret::from_bytes(&[0x5Au8; 32]).expect("cluster secret");
+    secret
+        .save_file(&secret_file, true)
+        .expect("write cluster secret file");
+
+    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = ServerConfig::new(master_bind)
+        .with_p2p(true)
+        .with_p2p_minimal_preset(true)
+        .with_ephemeral_key(true)
+        .with_p2p_ticket_file(&ticket_file)
+        .with_blob_store(&blob_dir, 64 * 1024 * 1024)
+        .with_cluster_secret(secret.clone());
+
+    let master_handle = MasterServer::spawn(config).await.expect("spawn P2P master");
+
+    let raw_ticket = tokio::fs::read_to_string(&ticket_file)
+        .await
+        .expect("read master ticket")
+        .trim()
+        .to_string();
+
+    let worker_sandbox = temp_dir.path().join("worker_sandbox");
+    let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
+        .with_name("log1-p2p-worker")
+        .with_cores(2)
+        .with_sandbox_base_dir(&worker_sandbox)
+        .with_p2p_ticket(&raw_ticket)
+        .with_p2p_minimal_preset(true)
+        .with_cluster_secret(secret);
+
+    let mut worker = WorkerClient::new(worker_config);
+    let worker_id = worker.worker_id();
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+    let worker_task = tokio::spawn(async move {
+        let _ = worker.run(worker_shutdown_rx).await;
+    });
+
+    let start = std::time::Instant::now();
+    let mut registered = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        if master_handle
+            .registry()
+            .list_workers()
+            .await
+            .iter()
+            .any(|w| w.worker_id == worker_id)
+        {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered, "Worker must register via P2P ticket");
+
+    let input_path = temp_dir.path().join("in.txt");
+    std::fs::write(&input_path, b"log1 payload\n").expect("write input file");
+    let out_dir = temp_dir.path().join("out");
+    let input_spec = format!("{}:in.txt", input_path.display());
+
+    let bin = env!("CARGO_BIN_EXE_rusty-grid");
+    let secret_arg = secret_file.to_str().unwrap();
+    let out_dir_arg = out_dir.to_str().unwrap();
+
+    #[cfg(windows)]
+    let submit_cmd_args: Vec<&str> = vec![
+        "submit",
+        "--master",
+        &raw_ticket,
+        "--secret-file",
+        secret_arg,
+        "--input",
+        &input_spec,
+        "--output",
+        "out.txt",
+        "--output-dir",
+        out_dir_arg,
+        "--wait",
+        "--command",
+        "cmd",
+        "--",
+        "/c",
+        "copy /Y in.txt out.txt >NUL && echo log1-ok",
+    ];
+    #[cfg(not(windows))]
+    let submit_cmd_args: Vec<&str> = vec![
+        "submit",
+        "--master",
+        &raw_ticket,
+        "--secret-file",
+        secret_arg,
+        "--input",
+        &input_spec,
+        "--output",
+        "out.txt",
+        "--output-dir",
+        out_dir_arg,
+        "--wait",
+        "--type",
+        "shell",
+        "--command",
+        "cp in.txt out.txt && echo log1-ok",
+    ];
+
+    let commands: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "status",
+            vec![
+                "status",
+                "--master",
+                &raw_ticket,
+                "--secret-file",
+                secret_arg,
+            ],
+        ),
+        (
+            "workers",
+            vec![
+                "workers",
+                "--master",
+                &raw_ticket,
+                "--secret-file",
+                secret_arg,
+            ],
+        ),
+        (
+            "workers-json",
+            vec![
+                "workers",
+                "--json",
+                "--master",
+                &raw_ticket,
+                "--secret-file",
+                secret_arg,
+            ],
+        ),
+        ("submit", submit_cmd_args),
+    ];
+
+    for (label, args) in commands {
+        let output = tokio::process::Command::new(bin)
+            .args(&args)
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("OXIDESWARM_HOME", &fake_ox_home)
+            .env("RUSTY_GRID_P2P_MINIMAL", "1")
+            .env("RUST_LOG", "info,iroh=info")
+            .output()
+            .await
+            .unwrap_or_else(|e| panic!("spawn rusty-grid {label}: {e}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "rusty-grid {label} over P2P ticket failed (status {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            !stderr.contains("Endpoint dropped without calling")
+                && !stderr.contains("Aborting ungracefully"),
+            "rusty-grid {label} logged unclosed iroh endpoint error to stderr:\n{stderr}"
+        );
+        if label == "workers-json" {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+                panic!(
+                    "workers --json over P2P ticket must produce valid JSON on stdout ({e}); got:\n{stdout}"
+                )
+            });
+            let arr = parsed
+                .as_array()
+                .expect("workers --json output must be a JSON array");
+            assert_eq!(arr.len(), 1, "expected 1 worker in workers --json");
+        }
+    }
+
+    let _ = worker_shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+    let _ = master_handle.shutdown();
+}

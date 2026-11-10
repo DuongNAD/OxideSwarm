@@ -746,11 +746,15 @@ pub struct BlobConnection {
     pipeline: SharedPipeline,
     permits: tokio::sync::Semaphore,
     reader: tokio::task::JoinHandle<()>,
+    p2p_guard: Option<std::sync::Arc<rusty_grid_core::transport::P2pClientGuard>>,
 }
 
 impl Drop for BlobConnection {
     fn drop(&mut self) {
         self.reader.abort();
+        if let Some(ref guard) = self.p2p_guard {
+            guard.start_close();
+        }
     }
 }
 
@@ -801,6 +805,7 @@ async fn run_blob_reader(
 
 impl BlobConnection {
     pub fn new(transport: MessageTransport<GridStream>) -> Self {
+        let p2p_guard = transport.get_ref().p2p_guard();
         let (writer, reader) = transport.split();
         let pipeline = SharedPipeline::default();
         let reader = tokio::spawn(run_blob_reader(reader, std::sync::Arc::clone(&pipeline)));
@@ -809,12 +814,24 @@ impl BlobConnection {
             pipeline,
             permits: tokio::sync::Semaphore::new(MAX_IN_FLIGHT_REQUESTS),
             reader,
+            p2p_guard,
         }
     }
 
     /// Opens a new authenticated connection to the Master at `addr` for blob transfers.
     pub async fn connect(addr: &str, secret: Option<&ClusterSecret>) -> GridResult<Self> {
         Ok(Self::new(connect_master(addr, secret).await?))
+    }
+
+    /// Gracefully closes the blob connection and awaits shutdown of any underlying client P2P
+    /// endpoint.
+    pub async fn close(mut self) {
+        self.permits.close();
+        self.reader.abort();
+        let _ = (&mut self.reader).await;
+        if let Some(guard) = self.p2p_guard.take() {
+            guard.close().await;
+        }
     }
 }
 
