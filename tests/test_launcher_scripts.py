@@ -839,17 +839,27 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("[CmdletBinding()]", inst_text)
         self.assertIn("[ValidateSet('off', 'fs')]", inst_text)
         self.assertIn("--isolation $Isolation", inst_text)
+        self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", inst_text)
+        self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", inst_text)
         self.assertIn("connected (isolation: $Isolation)", inst_text)
 
         self.assertIn("[CmdletBinding()]", uninst_text)
         self.assertIn("windows_acl_grants.txt", uninst_text)
         self.assertIn("revoke-isolation-acls.ps1", uninst_text)
+        self.assertIn("keeping $InstallRoot and $Manifest", uninst_text)
         self.assertLess(
             uninst_text.index("revoke-isolation-acls.ps1"),
             uninst_text.index("Remove-Item -Recurse -Force $InstallRoot"),
             "uninstall.ps1 must revoke isolation ACLs before deleting $InstallRoot",
         )
         self.assertIn("$env:OXIDESWARM_HOME", rev_text)
+        self.assertIn("while another worker is running", rev_text)
+        self.assertIn("-notin @('sandboxes', 'workspaces')", rev_text)
+        self.assertLess(
+            rev_text.index("foreach ($restore in $sddlRestores)"),
+            rev_text.index("foreach ($target in $targetPaths)"),
+            "revoke-isolation-acls.ps1 must restore SDDL before icacls /remove",
+        )
 
         if os.name == "nt" and shutil.which("powershell"):
             ps_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
@@ -1009,7 +1019,43 @@ public class Program {
                 vbs_text = read(os.path.join(inst_root_fs, "start-worker.vbs"))
                 self.assertIn("--isolation fs", vbs_text)
                 self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", vbs_text)
-                self.assertTrue(os.path.isfile(os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")))
+                self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", vbs_text)
+                manifest_fs = os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")
+                self.assertTrue(os.path.isfile(manifest_fs))
+
+                # Append a non-sandboxes SDDL entry to verify N1 skips SDDL restore on arbitrary directories.
+                non_sb_dir = os.path.join(tmp, "not_a_sandbox_root")
+                os.makedirs(non_sb_dir, exist_ok=True)
+                with open(manifest_fs, "a", encoding="utf-8") as mf:
+                    mf.write(f"SDDL|{non_sb_dir}|D:P(A;;FA;;;SY)\n")
+
+                # Verify S2 + N5: when another task lock is held, uninstall.ps1 refuses to delete
+                # $InstallRoot or $Manifest and leaves the manifest intact.
+                import ctypes
+                lock_file = os.path.join(tmp_temp, "oxideswarm.task.active.lock")
+                kernel32 = ctypes.windll.kernel32
+                lock_handle = kernel32.CreateFileW(
+                    lock_file, 0x40000000, 0, None, 2, 0x80, None
+                )
+                try:
+                    uninst_busy = subprocess.run(
+                        [
+                            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                            "-InstallRoot", inst_root_fs, "-Yes",
+                        ],
+                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, timeout=60,
+                    )
+                    self.assertNotEqual(uninst_busy.returncode, 0, uninst_busy.stdout)
+                    self.assertIn("while another worker is running", uninst_busy.stdout)
+                    self.assertIn("keeping", uninst_busy.stdout)
+                    self.assertTrue(os.path.isfile(manifest_fs), "manifest must be preserved when revoke is blocked")
+                finally:
+                    if lock_handle not in (-1, 0):
+                        kernel32.CloseHandle(lock_handle)
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
 
                 uninst_fs = subprocess.run(
                     [
@@ -1022,6 +1068,7 @@ public class Program {
                 )
                 self.assertEqual(uninst_fs.returncode, 0, uninst_fs.stdout)
                 self.assertIn("Revoking isolation ACL grants recorded in", uninst_fs.stdout)
+                self.assertIn("Refusing SDDL restore on non-sandbox/workspace base path", uninst_fs.stdout)
                 self.assertFalse(os.path.exists(inst_root_fs))
 
                 # 2b. Install with explicit -Isolation off overriding baked isolation=fs.

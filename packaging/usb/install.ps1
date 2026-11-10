@@ -114,8 +114,12 @@ Write-Host "  binary:  $version"
 
 # Every command below keeps its state in $State and runs from $InstallRoot.
 $GrantLog = Join-Path $State 'windows_acl_grants.txt'
+$SandboxBase = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes'
+$RustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
+$CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:OXIDESWARM_HOME = $State
 $env:RUSTY_GRID_ACL_GRANT_LOG = $GrantLog
+$env:RUSTY_GRID_SANDBOX_BASE_DIR = $SandboxBase
 Set-Location $InstallRoot
 
 # 4. Join: the token goes in on standard input only.
@@ -158,7 +162,9 @@ if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', 
 # Use at most half of the CPU cores, so the machine stays responsive for its owner.
 $slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
-if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
+# Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
+$supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
+if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
 $log = Join-Path $LogDir 'worker.log'
 
 # A small launcher that starts the worker hidden with this install's state folder. The HKCU Run
@@ -168,7 +174,11 @@ $cmdLine = 'cmd /c ""' + $Exe + '" ' + $workerArgs + ' >> "' + $log + '" 2>&1"'
 @(
     'Set sh = CreateObject("WScript.Shell")',
     ('sh.Environment("Process")("OXIDESWARM_HOME") = "' + $State + '"'),
+    ('sh.Environment("Process")("HOME") = "' + $State + '"'),
+    ('sh.Environment("Process")("RUSTUP_HOME") = "' + $RustupHome + '"'),
+    ('sh.Environment("Process")("CARGO_HOME") = "' + $CargoHome + '"'),
     ('sh.Environment("Process")("RUSTY_GRID_ACL_GRANT_LOG") = "' + $GrantLog + '"'),
+    ('sh.Environment("Process")("RUSTY_GRID_SANDBOX_BASE_DIR") = "' + $SandboxBase + '"'),
     ('sh.CurrentDirectory = "' + $InstallRoot + '"'),
     ('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
 ) | Set-Content -Path $vbs -Encoding ASCII

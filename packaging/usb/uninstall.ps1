@@ -45,11 +45,15 @@ foreach ($cand in @(
     }
 }
 if (Test-Path -LiteralPath $Manifest) {
-    if ($RevokeScript) {
-        Write-Host "Revoking isolation ACL grants recorded in $Manifest ..."
-        & $RevokeScript -ManifestPath $Manifest -RemoveManifest
-    } else {
-        Write-Warning "ACL grant manifest found at $Manifest, but revoke-isolation-acls.ps1 was not found."
+    if (-not $RevokeScript) {
+        Write-Host "ERROR: ACL grant manifest found at $Manifest, but revoke-isolation-acls.ps1 was not found; keeping $InstallRoot and $Manifest." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Revoking isolation ACL grants recorded in $Manifest ..."
+    & $RevokeScript -ManifestPath $Manifest -RemoveManifest
+    if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $Manifest)) {
+        Write-Host "ERROR: Isolation ACL revocation did not complete (exit code $LASTEXITCODE); keeping $InstallRoot and $Manifest." -ForegroundColor Red
+        exit 1
     }
 } else {
     Write-Host "No isolation ACL grant manifest in $Manifest (nothing to revoke)."

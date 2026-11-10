@@ -78,14 +78,16 @@ Each installer does the following, without administrator rights:
      and the host kernel cannot start an isolated worker; an explicit `--isolation fs` or baked `fs`
      in the kit's `isolation` file fails instead of falling back), and `--isolation off` by default
      on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs` when opted in; on Windows,
-     `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`
-     alongside `OXIDESWARM_HOME=<folder>\home` so `oxideswarm.toolchain` ACL grants are recorded in
-     `<folder>\home\windows_acl_grants.txt` on release **0.1.1+** without touching
-     `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes them before deleting `<folder>`. Note:
-     release **0.1.1** predates `BUG-18`, so on a Windows machine with Git for Windows installed, a
-     bare `whoami` task under `-Isolation fs` on a `0.1.1` worker resolves to `Git\usr\bin\whoami.exe`
+     `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`,
+     `RUSTY_GRID_SANDBOX_BASE_DIR=%TEMP%\oxideswarm-usb\sandboxes`, `OXIDESWARM_HOME=<folder>\home`,
+     `HOME=<folder>\home`, and explicit `RUSTUP_HOME` / `CARGO_HOME` so `oxideswarm.toolchain` ACL
+     grants are recorded in `<folder>\home\windows_acl_grants.txt` on release **0.1.1+** without
+     touching `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes them before deleting `<folder>`.
+     Note: release **0.1.1** predates `FEAT-3d` and `BUG-18`, so under `-Isolation fs` on `0.1.1`,
+     `install.ps1` omits `--workspaces` and a bare `whoami` task resolves to `Git\usr\bin\whoami.exe`
      and exits `0xC0000142` unless invoked as `C:\Windows\System32\whoami.exe`; release **0.1.2+**
-     resolves bare `whoami` to `%SystemRoot%\System32\whoami.exe` and exits `0`).
+     supports `--workspaces` under `-Isolation fs` and resolves bare `whoami` to
+     `%SystemRoot%\System32\whoami.exe`).
 5. It waits until `oxideswarm workers --json` lists the worker as connected.
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.

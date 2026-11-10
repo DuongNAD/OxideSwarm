@@ -37,7 +37,8 @@ param(
     [string]$ManifestPath = "",
     [string[]]$Paths = @(),
     [switch]$RemoveManifest,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -161,52 +162,6 @@ if (Test-Path -LiteralPath $ManifestPath) {
     Write-Host "No manifest file found at $ManifestPath"
 }
 
-foreach ($target in $targetPaths) {
-    if (-not (Test-Path -LiteralPath $target)) {
-        Write-Host "Skipping missing path: $target"
-        continue
-    }
-    $item = Get-Item -LiteralPath $target -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Write-Host "Skipping reparse point: $target"
-        continue
-    }
-    if ($DryRun) {
-        Write-Host "[DryRun] icacls `"$target`" /remove `"*$toolchainSid`" /c /q"
-    } else {
-        Write-Host "Revoking *$toolchainSid on: $target"
-        & icacls.exe $target /remove "*$toolchainSid" /c /q | Out-Null
-    }
-}
-
-foreach ($restore in $sddlRestores) {
-    $rPath = $restore.Path
-    $rSddl = $restore.Sddl
-    if (-not (Test-Path -LiteralPath $rPath)) {
-        Write-Host "Skipping missing SDDL restore path: $rPath"
-        continue
-    }
-    $item = Get-Item -LiteralPath $rPath -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Write-Host "Skipping reparse point SDDL restore: $rPath"
-        continue
-    }
-    if ($DryRun) {
-        Write-Host "[DryRun] Restore-AclSddl `"$rPath`" `"$rSddl`""
-    } else {
-        Write-Host "Restoring original DACL SDDL on: $rPath"
-        if ($item.PSIsContainer) {
-            $acl = New-Object System.Security.AccessControl.DirectorySecurity
-            $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
-            [System.IO.Directory]::SetAccessControl($rPath, $acl)
-        } else {
-            $acl = New-Object System.Security.AccessControl.FileSecurity
-            $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
-            [System.IO.File]::SetAccessControl($rPath, $acl)
-        }
-    }
-}
-
 $runningWorkers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -in @('oxideswarm.exe', 'rusty-grid.exe') -and $_.CommandLine -like '* worker*' })
 $lockHeld = $false
@@ -236,20 +191,72 @@ if (-not $lockHeld -and -not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-
     }
 }
 
-if ($runningWorkers.Count -gt 0 -or $lockHeld) {
-    Write-Warning "Refusing to sweep oxideswarm.task.* AppContainer profiles while a worker is running; stop the worker first."
-} else {
-    $packagesDir = Join-Path $env:LOCALAPPDATA "Packages"
-    if (Test-Path -LiteralPath $packagesDir) {
-        Get-ChildItem -LiteralPath $packagesDir -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            $prefix = ($_.Name -split '_')[0]
-            if ($prefix.StartsWith("oxideswarm.task.")) {
-                if ($DryRun) {
-                    Write-Host "[DryRun] DeleteAppContainerProfile($prefix)"
-                } else {
-                    $hr = [OxideSwarmIsolationNative]::DeleteAppContainerProfile($prefix)
-                    Write-Host "Deleted leftover AppContainer profile $prefix (HRESULT 0x$($hr.ToString('x8')))"
-                }
+if (($runningWorkers.Count -gt 0 -or $lockHeld) -and -not $Force -and -not $DryRun) {
+    Write-Warning "Refusing to revoke isolation ACL grants, restore sandbox_base SDDL, or sweep oxideswarm.task.* AppContainer profiles while another worker is running; stop all workers first (or pass -Force)."
+    exit 2
+}
+
+foreach ($restore in $sddlRestores) {
+    $rPath = $restore.Path
+    $rSddl = $restore.Sddl
+    if (-not (Test-Path -LiteralPath $rPath)) {
+        Write-Host "Skipping missing SDDL restore path: $rPath"
+        continue
+    }
+    $item = Get-Item -LiteralPath $rPath -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Host "Skipping reparse point SDDL restore: $rPath"
+        continue
+    }
+    $leaf = Split-Path -Leaf $rPath
+    if ($leaf -notin @('sandboxes', 'workspaces') -or -not $item.PSIsContainer) {
+        Write-Warning "Refusing SDDL restore on non-sandbox/workspace base path: $rPath"
+        continue
+    }
+    $curAcl = [System.IO.Directory]::GetAccessControl($rPath, [System.Security.AccessControl.AccessControlSections]::Access)
+    $curSddl = $curAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+    if ($curSddl -notlike "*$toolchainSid*") {
+        Write-Host "Skipping SDDL restore on $rPath (current DACL does not contain *$toolchainSid)"
+        continue
+    }
+    if ($DryRun) {
+        Write-Host "[DryRun] Restore-AclSddl `"$rPath`" `"$rSddl`""
+    } else {
+        Write-Host "Restoring original DACL SDDL on: $rPath"
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
+        [System.IO.Directory]::SetAccessControl($rPath, $acl)
+    }
+}
+
+foreach ($target in $targetPaths) {
+    if (-not (Test-Path -LiteralPath $target)) {
+        Write-Host "Skipping missing path: $target"
+        continue
+    }
+    $item = Get-Item -LiteralPath $target -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Host "Skipping reparse point: $target"
+        continue
+    }
+    if ($DryRun) {
+        Write-Host "[DryRun] icacls `"$target`" /remove `"*$toolchainSid`" /c /q"
+    } else {
+        Write-Host "Revoking *$toolchainSid on: $target"
+        & icacls.exe $target /remove "*$toolchainSid" /c /q | Out-Null
+    }
+}
+
+$packagesDir = Join-Path $env:LOCALAPPDATA "Packages"
+if (Test-Path -LiteralPath $packagesDir) {
+    Get-ChildItem -LiteralPath $packagesDir -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $prefix = ($_.Name -split '_')[0]
+        if ($prefix.StartsWith("oxideswarm.task.")) {
+            if ($DryRun) {
+                Write-Host "[DryRun] DeleteAppContainerProfile($prefix)"
+            } else {
+                $hr = [OxideSwarmIsolationNative]::DeleteAppContainerProfile($prefix)
+                Write-Host "Deleted leftover AppContainer profile $prefix (HRESULT 0x$($hr.ToString('x8')))"
             }
         }
     }

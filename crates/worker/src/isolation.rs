@@ -1099,7 +1099,9 @@ pub mod windows {
     /// Custom capability name derived via `DeriveCapabilitySidsFromName` and granted only to
     /// OxideSwarm task AppContainers and worker-owned toolchain directories.
     pub const OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME: &str = "oxideswarm.toolchain";
-    pub use super::{acl_grant_manifest_path, acl_grant_manifest_path_with, ACL_GRANT_LOG_FILENAME};
+    pub use super::{
+        acl_grant_manifest_path, acl_grant_manifest_path_with, ACL_GRANT_LOG_FILENAME,
+    };
 
     /// Serialises toolchain and sandbox_base ACL preparation within the worker process.
     static PREPARE_LOCK: Mutex<()> = Mutex::new(());
@@ -2733,14 +2735,11 @@ pub mod windows {
         // (such as the default `%TEMP%\rusty_grid\sandboxes`).
         let is_allowed_under_home = |home: &Path| -> bool {
             let allowed_ox = home.join(".oxideswarm").join("sandboxes");
-            let allowed_ox_home = std::env::var_os("OXIDESWARM_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .is_some_and(|ox_home| {
-                    !path_starts_with_ci(home, &ox_home)
-                        && path_starts_with_ci(sandbox_base, &ox_home)
-                        && !path_starts_with_ci(&ox_home, sandbox_base)
-                });
+            let allowed_local_ox = home
+                .join("AppData")
+                .join("Local")
+                .join("oxideswarm")
+                .join("sandboxes");
             let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
             let in_home_temp = path_starts_with_ci(sandbox_base, &allowed_home_temp)
                 && !path_starts_with_ci(&allowed_home_temp, sandbox_base);
@@ -2751,7 +2750,7 @@ pub mod windows {
                 && path_starts_with_ci(sandbox_base, &temp_root)
                 && !path_starts_with_ci(&temp_root, sandbox_base);
             path_starts_with_ci(sandbox_base, &allowed_ox)
-                || allowed_ox_home
+                || path_starts_with_ci(sandbox_base, &allowed_local_ox)
                 || in_home_temp
                 || in_env_temp
         };
@@ -2871,19 +2870,20 @@ pub mod windows {
                 .join("Local")
                 .join("oxideswarm")
                 .join("workspaces");
-            let allowed_ox_home = std::env::var_os("OXIDESWARM_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .is_some_and(|ox_home| {
-                    !path_starts_with_ci(home, &ox_home)
-                        && path_starts_with_ci(ws_root, &ox_home)
-                        && !path_starts_with_ci(&ox_home, ws_root)
-                });
+            let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
+            let in_home_temp = path_starts_with_ci(ws_root, &allowed_home_temp)
+                && !path_starts_with_ci(&allowed_home_temp, ws_root);
+            let temp_is_inside_home = !temp_root.as_os_str().is_empty()
+                && path_starts_with_ci(&temp_root, home)
+                && !path_starts_with_ci(home, &temp_root);
+            let in_env_temp = temp_is_inside_home
+                && path_starts_with_ci(ws_root, &temp_root)
+                && !path_starts_with_ci(&temp_root, ws_root);
             path_starts_with_ci(ws_root, &allowed1)
                 || path_starts_with_ci(ws_root, &allowed2)
                 || path_starts_with_ci(ws_root, &allowed3)
-                || allowed_ox_home
-                || path_starts_with_ci(ws_root, &temp_root)
+                || in_home_temp
+                || in_env_temp
         };
         if !host.user_home.as_os_str().is_empty()
             && path_starts_with_ci(ws_root, &host.user_home)
@@ -5078,6 +5078,25 @@ mod tests {
             .expect_err("must reject <user_home>\\Documents");
         assert!(err_docs.contains("user folder"), "{err_docs}");
 
+        let docs_sub = docs.join("sub");
+        std::fs::create_dir_all(&docs_sub).unwrap();
+        let err_docs_sub = windows::validate_sandbox_base_safe(&docs_sub, &host)
+            .expect_err("must reject <user_home>\\Documents\\sub as sandbox_base");
+        assert!(err_docs_sub.contains("user folder"), "{err_docs_sub}");
+        let err_ws_docs_sub = windows::validate_workspace_root_safe(&docs_sub, &host)
+            .expect_err("must reject <user_home>\\Documents\\sub as workspace_root");
+        assert!(err_ws_docs_sub.contains("user folder"), "{err_ws_docs_sub}");
+
+        let local_ox_sandboxes = fake_home
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm")
+            .join("sandboxes");
+        std::fs::create_dir_all(&local_ox_sandboxes).unwrap();
+        windows::validate_sandbox_base_safe(&local_ox_sandboxes, &host)
+            .expect("<user_home>\\AppData\\Local\\OxideSwarm\\sandboxes must be accepted");
+
         let ox_sandboxes = fake_home.path().join(".oxideswarm").join("sandboxes");
         std::fs::create_dir_all(&ox_sandboxes).unwrap();
         windows::validate_sandbox_base_safe(&ox_sandboxes, &host)
@@ -5133,11 +5152,7 @@ mod tests {
             ox_home.join("windows_acl_grants.txt")
         );
         assert_eq!(
-            acl_grant_manifest_path_with(
-                &host,
-                Some(OsStr::new("")),
-                Some(ox_home.as_os_str()),
-            ),
+            acl_grant_manifest_path_with(&host, Some(OsStr::new("")), Some(ox_home.as_os_str()),),
             ox_home.join("windows_acl_grants.txt")
         );
 

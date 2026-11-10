@@ -85,11 +85,18 @@ In `crates/worker/src/isolation.rs`:
    already exist on disk) in addition to `<host.user_home>/.oxideswarm/...`, without creating
    `<host.user_home>/.oxideswarm`.
 3. `windows::validate_sandbox_base_safe` and `windows::validate_workspace_root_safe` accept paths
-   inside a dedicated `OXIDESWARM_HOME` directory under `user_home`.
+   inside the dedicated `<host.user_home>\AppData\Local\oxideswarm\sandboxes` directory under
+   `user_home` (in addition to `<host.user_home>\.oxideswarm\sandboxes`) while still rejecting
+   arbitrary directories under `user_home`.
 4. `windows/revoke-isolation-acls.ps1` uses the same three-tier default for `-ManifestPath` and
-   checks for running `worker` processes by command line (`CommandLine -like '* worker*'`) rather
-   than any `oxideswarm` process, so a co-located `oxideswarm master` on the same host does not
-   block sweeping leftover `oxideswarm.task.*` AppContainer profiles after the worker stops.
+   checks before modifying any ACL or SDDL whether any `oxideswarm.exe` / `rusty-grid.exe` worker
+   process (`CommandLine -like '* worker*'`, so a co-located `oxideswarm master` does not block
+   cleanup) or `oxideswarm.task.*.lock` file is active. If another worker or task is active (and
+   `-Force` was not passed), `revoke-isolation-acls.ps1` prints a warning and exits `2` without
+   modifying ACLs, SDDL, AppContainer profiles, or the manifest. When no worker is active, it
+   restores `SDDL\t<path>\t<sddl>` entries before running `icacls /remove` (only on existing
+   directories whose leaf name is `sandboxes` or `workspaces` and whose current on-disk DACL SDDL
+   still contains the `oxideswarm.toolchain` SID).
 
 ### D2: Opt-in isolation in `make_kit.sh`, `install.ps1`, and `install.sh`
 
@@ -97,19 +104,23 @@ In `crates/worker/src/isolation.rs`:
    - validates that the value is `off` or `fs` (any other value exits `1`);
    - writes the chosen mode to `$KIT/isolation` when `--isolation` is passed;
    - copies `windows/revoke-isolation-acls.ps1` to `$KIT/revoke-isolation-acls.ps1`.
-2. `packaging/usb/install.ps1`:
+2. `packaging/usb/install.ps1` (and the `.cmd` wrappers `Install OxideSwarm.cmd` /
+   `Uninstall OxideSwarm.cmd`):
+   - the `.cmd` wrappers clear `set PSModulePath=` before invoking Windows PowerShell 5.1 so
+     launching from PowerShell 7 (`pwsh`) cannot shadow `Microsoft.PowerShell.Utility`
+     (`Get-FileHash`);
    - adds `[CmdletBinding()]` above `param(...)` so PowerShell rejects unknown parameters;
    - adds `[ValidateSet('off', 'fs')][string]$Isolation = ""`;
    - resolves `$Isolation`: CLI `-Isolation` > `$Kit\isolation` file > `'off'`;
-   - sets `$env:RUSTY_GRID_ACL_GRANT_LOG = Join-Path $State 'windows_acl_grants.txt'` (and writes the
-     same `RUSTY_GRID_ACL_GRANT_LOG` environment entry into `start-worker.vbs` alongside
-     `OXIDESWARM_HOME`), so even release **0.1.1** worker binaries (which predate `OXIDESWARM_HOME`
-     support in `acl_grant_manifest_path`) write `windows_acl_grants.txt` into `$InstallRoot\home`
-     and never touch `%USERPROFILE%\.oxideswarm`;
+   - sets `$env:RUSTY_GRID_ACL_GRANT_LOG = Join-Path $State 'windows_acl_grants.txt'` and
+     `$env:RUSTY_GRID_SANDBOX_BASE_DIR = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes'`
+     (and writes both into `start-worker.vbs` alongside `OXIDESWARM_HOME`), so even release **0.1.1**
+     worker binaries write `windows_acl_grants.txt` into `$InstallRoot\home`, use a dedicated USB
+     sandbox base directory, and never touch `%USERPROFILE%\.oxideswarm`;
    - copies `revoke-isolation-acls.ps1` into `$InstallRoot\revoke-isolation-acls.ps1`;
    - passes `--isolation $Isolation` in `$workerArgs` (used for both the immediate `wscript.exe`
      launch and the `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` `OxideSwarmUsbWorker`
-     autostart launcher);
+     autostart launcher, overridable via `OXIDESWARM_USB_RUN_VALUE` for isolated tests);
    - prints `  connected (isolation: $Isolation)`.
 3. `packaging/usb/install.sh`:
    - adds `--isolation off|fs`;
@@ -128,16 +139,21 @@ In `crates/worker/src/isolation.rs`:
    - if `$Manifest` exists, runs `revoke-isolation-acls.ps1 -ManifestPath $Manifest -RemoveManifest`
      (which removes `oxideswarm.toolchain` allow and deny ACEs from every path in the manifest,
      restores the original `sandbox_base` SDDL, and deletes leftover `oxideswarm.task.*`
-     AppContainer profiles) and prints what was revoked;
+     AppContainer profiles) and prints what was revoked; if `revoke-isolation-acls.ps1` fails (for
+     example exit code `2` because another OxideSwarm worker is still running on the machine) or the
+     script is missing, `uninstall.ps1` prints a clear error message and exits `1` while keeping
+     `$InstallRoot` and `$Manifest` intact so ACLs can be revoked once the other worker stops;
    - if `$Manifest` does not exist, prints that no isolation ACL manifest was present.
-4. Deletes `$InstallRoot`.
+4. Deletes `$InstallRoot` (and removes `%TEMP%\oxideswarm-usb\sandboxes` when empty).
 
 ### D4: Native Win32 command resolution under Windows isolation (`BUG-18`)
 
 In `crates/core/src/capabilities.rs` and `crates/worker/src/runner.rs`:
 
-1. `is_msys_usr_bin_dir(dir)` identifies MSYS2 POSIX `usr\bin` directories (`...\Git\usr\bin` and
-   `...\msys64\usr\bin`).
+1. `is_msys_usr_bin_dir(dir)` identifies MSYS2/Cygwin POSIX `bin` directories (either by the
+   presence of `msys-2.0.dll` / `cygwin1.dll` in `dir` on disk or by path suffixes such as
+   `...\Git\usr\bin`, `...\git\current\usr\bin`, `...\msys64\usr\bin`, `...\cygwin64\bin`, and
+   `...\cygwin\bin`).
 2. When `self.config.isolation != IsolationLevel::Off` on Windows, `TaskRunner` calls
    `augment_windows_path_for_isolation` and `resolve_windows_executable_for_isolation`:
    - `augment_windows_path_for_isolation` keeps native directories (`%SystemRoot%\System32`,
@@ -158,15 +174,17 @@ and Linux).
 
 Minimum release version for `-Isolation fs` on Windows:
 - **Release 0.1.1+**: `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG` to
-  `<InstallRoot>\home\windows_acl_grants.txt`, which release `0.1.1` already honours. Both ACL
-  grant logging and `uninstall.ps1` ACL revocation work with `0.1.1` archives without touching
-  `%USERPROFILE%\.oxideswarm`. Note that `0.1.1` predates `BUG-18`, so on a host with Git for
-  Windows installed, a bare `whoami` task under `-Isolation fs` on a `0.1.1` worker resolves to
-  `Git\usr\bin\whoami.exe` (`msys-2.0.dll`) and exits `0xC0000142` (`-1073741502`) unless invoked as
-  `C:\Windows\System32\whoami.exe`.
+  `<InstallRoot>\home\windows_acl_grants.txt`, `RUSTY_GRID_SANDBOX_BASE_DIR` to
+  `%TEMP%\oxideswarm-usb\sandboxes`, `HOME` to `<InstallRoot>\home` (with explicit `RUSTUP_HOME`
+  and `CARGO_HOME`), and omit `--workspaces` on `0.1.0`/`0.1.1` when `-Isolation fs` is selected
+  (since `0.1.1` predates `FEAT-3d`). Both ACL grant logging and `uninstall.ps1` ACL revocation work
+  with `0.1.1` archives without touching `%USERPROFILE%\.oxideswarm`. Note that `0.1.1` predates
+  `BUG-18`, so on a host with Git for Windows installed, a bare `whoami` task under `-Isolation fs`
+  on a `0.1.1` worker resolves to `Git\usr\bin\whoami.exe` (`msys-2.0.dll`) and exits `0xC0000142`
+  (`-1073741502`) unless invoked as `C:\Windows\System32\whoami.exe`.
 - **Release 0.1.2+** (builds containing this design): includes native `OXIDESWARM_HOME` manifest
-  precedence and the `BUG-18` fix so bare `whoami` resolves to `%SystemRoot%\System32\whoami.exe`
-  and exits `0`.
+  precedence, `--workspaces` under `-Isolation fs` (`FEAT-3d`), and the `BUG-18` fix so bare
+  `whoami` resolves to `%SystemRoot%\System32\whoami.exe` and exits `0`.
 
 ## Security
 
