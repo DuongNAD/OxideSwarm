@@ -1261,15 +1261,42 @@ impl MemberStore {
         let now = now_unix_secs();
         guard.prune_pending(now);
 
+        let (code_part, fp_part) = match pairing_code.split_once('@') {
+            Some((c, f)) => (c, Some(f)),
+            None => (pairing_code, None),
+        };
         let id = resolve_id_or_prefix(
             target,
             guard.pending.values().map(|e| e.info.pending_id.as_str()),
             "pending enrollment",
         )?;
+        if let Some(expected_fp) = fp_part {
+            let expected_clean: String = expected_fp
+                .trim()
+                .chars()
+                .filter(|c| *c != '-')
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if let Some(entry) = guard.pending.get(&id) {
+                let actual_clean: String = entry
+                    .info
+                    .master_fingerprint
+                    .chars()
+                    .filter(|c| *c != '-')
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if actual_clean != expected_clean {
+                    return Err(GridError::Config(format!(
+                        "master key fingerprint mismatch (joining machine showed {expected_fp}, master has {})",
+                        entry.info.master_fingerprint
+                    )));
+                }
+            }
+        }
         let expected_code_matches = guard
             .pending
             .get(&id)
-            .is_some_and(|e| verify_pairing_code(e.pairing_code.as_str(), pairing_code));
+            .is_some_and(|e| verify_pairing_code(e.pairing_code.as_str(), code_part));
         if !expected_code_matches {
             return Err(GridError::Config(format!(
                 "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
@@ -1369,7 +1396,9 @@ impl MemberStore {
                 apply_unconfirmed_op_to_entry(&mut rebuilt, pending_info.public_key, op);
             }
             let entry = rebuilt.expect("tracker has at least one approval op");
-            staged.by_pubkey.insert(pending_info.public_key, entry.clone());
+            staged
+                .by_pubkey
+                .insert(pending_info.public_key, entry.clone());
             Ok(entry)
         })?;
         let new_gen = gen_before.wrapping_add(1);
@@ -1463,7 +1492,9 @@ impl MemberStore {
                 .get(&rollback.public_key)
                 .filter(|t| {
                     t.expected_generation == current_gen
-                        && t.ops.iter().any(|op| op.approval_id == rollback.approval_id)
+                        && t.ops
+                            .iter()
+                            .any(|op| op.approval_id == rollback.approval_id)
                 })
                 .cloned()
         } else {
@@ -1777,8 +1808,8 @@ impl MemberStore {
         if !guard.state.v2_worker_seq.contains_key(&worker_id)
             && guard.state.v2_worker_seq.len() >= MAX_PERSISTED_V2_WORKERS
         {
-            let needed = (guard.state.v2_worker_seq.len() + 1)
-                .saturating_sub(MAX_PERSISTED_V2_WORKERS);
+            let needed =
+                (guard.state.v2_worker_seq.len() + 1).saturating_sub(MAX_PERSISTED_V2_WORKERS);
             let mut evictable: Vec<(u64, Uuid)> = guard
                 .state
                 .v2_worker_seq

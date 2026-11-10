@@ -419,6 +419,18 @@ pub fn read_token_hidden() -> GridResult<String> {
         .lock()
         .take(MAX_TOKEN_BYTES + 1)
         .read_line(&mut line);
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::tcflush(0, libc::TCIFLUSH);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+        };
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let _ = FlushConsoleInputBuffer(handle);
+    }
     drop(guard);
     eprintln!();
     read.map_err(|e| GridError::Config(format!("cannot read the join token: {e}")))?;
@@ -1062,6 +1074,15 @@ enum ConfirmationTerminal {
 /// controlling terminal fails immediately without sending an enrollment request.
 fn open_confirmation_terminal(stdin_is_terminal: bool) -> GridResult<ConfirmationTerminal> {
     if stdin_is_terminal {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let dup_fd = unsafe { libc::dup(0) };
+            if dup_fd >= 0 {
+                let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+                return Ok(ConfirmationTerminal::File(file));
+            }
+        }
         return Ok(ConfirmationTerminal::Stdin);
     }
     #[cfg(unix)]
@@ -1091,6 +1112,46 @@ fn open_confirmation_terminal(stdin_is_terminal: bool) -> GridResult<Confirmatio
         Err(GridError::Config(
             "cannot open controlling terminal to confirm the pairing code".into(),
         ))
+    }
+}
+
+/// Discards any pending input bytes sitting in the terminal input queue before displaying the
+/// `[y/N]` confirmation prompt (`Item 4`), so a multi-line paste at the token prompt
+/// (`<invite>\ny\n`) cannot auto-answer `[y/N]`.
+fn flush_confirmation_terminal(term: &ConfirmationTerminal) {
+    match term {
+        ConfirmationTerminal::Stdin => {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::tcflush(0, libc::TCIFLUSH);
+            }
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::System::Console::{
+                    FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+                };
+                let handle = GetStdHandle(STD_INPUT_HANDLE);
+                let _ = FlushConsoleInputBuffer(handle);
+            }
+        }
+        #[cfg(any(unix, windows))]
+        ConfirmationTerminal::File(file) => {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                unsafe {
+                    let _ = libc::tcflush(file.as_raw_fd(), libc::TCIFLUSH);
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+                unsafe {
+                    let _ = FlushConsoleInputBuffer(file.as_raw_handle());
+                }
+            }
+        }
     }
 }
 
@@ -1383,8 +1444,50 @@ async fn run_join_invite(
         .unwrap_or_else(default_machine_name);
 
     let (member_id, roles) = if !token.require_approval {
+        // Complete the v3 first-record confirmation (`ClientMessage::Hello` -> `ClientResponse::Hello`)
+        // before pausing for the interactive `[y/N]` prompt (`Item 3`) so the master's 5 s handshake
+        // watchdog is satisfied and the connection enters the 120 s pre-Enroll prompt window.
+        if let Err(e) = transport.send_msg(&ClientMessage::Hello).await {
+            eprintln!("Enrollment handshake failed: {e}");
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+        match tokio::time::timeout(
+            crate::connect::AUTH_TIMEOUT,
+            transport.recv_msg::<ClientResponse>(),
+        )
+        .await
+        {
+            Ok(Ok(Some(ClientResponse::Hello { .. }))) => {}
+            Ok(Ok(Some(
+                ClientResponse::EnrollRejected { message } | ClientResponse::Error { message },
+            ))) => {
+                eprintln!("Enrollment rejected: {message}");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            Ok(Ok(Some(other))) => {
+                eprintln!("Unexpected enrollment handshake reply from Master: {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Ok(Ok(None)) => {
+                eprintln!("Master closed connection during enrollment handshake");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            Ok(Err(e)) => {
+                eprintln!("Enrollment handshake failed: {e}");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            Err(_) => {
+                eprintln!(
+                    "Enrollment handshake timed out after {}s",
+                    crate::connect::AUTH_TIMEOUT.as_secs()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+
         // `--no-approval` invite: require `[y/N]` confirmation BEFORE sending `ClientMessage::Enroll`
         // so declining never enrolls the machine or consumes an invite use on the master.
+        flush_confirmation_terminal(&confirm_term);
         println!(
             "Pairing code: {}  (Master key fingerprint: {fp})",
             pairing_code.as_str()
@@ -1393,7 +1496,7 @@ async fn run_join_invite(
             "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
         );
         print!(
-            "Confirm that the cluster admin's master shows this pairing code and fingerprint [y/N]: "
+            "Confirm that this master key fingerprint ({fp}) matches the cluster you intend to join [y/N]: "
         );
         let _ = std::io::stdout().flush();
 
@@ -1523,6 +1626,7 @@ async fn run_join_invite(
             }
         };
 
+        flush_confirmation_terminal(&confirm_term);
         println!(
             "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
         );

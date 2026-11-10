@@ -1627,6 +1627,7 @@ impl MasterServer {
             local_node_key_path: self.config.local_node_key_path.clone(),
             members: Arc::clone(&self.config.members),
             p2p_ticket: self.p2p_ticket.clone(),
+            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
         };
 
         #[cfg(feature = "p2p")]
@@ -3471,6 +3472,73 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
         if let Some(ref peer) = v3_peer {
             match peer.purpose {
                 HandshakePurpose::Enroll => {
+                    if is_first && matches!(msg, ClientMessage::Hello) {
+                        let Ok(_prompt_permit) =
+                            Arc::clone(&auth_ctx.enroll_prompt_waiters).try_acquire_owned()
+                        else {
+                            warn!(
+                                member_id = %peer.member_id,
+                                "Refusing OXS-AUTH v3 pre-Enroll prompt wait: 32-waiter limit reached"
+                            );
+                            let _ = send_client_response(
+                                &mut transport,
+                                &ClientResponse::EnrollRejected {
+                                    message: members::GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                                },
+                            )
+                            .await;
+                            let _ = tokio::time::timeout(
+                                REFUSAL_DRAIN_TIMEOUT,
+                                transport.recv_raw_frame_max(
+                                    rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
+                                ),
+                            )
+                            .await;
+                            break;
+                        };
+                        send_client_response(
+                            &mut transport,
+                            &ClientResponse::Hello {
+                                min_compatible_version:
+                                    rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                            },
+                        )
+                        .await?;
+                        match tokio::time::timeout(
+                            ENROLL_PROMPT_IDLE_TIMEOUT,
+                            transport.recv_msg::<ClientMessage>(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(enroll_msg @ ClientMessage::Enroll { .. }))) => {
+                                next_msg = Some(enroll_msg);
+                                first_iteration = true;
+                                continue;
+                            }
+                            Ok(Ok(Some(_))) => {
+                                warn!(
+                                    member_id = %peer.member_id,
+                                    "Refusing non-Enroll message after Hello on OXS-AUTH v3 enroll connection"
+                                );
+                                break;
+                            }
+                            Ok(Ok(None)) | Ok(Err(_)) => {
+                                debug!(
+                                    member_id = %peer.member_id,
+                                    "Enroll peer closed connection before sending ClientMessage::Enroll"
+                                );
+                                break;
+                            }
+                            Err(_) => {
+                                info!(
+                                    member_id = %peer.member_id,
+                                    timeout_secs = ENROLL_PROMPT_IDLE_TIMEOUT.as_secs(),
+                                    "Enroll connection timed out waiting at [y/N] prompt before ClientMessage::Enroll"
+                                );
+                                break;
+                            }
+                        }
+                    }
                     if !is_first || !matches!(msg, ClientMessage::Enroll { .. }) {
                         warn!(
                             member_id = %peer.member_id,
@@ -3783,6 +3851,14 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 }
 
 const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
+
+/// Maximum concurrent `HandshakePurpose::Enroll` connections waiting at the pre-`Enroll`
+/// `[y/N]` prompt (`ClientMessage::Hello` received, `ClientMessage::Enroll` not yet sent).
+const MAX_ENROLL_PROMPT_WAITERS: usize = 32;
+
+/// Maximum time an enroll connection may sit at the `[y/N]` prompt after `ClientMessage::Hello`
+/// before sending `ClientMessage::Enroll` (`Item 3`).
+const ENROLL_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[allow(clippy::too_many_arguments)]
 async fn rollback_enrollment_and_disconnect_workers(
@@ -4463,7 +4539,7 @@ where
     Ok(())
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct MasterAuthContext {
     pub auth_mode: AuthMode,
     pub master_noise_key: Option<NodeKeypair>,
@@ -4471,6 +4547,21 @@ pub(crate) struct MasterAuthContext {
     pub local_node_key_path: Option<PathBuf>,
     pub members: Arc<MemberStore>,
     pub p2p_ticket: Option<String>,
+    pub enroll_prompt_waiters: Arc<Semaphore>,
+}
+
+impl Default for MasterAuthContext {
+    fn default() -> Self {
+        Self {
+            auth_mode: AuthMode::default(),
+            master_noise_key: None,
+            master_noise_key_path: None,
+            local_node_key_path: None,
+            members: Arc::default(),
+            p2p_ticket: None,
+            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
+        }
+    }
 }
 
 impl MasterAuthContext {
@@ -4695,9 +4786,11 @@ where
     if auth_peer.purpose == HandshakePurpose::Enroll {
         if !matches!(
             first_msg,
-            InboundMessage::Client(ClientMessage::Enroll { .. })
+            InboundMessage::Client(ClientMessage::Enroll { .. } | ClientMessage::Hello)
         ) {
-            let reason = "enroll handshake may only send ClientMessage::Enroll".to_string();
+            let reason =
+                "enroll handshake may only send ClientMessage::Enroll or ClientMessage::Hello"
+                    .to_string();
             warn!(
                 remote = %peer,
                 lane,
@@ -9437,6 +9530,7 @@ mod tests {
             local_node_key_path: None,
             members: Arc::clone(&members),
             p2p_ticket: None,
+            ..Default::default()
         };
         let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
         let client_pub = *master_kp.public_key();
@@ -9601,6 +9695,7 @@ mod tests {
             local_node_key_path: None,
             members: Arc::clone(&members),
             p2p_ticket: None,
+            ..Default::default()
         };
         let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
         let secret_c = secret.clone();
@@ -9912,6 +10007,7 @@ mod tests {
             local_node_key_path: None,
             members: Arc::new(MemberStore::new()),
             p2p_ticket: None,
+            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
         };
         let err = mismatch_ctx
             .ensure_v3_key_persisted()

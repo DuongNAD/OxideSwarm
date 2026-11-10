@@ -173,9 +173,10 @@ impl InteractiveJoin {
 
     fn wait_for_pairing_prompt(&self, timeout: Duration) -> bool {
         wait_for(timeout, || {
-            self.stdout().contains(
+            let out = self.stdout();
+            out.contains(
                 "Confirm that the cluster admin's master shows this pairing code and fingerprint [y/N]:",
-            )
+            ) || out.contains("matches the cluster you intend to join [y/N]:")
         })
     }
 
@@ -1533,4 +1534,132 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
             text(&status_after_restart.stderr)
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_round3_two_unnamed_workers_slow_no_approval_confirm_and_paste_no_autoconfirm() {
+    use std::io::Write;
+
+    let master_home = TempDir::new().unwrap();
+    assert!(run_cmd(with(master_home.path(), &["secret", "generate"]))
+        .status
+        .success());
+    let (_master, addr) = start_master(master_home.path(), &[]);
+
+    let inv_out = run_cmd(with(
+        master_home.path(),
+        &["invite", "--master", &addr, "--no-approval", "--uses", "5"],
+    ));
+    assert!(inv_out.status.success(), "{}", text(&inv_out.stderr));
+    let invite_str = text(&inv_out.stdout).trim().to_string();
+
+    // 1. Item 4: Pasting `<invite>\ny\n` in a single write at the hidden token prompt must NOT
+    //    auto-confirm the `[y/N]` prompt.
+    let paste_home = TempDir::new().unwrap();
+    let mut paste_sess = InteractiveJoin::spawn(
+        with(paste_home.path(), &["join", "--no-doctor"]),
+        &format!("{invite_str}\ny"),
+    );
+    assert!(
+        paste_sess.wait_for_pairing_prompt(Duration::from_secs(10)),
+        "paste_sess did not reach [y/N] prompt:\nstdout:\n{}\nstderr:\n{}",
+        paste_sess.stdout(),
+        paste_sess.stderr()
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        paste_sess.child.try_wait().unwrap().is_none(),
+        "Item 4 regression: pasting `<invite>\\ny\\n` auto-confirmed [y/N] without waiting for user input!"
+    );
+    paste_sess
+        .pty_master
+        .write_all(b"n\n")
+        .expect("decline after paste");
+    let _ = paste_sess.pty_master.flush();
+    let paste_out = paste_sess.wait_output(Duration::from_secs(10));
+    assert!(!paste_out.status.success(), "declined join must fail");
+    assert!(!paste_home.path().join(".oxideswarm").exists());
+
+    // 2. Item 3: Answering `y` after 8 seconds on a `--no-approval` invite (> 5 s handshake
+    //    watchdog) must succeed because `ClientMessage::Hello` -> `ClientResponse::Hello`
+    //    completes before the `[y/N]` prompt.
+    let joiner_home = TempDir::new().unwrap();
+    let mut slow_sess = InteractiveJoin::spawn(
+        with(joiner_home.path(), &["join", "--no-doctor"]),
+        &invite_str,
+    );
+    assert!(
+        slow_sess.wait_for_pairing_prompt(Duration::from_secs(10)),
+        "slow_sess did not reach [y/N] prompt"
+    );
+    std::thread::sleep(Duration::from_secs(8));
+    slow_sess.confirm("y");
+    let slow_out = slow_sess.wait_output(Duration::from_secs(15));
+    assert!(
+        slow_out.status.success(),
+        "Item 3 regression: answering `y` after 8s on --no-approval invite failed:\nstdout:\n{}\nstderr:\n{}",
+        text(&slow_out.stdout),
+        text(&slow_out.stderr)
+    );
+    assert!(
+        !joiner_home
+            .path()
+            .join(".oxideswarm")
+            .join("worker_id")
+            .exists(),
+        "Item 2 regression: `join` must not write an unnamed ~/.oxideswarm/worker_id file"
+    );
+
+    // 3. Item 2: Two unnamed workers in `joiner_home` (no `--name`, no `RUSTY_GRID_WORKER_NAME`)
+    //    get distinct ephemeral UUIDs and both stay registered simultaneously without superseding
+    //    each other.
+    let mut u1_cmd = cli(joiner_home.path());
+    u1_cmd
+        .args([
+            "worker",
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(joiner_home.path().join("sb1"));
+    let u1 = Service::spawn(u1_cmd, joiner_home.path().join("u1.log"));
+
+    let mut u2_cmd = cli(joiner_home.path());
+    u2_cmd
+        .args([
+            "worker",
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(joiner_home.path().join("sb2"));
+    let u2 = Service::spawn(u2_cmd, joiner_home.path().join("u2.log"));
+
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                master_home.path(),
+                &["workers", "--master", &addr, "--json"],
+            ));
+            if !out.status.success() {
+                return false;
+            }
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            v.as_array().is_some_and(|arr| arr.len() == 2)
+        }),
+        "Item 2 regression: two unnamed workers in the same HOME did not both stay registered:\nu1:\n{}\nu2:\n{}",
+        u1.log(),
+        u2.log()
+    );
+    assert!(
+        !joiner_home
+            .path()
+            .join(".oxideswarm")
+            .join("worker_id")
+            .exists(),
+        "Item 2 regression: unnamed `worker` must not write ~/.oxideswarm/worker_id"
+    );
 }

@@ -1095,21 +1095,50 @@ async fn run_members_inner(
             }
             match transport.recv_msg::<ClientResponse>().await {
                 Ok(Some(ClientResponse::PendingEnrollmentsList { pending })) => {
-                    if let Some(first) = pending.first() {
-                        let actual_clean: String = first
-                            .master_fingerprint
-                            .chars()
-                            .filter(|c| *c != '-')
-                            .collect::<String>()
-                            .to_ascii_lowercase();
-                        if actual_clean != expected_clean {
+                    let target_lower = a.target.trim().to_ascii_lowercase();
+                    let matches: Vec<_> = pending
+                        .iter()
+                        .filter(|p| {
+                            let pid = p.pending_id.to_ascii_lowercase();
+                            pid == target_lower
+                                || (target_lower.len() >= 4
+                                    && target_lower.chars().all(|c| c.is_ascii_hexdigit())
+                                    && pid.starts_with(&target_lower))
+                        })
+                        .collect();
+                    let Some(matched) = (if matches.len() == 1 {
+                        Some(matches[0])
+                    } else {
+                        pending
+                            .iter()
+                            .find(|p| p.pending_id.eq_ignore_ascii_case(&target_lower))
+                    }) else {
+                        if matches.len() > 1 {
                             eprintln!(
-                                "Error: master key fingerprint mismatch (joining machine showed {}, master has {})",
-                                sanitize_terminal_text(fp.trim()),
-                                sanitize_terminal_text(&first.master_fingerprint)
+                                "Error: ambiguous pending enrollment prefix '{}'",
+                                sanitize_terminal_text(&a.target)
                             );
-                            return ExitCode::FAILURE;
+                        } else {
+                            eprintln!(
+                                "Error: no pending enrollment '{}'",
+                                sanitize_terminal_text(&a.target)
+                            );
                         }
+                        return ExitCode::FAILURE;
+                    };
+                    let actual_clean: String = matched
+                        .master_fingerprint
+                        .chars()
+                        .filter(|c| *c != '-')
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if actual_clean != expected_clean {
+                        eprintln!(
+                            "Error: master key fingerprint mismatch (joining machine showed {}, master has {})",
+                            sanitize_terminal_text(fp.trim()),
+                            sanitize_terminal_text(&matched.master_fingerprint)
+                        );
+                        return ExitCode::FAILURE;
                     }
                 }
                 Ok(Some(ClientResponse::Error { message })) => {
@@ -1133,9 +1162,13 @@ async fn run_members_inner(
         MembersAction::Pending(_) => ClientMessage::ListPendingEnrollments,
         MembersAction::Approve(a) => {
             let clean_code: String = a.code.trim().chars().filter(|c| *c != '-').collect();
+            let pairing_payload = match a.fingerprint {
+                Some(ref fp) => format!("{clean_code}@{}", fp.trim()),
+                None => clean_code,
+            };
             ClientMessage::ApproveEnrollment {
                 pending_id: a.target.clone(),
-                pairing_code: RedactedString(clean_code),
+                pairing_code: RedactedString(pairing_payload),
             }
         }
         MembersAction::Reject(a) => ClientMessage::RejectEnrollment {
