@@ -458,6 +458,40 @@ impl TreeManifest {
         self.files.iter().map(|f| f.size).sum()
     }
 
+    /// Returns `true` if `dir` is an empty directory or the parent directory of any entry in this
+    /// manifest.
+    pub fn has_dir(&self, dir: &str) -> bool {
+        if self
+            .empty_dirs
+            .binary_search_by(|e| e.as_str().cmp(dir))
+            .is_ok()
+        {
+            return true;
+        }
+        let has_descendant_file = {
+            let idx = self
+                .files
+                .partition_point(|f| less_than_dir_slash(&f.path, dir));
+            idx < self.files.len() && is_dir_prefix(dir, &self.files[idx].path)
+        };
+        if has_descendant_file {
+            return true;
+        }
+        let has_descendant_link = {
+            let idx = self
+                .symlinks
+                .partition_point(|s| less_than_dir_slash(&s.path, dir));
+            idx < self.symlinks.len() && is_dir_prefix(dir, &self.symlinks[idx].path)
+        };
+        if has_descendant_link {
+            return true;
+        }
+        let idx = self
+            .empty_dirs
+            .partition_point(|d| less_than_dir_slash(d, dir));
+        idx < self.empty_dirs.len() && is_dir_prefix(dir, &self.empty_dirs[idx])
+    }
+
     /// Returns `true` if this manifest uses `oxideswarm-tree/2` features (symbolic links or empty
     /// directories).
     pub fn is_v2(&self) -> bool {
@@ -658,6 +692,24 @@ fn is_dir_prefix(dir: &str, path: &str) -> bool {
     path.len() > dir.len()
         && path.as_bytes()[dir.len()] == b'/'
         && path.as_bytes()[..dir.len()] == *dir.as_bytes()
+}
+
+#[inline]
+fn less_than_dir_slash(entry: &str, dir: &str) -> bool {
+    let eb = entry.as_bytes();
+    let db = dir.as_bytes();
+    let common = eb.len().min(db.len());
+    match eb[..common].cmp(&db[..common]) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => {
+            if eb.len() <= db.len() {
+                true
+            } else {
+                eb[db.len()] < b'/'
+            }
+        }
+    }
 }
 
 #[inline]
@@ -1010,6 +1062,165 @@ pub fn check_no_symlink_traversal(
         ));
     }
     Ok(())
+}
+
+const PATH_NODE_NONE: u8 = 0;
+const PATH_NODE_DIR: u8 = 1;
+const PATH_NODE_LEAF: u8 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct PathTrieNode {
+    kind: u8,
+    first_child_seg: u32,
+    first_child_node: u32,
+}
+
+impl Default for PathTrieNode {
+    fn default() -> Self {
+        Self {
+            kind: PATH_NODE_NONE,
+            first_child_seg: NONE_U32,
+            first_child_node: NONE_U32,
+        }
+    }
+}
+
+/// Compact node-ID trie of case- and Unicode-folded manifest paths (`files`, `symlinks`, and
+/// `empty_dirs`), used by the worker to detect case/normalization collisions and to query folded
+/// manifest directories without allocating prefix strings.
+#[derive(Debug)]
+pub struct FoldedPathTrie {
+    nodes: Vec<PathTrieNode>,
+    overflow_children: std::collections::HashMap<(u32, u32), u32>,
+    interner: SegmentInterner,
+}
+
+impl Default for FoldedPathTrie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FoldedPathTrie {
+    /// Creates an empty folded path trie with root node `0`.
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![PathTrieNode::default()],
+            overflow_children: std::collections::HashMap::new(),
+            interner: SegmentInterner::default(),
+        }
+    }
+
+    fn ensure_child(&mut self, parent: u32, segment: &str) -> u32 {
+        let seg_id = self.interner.intern_folded(segment);
+        let p = &self.nodes[parent as usize];
+        if p.first_child_seg == seg_id {
+            return p.first_child_node;
+        }
+        if p.first_child_seg != NONE_U32 {
+            if let Some(&next) = self.overflow_children.get(&(parent, seg_id)) {
+                return next;
+            }
+        }
+        let next = self.nodes.len() as u32;
+        self.nodes.push(PathTrieNode::default());
+        let p_mut = &mut self.nodes[parent as usize];
+        if p_mut.first_child_seg == NONE_U32 {
+            p_mut.first_child_seg = seg_id;
+            p_mut.first_child_node = next;
+        } else {
+            self.overflow_children.insert((parent, seg_id), next);
+        }
+        next
+    }
+
+    fn insert_path<'a>(
+        &mut self,
+        path: &'a str,
+        is_leaf: bool,
+        last_parent: &mut Option<(&'a str, u32)>,
+    ) -> Result<(), (String, String)> {
+        let (parent_node, final_seg) = match path.rsplit_once('/') {
+            Some((parent_str, leaf_seg)) => {
+                let pnode = match *last_parent {
+                    Some((prev_str, prev_node)) if prev_str == parent_str => prev_node,
+                    _ => {
+                        let mut node = 0u32;
+                        let mut pos = 0usize;
+                        for seg in parent_str.split('/') {
+                            let seg_end = pos + seg.len();
+                            node = self.ensure_child(node, seg);
+                            if self.nodes[node as usize].kind == PATH_NODE_LEAF {
+                                return Err((path.to_string(), fold_blob_path(&path[..seg_end])));
+                            }
+                            self.nodes[node as usize].kind = PATH_NODE_DIR;
+                            pos = seg_end + 1;
+                        }
+                        *last_parent = Some((parent_str, node));
+                        node
+                    }
+                };
+                (pnode, leaf_seg)
+            }
+            None => (0u32, path),
+        };
+        let node = self.ensure_child(parent_node, final_seg);
+        if self.nodes[node as usize].kind != PATH_NODE_NONE {
+            return Err((path.to_string(), fold_blob_path(path)));
+        }
+        self.nodes[node as usize].kind = if is_leaf {
+            PATH_NODE_LEAF
+        } else {
+            PATH_NODE_DIR
+        };
+        Ok(())
+    }
+
+    /// Builds a [`FoldedPathTrie`] over all entries of `manifest`, returning `Err((path,
+    /// folded_collision))` if any two entries or directory prefixes collide after case and Unicode
+    /// NFD folding.
+    pub fn from_manifest(manifest: &TreeManifest) -> Result<Self, (String, String)> {
+        let mut trie = Self::new();
+        let mut last_parent: Option<(&str, u32)> = None;
+        for p in manifest
+            .files()
+            .iter()
+            .map(|f| f.path.as_str())
+            .chain(manifest.symlinks().iter().map(|s| s.path.as_str()))
+        {
+            trie.insert_path(p, true, &mut last_parent)?;
+        }
+        for d in manifest.empty_dirs() {
+            trie.insert_path(d.as_str(), false, &mut last_parent)?;
+        }
+        Ok(trie)
+    }
+
+    /// Returns `true` if `path` matches any directory in the manifest after case and Unicode NFD
+    /// folding.
+    pub fn contains_dir(&self, path: &str) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let mut node = 0u32;
+        for seg in path.split('/') {
+            let p = &self.nodes[node as usize];
+            if p.first_child_seg == NONE_U32 {
+                return false;
+            }
+            let Some(seg_id) = self.interner.lookup_folded(seg) else {
+                return false;
+            };
+            if p.first_child_seg == seg_id {
+                node = p.first_child_node;
+            } else if let Some(&next) = self.overflow_children.get(&(node, seg_id)) {
+                node = next;
+            } else {
+                return false;
+            }
+        }
+        self.nodes[node as usize].kind == PATH_NODE_DIR
+    }
 }
 
 /// Where a [`TaskInput`] comes from.

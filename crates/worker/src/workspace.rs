@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::blob::{
     fold_blob_path, open_regular_file_nofollow, validate_blob_path, validate_symlink_target,
-    BlobFile, BlobHasher, BlobId, BlobSymlink, TreeManifest,
+    BlobFile, BlobHasher, BlobId, BlobSymlink, FoldedPathTrie, TreeManifest,
 };
 use rusty_grid_core::task::validate_workspace_name;
 use serde::{Deserialize, Serialize};
@@ -830,7 +830,7 @@ impl WorkspaceGuard {
         let mut st = read_state(&self.dir).unwrap_or_else(WorkspaceState::fresh);
         let force_hash = st.state != SyncState::Ready;
 
-        check_case_collisions(manifest)?;
+        let folded_manifest_dirs = check_case_collisions(manifest)?;
         // Check every path before any change, so a bad manifest touches nothing.
         let mut targets: Vec<(&BlobFile, PathBuf)> = Vec::with_capacity(manifest.files().len());
         for f in manifest.files() {
@@ -867,19 +867,6 @@ impl WorkspaceGuard {
             .collect();
         let new_empty_dirs: BTreeSet<&str> =
             manifest.empty_dirs().iter().map(|d| d.as_str()).collect();
-        let mut manifest_dirs: HashSet<&str> = new_empty_dirs.iter().copied().collect();
-        for p in new_file_paths
-            .iter()
-            .copied()
-            .chain(new_symlink_paths.iter().copied())
-            .chain(new_empty_dirs.iter().copied())
-        {
-            for (pos, _) in p.match_indices('/') {
-                manifest_dirs.insert(&p[..pos]);
-            }
-        }
-        let folded_manifest_dirs: HashSet<String> =
-            manifest_dirs.iter().map(|d| fold_blob_path(d)).collect();
         let was_tracked_symlink: HashSet<String> = st
             .symlinks
             .keys()
@@ -954,7 +941,7 @@ impl WorkspaceGuard {
             .empty_dirs
             .iter()
             .chain(st.pending_dirs.iter())
-            .filter(|p| !manifest_dirs.contains(p.as_str()))
+            .filter(|p| !manifest.has_dir(p.as_str()))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -1192,49 +1179,15 @@ impl WorkspaceGuard {
 /// and `a.rs`, `caf\u{00e9}.rs` and `cafe\u{0301}.rs`, or a file `A` next to `a/x`): on the
 /// case- and normalisation-insensitive default file systems of macOS and Windows they are one
 /// file, so the sync would leave one of the contents in place and rewrite it every time. Uses
-/// [`fold_blob_path`] (Unicode NFD + lowercasing) on every host.
-fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> {
-    let mut files: HashSet<String> = HashSet::new();
-    let mut dirs: HashSet<String> = HashSet::new();
-    let clash = |path: &str, other: &str| WorkspaceError::Path {
-        path: path.to_string(),
+/// [`FoldedPathTrie`] (node-ID trie over [`fold_blob_path`]) on every host.
+fn check_case_collisions(manifest: &TreeManifest) -> Result<FoldedPathTrie, WorkspaceError> {
+    FoldedPathTrie::from_manifest(manifest).map_err(|(path, other)| WorkspaceError::Path {
+        path,
         reason: format!(
             "it differs from '{other}' only by case or Unicode normalisation, which one file \
              system entry cannot hold on macOS and Windows"
         ),
-    };
-    for p in manifest
-        .files()
-        .iter()
-        .map(|f| f.path.as_str())
-        .chain(manifest.symlinks().iter().map(|s| s.path.as_str()))
-    {
-        let folded = fold_blob_path(p);
-        if dirs.contains(&folded) || !files.insert(folded.clone()) {
-            return Err(clash(p, &folded));
-        }
-        for (pos, _) in folded.match_indices('/') {
-            let d = &folded[..pos];
-            if files.contains(d) {
-                return Err(clash(p, d));
-            }
-            dirs.insert(d.to_string());
-        }
-    }
-    for d_path in manifest.empty_dirs() {
-        let folded = fold_blob_path(d_path);
-        if files.contains(&folded) || !dirs.insert(folded.clone()) {
-            return Err(clash(d_path, &folded));
-        }
-        for (pos, _) in folded.match_indices('/') {
-            let d = &folded[..pos];
-            if files.contains(d) {
-                return Err(clash(d_path, d));
-            }
-            dirs.insert(d.to_string());
-        }
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1803,7 +1756,7 @@ fn materialize_symlinks(
     tree: &Path,
     workspace_name: &str,
     link_targets: &[(&BlobSymlink, PathBuf, String)],
-    folded_manifest_dirs: &HashSet<String>,
+    folded_manifest_dirs: &FoldedPathTrie,
     was_tracked_symlink: &HashSet<String>,
     report: &mut SyncReport,
 ) -> Result<BTreeMap<String, String>, WorkspaceError> {
@@ -1822,8 +1775,8 @@ fn materialize_symlinks(
             rollback_symlinks(&active_symlinks);
             return Err(e);
         }
-        let target_is_dir = folded_manifest_dirs.contains(&fold_blob_path(resolved))
-            || is_real_dir(&tree.join(resolved));
+        let target_is_dir =
+            folded_manifest_dirs.contains_dir(resolved) || is_real_dir(&tree.join(resolved));
         let tracked = was_tracked_symlink.contains(&link.path);
         let kept = match fs::symlink_metadata(path) {
             Ok(m) if is_link_like(&m) => {
@@ -3308,11 +3261,15 @@ mod tests {
                 (&l_up, g.tree_dir().join(up_rel), "s".to_string()),
             ];
             let mut report = SyncReport::default();
+            let s_trie = FoldedPathTrie::from_manifest(
+                &TreeManifest::with_entries(vec![], vec![], vec!["s".to_string()]).unwrap(),
+            )
+            .unwrap();
             let err = materialize_symlinks(
                 &g.tree_dir(),
                 "proj",
                 &targets,
-                &HashSet::from(["s".to_string()]),
+                &s_trie,
                 &HashSet::new(),
                 &mut report,
             )
@@ -3498,11 +3455,15 @@ mod tests {
             (&l_up, g.tree_dir().join("s/b/up"), "s".to_string()),
         ];
         let mut report = SyncReport::default();
+        let s_trie = FoldedPathTrie::from_manifest(
+            &TreeManifest::with_entries(vec![], vec![], vec!["s".to_string()]).unwrap(),
+        )
+        .unwrap();
         let err_kept = materialize_symlinks(
             &g.tree_dir(),
             "proj",
             &targets,
-            &HashSet::from(["s".to_string()]),
+            &s_trie,
             &HashSet::from(["hop".to_string()]),
             &mut report,
         )
@@ -3519,5 +3480,26 @@ mod tests {
             fs::symlink_metadata(g.tree_dir().join("s/b/up")).is_err(),
             "created 's/b/up' link must be rolled back on failure"
         );
+    }
+
+    #[test]
+    fn w11_folded_path_trie_handles_deep_unshared_paths_and_case_folded_dirs() {
+        let tail_2040 = vec!["a"; 2_040].join("/");
+        let dummy_id = BlobId::of(b"x");
+        let deep_files: Vec<BlobFile> = (0..200)
+            .map(|i| BlobFile {
+                path: format!("f{i:03}/{tail_2040}"),
+                id: dummy_id,
+                size: 1,
+                executable: false,
+            })
+            .collect();
+        let m = TreeManifest::with_entries(deep_files, vec![], vec!["EmptyDir/ẞ_Sub".to_string()])
+            .unwrap();
+        let trie = check_case_collisions(&m).unwrap();
+        assert!(trie.contains_dir("f000/a/a"));
+        assert!(trie.contains_dir("F000/A/A"));
+        assert!(trie.contains_dir("emptydir/ss_sub"));
+        assert!(!trie.contains_dir(&format!("f000/{tail_2040}")));
     }
 }
