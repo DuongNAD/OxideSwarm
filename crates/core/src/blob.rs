@@ -51,10 +51,10 @@ const MANIFEST_MAGIC: &[u8] = b"oxideswarm-tree/2\n";
 /// comparing paths across case-insensitive and normalization-insensitive filesystems (macOS
 /// APFS/HFS+ and Windows NTFS).
 ///
-/// Maps characters through `char::to_uppercase` followed by `char::to_lowercase` between NFD
-/// passes so multi-codepoint and archaic/contextual case folds (`ſ`/`s`, `ς`/`σ`, `µ`/`μ`,
-/// `ß`/`ss`, `ﬀ`/`ff`, `İ`/`i\u{307}`) collapse to a single canonical form using `std` case
-/// tables.
+/// Maps characters through `char::to_lowercase`, `char::to_uppercase`, and `char::to_lowercase`
+/// between NFD passes so multi-codepoint and archaic/contextual case folds (`ſ`/`s`, `ς`/`σ`,
+/// `µ`/`μ`, `ẞ`/`ß`/`ss`, `K`/`k`, `ﬀ`/`ff`, `İ`/`i\u{307}`) collapse to a single canonical
+/// form using `std` case tables.
 pub fn fold_blob_path(s: &str) -> String {
     if s.is_ascii() {
         return s.to_ascii_lowercase();
@@ -62,6 +62,7 @@ pub fn fold_blob_path(s: &str) -> String {
     let nfd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd();
     let folded: String = nfd
         .normalize_iter(s.chars())
+        .flat_map(char::to_lowercase)
         .flat_map(char::to_uppercase)
         .flat_map(char::to_lowercase)
         .collect();
@@ -1549,6 +1550,9 @@ mod tests {
             ("σ", "ς"),
             ("μ", "\u{00b5}"),
             ("ss", "ß"),
+            ("ẞ", "ß"),
+            ("ẞ", "ss"),
+            ("\u{212a}", "k"),
             ("ff", "\u{fb00}"),
             ("caf\u{00e9}", "CAFE\u{0301}"),
         ] {
@@ -1596,6 +1600,28 @@ mod tests {
         assert!(
             err_deep.contains("traverses through symbolic link"),
             "{err_deep}"
+        );
+
+        // Capital sharp-S (`ẞ`, U+1E9E) and Kelvin sign (`K`, U+212A):
+        // `ss/k/up -> ..` and `hop -> ẞ/K/up/../..`
+        let err_sharp_s = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: "ss/k/up".to_string(),
+                    target: "..".to_string(),
+                },
+                BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "ẞ/\u{212a}/up/../..".to_string(),
+                },
+            ],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(
+            err_sharp_s.contains("traverses through symbolic link"),
+            "{err_sharp_s}"
         );
 
         // Linear-time prefix interning: 2,000 symlinks in a ~4,000-byte directory with a 2,040x
