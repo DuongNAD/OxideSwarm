@@ -127,10 +127,12 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `a67a3eb`: 70 items Implemented, 4 Partial and 43 Planned. Five items
+On 2026-11-11, at `master` `a67a3eb`: 70 items Implemented, 4 Partial and 44 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
-2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md). "Pull requests" lists them by number, "(open)" marks one
+2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
+One item (TEST-23) was added on 2026-11-11 from a CI failure on Windows.
+"Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
@@ -166,6 +168,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -786,6 +789,40 @@ The full suite must pass on a clean machine before CI can require it.
 - **Problem:** `generate_research_report` writes `expected_task_id` and `codec_decoded_task_id` (random UUIDv4 strings `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`) plus integer RAM/timing metrics into `target/research_report.json`. `contains_standalone_number` only checked `c.is_ascii_digit() || c == '.'` on the characters immediately before and after `"4090"`, so a UUIDv4 with `-4090-` in its third hyphen-delimited group (or `4090` adjacent to hex digits `'a'..='f'`), or a JSON/unit-labelled metric equal to `4090`, was mistaken for an `"RTX 4090"` GPU model name.
 - **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
 - **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
+
+### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
+
+- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
+  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
+  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
+  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
+  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
+  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
+  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
+- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
+  and waits for a gate file. The first master shuts down, a second one starts on the same address
+  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
+  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
+  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
+  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
+  `out.txt`. Two explanations fit the message, and neither has been tested:
+  1. The test is at fault: the PowerShell command ends without writing the file where the worker
+     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
+  2. The product is at fault: after the worker is adopted by a restarted master, output
+     collection reads the sandbox before the file is there, or reads another sandbox. That would
+     be a defect in the recovery path of FEAT-1, not in the test.
+- **Do:**
+  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
+     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
+  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
+     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
+     the marker file holds, and the time from assignment to the gate file (compare it with
+     `execution_time_ms`).
+  3. If the test is at fault, change only the test, and keep every assertion. If the product is
+     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
+- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
+  on Windows under CPU load. If production code changed, a regression test covers the cause.
 
 ## Phase 3: make the documents true
 
@@ -2389,3 +2426,9 @@ Add one dated line per finished item, newest last.
 - 2026-11-10: Added LV-1, LV-5, LV-10 and LV-14 as Phase 10, from
   [design 0058](design/0058-lasting-value.md), at the owner's word. Nothing is built. The Index
   counts are now 70 Implemented, 4 Partial and 43 Planned.
+- 2026-11-11: Added TEST-23 (Planned) at the owner's word.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` failed once in
+  "workspace tests (windows-latest)" on pull request 206 at `e1fcf70` (run `42817398752`, job
+  `129833857865`); that pull request changes only `docs/`. The same job passed on `master`
+  `0354b28` and on the rerun. The cause is not known. The Index counts are now 70 Implemented,
+  4 Partial and 44 Planned.
