@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `2f22c48` plus USB-2 and BUG-18: 70 items Implemented, 4 Partial and 40 Planned. Five items
+On 2026-11-10, at `master` `4a07fcb`: 70 items Implemented, 4 Partial and 41 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md). "Pull requests" lists them by number, "(open)" marks one
@@ -153,7 +153,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
-| BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | (design 0055), (open) |
+| BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -222,7 +222,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
-| USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | (design 0055), (open) |
+| USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
+| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
@@ -1878,6 +1879,31 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
   3. Update `packaging/usb/uninstall.ps1` to stop the worker and run `revoke-isolation-acls.ps1` against `$InstallRoot\home\windows_acl_grants.txt` before deleting `$InstallRoot`.
 - **Done when:** `tests/test_launcher_scripts.py` passes, and a live Windows install with `-Isolation fs` runs the trial-guide checks, revokes all `oxideswarm.toolchain` ACEs on `uninstall.ps1`, and leaves `%USERPROFILE%\.oxideswarm` untouched.
 
+### USB-3: Keep the Windows USB install folder apart from the default workspace root
+
+- **Evidence:** Found by reading on 2026-11-10 during the review of pull request 204. On Windows the
+  USB kit installs into `%LOCALAPPDATA%\OxideSwarm` (`packaging/usb/install.ps1` and
+  `uninstall.ps1`, parameter `-InstallRoot`), and `worker::workspace::default_root_with`
+  (`crates/worker/src/workspace.rs`) puts the default workspace root at
+  `%LOCALAPPDATA%\oxideswarm\workspaces`. NTFS compares names without case, so both are the same
+  folder.
+- **Problem:** `uninstall.ps1` removes `$InstallRoot` recursively. On a user account that also runs
+  a worker from a normal install with `--workspaces` and the default root, removing the USB kit
+  deletes that worker's workspaces. The reverse also holds: the other worker's workspace store sits
+  inside the kit's private install folder and its lock and state files can make the kit's checks
+  refuse the folder or the uninstall fail half way.
+- **Do:**
+  1. Give the kit an install folder name that no other component uses (for example
+     `%LOCALAPPDATA%\OxideSwarm-USB`), and keep reading the old name for upgrades and uninstall.
+  2. Make the kit always pass `--workspace-root <install folder>\workspaces`, also for the default
+     folder, so the kit never shares the default root.
+  3. Make `uninstall.ps1` refuse to delete a folder that holds a `workspaces` directory the kit did
+     not create, and say which worker uses it.
+- **Done when:** a test in `tests/test_launcher_scripts.py` shows that the kit's install folder and
+  workspace root never equal `default_root_with(Platform::Windows, ..)` for any case spelling, and a
+  live Windows run with a normal worker using the default root plus the USB kit installed and then
+  uninstalled leaves the normal worker's workspaces intact.
+
 ## Phase 9: an open compute network
 
 Draft, added on 2026-11-10 from Phase H of [ROADMAP.md](ROADMAP.md). The architecture and the stage
@@ -2299,6 +2325,13 @@ Add one dated line per finished item, newest last.
   `$InstallRoot`; and under `--isolation fs|fs+net` on Windows `TaskRunner` resolves bare commands
   against `%SystemRoot%\System32` before `Git\usr\bin` so `whoami` exits `0`. The Index counts are
   now 70 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: USB-2 and BUG-18 merged in pull request 204 (`4a07fcb`). A live run on Windows 11
+  as a normal user with a binary built from `4a07fcb` passed the Done when of USB-2: install with
+  `-Isolation fs`, the trial guide's `cmd /c ver`, the PowerShell sum and bare `whoami` exit `0`,
+  reading and listing `Documents` is denied, and `uninstall.ps1 -Yes` restores the sandbox base
+  SDDL and leaves no `oxideswarm.toolchain` ACE. Release 0.1.1 lacks BUG-18, and `install.ps1`
+  keeps `--workspaces` off under isolation for 0.1.0 and 0.1.1, so a kit needs 0.1.2 or later to
+  use both. Added USB-3 (Planned). The Index counts are now 70 Implemented, 4 Partial and 37 Planned.
 - 2026-11-10: Added LV-1, LV-5, LV-10 and LV-14 as Phase 10, from
   [design 0058](design/0058-lasting-value.md), at the owner's word. Nothing is built. The Index
-  counts are now 70 Implemented, 4 Partial and 40 Planned.
+  counts are now 70 Implemented, 4 Partial and 41 Planned.
