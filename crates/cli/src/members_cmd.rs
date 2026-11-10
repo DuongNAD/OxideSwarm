@@ -127,7 +127,9 @@ fn field_ok(value: &str) -> bool {
 }
 
 fn sanitize_terminal_text(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).collect()
+    raw.chars()
+        .filter(|c| !rusty_grid_core::noise_auth::is_control_or_format_char(*c))
+        .collect()
 }
 
 impl InviteToken {

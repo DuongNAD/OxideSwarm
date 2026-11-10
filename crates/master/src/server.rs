@@ -3760,6 +3760,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     &mut transport,
                     msg,
                     &auth_ctx,
+                    v3_peer.as_ref(),
                     &registry,
                     &queue,
                     &scheduler_notify,
@@ -4030,6 +4031,7 @@ async fn handle_member_admin_message<S>(
     transport: &mut MessageTransport<S>,
     msg: ClientMessage,
     auth_ctx: &MasterAuthContext,
+    v3_peer: Option<&AuthenticatedV3Peer>,
     registry: &WorkerRegistry,
     queue: &TaskQueue,
     scheduler_notify: &Arc<tokio::sync::Notify>,
@@ -4041,6 +4043,24 @@ async fn handle_member_admin_message<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let is_v3_admin = v3_peer.is_some_and(|peer| {
+        peer.purpose == HandshakePurpose::Member
+            && auth_ctx
+                .members
+                .get(&peer.public_key)
+                .is_some_and(|m| m.has_admin_role())
+    });
+    let is_v2_authenticated = v3_peer.is_none() && transport.is_encrypted();
+    if !is_v3_admin && !is_v2_authenticated {
+        send_client_response(
+            transport,
+            &ClientResponse::Error {
+                message: "Authentication failed: member and invite administration requires cluster secret (v2) or admin member (v3) authentication (run `oxideswarm secret generate` or start the master with `--auth members`)".into(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     match msg {
         ClientMessage::CreateInvite {
             roles,
@@ -4314,7 +4334,17 @@ impl MasterAuthContext {
             ));
         }
         if let Some(ref key_path) = self.master_noise_key_path {
-            if !key_path.is_file() {
+            if key_path.is_file() {
+                let existing = NodeKeypair::load_file(key_path)?;
+                if existing.public_key() != master_key.public_key() {
+                    return Err(GridError::Config(format!(
+                        "existing master_noise.key at '{}' has a different public key ({}) than the running master ({}); restart the master so it uses the key on disk",
+                        key_path.display(),
+                        existing.public_key().fingerprint(),
+                        master_key.public_key().fingerprint(),
+                    )));
+                }
+            } else {
                 master_key.save_file(key_path, false)?;
             }
         }
@@ -9607,5 +9637,133 @@ mod tests {
         }
 
         let _ = handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_n2_unauthenticated_member_admin_refused_and_restart_with_secret_and_n6_key_mismatch(
+    ) {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::MemberRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        // Phase 1: Start a loopback master with NO secret and no non-host members (`requires_auth` is false).
+        let mut cfg1 = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_ephemeral_key(false);
+        cfg1.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg1.enable_p2p = false;
+        }
+        cfg1.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg1.enable_web_ui = false;
+        }
+        let handle1 = MasterServer::spawn(cfg1).await.unwrap();
+        let addr1 = handle1.server_addr;
+
+        // `mallory` connects without v2 or v3 authentication and attempts `CreateInvite` and `ListMembers`.
+        for msg in [
+            ClientMessage::CreateInvite {
+                roles: vec![MemberRole::Admin],
+                max_uses: 1,
+                expires_in_secs: 3600,
+                require_approval: false,
+            },
+            ClientMessage::ListMembers,
+        ] {
+            let stream = TcpStream::connect(addr1).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            t.send_msg(&msg).await.unwrap();
+            let resp = t.recv_msg::<ClientResponse>().await.unwrap().unwrap();
+            match resp {
+                ClientResponse::Error { message } => {
+                    assert!(
+                        message.contains("Authentication failed"),
+                        "expected Authentication failed for unauthenticated member-admin, got: {message}"
+                    );
+                }
+                other => panic!("expected ClientResponse::Error for {msg:?}, got: {other:?}"),
+            }
+        }
+        assert!(
+            handle1.members().is_empty(),
+            "no members or invites may be created by an unauthenticated peer"
+        );
+        let _ = handle1.shutdown();
+
+        // Phase 2: Restart the master WITH a cluster secret on the same state_dir.
+        let secret = ClusterSecret::generate().unwrap();
+        let mut cfg2 = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_ephemeral_key(false);
+        cfg2.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg2.enable_p2p = false;
+        }
+        cfg2.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg2.enable_web_ui = false;
+        }
+        let handle2 = MasterServer::spawn(cfg2).await.unwrap();
+        let addr2 = handle2.server_addr;
+
+        // Unauthenticated peer is rejected at the handshake gate.
+        {
+            let stream = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let _ = t.send_msg(&ClientMessage::ListMembers).await;
+            let res = t.recv_msg::<ClientResponse>().await;
+            assert!(
+                !matches!(res, Ok(Some(ClientResponse::MembersList { .. }))),
+                "unauthenticated peer must not list members after restart with secret"
+            );
+        }
+        // v2-authenticated admin can list members and create an invite.
+        {
+            let stream = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::ListMembers).await.unwrap();
+            match t.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+                ClientResponse::MembersList { members } => assert!(members.is_empty()),
+                other => panic!("expected MembersList, got: {other:?}"),
+            }
+        }
+        let _ = handle2.shutdown();
+
+        // N6: ensure_v3_key_persisted detects a mismatch when master_noise.key on disk differs
+        // from the in-memory master_noise_key.
+        let disk_kp = NodeKeypair::generate().unwrap();
+        let mem_kp = NodeKeypair::generate().unwrap();
+        let key_path = dir.path().join("mismatch_master_noise.key");
+        disk_kp.save_file(&key_path, false).unwrap();
+        let mismatch_ctx = MasterAuthContext {
+            auth_mode: AuthMode::Both,
+            master_noise_key: Some(mem_kp),
+            master_noise_key_path: Some(key_path),
+            local_node_key_path: None,
+            members: Arc::new(MemberStore::new()),
+            p2p_ticket: None,
+        };
+        let err = mismatch_ctx
+            .ensure_v3_key_persisted()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("different public key"),
+            "expected key mismatch error, got: {err}"
+        );
     }
 }

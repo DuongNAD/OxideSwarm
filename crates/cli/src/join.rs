@@ -1000,7 +1000,7 @@ pub async fn run_join(
 fn sanitize_machine_name(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
+        .filter(|c| !rusty_grid_core::noise_auth::is_control_or_format_char(*c) || *c == ' ')
         .take(64)
         .collect();
     cleaned.trim().to_string()

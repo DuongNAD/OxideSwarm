@@ -234,7 +234,7 @@ impl PersistentMemberState {
         match self.by_pubkey.get_mut(&public_key) {
             Some(existing) => {
                 existing.id = id;
-                if !name.trim().is_empty() {
+                if existing.name.trim().is_empty() && !name.trim().is_empty() {
                     existing.name = name;
                 }
                 for role in roles {
@@ -243,7 +243,7 @@ impl PersistentMemberState {
                     }
                 }
                 existing.last_seen = Some(now);
-                if via_invite.is_some() {
+                if existing.via_invite.is_none() && via_invite.is_some() {
                     existing.via_invite = via_invite;
                 }
                 existing.clone()
@@ -301,11 +301,11 @@ pub fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Strips control characters (`char::is_control`), trims whitespace, and bounds the string to
-/// `max_chars` Unicode scalar values.
+/// Strips control and Unicode format characters (`Cf`, BiDi overrides/isolates), trims
+/// whitespace, and bounds the string to `max_chars` Unicode scalar values.
 pub fn sanitize_display_field(raw: &str, max_chars: usize) -> String {
     raw.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !rusty_grid_core::noise_auth::is_control_or_format_char(*c))
         .collect::<String>()
         .trim()
         .chars()
@@ -313,12 +313,15 @@ pub fn sanitize_display_field(raw: &str, max_chars: usize) -> String {
         .collect()
 }
 
-/// Validates a member name (`1..=MAX_MEMBER_NAME_CHARS` characters after trimming, no control
-/// characters).
+/// Validates a member name (`1..=MAX_MEMBER_NAME_CHARS` characters after trimming, no control or
+/// Unicode format characters).
 pub fn validate_member_name(raw: &str) -> GridResult<String> {
-    if raw.chars().any(char::is_control) {
+    if raw
+        .chars()
+        .any(rusty_grid_core::noise_auth::is_control_or_format_char)
+    {
         return Err(GridError::Config(
-            "member name cannot contain control characters".into(),
+            "member name cannot contain control or format characters".into(),
         ));
     }
     let trimmed = raw.trim();
@@ -819,6 +822,13 @@ impl MemberStore {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if !persist {
             guard.save_path = None;
+        }
+        if guard.state.revoked_keys.contains(&host_pubkey) {
+            tracing::warn!(
+                member_id = %host_pubkey.member_id(),
+                "Skipping auto-enrollment of local host node.key because its public key is in revoked_keys"
+            );
+            return Ok(());
         }
         let now = now_unix_secs();
         let name = sanitize_display_field(&host_name.into(), MAX_MEMBER_NAME_CHARS);
@@ -2236,5 +2246,99 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("maximum of 64"), "got: {err}");
+    }
+
+    #[test]
+    fn test_n5_revoked_host_key_not_re_enrolled_n8_preserve_name_and_via_invite_n9_cf_format_chars()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let host_kp = NodeKeypair::generate().unwrap();
+        store
+            .ensure_local_host_admin(*host_kp.public_key(), "local-host", true)
+            .unwrap();
+        assert!(store.contains(host_kp.public_key()));
+
+        // N5: once revoked, ensure_local_host_admin must not re-add the revoked key.
+        store.revoke_member(&host_kp.member_id()).unwrap();
+        assert!(!store.contains(host_kp.public_key()));
+        store
+            .ensure_local_host_admin(*host_kp.public_key(), "local-host", true)
+            .unwrap();
+        assert!(
+            !store.contains(host_kp.public_key()),
+            "revoked local-host key must not be re-enrolled by ensure_local_host_admin"
+        );
+
+        // N8: re-enrolling an existing member to add a role preserves its existing name and
+        // original via_invite.
+        let inv1 = store
+            .create_invite(vec![MemberRole::Worker], 5, 3600, false)
+            .unwrap();
+        let inv2 = store
+            .create_invite(vec![MemberRole::Client], 5, 3600, false)
+            .unwrap();
+        let member_kp = NodeKeypair::generate().unwrap();
+        let hash = [0x33u8; KEY_LEN];
+        let proof1 = compute_enroll_proof(&inv1.invite_secret.0, &hash);
+        store
+            .handle_enroll_request(
+                *member_kp.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:43000",
+                &inv1.invite_id,
+                &proof1,
+                "initial-box".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+        store
+            .rename_member(&member_kp.member_id(), "curated-admin-name")
+            .unwrap();
+        let proof2 = compute_enroll_proof(&inv2.invite_secret.0, &hash);
+        store
+            .handle_enroll_request(
+                *member_kp.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:43001",
+                &inv2.invite_id,
+                &proof2,
+                "overwriting-hostname".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+        let updated = store.get(member_kp.public_key()).unwrap();
+        assert_eq!(
+            updated.name, "curated-admin-name",
+            "re-enrollment must preserve existing non-empty member name"
+        );
+        assert_eq!(
+            updated.via_invite.as_deref(),
+            Some(inv1.invite_id.as_str()),
+            "re-enrollment must preserve original via_invite"
+        );
+        assert!(updated.has_worker_role() && updated.has_client_role());
+
+        // N9: Unicode format characters (Cf: BiDi overrides/isolates, zero-width space) are
+        // rejected by validate_member_name and stripped by sanitize_display_field.
+        for bad in ["node\u{202e}spoof", "node\u{2066}iso", "node\u{200b}zw"] {
+            assert!(
+                validate_member_name(bad).is_err(),
+                "expected validate_member_name to reject {bad:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_display_field("linux\u{202e}\u{2066}\u{200b}-x64", 32),
+            "linux-x64"
+        );
     }
 }
