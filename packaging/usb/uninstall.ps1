@@ -50,6 +50,7 @@ if (Test-Path -LiteralPath $Manifest) {
         exit 1
     }
     Write-Host "Revoking isolation ACL grants recorded in $Manifest ..."
+    $global:LASTEXITCODE = 0
     & $RevokeScript -ManifestPath $Manifest -RemoveManifest
     if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $Manifest)) {
         Write-Host "ERROR: Isolation ACL revocation did not complete (exit code $LASTEXITCODE); keeping $InstallRoot and $Manifest." -ForegroundColor Red

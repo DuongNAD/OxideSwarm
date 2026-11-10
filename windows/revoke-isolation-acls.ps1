@@ -196,6 +196,8 @@ if (($runningWorkers.Count -gt 0 -or $lockHeld) -and -not $Force -and -not $DryR
     exit 2
 }
 
+$failures = 0
+
 foreach ($restore in $sddlRestores) {
     $rPath = $restore.Path
     $rSddl = $restore.Sddl
@@ -213,19 +215,24 @@ foreach ($restore in $sddlRestores) {
         Write-Warning "Refusing SDDL restore on non-sandbox/workspace base path: $rPath"
         continue
     }
-    $curAcl = [System.IO.Directory]::GetAccessControl($rPath, [System.Security.AccessControl.AccessControlSections]::Access)
-    $curSddl = $curAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
-    if ($curSddl -notlike "*$toolchainSid*") {
-        Write-Host "Skipping SDDL restore on $rPath (current DACL does not contain *$toolchainSid)"
-        continue
-    }
-    if ($DryRun) {
-        Write-Host "[DryRun] Restore-AclSddl `"$rPath`" `"$rSddl`""
-    } else {
-        Write-Host "Restoring original DACL SDDL on: $rPath"
-        $acl = New-Object System.Security.AccessControl.DirectorySecurity
-        $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
-        [System.IO.Directory]::SetAccessControl($rPath, $acl)
+    try {
+        $curAcl = [System.IO.Directory]::GetAccessControl($rPath, [System.Security.AccessControl.AccessControlSections]::Access)
+        $curSddl = $curAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+        if ($curSddl -notlike "*$toolchainSid*") {
+            Write-Host "Skipping SDDL restore on $rPath (current DACL does not contain *$toolchainSid)"
+            continue
+        }
+        if ($DryRun) {
+            Write-Host "[DryRun] Restore-AclSddl `"$rPath`" `"$rSddl`""
+        } else {
+            Write-Host "Restoring original DACL SDDL on: $rPath"
+            $acl = New-Object System.Security.AccessControl.DirectorySecurity
+            $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
+            [System.IO.Directory]::SetAccessControl($rPath, $acl)
+        }
+    } catch {
+        Write-Warning "Failed to restore original DACL SDDL on $($rPath): $($_.Exception.Message)"
+        $failures++
     }
 }
 
@@ -243,7 +250,12 @@ foreach ($target in $targetPaths) {
         Write-Host "[DryRun] icacls `"$target`" /remove `"*$toolchainSid`" /c /q"
     } else {
         Write-Host "Revoking *$toolchainSid on: $target"
+        $global:LASTEXITCODE = 0
         & icacls.exe $target /remove "*$toolchainSid" /c /q | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "icacls /remove exited with code $LASTEXITCODE on: $target"
+            $failures++
+        }
     }
 }
 
@@ -262,7 +274,13 @@ if (Test-Path -LiteralPath $packagesDir) {
     }
 }
 
+if ($failures -gt 0) {
+    Write-Warning "Completed with $failures failure(s); keeping manifest: $ManifestPath"
+    exit 1
+}
+
 if ($RemoveManifest -and -not $DryRun -and (Test-Path -LiteralPath $ManifestPath)) {
     Remove-Item -LiteralPath $ManifestPath -Force
     Write-Host "Removed manifest: $ManifestPath"
 }
+exit 0

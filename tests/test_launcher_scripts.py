@@ -846,6 +846,7 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("[CmdletBinding()]", uninst_text)
         self.assertIn("windows_acl_grants.txt", uninst_text)
         self.assertIn("revoke-isolation-acls.ps1", uninst_text)
+        self.assertIn("$global:LASTEXITCODE = 0", uninst_text)
         self.assertIn("keeping $InstallRoot and $Manifest", uninst_text)
         self.assertLess(
             uninst_text.index("revoke-isolation-acls.ps1"),
@@ -855,10 +856,19 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("$env:OXIDESWARM_HOME", rev_text)
         self.assertIn("while another worker is running", rev_text)
         self.assertIn("-notin @('sandboxes', 'workspaces')", rev_text)
+        self.assertIn("$failures = 0", rev_text)
+        self.assertIn("icacls /remove exited with code", rev_text)
+        self.assertIn("exit 1", rev_text)
+        self.assertIn("exit 0", rev_text)
         self.assertLess(
             rev_text.index("foreach ($restore in $sddlRestores)"),
             rev_text.index("foreach ($target in $targetPaths)"),
             "revoke-isolation-acls.ps1 must restore SDDL before icacls /remove",
+        )
+        self.assertLess(
+            rev_text.index("if ($failures -gt 0)"),
+            rev_text.index("Remove-Item -LiteralPath $ManifestPath -Force"),
+            "revoke-isolation-acls.ps1 must refuse to remove the manifest when any failure occurred",
         )
 
         if os.name == "nt" and shutil.which("powershell"):
@@ -917,6 +927,81 @@ class StaticRepositoryChecks(unittest.TestCase):
                 self.assertEqual(uninst_res.returncode, 0, uninst_res.stdout)
                 self.assertIn("No isolation ACL grant manifest", uninst_res.stdout)
                 self.assertFalse(os.path.exists(fake_install))
+
+                # 1b. R2-S1 Scenario B: manifest exists, but all recorded paths are already gone
+                # (so zero icacls invocations run). revoke-isolation-acls.ps1 must exit 0 and
+                # uninstall.ps1 must not fail with a null $LASTEXITCODE.
+                fake_no_icacls = os.path.join(tmp, "win-no-icacls")
+                os.makedirs(os.path.join(fake_no_icacls, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_no_icacls, "home"), exist_ok=True)
+                shutil.copyfile(revoke_ps1, os.path.join(fake_no_icacls, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(fake_no_icacls, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                with open(os.path.join(fake_no_icacls, "home", "windows_acl_grants.txt"), "w", encoding="utf-8") as f:
+                    f.write(os.path.join(tmp, "already-deleted-sandbox-base") + "\n")
+                uninst_no_icacls = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_no_icacls, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_no_icacls.returncode, 0, uninst_no_icacls.stdout)
+                self.assertIn("Skipping missing path:", uninst_no_icacls.stdout)
+                self.assertFalse(os.path.exists(fake_no_icacls))
+
+                # 1c. R2-S1 Scenario A: an earlier icacls fails (exit 5), a later icacls succeeds (exit 0).
+                # revoke-isolation-acls.ps1 must exit 1 and keep the manifest; uninstall.ps1 must exit 1
+                # and keep both $InstallRoot and $Manifest.
+                fake_icacls_dir = os.path.join(tmp, "fake_icacls_bin")
+                os.makedirs(fake_icacls_dir, exist_ok=True)
+                fake_icacls_cs = os.path.join(tmp, "FakeIcacls.cs")
+                fake_icacls_exe = os.path.join(fake_icacls_dir, "icacls.exe")
+                with open(fake_icacls_cs, "w", encoding="utf-8") as f:
+                    f.write(
+                        "using System;\n"
+                        "public class Program {\n"
+                        "    public static int Main(string[] args) {\n"
+                        "        if (args.Length > 0 && args[0].Contains(\"fail_acl_dir\")) return 5;\n"
+                        "        return 0;\n"
+                        "    }\n"
+                        "}\n"
+                    )
+                comp_icacls = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        f"Add-Type -Path '{fake_icacls_cs}' -OutputAssembly '{fake_icacls_exe}' -OutputType ConsoleApplication",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(comp_icacls.returncode, 0, comp_icacls.stdout)
+                fake_partial = os.path.join(tmp, "win-partial-icacls")
+                fail_acl_dir = os.path.join(tmp, "fail_acl_dir")
+                ok_acl_dir = os.path.join(tmp, "ok_acl_dir")
+                for d in (os.path.join(fake_partial, "bin"), os.path.join(fake_partial, "home"), fail_acl_dir, ok_acl_dir):
+                    os.makedirs(d, exist_ok=True)
+                shutil.copyfile(revoke_ps1, os.path.join(fake_partial, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(fake_partial, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                partial_manifest = os.path.join(fake_partial, "home", "windows_acl_grants.txt")
+                with open(partial_manifest, "w", encoding="utf-8") as f:
+                    f.write(fail_acl_dir + "\n" + ok_acl_dir + "\n")
+                ps_env_fake_icacls = dict(ps_env, PATH=fake_icacls_dir + os.pathsep + ps_env.get("PATH", ""))
+                uninst_partial = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_partial, "-Yes",
+                    ],
+                    env=ps_env_fake_icacls, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(uninst_partial.returncode, 0, uninst_partial.stdout)
+                self.assertIn("icacls /remove exited with code 5", uninst_partial.stdout)
+                self.assertIn("keeping", uninst_partial.stdout)
+                self.assertTrue(os.path.isfile(partial_manifest), "manifest must be kept when an earlier icacls fails")
+                self.assertTrue(os.path.isdir(fake_partial), "install root must be kept when an earlier icacls fails")
 
                 # 2. Fake-binary end-to-end test of install.ps1 and uninstall.ps1 on Windows.
                 kit_dir = os.path.join(tmp, "kit")
