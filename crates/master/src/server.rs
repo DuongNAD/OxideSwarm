@@ -2070,7 +2070,10 @@ const BLOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// there until the task finishes, so the bound cannot evict them before a worker fetched them.
 /// Tasks without inputs, output patterns, or a workspace source tree pass untouched.
 /// Returns whether any input or workspace tree manifest uses `oxideswarm-tree/2` (`TREE_V2`).
-async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<bool, String> {
+pub(crate) async fn admit_blob_task(
+    blob_store: Option<&Arc<BlobStore>>,
+    task: &Task,
+) -> Result<bool, String> {
     let workspace_tree = task
         .workspace
         .as_ref()
