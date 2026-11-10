@@ -12,7 +12,8 @@ works a limited number of times.
 | `make_kit.sh` | Writes `<DIR>/OxideSwarm/`: these installers, the release archives for macOS (arm64 and x86_64), Windows and Linux with `SHA256SUMS`, and the join token read from standard input |
 | `install.sh`, `Install OxideSwarm.command` | Install on Linux and macOS |
 | `install.ps1`, `Install OxideSwarm.cmd` | Install on Windows |
-| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added |
+| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added (on Windows, also revokes any `oxideswarm.toolchain` ACL grants recorded in `<folder>\home\windows_acl_grants.txt` via `revoke-isolation-acls.ps1`) |
+| `revoke-isolation-acls.ps1` |Copied from `windows/revoke-isolation-acls.ps1` so `uninstall.ps1` can revoke Windows isolation ACLs cleanly |
 | `KIT_README.txt` | Becomes `README.txt` on the stick |
 
 ## Make a kit
@@ -29,7 +30,9 @@ existing kit.
 
 For a trial on someone else's machine, add `--no-autostart`. The kit then holds a `no-autostart`
 file, and its installers add no start at login: the worker stops at logout or shutdown, and nothing
-stays behind once the uninstaller has run.
+stays behind once the uninstaller has run. `--isolation off|fs` bakes a default worker isolation
+mode into the kit (`isolation` file) so double-clicking `Install OxideSwarm.cmd` on Windows or
+`Install OxideSwarm.command` on macOS uses that mode without command-line flags ([design 0055](../../docs/design/0055-usb-kit-windows-isolation.md)).
 
 ## Networks where machines cannot see each other
 
@@ -71,15 +74,20 @@ Each installer does the following, without administrator rights:
    - with `--max-concurrency` set to half of the CPU cores (at least 1), so the machine stays
      responsive for its owner;
    - with `--workspaces` when `cargo` is on `PATH`;
-   - with `--isolation fs` on macOS and Linux, falling back to `off` if the worker cannot start with
-     it.
+   - with `--isolation fs` on macOS and Linux (falling back to `off` if the worker cannot start with
+     it), and `--isolation off` by default on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs`
+     when opted in; on Windows, `--isolation fs` records any `oxideswarm.toolchain` ACL grants in
+     `<folder>\home\windows_acl_grants.txt`, and `uninstall.ps1` revokes them before deleting
+     `<folder>`).
 5. It waits until `oxideswarm workers --json` lists the worker as connected.
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.
 
 `install.sh --no-autostart` and `install.ps1 -NoAutostart` skip the start at login, as does a
-`no-autostart` file in the kit. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
-Windows) change the defaults.
+`no-autostart` file in the kit. `--isolation off|fs` (`-Isolation off|fs` on Windows) overrides the
+default or baked `isolation` file. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
+Windows) change the defaults. Both `install.ps1` and `uninstall.ps1` declare `[CmdletBinding()]` so
+unknown parameters fail immediately.
 
 The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
 logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P

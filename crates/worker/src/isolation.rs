@@ -2118,13 +2118,21 @@ pub mod windows {
         Ok(())
     }
 
-    /// Returns the path of the reversible ACL grant manifest file.
-    /// Honours `RUSTY_GRID_ACL_GRANT_LOG` if set; otherwise uses
-    /// `<user_home>/.oxideswarm/windows_acl_grants.txt`.
-    pub fn acl_grant_manifest_path(host: &HostDirs) -> PathBuf {
-        if let Some(custom) = std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG") {
+    /// Pure helper for [`acl_grant_manifest_path`] so precedence can be unit-tested without
+    /// mutating process-wide environment variables.
+    pub fn acl_grant_manifest_path_with(
+        host: &HostDirs,
+        grant_log_env: Option<&std::ffi::OsStr>,
+        oxideswarm_home_env: Option<&std::ffi::OsStr>,
+    ) -> PathBuf {
+        if let Some(custom) = grant_log_env {
             if !custom.is_empty() {
                 return PathBuf::from(custom);
+            }
+        }
+        if let Some(ox_home) = oxideswarm_home_env {
+            if !ox_home.is_empty() {
+                return PathBuf::from(ox_home).join(ACL_GRANT_LOG_FILENAME);
             }
         }
         if !host.user_home.as_os_str().is_empty() {
@@ -2134,6 +2142,20 @@ pub mod windows {
                 .join(ACL_GRANT_LOG_FILENAME);
         }
         std::env::temp_dir().join(ACL_GRANT_LOG_FILENAME)
+    }
+
+    /// Returns the path of the reversible ACL grant manifest file.
+    ///
+    /// Precedence:
+    /// 1. `RUSTY_GRID_ACL_GRANT_LOG` (when set and non-empty),
+    /// 2. `<OXIDESWARM_HOME>/windows_acl_grants.txt` (when `OXIDESWARM_HOME` is set and non-empty),
+    /// 3. `<user_home>/.oxideswarm/windows_acl_grants.txt`.
+    pub fn acl_grant_manifest_path(host: &HostDirs) -> PathBuf {
+        acl_grant_manifest_path_with(
+            host,
+            std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").as_deref(),
+            std::env::var_os("OXIDESWARM_HOME").as_deref(),
+        )
     }
 
     fn record_manifest_line(manifest_path: Option<&Path>, line: &str) -> io::Result<()> {
@@ -2708,6 +2730,14 @@ pub mod windows {
         // (such as the default `%TEMP%\rusty_grid\sandboxes`).
         let is_allowed_under_home = |home: &Path| -> bool {
             let allowed_ox = home.join(".oxideswarm").join("sandboxes");
+            let allowed_ox_home = std::env::var_os("OXIDESWARM_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .is_some_and(|ox_home| {
+                    !path_starts_with_ci(home, &ox_home)
+                        && path_starts_with_ci(sandbox_base, &ox_home)
+                        && !path_starts_with_ci(&ox_home, sandbox_base)
+                });
             let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
             let in_home_temp = path_starts_with_ci(sandbox_base, &allowed_home_temp)
                 && !path_starts_with_ci(&allowed_home_temp, sandbox_base);
@@ -2717,7 +2747,10 @@ pub mod windows {
             let in_env_temp = temp_is_inside_home
                 && path_starts_with_ci(sandbox_base, &temp_root)
                 && !path_starts_with_ci(&temp_root, sandbox_base);
-            path_starts_with_ci(sandbox_base, &allowed_ox) || in_home_temp || in_env_temp
+            path_starts_with_ci(sandbox_base, &allowed_ox)
+                || allowed_ox_home
+                || in_home_temp
+                || in_env_temp
         };
         if !host.user_home.as_os_str().is_empty()
             && path_starts_with_ci(sandbox_base, &host.user_home)
@@ -2835,9 +2868,18 @@ pub mod windows {
                 .join("Local")
                 .join("oxideswarm")
                 .join("workspaces");
+            let allowed_ox_home = std::env::var_os("OXIDESWARM_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .is_some_and(|ox_home| {
+                    !path_starts_with_ci(home, &ox_home)
+                        && path_starts_with_ci(ws_root, &ox_home)
+                        && !path_starts_with_ci(&ox_home, ws_root)
+                });
             path_starts_with_ci(ws_root, &allowed1)
                 || path_starts_with_ci(ws_root, &allowed2)
                 || path_starts_with_ci(ws_root, &allowed3)
+                || allowed_ox_home
                 || path_starts_with_ci(ws_root, &temp_root)
         };
         if !host.user_home.as_os_str().is_empty()
@@ -2975,7 +3017,12 @@ pub mod windows {
 
         let manifest = acl_grant_manifest_path(host);
         let manifest_opt = if host.user_home.as_os_str().is_empty()
-            && std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").is_none()
+            && std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG")
+                .filter(|v| !v.is_empty())
+                .is_none()
+            && std::env::var_os("OXIDESWARM_HOME")
+                .filter(|v| !v.is_empty())
+                .is_none()
         {
             None
         } else {
@@ -2996,9 +3043,24 @@ pub mod windows {
         // Never touch `host.user_home` itself. Windows `SeChangeNotifyPrivilege` (Bypass Traverse
         // Checking, held by AppContainers) allows opening `<user_home>\.rustup` or
         // `<user_home>\.cargo` directly by full path without any ACE on `<user_home>`.
-        // If a secret file under `<user_home>\.oxideswarm` was atomically replaced via same-volume
-        // `MoveFileExW` (`std::fs::rename`) from a staging location that carried an
-        // `oxideswarm.toolchain` allow ACE, strip that allow ACE so the secret stays unreadable.
+        // If a secret file under `<user_home>\.oxideswarm` or `<OXIDESWARM_HOME>` was atomically
+        // replaced via same-volume `MoveFileExW` (`std::fs::rename`) from a staging location that
+        // carried an `oxideswarm.toolchain` allow ACE, strip that allow ACE so the secret stays
+        // unreadable.
+        if let Some(ox_home) = std::env::var_os("OXIDESWARM_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+        {
+            for rel in ["cluster.secret", "p2p_secret.key"] {
+                let sec = ox_home.join(rel);
+                if sec.exists()
+                    && !is_reparse_point(&sec)
+                    && dacl_already_grants_sid(&sec, toolchain_sid.as_psid(), FILE_READ_ATTRIBUTES)
+                {
+                    let _ = remove_sid_aces_from_path(&sec, toolchain_sid.as_psid());
+                }
+            }
+        }
         if !host.user_home.as_os_str().is_empty() {
             for rel in [".oxideswarm/cluster.secret", ".oxideswarm/p2p_secret.key"] {
                 let sec = host.user_home.join(rel);
@@ -3796,6 +3858,22 @@ pub mod windows {
                 };
                 if !existing_protected.contains(&norm_pf) {
                     existing_protected.push(norm_pf);
+                }
+            }
+        }
+        if let Some(ox_home) = std::env::var_os("OXIDESWARM_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+        {
+            let ox_secret = ox_home.join("cluster.secret");
+            if ox_secret.exists() {
+                let norm_ox = if !is_reparse_point(&ox_secret) {
+                    normalize_win_path(&ox_secret)
+                } else {
+                    ox_secret
+                };
+                if !existing_protected.contains(&norm_ox) {
+                    existing_protected.push(norm_ox);
                 }
             }
         }
@@ -5016,5 +5094,58 @@ mod tests {
         let err_non_empty = windows::validate_sandbox_base_safe(&non_empty, &host)
             .expect_err("must reject existing directory containing non-sandbox files");
         assert!(err_non_empty.contains("important.docx"), "{err_non_empty}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_acl_grant_manifest_path_precedence_honours_oxideswarm_home() {
+        use std::ffi::OsStr;
+
+        let fake_home = PathBuf::from(r"C:\Users\alice");
+        let host = HostDirs::from_home(fake_home.clone(), None, None);
+        let ox_home = PathBuf::from(r"C:\Users\alice\AppData\Local\OxideSwarm\home");
+        let explicit_log = PathBuf::from(r"D:\custom\grants.txt");
+
+        // 1. Default when neither RUSTY_GRID_ACL_GRANT_LOG nor OXIDESWARM_HOME is set:
+        //    <user_home>/.oxideswarm/windows_acl_grants.txt
+        assert_eq!(
+            windows::acl_grant_manifest_path_with(&host, None, None),
+            fake_home.join(".oxideswarm").join("windows_acl_grants.txt")
+        );
+
+        // Empty env values are ignored and fall through to the next tier.
+        assert_eq!(
+            windows::acl_grant_manifest_path_with(
+                &host,
+                Some(OsStr::new("")),
+                Some(OsStr::new(""))
+            ),
+            fake_home.join(".oxideswarm").join("windows_acl_grants.txt")
+        );
+
+        // 2. When OXIDESWARM_HOME is set and RUSTY_GRID_ACL_GRANT_LOG is unset/empty:
+        //    <OXIDESWARM_HOME>/windows_acl_grants.txt
+        assert_eq!(
+            windows::acl_grant_manifest_path_with(&host, None, Some(ox_home.as_os_str())),
+            ox_home.join("windows_acl_grants.txt")
+        );
+        assert_eq!(
+            windows::acl_grant_manifest_path_with(
+                &host,
+                Some(OsStr::new("")),
+                Some(ox_home.as_os_str()),
+            ),
+            ox_home.join("windows_acl_grants.txt")
+        );
+
+        // 3. When RUSTY_GRID_ACL_GRANT_LOG is set, it overrides OXIDESWARM_HOME and user_home.
+        assert_eq!(
+            windows::acl_grant_manifest_path_with(
+                &host,
+                Some(explicit_log.as_os_str()),
+                Some(ox_home.as_os_str()),
+            ),
+            explicit_log
+        );
     }
 }

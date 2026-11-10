@@ -763,8 +763,261 @@ class UsbKitTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
         self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
 
+    def test_make_kit_and_install_support_isolation_option_and_reject_invalid_values(self):
+        bad_kit = self.make_kit(extra=["--isolation", "bogus"])
+        self.assertNotEqual(bad_kit.returncode, 0)
+        self.assertIn("--isolation must be off or fs", bad_kit.stdout)
+
+        ok_kit = self.make_kit(extra=["--no-autostart", "--isolation", "off"])
+        self.assertEqual(ok_kit.returncode, 0, ok_kit.stdout)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        self.assertTrue(os.path.isfile(os.path.join(kit, "revoke-isolation-acls.ps1")))
+        self.assertEqual(read(os.path.join(kit, "isolation")).strip(), "off")
+
+        # Baked kit isolation=off is honoured by install.sh when --isolation is not passed.
+        root1 = os.path.join(self.tmp, "install-baked-off")
+        res1 = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root1, "--name", "kit-iso-off"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res1.returncode, 0, res1.stdout)
+        self.assertIn("connected (isolation: off)", res1.stdout)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--isolation off" in worker_calls[-1], worker_calls)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root1, "--yes"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+
+        # CLI --isolation fs overrides baked kit isolation=off.
+        root2 = os.path.join(self.tmp, "install-cli-fs")
+        res2 = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root2, "--name", "kit-iso-fs", "--isolation", "fs"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res2.returncode, 0, res2.stdout)
+        self.assertIn("connected (isolation: fs)", res2.stdout)
+        worker_calls2 = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls2 and "--isolation fs" in worker_calls2[-1], worker_calls2)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root2, "--yes"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+
+        # Invalid --isolation value on install.sh fails immediately.
+        bad_inst = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root2, "--isolation", "invalid"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+        self.assertNotEqual(bad_inst.returncode, 0)
+        self.assertIn("--isolation must be off or fs", bad_inst.stdout)
+
 
 class StaticRepositoryChecks(unittest.TestCase):
+    def test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation(self):
+        install_ps1 = os.path.join(ROOT, "packaging", "usb", "install.ps1")
+        uninstall_ps1 = os.path.join(ROOT, "packaging", "usb", "uninstall.ps1")
+        revoke_ps1 = os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1")
+
+        inst_text = read(install_ps1)
+        uninst_text = read(uninstall_ps1)
+        rev_text = read(revoke_ps1)
+
+        self.assertIn("[CmdletBinding()]", inst_text)
+        self.assertIn("[ValidateSet('off', 'fs')]", inst_text)
+        self.assertIn("--isolation $Isolation", inst_text)
+        self.assertIn("connected (isolation: $Isolation)", inst_text)
+
+        self.assertIn("[CmdletBinding()]", uninst_text)
+        self.assertIn("windows_acl_grants.txt", uninst_text)
+        self.assertIn("revoke-isolation-acls.ps1", uninst_text)
+        self.assertLess(
+            uninst_text.index("revoke-isolation-acls.ps1"),
+            uninst_text.index("Remove-Item -Recurse -Force $InstallRoot"),
+            "uninstall.ps1 must revoke isolation ACLs before deleting $InstallRoot",
+        )
+        self.assertIn("$env:OXIDESWARM_HOME", rev_text)
+
+        if os.name == "nt" and shutil.which("powershell"):
+            for script in (install_ps1, uninstall_ps1):
+                bad_param = subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-NoSuchParam"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(bad_param.returncode, 0, bad_param.stdout)
+                self.assertIn("NoSuchParam", bad_param.stdout)
+
+            bad_iso = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1, "-Isolation", "bogus"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertNotEqual(bad_iso.returncode, 0, bad_iso.stdout)
+
+            tmp = tempfile.mkdtemp(prefix="ox_win_usb_test_")
+            try:
+                # 1. Verify uninstall.ps1 is idempotent when no manifest file exists in $InstallRoot\home.
+                fake_install = os.path.join(tmp, "win-fake-install")
+                os.makedirs(os.path.join(fake_install, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_install, "home"), exist_ok=True)
+                with open(os.path.join(fake_install, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                uninst_res = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_install, "-Yes",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_res.returncode, 0, uninst_res.stdout)
+                self.assertIn("No isolation ACL grant manifest", uninst_res.stdout)
+                self.assertFalse(os.path.exists(fake_install))
+
+                # 2. Fake-binary end-to-end test of install.ps1 and uninstall.ps1 on Windows.
+                kit_dir = os.path.join(tmp, "kit")
+                os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+                for name in ("install.ps1", "uninstall.ps1"):
+                    shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+                shutil.copyfile(revoke_ps1, os.path.join(kit_dir, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(kit_dir, "join.token"), "w", encoding="utf-8") as f:
+                    f.write(KIT_TOKEN + "\n")
+                with open(os.path.join(kit_dir, "no-autostart"), "w", encoding="utf-8") as f:
+                    f.write("trial\n")
+                with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                    f.write("fs\n")
+
+                fake_exe = os.path.join(tmp, "oxideswarm.exe")
+                cs_code = r"""
+using System;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string joined = string.Join(" ", args);
+        string home = Environment.GetEnvironmentVariable("OXIDESWARM_HOME") ?? "";
+        if (!string.IsNullOrEmpty(home) && Directory.Exists(home)) {
+            try { File.AppendAllText(Path.Combine(home, "args.log"), joined + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            Console.In.ReadToEnd();
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            if (joined.Contains("--isolation fs") && !string.IsNullOrEmpty(home)) {
+                string dummyTarget = Path.Combine(home, "dummy_toolchain_dir");
+                Directory.CreateDirectory(dummyTarget);
+                File.WriteAllText(Path.Combine(home, "windows_acl_grants.txt"), dummyTarget + Environment.NewLine);
+            }
+            Thread.Sleep(25000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            Console.WriteLine("[{\"name\":\"win-kit-test\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+                cs_file = os.path.join(tmp, "FakeOxide.cs")
+                with open(cs_file, "w", encoding="utf-8") as f:
+                    f.write(cs_code)
+                compile_res = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+                import zipfile
+                zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+                zip_path = os.path.join(kit_dir, "archives", zip_name)
+                with zipfile.ZipFile(zip_path, "w") as zf:
+                    zf.write(fake_exe, "oxideswarm.exe")
+                zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+                with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                    f.write(f"{zip_sha}  {zip_name}\n")
+
+                # 2a. Install using baked isolation=fs from kit\isolation, then uninstall (revoking manifest).
+                inst_root_fs = os.path.join(tmp, "installed-fs")
+                inst_fs = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "install.ps1"),
+                        "-InstallRoot", inst_root_fs, "-Name", "win-kit-test",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(inst_fs.returncode, 0, inst_fs.stdout)
+                self.assertIn("connected (isolation: fs)", inst_fs.stdout)
+                vbs_text = read(os.path.join(inst_root_fs, "start-worker.vbs"))
+                self.assertIn("--isolation fs", vbs_text)
+                self.assertTrue(os.path.isfile(os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")))
+
+                uninst_fs = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                        "-InstallRoot", inst_root_fs, "-Yes",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(uninst_fs.returncode, 0, uninst_fs.stdout)
+                self.assertIn("Revoking isolation ACL grants recorded in", uninst_fs.stdout)
+                self.assertFalse(os.path.exists(inst_root_fs))
+
+                # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
+                inst_root_off = os.path.join(tmp, "installed-off")
+                inst_off = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "install.ps1"),
+                        "-InstallRoot", inst_root_off, "-Name", "win-kit-test", "-Isolation", "off",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(inst_off.returncode, 0, inst_off.stdout)
+                self.assertIn("connected (isolation: off)", inst_off.stdout)
+                vbs_off = read(os.path.join(inst_root_off, "start-worker.vbs"))
+                self.assertIn("--isolation off", vbs_off)
+                self.assertFalse(os.path.exists(os.path.join(inst_root_off, "home", "windows_acl_grants.txt")))
+
+                uninst_off = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                        "-InstallRoot", inst_root_off, "-Yes",
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(uninst_off.returncode, 0, uninst_off.stdout)
+                self.assertIn("No isolation ACL grant manifest", uninst_off.stdout)
+                self.assertFalse(os.path.exists(inst_root_off))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
     def test_gitattributes_pins_line_endings(self):
         path = os.path.join(ROOT, ".gitattributes")
         self.assertTrue(os.path.isfile(path), ".gitattributes is missing")

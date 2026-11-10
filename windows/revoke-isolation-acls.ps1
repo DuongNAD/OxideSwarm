@@ -20,6 +20,7 @@
 .PARAMETER ManifestPath
     Path to the ACL grant manifest written by the worker. Defaults to
     `$env:RUSTY_GRID_ACL_GRANT_LOG` if set, otherwise
+    `$env:OXIDESWARM_HOME\windows_acl_grants.txt` if `$env:OXIDESWARM_HOME` is set, otherwise
     `$env:USERPROFILE\.oxideswarm\windows_acl_grants.txt`.
 
 .PARAMETER Paths
@@ -42,6 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+if (-not ('OxideSwarmIsolationNative' -as [type])) {
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -111,6 +113,7 @@ public static class OxideSwarmIsolationNative {
     }
 }
 "@
+}
 
 $toolchainSid = [OxideSwarmIsolationNative]::GetToolchainCapabilitySid()
 Write-Host "oxideswarm.toolchain capability SID: $toolchainSid"
@@ -118,6 +121,8 @@ Write-Host "oxideswarm.toolchain capability SID: $toolchainSid"
 if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
     if (-not [string]::IsNullOrWhiteSpace($env:RUSTY_GRID_ACL_GRANT_LOG)) {
         $ManifestPath = $env:RUSTY_GRID_ACL_GRANT_LOG
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:OXIDESWARM_HOME)) {
+        $ManifestPath = Join-Path $env:OXIDESWARM_HOME "windows_acl_grants.txt"
     } else {
         $ManifestPath = Join-Path $env:USERPROFILE ".oxideswarm\windows_acl_grants.txt"
     }
@@ -202,7 +207,8 @@ foreach ($restore in $sddlRestores) {
     }
 }
 
-$runningWorkers = @(Get-Process -Name "oxideswarm", "rusty-grid" -ErrorAction SilentlyContinue)
+$runningWorkers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('oxideswarm.exe', 'rusty-grid.exe') -and $_.CommandLine -like '* worker*' })
 $lockHeld = $false
 if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
     $manifestDir = Split-Path -Parent $ManifestPath

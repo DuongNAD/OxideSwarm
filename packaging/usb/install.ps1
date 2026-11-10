@@ -5,12 +5,15 @@
 # through an HKCU Run entry. The user's own %USERPROFILE%\.oxideswarm is never read or written:
 # the installed worker keeps its state in <install folder>\home.
 #
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Isolation off|fs]
+[CmdletBinding()]
 param(
     [string]$Name = "",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm"),
     [switch]$NoAutostart,
-    [switch]$NoWorkspaces
+    [switch]$NoWorkspaces,
+    [ValidateSet('off', 'fs')]
+    [string]$Isolation = ""
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
@@ -21,6 +24,18 @@ if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Wi
 $TokenFile = Join-Path $Kit 'join.token'
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
+$IsolationFile = Join-Path $Kit 'isolation'
+if (-not $Isolation) {
+    if (Test-Path $IsolationFile) {
+        $bakedIso = (Get-Content -Raw $IsolationFile).Trim().ToLower()
+        if ($bakedIso -notin @('off', 'fs')) { Fail "the kit's isolation file holds '$bakedIso' (expected 'off' or 'fs')" }
+        $Isolation = $bakedIso
+    } else {
+        $Isolation = 'off'
+    }
+} else {
+    $Isolation = $Isolation.ToLower()
+}
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
 if (-not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
@@ -80,6 +95,15 @@ try {
         $f = Join-Path $src.DirectoryName $b
         if (Test-Path $f) { Copy-Item $f (Join-Path $Bin $b) -Force }
     }
+    foreach ($revCand in @(
+        (Join-Path $Kit 'revoke-isolation-acls.ps1'),
+        (Join-Path $Kit '..\..\windows\revoke-isolation-acls.ps1')
+    )) {
+        if (Test-Path -LiteralPath $revCand) {
+            Copy-Item -LiteralPath $revCand -Destination (Join-Path $InstallRoot 'revoke-isolation-acls.ps1') -Force
+            break
+        }
+    }
 } finally {
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
 }
@@ -131,7 +155,7 @@ if ($ticket) {
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
 # Use at most half of the CPU cores, so the machine stays responsive for its owner.
 $slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
-$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots"
+$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
 if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
 $log = Join-Path $LogDir 'worker.log'
 
@@ -175,7 +199,7 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
 }
 if (-not $connected) { Fail "the worker runs but the master does not list it yet; see $log" }
-Write-Host "  connected"
+Write-Host "  connected (isolation: $Isolation)"
 
 # 8. Start at logon (current user only, no administrator rights).
 if (-not $NoAutostart) {

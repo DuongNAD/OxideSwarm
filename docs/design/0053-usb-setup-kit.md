@@ -218,3 +218,10 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   `workers --json` over P2P. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of
   the P2P ticket, which the legacy argument passing dropped. A P2P-only kit passed end to end under
   PowerShell 5.1 on Windows 11 and from a stick on macOS.
+- 2026-11-10: Opt-in Windows isolation in the kit ([design 0055](0055-usb-kit-windows-isolation.md),
+  `USB-2`): `make_kit.sh --isolation off|fs` bakes a kit default into `isolation` and ships
+  `revoke-isolation-acls.ps1`, `install.ps1` accepts `-Isolation off|fs` (default `off`) with
+  `[CmdletBinding()]`, `acl_grant_manifest_path` honours `OXIDESWARM_HOME` so an isolated USB-kit
+  worker writes `<InstallRoot>\home\windows_acl_grants.txt` and never touches
+  `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes all recorded `oxideswarm.toolchain` ACL
+  grants before deleting `<InstallRoot>`.
