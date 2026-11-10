@@ -822,11 +822,19 @@ class StaticRepositoryChecks(unittest.TestCase):
     def test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation(self):
         install_ps1 = os.path.join(ROOT, "packaging", "usb", "install.ps1")
         uninstall_ps1 = os.path.join(ROOT, "packaging", "usb", "uninstall.ps1")
+        install_cmd = os.path.join(ROOT, "packaging", "usb", "Install OxideSwarm.cmd")
+        uninstall_cmd = os.path.join(ROOT, "packaging", "usb", "Uninstall OxideSwarm.cmd")
         revoke_ps1 = os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1")
 
         inst_text = read(install_ps1)
         uninst_text = read(uninstall_ps1)
+        inst_cmd_text = read(install_cmd)
+        uninst_cmd_text = read(uninstall_cmd)
         rev_text = read(revoke_ps1)
+
+        for cmd_text in (inst_cmd_text, uninst_cmd_text):
+            self.assertIn("set PSModulePath=", cmd_text)
+            self.assertLess(cmd_text.index("set PSModulePath="), cmd_text.index("powershell"))
 
         self.assertIn("[CmdletBinding()]", inst_text)
         self.assertIn("[ValidateSet('off', 'fs')]", inst_text)
@@ -844,10 +852,11 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("$env:OXIDESWARM_HOME", rev_text)
 
         if os.name == "nt" and shutil.which("powershell"):
+            ps_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             for script in (install_ps1, uninstall_ps1):
                 bad_param = subprocess.run(
                     ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-NoSuchParam"],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=30,
                 )
                 self.assertNotEqual(bad_param.returncode, 0, bad_param.stdout)
@@ -855,7 +864,7 @@ class StaticRepositoryChecks(unittest.TestCase):
 
             bad_iso = subprocess.run(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1, "-Isolation", "bogus"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=30,
             )
             self.assertNotEqual(bad_iso.returncode, 0, bad_iso.stdout)
@@ -873,7 +882,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                         "-File", uninstall_ps1, "-InstallRoot", fake_install, "-Yes",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=30,
                 )
                 self.assertEqual(uninst_res.returncode, 0, uninst_res.stdout)
@@ -917,7 +926,11 @@ public class Program {
             if (joined.Contains("--isolation fs") && !string.IsNullOrEmpty(home)) {
                 string dummyTarget = Path.Combine(home, "dummy_toolchain_dir");
                 Directory.CreateDirectory(dummyTarget);
-                File.WriteAllText(Path.Combine(home, "windows_acl_grants.txt"), dummyTarget + Environment.NewLine);
+                string grantLog = Environment.GetEnvironmentVariable("RUSTY_GRID_ACL_GRANT_LOG");
+                if (string.IsNullOrEmpty(grantLog)) {
+                    grantLog = Path.Combine(home, "windows_acl_grants.txt");
+                }
+                File.WriteAllText(grantLog, dummyTarget + Environment.NewLine);
             }
             Thread.Sleep(25000);
             return 0;
@@ -942,7 +955,7 @@ public class Program {
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
                         f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=30,
                 )
                 self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
@@ -964,7 +977,7 @@ public class Program {
                         "-File", os.path.join(kit_dir, "install.ps1"),
                         "-InstallRoot", inst_root_fs, "-Name", "win-kit-test",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=60,
                 )
                 self.assertEqual(inst_fs.returncode, 0, inst_fs.stdout)
@@ -979,7 +992,7 @@ public class Program {
                         "-File", os.path.join(kit_dir, "uninstall.ps1"),
                         "-InstallRoot", inst_root_fs, "-Yes",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=60,
                 )
                 self.assertEqual(uninst_fs.returncode, 0, uninst_fs.stdout)
@@ -994,7 +1007,7 @@ public class Program {
                         "-File", os.path.join(kit_dir, "install.ps1"),
                         "-InstallRoot", inst_root_off, "-Name", "win-kit-test", "-Isolation", "off",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=60,
                 )
                 self.assertEqual(inst_off.returncode, 0, inst_off.stdout)
@@ -1009,7 +1022,7 @@ public class Program {
                         "-File", os.path.join(kit_dir, "uninstall.ps1"),
                         "-InstallRoot", inst_root_off, "-Yes",
                     ],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, timeout=60,
                 )
                 self.assertEqual(uninst_off.returncode, 0, uninst_off.stdout)
