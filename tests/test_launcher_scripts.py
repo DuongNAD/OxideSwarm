@@ -1234,6 +1234,8 @@ class StaticRepositoryChecks(unittest.TestCase):
                 os.makedirs(os.path.join(fake_install, "home"), exist_ok=True)
                 with open(os.path.join(fake_install, "bin", "oxideswarm.exe"), "wb") as f:
                     f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_install, ".oxideswarm-usb-install"), "w").close()
                 uninst_res = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1255,6 +1257,8 @@ class StaticRepositoryChecks(unittest.TestCase):
                 shutil.copyfile(revoke_ps1, os.path.join(fake_no_icacls, "revoke-isolation-acls.ps1"))
                 with open(os.path.join(fake_no_icacls, "bin", "oxideswarm.exe"), "wb") as f:
                     f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_no_icacls, ".oxideswarm-usb-install"), "w").close()
                 with open(os.path.join(fake_no_icacls, "home", "windows_acl_grants.txt"), "w", encoding="utf-8") as f:
                     f.write(os.path.join(tmp, "already-deleted-sandbox-base") + "\n")
                 uninst_no_icacls = subprocess.run(
@@ -1303,6 +1307,8 @@ class StaticRepositoryChecks(unittest.TestCase):
                 shutil.copyfile(revoke_ps1, os.path.join(fake_partial, "revoke-isolation-acls.ps1"))
                 with open(os.path.join(fake_partial, "bin", "oxideswarm.exe"), "wb") as f:
                     f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_partial, ".oxideswarm-usb-install"), "w").close()
                 partial_manifest = os.path.join(fake_partial, "home", "windows_acl_grants.txt")
                 with open(partial_manifest, "w", encoding="utf-8") as f:
                     f.write(fail_acl_dir + "\n" + ok_acl_dir + "\n")
@@ -1407,7 +1413,9 @@ public class Program {
                     f.write(f"{zip_sha}  {zip_name}\n")
 
                 # 2a. Install using baked isolation=fs from kit\isolation, then uninstall (revoking manifest).
-                inst_root_fs = os.path.join(tmp, "installed-fs")
+                # Under %LOCALAPPDATA%, where a double-clicked install goes: a folder elsewhere on the
+                # kit's own drive is refused (a CI runner has only one drive).
+                inst_root_fs = os.path.join(tmp_localappdata, "installed-fs")
                 inst_fs = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1483,7 +1491,7 @@ public class Program {
                 self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed by uninstall.ps1")
 
                 # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
-                inst_root_off = os.path.join(tmp, "installed-off")
+                inst_root_off = os.path.join(tmp_localappdata, "installed-off")
                 inst_off = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1533,6 +1541,8 @@ public class Program {
                 os.makedirs(os.path.join(fake_reparse_inst, "home"), exist_ok=True)
                 with open(os.path.join(fake_reparse_inst, "bin", "oxideswarm.exe"), "wb") as f:
                     f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_reparse_inst, ".oxideswarm-usb-install"), "w").close()
                 uninst_reparse = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1552,8 +1562,8 @@ public class Program {
             finally:
                 for pid_candidate in (
                     pids_log,
-                    os.path.join(tmp, "installed-fs", "run", "worker.pid"),
-                    os.path.join(tmp, "installed-off", "run", "worker.pid"),
+                    os.path.join(tmp_localappdata, "installed-fs", "run", "worker.pid"),
+                    os.path.join(tmp_localappdata, "installed-off", "run", "worker.pid"),
                 ):
                     if os.path.isfile(pid_candidate):
                         try:
