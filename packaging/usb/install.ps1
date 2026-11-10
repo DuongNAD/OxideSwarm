@@ -89,7 +89,14 @@ if ($Update) {
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
     if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
-    if (-not $PSBoundParameters.ContainsKey('Isolation') -and $settings['isolation'] -in @('off', 'fs')) { $Isolation = $settings['isolation'] }
+    # The isolation it runs with is kept: kit-install.txt, else the --isolation in its launcher (an
+    # install made before kit-install.txt existed). An update never lowers it without -Isolation.
+    $recordedIso = $settings['isolation']
+    if (-not $recordedIso) {
+        $oldVbs = Join-Path $InstallRoot 'start-worker.vbs'
+        if ((Test-Path -LiteralPath $oldVbs) -and ((Get-Content -Raw -LiteralPath $oldVbs) -match '--isolation (off|fs)\b')) { $recordedIso = $Matches[1] }
+    }
+    if (-not $PSBoundParameters.ContainsKey('Isolation') -and $recordedIso -in @('off', 'fs')) { $Isolation = $recordedIso }
     # The start at logon stays as it is: only an install that has one gets it again.
     if (-not $PSBoundParameters.ContainsKey('NoAutostart')) {
         $run = $null
@@ -129,6 +136,90 @@ function Test-InstallDrive($root) {
     if ($disk -and $disk.InterfaceType -eq 'USB') { return "drive $driveRoot is on an external USB disk, which can be unplugged while a task runs" }
     return $null
 }
+# An install folder outside %LOCALAPPDATA% gets a DACL this installer builds itself: protected (no
+# inherited entries), full control for this user, SYSTEM and Administrators only, owned by this user.
+# Another local account must not be able to read the cluster secret in it, or replace the worker
+# that the start-at-logon entry runs as this user.
+$UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$TrustedSids = @($UserSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+$TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+function Get-PrivateSecurity {
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in $TrustedSids) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier $sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    }
+    return $sec
+}
+function Get-AccountName($sid) {
+    try { return (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value } catch { return $sid }
+}
+# The first account other than this user, SYSTEM, Administrators, TrustedInstaller or an app package
+# that owns $path or is granted one of the $mask rights on it; $null when there is none. Entries that
+# only flow to children (inherit-only) do not count for $path itself.
+function Get-ForeignGrant($path, [int]$mask, [bool]$inherited = $true) {
+    $acl = Get-Acl -LiteralPath $path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $TrustedSids -and $owner -ne $TrustedInstaller) { return "owner $(Get-AccountName $owner)" }
+    foreach ($r in $acl.GetAccessRules($true, $inherited, [Security.Principal.SecurityIdentifier])) {
+        if ($r.AccessControlType -ne 'Allow') { continue }
+        if ($r.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = $r.IdentityReference.Value
+        if ($sid -in $TrustedSids -or $sid -eq $TrustedInstaller -or $sid -like 'S-1-15-*') { continue }
+        # GENERIC_ALL (0x10000000) holds every right.
+        if (([int]$r.FileSystemRights -band $mask) -or ([int]$r.FileSystemRights -band 0x10000000)) { return Get-AccountName $sid }
+    }
+    return $null
+}
+# Whether $acl is the private DACL: protected, and only trusted accounts (app package SIDs that task
+# isolation adds are allowed).
+function Test-PrivateAcl($acl) {
+    if (-not $acl.AreAccessRulesProtected) { return $false }
+    foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $r.IdentityReference.Value
+        if ($r.AccessControlType -eq 'Allow' -and $sid -notin $TrustedSids -and $sid -notlike 'S-1-15-*') { return $false }
+    }
+    return $true
+}
+# DELETE 0x10000, WRITE_DAC 0x40000, WRITE_OWNER 0x80000, FILE_DELETE_CHILD 0x40.
+$RenameRights = 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40
+# Why $root may not be used: nobody else may rename, delete or re-permission a folder on the way to
+# it (or delete folders at the drive root), and an existing $root must belong to this user and hold
+# nothing another account wrote or may change.
+function Test-RootSafety($root) {
+    $drive = [IO.Path]::GetPathRoot($root)
+    $dir = Split-Path -Parent $root
+    while ($dir -and $dir.TrimEnd('\') -ne $drive.TrimEnd('\')) {
+        if (Test-Path -LiteralPath $dir) {
+            if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$dir is a link" }
+            $who = Get-ForeignGrant $dir $RenameRights
+            if ($who) { return "another account ($who) can rename or change $dir; choose a folder directly under the drive, such as $(Join-Path $drive 'OxideSwarm')" }
+        }
+        $dir = Split-Path -Parent $dir
+    }
+    $who = Get-ForeignGrant $drive (0x40 -bor 0x40000 -bor 0x80000)
+    if ($who) { return "another account ($who) can delete or re-permission folders at the root of $drive" }
+    if (-not (Test-Path -LiteralPath $root)) { return $null }
+    $item = Get-Item -LiteralPath $root -Force
+    if (-not $item.PSIsContainer) { return "$root is a file" }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$root is a link" }
+    $acl = Get-Acl -LiteralPath $root
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value) {
+        return "$root belongs to another account ($(Get-AccountName $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value)); remove it or choose another folder"
+    }
+    if (Test-PrivateAcl $acl) { return $null }
+    # Not made by this installer, or by an older one: every entry must be ours.
+    $ours = (Test-Path -LiteralPath (Join-Path $root '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $root 'bin\oxideswarm.exe'))
+    $children = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)
+    if (-not $ours -and $children.Count -gt 0) { return "$root already holds other files; choose a new or empty folder with -InstallRoot" }
+    foreach ($c in $children) {
+        if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$($c.FullName) is a link" }
+        $who = Get-ForeignGrant $c.FullName -1 $false
+        if ($who) { return "another account ($who) has rights on $($c.FullName); remove $root or choose another folder" }
+    }
+    return $null
+}
 $explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
 if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected) {
     $choices = @($DefaultRoot)
@@ -154,19 +245,14 @@ if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected)
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $PrivateRoot = $InstallRoot.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
-if (-not $PrivateRoot -and -not $Update) {
+if (-not $PrivateRoot) {
     if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
-    $why = Test-InstallDrive $InstallRoot
-    if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
-    if (Test-Path -LiteralPath $InstallRoot) {
-        $item = Get-Item -LiteralPath $InstallRoot -Force
-        if (-not $item.PSIsContainer) { Fail "$InstallRoot is a file" }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$InstallRoot is a link; not using it" }
-        $ours = (Test-Path (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
-        if (-not $ours -and (Get-ChildItem -LiteralPath $InstallRoot -Force | Select-Object -First 1)) {
-            Fail "$InstallRoot already holds other files; choose a new or empty folder with -InstallRoot"
-        }
+    if (-not $Update) {
+        $why = Test-InstallDrive $InstallRoot
+        if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
     }
+    $why = Test-RootSafety $InstallRoot
+    if ($why) { Fail "cannot use ${InstallRoot}: $why" }
 }
 # One install per user: the uninstaller finds it through $PointerKey. An install somewhere else must
 # be removed first, unless -InstallRoot asked for this folder on purpose.
@@ -206,15 +292,25 @@ Write-Host "  archive: $($Archive.Name) (checksum OK)"
 
 # 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
 if (-not $PrivateRoot) {
-    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $InstallRoot /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "could not limit $InstallRoot to this user (icacls exit code $LASTEXITCODE)" }
+    $sec = Get-PrivateSecurity
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        # Created with its DACL in one call, so it never exists open to others.
+        $sec.SetOwner($UserSid)
+        [void][IO.Directory]::CreateDirectory($InstallRoot, $sec)
+    } elseif (-not (Test-PrivateAcl (Get-Acl -LiteralPath $InstallRoot))) {
+        (Get-Item -LiteralPath $InstallRoot -Force).SetAccessControl($sec)
+    }
+    # CreateDirectory returns an existing folder as it is (one made in between by someone else), so
+    # check what is there now.
+    $acl = Get-Acl -LiteralPath $InstallRoot
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value -or -not (Test-PrivateAcl $acl)) {
+        Fail "could not make $InstallRoot private to this user; remove it and run the installer again"
+    }
     New-Item -ItemType Directory -Force -Path (Join-Path $InstallRoot 'work') | Out-Null
     Write-Host "  access:  this user, SYSTEM and Administrators only"
 }
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-Set-Content -Path (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
 if (-not ($pointer -and $pointer -ne $InstallRoot -and (Test-Path (Join-Path $pointer 'bin\oxideswarm.exe')))) {
     foreach ($k in @('HKCU:\Software\OxideSwarm', $PointerKey)) { if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
     Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
@@ -325,6 +421,8 @@ if ($ticket) {
 
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
+# The name goes into the worker's command line and the launcher, so only safe characters pass.
+if ($Name -notmatch '^[A-Za-z0-9_.-]{1,64}$') { Fail "the name '$Name' may only hold letters, digits, '.', '_' and '-' (at most 64)" }
 # A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
 # same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
 # machine's own id (MachineGuid), the name and the cluster secret: the machine id never leaves the

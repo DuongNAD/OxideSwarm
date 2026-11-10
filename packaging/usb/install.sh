@@ -206,6 +206,12 @@ cd "$ROOT"
 # 3. Stop a worker that an earlier run of this installer started.
 if [ -f "$RUN_DIR/worker.pid" ]; then
   OLD=$(cat "$RUN_DIR/worker.pid" 2>/dev/null || true)
+  # A PID file can outlive a reboot, and its number then names another process: only one that runs
+  # this install's binary is stopped.
+  case "$(ps -ww -p "$OLD" -o command= 2>/dev/null)" in
+    *"$BIN_DIR/oxideswarm "*) ;;
+    *) OLD="" ;;
+  esac
   if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
     say "  stopping the worker started earlier (PID $OLD)"
     kill "$OLD" 2>/dev/null || true

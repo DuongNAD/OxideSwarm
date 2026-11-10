@@ -119,7 +119,9 @@ disconnected old entry. The id is a version 8 UUID made from a SHA-256 over the 
 and the cluster secret: the machine id never leaves the machine, and the same machine gets unrelated
 ids in different clusters. An existing id file is kept, and without a machine id the worker makes a
 random one as before. Entries left by installs made before this change stay in the listing until
-the master restarts.
+the master restarts. With per-machine keys and invites (ENROLL-1b), a reinstall that enrols a new
+key keeps this id, which still belongs to the old member: ask the cluster owner to run
+`oxideswarm members revoke <old member>` first.
 
 ### Remove the stick safely
 
@@ -157,9 +159,12 @@ the folder in advance. A folder outside `%LOCALAPPDATA%`:
 - must be on a fixed NTFS or ReFS drive, not on the kit's drive, not the root of a drive, and new,
   empty or an earlier install of the kit. FAT and exFAT keep no permissions, and a removable drive
   can be pulled out while a task runs;
-- is limited to the current user, `SYSTEM` and `Administrators` (`icacls /inheritance:r`) before
-  anything is written into it, because a new folder at the root of a data drive lets every local
-  account change its content;
+- gets a protected DACL the installer builds itself: full control for the current user, `SYSTEM` and
+  `Administrators` only, owned by the current user. A new folder is created with it in one call; an
+  existing one must belong to the current user and hold nothing another account owns or has rights
+  on, and no folder on the way to it may be renamed, deleted or re-permissioned by another account.
+  The result is checked before anything is written, for an update too. A new folder at the root of
+  a data drive otherwise lets every local account change its content;
 - also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`)
   and the workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
   user's cache folder on drive C.

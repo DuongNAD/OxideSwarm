@@ -955,6 +955,49 @@ class UsbKitTests(unittest.TestCase):
             self.assertIn(needle, text)
         self.assertLess(text.index("oxideswarm-usb-worker-id-v1"), text.index("Start-Process -FilePath 'wscript.exe'"))
 
+    def test_windows_installer_refuses_folders_another_account_controls(self):
+        # Review M1: the folder gets a DACL built here (protected, three trusted SIDs, owner = this
+        # user), a new one is created with it in one call, an existing one must belong to this user
+        # and hold nothing another account may change, the folders on the way to it must not be
+        # renamable by others, the result is verified, and an update runs the same checks.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertNotIn("icacls", text)
+        for needle in ("SetAccessRuleProtection($true, $false)", "$sec.SetOwner($UserSid)",
+                       "[IO.Directory]::CreateDirectory($InstallRoot, $sec)", "function Test-RootSafety",
+                       "belongs to another account", "can rename or change", "$RenameRights",
+                       "could not make $InstallRoot private"):
+            self.assertIn(needle, text)
+        # Run for an update as well: directly in the `if (-not $PrivateRoot)` block, not nested deeper.
+        check = text.index("\n    $why = Test-RootSafety $InstallRoot\n")
+        self.assertTrue(text.rindex("if (-not $PrivateRoot) {", 0, check) > text.rindex("\n}", 0, check))
+        self.assertLess(check, text.index("[IO.Directory]::CreateDirectory($InstallRoot, $sec)"))
+        self.assertIn("'^[A-Za-z0-9_.-]{1,64}$'", text)
+        # S6: an update keeps the isolation of the existing launcher when kit-install.txt lacks it.
+        self.assertIn("'--isolation (off|fs)\\b'", text)
+        # S5: the uninstaller deletes only a marked folder without links.
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        delete = uninstall.index("Remove-Item -Recurse -Force -LiteralPath $InstallRoot")
+        for needle in (".oxideswarm-usb-install", "contains links", "is a link; not touching it"):
+            self.assertLess(uninstall.index(needle), delete, needle)
+
+    def test_a_stale_pid_file_never_stops_another_process(self):
+        # Review S7: a PID file can outlive a reboot; its number may then name any process.
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        decoy = subprocess.Popen(["/bin/sleep", "300"])
+        self.addCleanup(decoy.kill)
+        worker = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        self.addCleanup(lambda: pid_alive(worker) and os.kill(worker, signal.SIGKILL))
+        with open(os.path.join(root, "run", "worker.pid"), "w") as f:
+            f.write("%d\n" % decoy.pid)
+        self.assertEqual(self.update().returncode, 0)
+        self.assertIsNone(decoy.poll(), "the update stopped a process that is not this install's worker")
+        with open(os.path.join(root, "run", "worker.pid"), "w") as f:
+            f.write("%d\n" % decoy.pid)
+        self.uninstall_root(root)
+        self.assertIsNone(decoy.poll(), "the uninstaller stopped a process that is not this install's worker")
+
     def test_launchers_offer_to_eject_the_stick(self):
         # macOS: the prompt runs in a new shell after `cd /`, so the script read from the stick does
         # not keep the volume busy (checked by hand with a mounted exFAT image).
@@ -995,14 +1038,14 @@ class UsbKitTests(unittest.TestCase):
         text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
         for needle in ("[IO.DriveInfo]::GetDrives()", "@('NTFS', 'ReFS')", "$drive.DriveType -ne 'Fixed'",
                        "it is on the drive this kit runs from", "not the root of a drive",
-                       "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-                       "/inheritance:r", "$SandboxBase = if ($PrivateRoot)", "--workspace-root",
+                       "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User",
+                       "SetAccessRuleProtection($true, $false)", "$SandboxBase = if ($PrivateRoot)", "--workspace-root",
                        "AssocClass=Win32_LogicalDiskToPartition", "$disk.InterfaceType -eq 'USB'",
                        "'HKCU:\\Software\\OxideSwarm\\UsbKit'"):
             self.assertIn(needle, text)
         ask = text.index('Read-Host "Choose [1]"')
         self.assertIn("-not [Console]::IsInputRedirected", text[text.index("$explicitRoot ="):ask])
-        lock = text.index("/inheritance:r")
+        lock = text.index("[IO.Directory]::CreateDirectory($InstallRoot, $sec)")
         self.assertTrue(lock < text.index("foreach ($d in @($Bin, $State, $RunDir, $LogDir))"),
                         "the folder must be limited before the installer writes into it")
         uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
