@@ -538,25 +538,30 @@ off by default until FEAT-3 is Implemented.
   `MANIFEST_MAGIC_V1 = b"oxideswarm-tree/1\n"` otherwise, while `TreeManifest::decode` accepts both)
   adds `symlinks: Vec<BlobSymlink>` (`BlobSymlink { path, target }`) and `empty_dirs: Vec<String>`
   (empty directories), negotiated with workers via `ProtocolCapabilities::TREE_V2` (`1 << 13`) on
-  each task's `TaskEntry::requires_tree_v2` (set when `BlobStore::resolve_inputs_with_features`
-  decodes the manifest inside `spawn_blocking`). `TreeManifest::validate`, `validate_symlink_target`,
-  `FoldedSymlinkTrie` and `check_no_symlink_traversal` enforce sorted unique paths across `files`,
-  `symlinks` and `empty_dirs`, no path overlap or ancestor/descendant conflict with a link or empty
-  directory, and that every `BlobSymlink::target` is a relative `/` path (`.`, `..` and normal
+  each task's `TaskEntry::requires_tree_v2` (defaulting fail-closed to `true` for any task with a
+  tree input or workspace source tree until `admit_blob_task` or `repin_recovered_blobs` verifies a
+  v1 manifest inside `spawn_blocking`). `TreeManifest::validate`, `validate_symlink_target`,
+  `FoldedSymlinkTrie` and `check_no_symlink_traversal` enforce manifest complexity budgets
+  (`MAX_TREE_SYMLINKS = 100_000`, `MAX_TREE_PATH_BYTES = 16 MiB`, `MAX_TREE_SEGMENTS = 8M`), sorted
+  unique paths across `files`, `symlinks` and `empty_dirs`, linear-time segment-order
+  (`cmp_path_segments`) ancestor/descendant conflict checks across files, links and empty
+  directories, and that every `BlobSymlink::target` is a relative `/` path (`.`, `..` and normal
   components only, no `:`, `\` or NUL) whose lexical resolution from `path`'s parent stays strictly
   inside the tree root and never steps onto or through another `symlinks` entry (compared in
-  `O(|segment|)` per step via `FoldedSymlinkTrie` after `fold_blob_path` full Unicode `to_uppercase`
-  + `to_lowercase` case-folding and NFD decomposition). `scan_workspace_source`
+  `O(|segment|)` per step via the flat 16-byte-node `FoldedSymlinkTrie` + `SegmentInterner` after
+  `fold_blob_path` NFD + `to_lowercase`/`to_uppercase`/`to_lowercase` + NFD folding). `scan_workspace_source`
   (`crates/cli/src/blobs.rs`) records in-tree relative symbolic links in `manifest.symlinks()`,
   skips links whose target is non-UTF-8, absolute, leaves the tree root or traverses through another
   link (reporting each in `prepared.skipped` and in CLI/MCP submit summaries), and records empty
   non-ignored directories in `manifest.empty_dirs()`. `WorkspaceGuard::sync`
-  (`crates/worker/src/workspace.rs`) checks case and Unicode NFC/NFD collisions via
-  `fold_blob_path`, tracks `symlinks` and `empty_dirs` in `state.json`, removes stale tracked links
-  and empty directories before creating new entries, creates empty directories and symbolic links
-  after verifying non-symlink parents and re-verifying every created link's on-disk target walk once
-  all links exist (rolling back newly created links on any link-chain race), and on Windows skips
-  symbolic links when creation returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`), recording
+  (`crates/worker/src/workspace.rs`) checks case and Unicode NFC/NFD collisions and directory
+  ancestors via `FoldedPathTrie` and `TreeManifest::has_dir`, tracks `symlinks` and `empty_dirs` in
+  `state.json`, removes stale tracked links and empty directories before creating new entries,
+  creates empty directories and symbolic links after verifying non-symlink parents, re-verifies every
+  kept and newly created link's on-disk target walk segment-by-segment (`openat` +
+  `fstatat(AT_SYMLINK_NOFOLLOW)` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows, failing closed
+  on any error other than `ENOENT` and rolling back all active links on failure), and on Windows
+  skips symbolic links when creation returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`), recording
   `SyncReport { skipped_symlinks, warning }` (with a hint to enable Windows Developer Mode) forwarded
   to the task's `stderr`. Windows symlink tests skip cleanly when symlink creation returns OS error
   `1314` unless `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.

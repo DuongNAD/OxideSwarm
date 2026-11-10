@@ -526,6 +526,24 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     features
 }
 
+/// True when `task` references any tree manifest (`InputSource::Tree` or `WorkspaceSource::Tree`).
+///
+/// Direct `TaskQueue::submit` / `try_submit_slot` / `attach_store_and_replay` paths that have not
+/// yet inspected the manifest via `admit_blob_task` / `repin_recovered_blobs` default
+/// `requires_tree_v2` to `task_has_tree_input(task)` so uninspected tree tasks fail closed
+/// (requiring `TREE_V2` until the manifest is verified to be v1).
+fn task_has_tree_input(task: &Task) -> bool {
+    task.inputs
+        .iter()
+        .any(|i| matches!(i.source, rusty_grid_core::blob::InputSource::Tree { .. }))
+        || task.workspace.as_ref().is_some_and(|w| {
+            matches!(
+                w.source,
+                Some(rusty_grid_core::task::WorkspaceSource::Tree { .. })
+            )
+        })
+}
+
 pub use rusty_grid_core::task::WorkspaceAffinity;
 
 /// Upper bound on in-memory workspace affinity entries so ephemeral workspace names cannot grow
@@ -1843,6 +1861,7 @@ impl TaskQueue {
                 };
 
                 let has_hold = adoptable_by.is_some() || fail_if_not_adopted;
+                let requires_tree_v2 = task_has_tree_input(&p.task);
                 let entry = TaskEntry {
                     task: p.task,
                     priority: p.priority,
@@ -1867,7 +1886,7 @@ impl TaskQueue {
                     retry_history: p.retry_history,
                     result: p.result,
                     error_message: p.error_message,
-                    requires_tree_v2: false,
+                    requires_tree_v2,
                 };
 
                 let is_terminal = entry.state.is_terminal();
@@ -1988,10 +2007,9 @@ impl TaskQueue {
         for (task_id, inputs) in active_inputs {
             match blob_store.resolve_inputs_with_features(&inputs).await {
                 Ok((ids, needs_tree_v2)) => {
-                    if needs_tree_v2 {
-                        self.set_requires_tree_v2(&task_id, true).await;
-                    }
                     let missing = blob_store.pin_task(task_id, ids);
+                    self.set_requires_tree_v2(&task_id, needs_tree_v2 || !missing.is_empty())
+                        .await;
                     if !missing.is_empty() {
                         tracing::warn!(
                             task_id = %task_id,
@@ -2001,6 +2019,7 @@ impl TaskQueue {
                     }
                 }
                 Err(err) => {
+                    self.set_requires_tree_v2(&task_id, true).await;
                     tracing::warn!(
                         task_id = %task_id,
                         error = %err,
@@ -2457,6 +2476,7 @@ impl TaskQueue {
 
             let task = task_slot.take().expect("task_slot checked above");
             let task_id = task.id;
+            let requires_tree_v2 = task_has_tree_input(&task);
             inner.next_sequence += 1;
 
             let entry = TaskEntry {
@@ -2483,7 +2503,7 @@ impl TaskQueue {
                 retry_history: Vec::new(),
                 result: None,
                 error_message: None,
-                requires_tree_v2: false,
+                requires_tree_v2,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -2542,7 +2562,8 @@ impl TaskQueue {
     /// queued, running or finished is refused instead of replacing the entry (which would orphan
     /// its queue keys and run the work twice).
     pub async fn submit_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
-        self.submit_with_priority_and_tree_v2(task, priority, false)
+        let requires_tree_v2 = task_has_tree_input(&task);
+        self.submit_with_priority_and_tree_v2(task, priority, requires_tree_v2)
             .await
     }
 
