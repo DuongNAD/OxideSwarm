@@ -14,7 +14,10 @@
 # not join again, and only replaces the binaries and restarts the worker.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Isolation off|fs]
-#                                                 [-Gpu | -NoGpu] [-Update]
+#                                                 [-Gpu | -NoGpu] [-Slots N] [-Update]
+#
+# -Slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
+# processors of the performance cores, at most half of all processors (USB-4).
 [CmdletBinding()]
 param(
     [string]$Name = "",
@@ -24,12 +27,15 @@ param(
     [switch]$Gpu,
     [switch]$NoGpu,
     [switch]$Update,
+    [int]$Slots = 0,
     [ValidateSet('off', 'fs')]
     [string]$Isolation = ""
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+if ($PSBoundParameters.ContainsKey('Slots') -and ($Slots -lt 1 -or $Slots -gt 256)) { Fail "-Slots needs a number from 1 to 256 (got: $Slots)" }
+$slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
 $DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
 $PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -89,6 +95,8 @@ if ($Update) {
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
     if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
+    # Slots chosen with -Slots at install time are kept; an automatic choice is made again.
+    if ($slotsSet -eq 0 -and $settings['slots'] -match '^\d+$' -and [int]$settings['slots'] -ge 1 -and [int]$settings['slots'] -le 256) { $slotsSet = [int]$settings['slots'] }
     # The isolation it runs with is kept: kit-install.txt, else the --isolation in its launcher (an
     # install made before kit-install.txt existed). An update never lowers it without -Isolation.
     $recordedIso = $settings['isolation']
@@ -445,8 +453,77 @@ if (-not (Test-Path $idFile) -or (Get-Item $idFile).Length -eq 0) {
         [IO.File]::WriteAllText($idFile, $uuid + "`n")
     }
 }
-# Use at most half of the CPU cores, so the machine stays responsive for its owner.
-$slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
+# Task slots (USB-4): the logical processors of the performance cores, at most half of all
+# processors and at least 1, so the machine stays responsive for its owner. A laptop chip with few
+# performance cores slows down far more than linearly when every efficient core is busy too. When
+# the core types cannot be read, a machine with a battery gets a quarter of its processors.
+# OXIDESWARM_USB_CPU_INFO="total=N perf=N|- battery=0|1" replaces the probe (tests).
+function Get-CpuInfo {
+    $info = @{ total = [Environment]::ProcessorCount; perf = 0; battery = $false }
+    if ($env:OXIDESWARM_USB_CPU_INFO) {
+        foreach ($kv in ($env:OXIDESWARM_USB_CPU_INFO -split '\s+')) {
+            if ($kv -match '^total=(\d+)$') { $info.total = [int]$Matches[1] }
+            elseif ($kv -match '^perf=(\d+)$') { $info.perf = [int]$Matches[1] }
+            elseif ($kv -match '^battery=1$') { $info.battery = $true }
+        }
+        return $info
+    }
+    try {
+        if (-not ('OxideSwarmCpuSets' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OxideSwarmCpuSets {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetSystemCpuSetInformation(IntPtr information, uint bufferLength, out uint returnedLength, IntPtr process, uint flags);
+    // Logical processors in the highest efficiency class (the performance cores), or -1.
+    public static int PerformanceThreads() {
+        uint needed;
+        GetSystemCpuSetInformation(IntPtr.Zero, 0, out needed, IntPtr.Zero, 0);
+        if (needed == 0) return -1;
+        IntPtr buffer = Marshal.AllocHGlobal((int)needed);
+        try {
+            uint got;
+            if (!GetSystemCpuSetInformation(buffer, needed, out got, IntPtr.Zero, 0)) return -1;
+            int best = -1, count = 0, offset = 0;
+            while (offset + 19 <= (int)got) {
+                int size = Marshal.ReadInt32(buffer, offset);
+                int type = Marshal.ReadInt32(buffer, offset + 4);
+                if (size <= 0) break;
+                if (type == 0) {
+                    // SYSTEM_CPU_SET_INFORMATION.CpuSet.EfficiencyClass
+                    int cls = Marshal.ReadByte(buffer, offset + 18);
+                    if (cls > best) { best = cls; count = 1; } else if (cls == best) { count++; }
+                }
+                offset += size;
+            }
+            return best < 0 ? -1 : count;
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+}
+'@
+        }
+        $perf = [OxideSwarmCpuSets]::PerformanceThreads()
+        if ($perf -ge 1) { $info.perf = $perf }
+    } catch { }
+    try { if (Get-CimInstance Win32_Battery -ErrorAction Stop) { $info.battery = $true } } catch { }
+    return $info
+}
+$cpu = Get-CpuInfo
+$cpuTotal = [Math]::Max(1, [int]$cpu.total)
+$half = [Math]::Max(1, [int][Math]::Floor($cpuTotal / 2))
+if ($slotsSet -ge 1) {
+    $slots = $slotsSet; $slotsWhy = 'set with -Slots'
+} elseif ($cpu.perf -ge 1) {
+    $slots = [Math]::Min([int]$cpu.perf, $half); $slotsWhy = "performance cores, at most half of $cpuTotal processors"
+} elseif ($cpu.battery) {
+    $slots = [Math]::Max(1, [int][Math]::Floor($cpuTotal / 4)); $slotsWhy = "a quarter of $cpuTotal processors on a machine with a battery"
+} else {
+    $slots = $half; $slotsWhy = "half of $cpuTotal processors"
+}
+Write-Host "  slots:   $slots ($slotsWhy; change it with -Slots N)"
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
 # Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
 $supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
@@ -506,7 +583,8 @@ Write-Host "  connected (isolation: $Isolation)"
 # What an update keeps: the name, the build, the workspace choice and the isolation.
 $builtWithGpu = if ($GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
 $withWorkspaces = if ($NoWorkspaces) { '0' } else { '1' }
-Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation")
+$recordedSlots = if ($slotsSet -ge 1) { "$slotsSet" } else { '' }
+Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation", "slots=$recordedSlots")
 
 # 8. Start at logon (current user only, no administrator rights).
 if (-not $NoAutostart) {

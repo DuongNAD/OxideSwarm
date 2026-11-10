@@ -7,7 +7,10 @@
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
 #   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
-#                   [--gpu|--no-gpu] [--update]
+#                   [--gpu|--no-gpu] [--slots N] [--update]
+#
+# --slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
+# processors of the performance cores, at most half of all processors (USB-4).
 #
 # --update (what "Update OxideSwarm.command" runs) updates an existing install in place: it keeps
 # its folder, name, GPU choice, isolation, cluster membership and start at login, asks nothing,
@@ -26,6 +29,7 @@ UPDATE=0
 ISOLATION=""
 EXPLICIT_ISOLATION=0
 ISO_SET_BY_FLAG=0
+SLOTS_SET=""
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -46,7 +50,15 @@ while [ $# -gt 0 ]; do
         *) fail "--isolation must be off or fs (got: $2)" ;;
       esac
       shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    --slots)
+      [ $# -ge 2 ] || fail "--slots needs a number from 1 to 256"
+      case "$2" in
+        ''|*[!0-9]*) fail "--slots needs a number from 1 to 256 (got: $2)" ;;
+      esac
+      { [ "$2" -ge 1 ] && [ "$2" -le 256 ]; } || fail "--slots needs a number from 1 to 256 (got: $2)"
+      SLOTS_SET=$2
+      shift ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
   shift
@@ -104,6 +116,8 @@ if [ "$UPDATE" = 1 ]; then
         workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
         # The isolation the worker ran with is kept, and an update never weakens it silently.
         isolation) [ "$ISO_SET_BY_FLAG" = 1 ] || case "$value" in off|fs) ISOLATION=$value; EXPLICIT_ISOLATION=1 ;; esac ;;
+        # Slots chosen with --slots at install time are kept; an automatic choice is made again.
+        slots) [ -n "$SLOTS_SET" ] || case "$value" in ''|*[!0-9]*) ;; *) [ "$value" -ge 1 ] && [ "$value" -le 256 ] && SLOTS_SET=$value ;; esac ;;
       esac
     done < "$ROOT/kit-install.conf"
   fi
@@ -275,9 +289,60 @@ if [ ! -s "$ID_FILE" ]; then
     (umask 077; printf '%s\n' "$UUID" > "$ID_FILE")
   fi
 fi
-# Use at most half of the CPU cores, so the machine stays responsive for its owner.
-if [ "$OS" = Darwin ]; then CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 2); else CORES=$(nproc 2>/dev/null || echo 2); fi
-SLOTS=$((CORES / 2)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+# Task slots (USB-4): the logical processors of the performance cores, at most half of all
+# processors and at least 1, so the machine stays responsive for its owner. A laptop chip with few
+# performance cores slows down far more than linearly when every efficient core is busy too. When
+# the core types cannot be read, a machine with a battery gets a quarter of its processors.
+# OXIDESWARM_USB_CPU_INFO="total=N perf=N|- battery=0|1" replaces the probe (tests).
+count_cpu_list() {
+  n=0
+  old_ifs=$IFS; IFS=,
+  for part in $1; do
+    case "$part" in
+      *-*) a=${part%-*}; b=${part#*-}; n=$((n + b - a + 1)) ;;
+      '') ;;
+      *) n=$((n + 1)) ;;
+    esac
+  done
+  IFS=$old_ifs
+  printf '%s\n' "$n"
+}
+CPU_TOTAL=""; CPU_PERF=""; CPU_BATTERY=0
+if [ -n "${OXIDESWARM_USB_CPU_INFO:-}" ]; then
+  for kv in $OXIDESWARM_USB_CPU_INFO; do
+    case "$kv" in
+      total=*) CPU_TOTAL=${kv#total=} ;;
+      perf=*) CPU_PERF=${kv#perf=} ;;
+      battery=*) CPU_BATTERY=${kv#battery=} ;;
+    esac
+  done
+elif [ "$OS" = Darwin ]; then
+  CPU_TOTAL=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  CPU_PERF=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || true)
+  if pmset -g batt 2>/dev/null | grep -q InternalBattery; then CPU_BATTERY=1; fi
+else
+  CPU_TOTAL=$(nproc 2>/dev/null || true)
+  if [ -r /sys/devices/cpu_core/cpus ]; then CPU_PERF=$(count_cpu_list "$(cat /sys/devices/cpu_core/cpus)"); fi
+  for b in /sys/class/power_supply/BAT*; do
+    if [ -e "$b" ]; then CPU_BATTERY=1; break; fi
+  done
+fi
+case "$CPU_TOTAL" in ''|*[!0-9]*) CPU_TOTAL=2 ;; esac
+case "$CPU_PERF" in ''|*[!0-9]*) CPU_PERF="" ;; esac
+[ "$CPU_TOTAL" -ge 1 ] || CPU_TOTAL=1
+HALF=$((CPU_TOTAL / 2)); [ "$HALF" -ge 1 ] || HALF=1
+if [ -n "$SLOTS_SET" ]; then
+  SLOTS=$SLOTS_SET; SLOTS_WHY="set with --slots"
+elif [ -n "$CPU_PERF" ] && [ "$CPU_PERF" -ge 1 ]; then
+  SLOTS=$CPU_PERF; [ "$SLOTS" -le "$HALF" ] || SLOTS=$HALF
+  SLOTS_WHY="performance cores, at most half of $CPU_TOTAL processors"
+elif [ "$CPU_BATTERY" = 1 ]; then
+  SLOTS=$((CPU_TOTAL / 4)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+  SLOTS_WHY="a quarter of $CPU_TOTAL processors on a machine with a battery"
+else
+  SLOTS=$HALF; SLOTS_WHY="half of $CPU_TOTAL processors"
+fi
+say "  slots:   $SLOTS ($SLOTS_WHY; change it with --slots N)"
 WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
@@ -324,7 +389,7 @@ say "  connected (isolation: $ISOLATION)"
 # What an update keeps: the name, the build, the workspace choice and the isolation.
 GPU_USED=0
 if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
-printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" > "$ROOT/kit-install.conf"
+printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\nslots=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" "$SLOTS_SET" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
 if [ "$AUTOSTART" = 1 ]; then

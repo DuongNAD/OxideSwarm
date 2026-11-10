@@ -273,3 +273,11 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   `[A-Za-z0-9_.-]{1,64}`. Open: the USB-bus check reads `Win32_DiskDrive.InterfaceType`, which
   reports SCSI for UASP and Thunderbolt enclosures, so such disks are still offered; the worker-side
   findings S1 to S4 follow separately.
+- 2026-11-10: `USB-4`. The installers size the worker's task slots to the performance cores
+  (`GetSystemCpuSetInformation` efficiency classes on Windows, `hw.perflevel0.logicalcpu` on
+  macOS, `/sys/devices/cpu_core/cpus` on Linux), at most half of all processors and at least 1; a
+  quarter of the processors on a machine with a battery when the core types cannot be read.
+  `install.sh --slots N` / `install.ps1 -Slots N` override it, and `kit-install.conf` /
+  `kit-install.txt` keep an override across updates. Reason: on an i7-1355U laptop, 6 concurrent
+  tasks took 39.6 s each against 2.9 s for 2, and a 32-task batch waited 52 s on the laptop's 6
+  tasks (see `SCHED-4`, design 0060).
