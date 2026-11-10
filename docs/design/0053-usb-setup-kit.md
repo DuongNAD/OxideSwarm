@@ -225,3 +225,37 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   worker writes `<InstallRoot>\home\windows_acl_grants.txt` and never touches
   `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes all recorded `oxideswarm.toolchain` ACL
   grants before deleting `<InstallRoot>`.
+- 2026-11-10: D2 `--gpu` in kit format v0. During the trial, a laptop with a discrete GPU joined
+  with `GPU: none`, because the kit only held the plain archives. `make_kit.sh --gpu` adds the `-gpu`
+  archive of each target. The installers ask whether this machine's GPU should do work and install
+  the GPU build on yes; without a terminal they keep the plain build. `install.sh --gpu|--no-gpu` and
+  `install.ps1 -Gpu|-NoGpu` answer in advance.
+- 2026-11-10: Install folder on another drive (Windows). The trial showed task folders and the file
+  cache in `%TEMP%` on drive C even with `-InstallRoot`. `install.ps1` now offers each fixed NTFS or
+  ReFS drive other than the kit's, and checks a folder given with `-InstallRoot` the same way. A
+  folder outside `%LOCALAPPDATA%` is limited to the user, `SYSTEM` and `Administrators` before
+  anything is written into it, and the worker gets its sandbox base and `--workspace-root`
+  inside it. The folder is recorded in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1`. The
+  worker itself does not check the permissions of a custom sandbox base on Windows
+  (`ensure_private_dir` acts on Unix only); that is a separate fix.
+- 2026-11-10: The install-folder menu was checked on a Windows 11 laptop with an internal `E:`
+  (NTFS): it offered `E:\OxideSwarm`, skipped the kit stick (`D:`, exFAT, removable) and Google
+  Drive (`G:`, FAT32), and refused a second install while one existed on drive C. Google Drive is
+  skipped only because it reports FAT32, so the installer now also requires a disk partition behind
+  the drive letter (`Win32_LogicalDiskToPartition`; a cloud or virtual drive has none) and refuses
+  disks on the USB bus. The worker-side fix landed the same day (design 0021 status log).
+- 2026-11-10: Update in place (`install.sh --update`, `install.ps1 -Update`, and the `Update
+  OxideSwarm` launchers). During the trial every new kit meant uninstall and install on each
+  machine. The update keeps the folder, name, build and start at login, does not join again and
+  skips the doctor; the installer now records the name, build and workspace choice in
+  `kit-install.conf` / `kit-install.txt`. The normal installer also stops this install's LaunchAgent
+  or systemd unit before it replaces the binary.
+- 2026-11-10: One worker per machine, and a safe eject. Each reinstall during the trial left a
+  disconnected entry beside the new worker, because a fresh state folder got a fresh random id. The
+  installers now write the id file before the first start: a version 8 UUID from a SHA-256 over the
+  machine id (`MachineGuid`, `IOPlatformUUID`, `/etc/machine-id`), the worker name and the cluster
+  secret, so the machine id stays local and ids do not link one machine across clusters. With
+  ENROLL-1b's per-member worker ids, a reinstall that enrols a new key under the same id may be
+  refused (not checked yet); that interaction is open. The launchers end with an offer to eject the stick, run so that
+  the launcher read from the stick does not keep it busy (tested on macOS with a mounted exFAT image;
+  the Windows path is untested).

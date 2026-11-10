@@ -7,6 +7,11 @@
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
 #   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
+#                   [--gpu|--no-gpu] [--update]
+#
+# --update (what "Update OxideSwarm.command" runs) updates an existing install in place: it keeps
+# its folder, name, GPU choice, isolation, cluster membership and start at login, asks nothing,
+# does not join again, and only replaces the binaries and restarts the worker.
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -16,8 +21,11 @@ NAME=""
 ROOT=""
 AUTOSTART=1
 WORKSPACES=1
+GPU=""
+UPDATE=0
 ISOLATION=""
 EXPLICIT_ISOLATION=0
+ISO_SET_BY_FLAG=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -28,14 +36,17 @@ while [ $# -gt 0 ]; do
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-workspaces) WORKSPACES=0 ;;
+    --update) UPDATE=1 ;;
+    --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
+    --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
     --isolation)
       [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
       case "$2" in
-        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1 ;;
+        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1; ISO_SET_BY_FLAG=1 ;;
         *) fail "--isolation must be off or fs (got: $2)" ;;
       esac
       shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
   shift
@@ -58,7 +69,7 @@ if [ -z "$ROOT" ]; then
   fi
 fi
 
-[ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+[ "$UPDATE" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
 if [ -z "$ISOLATION" ]; then
@@ -74,16 +85,72 @@ if [ -z "$ISOLATION" ]; then
 fi
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
 
+PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
+UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/oxideswarm-usb-worker.service"
+# Whether this install's worker is started at login now (a LaunchAgent or a systemd user unit that
+# runs this install's binary).
+has_autostart() {
+  { [ -f "$PLIST" ] && grep -qF "$ROOT/bin/oxideswarm" "$PLIST"; } ||
+    { [ -f "$UNIT" ] && grep -qF "$ROOT/bin/oxideswarm" "$UNIT"; }
+}
+if [ "$UPDATE" = 1 ]; then
+  [ -x "$ROOT/bin/oxideswarm" ] || fail "there is no OxideSwarm from a USB kit in $ROOT; run the installer first"
+  # Its settings: kit-install.conf (written since the update mode exists), else what is on disk.
+  if [ -f "$ROOT/kit-install.conf" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        name) [ -n "$NAME" ] || NAME=$value ;;
+        gpu) [ -n "$GPU" ] || case "$value" in 0|1) GPU=$value ;; esac ;;
+        workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
+        # The isolation the worker ran with is kept, and an update never weakens it silently.
+        isolation) [ "$ISO_SET_BY_FLAG" = 1 ] || case "$value" in off|fs) ISOLATION=$value; EXPLICIT_ISOLATION=1 ;; esac ;;
+      esac
+    done < "$ROOT/kit-install.conf"
+  fi
+  if [ -z "$NAME" ]; then
+    ID_FILE=$(ls -t "$ROOT"/home/worker_id.* 2>/dev/null | head -n 1 || true)
+    [ -n "$ID_FILE" ] && NAME=${ID_FILE##*/worker_id.}
+  fi
+  case "$NAME" in *[!A-Za-z0-9_.-]*) NAME="" ;; esac
+  # The start at login stays as it is.
+  if has_autostart; then AUTOSTART=1; else AUTOSTART=0; fi
+fi
+
 ARCHIVE=""
 for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
   [ -f "$f" ] && ARCHIVE=$f
 done
 [ -n "$ARCHIVE" ] || fail "no archive for $TARGET in $KIT_DIR/archives"
-ARCHIVE_NAME=$(basename "$ARCHIVE")
+# A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
+# when it finds one. It is installed only when the person at the keyboard agrees (or --gpu).
+GPU_ARCHIVE=""
+for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
+  [ -f "$f" ] && GPU_ARCHIVE=$f
+done
+if [ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ]; then
+  [ "$UPDATE" = 1 ] && fail "this install uses the GPU build, which this kit lacks; update from a kit made with make_kit.sh --gpu, or add --no-gpu"
+  fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
+fi
 
-say "OxideSwarm USB installer"
+if [ "$UPDATE" = 1 ]; then say "OxideSwarm USB installer (update)"; else say "OxideSwarm USB installer"; fi
 say "  system:  $OS $ARCH ($TARGET)"
 say "  folder:  $ROOT"
+
+if [ -n "$GPU_ARCHIVE" ] && [ -z "$GPU" ]; then
+  GPU=0
+  if [ -t 0 ]; then
+    printf "Let the cluster use this computer's GPU as well? [Y/n] "
+    read -r answer || answer=n
+    case "$answer" in [Nn]*) ;; *) GPU=1 ;; esac
+  fi
+fi
+if [ -n "$GPU_ARCHIVE" ] && [ "$GPU" = 1 ]; then
+  ARCHIVE=$GPU_ARCHIVE
+  say "  gpu:     yes (GPU build; the worker offers the GPU it finds)"
+elif [ -n "$GPU_ARCHIVE" ]; then
+  say "  gpu:     no (CPU build; run the installer with --gpu to change that)"
+fi
+ARCHIVE_NAME=$(basename "$ARCHIVE")
 
 # 1. Check the archive against the kit's SHA256SUMS. This catches a corrupted or outdated copy;
 #    it cannot catch a deliberate swap of the whole stick (design 0053, Security).
@@ -96,6 +163,16 @@ else
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || fail "checksum mismatch for $ARCHIVE_NAME: the copy on the stick is damaged"
 say "  archive: $ARCHIVE_NAME (checksum OK)"
+
+# Stop the worker this install's start-at-login entry keeps alive before its binary changes; step 8
+# puts the entry back.
+if has_autostart; then
+  if [ "$OS" = Darwin ]; then
+    launchctl bootout "gui/$(id -u)/com.oxideswarm.usb-worker" 2>/dev/null || true
+  else
+    systemctl --user stop oxideswarm-usb-worker.service 2>/dev/null || true
+  fi
+fi
 
 # 2. Unpack the binaries.
 BIN_DIR="$ROOT/bin"
@@ -137,11 +214,14 @@ if [ -f "$RUN_DIR/worker.pid" ]; then
   rm -f "$RUN_DIR/worker.pid"
 fi
 
-# 4. Join: the token is read from standard input only, never from the command line.
-say ""
-say "Joining the cluster ..."
-if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
-  fail "join failed (see the message above); nothing was started"
+# 4. Join: the token is read from standard input only, never from the command line. An update keeps
+# the existing membership.
+if [ "$UPDATE" = 0 ]; then
+  say ""
+  say "Joining the cluster ..."
+  if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
+    fail "join failed (see the message above); nothing was started"
+  fi
 fi
 
 # The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
@@ -163,6 +243,31 @@ if [ -z "$NAME" ]; then
   NAME=$(hostname -s 2>/dev/null || hostname)
   NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
   [ -n "$NAME" ] || NAME=worker
+fi
+# A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
+# same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
+# machine's own id, the name and the cluster secret: the machine id never leaves the machine, and the
+# same machine gets unrelated ids in different clusters. An existing id file is kept.
+# OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
+ID_FILE="$STATE/worker_id.$NAME"
+if [ ! -s "$ID_FILE" ]; then
+  MACHINE_ID=${OXIDESWARM_USB_MACHINE_ID:-}
+  if [ -z "$MACHINE_ID" ] && [ "$OS" = Darwin ]; then
+    MACHINE_ID=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4; exit }' || true)
+  fi
+  if [ -z "$MACHINE_ID" ]; then
+    for f in /etc/machine-id /var/lib/dbus/machine-id; do
+      if [ -s "$f" ]; then MACHINE_ID=$(cat "$f"); break; fi
+    done
+  fi
+  if [ -n "$MACHINE_ID" ]; then
+    if command -v shasum >/dev/null 2>&1; then SHA="shasum -a 256"; else SHA=sha256sum; fi
+    H=$({ printf 'oxideswarm-usb-worker-id-v1\n%s\n%s\n' "$MACHINE_ID" "$NAME"; cat "$STATE/cluster.secret" 2>/dev/null || true; } | $SHA | cut -c1-32)
+    # UUID version 8 (vendor-specific) with the RFC 9562 variant bits.
+    VARIANT=$(printf '%x' $(( (0x$(printf '%s' "$H" | cut -c17) & 3) | 8 )))
+    UUID="$(printf '%s' "$H" | cut -c1-8)-$(printf '%s' "$H" | cut -c9-12)-8$(printf '%s' "$H" | cut -c14-16)-$VARIANT$(printf '%s' "$H" | cut -c18-20)-$(printf '%s' "$H" | cut -c21-32)"
+    (umask 077; printf '%s\n' "$UUID" > "$ID_FILE")
+  fi
 fi
 # Use at most half of the CPU cores, so the machine stays responsive for its owner.
 if [ "$OS" = Darwin ]; then CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 2); else CORES=$(nproc 2>/dev/null || echo 2); fi
@@ -210,11 +315,14 @@ while [ $i -lt 30 ]; do
 done
 [ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
 say "  connected (isolation: $ISOLATION)"
+# What an update keeps: the name, the build, the workspace choice and the isolation.
+GPU_USED=0
+if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
+printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$OS" = Darwin ]; then
-    PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     {
       printf '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -240,7 +348,7 @@ if [ "$AUTOSTART" = 1 ]; then
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     say "  autostart: LaunchAgent com.oxideswarm.usb-worker"
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    UNIT_DIR=$(dirname "$UNIT")
     mkdir -p "$UNIT_DIR"
     {
       printf '[Unit]\nDescription=OxideSwarm worker (USB kit)\n\n[Service]\n'
@@ -260,6 +368,12 @@ if [ "$AUTOSTART" = 1 ]; then
   fi
 else
   say "  autostart: skipped (--no-autostart); worker PID $(cat "$RUN_DIR/worker.pid")"
+fi
+
+if [ "$UPDATE" = 1 ]; then
+  say ""
+  say "Updated. Worker '$NAME' runs $("$BIN" --version) from $ROOT."
+  exit 0
 fi
 
 # 9. Check the cluster.
