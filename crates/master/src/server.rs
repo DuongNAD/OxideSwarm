@@ -3055,14 +3055,14 @@ pub async fn handle_worker_disconnect_with_broadcast(
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
-) {
+) -> bool {
     let unregistered = registry
         .unregister(worker_id, session_id)
         .await
         .unwrap_or(false);
     if !unregistered {
         debug!(worker_id = %worker_id, "Worker unregister skipped (stale session or already handled)");
-        return;
+        return false;
     }
     if let Some(sid) = session_id {
         queue.set_worker_session_resume_connected(*worker_id, sid, false);
@@ -3097,6 +3097,7 @@ pub async fn handle_worker_disconnect_with_broadcast(
         broadcast_tx,
     )
     .await;
+    true
 }
 
 /// Unregisters a worker session that announced a graceful drain (`WorkerMessage::Disconnecting`),
@@ -4050,6 +4051,18 @@ where
             expires_in_secs,
             require_approval,
         } => {
+            if !auth_ctx.auth_mode.allows_members() {
+                send_client_response(
+                    transport,
+                    &ClientResponse::Error {
+                        message:
+                            "cannot create an invite when the master is configured with --auth secret"
+                                .into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             let master_key_pub = match auth_ctx.ensure_v3_key_persisted() {
                 Ok(pk) => pk,
                 Err(e) => {
@@ -4206,7 +4219,7 @@ where
                 Ok((entry, owned_workers)) => {
                     let mut disconnected_sessions = 0usize;
                     for wid in &owned_workers {
-                        handle_worker_disconnect_with_broadcast(
+                        if handle_worker_disconnect_with_broadcast(
                             registry,
                             queue,
                             scheduler_notify,
@@ -4218,8 +4231,10 @@ where
                             #[cfg(feature = "dashboard")]
                             broadcast_tx,
                         )
-                        .await;
-                        disconnected_sessions += 1;
+                        .await
+                        {
+                            disconnected_sessions += 1;
+                        }
                     }
                     info!(
                         member_id = %entry.id,
@@ -4560,7 +4575,7 @@ where
             if is_protocol_version_compatible(*protocol_version) && capabilities.cpu_cores > 0 {
                 if let Err(err) = auth_ctx
                     .members
-                    .claim_worker_id(*worker_id, &auth_peer.member_id)
+                    .check_worker_id_claim(*worker_id, Some(&auth_peer.member_id))
                 {
                     let reason = err.to_string();
                     warn!(

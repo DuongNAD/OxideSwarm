@@ -111,6 +111,8 @@ pub struct WorkerEntry {
     /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
     /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
     pub preserved_thermal_until: Option<Instant>,
+    /// Enrolled member ID (`members.json`) that authenticated the live session, or `None` for v2/open sessions.
+    pub owner_member_id: Option<String>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -451,6 +453,7 @@ impl WorkerRegistry {
                 heartbeat_interval: hb_interval,
                 mobile_status,
                 preserved_thermal_until: None,
+                owner_member_id: None,
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -461,6 +464,33 @@ impl WorkerRegistry {
             session_id,
             superseded_session,
         })
+    }
+
+    /// Returns `Some(owner_member_id)` if `worker_id` currently has a live (`Connected` or `Busy`)
+    /// session in the registry, or `None` if `worker_id` is not registered or is `Disconnected`.
+    pub async fn live_session_owner(&self, worker_id: &Uuid) -> Option<Option<String>> {
+        let inner = self.inner.read().await;
+        let entry = inner.workers.get(worker_id)?;
+        if entry.status == WorkerStatus::Disconnected {
+            None
+        } else {
+            Some(entry.owner_member_id.clone())
+        }
+    }
+
+    /// Records the authenticated v3 `member_id` (or `None` for v2/open) that owns `session_id`.
+    pub async fn set_owner_member_id(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+        owner_member_id: Option<String>,
+    ) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id {
+                entry.owner_member_id = owner_member_id;
+            }
+        }
     }
 
     /// Attaches the receive-side liveness clock of `session_id`'s connection.

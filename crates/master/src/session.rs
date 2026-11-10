@@ -534,6 +534,8 @@ impl<
             shutdown_rx,
             abort_handle,
             blob_store,
+            &auth_ctx,
+            v3_peer.as_ref(),
             #[cfg(feature = "dashboard")]
             broadcast_tx,
         )
@@ -557,6 +559,8 @@ impl<
         shutdown_rx: watch::Receiver<bool>,
         abort_handle: Option<AbortHandle>,
         blob_store: Option<Arc<BlobStore>>,
+        auth_ctx: &MasterAuthContext,
+        v3_peer: Option<&rusty_grid_core::noise_auth::AuthenticatedV3Peer>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
     ) -> GridResult<Option<Self>> {
         // 2. Validate Register message
@@ -624,6 +628,44 @@ impl<
         let remote_addr = pre_auth.remote_addr();
         let rx_clock = pre_auth.rx_clock().clone();
         let is_multiplexed = pre_auth.is_multiplexed();
+        let caller_member_id = v3_peer.map(|p| p.member_id.as_str());
+
+        if let Err(err) = auth_ctx
+            .members
+            .check_worker_id_claim(worker_id, caller_member_id)
+        {
+            let reason = err.to_string();
+            let reject_ack = MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id,
+                heartbeat_interval_secs: 0,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+                message: Some(reason),
+            };
+            pre_auth.send_handshake_refusal(&reject_ack).await;
+            return Err(err);
+        }
+
+        if let Some(live_owner) = registry.live_session_owner(&worker_id).await {
+            if live_owner.as_deref() != caller_member_id {
+                let owner_desc = live_owner.as_deref().unwrap_or("an active session");
+                let reason = format!(
+                    "worker_id {worker_id} is owned by another member ({owner_desc}); {} cannot take over its live session",
+                    caller_member_id.unwrap_or("v2 peer")
+                );
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(reason.clone()),
+                };
+                pre_auth.send_handshake_refusal(&reject_ack).await;
+                return Err(GridError::AuthFailed(reason));
+            }
+        }
 
         // 3. Register in WorkerRegistry
         let negotiated_features = worker_features
@@ -642,8 +684,29 @@ impl<
                 abort_handle,
             )
             .await?;
-        queue.set_worker_session_resume(worker_id, worker_supports_resume);
         let session_id = registration.session_id;
+        registry
+            .set_owner_member_id(&worker_id, session_id, v3_peer.map(|p| p.member_id.clone()))
+            .await;
+
+        if let Some(peer) = v3_peer {
+            if let Err(err) = auth_ctx.members.claim_worker_id(worker_id, &peer.member_id) {
+                let _ = registry.unregister(&worker_id, Some(session_id)).await;
+                let reason = err.to_string();
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(reason),
+                };
+                pre_auth.send_handshake_refusal(&reject_ack).await;
+                return Err(err);
+            }
+        }
+
+        queue.set_worker_session_resume(worker_id, worker_supports_resume);
         queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
         registry
             .set_rx_clock(&worker_id, session_id, rx_clock)

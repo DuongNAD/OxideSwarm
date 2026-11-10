@@ -1,7 +1,7 @@
 //! Enrolled member store (`members.json`), invites, pending enrollments, worker-ID ownership, and
 //! master authentication mode (`--auth`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -31,6 +31,12 @@ pub const MAX_PENDING_ENROLLMENTS: usize = 32;
 
 /// Time-to-live (10 minutes) for a pending enrollment request (design 0051 D4).
 pub const PENDING_ENROLLMENT_TTL_SECS: u64 = 600;
+
+/// Maximum number of claimed worker IDs per enrolled member (design 0051 D5).
+pub const MAX_WORKERS_PER_MEMBER: usize = 64;
+
+/// Maximum length in Unicode scalar values of an enrolled member's name.
+pub const MAX_MEMBER_NAME_CHARS: usize = 64;
 
 /// `via_invite` tag used when the master auto-enrolls the host's own `node.key` as `admin`.
 pub const LOCAL_HOST_INVITE_TAG: &str = "local-host";
@@ -138,6 +144,9 @@ pub struct MembersFile {
     /// Worker IDs owned by each member (`worker_id -> member_id`, design 0051 D5).
     #[serde(default)]
     pub worker_owners: BTreeMap<Uuid, String>,
+    /// Public keys of revoked members that are permanently refused re-enrollment (design 0051 G4).
+    #[serde(default)]
+    pub revoked_keys: Vec<PublicKey>,
 }
 
 impl Default for MembersFile {
@@ -147,6 +156,7 @@ impl Default for MembersFile {
             members: Vec::new(),
             invites: Vec::new(),
             worker_owners: BTreeMap::new(),
+            revoked_keys: Vec::new(),
         }
     }
 }
@@ -187,11 +197,80 @@ struct PendingEnrollmentEntry {
     decision_tx: oneshot::Sender<PendingDecision>,
 }
 
-#[derive(Default)]
-struct MemberStoreInner {
+#[derive(Clone, Default)]
+struct PersistentMemberState {
     by_pubkey: HashMap<PublicKey, MemberEntry>,
     invites: Vec<InviteRecord>,
     worker_owners: BTreeMap<Uuid, String>,
+    revoked_keys: HashSet<PublicKey>,
+}
+
+impl PersistentMemberState {
+    fn to_members_file(&self) -> MembersFile {
+        let mut members: Vec<MemberEntry> = self.by_pubkey.values().cloned().collect();
+        members.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut revoked_keys: Vec<PublicKey> = self.revoked_keys.iter().copied().collect();
+        revoked_keys.sort_by_key(PublicKey::to_hex);
+        MembersFile {
+            version: MEMBERS_FILE_VERSION,
+            members,
+            invites: self.invites.clone(),
+            worker_owners: self.worker_owners.clone(),
+            revoked_keys,
+        }
+    }
+
+    fn upsert_member(
+        &mut self,
+        public_key: PublicKey,
+        name: String,
+        roles: Vec<MemberRole>,
+        via_invite: Option<String>,
+        now: u64,
+    ) -> MemberEntry {
+        let id = public_key.member_id();
+        match self.by_pubkey.get_mut(&public_key) {
+            Some(existing) => {
+                existing.id = id;
+                if !name.trim().is_empty() {
+                    existing.name = name;
+                }
+                for role in roles {
+                    if !existing.roles.contains(&role) {
+                        existing.roles.push(role);
+                    }
+                }
+                existing.last_seen = Some(now);
+                if via_invite.is_some() {
+                    existing.via_invite = via_invite;
+                }
+                existing.clone()
+            }
+            None => {
+                let entry = MemberEntry {
+                    id,
+                    name,
+                    public_key,
+                    roles,
+                    enrolled_at: Some(now),
+                    last_seen: Some(now),
+                    via_invite,
+                };
+                self.by_pubkey.insert(public_key, entry.clone());
+                entry
+            }
+        }
+    }
+
+    fn prune_inactive_invites(&mut self, now: u64) {
+        self.invites
+            .retain(|inv| !inv.revoked && inv.uses_remaining > 0 && now < inv.expires_at);
+    }
+}
+
+#[derive(Default)]
+struct MemberStoreInner {
+    state: PersistentMemberState,
     pending: HashMap<String, PendingEnrollmentEntry>,
     save_path: Option<PathBuf>,
 }
@@ -206,8 +285,8 @@ impl fmt::Debug for MemberStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("MemberStore")
-            .field("members", &guard.by_pubkey.len())
-            .field("invites", &guard.invites.len())
+            .field("members", &guard.state.by_pubkey.len())
+            .field("invites", &guard.state.invites.len())
             .field("pending", &guard.pending.len())
             .finish()
     }
@@ -218,6 +297,38 @@ pub fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Strips control characters (`char::is_control`), trims whitespace, and bounds the string to
+/// `max_chars` Unicode scalar values.
+pub fn sanitize_display_field(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// Validates a member name (`1..=MAX_MEMBER_NAME_CHARS` characters after trimming, no control
+/// characters).
+pub fn validate_member_name(raw: &str) -> GridResult<String> {
+    if raw.chars().any(char::is_control) {
+        return Err(GridError::Config(
+            "member name cannot contain control characters".into(),
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(GridError::Config("member name cannot be empty".into()));
+    }
+    if trimmed.chars().count() > MAX_MEMBER_NAME_CHARS {
+        return Err(GridError::Config(format!(
+            "member name cannot exceed {MAX_MEMBER_NAME_CHARS} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn random_hex(num_bytes: usize) -> GridResult<String> {
@@ -252,9 +363,9 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
         ))
     })?;
     let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o022 != 0 {
+    if mode & 0o077 != 0 {
         let msg = format!(
-            "refusing to load members file {}: permissions {:03o} allow group/others write access (fix with: chmod 600 {})",
+            "refusing to load members file {}: permissions {:03o} allow group/others access (fix with: chmod 600 {})",
             path.display(),
             mode,
             path.display()
@@ -394,71 +505,67 @@ fn write_members_file_atomic(path: &Path, file: &MembersFile) -> GridResult<()> 
 }
 
 impl MemberStoreInner {
-    fn to_members_file(&self) -> MembersFile {
-        let mut members: Vec<MemberEntry> = self.by_pubkey.values().cloned().collect();
-        members.sort_by(|a, b| a.id.cmp(&b.id));
-        MembersFile {
-            version: MEMBERS_FILE_VERSION,
-            members,
-            invites: self.invites.clone(),
-            worker_owners: self.worker_owners.clone(),
-        }
-    }
-
-    fn persist_if_configured(&self) -> GridResult<()> {
+    fn mutate_and_persist<T, F>(&mut self, f: F) -> GridResult<T>
+    where
+        F: FnOnce(&mut PersistentMemberState) -> GridResult<T>,
+    {
+        let mut staged = self.state.clone();
+        let out = f(&mut staged)?;
         if let Some(ref path) = self.save_path {
-            write_members_file_atomic(path, &self.to_members_file())?;
+            write_members_file_atomic(path, &staged.to_members_file())?;
         }
-        Ok(())
+        self.state = staged;
+        Ok(out)
     }
 
     fn prune_pending(&mut self, now: u64) {
         self.pending
             .retain(|_, entry| now < entry.info.expires_at && !entry.decision_tx.is_closed());
     }
-
-    fn upsert_member(
-        &mut self,
-        public_key: PublicKey,
-        name: String,
-        roles: Vec<MemberRole>,
-        via_invite: Option<String>,
-        now: u64,
-    ) -> MemberEntry {
-        let id = public_key.member_id();
-        let entry = match self.by_pubkey.get_mut(&public_key) {
-            Some(existing) => {
-                existing.id = id.clone();
-                if !name.trim().is_empty() {
-                    existing.name = name;
-                }
-                existing.roles = roles;
-                existing.last_seen = Some(now);
-                if via_invite.is_some() {
-                    existing.via_invite = via_invite;
-                }
-                existing.clone()
-            }
-            None => {
-                let entry = MemberEntry {
-                    id: id.clone(),
-                    name,
-                    public_key,
-                    roles,
-                    enrolled_at: Some(now),
-                    last_seen: Some(now),
-                    via_invite,
-                };
-                self.by_pubkey.insert(public_key, entry.clone());
-                entry
-            }
-        };
-        entry
-    }
 }
 
-/// Resolves a target identifier (`id`, prefix >= 4 chars, or exact `name`) over items `(id, name)`.
-fn resolve_id_or_name<'a, I>(target: &str, items: I, kind: &str) -> GridResult<String>
+/// Resolves a target identifier by exact ID or unique hex ID prefix (`>= 4` hex characters).
+/// Never matches by display name so an attacker cannot shadow an ID prefix with a crafted name.
+fn resolve_id_or_prefix<'a, I>(target: &str, ids: I, kind: &str) -> GridResult<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let q = target.trim();
+    if q.is_empty() {
+        return Err(GridError::Config(format!("{kind} target cannot be empty")));
+    }
+    let q_clean = q.replace('-', "").to_ascii_lowercase();
+    let all: Vec<&'a str> = ids.into_iter().collect();
+
+    // 1. Exact ID match.
+    for id in &all {
+        if id.eq_ignore_ascii_case(&q_clean) || id.eq_ignore_ascii_case(q) {
+            return Ok((*id).to_string());
+        }
+    }
+    // 2. Unique ID prefix of at least 4 hex characters.
+    if q_clean.len() >= 4 && q_clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        let prefix_matches: Vec<&str> = all
+            .iter()
+            .filter(|id| id.to_ascii_lowercase().starts_with(&q_clean))
+            .copied()
+            .collect();
+        if prefix_matches.len() == 1 {
+            return Ok(prefix_matches[0].to_string());
+        }
+        if prefix_matches.len() > 1 {
+            return Err(GridError::Config(format!(
+                "ambiguous {kind} ID prefix '{q}'; matches {} entries",
+                prefix_matches.len()
+            )));
+        }
+    }
+    Err(GridError::Config(format!("no {kind} matching ID '{q}'")))
+}
+
+/// Resolves a target identifier for `members rename` by exact ID, unique hex ID prefix (`>= 4`
+/// hex chars), or finally unique exact `name`.
+fn resolve_id_prefix_or_name<'a, I>(target: &str, items: I, kind: &str) -> GridResult<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
@@ -466,16 +573,10 @@ where
     if q.is_empty() {
         return Err(GridError::Config(format!("{kind} target cannot be empty")));
     }
-    let q_clean = q.replace('-', "").to_ascii_lowercase();
     let all: Vec<(&'a str, &'a str)> = items.into_iter().collect();
-
-    // 1. Exact ID match.
-    for (id, _) in &all {
-        if id.eq_ignore_ascii_case(&q_clean) || id.eq_ignore_ascii_case(q) {
-            return Ok((*id).to_string());
-        }
+    if let Ok(id) = resolve_id_or_prefix(q, all.iter().map(|(id, _)| *id), kind) {
+        return Ok(id);
     }
-    // 2. Exact name match (if unique).
     let name_matches: Vec<&str> = all
         .iter()
         .filter(|(_, name)| *name == q)
@@ -488,23 +589,6 @@ where
         return Err(GridError::Config(format!(
             "ambiguous {kind} name '{q}'; specify the ID instead"
         )));
-    }
-    // 3. Unique ID prefix of at least 4 hex characters.
-    if q_clean.len() >= 4 {
-        let prefix_matches: Vec<&str> = all
-            .iter()
-            .filter(|(id, _)| id.to_ascii_lowercase().starts_with(&q_clean))
-            .map(|(id, _)| *id)
-            .collect();
-        if prefix_matches.len() == 1 {
-            return Ok(prefix_matches[0].to_string());
-        }
-        if prefix_matches.len() > 1 {
-            return Err(GridError::Config(format!(
-                "ambiguous {kind} ID prefix '{q}'; matches {} entries",
-                prefix_matches.len()
-            )));
-        }
     }
     Err(GridError::Config(format!("no {kind} matching '{q}'")))
 }
@@ -529,11 +613,18 @@ impl MemberStore {
         let mut by_pubkey = HashMap::new();
         for mut entry in entries {
             entry.id = entry.public_key.member_id();
+            entry.name = sanitize_display_field(&entry.name, MAX_MEMBER_NAME_CHARS);
+            if entry.name.is_empty() {
+                entry.name = entry.id.clone();
+            }
             by_pubkey.insert(entry.public_key, entry);
         }
         Self {
             inner: Arc::new(RwLock::new(MemberStoreInner {
-                by_pubkey,
+                state: PersistentMemberState {
+                    by_pubkey,
+                    ..Default::default()
+                },
                 ..Default::default()
             })),
         }
@@ -553,11 +644,15 @@ impl MemberStore {
                 return Err(GridError::Config(format!(
                     "invalid members file {}: member '{}' has id '{}' which does not match its public_key id '{expected_id}'",
                     source_path.display(),
-                    entry.name,
+                    sanitize_display_field(&entry.name, MAX_MEMBER_NAME_CHARS),
                     raw_id
                 )));
             }
             entry.id = expected_id.clone();
+            entry.name = sanitize_display_field(&entry.name, MAX_MEMBER_NAME_CHARS);
+            if entry.name.is_empty() {
+                entry.name = expected_id.clone();
+            }
             if by_pubkey.contains_key(&entry.public_key) {
                 return Err(GridError::Config(format!(
                     "invalid members file {}: duplicate public_key '{}' (member id '{expected_id}')",
@@ -569,7 +664,10 @@ impl MemberStore {
         }
         Ok(Self {
             inner: Arc::new(RwLock::new(MemberStoreInner {
-                by_pubkey,
+                state: PersistentMemberState {
+                    by_pubkey,
+                    ..Default::default()
+                },
                 ..Default::default()
             })),
         })
@@ -631,8 +729,10 @@ impl MemberStore {
         let store = Self::try_from_entries(parsed.members, source_path)?;
         {
             let mut guard = store.inner.write().unwrap_or_else(|e| e.into_inner());
-            guard.invites = parsed.invites;
-            guard.worker_owners = parsed.worker_owners;
+            guard.state.invites = parsed.invites;
+            guard.state.prune_inactive_invites(now_unix_secs());
+            guard.state.worker_owners = parsed.worker_owners;
+            guard.state.revoked_keys = parsed.revoked_keys.into_iter().collect();
         }
         Ok(store)
     }
@@ -642,6 +742,7 @@ impl MemberStore {
         self.inner
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .state
             .by_pubkey
             .len()
     }
@@ -664,6 +765,7 @@ impl MemberStore {
     pub fn has_non_host_members(&self) -> bool {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         guard
+            .state
             .by_pubkey
             .values()
             .any(|m| m.via_invite.as_deref() != Some(LOCAL_HOST_INVITE_TAG))
@@ -674,6 +776,7 @@ impl MemberStore {
         self.inner
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .state
             .by_pubkey
             .contains_key(pubkey)
     }
@@ -683,6 +786,7 @@ impl MemberStore {
         self.inner
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .state
             .by_pubkey
             .get(pubkey)
             .cloned()
@@ -691,7 +795,7 @@ impl MemberStore {
     /// Updates `last_seen` for `pubkey` in memory.
     pub fn touch_last_seen(&self, pubkey: &PublicKey) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.by_pubkey.get_mut(pubkey) {
+        if let Some(entry) = guard.state.by_pubkey.get_mut(pubkey) {
             entry.last_seen = Some(now_unix_secs());
         }
     }
@@ -709,33 +813,41 @@ impl MemberStore {
             guard.save_path = None;
         }
         let now = now_unix_secs();
-        let changed = match guard.by_pubkey.get_mut(&host_pubkey) {
-            Some(entry) => {
-                if !entry.roles.contains(&MemberRole::Admin) {
-                    entry.roles.push(MemberRole::Admin);
-                    true
-                } else {
-                    false
+        let name = sanitize_display_field(&host_name.into(), MAX_MEMBER_NAME_CHARS);
+        let name = if name.is_empty() {
+            LOCAL_HOST_INVITE_TAG.to_string()
+        } else {
+            name
+        };
+        let needs_update = match guard.state.by_pubkey.get(&host_pubkey) {
+            Some(entry) => !entry.roles.contains(&MemberRole::Admin),
+            None => true,
+        };
+        if !needs_update {
+            return Ok(());
+        }
+        guard.mutate_and_persist(|staged| {
+            match staged.by_pubkey.get_mut(&host_pubkey) {
+                Some(entry) => {
+                    if !entry.roles.contains(&MemberRole::Admin) {
+                        entry.roles.push(MemberRole::Admin);
+                    }
+                }
+                None => {
+                    let entry = MemberEntry {
+                        id: host_pubkey.member_id(),
+                        name,
+                        public_key: host_pubkey,
+                        roles: vec![MemberRole::Admin],
+                        enrolled_at: Some(now),
+                        last_seen: Some(now),
+                        via_invite: Some(LOCAL_HOST_INVITE_TAG.to_string()),
+                    };
+                    staged.by_pubkey.insert(host_pubkey, entry);
                 }
             }
-            None => {
-                let entry = MemberEntry {
-                    id: host_pubkey.member_id(),
-                    name: host_name.into(),
-                    public_key: host_pubkey,
-                    roles: vec![MemberRole::Admin],
-                    enrolled_at: Some(now),
-                    last_seen: Some(now),
-                    via_invite: Some(LOCAL_HOST_INVITE_TAG.to_string()),
-                };
-                guard.by_pubkey.insert(host_pubkey, entry);
-                true
-            }
-        };
-        if changed && persist {
-            guard.persist_if_configured()?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Creates and persists a new invite (design 0051 D3).
@@ -759,9 +871,16 @@ impl MemberStore {
                 "invite --expires must be greater than 0 seconds".into(),
             ));
         }
+        if roles.contains(&MemberRole::Admin) && (!require_approval || max_uses != 1) {
+            return Err(GridError::Config(
+                "an invite that grants the admin role must require approval and have --uses 1"
+                    .into(),
+            ));
+        }
         let invite_id = random_hex(16)?;
         let invite_secret = RedactedBytes32(random_bytes_32()?);
-        let expires_at = now_unix_secs().saturating_add(expires_in_secs);
+        let now = now_unix_secs();
+        let expires_at = now.saturating_add(expires_in_secs);
         let record = InviteRecord {
             invite_id,
             invite_secret,
@@ -773,32 +892,56 @@ impl MemberStore {
             revoked: false,
         };
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        guard.invites.push(record.clone());
-        guard.persist_if_configured()?;
+        guard.mutate_and_persist(|staged| {
+            staged.prune_inactive_invites(now);
+            staged.invites.push(record.clone());
+            Ok(())
+        })?;
         Ok(record)
     }
 
     /// Lists all invites (design 0051 D3).
     pub fn list_invites(&self) -> Vec<InviteSummary> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        guard.invites.iter().map(InviteRecord::to_summary).collect()
+        guard
+            .state
+            .invites
+            .iter()
+            .map(InviteRecord::to_summary)
+            .collect()
     }
 
-    /// Revokes an invite by ID or unique prefix (>= 4 chars).
+    /// Revokes an invite by ID or unique hex prefix (>= 4 chars) and rejects any pending
+    /// enrollment requests waiting on that invite.
     pub fn revoke_invite(&self, target: &str) -> GridResult<String> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_or_name(
+        let id = resolve_id_or_prefix(
             target,
-            guard.invites.iter().map(|inv| (inv.invite_id.as_str(), "")),
+            guard.state.invites.iter().map(|inv| inv.invite_id.as_str()),
             "invite",
         )?;
-        let inv = guard
-            .invites
-            .iter_mut()
-            .find(|i| i.invite_id == id)
-            .ok_or_else(|| GridError::Config(format!("unknown invite '{target}'")))?;
-        inv.revoked = true;
-        guard.persist_if_configured()?;
+        guard.mutate_and_persist(|staged| {
+            let inv = staged
+                .invites
+                .iter_mut()
+                .find(|i| i.invite_id == id)
+                .ok_or_else(|| GridError::Config(format!("unknown invite '{target}'")))?;
+            inv.revoked = true;
+            Ok(())
+        })?;
+        let dropped_pending_ids: Vec<String> = guard
+            .pending
+            .iter()
+            .filter(|(_, entry)| entry.info.invite_id == id)
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in dropped_pending_ids {
+            if let Some(entry) = guard.pending.remove(&pid) {
+                let _ = entry.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
+        }
         Ok(id)
     }
 
@@ -822,13 +965,28 @@ impl MemberStore {
         let now = now_unix_secs();
         guard.prune_pending(now);
 
-        let Some(inv_idx) = guard.invites.iter().position(|i| i.invite_id == invite_id) else {
+        if guard.state.revoked_keys.contains(&peer_public_key) {
+            return Ok(EnrollOutcome::Rejected {
+                log_reason: format!(
+                    "public key of candidate {} has been revoked",
+                    peer_public_key.member_id()
+                ),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        }
+
+        let Some(inv_idx) = guard
+            .state
+            .invites
+            .iter()
+            .position(|i| i.invite_id == invite_id)
+        else {
             return Ok(EnrollOutcome::Rejected {
                 log_reason: format!("unknown invite_id '{invite_id}'"),
                 wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
             });
         };
-        let invite = &guard.invites[inv_idx];
+        let invite = &guard.state.invites[inv_idx];
         if invite.revoked {
             return Ok(EnrollOutcome::Rejected {
                 log_reason: format!("invite '{}' has been revoked", invite.invite_id),
@@ -861,59 +1019,87 @@ impl MemberStore {
         let clean_name = if name.trim().is_empty() {
             peer_public_key.member_id()
         } else {
-            name.trim().to_string()
+            match validate_member_name(&name) {
+                Ok(valid) => valid,
+                Err(e) => {
+                    return Ok(EnrollOutcome::Rejected {
+                        log_reason: format!(
+                            "invalid enrollment name from candidate {}: {e}",
+                            peer_public_key.member_id()
+                        ),
+                        wire_message: format!("enrollment rejected: {e}"),
+                    });
+                }
+            }
         };
+        let clean_os = sanitize_display_field(&os, 32);
+        let clean_arch = sanitize_display_field(&arch, 32);
 
         if !invite.require_approval {
             let roles = invite.roles.clone();
             let inv_id = invite.invite_id.clone();
-            guard.invites[inv_idx].uses_remaining -= 1;
-            let entry = guard.upsert_member(
-                peer_public_key,
-                clean_name,
-                roles.clone(),
-                Some(inv_id),
-                now,
-            );
-            guard.persist_if_configured()?;
+            let entry = guard.mutate_and_persist(|staged| {
+                staged.invites[inv_idx].uses_remaining -= 1;
+                Ok(staged.upsert_member(
+                    peer_public_key,
+                    clean_name,
+                    roles.clone(),
+                    Some(inv_id),
+                    now,
+                ))
+            })?;
             return Ok(EnrollOutcome::ImmediateApproved {
                 member_id: entry.id,
-                roles,
+                roles: entry.roles,
             });
         }
 
-        let member_id = peer_public_key.member_id();
-        if !guard.pending.contains_key(&member_id) && guard.pending.len() >= MAX_PENDING_ENROLLMENTS
+        if guard
+            .pending
+            .values()
+            .any(|e| e.info.public_key == peer_public_key)
         {
+            return Ok(EnrollOutcome::Rejected {
+                log_reason: format!(
+                    "candidate {} already has a live pending enrollment request",
+                    peer_public_key.member_id()
+                ),
+                wire_message: "an enrollment request for this machine is already pending approval"
+                    .to_string(),
+            });
+        }
+        if guard.pending.len() >= MAX_PENDING_ENROLLMENTS {
             return Ok(EnrollOutcome::Rejected {
                 log_reason: format!("pending enrollment limit ({MAX_PENDING_ENROLLMENTS}) reached"),
                 wire_message: "too many pending enrollment requests; try again later".to_string(),
             });
         }
 
+        let member_id = peer_public_key.member_id();
+        let pending_id = random_hex(8)?;
         let pairing_code = derive_pairing_code(handshake_hash);
         let info = PendingEnrollmentInfo {
-            pending_id: member_id.clone(),
-            member_id: member_id.clone(),
+            pending_id: pending_id.clone(),
+            member_id,
             public_key: peer_public_key,
             name: clean_name,
-            os,
-            arch,
+            os: clean_os,
+            arch: clean_arch,
             roles: invite.roles.clone(),
             invite_id: invite.invite_id.clone(),
             pairing_code,
-            master_fingerprint: master_fingerprint.to_string(),
-            remote_addr: remote_addr.to_string(),
+            master_fingerprint: sanitize_display_field(master_fingerprint, 64),
+            remote_addr: sanitize_display_field(remote_addr, 128),
             requested_at: now,
             expires_at: now.saturating_add(PENDING_ENROLLMENT_TTL_SECS),
         };
         let (decision_tx, decision_rx) = oneshot::channel();
         guard.pending.insert(
-            member_id.clone(),
+            pending_id.clone(),
             PendingEnrollmentEntry { info, decision_tx },
         );
         Ok(EnrollOutcome::Pending {
-            pending_id: member_id,
+            pending_id,
             decision_rx,
         })
     }
@@ -939,20 +1125,18 @@ impl MemberStore {
         list
     }
 
-    /// Approves a pending enrollment request by ID, prefix, or name after verifying the 6-digit
-    /// pairing check in constant time (design 0051 D4/D5).
-    /// Consumes one use from the invite at approval time.
+    /// Approves a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)
+    /// after verifying the 6-digit pairing check in constant time (design 0051 D4/D5).
+    /// Consumes one use from the invite at approval time and writes `members.json` before
+    /// mutating in-memory state.
     pub fn approve_pending(&self, target: &str, pairing_code: &str) -> GridResult<MemberEntry> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         guard.prune_pending(now);
 
-        let id = resolve_id_or_name(
+        let id = resolve_id_or_prefix(
             target,
-            guard
-                .pending
-                .values()
-                .map(|e| (e.info.pending_id.as_str(), e.info.name.as_str())),
+            guard.pending.values().map(|e| e.info.pending_id.as_str()),
             "pending enrollment",
         )?;
         let expected_code_matches = guard
@@ -964,76 +1148,99 @@ impl MemberStore {
                 "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
             )));
         }
-        let pending = guard
+
+        let pending_info = guard
             .pending
-            .remove(&id)
+            .get(&id)
+            .map(|e| e.info.clone())
             .ok_or_else(|| GridError::Config(format!("no pending enrollment '{target}'")))?;
 
+        if guard.state.revoked_keys.contains(&pending_info.public_key) {
+            if let Some(pending) = guard.pending.remove(&id) {
+                let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
+            return Err(GridError::Config(
+                "cannot approve: this machine's public key has been revoked".into(),
+            ));
+        }
+
         let inv_idx = guard
+            .state
             .invites
             .iter()
-            .position(|i| i.invite_id == pending.info.invite_id);
+            .position(|i| i.invite_id == pending_info.invite_id);
         let Some(inv_idx) = inv_idx else {
-            let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+            if let Some(pending) = guard.pending.remove(&id) {
+                let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
             return Err(GridError::Config(
                 "cannot approve: the invite for this request no longer exists".into(),
             ));
         };
-        if guard.invites[inv_idx].revoked {
-            let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+        if guard.state.invites[inv_idx].revoked {
+            if let Some(pending) = guard.pending.remove(&id) {
+                let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
             return Err(GridError::Config(
                 "cannot approve: the invite for this request has been revoked".into(),
             ));
         }
-        if now >= guard.invites[inv_idx].expires_at {
-            let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+        if now >= guard.state.invites[inv_idx].expires_at {
+            if let Some(pending) = guard.pending.remove(&id) {
+                let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
             return Err(GridError::Config(
                 "cannot approve: the invite for this request has expired".into(),
             ));
         }
-        if guard.invites[inv_idx].uses_remaining == 0 {
-            let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+        if guard.state.invites[inv_idx].uses_remaining == 0 {
+            if let Some(pending) = guard.pending.remove(&id) {
+                let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
+            }
             return Err(GridError::Config(
                 "cannot approve: the invite for this request has no remaining uses".into(),
             ));
         }
 
-        guard.invites[inv_idx].uses_remaining -= 1;
-        let entry = guard.upsert_member(
-            pending.info.public_key,
-            pending.info.name.clone(),
-            pending.info.roles.clone(),
-            Some(pending.info.invite_id.clone()),
-            now,
-        );
-        guard.persist_if_configured()?;
-        let _ = pending.decision_tx.send(PendingDecision::Approved {
-            member_id: entry.id.clone(),
-            roles: entry.roles.clone(),
-        });
+        let entry = guard.mutate_and_persist(|staged| {
+            staged.invites[inv_idx].uses_remaining -= 1;
+            Ok(staged.upsert_member(
+                pending_info.public_key,
+                pending_info.name.clone(),
+                pending_info.roles.clone(),
+                Some(pending_info.invite_id.clone()),
+                now,
+            ))
+        })?;
+        if let Some(pending) = guard.pending.remove(&id) {
+            let _ = pending.decision_tx.send(PendingDecision::Approved {
+                member_id: entry.id.clone(),
+                roles: entry.roles.clone(),
+            });
+        }
         Ok(entry)
     }
 
-    /// Rejects a pending enrollment request by ID, prefix, or name without consuming an invite use.
+    /// Rejects a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)
+    /// without consuming an invite use.
     pub fn reject_pending(&self, target: &str) -> GridResult<String> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         guard.prune_pending(now);
 
-        let id = resolve_id_or_name(
+        let id = resolve_id_or_prefix(
             target,
-            guard
-                .pending
-                .values()
-                .map(|e| (e.info.pending_id.as_str(), e.info.name.as_str())),
+            guard.pending.values().map(|e| e.info.pending_id.as_str()),
             "pending enrollment",
         )?;
         let pending = guard
@@ -1049,80 +1256,143 @@ impl MemberStore {
     /// Lists all enrolled members sorted by member ID.
     pub fn list_members(&self) -> Vec<MemberEntry> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        let mut list: Vec<MemberEntry> = guard.by_pubkey.values().cloned().collect();
+        let mut list: Vec<MemberEntry> = guard.state.by_pubkey.values().cloned().collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
 
-    /// Renames an enrolled member by ID, prefix, or current name.
+    /// Renames an enrolled member by ID, unique hex prefix, or current name.
     pub fn rename_member(&self, target: &str, new_name: &str) -> GridResult<MemberEntry> {
-        let clean = new_name.trim();
-        if clean.is_empty() {
-            return Err(GridError::Config("new member name cannot be empty".into()));
-        }
+        let clean = validate_member_name(new_name)?;
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_or_name(
+        let id = resolve_id_prefix_or_name(
             target,
             guard
+                .state
                 .by_pubkey
                 .values()
                 .map(|m| (m.id.as_str(), m.name.as_str())),
             "member",
         )?;
         let pubkey = *guard
+            .state
             .by_pubkey
             .iter()
             .find(|(_, m)| m.id == id)
             .map(|(k, _)| k)
             .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-        let updated = {
-            let entry = guard.by_pubkey.get_mut(&pubkey).unwrap();
-            entry.name = clean.to_string();
-            entry.clone()
-        };
-        guard.persist_if_configured()?;
-        Ok(updated)
+        guard.mutate_and_persist(|staged| {
+            let entry = staged
+                .by_pubkey
+                .get_mut(&pubkey)
+                .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+            entry.name = clean;
+            Ok(entry.clone())
+        })
     }
 
-    /// Revokes an enrolled member by ID, prefix, or name and releases its owned worker IDs.
+    /// Revokes an enrolled member by exact ID or unique hex ID prefix (`>= 4` chars), records its
+    /// public key in `revoked_keys`, and releases its owned worker IDs.
     /// Returns `(revoked_entry, owned_worker_ids)`.
     pub fn revoke_member(&self, target: &str) -> GridResult<(MemberEntry, Vec<Uuid>)> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_or_name(
+        let id = resolve_id_or_prefix(
             target,
-            guard
-                .by_pubkey
-                .values()
-                .map(|m| (m.id.as_str(), m.name.as_str())),
+            guard.state.by_pubkey.values().map(|m| m.id.as_str()),
             "member",
         )?;
         let pubkey = *guard
+            .state
             .by_pubkey
             .iter()
             .find(|(_, m)| m.id == id)
             .map(|(k, _)| k)
             .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-        let removed = guard.by_pubkey.remove(&pubkey).unwrap();
-        let mut owned_workers = Vec::new();
-        guard.worker_owners.retain(|wid, owner| {
-            if *owner == removed.id {
-                owned_workers.push(*wid);
-                false
-            } else {
-                true
+        let (removed, owned_workers) = guard.mutate_and_persist(|staged| {
+            let removed = staged
+                .by_pubkey
+                .remove(&pubkey)
+                .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+            staged.revoked_keys.insert(pubkey);
+            let mut owned_workers = Vec::new();
+            staged.worker_owners.retain(|wid, owner| {
+                if *owner == removed.id {
+                    owned_workers.push(*wid);
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok((removed, owned_workers))
+        })?;
+        let dropped_pending_ids: Vec<String> = guard
+            .pending
+            .iter()
+            .filter(|(_, entry)| entry.info.public_key == pubkey)
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in dropped_pending_ids {
+            if let Some(entry) = guard.pending.remove(&pid) {
+                let _ = entry.decision_tx.send(PendingDecision::Rejected {
+                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                });
             }
-        });
-        guard.persist_if_configured()?;
+        }
         Ok((removed, owned_workers))
     }
 
-    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5).
+    /// Read-only check verifying that `worker_id` is not owned by another member and that
+    /// `member_id` (if a v3 member) has not exceeded [`MAX_WORKERS_PER_MEMBER`].
+    pub fn check_worker_id_claim(
+        &self,
+        worker_id: Uuid,
+        member_id: Option<&str>,
+    ) -> GridResult<()> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
+            if member_id != Some(existing_owner.as_str()) {
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another member ({existing_owner}); {} cannot register it",
+                    member_id.unwrap_or("unauthenticated/v2 peer")
+                )));
+            }
+            return Ok(());
+        }
+        if let Some(mid) = member_id {
+            let owned_count = guard
+                .state
+                .worker_owners
+                .values()
+                .filter(|owner| owner.as_str() == mid)
+                .count();
+            if owned_count >= MAX_WORKERS_PER_MEMBER {
+                return Err(GridError::AuthFailed(format!(
+                    "member {mid} has reached the maximum of {MAX_WORKERS_PER_MEMBER} claimed worker IDs"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records or verifies ownership of `worker_id` by `member_id` after worker registration has
+    /// succeeded (design 0051 D5).
     ///
-    /// The first `Register` of `worker_id` from a v3 member records `member_id` as its owner.
-    /// A `Register` with a `worker_id` owned by another member is refused.
+    /// If `worker_id` is already recorded for `member_id`, returns immediately under a read lock
+    /// without rewriting `members.json`.
     pub fn claim_worker_id(&self, worker_id: Uuid, member_id: &str) -> GridResult<()> {
+        {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
+                if existing_owner != member_id {
+                    return Err(GridError::AuthFailed(format!(
+                        "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
+                    )));
+                }
+                return Ok(());
+            }
+        }
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing_owner) = guard.worker_owners.get(&worker_id) {
+        if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
             if existing_owner != member_id {
                 return Err(GridError::AuthFailed(format!(
                     "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
@@ -1130,15 +1400,30 @@ impl MemberStore {
             }
             return Ok(());
         }
-        guard.worker_owners.insert(worker_id, member_id.to_string());
-        guard.persist_if_configured()?;
-        Ok(())
+        let owned_count = guard
+            .state
+            .worker_owners
+            .values()
+            .filter(|owner| owner.as_str() == member_id)
+            .count();
+        if owned_count >= MAX_WORKERS_PER_MEMBER {
+            return Err(GridError::AuthFailed(format!(
+                "member {member_id} has reached the maximum of {MAX_WORKERS_PER_MEMBER} claimed worker IDs"
+            )));
+        }
+        guard.mutate_and_persist(|staged| {
+            staged
+                .worker_owners
+                .insert(worker_id, member_id.to_string());
+            Ok(())
+        })
     }
 
     /// Returns the worker IDs currently owned by `member_id`.
     pub fn workers_owned_by(&self, member_id: &str) -> Vec<Uuid> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         guard
+            .state
             .worker_owners
             .iter()
             .filter(|(_, owner)| owner.as_str() == member_id)
@@ -1380,9 +1665,13 @@ mod tests {
         assert_eq!(store.list_pending().len(), 1);
         assert_eq!(store.list_invites()[0].uses_remaining, 1);
 
-        // Approving the second with the matching pairing code takes the single use and enrolls box-2.
-        let enrolled = store.approve_pending("box-2", code2.as_str()).unwrap();
-        assert_eq!(enrolled.id, pid2);
+        // Approving by name is refused (approve accepts only ID or unique hex ID prefix).
+        assert!(store.approve_pending("box-2", code2.as_str()).is_err());
+
+        // Approving the second by its pending ID prefix with the matching pairing code takes the
+        // single use and enrolls box-2.
+        let enrolled = store.approve_pending(&pid2[..6], code2.as_str()).unwrap();
+        assert_eq!(enrolled.id, cand2.member_id());
         assert!(matches!(
             rx2.try_recv().unwrap(),
             PendingDecision::Approved { .. }
@@ -1393,18 +1682,401 @@ mod tests {
     }
 
     #[test]
-    fn worker_id_ownership_prevents_takeover_by_another_member() {
+    fn worker_id_ownership_prevents_takeover_and_enforces_per_member_bound() {
         let store = MemberStore::new();
         let wid = Uuid::new_v4();
+        store.check_worker_id_claim(wid, Some("member_a")).unwrap();
         store.claim_worker_id(wid, "member_a").unwrap();
         store.claim_worker_id(wid, "member_a").unwrap();
         let err = store.claim_worker_id(wid, "member_b").unwrap_err();
         assert!(err.to_string().contains("owned by another member"));
+        assert!(store.check_worker_id_claim(wid, Some("member_b")).is_err());
+        assert!(store.check_worker_id_claim(wid, None).is_err());
+
+        for _ in 1..MAX_WORKERS_PER_MEMBER {
+            store.claim_worker_id(Uuid::new_v4(), "member_a").unwrap();
+        }
+        let extra = Uuid::new_v4();
+        assert!(store.check_worker_id_claim(extra, Some("member_a")).is_err());
+        let bound_err = store.claim_worker_id(extra, "member_a").unwrap_err();
+        assert!(bound_err.to_string().contains("maximum"));
+    }
+
+    #[test]
+    fn master_side_expired_revoked_wrong_proof_32_cap_and_10_min_ttl() {
+        let store = MemberStore::new();
+        let inv = store
+            .create_invite(vec![MemberRole::Worker], 5, 3600, true)
+            .unwrap();
+        let cand = NodeKeypair::generate().unwrap();
+        let hash = [0x33u8; KEY_LEN];
+        let valid_proof = compute_enroll_proof(&inv.invite_secret.0, &hash);
+
+        // 1. Wrong proof is refused on the master with the generic wire message.
+        let bad_proof = RedactedBytes32([0xffu8; KEY_LEN]);
+        match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40000",
+                &inv.invite_id,
+                &bad_proof,
+                "node-bad".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected {
+                log_reason,
+                wire_message,
+            } => {
+                assert!(log_reason.contains("invalid enrollment proof"));
+                assert_eq!(wire_message, GENERIC_ENROLL_REJECT_MESSAGE);
+            }
+            _ => panic!("expected wrong proof to be rejected"),
+        }
+
+        // 2. Expired invite is refused on the master.
+        let exp_inv = store
+            .create_invite(vec![MemberRole::Worker], 1, 60, true)
+            .unwrap();
+        {
+            let mut guard = store.inner.write().unwrap();
+            guard
+                .state
+                .invites
+                .iter_mut()
+                .find(|i| i.invite_id == exp_inv.invite_id)
+                .unwrap()
+                .expires_at = 1;
+        }
+        let exp_proof = compute_enroll_proof(&exp_inv.invite_secret.0, &hash);
+        match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40001",
+                &exp_inv.invite_id,
+                &exp_proof,
+                "node-exp".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected {
+                log_reason,
+                wire_message,
+            } => {
+                assert!(log_reason.contains("expired"));
+                assert_eq!(wire_message, GENERIC_ENROLL_REJECT_MESSAGE);
+            }
+            _ => panic!("expected expired invite to be rejected"),
+        }
+
+        // 3. Revoking an invite drops its pending requests and refuses subsequent requests.
+        let rev_inv = store
+            .create_invite(vec![MemberRole::Worker], 2, 3600, true)
+            .unwrap();
+        let rev_proof = compute_enroll_proof(&rev_inv.invite_secret.0, &hash);
+        let mut rx_pending = match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40002",
+                &rev_inv.invite_id,
+                &rev_proof,
+                "node-rev".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending { decision_rx, .. } => decision_rx,
+            _ => panic!("expected Pending"),
+        };
+        store.revoke_invite(&rev_inv.invite_id[..8]).unwrap();
+        assert!(
+            matches!(rx_pending.try_recv(), Ok(PendingDecision::Rejected { .. })),
+            "revoking invite must drop its pending requests"
+        );
+        assert!(store.list_pending().is_empty());
+
+        match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40003",
+                &rev_inv.invite_id,
+                &rev_proof,
+                "node-rev-2".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected {
+                log_reason,
+                wire_message,
+            } => {
+                assert!(log_reason.contains("revoked"));
+                assert_eq!(wire_message, GENERIC_ENROLL_REJECT_MESSAGE);
+            }
+            _ => panic!("expected revoked invite to be rejected"),
+        }
+
+        // 4. Duplicate request from the same key while one is live is refused without cancelling the first.
+        let (first_pid, _first_rx) = match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40004",
+                &inv.invite_id,
+                &valid_proof,
+                "node-dup-1".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected first request Pending"),
+        };
+        match store
+            .handle_enroll_request(
+                *cand.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:40005",
+                &inv.invite_id,
+                &valid_proof,
+                "node-dup-2".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected { log_reason, .. } => {
+                assert!(log_reason.contains("already has a live pending enrollment request"));
+            }
+            _ => panic!("expected second concurrent request from same key to be rejected"),
+        }
+        store.remove_pending(&first_pid);
+
+        // 5. 32-request cap (MAX_PENDING_ENROLLMENTS) is enforced, and 10-minute TTL expiry prunes old entries.
+        let mut receivers = Vec::new();
+        for idx in 0..MAX_PENDING_ENROLLMENTS {
+            let kp = NodeKeypair::generate().unwrap();
+            match store
+                .handle_enroll_request(
+                    *kp.public_key(),
+                    &hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:41000",
+                    &inv.invite_id,
+                    &valid_proof,
+                    format!("cap-{idx}"),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap()
+            {
+                EnrollOutcome::Pending { decision_rx, .. } => receivers.push(decision_rx),
+                _ => panic!("expected Pending at {idx}"),
+            }
+        }
+        assert_eq!(store.list_pending().len(), MAX_PENDING_ENROLLMENTS);
+        let overflow_kp = NodeKeypair::generate().unwrap();
+        match store
+            .handle_enroll_request(
+                *overflow_kp.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:41999",
+                &inv.invite_id,
+                &valid_proof,
+                "overflow".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected { log_reason, .. } => {
+                assert!(log_reason.contains("pending enrollment limit"));
+            }
+            _ => panic!("expected 33rd pending request to be rejected"),
+        }
+
+        // Backdate one pending request past the 10-minute TTL and verify it is pruned so the next request succeeds.
+        {
+            let mut guard = store.inner.write().unwrap();
+            let first_entry = guard.pending.values_mut().next().unwrap();
+            first_entry.info.expires_at = now_unix_secs().saturating_sub(1);
+        }
+        assert_eq!(store.list_pending().len(), MAX_PENDING_ENROLLMENTS - 1);
+        assert!(matches!(
+            store
+                .handle_enroll_request(
+                    *overflow_kp.public_key(),
+                    &hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:41999",
+                    &inv.invite_id,
+                    &valid_proof,
+                    "overflow-after-ttl".into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap(),
+            EnrollOutcome::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+
+        // Item 6: admin invite requires approval and uses == 1.
+        assert!(store
+            .create_invite(vec![MemberRole::Admin], 1, 3600, false)
+            .is_err());
+        assert!(store
+            .create_invite(vec![MemberRole::Admin], 2, 3600, true)
+            .is_err());
+        let admin_inv = store
+            .create_invite(vec![MemberRole::Admin], 1, 3600, true)
+            .unwrap();
+
+        // Item 8: enrolling again merges roles instead of overwriting existing roles.
+        let host_kp = NodeKeypair::generate().unwrap();
+        store
+            .ensure_local_host_admin(*host_kp.public_key(), "local-host", true)
+            .unwrap();
+        let worker_inv = store
+            .create_invite(vec![MemberRole::Worker], 2, 3600, false)
+            .unwrap();
+        let hash = [0x44u8; KEY_LEN];
+        let proof = compute_enroll_proof(&worker_inv.invite_secret.0, &hash);
+        match store
+            .handle_enroll_request(
+                *host_kp.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:42000",
+                &worker_inv.invite_id,
+                &proof,
+                "local-host".into(),
+                "macos".into(),
+                "aarch64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::ImmediateApproved { roles, .. } => {
+                assert!(roles.contains(&MemberRole::Admin));
+                assert!(roles.contains(&MemberRole::Worker));
+            }
+            _ => panic!("expected ImmediateApproved"),
+        }
+
+        // Item 10: a request named after another request's ID prefix cannot hijack `approve_pending`.
+        let cand_real = NodeKeypair::generate().unwrap();
+        let cand_spoof = NodeKeypair::generate().unwrap();
+        let admin_proof = compute_enroll_proof(&admin_inv.invite_secret.0, &hash);
+        let (real_pid, _real_rx) = match store
+            .handle_enroll_request(
+                *cand_real.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:42001",
+                &admin_inv.invite_id,
+                &admin_proof,
+                "honest-admin".into(),
+                "linux\x1b[31m".into(),
+                "x86_64\n".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        let prefix = &real_pid[..6];
+        let (_spoof_pid, _spoof_rx) = match store
+            .handle_enroll_request(
+                *cand_spoof.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:42002",
+                &admin_inv.invite_id,
+                &admin_proof,
+                prefix.to_string(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        let code = derive_pairing_code(&hash);
+        let approved = store.approve_pending(prefix, code.as_str()).unwrap();
+        assert_eq!(
+            approved.id,
+            cand_real.member_id(),
+            "ID prefix must resolve to the request with that ID, never to a request named after that prefix"
+        );
+        // Control characters in os/arch were stripped when stored.
+        assert!(validate_member_name("bad\x1bname").is_err());
+        assert!(validate_member_name(&"a".repeat(65)).is_err());
+
+        // Item 7: revoking a member records its public key in `revoked_keys` (persisted across reload)
+        // and refuses re-enrollment of that key.
+        store.revoke_member(&cand_real.member_id()[..6]).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let proof2 = compute_enroll_proof(&worker_inv.invite_secret.0, &hash);
+        match reloaded
+            .handle_enroll_request(
+                *cand_real.public_key(),
+                &hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:42003",
+                &worker_inv.invite_id,
+                &proof2,
+                "honest-admin".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Rejected {
+                log_reason,
+                wire_message,
+            } => {
+                assert!(log_reason.contains("revoked"));
+                assert_eq!(wire_message, GENERIC_ENROLL_REJECT_MESSAGE);
+            }
+            _ => panic!("expected revoked key to be refused re-enrollment"),
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn reject_group_or_world_writable_members_file_or_directory() {
+    fn reject_group_or_world_accessible_members_file_or_writable_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1421,12 +2093,20 @@ mod tests {
         // Private file + private directory succeeds.
         assert_eq!(MemberStore::load_file(&path).unwrap().len(), 1);
 
-        // Group-writable members.json is refused.
+        // Group-readable (0640) members.json is refused (0o077 check).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = MemberStore::load_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("allow group/others access"),
+            "unexpected error for 0640: {err}"
+        );
+
+        // Group-writable (0620) members.json is refused.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
         let err = MemberStore::load_file(&path).unwrap_err().to_string();
         assert!(
-            err.contains("allow group/others write access"),
-            "unexpected error: {err}"
+            err.contains("allow group/others access"),
+            "unexpected error for 0620: {err}"
         );
 
         // Restore 0600 on file, make parent directory world-writable: refused.

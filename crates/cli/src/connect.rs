@@ -330,14 +330,12 @@ pub async fn connect_master(
     connect_master_with_relay(addr, secret, relay_url.as_deref()).await
 }
 
-/// Like [`connect_master`], but with an explicit optional `relay_url` (`https://...`) for P2P
-/// client connections. Validates `relay_url` and checks for conflicts with P2P minimal mode before
-/// any network activity.
-pub async fn connect_master_with_relay(
+/// Opens an unauthenticated raw TCP or P2P `STREAM_CLIENT` stream to `addr`.
+pub async fn open_raw_master_stream(
     addr: &str,
     secret: Option<&ClusterSecret>,
     relay_url: Option<&str>,
-) -> GridResult<MessageTransport<GridStream>> {
+) -> GridResult<(String, GridStream, bool)> {
     let minimal = if relay_url.is_some() {
         client_p2p_minimal_requested()
     } else {
@@ -345,10 +343,8 @@ pub async fn connect_master_with_relay(
     };
     rusty_grid_core::transport::resolve_p2p_relay_mode(minimal, relay_url)?;
 
-    let codec = resolve_client_wire_codec()?;
     let trimmed = addr.trim();
-
-    let (addr, stream, via_p2p) = if is_p2p_ticket(trimmed) {
+    if is_p2p_ticket(trimmed) {
         let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(trimmed)?;
         let label = format!("iroh://{}", endpoint_addr.id);
         let stream = rusty_grid_core::transport::connect_p2p_client_stream_with_relay(
@@ -367,7 +363,7 @@ pub async fn connect_master_with_relay(
             )),
             other => other,
         })?;
-        (label, stream, true)
+        Ok((label, stream, true))
     } else {
         let addr = resolve_master_addr(trimmed, secret).await?;
         let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
@@ -386,8 +382,20 @@ pub async fn connect_master_with_relay(
         };
         // Best effort: a failure here only costs latency / dead-peer detection.
         let _ = configure_tcp_stream(&stream);
-        (addr, GridStream::Tcp(stream), false)
-    };
+        Ok((addr, GridStream::Tcp(stream), false))
+    }
+}
+
+/// Like [`connect_master`], but with an explicit optional `relay_url` (`https://...`) for P2P
+/// client connections. Validates `relay_url` and checks for conflicts with P2P minimal mode before
+/// any network activity.
+pub async fn connect_master_with_relay(
+    addr: &str,
+    secret: Option<&ClusterSecret>,
+    relay_url: Option<&str>,
+) -> GridResult<MessageTransport<GridStream>> {
+    let codec = resolve_client_wire_codec()?;
+    let (addr, stream, via_p2p) = open_raw_master_stream(addr, secret, relay_url).await?;
 
     let upgrade_hint = |detail: &str| {
         GridError::ConnectionFailed(format!(

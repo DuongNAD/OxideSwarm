@@ -126,21 +126,8 @@ fn field_ok(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_FIELD_LEN && !value.chars().any(char::is_whitespace)
 }
 
-fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
-    let trimmed = hex.trim();
-    if trimmed.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
-        let s = std::str::from_utf8(chunk).ok()?;
-        out[i] = u8::from_str_radix(s, 16).ok()?;
-    }
-    Some(out)
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+fn sanitize_terminal_text(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
 }
 
 impl InviteToken {
@@ -151,7 +138,7 @@ impl InviteToken {
             t: self.ticket.clone(),
             mk: self.master_key.to_hex(),
             id: self.invite_id.clone(),
-            s: encode_hex(self.invite_secret.as_bytes()),
+            s: self.invite_secret.to_hex(),
             exp: self.expires_at,
             r: self.roles.clone(),
             ap: self.require_approval,
@@ -192,7 +179,7 @@ impl InviteToken {
 
         let master_key = PublicKey::from_hex(&payload.mk)
             .map_err(|_| InviteTokenError::Invalid("master key is malformed"))?;
-        let secret_bytes = decode_hex_32(&payload.s)
+        let invite_secret = RedactedBytes32::from_hex(&payload.s)
             .ok_or(InviteTokenError::Invalid("invite secret is malformed"))?;
         if payload.id.len() != 32 || !payload.id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(InviteTokenError::Invalid("invite id is malformed"));
@@ -217,7 +204,7 @@ impl InviteToken {
             ticket: payload.t,
             master_key,
             invite_id: payload.id.to_ascii_lowercase(),
-            invite_secret: RedactedBytes32(secret_bytes),
+            invite_secret,
             expires_at: payload.exp,
             roles: payload.r,
             require_approval: payload.ap,
@@ -429,33 +416,47 @@ fn resolve_admin_connect_addr(
     )
 }
 
-fn resolve_invite_targets(
+/// Resolves and validates the local `--master`, `--p2p-ticket`, and `--p2p-ticket-file` inputs
+/// before connecting to the master so invalid files or malformed addresses never create an
+/// orphaned invite on the master.
+fn resolve_local_invite_targets(
     args: &InviteArgs,
     config_file: Option<&ConfigFile>,
-    master_reported_ticket: Option<String>,
 ) -> GridResult<(Option<String>, Option<String>)> {
     let master_cfg = config_file.and_then(|c| c.master.as_ref());
 
     let explicit_ticket = match (&args.p2p_ticket, &args.p2p_ticket_file) {
-        (Some(t), _) => Some(t.trim().to_string()),
-        (None, Some(file)) => Some(
-            std::fs::read_to_string(file)
-                .map_err(|e| {
-                    GridError::Config(format!(
-                        "cannot read P2P ticket file '{}': {e}",
-                        file.display()
-                    ))
-                })?
-                .trim()
-                .to_string(),
-        ),
+        (Some(t), _) => {
+            let trimmed = t.trim().to_string();
+            if !field_ok(&trimmed) {
+                return Err(GridError::Config(
+                    "--p2p-ticket is empty or malformed".into(),
+                ));
+            }
+            Some(trimmed)
+        }
+        (None, Some(file)) => {
+            let content = std::fs::read_to_string(file).map_err(|e| {
+                GridError::Config(format!(
+                    "cannot read P2P ticket file '{}': {e}",
+                    file.display()
+                ))
+            })?;
+            let trimmed = content.trim().to_string();
+            if !field_ok(&trimmed) {
+                return Err(GridError::Config(format!(
+                    "P2P ticket file '{}' is empty or malformed",
+                    file.display()
+                )));
+            }
+            Some(trimmed)
+        }
         (None, None) => master_cfg
             .and_then(|m| m.p2p_ticket_file.as_deref())
             .and_then(|f| std::fs::read_to_string(f).ok())
             .map(|t| t.trim().to_string())
-            .or(master_reported_ticket),
-    }
-    .filter(|t| !t.is_empty());
+            .filter(|t| field_ok(t)),
+    };
 
     let master_from_arg = args
         .master
@@ -464,7 +465,18 @@ fn resolve_invite_targets(
         .filter(|s| !s.is_empty());
     let (master, ticket) = match master_from_arg {
         Some(m) if is_p2p_ticket(m) => (None, explicit_ticket.or_else(|| Some(m.to_string()))),
-        Some(m) => (Some(normalize_master_addr(m)), explicit_ticket),
+        Some(m) => {
+            if m.eq_ignore_ascii_case("auto") || m.to_ascii_lowercase().starts_with("auto:") {
+                return Err(GridError::Config(
+                    "--master in `oxideswarm invite` must be a concrete HOST:PORT or P2P ticket, not 'auto'".into(),
+                ));
+            }
+            let norm = normalize_master_addr(m);
+            if !field_ok(&norm) {
+                return Err(GridError::Config("--master address is malformed".into()));
+            }
+            (Some(norm), explicit_ticket)
+        }
         None => {
             let env_master = CLIENT_MASTER_ENV_VARS.iter().find_map(|name| {
                 std::env::var(name)
@@ -475,6 +487,10 @@ fn resolve_invite_targets(
             if let Some(em) = env_master {
                 if is_p2p_ticket(&em) {
                     (None, explicit_ticket.or(Some(em)))
+                } else if em.eq_ignore_ascii_case("auto")
+                    || em.to_ascii_lowercase().starts_with("auto:")
+                {
+                    (None, explicit_ticket)
                 } else {
                     (Some(normalize_master_addr(&em)), explicit_ticket)
                 }
@@ -496,12 +512,35 @@ fn resolve_invite_targets(
         }
     };
 
-    if master.is_none() && ticket.is_none() {
+    if let Some(ref m) = master {
+        if !field_ok(m) {
+            return Err(GridError::Config("master address is malformed".into()));
+        }
+    }
+    if let Some(ref t) = ticket {
+        if !field_ok(t) {
+            return Err(GridError::Config("P2P ticket is malformed".into()));
+        }
+    }
+    Ok((master, ticket))
+}
+
+fn finalize_invite_targets(
+    local_master: Option<String>,
+    local_ticket: Option<String>,
+    master_reported_ticket: Option<String>,
+) -> GridResult<(Option<String>, Option<String>)> {
+    let ticket = local_ticket.or_else(|| {
+        master_reported_ticket
+            .map(|t| t.trim().to_string())
+            .filter(|t| field_ok(t))
+    });
+    if local_master.is_none() && ticket.is_none() {
         return Err(GridError::Config(
             "no address to put in the invite: pass --master HOST:PORT (the address other machines use to reach this master, for example 192.168.1.5:8088), or --p2p-ticket-file".into(),
         ));
     }
-    Ok((master, ticket))
+    Ok((local_master, ticket))
 }
 
 /// Runs `oxideswarm invite`.
@@ -667,6 +706,15 @@ async fn run_invite_inner(
         !args.no_approval
     };
 
+    let (local_master, local_ticket) =
+        match resolve_local_invite_targets(&args, config_file.as_ref()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     let mut transport = match connect_master(&connect_addr, cluster_secret.as_ref()).await {
         Ok(t) => t,
         Err(e) => {
@@ -715,9 +763,15 @@ async fn run_invite_inner(
             }
         };
 
-    let (master, ticket) = match resolve_invite_targets(&args, config_file.as_ref(), p2p_ticket) {
+    let (master, ticket) = match finalize_invite_targets(local_master, local_ticket, p2p_ticket) {
         Ok(targets) => targets,
         Err(e) => {
+            let _ = transport
+                .send_msg(&ClientMessage::RevokeInvite {
+                    invite_id: invite_id.clone(),
+                })
+                .await;
+            let _ = transport.recv_msg::<ClientResponse>().await;
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
@@ -1048,19 +1102,20 @@ async fn run_members_inner(
             name,
             roles,
         })) => {
+            let safe_name = sanitize_terminal_text(&name);
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "pending_id": pending_id,
                         "member_id": member_id,
-                        "name": name,
+                        "name": safe_name,
                         "roles": roles,
                     })
                 );
             } else {
                 println!(
-                    "Approved member {name} ({member_id}) with roles: {}",
+                    "Approved member {safe_name} ({member_id}) with roles: {}",
                     format_roles(&roles)
                 );
             }
@@ -1097,21 +1152,22 @@ async fn run_members_inner(
             ExitCode::SUCCESS
         }
         Ok(Some(ClientResponse::MemberRenamed { member_id, name })) => {
+            let safe_name = sanitize_terminal_text(&name);
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "member_id": member_id,
-                        "name": name,
+                        "name": safe_name,
                     })
                 );
             } else {
-                println!("Renamed member {member_id} to {name}");
+                println!("Renamed member {member_id} to {safe_name}");
             }
             ExitCode::SUCCESS
         }
         Ok(Some(ClientResponse::Error { message })) => {
-            eprintln!("Error: {message}");
+            eprintln!("Error: {}", sanitize_terminal_text(&message));
             ExitCode::FAILURE
         }
         Ok(other) => {
@@ -1146,11 +1202,12 @@ fn render_members_list(members: &[MemberEntry], json: bool) {
             .last_seen
             .map(|ts| ts.to_string())
             .unwrap_or_else(|| "never".into());
-        let invite = m.via_invite.as_deref().unwrap_or("-");
+        let invite = sanitize_terminal_text(m.via_invite.as_deref().unwrap_or("-"));
+        let safe_name = sanitize_terminal_text(&m.name);
         println!(
             "{}  name={}  roles={}  fingerprint={}  enrolled_at={}  last_seen={}  invite={}",
             m.id,
-            m.name,
+            safe_name,
             format_roles(&m.roles),
             m.public_key.fingerprint(),
             enrolled_at,
@@ -1180,23 +1237,23 @@ fn render_pending_list(pending: &[PendingEnrollmentInfo], json: bool) {
         let contention = if same_invite_count > 1 {
             format!(
                 "  [{same_invite_count} requests for invite {}]",
-                p.invite_id
+                sanitize_terminal_text(&p.invite_id)
             )
         } else {
             String::new()
         };
         println!(
             "{}  code={}  master_fingerprint={}  from={}  name={}  os={}/{}  member_id={}  roles={}  invite={}{}",
-            p.pending_id,
-            p.pairing_code.as_str(),
-            p.master_fingerprint,
-            p.remote_addr,
-            p.name,
-            p.os,
-            p.arch,
-            p.member_id,
+            sanitize_terminal_text(&p.pending_id),
+            sanitize_terminal_text(p.pairing_code.as_str()),
+            sanitize_terminal_text(&p.master_fingerprint),
+            sanitize_terminal_text(&p.remote_addr),
+            sanitize_terminal_text(&p.name),
+            sanitize_terminal_text(&p.os),
+            sanitize_terminal_text(&p.arch),
+            sanitize_terminal_text(&p.member_id),
             format_roles(&p.roles),
-            p.invite_id,
+            sanitize_terminal_text(&p.invite_id),
             contention
         );
     }

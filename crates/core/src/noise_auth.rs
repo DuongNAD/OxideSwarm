@@ -488,6 +488,18 @@ impl RedactedBytes32 {
     pub const fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
+
+    /// Lowercase 64-character hex representation.
+    pub fn to_hex(&self) -> String {
+        hex_encode(&self.0)
+    }
+
+    /// Parses a 64-character hex string (ignoring surrounding whitespace) into [`RedactedBytes32`].
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let bytes = hex_decode(text.trim())?;
+        let arr: [u8; KEY_LEN] = bytes.try_into().ok()?;
+        Some(Self(arr))
+    }
 }
 
 impl fmt::Debug for RedactedBytes32 {

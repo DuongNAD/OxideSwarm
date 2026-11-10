@@ -1022,13 +1022,22 @@ pub async fn run_join(
     }
 }
 
+fn sanitize_machine_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(64)
+        .collect();
+    cleaned.trim().to_string()
+}
+
 fn default_machine_name() -> String {
     std::env::var("RUSTY_GRID_WORKER_NAME")
         .or_else(|_| std::env::var("RUSTY_GRID_NAME"))
         .or_else(|_| std::env::var("HOSTNAME"))
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| sanitize_machine_name(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("node-{}", std::env::consts::OS))
 }
@@ -1038,57 +1047,20 @@ async fn open_enroll_stream(
     ticket: Option<&str>,
 ) -> GridResult<rusty_grid_core::transport::GridStream> {
     let relay_url = crate::connect::active_client_relay_url();
-    let minimal = crate::connect::client_p2p_minimal_requested() || cfg!(test);
-    rusty_grid_core::transport::resolve_p2p_relay_mode(minimal, relay_url.as_deref())?;
 
     if let Some(m) = master {
-        let addr = crate::connect::resolve_master_addr(m, None).await?;
-        match tokio::time::timeout(
-            crate::connect::CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                let _ = rusty_grid_core::transport::configure_tcp_stream(&stream);
-                return Ok(rusty_grid_core::transport::GridStream::Tcp(stream));
-            }
-            Ok(Err(e)) if ticket.is_none() => {
-                return Err(GridError::ConnectionFailed(format!(
-                    "Failed to connect to Master at {addr}: {e}"
-                )));
-            }
-            Err(_) if ticket.is_none() => {
-                return Err(GridError::ConnectionFailed(format!(
-                    "Failed to connect to Master at {addr}: timed out after {}s",
-                    crate::connect::CONNECT_TIMEOUT.as_secs()
-                )));
-            }
-            _ => {
+        match crate::connect::open_raw_master_stream(m, None, relay_url.as_deref()).await {
+            Ok((_label, stream, _via_p2p)) => return Ok(stream),
+            Err(e) if ticket.is_none() => return Err(e),
+            Err(_) => {
                 // Fall back to P2P ticket below when TCP connect fails and a ticket is present.
             }
         }
     }
 
     if let Some(t) = ticket {
-        let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(t)?;
-        let label = format!("iroh://{}", endpoint_addr.id);
-        let stream = rusty_grid_core::transport::connect_p2p_client_stream_with_relay(
-            endpoint_addr,
-            crate::connect::CONNECT_TIMEOUT,
-            minimal,
-            relay_url.as_deref(),
-        )
-        .await
-        .map_err(|e| match e {
-            GridError::Timeout { duration_secs, .. } => GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {label}: timed out after {duration_secs}s"
-            )),
-            GridError::ConnectionFailed(detail) => GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {label}: {detail}"
-            )),
-            other => other,
-        })?;
+        let (_label, stream, _via_p2p) =
+            crate::connect::open_raw_master_stream(t, None, relay_url.as_deref()).await?;
         return Ok(stream);
     }
 
@@ -1336,7 +1308,9 @@ async fn run_join_invite(
     let proof = compute_enroll_proof(token.invite_secret.as_bytes(), &handshake_hash);
     let machine_name = config
         .and_then(|c| c.worker.as_ref())
-        .and_then(|w| w.name.clone())
+        .and_then(|w| w.name.as_deref())
+        .map(sanitize_machine_name)
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(default_machine_name);
 
     if let Err(e) = transport
