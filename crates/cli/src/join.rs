@@ -9,7 +9,7 @@
 //! The token is as sensitive as the secret. Nothing in this module logs, prints or formats a token
 //! or a secret: errors describe what is wrong, never the text.
 
-use std::io::{BufRead, IsTerminal, Read};
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -189,35 +189,6 @@ pub fn read_token(reader: impl Read) -> GridResult<String> {
             ))
         })?;
     clean_token(&text)
-}
-
-/// Reads the first non-empty line (bounded by [`MAX_TOKEN_BYTES`]) from `reader`, leaving any
-/// subsequent lines (such as the `[y/N]` pairing confirmation) unread in the buffer.
-pub fn read_token_first_line(reader: &mut impl std::io::BufRead) -> GridResult<String> {
-    let mut total_read = 0u64;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .take(MAX_TOKEN_BYTES + 1 - total_read)
-            .read_line(&mut line)
-            .map_err(|e| {
-                GridError::Config(format!(
-                    "cannot read the join token from standard input: {e}"
-                ))
-            })?;
-        if n == 0 {
-            return clean_token("");
-        }
-        total_read = total_read.saturating_add(n as u64);
-        if total_read > MAX_TOKEN_BYTES {
-            return Err(GridError::Config(
-                "the input is too long to be a join token".into(),
-            ));
-        }
-        if !line.trim().is_empty() {
-            return clean_token(&line);
-        }
-    }
 }
 
 /// Switches the terminal behind a file descriptor (Unix) or console handle (Windows) to no-echo
@@ -874,10 +845,11 @@ pub async fn run_join(
         return ExitCode::FAILURE;
     }
     let stdin = std::io::stdin();
-    let read = if stdin.is_terminal() {
+    let stdin_is_terminal = stdin.is_terminal();
+    let read = if stdin_is_terminal {
         read_token_hidden()
     } else {
-        read_token_first_line(&mut stdin.lock())
+        read_token(stdin.lock())
     };
     let text = match read {
         Ok(text) => text,
@@ -887,7 +859,7 @@ pub async fn run_join(
         }
     };
     if text.starts_with(crate::members_cmd::INVITE_PREFIX) || text.starts_with("oxs1-invite") {
-        return run_join_invite(args, secret_opts, config, text).await;
+        return run_join_invite(args, secret_opts, config, text, stdin_is_terminal).await;
     }
     let token = match JoinToken::decode(&text) {
         Ok(token) => token,
@@ -1073,6 +1045,75 @@ fn parse_yes_no_confirmation(line: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Reads the joiner's `[y/N]` confirmation from the controlling terminal after the pairing code
+/// and master fingerprint have been printed.
+///
+/// When `stdin` was already a terminal (`stdin_is_terminal`), reads from `stdin`. When the invite
+/// token was piped in on `stdin` (`!stdin_is_terminal`), opens `/dev/tty` on Unix or `CONIN$` on
+/// Windows so pre-stuffed lines on `stdin` cannot bypass the interactive pairing check.
+fn read_confirmation_from_terminal(stdin_is_terminal: bool) -> GridResult<bool> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    if stdin_is_terminal {
+        let n = std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| {
+                GridError::Config(format!("cannot read confirmation from terminal: {e}"))
+            })?;
+        return Ok(n > 0 && parse_yes_no_confirmation(&line));
+    }
+    #[cfg(unix)]
+    {
+        let tty = std::fs::File::open("/dev/tty").map_err(|e| {
+            GridError::Config(format!(
+                "cannot open /dev/tty to confirm the pairing code ({e}); run `oxideswarm join` from an interactive terminal"
+            ))
+        })?;
+        let mut reader = std::io::BufReader::new(tty);
+        let n = reader.read_line(&mut line).map_err(|e| {
+            GridError::Config(format!("cannot read confirmation from /dev/tty: {e}"))
+        })?;
+        Ok(n > 0 && parse_yes_no_confirmation(&line))
+    }
+    #[cfg(windows)]
+    {
+        let con = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .map_err(|e| {
+                GridError::Config(format!(
+                    "cannot open CONIN$ to confirm the pairing code ({e}); run `oxideswarm join` from an interactive console"
+                ))
+            })?;
+        let mut reader = std::io::BufReader::new(con);
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| GridError::Config(format!("cannot read confirmation from CONIN$: {e}")))?;
+        Ok(n > 0 && parse_yes_no_confirmation(&line))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(GridError::Config(
+            "cannot open controlling terminal to confirm the pairing code".into(),
+        ))
+    }
+}
+
+/// Spawns a detached OS thread (not a `tokio::task::spawn_blocking` pool thread) to read the
+/// `[y/N]` confirmation over a `oneshot` channel so that if the master rejects or closes the
+/// enrollment connection, the process can return and exit immediately without hanging on `Enter`.
+fn spawn_confirmation_prompt(
+    stdin_is_terminal: bool,
+) -> tokio::sync::oneshot::Receiver<GridResult<bool>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_confirmation_from_terminal(stdin_is_terminal));
+    });
+    rx
+}
+
 async fn run_worker_member_readonly_check(
     target: &str,
     node_key: rusty_grid_core::noise_auth::NodeKeypair,
@@ -1159,6 +1200,7 @@ async fn run_join_invite(
     _secret_opts: &SecretOpts,
     config: Option<&ConfigFile>,
     text: String,
+    stdin_is_terminal: bool,
 ) -> ExitCode {
     use rusty_grid_core::noise_auth::{
         compute_enroll_proof, default_node_key_path, derive_pairing_code,
@@ -1167,7 +1209,7 @@ async fn run_join_invite(
     use rusty_grid_core::protocol::{
         ClientMessage, ClientResponse, EndpointRole, MessageTransport,
     };
-    use std::io::{BufRead, Write};
+    use std::io::Write;
 
     let token = match crate::members_cmd::InviteToken::decode(&text) {
         Ok(t) => t,
@@ -1387,26 +1429,28 @@ async fn run_join_invite(
     );
     let _ = std::io::stdout().flush();
 
-    let mut confirm_task = std::pin::pin!(tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        let res = std::io::stdin().lock().read_line(&mut line);
-        res.map(|n| n > 0 && parse_yes_no_confirmation(&line))
-            .unwrap_or(false)
-    }));
-
+    let mut confirm_rx = spawn_confirmation_prompt(stdin_is_terminal);
     let mut confirmed: Option<bool> = None;
 
     while approved.is_none() || confirmed.is_none() {
         if approved.is_none() && confirmed.is_none() {
             tokio::select! {
-                conf_res = &mut confirm_task => {
-                    let ok = conf_res.unwrap_or(false);
-                    if !ok {
-                        drop(transport);
-                        eprintln!("Confirmation declined; nothing was written.");
-                        return ExitCode::FAILURE;
+                conf_res = &mut confirm_rx => {
+                    match conf_res {
+                        Ok(Ok(true)) => {
+                            confirmed = Some(true);
+                        }
+                        Ok(Ok(false)) | Err(_) => {
+                            drop(transport);
+                            eprintln!("Confirmation declined; nothing was written.");
+                            return ExitCode::FAILURE;
+                        }
+                        Ok(Err(e)) => {
+                            drop(transport);
+                            eprintln!("{e}; nothing was written.");
+                            return ExitCode::FAILURE;
+                        }
                     }
-                    confirmed = Some(true);
                 }
                 msg_res = transport.recv_msg::<ClientResponse>() => {
                     match msg_res {
@@ -1435,13 +1479,21 @@ async fn run_join_invite(
                 }
             }
         } else if confirmed.is_none() {
-            let ok = (&mut confirm_task).await.unwrap_or(false);
-            if !ok {
-                drop(transport);
-                eprintln!("Confirmation declined; nothing was written.");
-                return ExitCode::FAILURE;
+            match (&mut confirm_rx).await {
+                Ok(Ok(true)) => {
+                    confirmed = Some(true);
+                }
+                Ok(Ok(false)) | Err(_) => {
+                    drop(transport);
+                    eprintln!("Confirmation declined; nothing was written.");
+                    return ExitCode::FAILURE;
+                }
+                Ok(Err(e)) => {
+                    drop(transport);
+                    eprintln!("{e}; nothing was written.");
+                    return ExitCode::FAILURE;
+                }
             }
-            confirmed = Some(true);
         } else {
             match transport.recv_msg::<ClientResponse>().await {
                 Ok(Some(ClientResponse::EnrollKeepalive)) => {}

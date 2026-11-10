@@ -67,6 +67,169 @@ fn run_with_stdin(mut cmd: Command, input: &str) -> Output {
     child.wait_with_output().expect("wait rusty-grid")
 }
 
+/// Drives an interactive `oxideswarm join` session using a real Unix pseudo-terminal on `stdin`
+/// so the invite token is entered at the hidden prompt first, and the `[y/N]` confirmation is
+/// entered on the terminal *only after* `join` has printed the pairing code and master fingerprint.
+#[cfg(unix)]
+struct InteractiveJoin {
+    pty_master: fs::File,
+    child: Child,
+    stdout_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl InteractiveJoin {
+    fn spawn(mut cmd: Command, invite: &str) -> Self {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let (mut master_fd, mut slave_fd) = (0, 0);
+        // SAFETY: `openpty` initializes both file descriptors on return code 0.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: both descriptors are valid and uniquely owned from here on.
+        let (mut pty_master, pty_slave) = unsafe {
+            (
+                fs::File::from_raw_fd(master_fd),
+                fs::File::from_raw_fd(slave_fd),
+            )
+        };
+
+        cmd.stdin(Stdio::from(pty_slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn interactive join");
+        let mut child_stdout = child.stdout.take().expect("child stdout");
+        let mut child_stderr = child.stderr.take().expect("child stderr");
+
+        let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stdout_clone = stdout_buf.clone();
+        let stderr_clone = stderr_buf.clone();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = child_stdout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                stdout_clone.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = child_stderr.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                stderr_clone.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+
+        let sess = Self {
+            pty_master: pty_master.try_clone().expect("clone pty_master"),
+            child,
+            stdout_buf,
+            stderr_buf,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+        };
+
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                sess.stderr().contains("Paste the join token")
+            }),
+            "join did not prompt for the token; stderr:\n{}",
+            sess.stderr()
+        );
+        pty_master
+            .write_all(format!("{invite}\n").as_bytes())
+            .expect("write invite to pty");
+        pty_master.flush().expect("flush pty");
+        sess
+    }
+
+    fn stdout(&self) -> String {
+        text(&self.stdout_buf.lock().unwrap())
+    }
+
+    fn stderr(&self) -> String {
+        text(&self.stderr_buf.lock().unwrap())
+    }
+
+    fn wait_for_pairing_prompt(&self, timeout: Duration) -> bool {
+        wait_for(timeout, || {
+            self.stdout().contains(
+                "Confirm that the cluster admin's master shows this pairing code and fingerprint [y/N]:",
+            )
+        })
+    }
+
+    fn confirm(&mut self, answer: &str) {
+        assert!(
+            self.wait_for_pairing_prompt(Duration::from_secs(15)),
+            "join did not print pairing confirmation prompt before confirm({answer:?});\nstdout:\n{}\nstderr:\n{}",
+            self.stdout(),
+            self.stderr()
+        );
+        self.pty_master
+            .write_all(format!("{answer}\n").as_bytes())
+            .expect("write confirmation to pty");
+        self.pty_master.flush().expect("flush pty");
+    }
+
+    fn wait_output(mut self, timeout: Duration) -> Output {
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait join") {
+                break status;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "join did not exit within {timeout:?};\nstdout:\n{}\nstderr:\n{}",
+                self.stdout(),
+                self.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if let Some(h) = self.stdout_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.stderr_thread.take() {
+            let _ = h.join();
+        }
+        Output {
+            status,
+            stdout: self.stdout_buf.lock().unwrap().clone(),
+            stderr: self.stderr_buf.lock().unwrap().clone(),
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InteractiveJoin {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct Service {
     child: Child,
     log: PathBuf,
@@ -225,7 +388,7 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     };
     let exp_out = run_with_stdin(
         with(expired_home.path(), &["join"]),
-        &format!("{}\ny\n", expired_token.encode()),
+        &format!("{}\n", expired_token.encode()),
     );
     assert!(
         !exp_out.status.success(),
@@ -237,6 +400,33 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         "expired invite must write nothing to ~/.oxideswarm"
     );
 
+    // Master-side expired invite refusal (Item 16): create a 1s invite on the master, wait for it
+    // to expire on the master, and redeem a copy whose client-side `expires_at` is still in the
+    // future (simulating clock skew) so `join` reaches the master and the master rejects it.
+    let short_inv_out = run_cmd(with(
+        master_home.path(),
+        &["invite", "--master", &addr, "--expires", "1s"],
+    ));
+    assert!(short_inv_out.status.success());
+    let mut skewed_expired =
+        InviteToken::decode(text(&short_inv_out.stdout).trim()).expect("decode short invite");
+    skewed_expired.expires_at += 3600;
+    std::thread::sleep(Duration::from_millis(1200));
+    let master_exp_out = run_with_stdin(
+        with(expired_home.path(), &["join"]),
+        &format!("{}\n", skewed_expired.encode()),
+    );
+    assert!(
+        !master_exp_out.status.success(),
+        "master-side expired invite must fail"
+    );
+    assert!(
+        text(&master_exp_out.stderr).contains("invalid, expired, or revoked invite"),
+        "expected master-side expired invite error, got: {}",
+        text(&master_exp_out.stderr)
+    );
+    assert!(!expired_home.path().join(".oxideswarm").exists());
+
     // Create a valid 1-use worker invite and decline the [y/N] confirmation.
     let inv_decline_out = run_cmd(with(master_home.path(), &["invite", "--master", &addr]));
     assert!(
@@ -245,10 +435,22 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         text(&inv_decline_out.stderr)
     );
     let inv_decline = text(&inv_decline_out.stdout).trim().to_string();
-    let dec_out = run_with_stdin(
+
+    // Item 9: piping both the invite and `y` on stdin (`printf '%s\ny\n' "$INVITE" | oxideswarm join`)
+    // is rejected as invalid input before connecting or writing anything.
+    let prestuffed_out = run_with_stdin(
         with(declined_home.path(), &["join"]),
-        &format!("{inv_decline}\nn\n"),
+        &format!("{inv_decline}\ny\n"),
     );
+    assert!(
+        !prestuffed_out.status.success(),
+        "pre-stuffed multi-line piped stdin must be rejected"
+    );
+    assert!(!declined_home.path().join(".oxideswarm").exists());
+
+    let mut dec_join = InteractiveJoin::spawn(with(declined_home.path(), &["join"]), &inv_decline);
+    dec_join.confirm("n");
+    let dec_out = dec_join.wait_output(Duration::from_secs(10));
     assert!(
         !dec_out.status.success(),
         "declining confirmation must fail"
@@ -293,19 +495,7 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     );
 
     // Also test killing a live `join` process while it is waiting in `pending`:
-    let mut drop_join_cmd = with(drop_home.path(), &["join"]);
-    drop_join_cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut drop_child = drop_join_cmd.spawn().unwrap();
-    {
-        let stdin = drop_child.stdin.as_mut().unwrap();
-        stdin
-            .write_all(format!("{inv_decline}\n").as_bytes())
-            .unwrap();
-        stdin.flush().unwrap();
-    }
+    let mut drop_join = InteractiveJoin::spawn(with(drop_home.path(), &["join"]), &inv_decline);
     assert!(
         wait_for(Duration::from_secs(10), || {
             let out = run_cmd(with(
@@ -320,8 +510,7 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         }),
         "drop_child did not appear in members pending"
     );
-    let _ = drop_child.kill();
-    let _ = drop_child.wait();
+    drop_join.kill_and_wait();
     assert!(
         wait_for(Duration::from_secs(10), || {
             let out = run_cmd(with(
@@ -340,22 +529,14 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     // 4. Invite, join, approve, confirm, and the worker runs a task (reusing `inv_decline` to
     //    prove its 1 use is still intact!).
     let mut join_1_cmd = with(worker_1_home.path(), &["join"]);
-    join_1_cmd
-        .env("RUSTY_GRID_WORKER_NAME", "worker-one")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut join_1_child = join_1_cmd.spawn().unwrap();
-    {
-        let mut stdin = join_1_child.stdin.take().unwrap();
-        stdin
-            .write_all(format!("{inv_decline}\ny\n").as_bytes())
-            .unwrap();
-    }
+    join_1_cmd.env("RUSTY_GRID_WORKER_NAME", "worker-one");
+    let mut join_1 = InteractiveJoin::spawn(join_1_cmd, &inv_decline);
 
     // Wait for `worker-one` to appear in `members pending`, then approve it.
     let mut pending_1_id = String::new();
     let mut pending_1_code = String::new();
+    let mut pending_1_fp = String::new();
+    let mut pending_1_remote = String::new();
     assert!(
         wait_for(Duration::from_secs(15), || {
             let out = run_cmd(with(
@@ -372,6 +553,11 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
+                pending_1_fp = item["master_fingerprint"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                pending_1_remote = item["remote_addr"].as_str().unwrap_or_default().to_string();
                 !pending_1_id.is_empty()
             } else {
                 false
@@ -380,10 +566,51 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         "worker-one did not appear in members pending"
     );
     assert_eq!(pending_1_code.len(), 6, "6-digit pairing code");
+    assert_eq!(pending_1_fp, master_fp, "pending entry carries master_fingerprint");
+    assert!(
+        pending_1_remote.starts_with("127.0.0.1:"),
+        "pending entry carries remote_addr: {pending_1_remote}"
+    );
+
+    // Item 3: wrong `--code` is refused and leaves the pending request and invite use intact.
+    let wrong_code = if pending_1_code == "000000" {
+        "999999"
+    } else {
+        "000000"
+    };
+    let bad_approve = run_cmd(with(
+        master_home.path(),
+        &[
+            "members",
+            "approve",
+            &pending_1_id,
+            "--code",
+            wrong_code,
+            "--master",
+            &addr,
+        ],
+    ));
+    assert!(
+        !bad_approve.status.success(),
+        "members approve with wrong --code must fail"
+    );
+    assert!(
+        text(&bad_approve.stderr).contains("pairing code mismatch"),
+        "expected pairing code mismatch error, got: {}",
+        text(&bad_approve.stderr)
+    );
 
     let approve_1 = run_cmd(with(
         master_home.path(),
-        &["members", "approve", &pending_1_id, "--master", &addr],
+        &[
+            "members",
+            "approve",
+            &pending_1_id,
+            "--code",
+            &pending_1_code,
+            "--master",
+            &addr,
+        ],
     ));
     assert!(
         approve_1.status.success(),
@@ -391,7 +618,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         text(&approve_1.stderr)
     );
 
-    let join_1_out = join_1_child.wait_with_output().unwrap();
+    join_1.confirm("y");
+    let join_1_out = join_1.wait_output(Duration::from_secs(20));
     assert!(
         join_1_out.status.success(),
         "join_1 failed:\nstdout:\n{}\nstderr:\n{}",
@@ -498,35 +726,16 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let shared_inv_id = InviteToken::decode(&shared_inv).unwrap().invite_id;
 
     let mut join_a_cmd = with(contender_a_home.path(), &["join", "--no-doctor"]);
-    join_a_cmd
-        .env("RUSTY_GRID_WORKER_NAME", "contender-a")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut join_a_child = join_a_cmd.spawn().unwrap();
-    join_a_child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{shared_inv}\ny\n").as_bytes())
-        .unwrap();
+    join_a_cmd.env("RUSTY_GRID_WORKER_NAME", "contender-a");
+    let join_a = InteractiveJoin::spawn(join_a_cmd, &shared_inv);
 
     let mut join_b_cmd = with(contender_b_home.path(), &["join", "--no-doctor"]);
-    join_b_cmd
-        .env("RUSTY_GRID_WORKER_NAME", "contender-b")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut join_b_child = join_b_cmd.spawn().unwrap();
-    join_b_child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{shared_inv}\ny\n").as_bytes())
-        .unwrap();
+    join_b_cmd.env("RUSTY_GRID_WORKER_NAME", "contender-b");
+    let mut join_b = InteractiveJoin::spawn(join_b_cmd, &shared_inv);
 
     let mut pending_a_id = String::new();
     let mut pending_b_id = String::new();
+    let mut pending_b_code = String::new();
     assert!(
         wait_for(Duration::from_secs(15), || {
             let out = run_cmd(with(
@@ -547,6 +756,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
                     }
                     Some("contender-b") => {
                         pending_b_id = item["pending_id"].as_str().unwrap_or_default().to_string();
+                        pending_b_code = item["pairing_code"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
                     }
                     _ => {}
                 }
@@ -554,6 +767,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
             !pending_a_id.is_empty() && !pending_b_id.is_empty()
         }),
         "both contenders did not appear in members pending"
+    );
+    assert!(
+        join_a.wait_for_pairing_prompt(Duration::from_secs(10)),
+        "contender-a did not print pairing prompt"
     );
 
     // Human `members pending` output marks the contention (`[2 requests for invite ...]`).
@@ -568,14 +785,15 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         text(&pending_human.stdout)
     );
 
-    // Reject contender-a, approve contender-b.
+    // Reject contender-a while its [y/N] prompt is still unanswered; verify it exits immediately
+    // without hanging for Enter (Item 9), then approve contender-b with `--code`.
     let rej_a = run_cmd(with(
         master_home.path(),
         &["members", "reject", &pending_a_id, "--master", &addr],
     ));
     assert!(rej_a.status.success(), "{}", text(&rej_a.stderr));
 
-    let out_a = join_a_child.wait_with_output().unwrap();
+    let out_a = join_a.wait_output(Duration::from_secs(5));
     assert!(
         !out_a.status.success(),
         "rejected contender-a must exit non-zero"
@@ -587,11 +805,20 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
 
     let app_b = run_cmd(with(
         master_home.path(),
-        &["members", "approve", &pending_b_id, "--master", &addr],
+        &[
+            "members",
+            "approve",
+            &pending_b_id,
+            "--code",
+            &pending_b_code,
+            "--master",
+            &addr,
+        ],
     ));
     assert!(app_b.status.success(), "{}", text(&app_b.stderr));
 
-    let out_b = join_b_child.wait_with_output().unwrap();
+    join_b.confirm("y");
+    let out_b = join_b.wait_output(Duration::from_secs(15));
     assert!(
         out_b.status.success(),
         "approved contender-b must succeed:\n{}\n{}",
@@ -637,10 +864,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     ));
     assert!(inv_w2_out.status.success());
     let inv_w2 = text(&inv_w2_out.stdout).trim().to_string();
-    let join_w2 = run_with_stdin(
-        with(worker_2_home.path(), &["join", "--no-doctor"]),
-        &format!("{inv_w2}\ny\n"),
-    );
+    let mut join_w2_sess =
+        InteractiveJoin::spawn(with(worker_2_home.path(), &["join", "--no-doctor"]), &inv_w2);
+    join_w2_sess.confirm("y");
+    let join_w2 = join_w2_sess.wait_output(Duration::from_secs(15));
     assert!(
         join_w2.status.success(),
         "worker_2 join failed:\n{}\n{}",
@@ -841,10 +1068,10 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
     assert_eq!(decoded.ticket.as_deref(), Some(ticket.as_str()));
 
     // Redeem the P2P invite via `oxideswarm join --no-doctor`.
-    let join_out = run_with_stdin(
-        with(joiner_home.path(), &["join", "--no-doctor"]),
-        &format!("{invite_str}\ny\n"),
-    );
+    let mut join_sess =
+        InteractiveJoin::spawn(with(joiner_home.path(), &["join", "--no-doctor"]), &invite_str);
+    join_sess.confirm("y");
+    let join_out = join_sess.wait_output(Duration::from_secs(20));
     assert!(
         join_out.status.success(),
         "P2P join failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1022,7 +1249,9 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
     let member_home = TempDir::new().unwrap();
     let mut join_cmd = with(member_home.path(), &["join", "--no-doctor"]);
     join_cmd.env("RUSTY_GRID_WORKER_NAME", "secret-file-member");
-    let join_out = run_with_stdin(join_cmd, &format!("{invite_str}\ny\n"));
+    let mut join_sess = InteractiveJoin::spawn(join_cmd, &invite_str);
+    join_sess.confirm("y");
+    let join_out = join_sess.wait_output(Duration::from_secs(20));
     assert!(
         join_out.status.success(),
         "join failed:\n{}\n{}",
