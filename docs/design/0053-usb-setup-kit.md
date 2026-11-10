@@ -225,3 +225,5 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   worker writes `<InstallRoot>\home\windows_acl_grants.txt` and never touches
   `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes all recorded `oxideswarm.toolchain` ACL
   grants before deleting `<InstallRoot>`.
+- 2026-11-10: A bootable image stays a non-goal of the kit. [Design 0056](0056-frontier-program.md)
+  plans one as a separate item (IMG-1), which reuses the kit's invite.

@@ -1,8 +1,9 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
-Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09.
-Created: 2026-11-07    Updated: 2026-11-09
+Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, and Q27 to Q29 (the charter
+of design 0057) on 2026-11-10.
+Created: 2026-11-07    Updated: 2026-11-10
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -30,6 +31,19 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 - Long-term goal (Draft, 2026-11-10): an open compute network where anyone can offer and use idle
   compute, safely and with checkable results. Phase H carries it, and the architecture is in
   [design 0054](design/0054-open-compute-network.md).
+- Frontier program (Draft, 2026-11-10): what a person outside the project would switch to
+  OxideSwarm for. Tasks become portable, movable and checkable, through bets A to E. Each bet
+  starts with a spike that can end it and finishes with a recorded run on real machines. The plan
+  is in [design 0056](design/0056-frontier-program.md), and decisions Q19 to Q26 and Q30 are open.
+- Lasting value (Draft, 2026-11-10): why anyone should trust the grid, build on it, cite it and
+  find it alive after its founder. Fuzzing, deterministic simulation, a written specification with
+  a second decoder, citable releases, and a release without the owner. The plan is in
+  [design 0058](design/0058-lasting-value.md). Its first four items are in the backlog, and
+  decisions Q31 and Q33 to Q35 are open.
+- First users (Draft, 2026-11-10): who gains what from the grid today, and the order of work that
+  serves them. The first audience is a developer with a coding agent and machines on more than one
+  operating system. A study of first use comes before more is built. The plan is in
+  [design 0059](design/0059-first-users.md), and decisions Q36 to Q39 are open.
 
 ## Where the project stands
 
@@ -345,7 +359,82 @@ The hard problems are not the network. They are:
 H0 can start after ENROLL-1, because it is useful inside trusted clusters. H1 needs SCALE-6. H2
 needs ECO-3 and an independent security review of its threat model.
 
+A project that receives donated compute publishes its outputs and its task code. The draft charter
+is [design 0057](design/0057-open-results-charter.md). The owner accepted its principle on
+2026-11-10 (Q27 to Q29), and its text still needs a legal review. It is a
+condition for using the public pool, not a term of the software licence, and it does not cover a
+cluster on its owner's machines.
+
 **Exit check per stage:** the stage table of design 0054, each result recorded with its date.
+
+### Frontier program: bets across the phases
+
+Draft, proposed on 2026-11-10; decisions Q19 to Q26 and Q30 are open. The phases above say how the
+grid grows. [Design 0056](design/0056-frontier-program.md) says what a person outside the project
+would switch to it for, from a research run of 2026-11-10. It moves nothing the owner accepted.
+
+Three properties are the test for its work. A task runs on any machine (portable), outlives the
+machine it started on (movable), and leaves evidence of what it did (checkable).
+
+| Bet | What it builds | Items | Lighthouse run |
+|---|---|---|---|
+| A | Compute shaped for coding agents: several operating systems in one call, sharded test runs, live output, workspace forks, device leases | AX-1 to AX-7, CACHE-1 | One call from an agent tests a change on macOS, Windows, Linux and a real Android phone |
+| B | Portable and movable tasks on WebAssembly, with checkpoints a task takes itself | NET-1, WASM-2 to WASM-5 | A job starts on a laptop, the lid closes, and it finishes on another machine with identical output |
+| C | Signed receipts, quorum runs, a reproducible release, independent rebuilds | PROOF-1 to PROOF-5 | Two machines with different owners build a release, and the archives match |
+| D | Language models served by ordinary machines: one small model per machine behind a gateway | LLM-6 to LLM-8, EDU-1, EDU-2 | A school lab becomes a private assistant for the class from a USB stick, without Internet access |
+| E | The commons: Phase H with a first workload (independent rebuilds), rules for a good guest, and a worker image that starts a whole machine from USB or the network | GREEN-1, GREEN-2, EDU-3, IMG-1 to IMG-4, with NET-2 to NET-4 | A school lab works for the grid at night and is back on its own system in the morning. The stage checks of design 0054 |
+
+Order: each bet starts with a short spike that can end it (R1 to R10). Waves follow the releases:
+agents after `0.2.0`, then evidence and portability, then models and classrooms, then the commons.
+Each wave has one protocol version bump at most and ends with a recorded lighthouse run.
+
+The research also questions step 4 of "Launch". In the published run, one model split over home
+machines reached about 1.5 tokens per second over Wi-Fi. Design 0056 proposes the classroom run as
+the model demo instead (Q25).
+
+**Exit check per bet:** its lighthouse run in design 0056 D7, recorded with script and date.
+
+### Lasting value: trust, a specification, evidence and stewardship
+
+Draft, proposed on 2026-11-10; decisions Q31 and Q33 to Q35 are open.
+[Design 0058](design/0058-lasting-value.md) adds no feature. It plans why anyone should trust the
+grid, build on it, cite it, and find it alive after its founder has moved on.
+
+| Track | What it builds | Items | Proof run |
+|---|---|---|---|
+| Assurance | Fuzzing of every parser, deterministic simulation of master and workers with injected faults, a checked model of failover, an inventory of `unsafe`, provenance for releases, an independent review | LV-1 to LV-7 | The nightly simulation ran its seeds and every invariant held |
+| Specification | The cluster protocol and the formats written down, with test vectors | LV-8, LV-9 | A decoder written from the specification alone reads every vector |
+| Evidence | A citation file and a DOI per release, a measurement study of a school lab, a case study of the development method | LV-10 to LV-13 | The records and the texts are public |
+| Stewardship | Governance files, a release runbook, a second person who can release, funding applications | LV-14 to LV-17 | A second person cuts a release from the runbook alone |
+
+Rule: every release ships at least one item of design 0058, and the record takes one lane of work
+at most. The first items need nothing else: LV-10, LV-14, LV-5 and the first fuzz targets of LV-1.
+They are in [BACKLOG.md](BACKLOG.md) since 2026-11-10, as its Phase 10.
+
+**Exit check per track:** its proof run in design 0058 D6, recorded with its date.
+
+### First users: who gains what, and in which order
+
+Draft, proposed on 2026-11-10; decisions Q36 to Q39 are open.
+[Design 0059](design/0059-first-users.md) asks what a person gains from installing the grid, and
+orders the work by that. Its statements about users are reasoning until its study or a recorded
+run supports them.
+
+| Audience | The job they already have | What is missing | Items |
+|---|---|---|---|
+| A developer with a coding agent and machines on more than one operating system (first) | Checking a change on Windows, macOS and Linux | One call that fans out and returns one table | AX-1, AX-3 |
+| A developer with a slow test suite and a second machine | Waiting for the suite | Shards over several machines, and a number that shows the gain | AX-2, ADOPT-2 |
+| The owner of a desktop with a GPU who works on a laptop | Using a local model away from the desk | A routed prompt, and an endpoint that existing clients call | LLM-1, LLM-6 |
+| A small team, a lab or a class with idle machines | Batch jobs that run on one machine | A guide per job, batch inference, the classroom profile | ADOPT-4, LLM-8, EDU-1 |
+| A maintainer who waits for hosted CI runners or pays for them | CI on three operating systems | Their own machines as runners | AX-7 |
+
+Order: a study of first use with three to five people (ADOPT-1), a run summary (ADOPT-2), AX-1,
+AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for common jobs
+(ADOPT-4), then LLM-1 and LLM-6. The study may reorder the later steps. No item of design 0059 is
+in [BACKLOG.md](BACKLOG.md).
+
+**Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
+0059.
 
 ## What waits, and why
 
@@ -388,6 +477,27 @@ answers.
 | Q16 | Which workloads does the public pool take first? | Open. Recommended: open-source CI builds and tests, Monte Carlo and parameter sweeps, rendering; all split well and can be checked |
 | Q17 | Who governs the network once it has outside users? | Open. Recommended: the owner until then, then a neutral steward with an open specification |
 | Q18 | When does Phase H start? | Open. Recommended: H0 after ENROLL-1; H1 after SCALE-6; H2 after ECO-3 and an external security review |
+| Q19 | Accept the direction of design 0056: tasks that are portable, movable and checkable, and the dogfood rule? | Open. Recommended: yes |
+| Q20 | May the spikes R1 to R4 of design 0056 run now, beside Phase E? | Open. Recommended: yes. A spike builds nothing in the product |
+| Q21 | Move NET-1, the WebAssembly task type, from stage H0 into the second wave of design 0056? | Open. Recommended: yes, after spike R1, behind a Cargo feature |
+| Q22 | Which bet follows the `0.2.0` release? | Open. Recommended: bet A (AX-1, AX-2, AX-3) |
+| Q23 | Which format do execution receipts use, and where is the log? | Open. Recommended: an in-toto statement with a SLSA provenance predicate, and a log of our own first |
+| Q24 | Does spike R6, GPU for WebAssembly tasks, reopen decision D6? | Open. Recommended: no. D6 stands until R6 has a record |
+| Q25 | Is there a lab for the classroom run (EDU-1), and in which term? Accepting it adds a second user story | Open. Owner |
+| Q26 | How does the agents' time split between design 0056 and Phases F and G? | Open. Recommended: one lane on Phases F and G, two on the current wave |
+| Q27 | Accept the principle of the charter in design 0057: outputs and task code of donated compute are open, later products are free, private clusters are not covered, and the charter binds the owner? | Yes, decided by the owner on 2026-11-10. The charter's text still needs a legal review (CHARTER-1) |
+| Q28 | How long may a project keep outputs of donated compute before it publishes them? | At most six months after a batch ends, and no delay for outputs that are checks. Decided by the owner on 2026-11-10 |
+| Q29 | Which licences do the outputs and the task code of donated compute use? | CC BY 4.0 for outputs, CC0 allowed; any licence the Open Source Initiative approves for code. Decided by the owner on 2026-11-10 |
+| Q30 | Does OxideSwarm aim to replace the operating systems installed on machines? The owner raised it on 2026-11-10 | Open. Recommended: no. It stays a program on every system. The worker image of design 0056 (IMG-1 to IMG-4), which the owner added to the plan the same day, is the part that is built |
+| Q31 | Accept design 0058 and its rule: every release ships at least one of its items, and it takes one lane at most? | Open. Recommended: yes |
+| Q32 | Which items of design 0058 come first? | Decided by the owner on 2026-11-10 for the first items: LV-10, LV-14, LV-5 and the first targets of LV-1 are in the backlog. The order of the rest is open. Recommended: LV-2 and LV-8 next |
+| Q33 | May the repository's history and review records be the data of a published case study (LV-12)? | Open. Owner. Recommended: yes for what is already public in the repository |
+| Q34 | Will the owner apply for an independent security review and for funding (LV-6, LV-16)? | Open. Owner |
+| Q35 | May user guides be translated into Vietnamese, with English as the source? | Open. Recommended: yes. Writing standard rule 1 then says so |
+| Q36 | Accept the first audience of design 0059 (a developer with a coding agent and machines on more than one operating system, then one with a slow test suite) and its order of work? | Open. Recommended: yes |
+| Q37 | Will the owner run the first round of the study of first use (ADOPT-1), and with how many people? | Open. Owner. Recommended: three to five people, before AX-1 starts |
+| Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
+| Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -449,3 +559,27 @@ answers.
 - 2026-11-10: The owner set a long-term goal: an open, worldwide compute network on top of
   OxideSwarm. Phase H (NET-1 to NET-8) is added from [design 0054](design/0054-open-compute-network.md)
   (Draft), with open decisions Q14 to Q18. Nothing in Phases E to G moved.
+- 2026-11-10: Draft added at the owner's request for a research and development plan: the frontier
+  program of [design 0056](design/0056-frontier-program.md), with bets A to E, spikes R1 to R9,
+  lighthouse runs and open decisions Q19 to Q26. A web research run of 2026-11-10 supplied its
+  findings. Nothing in Phases E to H moved.
+- 2026-11-10: The owner proposed that research done with compute the project mobilises is free and
+  public. [Design 0057](design/0057-open-results-charter.md) (Draft) turns this into a charter for
+  the public pool of Phase H, with open decisions Q27 to Q29. It builds nothing.
+- 2026-11-10: The owner accepted Q27 to Q29 with their recommended defaults: the charter's
+  principle, an embargo of at most six months, and CC BY 4.0 for outputs. The charter's text still
+  needs a legal review (CHARTER-1), and nothing is built.
+- 2026-11-10: The owner asked whether OxideSwarm should become an operating system that replaces
+  the installed ones, and then added a bootable worker image to the plan. Design 0056 gained IMG-1
+  to IMG-4, spike R10 and lighthouse L6. Q30 is open, and the first non-goal of design 0054
+  stands until it is decided.
+- 2026-11-10: Draft added at the owner's request for further directions that make the project
+  worth remembering: [design 0058](design/0058-lasting-value.md), with items LV-1 to LV-17, spikes
+  R11 to R13, proof runs V1 to V4 and open decisions Q31 to Q35. It adds no feature, and nothing
+  moved.
+- 2026-11-10: The owner put the first items of design 0058 into the backlog (LV-1, LV-5, LV-10 and
+  LV-14, Phase 10 of [BACKLOG.md](BACKLOG.md)). Q32 is decided for these.
+- 2026-11-10: Draft added at the owner's request on what a user gains and which upgrades make
+  people use the project: [design 0059](design/0059-first-users.md), with items ADOPT-1 to
+  ADOPT-4, measures M15 to M17 and open decisions Q36 to Q39. Nothing moved, and no item entered
+  the backlog.

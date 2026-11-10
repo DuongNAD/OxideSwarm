@@ -189,3 +189,7 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
 
 - 2026-11-07: Created as Planned at the owner's request, from a discussion of mixture-of-experts
   and mixture-of-agents designs. Nothing is built.
+- 2026-11-10: The research in [design 0056](0056-frontier-program.md) found the split of one model
+  slow on ordinary networks: about 1.5 tokens per second for a 70B model over Wi-Fi in the
+  prima.cpp paper. Design 0056 adds LLM-6 to LLM-8 on the request path of D1. LLM-2 to LLM-5 keep
+  their order. Nothing is built.

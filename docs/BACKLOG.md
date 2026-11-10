@@ -127,10 +127,10 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `2f22c48` plus USB-2 and BUG-18: 70 items Implemented, 4 Partial and 36 Planned. Five items
+On 2026-11-10, at `master` `2f22c48` plus USB-2 and BUG-18: 70 items Implemented, 4 Partial and 40 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
-2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
+2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md). "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
@@ -245,6 +245,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | (design 0054) |
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | (design 0054) |
+| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Planned | (design 0058) |
+| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
+| LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 
 ## Phase 0: integrate open work
 
@@ -1823,6 +1827,8 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
      reporting policy with a contact, and issue and discussion templates. The owner decides each
      (owner item, and Q11 for licence).
   3. Link all of it from `README.md`.
+- **Note (2026-11-10):** LV-14 carries out step 2, except the security reporting policy, which
+  REL-5 delivered.
 - **Done when:** The site builds in CI and is reachable, `README.md` links the governance and the
   security policy, and a test report of a vulnerability reaches the named contact.
 
@@ -1888,6 +1894,150 @@ roadmap are open. Each item starts with a threat model of its own and an indepen
 | NET-6 | Clusters publish capacity and task classes through gossip or a DHT over iroh | Clusters find each other with no central server |
 | NET-7 | A written protocol specification, a conformance test suite, a security process and a neutral steward | Two independent implementations pass the suite together |
 | NET-8 | Optional trusted execution (AMD SEV-SNP, Intel TDX, GPU confidential computing) with attestation | A task's attestation is checked before its inputs are released |
+
+## Phase 10: lasting value
+
+Added on 2026-11-10 from [design 0058](design/0058-lasting-value.md), at the owner's word, for its
+first items. The record plans assurance, a written specification, citable evidence and stewardship,
+and adds no feature. Its other items (LV-2 to LV-4, LV-6 to LV-9, LV-11 to LV-13 and LV-15 to
+LV-17) stay in the design record until the owner adds them here. The four items below do not depend
+on each other and can run in parallel. None changes the wire format, a CLI flag or a default, so
+none needs a design record of its own.
+
+### LV-1: Fuzz targets for the parsers of untrusted bytes (first targets)
+
+- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. The repository has no `fuzz/` directory
+  and no property-testing dependency. Bytes from another machine reach these parsers, the first two
+  before authentication completes: the frame reader and format dispatch of `MessageTransport`
+  (`crates/core/src/protocol.rs`: `recv_raw_frame_max`, `recv_msg_with_codec_max`, frames up to
+  `MAX_FRAME_SIZE`, 64 MiB), the handshake frames (`crates/core/src/cluster_auth.rs`,
+  `crates/core/src/noise_auth.rs`), and `TreeManifest::decode` (`crates/core/src/blob.rs`). The
+  `audit` job of CI reports `bincode` 1.x as unmaintained.
+- **Problem:** Nothing has fed these parsers malformed input at scale. A panic or an unbounded
+  allocation in one of them is a remote denial of service, and before the handshake it needs no
+  secret.
+- **Do:**
+  1. Add a `fuzz/` crate for `cargo fuzz` (libFuzzer), outside the workspace members (add it to
+     `exclude` in the root `Cargo.toml`), with a `Cargo.lock` of its own. List its dependencies for
+     the owner in the pull request.
+  2. Write three targets:
+     - `inbound_frame`: the input is a byte stream that a `MessageTransport` over an in-memory
+       stream reads as `InboundMessage`, once per `WireCodec`, with a small frame limit. The frame
+       reader, the format byte dispatch and both decoders are then in the path.
+     - `server_handshake`: the input is what a peer sends first. Run the server side of the
+       handshake against it over an in-memory stream, with a fixed test secret and a fixed test
+       key.
+     - `tree_manifest`: the input goes to `TreeManifest::decode`.
+
+     If a parser is only reachable through private functions, expose it behind a Cargo feature
+     `fuzzing` of `rusty_grid_core` that is off by default. Do not change a normal build.
+  3. Seed each target's corpus with valid encodings, for example the messages that
+     `crates/core/src/wire_layout_tests.rs` builds.
+  4. Run each target for one hour locally. Record the date, the machine, the number of executions
+     and every finding in `fuzz/README.md`. This is spike R12 of design 0058.
+  5. For each finding follow rule 4: a failing test first, then the fix. A finding that a remote
+     peer can trigger goes through the private route of `docs/SECURITY.md` before any public pull
+     request.
+  6. Add a CI job on Linux that builds the targets and runs each for 60 seconds on pull requests,
+     and for 10 minutes each on the weekly schedule. The job pins a dated nightly toolchain,
+     because `cargo fuzz` needs one. Keep crash inputs as files under `fuzz/regressions/`, and run
+     them in the same job.
+- **Done when:** The three targets build and run in CI. `fuzz/README.md` holds the one-hour record.
+  A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
+  design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
+  the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
+
+### LV-5: Supply chain: dependency policy, release provenance, outside checklist
+
+- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. CI runs `cargo audit`
+  (`.github/workflows/ci.yml`, job `audit`), and Dependabot is configured. No `deny.toml` exists.
+  `.github/workflows/release.yml` writes `SHA256SUMS` and attaches no signature and no provenance.
+  The workflows name actions by tag (`actions/checkout@v7`, `Swatinem/rust-cache@v2`,
+  `taiki-e/install-action@v2`), not by commit.
+- **Problem:** A checksum proves that a download is intact. It does not prove where and from which
+  commit an archive was built. A dependency with an unwanted licence or from an unexpected source
+  would pass CI. A moved action tag would change what CI runs.
+- **Do:**
+  1. Add `deny.toml` and a CI job on Linux that runs
+     `cargo deny --locked check licenses bans sources`. `cargo audit` keeps the advisories. Allow
+     the licences that the current dependency tree uses, and list them for the owner in the pull
+     request. Allow crates.io as the only source, plus any git source that `Cargo.lock` already
+     has.
+  2. Build provenance. In `release.yml`, attest every archive with `actions/attest`, in the job
+     that holds the archives, with the permissions `id-token: write` and `attestations: write` on
+     that job only. Add a manual `workflow_dispatch` run that builds and attests and creates no
+     release, so that the step can be checked without a tag. Skip the step on pull requests from
+     forks.
+  3. Add the verify command to the install section of `README.md`:
+     `gh attestation verify <ARCHIVE> --repo <OWNER>/<REPO>`. Say what it proves (where and from
+     which commit the archive was built) and what it does not prove (that the source is safe).
+  4. Pin every `uses:` in `.github/workflows/` to a full commit hash, with the tag in a comment.
+     Dependabot keeps them current. Keep `permissions: contents: read` as the default of every
+     workflow.
+  5. Add the OpenSSF Scorecard workflow, on a schedule and on pushes to `master`, and its badge to
+     `README.md`.
+  6. Owner: make the `cargo deny` job a required check once it is green on `master`, and fill in
+     the OpenSSF Best Practices questionnaire.
+- **Done when:** The `cargo deny` job passes on `master`. A manual run of `release.yml` produces an
+  attestation per archive, `gh attestation verify` accepts an archive of that run and refuses a
+  copy with one changed byte, and both outputs are in the pull request. No `uses:` line in
+  `.github/workflows/` names a tag or a branch. The Scorecard workflow has run once.
+
+### LV-10: Citation file and a DOI per release
+
+- **Evidence:** Reproduced on 2026-11-10 at `master` `2f22c48`. The repository root has no
+  `CITATION.cff`, and `README.md` has no section on how to cite the project.
+- **Problem:** A paper, a course or another project that uses OxideSwarm has nothing stable to
+  cite, and a release has no identifier that outlives the repository.
+- **Do:**
+  1. Add `CITATION.cff` in the repository root, in format version 1.2.0, with the keys
+     `cff-version`, `message`, `title`, `abstract`, `authors`, `version`, `date-released`,
+     `license`, `repository-code` and `keywords`. Take `version` and the licences (`MIT`,
+     `Apache-2.0`) from `[workspace.package]` in `Cargo.toml`. Use the entity "The OxideSwarm
+     Authors" as the author, as `Cargo.toml` does, unless the owner gives a personal name and an
+     ORCID.
+  2. Add a test to `tests/test_m1_challenger_hygiene.py`, with the standard library only: the file
+     has every key listed above, and its `version` equals the workspace version in `Cargo.toml`. A
+     version bump without the citation file then fails CI.
+  3. Add a "How to cite" section to `README.md`, above "License".
+  4. Owner: switch the repository on in Zenodo, so that Zenodo archives each GitHub release and
+     gives it a DOI. After the next release, add the DOI to `CITATION.cff` (`identifiers`) and to
+     the "How to cite" section.
+- **Done when:** The new test passes on Linux, macOS and Windows, and the repository page shows
+  "Cite this repository". Step 4 is finished when the DOI of a release is in `README.md`. Until
+  then the item is Partial.
+
+### LV-14: Governance files and a licence that GitHub detects
+
+- **Evidence:** Reproduced on 2026-11-10 at `master` `2f22c48`. The repository has no
+  `CODE_OF_CONDUCT.md`, no `GOVERNANCE.md` and no `.github/FUNDING.yml`.
+  `gh api repos/<OWNER>/<REPO> --jq .license.spdx_id` prints `NOASSERTION`: the root holds
+  `LICENSE-MIT`, `LICENSE-APACHE` and a four-line `LICENSE` that points to both. `git shortlog -sn`
+  lists one human author.
+- **Problem:** A newcomer cannot tell who decides, how a change is accepted or how to become a
+  maintainer. Funds ask for a governance file. Tools that read the licence from GitHub see none.
+- **Do:** This item carries out step 2 of ECO-8, except the security reporting policy, which REL-5
+  delivered. ECO-8 keeps the documentation site.
+  1. Add `GOVERNANCE.md`. State the facts as they are: one owner decides, through design records
+     and the decisions table of `docs/ROADMAP.md`; coding agents implement and review; a pull
+     request merges when its required checks are green and it has a review. Say how a person
+     becomes a maintainer and which rights that gives, and that a neutral steward is planned for
+     the public network (decision Q17). Write nothing that is not true today.
+  2. Add `CODE_OF_CONDUCT.md`. Propose the Contributor Covenant 2.1 to the owner, with the private
+     reporting route of `docs/SECURITY.md` as the contact. The owner decides the text.
+  3. Licence detection. Ask the owner before changing any licence file. The proposal: remove the
+     pointer file `LICENSE`, keep `LICENSE-MIT` and `LICENSE-APACHE`, and update what names the
+     pointer file (`.github/workflows/release.yml` copies it into the archives). Check the
+     repository page after the change. If GitHub still shows no licence, restore the file and
+     record the result in the status log.
+  4. Add `.github/FUNDING.yml` only when the owner has a sponsorship account and names it.
+  5. Link `GOVERNANCE.md` and `CODE_OF_CONDUCT.md` from `README.md` and `CONTRIBUTING.md`.
+  6. Add a short section to `README.md` that says how the project is built: coding agents write
+     and review the code, and the owner decides and approves. The owner approves the wording.
+     Funds and journals ask for this statement.
+- **Done when:** The two files and the `README.md` section exist and are linked, the links test of
+  `tests/test_m1_challenger_hygiene.py` passes, and the status log records what the repository
+  page shows as the licence after step 3.
 
 ## Status log
 
@@ -2149,3 +2299,6 @@ Add one dated line per finished item, newest last.
   `$InstallRoot`; and under `--isolation fs|fs+net` on Windows `TaskRunner` resolves bare commands
   against `%SystemRoot%\System32` before `Git\usr\bin` so `whoami` exits `0`. The Index counts are
   now 70 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added LV-1, LV-5, LV-10 and LV-14 as Phase 10, from
+  [design 0058](design/0058-lasting-value.md), at the owner's word. Nothing is built. The Index
+  counts are now 70 Implemented, 4 Partial and 40 Planned.

@@ -122,6 +122,8 @@ the host. They are optional and come later, for users who need confidentiality.
 - **Task classes and policy.** Tasks are allowed by class. Mining, scanning and denial of service
   are refused, and repeat offenders are blocked by key.
 - **Transparency.** Reports say what ran, how much and for whom.
+- **Open results.** A project that receives donated compute publishes its outputs and its task
+  code. The draft charter is [design 0057](0057-open-results-charter.md).
 - **Governance.** An open specification, a public security process and, when the network has
   outside users, a neutral steward (Q17).
 
@@ -184,3 +186,14 @@ Fuzzing covers every parser of network input.
 
 - 2026-11-10: Draft. The owner set the long-term goal of an open, worldwide compute network on top
   of OxideSwarm. Phase H in `docs/ROADMAP.md`; decisions Q14 to Q18 are open.
+- 2026-11-10: [Design 0056](0056-frontier-program.md) proposes to build NET-1 earlier, inside
+  trusted clusters (Q21), and names independent rebuilds (PROOF-5) as a first public workload for
+  Q16. Its research found Wasmtime at tier 3 on Android, and no measurement of bit-identical
+  results across CPU architectures. The exit check of H0 therefore waits for spike R1. Nothing in
+  this record changed.
+- 2026-11-10: D7 gained "Open results", from the owner's proposal of the same day. The draft
+  charter is [design 0057](0057-open-results-charter.md). The owner accepted its principle the
+  same day (Q27 to Q29).
+- 2026-11-10: The owner asked whether OxideSwarm should replace installed operating systems. The
+  first non-goal of this record stands until Q30 is decided. Design 0056 adds a worker image that
+  starts a whole machine without touching its installed system (IMG-1 to IMG-4).
