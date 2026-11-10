@@ -1629,23 +1629,32 @@ pub fn augment_windows_path(existing_path: &str) -> String {
     }
 }
 
-/// Returns `true` when `dir` is an MSYS2 POSIX `usr\bin` directory (`...\Git\usr\bin` or
-/// `...\msys64\usr\bin`) whose executables link against `msys-2.0.dll`.
+/// Returns `true` when `dir` is an MSYS2 or Cygwin POSIX binary directory (`...\Git\usr\bin`,
+/// `...\git\current\usr\bin`, `...\msys64\usr\bin`, `...\cygwin64\bin`, or any folder containing
+/// `msys-2.0.dll` or `cygwin1.dll`) whose executables link against `msys-2.0.dll` / `cygwin1.dll`.
 ///
-/// Inside a Windows AppContainer (`--isolation fs` or `--isolation fs+net`), `msys-2.0.dll`
-/// fails during `DllMain(DLL_PROCESS_ATTACH)` Cygwin shared-heap initialization and terminates
-/// the child process with `0xC0000142` (`STATUS_DLL_INIT_FAILURE`). Native Win32 tools in
-/// `%SystemRoot%\System32` (`whoami.exe`, `cmd.exe`, `powershell.exe`, `where.exe`, `tar.exe`,
+/// Inside a Windows AppContainer (`--isolation fs` or `--isolation fs+net`), `msys-2.0.dll` and
+/// `cygwin1.dll` fail during `DllMain(DLL_PROCESS_ATTACH)` Cygwin shared-heap initialization and
+/// terminate the child process with `0xC0000142` (`STATUS_DLL_INIT_FAILURE`). Native Win32 tools
+/// in `%SystemRoot%\System32` (`whoami.exe`, `cmd.exe`, `powershell.exe`, `where.exe`, `tar.exe`,
 /// `curl.exe`, `find.exe`, `sort.exe`, `timeout.exe`) and `Git\cmd` / `Git\bin` (`git.exe`) do
 /// not link `msys-2.0.dll` and run cleanly inside an AppContainer.
 #[cfg(windows)]
 pub fn is_msys_usr_bin_dir(dir: &std::path::Path) -> bool {
+    if dir.join("msys-2.0.dll").is_file() || dir.join("cygwin1.dll").is_file() {
+        return true;
+    }
     let norm = dir
         .to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase();
-    norm.ends_with(r"\git\usr\bin") || norm.ends_with(r"\msys64\usr\bin")
+    norm.ends_with(r"\git\usr\bin")
+        || norm.ends_with(r"\git\current\usr\bin")
+        || norm.ends_with(r"\msys64\usr\bin")
+        || norm.ends_with(r"\msys32\usr\bin")
+        || norm.ends_with(r"\cygwin64\bin")
+        || norm.ends_with(r"\cygwin\bin")
 }
 
 /// Augments `existing_path` for a task running inside a Windows AppContainer (`--isolation fs`
@@ -3619,7 +3628,13 @@ Now drawing from 'AC Power'
             r"C:\Program Files\Git\usr\bin"
         )));
         assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Users\dev\scoop\apps\git\current\usr\bin"
+        )));
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
             r"C:\msys64\usr\bin\"
+        )));
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\cygwin64\bin"
         )));
         assert!(!is_msys_usr_bin_dir(std::path::Path::new(
             r"C:\Windows\System32"
@@ -3630,6 +3645,12 @@ Now drawing from 'AC Power'
         assert!(!is_msys_usr_bin_dir(std::path::Path::new(
             r"C:\Program Files\Git\bin"
         )));
+
+        // A custom folder containing msys-2.0.dll or cygwin1.dll is also detected (N4).
+        let custom_msys = tempfile::tempdir().expect("tempdir");
+        assert!(!is_msys_usr_bin_dir(custom_msys.path()));
+        std::fs::write(custom_msys.path().join("msys-2.0.dll"), b"MZ").unwrap();
+        assert!(is_msys_usr_bin_dir(custom_msys.path()));
 
         // Even when the caller's PATH places Git\usr\bin ahead of System32 (e.g. Git Bash),
         // augment_windows_path_for_isolation moves MSYS2 usr\bin after native directories,

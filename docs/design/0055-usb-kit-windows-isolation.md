@@ -101,6 +101,11 @@ In `crates/worker/src/isolation.rs`:
    - adds `[CmdletBinding()]` above `param(...)` so PowerShell rejects unknown parameters;
    - adds `[ValidateSet('off', 'fs')][string]$Isolation = ""`;
    - resolves `$Isolation`: CLI `-Isolation` > `$Kit\isolation` file > `'off'`;
+   - sets `$env:RUSTY_GRID_ACL_GRANT_LOG = Join-Path $State 'windows_acl_grants.txt'` (and writes the
+     same `RUSTY_GRID_ACL_GRANT_LOG` environment entry into `start-worker.vbs` alongside
+     `OXIDESWARM_HOME`), so even release **0.1.1** worker binaries (which predate `OXIDESWARM_HOME`
+     support in `acl_grant_manifest_path`) write `windows_acl_grants.txt` into `$InstallRoot\home`
+     and never touch `%USERPROFILE%\.oxideswarm`;
    - copies `revoke-isolation-acls.ps1` into `$InstallRoot\revoke-isolation-acls.ps1`;
    - passes `--isolation $Isolation` in `$workerArgs` (used for both the immediate `wscript.exe`
      launch and the `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` `OxideSwarmUsbWorker`
@@ -109,7 +114,8 @@ In `crates/worker/src/isolation.rs`:
 3. `packaging/usb/install.sh`:
    - adds `--isolation off|fs`;
    - resolves `ISOLATION`: CLI `--isolation` > `$KIT_DIR/isolation` file > `fs` (falling back to
-     `off` if the worker cannot start with `fs`).
+     `off` only when `fs` came from the default; when `--isolation fs` is requested explicitly or via
+     `$KIT_DIR/isolation`, `install.sh` fails if the worker cannot start with `fs`).
 
 ### D3: Reversible ACL cleanup in `uninstall.ps1`
 
@@ -150,6 +156,18 @@ No wire protocol change. CLI flags on `oxideswarm` are unchanged; `make_kit.sh`,
 `isolation` file keep the previous defaults (`off` on Windows, `fs` with fallback to `off` on macOS
 and Linux).
 
+Minimum release version for `-Isolation fs` on Windows:
+- **Release 0.1.1+**: `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG` to
+  `<InstallRoot>\home\windows_acl_grants.txt`, which release `0.1.1` already honours. Both ACL
+  grant logging and `uninstall.ps1` ACL revocation work with `0.1.1` archives without touching
+  `%USERPROFILE%\.oxideswarm`. Note that `0.1.1` predates `BUG-18`, so on a host with Git for
+  Windows installed, a bare `whoami` task under `-Isolation fs` on a `0.1.1` worker resolves to
+  `Git\usr\bin\whoami.exe` (`msys-2.0.dll`) and exits `0xC0000142` (`-1073741502`) unless invoked as
+  `C:\Windows\System32\whoami.exe`.
+- **Release 0.1.2+** (builds containing this design): includes native `OXIDESWARM_HOME` manifest
+  precedence and the `BUG-18` fix so bare `whoami` resolves to `%SystemRoot%\System32\whoami.exe`
+  and exits `0`.
+
 ## Security
 
 - On Windows, `--isolation off` remains the default in `install.ps1` unless `-Isolation fs` or
@@ -166,14 +184,14 @@ and Linux).
 
 - **Unit tests:**
   - `isolation::tests::test_acl_grant_manifest_path_precedence_honours_oxideswarm_home` in
-    `crates/worker/src/isolation.rs`;
+    `crates/worker/src/isolation.rs` (runs on all OSes);
   - `capabilities::tests::test_windows_executable_resolution_for_isolation_prefers_system32_over_msys_usr_bin`
     in `crates/core/src/capabilities.rs`.
 - **Integration tests:**
   - `windows::test_bare_whoami_succeeds_under_isolation_fs` in
     `crates/worker/tests/test_feat3_os_isolation.rs`;
   - `UsbKitTests::test_make_kit_and_install_support_isolation_option_and_reject_invalid_values` and
-    `UsbKitTests::test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation`
+    `StaticRepositoryChecks::test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation`
     in `tests/test_launcher_scripts.py`.
 - **Live Windows verification:**
   - Build a kit with `make_kit.sh`, install with `install.ps1 -Isolation fs` under a temporary

@@ -17,6 +17,7 @@ ROOT=""
 AUTOSTART=1
 WORKSPACES=1
 ISOLATION=""
+EXPLICIT_ISOLATION=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -30,7 +31,7 @@ while [ $# -gt 0 ]; do
     --isolation)
       [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
       case "$2" in
-        off|fs) ISOLATION=$2 ;;
+        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1 ;;
         *) fail "--isolation must be off or fs (got: $2)" ;;
       esac
       shift ;;
@@ -64,7 +65,7 @@ if [ -z "$ISOLATION" ]; then
   if [ -f "$KIT_DIR/isolation" ]; then
     BAKED_ISO=$(tr -d ' \r\n\t' < "$KIT_DIR/isolation")
     case "$BAKED_ISO" in
-      off|fs) ISOLATION=$BAKED_ISO ;;
+      off|fs) ISOLATION=$BAKED_ISO; EXPLICIT_ISOLATION=1 ;;
       *) fail "the kit's isolation file holds '$BAKED_ISO' (expected 'off' or 'fs')" ;;
     esac
   else
@@ -182,13 +183,13 @@ say "Starting worker '$NAME' ..."
 start_worker
 sleep 4
 if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
-  if [ "$ISOLATION" != off ]; then
+  if [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
     say "  the worker stopped with --isolation $ISOLATION (see $LOG_DIR/worker.log); trying --isolation off"
     ISOLATION=off
     start_worker
     sleep 3
   fi
-  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
+  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start with --isolation $ISOLATION; see $LOG_DIR/worker.log"
 fi
 
 # 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its

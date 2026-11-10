@@ -74,11 +74,18 @@ Each installer does the following, without administrator rights:
    - with `--max-concurrency` set to half of the CPU cores (at least 1), so the machine stays
      responsive for its owner;
    - with `--workspaces` when `cargo` is on `PATH`;
-   - with `--isolation fs` on macOS and Linux (falling back to `off` if the worker cannot start with
-     it), and `--isolation off` by default on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs`
-     when opted in; on Windows, `--isolation fs` records any `oxideswarm.toolchain` ACL grants in
-     `<folder>\home\windows_acl_grants.txt`, and `uninstall.ps1` revokes them before deleting
-     `<folder>`).
+   - with `--isolation fs` on macOS and Linux (falling back to `off` only when `fs` was the default
+     and the host kernel cannot start an isolated worker; an explicit `--isolation fs` or baked `fs`
+     in the kit's `isolation` file fails instead of falling back), and `--isolation off` by default
+     on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs` when opted in; on Windows,
+     `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`
+     alongside `OXIDESWARM_HOME=<folder>\home` so `oxideswarm.toolchain` ACL grants are recorded in
+     `<folder>\home\windows_acl_grants.txt` on release **0.1.1+** without touching
+     `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes them before deleting `<folder>`. Note:
+     release **0.1.1** predates `BUG-18`, so on a Windows machine with Git for Windows installed, a
+     bare `whoami` task under `-Isolation fs` on a `0.1.1` worker resolves to `Git\usr\bin\whoami.exe`
+     and exits `0xC0000142` unless invoked as `C:\Windows\System32\whoami.exe`; release **0.1.2+**
+     resolves bare `whoami` to `%SystemRoot%\System32\whoami.exe` and exits `0`).
 5. It waits until `oxideswarm workers --json` lists the worker as connected.
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.

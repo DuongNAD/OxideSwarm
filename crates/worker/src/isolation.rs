@@ -194,6 +194,51 @@ impl HostDirs {
     }
 }
 
+/// Default filename under `<OXIDESWARM_HOME>/` or `<user_home>/.oxideswarm/` where every path
+/// whose DACL is modified by `prepare_worker_toolchains` on Windows is recorded before the
+/// modification takes place.
+pub const ACL_GRANT_LOG_FILENAME: &str = "windows_acl_grants.txt";
+
+/// Pure helper for [`acl_grant_manifest_path`] so precedence can be unit-tested on every OS
+/// without mutating process-wide environment variables.
+pub fn acl_grant_manifest_path_with(
+    host: &HostDirs,
+    grant_log_env: Option<&std::ffi::OsStr>,
+    oxideswarm_home_env: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(custom) = grant_log_env {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    if let Some(ox_home) = oxideswarm_home_env {
+        if !ox_home.is_empty() {
+            return PathBuf::from(ox_home).join(ACL_GRANT_LOG_FILENAME);
+        }
+    }
+    if !host.user_home.as_os_str().is_empty() {
+        return host
+            .user_home
+            .join(".oxideswarm")
+            .join(ACL_GRANT_LOG_FILENAME);
+    }
+    std::env::temp_dir().join(ACL_GRANT_LOG_FILENAME)
+}
+
+/// Returns the path of the reversible Windows ACL grant manifest file.
+///
+/// Precedence:
+/// 1. `RUSTY_GRID_ACL_GRANT_LOG` (when set and non-empty),
+/// 2. `<OXIDESWARM_HOME>/windows_acl_grants.txt` (when `OXIDESWARM_HOME` is set and non-empty),
+/// 3. `<user_home>/.oxideswarm/windows_acl_grants.txt`.
+pub fn acl_grant_manifest_path(host: &HostDirs) -> PathBuf {
+    acl_grant_manifest_path_with(
+        host,
+        std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").as_deref(),
+        std::env::var_os("OXIDESWARM_HOME").as_deref(),
+    )
+}
+
 /// Changes to a task's environment under `fs` / `fs+net` (design 0033 D1.4). Apply them after the
 /// task's own variables: the isolation wins over a task that names the same variable, except for
 /// `RUSTUP_HOME` and `CARGO_HOME`, which a task may point elsewhere (for example at a Cargo cache
@@ -1054,9 +1099,7 @@ pub mod windows {
     /// Custom capability name derived via `DeriveCapabilitySidsFromName` and granted only to
     /// OxideSwarm task AppContainers and worker-owned toolchain directories.
     pub const OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME: &str = "oxideswarm.toolchain";
-    /// Default filename under `<user_home>/.oxideswarm/` where every path whose DACL is modified
-    /// by `prepare_worker_toolchains` is recorded before the modification takes place.
-    pub const ACL_GRANT_LOG_FILENAME: &str = "windows_acl_grants.txt";
+    pub use super::{acl_grant_manifest_path, acl_grant_manifest_path_with, ACL_GRANT_LOG_FILENAME};
 
     /// Serialises toolchain and sandbox_base ACL preparation within the worker process.
     static PREPARE_LOCK: Mutex<()> = Mutex::new(());
@@ -2116,46 +2159,6 @@ pub mod windows {
             return Err(io::Error::from_raw_os_error(set_rc as i32));
         }
         Ok(())
-    }
-
-    /// Pure helper for [`acl_grant_manifest_path`] so precedence can be unit-tested without
-    /// mutating process-wide environment variables.
-    pub fn acl_grant_manifest_path_with(
-        host: &HostDirs,
-        grant_log_env: Option<&std::ffi::OsStr>,
-        oxideswarm_home_env: Option<&std::ffi::OsStr>,
-    ) -> PathBuf {
-        if let Some(custom) = grant_log_env {
-            if !custom.is_empty() {
-                return PathBuf::from(custom);
-            }
-        }
-        if let Some(ox_home) = oxideswarm_home_env {
-            if !ox_home.is_empty() {
-                return PathBuf::from(ox_home).join(ACL_GRANT_LOG_FILENAME);
-            }
-        }
-        if !host.user_home.as_os_str().is_empty() {
-            return host
-                .user_home
-                .join(".oxideswarm")
-                .join(ACL_GRANT_LOG_FILENAME);
-        }
-        std::env::temp_dir().join(ACL_GRANT_LOG_FILENAME)
-    }
-
-    /// Returns the path of the reversible ACL grant manifest file.
-    ///
-    /// Precedence:
-    /// 1. `RUSTY_GRID_ACL_GRANT_LOG` (when set and non-empty),
-    /// 2. `<OXIDESWARM_HOME>/windows_acl_grants.txt` (when `OXIDESWARM_HOME` is set and non-empty),
-    /// 3. `<user_home>/.oxideswarm/windows_acl_grants.txt`.
-    pub fn acl_grant_manifest_path(host: &HostDirs) -> PathBuf {
-        acl_grant_manifest_path_with(
-            host,
-            std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").as_deref(),
-            std::env::var_os("OXIDESWARM_HOME").as_deref(),
-        )
     }
 
     fn record_manifest_line(manifest_path: Option<&Path>, line: &str) -> io::Result<()> {
@@ -3558,7 +3561,12 @@ pub mod windows {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let manifest = acl_grant_manifest_path(jail.host);
                     let manifest_opt = if jail.host.user_home.as_os_str().is_empty()
-                        && std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").is_none()
+                        && std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG")
+                            .filter(|v| !v.is_empty())
+                            .is_none()
+                        && std::env::var_os("OXIDESWARM_HOME")
+                            .filter(|v| !v.is_empty())
+                            .is_none()
                     {
                         None
                     } else {
@@ -5096,7 +5104,6 @@ mod tests {
         assert!(err_non_empty.contains("important.docx"), "{err_non_empty}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn test_acl_grant_manifest_path_precedence_honours_oxideswarm_home() {
         use std::ffi::OsStr;
@@ -5109,28 +5116,24 @@ mod tests {
         // 1. Default when neither RUSTY_GRID_ACL_GRANT_LOG nor OXIDESWARM_HOME is set:
         //    <user_home>/.oxideswarm/windows_acl_grants.txt
         assert_eq!(
-            windows::acl_grant_manifest_path_with(&host, None, None),
+            acl_grant_manifest_path_with(&host, None, None),
             fake_home.join(".oxideswarm").join("windows_acl_grants.txt")
         );
 
         // Empty env values are ignored and fall through to the next tier.
         assert_eq!(
-            windows::acl_grant_manifest_path_with(
-                &host,
-                Some(OsStr::new("")),
-                Some(OsStr::new(""))
-            ),
+            acl_grant_manifest_path_with(&host, Some(OsStr::new("")), Some(OsStr::new(""))),
             fake_home.join(".oxideswarm").join("windows_acl_grants.txt")
         );
 
         // 2. When OXIDESWARM_HOME is set and RUSTY_GRID_ACL_GRANT_LOG is unset/empty:
         //    <OXIDESWARM_HOME>/windows_acl_grants.txt
         assert_eq!(
-            windows::acl_grant_manifest_path_with(&host, None, Some(ox_home.as_os_str())),
+            acl_grant_manifest_path_with(&host, None, Some(ox_home.as_os_str())),
             ox_home.join("windows_acl_grants.txt")
         );
         assert_eq!(
-            windows::acl_grant_manifest_path_with(
+            acl_grant_manifest_path_with(
                 &host,
                 Some(OsStr::new("")),
                 Some(ox_home.as_os_str()),
@@ -5140,7 +5143,7 @@ mod tests {
 
         // 3. When RUSTY_GRID_ACL_GRANT_LOG is set, it overrides OXIDESWARM_HOME and user_home.
         assert_eq!(
-            windows::acl_grant_manifest_path_with(
+            acl_grant_manifest_path_with(
                 &host,
                 Some(explicit_log.as_os_str()),
                 Some(ox_home.as_os_str()),

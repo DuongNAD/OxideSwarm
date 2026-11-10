@@ -113,7 +113,9 @@ if ($LASTEXITCODE -ne 0) { Fail "the unpacked binary does not run on this machin
 Write-Host "  binary:  $version"
 
 # Every command below keeps its state in $State and runs from $InstallRoot.
+$GrantLog = Join-Path $State 'windows_acl_grants.txt'
 $env:OXIDESWARM_HOME = $State
+$env:RUSTY_GRID_ACL_GRANT_LOG = $GrantLog
 Set-Location $InstallRoot
 
 # 4. Join: the token goes in on standard input only.
@@ -166,6 +168,7 @@ $cmdLine = 'cmd /c ""' + $Exe + '" ' + $workerArgs + ' >> "' + $log + '" 2>&1"'
 @(
     'Set sh = CreateObject("WScript.Shell")',
     ('sh.Environment("Process")("OXIDESWARM_HOME") = "' + $State + '"'),
+    ('sh.Environment("Process")("RUSTY_GRID_ACL_GRANT_LOG") = "' + $GrantLog + '"'),
     ('sh.CurrentDirectory = "' + $InstallRoot + '"'),
     ('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
 ) | Set-Content -Path $vbs -Encoding ASCII
