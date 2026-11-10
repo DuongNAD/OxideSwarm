@@ -297,11 +297,25 @@ pub enum TaskRunnerError {
 }
 
 #[cfg(windows)]
-use rusty_grid_core::capabilities::resolve_windows_executable;
+use rusty_grid_core::capabilities::{
+    resolve_windows_executable, resolve_windows_executable_for_isolation,
+};
 
 #[cfg(windows)]
 fn augment_windows_path(existing_path: &str) -> String {
     let augmented = rusty_grid_core::capabilities::augment_windows_path(existing_path);
+    prepend_msvc_bin_if_present(augmented)
+}
+
+#[cfg(windows)]
+fn augment_windows_path_for_isolation(existing_path: &str) -> String {
+    let augmented =
+        rusty_grid_core::capabilities::augment_windows_path_for_isolation(existing_path);
+    prepend_msvc_bin_if_present(augmented)
+}
+
+#[cfg(windows)]
+fn prepend_msvc_bin_if_present(augmented: String) -> String {
     if let Some((msvc_bin, _)) = crate::isolation::windows::resolve_windows_msvc_env() {
         let msvc_str = msvc_bin.to_string_lossy();
         let lower_existing = augmented.to_ascii_lowercase();
@@ -3374,7 +3388,11 @@ impl TaskRunner {
             Some(p) => {
                 #[cfg(windows)]
                 {
-                    augment_windows_path(p)
+                    if self.config.isolation != IsolationLevel::Off {
+                        augment_windows_path_for_isolation(p)
+                    } else {
+                        augment_windows_path(p)
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -3385,7 +3403,11 @@ impl TaskRunner {
                 let base = std::env::var("PATH").unwrap_or_default();
                 #[cfg(windows)]
                 {
-                    augment_windows_path(&base)
+                    if self.config.isolation != IsolationLevel::Off {
+                        augment_windows_path_for_isolation(&base)
+                    } else {
+                        augment_windows_path(&base)
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -3416,7 +3438,11 @@ impl TaskRunner {
         };
 
         #[cfg(windows)]
-        let resolved_program = resolve_windows_executable(program, &effective_path);
+        let resolved_program = if self.config.isolation != IsolationLevel::Off {
+            resolve_windows_executable_for_isolation(program, &effective_path)
+        } else {
+            resolve_windows_executable(program, &effective_path)
+        };
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
 

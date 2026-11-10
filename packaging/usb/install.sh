@@ -6,7 +6,7 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -16,6 +16,8 @@ NAME=""
 ROOT=""
 AUTOSTART=1
 WORKSPACES=1
+ISOLATION=""
+EXPLICIT_ISOLATION=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -26,6 +28,13 @@ while [ $# -gt 0 ]; do
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-workspaces) WORKSPACES=0 ;;
+    --isolation)
+      [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
+      case "$2" in
+        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1 ;;
+        *) fail "--isolation must be off or fs (got: $2)" ;;
+      esac
+      shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
@@ -52,6 +61,17 @@ fi
 [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
+if [ -z "$ISOLATION" ]; then
+  if [ -f "$KIT_DIR/isolation" ]; then
+    BAKED_ISO=$(tr -d ' \r\n\t' < "$KIT_DIR/isolation")
+    case "$BAKED_ISO" in
+      off|fs) ISOLATION=$BAKED_ISO; EXPLICIT_ISOLATION=1 ;;
+      *) fail "the kit's isolation file holds '$BAKED_ISO' (expected 'off' or 'fs')" ;;
+    esac
+  else
+    ISOLATION=fs
+  fi
+fi
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
 
 ARCHIVE=""
@@ -151,7 +171,6 @@ WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi
-ISOLATION=fs
 start_worker() {
   # shellcheck disable=SC2086
   nohup "$BIN" $WORKER_ARGS --isolation "$ISOLATION" >> "$LOG_DIR/worker.log" 2>&1 &
@@ -164,11 +183,13 @@ say "Starting worker '$NAME' ..."
 start_worker
 sleep 4
 if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
-  say "  the worker stopped with --isolation fs (see $LOG_DIR/worker.log); trying --isolation off"
-  ISOLATION=off
-  start_worker
-  sleep 3
-  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
+  if [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
+    say "  the worker stopped with --isolation $ISOLATION (see $LOG_DIR/worker.log); trying --isolation off"
+    ISOLATION=off
+    start_worker
+    sleep 3
+  fi
+  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start with --isolation $ISOLATION; see $LOG_DIR/worker.log"
 fi
 
 # 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
