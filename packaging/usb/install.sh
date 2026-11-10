@@ -6,7 +6,7 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--gpu|--no-gpu]
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -16,6 +16,7 @@ NAME=""
 ROOT=""
 AUTOSTART=1
 WORKSPACES=1
+GPU=""
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -26,6 +27,8 @@ while [ $# -gt 0 ]; do
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-workspaces) WORKSPACES=0 ;;
+    --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
+    --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
@@ -59,11 +62,33 @@ for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
   [ -f "$f" ] && ARCHIVE=$f
 done
 [ -n "$ARCHIVE" ] || fail "no archive for $TARGET in $KIT_DIR/archives"
-ARCHIVE_NAME=$(basename "$ARCHIVE")
+# A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
+# when it finds one. It is installed only when the person at the keyboard agrees (or --gpu).
+GPU_ARCHIVE=""
+for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
+  [ -f "$f" ] && GPU_ARCHIVE=$f
+done
+[ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ] && fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
 
 say "OxideSwarm USB installer"
 say "  system:  $OS $ARCH ($TARGET)"
 say "  folder:  $ROOT"
+
+if [ -n "$GPU_ARCHIVE" ] && [ -z "$GPU" ]; then
+  GPU=0
+  if [ -t 0 ]; then
+    printf "Let the cluster use this computer's GPU as well? [Y/n] "
+    read -r answer || answer=n
+    case "$answer" in [Nn]*) ;; *) GPU=1 ;; esac
+  fi
+fi
+if [ -n "$GPU_ARCHIVE" ] && [ "$GPU" = 1 ]; then
+  ARCHIVE=$GPU_ARCHIVE
+  say "  gpu:     yes (GPU build; the worker offers the GPU it finds)"
+elif [ -n "$GPU_ARCHIVE" ]; then
+  say "  gpu:     no (CPU build; run the installer with --gpu to change that)"
+fi
+ARCHIVE_NAME=$(basename "$ARCHIVE")
 
 # 1. Check the archive against the kit's SHA256SUMS. This catches a corrupted or outdated copy;
 #    it cannot catch a deliberate swap of the whole stick (design 0053, Security).

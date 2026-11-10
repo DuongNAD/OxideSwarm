@@ -218,3 +218,8 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   `workers --json` over P2P. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of
   the P2P ticket, which the legacy argument passing dropped. A P2P-only kit passed end to end under
   PowerShell 5.1 on Windows 11 and from a stick on macOS.
+- 2026-11-10: D2 `--gpu` in kit format v0. During the trial, a laptop with a discrete GPU joined
+  with `GPU: none`, because the kit only held the plain archives. `make_kit.sh --gpu` adds the `-gpu`
+  archive of each target. The installers ask whether this machine's GPU should do work and install
+  the GPU build on yes; without a terminal they keep the plain build. `install.sh --gpu|--no-gpu` and
+  `install.ps1 -Gpu|-NoGpu` answer in advance.

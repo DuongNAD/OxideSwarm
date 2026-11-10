@@ -5,12 +5,14 @@
 # through an HKCU Run entry. The user's own %USERPROFILE%\.oxideswarm is never read or written:
 # the installed worker keeps its state in <install folder>\home.
 #
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Gpu | -NoGpu]
 param(
     [string]$Name = "",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm"),
     [switch]$NoAutostart,
-    [switch]$NoWorkspaces
+    [switch]$NoWorkspaces,
+    [switch]$Gpu,
+    [switch]$NoGpu
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
@@ -26,9 +28,27 @@ if (-not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
 $Archive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target.zip" | Select-Object -First 1
 if (-not $Archive) { Fail "no archive for $Target in the kit" }
+# A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
+# when it finds one. It is installed only when the person at the keyboard agrees (or -Gpu).
+$GpuArchive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target-gpu.zip" | Select-Object -First 1
+if ($Gpu -and $NoGpu) { Fail "-Gpu and -NoGpu cannot be used together" }
+if ($Gpu -and -not $GpuArchive) { Fail "this kit has no GPU build for $Target (make it with make_kit.sh --gpu)" }
 
 Write-Host "OxideSwarm USB installer"
 Write-Host "  folder:  $InstallRoot"
+if ($GpuArchive) {
+    $useGpu = [bool]$Gpu
+    if (-not $Gpu -and -not $NoGpu -and -not [Console]::IsInputRedirected) {
+        $answer = Read-Host "Let the cluster use this computer's GPU as well? [Y/n]"
+        $useGpu = -not ($answer -match '^\s*[Nn]')
+    }
+    if ($useGpu) {
+        $Archive = $GpuArchive
+        Write-Host "  gpu:     yes (GPU build; the worker offers the GPU it finds)"
+    } else {
+        Write-Host "  gpu:     no (CPU build; run install.ps1 -Gpu to change that)"
+    }
+}
 
 # 1. Check the archive against the kit's SHA256SUMS (catches a damaged copy, not a swapped stick).
 $expected = $null

@@ -31,6 +31,13 @@ For a trial on someone else's machine, add `--no-autostart`. The kit then holds 
 file, and its installers add no start at login: the worker stops at logout or shutdown, and nothing
 stays behind once the uninstaller has run.
 
+`--gpu` also puts the `-gpu` archives on the kit (built with `gpu-wgpu`, design 0053 D2). Only that
+build can offer a GPU: the plain build never does, even on a machine with a graphics card. On a kit
+with a GPU build, the installer asks `Let the cluster use this computer's GPU as well? [Y/n]` and
+installs the GPU build on yes. Without a terminal to ask, it installs the plain build. `--gpu` and
+`--no-gpu` (`-Gpu` and `-NoGpu` on Windows) answer the question in advance. The GPU build skips
+software adapters, so on a machine without a GPU it behaves like the plain build.
+
 ## Networks where machines cannot see each other
 
 On school, office or café Wi-Fi, the machines often cannot reach each other directly (client

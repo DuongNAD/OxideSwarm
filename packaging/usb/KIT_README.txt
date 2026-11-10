@@ -18,6 +18,9 @@ The installer:
   4. starts the worker and starts it again at every login,
   5. runs "oxideswarm doctor" and prints the result.
 
+If the stick also holds a GPU build, the installer first asks whether the
+cluster may use this computer's GPU as well. Answer n to keep the GPU out.
+
 It never changes ~/.oxideswarm or any other OxideSwarm installation on the
 computer. To remove it, run "Uninstall OxideSwarm" from the same stick.
 

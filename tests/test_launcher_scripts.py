@@ -579,6 +579,8 @@ exit 0
 
 KIT_TARGETS = ("aarch64-apple-darwin.tar.gz", "x86_64-apple-darwin.tar.gz",
                "x86_64-pc-windows-msvc.zip", "x86_64-unknown-linux-gnu.tar.gz")
+# The release also carries a gpu-wgpu build of each target, named <target>-gpu.<ext>.
+KIT_GPU_TARGETS = tuple(t.replace(".tar.gz", "-gpu.tar.gz").replace(".zip", "-gpu.zip") for t in KIT_TARGETS)
 KIT_TOKEN = "oxs1-join:" + "QUJD" * 10 + "." + "0" * 32
 
 
@@ -597,15 +599,18 @@ class UsbKitTests(unittest.TestCase):
         self.archives = os.path.join(self.tmp, "archives")
         os.makedirs(self.archives)
         sums = []
-        for target in KIT_TARGETS:
+        for target in KIT_TARGETS + KIT_GPU_TARGETS:
             name = "oxideswarm-9.9.9-" + target
             path = os.path.join(self.archives, name)
             if target.endswith(".tar.gz"):
                 stage = os.path.join(self.tmp, "stage", name[:-len(".tar.gz")])
                 os.makedirs(stage)
                 exe = os.path.join(stage, "oxideswarm")
+                binary = FAKE_KIT_BINARY
+                if "-gpu." in target:
+                    binary = binary.replace('echo "rusty-grid 9.9.9"', 'echo "rusty-grid 9.9.9 gpu-build"')
                 with open(exe, "w") as f:
-                    f.write(FAKE_KIT_BINARY)
+                    f.write(binary)
                 os.chmod(exe, 0o755)
                 subprocess.run(["tar", "-czf", path, "-C", os.path.dirname(stage), os.path.basename(stage)], check=True)
             else:
@@ -747,6 +752,98 @@ class UsbKitTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "systemd")))
         worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
         self.assertTrue(worker_calls and "--max-concurrency " in worker_calls[0], worker_calls)
+
+    def install(self, *args):
+        root = os.path.join(self.tmp, "install-root")
+        return root, subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                                     "--no-autostart", "--name", "kit-gpu"] + list(args),
+                                    env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, timeout=90)
+
+    def test_make_kit_adds_the_gpu_builds_only_with_gpu(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        names = os.listdir(os.path.join(self.stick, "OxideSwarm", "archives"))
+        self.assertEqual([n for n in names if "-gpu." in n], [])
+        res = self.make_kit(extra=["--replace", "--gpu"])
+        self.assertEqual(res.returncode, 0, res.stdout)
+        names = os.listdir(os.path.join(self.stick, "OxideSwarm", "archives"))
+        for target in KIT_TARGETS + KIT_GPU_TARGETS:
+            self.assertIn("oxideswarm-9.9.9-" + target, names)
+
+    def test_install_takes_the_gpu_build_with_gpu(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("gpu:     yes", res.stdout)
+        self.assertIn("-gpu.tar.gz (checksum OK)", res.stdout)
+        self.assertIn("gpu-build", res.stdout)
+
+    def test_install_without_a_terminal_keeps_the_cpu_build(self):
+        # Nobody can be asked, so the GPU is not offered unless --gpu says so.
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("gpu:     no", res.stdout)
+        self.assertNotIn("gpu-build", res.stdout)
+
+    def install_on_a_terminal(self, answer):
+        # The question needs a terminal on standard input; a pseudo-terminal stands in for one.
+        import pty
+        root = os.path.join(self.tmp, "install-root")
+        argv = ["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                "--no-autostart", "--name", "kit-tty"]
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve("/bin/bash", argv, self.env())
+        out, sent, deadline = b"", False, time.time() + 90
+        while time.time() < deadline:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if not sent and b"[Y/n]" in out:
+                os.write(fd, answer)
+                sent = True
+        os.close(fd)
+        _, status = os.waitpid(pid, 0)
+        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1, out.decode("utf-8", "replace")
+
+    def test_install_asks_about_the_gpu_on_a_terminal(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        code, out = self.install_on_a_terminal(b"n\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[Y/n]", out)
+        self.assertIn("gpu:     no", out)
+        self.assertNotIn("gpu-build", out)
+        subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "uninstall.sh"), "--install-root",
+                        os.path.join(self.tmp, "install-root"), "--yes"], env=self.env(),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        code, out = self.install_on_a_terminal(b"\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("gpu:     yes", out)
+        self.assertIn("gpu-build", out)
+
+    def test_install_gpu_needs_a_gpu_build_on_the_kit(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no GPU build", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
+        root, res = self.install("--gpu", "--no-gpu")
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_windows_installer_offers_the_gpu_build(self):
+        # Static text: the live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn('-Filter "oxideswarm-*-$Target-gpu.zip"', text)
+        self.assertIn("[Console]::IsInputRedirected", text)
+        self.assertIn("$Archive = $GpuArchive", text)
+        choice = text.index("$Archive = $GpuArchive")
+        check = text.index("Get-FileHash $Archive.FullName")
+        self.assertTrue(choice < check, "the GPU choice must come before the checksum check")
 
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)
