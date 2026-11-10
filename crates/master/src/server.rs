@@ -3738,6 +3738,12 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     &mut transport,
                     v3_peer.as_ref(),
                     &auth_ctx,
+                    &registry,
+                    &queue,
+                    &scheduler_notify,
+                    &waiters,
+                    #[cfg(feature = "dashboard")]
+                    broadcast_tx.as_ref(),
                     &invite_id,
                     &proof,
                     name,
@@ -3776,11 +3782,68 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     Ok(())
 }
 
+const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
+
+#[allow(clippy::too_many_arguments)]
+async fn rollback_enrollment_and_disconnect_workers(
+    auth_ctx: &MasterAuthContext,
+    rollback: members::ApprovedEnrollmentRollback,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) {
+    let member_id = rollback.member_id.clone();
+    let pubkey = rollback.public_key;
+    let released_claims = auth_ctx
+        .members
+        .rollback_approved_enrollment(rollback)
+        .unwrap_or_default();
+    let still_has_worker_role = auth_ctx
+        .members
+        .get(&pubkey)
+        .is_some_and(|m| m.has_worker_role());
+    if !still_has_worker_role {
+        let mut wids = released_claims;
+        for wid in registry.release_workers_owned_by(&member_id).await {
+            if !wids.contains(&wid) {
+                wids.push(wid);
+            }
+        }
+        for wid in &wids {
+            registry.release_worker_owner(wid).await;
+            let _ = handle_worker_disconnect_with_broadcast(
+                registry,
+                queue,
+                scheduler_notify,
+                Some(waiters),
+                wid,
+                None,
+                "Enrollment confirmation declined by joining machine",
+                true,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_enroll_connection<S>(
     transport: &mut MessageTransport<S>,
     v3_peer: Option<&AuthenticatedV3Peer>,
     auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
     invite_id: &str,
     proof: &rusty_grid_core::noise_auth::RedactedBytes32,
     name: String,
@@ -3863,6 +3926,12 @@ async fn handle_enroll_connection<S>(
             wait_for_pending_enrollment(
                 transport,
                 auth_ctx,
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
                 &peer.member_id,
                 pending_id,
                 decision_rx,
@@ -3891,9 +3960,17 @@ async fn handle_enroll_connection<S>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_pending_enrollment<S>(
     transport: &mut MessageTransport<S>,
     auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
     member_id: &str,
     pending_id: String,
     mut decision_rx: tokio::sync::oneshot::Receiver<members::PendingDecision>,
@@ -3952,16 +4029,29 @@ async fn wait_for_pending_enrollment<S>(
                                 member_id = %member_id,
                                 "Joining machine disconnected while sending Enrolled; rolling back enrollment"
                             );
-                            let _ = auth_ctx.members.rollback_approved_enrollment(*rollback);
+                            rollback_enrollment_and_disconnect_workers(
+                                auth_ctx,
+                                *rollback,
+                                registry,
+                                queue,
+                                scheduler_notify,
+                                waiters,
+                                #[cfg(feature = "dashboard")]
+                                broadcast_tx,
+                            )
+                            .await;
                             break;
                         }
+                        let confirm_deadline = tokio::time::Instant::now()
+                            + Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS);
                         let confirm_res = tokio::time::timeout_at(
-                            enroll_deadline,
+                            confirm_deadline,
                             transport.recv_msg::<ClientMessage>(),
                         )
                         .await;
                         match confirm_res {
                             Ok(Ok(Some(ClientMessage::Hello))) => {
+                                auth_ctx.members.confirm_approved_enrollment(&rollback);
                                 info!(
                                     pending_id = %pending_id,
                                     member_id = %member_id,
@@ -3982,7 +4072,17 @@ async fn wait_for_pending_enrollment<S>(
                                     member_id = %member_id,
                                     "Joining machine declined confirmation or disconnected after approval; rolling back enrollment"
                                 );
-                                let _ = auth_ctx.members.rollback_approved_enrollment(*rollback);
+                                rollback_enrollment_and_disconnect_workers(
+                                    auth_ctx,
+                                    *rollback,
+                                    registry,
+                                    queue,
+                                    scheduler_notify,
+                                    waiters,
+                                    #[cfg(feature = "dashboard")]
+                                    broadcast_tx,
+                                )
+                                .await;
                                 let _ = send_client_response(
                                     transport,
                                     &ClientResponse::EnrollRejected {

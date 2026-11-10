@@ -540,6 +540,21 @@ impl WorkerRegistry {
         inner.owner_member_ids.remove(worker_id);
     }
 
+    /// Releases and returns all `worker_id`s currently recorded as owned by `member_id`.
+    pub async fn release_workers_owned_by(&self, member_id: &str) -> Vec<Uuid> {
+        let mut inner = self.inner.write().await;
+        let mut released = Vec::new();
+        inner.owner_member_ids.retain(|wid, owner| {
+            if owner.as_deref() == Some(member_id) {
+                released.push(*wid);
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
+
     /// Attaches the receive-side liveness clock of `session_id`'s connection.
     pub async fn set_rx_clock(&self, worker_id: &Uuid, session_id: u64, clock: Arc<RxClock>) {
         let mut inner = self.inner.write().await;
