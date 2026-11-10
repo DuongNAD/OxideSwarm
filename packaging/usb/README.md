@@ -79,8 +79,13 @@ Each installer does the following, without administrator rights:
    changed.
 4. It starts the worker:
    - with the machine's name and `--no-portal`;
-   - with `--max-concurrency` set to half of the CPU cores (at least 1), so the machine stays
-     responsive for its owner;
+   - with `--max-concurrency` set to the logical processors of the performance cores, at most half
+     of all processors and at least 1 (USB-4). Where the core types cannot be read, a machine with a
+     battery gets a quarter of its processors. `--slots N` (`install.sh`) or `-Slots N`
+     (`install.ps1`) sets the number; the installer prints the value it chose, and an update keeps
+     a value set this way. Measured on 2026-11-10: an Intel Core i7-1355U laptop (2 performance
+     cores) ran 2, 4 and 6 concurrent tasks at 2.9 s, 12.5 s and 39.6 s each, so it now gets 4
+     slots instead of 6.
    - with `--workspaces` when `cargo` is on `PATH`;
    - with `--isolation fs` on macOS and Linux (falling back to `off` only when `fs` was the default
      and the host kernel cannot start an isolated worker; an explicit `--isolation fs` or baked `fs`

@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "ERROR: $InstallRoot does n
 # Windows PowerShell 5.1 follows junctions while it deletes.
 $rootItem = Get-Item -LiteralPath $InstallRoot -Force
 if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-Host "ERROR: $InstallRoot is a link; not touching it." -ForegroundColor Red; exit 1 }
-$isDefault = $InstallRoot -eq (Join-Path $env:LOCALAPPDATA 'OxideSwarm').TrimEnd('\')
+$isDefault = [string]::Equals($InstallRoot, [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm')).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
 if (-not $isDefault -and -not (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install'))) {
     Write-Host "ERROR: $InstallRoot has no .oxideswarm-usb-install marker; not touching it." -ForegroundColor Red; exit 1
 }
