@@ -13,7 +13,8 @@ works a limited number of times.
 | `install.sh`, `Install OxideSwarm.command` | Install on Linux and macOS |
 | `install.ps1`, `Install OxideSwarm.cmd` | Install on Windows |
 | `Update OxideSwarm.command`, `Update OxideSwarm.cmd` | Update an install in place (`install.sh --update`, `install.ps1 -Update`) |
-| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added |
+| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added (on Windows, also revokes any `oxideswarm.toolchain` ACL grants recorded in `<folder>\home\windows_acl_grants.txt` via `revoke-isolation-acls.ps1` and removes `%TEMP%\oxideswarm-usb`) |
+| `revoke-isolation-acls.ps1` | Copied from `windows/revoke-isolation-acls.ps1` so `uninstall.ps1` can revoke Windows isolation ACLs cleanly |
 | `KIT_README.txt` | Becomes `README.txt` on the stick |
 
 ## Make a kit
@@ -30,7 +31,9 @@ existing kit.
 
 For a trial on someone else's machine, add `--no-autostart`. The kit then holds a `no-autostart`
 file, and its installers add no start at login: the worker stops at logout or shutdown, and nothing
-stays behind once the uninstaller has run.
+stays behind once the uninstaller has run. `--isolation off|fs` bakes a default worker isolation
+mode into the kit (`isolation` file) so double-clicking `Install OxideSwarm.cmd` on Windows or
+`Install OxideSwarm.command` on macOS uses that mode without command-line flags ([design 0055](../../docs/design/0055-usb-kit-windows-isolation.md)).
 
 `--gpu` also puts the `-gpu` archives on the kit (built with `gpu-wgpu`, design 0053 D2). Only that
 build can offer a GPU: the plain build never does, even on a machine with a graphics card. On a kit
@@ -79,15 +82,33 @@ Each installer does the following, without administrator rights:
    - with `--max-concurrency` set to half of the CPU cores (at least 1), so the machine stays
      responsive for its owner;
    - with `--workspaces` when `cargo` is on `PATH`;
-   - with `--isolation fs` on macOS and Linux, falling back to `off` if the worker cannot start with
-     it.
+   - with `--isolation fs` on macOS and Linux (falling back to `off` only when `fs` was the default
+     and the host kernel cannot start an isolated worker; an explicit `--isolation fs` or baked `fs`
+     in the kit's `isolation` file fails instead of falling back), and `--isolation off` by default
+     on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs` when opted in; on Windows,
+     `install.ps1` and `start-worker.vbs` set `OXIDESWARM_HOME=<folder>\home`,
+     `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`, and
+     `RUSTY_GRID_SANDBOX_BASE_DIR=%TEMP%\oxideswarm-usb\sandboxes` (`<folder>\work` for a folder
+     outside `%LOCALAPPDATA%`), while `start-worker.vbs` also
+     sets `HOME=<folder>\home` — so worker child processes read `HOME`-based git/ssh config from
+     `<folder>\home` in both `off` and `fs` modes — and explicit `RUSTUP_HOME` / `CARGO_HOME` so
+     `oxideswarm.toolchain` ACL grants are recorded in `<folder>\home\windows_acl_grants.txt` on
+     release **0.1.1+** without touching `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes
+     them before deleting `<folder>` and `%TEMP%\oxideswarm-usb`.
+     Note: release **0.1.1** predates `FEAT-3d` and `BUG-18`, so under `-Isolation fs` on `0.1.1`,
+     `install.ps1` omits `--workspaces` and a bare `whoami` task resolves to `Git\usr\bin\whoami.exe`
+     and exits `0xC0000142` unless invoked as `C:\Windows\System32\whoami.exe`; release **0.1.2+**
+     supports `--workspaces` under `-Isolation fs` and resolves bare `whoami` to
+     `%SystemRoot%\System32\whoami.exe`).
 5. It waits until `oxideswarm workers --json` lists the worker as connected.
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.
 
 `install.sh --no-autostart` and `install.ps1 -NoAutostart` skip the start at login, as does a
-`no-autostart` file in the kit. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
-Windows) change the defaults.
+`no-autostart` file in the kit. `--isolation off|fs` (`-Isolation off|fs` on Windows) overrides the
+default or baked `isolation` file. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
+Windows) change the defaults. Both `install.ps1` and `uninstall.ps1` declare `[CmdletBinding()]` so
+unknown parameters fail immediately.
 
 ### Update a machine
 
@@ -120,8 +141,8 @@ the folder in advance. A folder outside `%LOCALAPPDATA%`:
 - is limited to the current user, `SYSTEM` and `Administrators` (`icacls /inheritance:r`) before
   anything is written into it, because a new folder at the root of a data drive lets every local
   account change its content;
-- also holds the task folders and the file cache (`--sandbox-base-dir <folder>\work`) and the
-  workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
+- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`)
+  and the workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
   user's cache folder on drive C.
 
 The installer records the folder in `HKCU\Software\OxideSwarm\UsbKit`, and `uninstall.ps1` removes

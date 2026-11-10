@@ -1,9 +1,11 @@
-# OxideSwarm USB uninstaller for Windows (kit format v0).
-# Stops the worker this kit installed, removes its HKCU Run entry and its folder (binaries, the
-# cluster secret it received, logs, task folders and file cache). Nothing else is touched. Without
-# -InstallRoot it removes the install the installer recorded in HKCU (another drive included), else
-# %LOCALAPPDATA%\OxideSwarm.
+# OxideSwarm USB uninstaller for Windows (kit format v0, design 0053 / 0055).
+# Stops the worker this kit installed, revokes any oxideswarm.toolchain ACL grants recorded in its
+# manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its folder
+# (binaries, the cluster secret it received, logs, task folders and file cache), and
+# %TEMP%\oxideswarm-usb. Nothing else is touched. Without -InstallRoot it removes the install the
+# installer recorded in HKCU (another drive included), else %LOCALAPPDATA%\OxideSwarm.
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-Yes]
+[CmdletBinding()]
 param(
     [string]$InstallRoot = "",
     [switch]$Yes
@@ -23,20 +25,78 @@ if (-not $Yes) {
 }
 # The start at logon belongs to this install only if it runs this install's launcher.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
 $run = $null
-try { $run = (Get-ItemProperty -Path $runKey -Name 'OxideSwarmUsbWorker' -ErrorAction Stop).OxideSwarmUsbWorker } catch { $run = $null }
+try { $run = (Get-ItemProperty -Path $runKey -Name $runValueName -ErrorAction Stop).$runValueName } catch { $run = $null }
 if ($run -and $run.IndexOf($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-    Remove-ItemProperty -Path $runKey -Name 'OxideSwarmUsbWorker'
+    Remove-ItemProperty -Path $runKey -Name $runValueName
 }
 # Stop the worker by the exact path of this install's binary (never by process name).
+$pidsToWait = @()
 Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $Exe } | ForEach-Object {
+    $pidsToWait += $_.ProcessId
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
-Start-Sleep -Seconds 2
+for ($i = 0; $i -lt 20; $i++) {
+    $stillAlive = @($pidsToWait | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($stillAlive.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 250
+}
+Start-Sleep -Seconds 1
+
+# Revoke any oxideswarm.toolchain ACL grants recorded in this kit's manifest before deleting $InstallRoot.
+$Manifest = Join-Path $InstallRoot 'home\windows_acl_grants.txt'
+$RevokeScript = $null
+foreach ($cand in @(
+    (Join-Path $PSScriptRoot 'revoke-isolation-acls.ps1'),
+    (Join-Path $InstallRoot 'revoke-isolation-acls.ps1'),
+    (Join-Path $PSScriptRoot '..\..\windows\revoke-isolation-acls.ps1')
+)) {
+    if ($cand -and (Test-Path -LiteralPath $cand)) {
+        $RevokeScript = $cand
+        break
+    }
+}
+if (Test-Path -LiteralPath $Manifest) {
+    if (-not $RevokeScript) {
+        Write-Host "ERROR: ACL grant manifest found at $Manifest, but revoke-isolation-acls.ps1 was not found; keeping $InstallRoot and $Manifest." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Revoking isolation ACL grants recorded in $Manifest ..."
+    $global:LASTEXITCODE = 0
+    & $RevokeScript -ManifestPath $Manifest -RemoveManifest
+    if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $Manifest)) {
+        Write-Host "ERROR: Isolation ACL revocation did not complete (exit code $LASTEXITCODE); keeping $InstallRoot and $Manifest." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host "No isolation ACL grant manifest in $Manifest (nothing to revoke)."
+}
+
 Remove-Item -Recurse -Force -LiteralPath $InstallRoot
 if ($pointer -and $pointer -eq $InstallRoot) {
     Remove-Item -Path $PointerKey -Force
     $parent = Get-Item -Path 'HKCU:\Software\OxideSwarm' -ErrorAction SilentlyContinue
     if ($parent -and $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0) { Remove-Item -Path 'HKCU:\Software\OxideSwarm' }
+}
+$UsbTempRoot = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb'
+if (Test-Path -LiteralPath $UsbTempRoot) {
+    $usbTempItem = Get-Item -LiteralPath $UsbTempRoot -Force
+    if (($usbTempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Warning "Refusing to remove reparse point at $UsbTempRoot"
+    } else {
+        $hasReparseDescendant = $false
+        foreach ($child in Get-ChildItem -LiteralPath $UsbTempRoot -Recurse -Force -ErrorAction SilentlyContinue) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $hasReparseDescendant = $true
+                break
+            }
+        }
+        if ($hasReparseDescendant) {
+            Write-Warning "Refusing to remove $UsbTempRoot because it contains a reparse point."
+        } else {
+            Remove-Item -LiteralPath $UsbTempRoot -Recurse -Force
+        }
+    }
 }
 Write-Host "Removed. The cluster owner can also remove this machine from the cluster."

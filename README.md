@@ -758,7 +758,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (`--secret-file`, mode `0600`; preferred over inline hex) |
 | `RUSTY_GRID_MASTER_KEY` | Worker, CLI & MCP | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 Noise `IK` authentication (`--master-key`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file (`--config`) |
-| `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
+| `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, `windows_acl_grants.txt`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
 | `RUST_LOG` | Global | Standard `tracing_subscriber::EnvFilter` directive overriding `--verbose` / `--quiet` |
 
 #### Tier B: Master Coordinator & Scheduling

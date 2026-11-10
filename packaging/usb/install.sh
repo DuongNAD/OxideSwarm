@@ -6,11 +6,12 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--gpu|--no-gpu] [--update]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
+#                   [--gpu|--no-gpu] [--update]
 #
 # --update (what "Update OxideSwarm.command" runs) updates an existing install in place: it keeps
-# its folder, name, GPU choice, cluster membership and start at login, asks nothing, does not join
-# again, and only replaces the binaries and restarts the worker.
+# its folder, name, GPU choice, isolation, cluster membership and start at login, asks nothing,
+# does not join again, and only replaces the binaries and restarts the worker.
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -22,6 +23,9 @@ AUTOSTART=1
 WORKSPACES=1
 GPU=""
 UPDATE=0
+ISOLATION=""
+EXPLICIT_ISOLATION=0
+ISO_SET_BY_FLAG=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -35,6 +39,13 @@ while [ $# -gt 0 ]; do
     --update) UPDATE=1 ;;
     --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
     --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
+    --isolation)
+      [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
+      case "$2" in
+        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1; ISO_SET_BY_FLAG=1 ;;
+        *) fail "--isolation must be off or fs (got: $2)" ;;
+      esac
+      shift ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
@@ -61,6 +72,17 @@ fi
 [ "$UPDATE" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
+if [ -z "$ISOLATION" ]; then
+  if [ -f "$KIT_DIR/isolation" ]; then
+    BAKED_ISO=$(tr -d ' \r\n\t' < "$KIT_DIR/isolation")
+    case "$BAKED_ISO" in
+      off|fs) ISOLATION=$BAKED_ISO; EXPLICIT_ISOLATION=1 ;;
+      *) fail "the kit's isolation file holds '$BAKED_ISO' (expected 'off' or 'fs')" ;;
+    esac
+  else
+    ISOLATION=fs
+  fi
+fi
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
 
 PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
@@ -80,6 +102,8 @@ if [ "$UPDATE" = 1 ]; then
         name) [ -n "$NAME" ] || NAME=$value ;;
         gpu) [ -n "$GPU" ] || case "$value" in 0|1) GPU=$value ;; esac ;;
         workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
+        # The isolation the worker ran with is kept, and an update never weakens it silently.
+        isolation) [ "$ISO_SET_BY_FLAG" = 1 ] || case "$value" in off|fs) ISOLATION=$value; EXPLICIT_ISOLATION=1 ;; esac ;;
       esac
     done < "$ROOT/kit-install.conf"
   fi
@@ -227,7 +251,6 @@ WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi
-ISOLATION=fs
 start_worker() {
   # shellcheck disable=SC2086
   nohup "$BIN" $WORKER_ARGS --isolation "$ISOLATION" >> "$LOG_DIR/worker.log" 2>&1 &
@@ -240,11 +263,13 @@ say "Starting worker '$NAME' ..."
 start_worker
 sleep 4
 if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
-  say "  the worker stopped with --isolation fs (see $LOG_DIR/worker.log); trying --isolation off"
-  ISOLATION=off
-  start_worker
-  sleep 3
-  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
+  if [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
+    say "  the worker stopped with --isolation $ISOLATION (see $LOG_DIR/worker.log); trying --isolation off"
+    ISOLATION=off
+    start_worker
+    sleep 3
+  fi
+  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start with --isolation $ISOLATION; see $LOG_DIR/worker.log"
 fi
 
 # 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
@@ -265,10 +290,10 @@ while [ $i -lt 30 ]; do
 done
 [ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
 say "  connected (isolation: $ISOLATION)"
-# What an update keeps: the name, the build and the workspace choice.
+# What an update keeps: the name, the build, the workspace choice and the isolation.
 GPU_USED=0
 if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
-printf 'name=%s\ngpu=%s\nworkspaces=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" > "$ROOT/kit-install.conf"
+printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
 if [ "$AUTOSTART" = 1 ]; then

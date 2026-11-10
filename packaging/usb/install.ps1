@@ -10,10 +10,12 @@
 # the file cache too, and the installer limits it to this user, SYSTEM and Administrators.
 #
 # -Update (what "Update OxideSwarm.cmd" runs) updates an existing install in place: it keeps its
-# folder, name, GPU choice, cluster membership and start at logon, asks nothing, does not join again,
-# and only replaces the binaries and restarts the worker.
+# folder, name, GPU choice, isolation, cluster membership and start at logon, asks nothing, does
+# not join again, and only replaces the binaries and restarts the worker.
 #
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Gpu | -NoGpu] [-Update]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Isolation off|fs]
+#                                                 [-Gpu | -NoGpu] [-Update]
+[CmdletBinding()]
 param(
     [string]$Name = "",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm"),
@@ -21,7 +23,9 @@ param(
     [switch]$NoWorkspaces,
     [switch]$Gpu,
     [switch]$NoGpu,
-    [switch]$Update
+    [switch]$Update,
+    [ValidateSet('off', 'fs')]
+    [string]$Isolation = ""
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
@@ -29,12 +33,31 @@ function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 $DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
 $PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
+function FailAfterStart($msg) {
+    if ($Isolation -eq 'fs') {
+        Fail "$msg (if the worker already granted isolation ACLs, run 'Uninstall OxideSwarm.cmd' or uninstall.ps1 to revert them)"
+    }
+    Fail $msg
+}
 
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
 $TokenFile = Join-Path $Kit 'join.token'
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
+$IsolationFile = Join-Path $Kit 'isolation'
+if (-not $Isolation) {
+    if (Test-Path $IsolationFile) {
+        $bakedIso = (Get-Content -Raw $IsolationFile).Trim().ToLower()
+        if ($bakedIso -notin @('off', 'fs')) { Fail "the kit's isolation file holds '$bakedIso' (expected 'off' or 'fs')" }
+        $Isolation = $bakedIso
+    } else {
+        $Isolation = 'off'
+    }
+} else {
+    $Isolation = $Isolation.ToLower()
+}
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
 if (-not $Update -and -not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
@@ -66,10 +89,11 @@ if ($Update) {
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
     if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
+    if (-not $PSBoundParameters.ContainsKey('Isolation') -and $settings['isolation'] -in @('off', 'fs')) { $Isolation = $settings['isolation'] }
     # The start at logon stays as it is: only an install that has one gets it again.
     if (-not $PSBoundParameters.ContainsKey('NoAutostart')) {
         $run = $null
-        try { $run = (Get-ItemProperty -Path $RunKey -Name 'OxideSwarmUsbWorker' -ErrorAction Stop).OxideSwarmUsbWorker } catch { $run = $null }
+        try { $run = (Get-ItemProperty -Path $RunKey -Name $runValueName -ErrorAction Stop).$runValueName } catch { $run = $null }
         $NoAutostart = -not ($run -and $run.IndexOf($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
     }
 }
@@ -233,6 +257,15 @@ try {
         $f = Join-Path $src.DirectoryName $b
         if (Test-Path $f) { Copy-Item $f (Join-Path $Bin $b) -Force }
     }
+    foreach ($revCand in @(
+        (Join-Path $Kit 'revoke-isolation-acls.ps1'),
+        (Join-Path $Kit '..\..\windows\revoke-isolation-acls.ps1')
+    )) {
+        if (Test-Path -LiteralPath $revCand) {
+            Copy-Item -LiteralPath $revCand -Destination (Join-Path $InstallRoot 'revoke-isolation-acls.ps1') -Force
+            break
+        }
+    }
 } finally {
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
 }
@@ -242,7 +275,15 @@ if ($LASTEXITCODE -ne 0) { Fail "the unpacked binary does not run on this machin
 Write-Host "  binary:  $version"
 
 # Every command below keeps its state in $State and runs from $InstallRoot.
+$GrantLog = Join-Path $State 'windows_acl_grants.txt'
+# Task folders and the file cache: inside a folder outside %LOCALAPPDATA% (private, see step 2), else
+# in the kit's own temp folder, which uninstall.ps1 removes.
+$SandboxBase = if ($PrivateRoot) { Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes' } else { Join-Path $InstallRoot 'work' }
+$RustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
+$CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:OXIDESWARM_HOME = $State
+$env:RUSTY_GRID_ACL_GRANT_LOG = $GrantLog
+$env:RUSTY_GRID_SANDBOX_BASE_DIR = $SandboxBase
 Set-Location $InstallRoot
 
 # 4. Join: the token goes in on standard input only. An update keeps the existing membership.
@@ -286,11 +327,12 @@ if ($ticket) {
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
 # Use at most half of the CPU cores, so the machine stays responsive for its owner.
 $slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
-$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots"
-# Outside %LOCALAPPDATA%, the task folders, the file cache and the workspaces stay in the install folder.
-if (-not $PrivateRoot) { $workerArgs += ' --sandbox-base-dir "' + (Join-Path $InstallRoot 'work') + '"' }
-if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+$workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
+# Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
+$supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
+if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
     $workerArgs += " --workspaces"
+    # Outside %LOCALAPPDATA% the workspaces stay in the install folder, like the task folders ($SandboxBase).
     if (-not $PrivateRoot) { $workerArgs += ' --workspace-root "' + (Join-Path $InstallRoot 'workspaces') + '"' }
 }
 $log = Join-Path $LogDir 'worker.log'
@@ -302,6 +344,11 @@ $cmdLine = 'cmd /c ""' + $Exe + '" ' + $workerArgs + ' >> "' + $log + '" 2>&1"'
 @(
     'Set sh = CreateObject("WScript.Shell")',
     ('sh.Environment("Process")("OXIDESWARM_HOME") = "' + $State + '"'),
+    ('sh.Environment("Process")("HOME") = "' + $State + '"'),
+    ('sh.Environment("Process")("RUSTUP_HOME") = "' + $RustupHome + '"'),
+    ('sh.Environment("Process")("CARGO_HOME") = "' + $CargoHome + '"'),
+    ('sh.Environment("Process")("RUSTY_GRID_ACL_GRANT_LOG") = "' + $GrantLog + '"'),
+    ('sh.Environment("Process")("RUSTY_GRID_SANDBOX_BASE_DIR") = "' + $SandboxBase + '"'),
     ('sh.CurrentDirectory = "' + $InstallRoot + '"'),
     ('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
 ) | Set-Content -Path $vbs -Encoding ASCII
@@ -314,13 +361,13 @@ $workerPid = $null
 for ($i = 0; $i -lt 10 -and -not $workerPid; $i++) {
     Start-Sleep -Seconds 1
     $workerPid = Get-CimInstance Win32_Process |
-        Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -like '* worker *' } |
+        Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -match '(?:oxideswarm|rusty-grid)(?:\.exe)?["'']?\s+(worker)(\s|$)' } |
         Select-Object -First 1 -ExpandProperty ProcessId
 }
-if (-not $workerPid) { Fail "the worker did not start; see $log" }
+if (-not $workerPid) { FailAfterStart "the worker did not start; see $log" }
 $workerPid | Set-Content $pidFile
 Start-Sleep -Seconds 3
-if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { Fail "the worker stopped right away; see $log" }
+if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { FailAfterStart "the worker stopped right away; see $log" }
 
 # 7. Wait until the master lists it. The checks run without log lines: release 0.1.x writes its
 # informational logs to standard output, which would break the JSON parsing below. The worker
@@ -334,17 +381,17 @@ for ($i = 0; $i -lt 30; $i++) {
     if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
     Start-Sleep -Seconds 1
 }
-if (-not $connected) { Fail "the worker runs but the master does not list it yet; see $log" }
-Write-Host "  connected"
-# What an update keeps: the name, the build and the workspace choice.
+if (-not $connected) { FailAfterStart "the worker runs but the master does not list it yet; see $log" }
+Write-Host "  connected (isolation: $Isolation)"
+# What an update keeps: the name, the build, the workspace choice and the isolation.
 $builtWithGpu = if ($GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
 $withWorkspaces = if ($NoWorkspaces) { '0' } else { '1' }
-Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces")
+Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation")
 
 # 8. Start at logon (current user only, no administrator rights).
 if (-not $NoAutostart) {
-    Set-ItemProperty -Path $RunKey -Name 'OxideSwarmUsbWorker' -Value ('wscript.exe "' + $vbs + '"')
-    Write-Host "  autostart: HKCU Run entry OxideSwarmUsbWorker"
+    Set-ItemProperty -Path $RunKey -Name $runValueName -Value ('wscript.exe "' + $vbs + '"')
+    Write-Host "  autostart: HKCU Run entry $runValueName"
 } else {
     Write-Host "  autostart: skipped (-NoAutostart)"
 }

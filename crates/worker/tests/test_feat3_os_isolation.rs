@@ -5915,6 +5915,40 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             res.stderr_str()
         );
     }
+
+    /// BUG-18 regression test: bare `whoami` (`TaskSpec::Command { program: "whoami", .. }`)
+    /// under `--isolation fs` must resolve to `%SystemRoot%\System32\whoami.exe` rather than
+    /// `C:\Program Files\Git\usr\bin\whoami.exe` (`msys-2.0.dll`, which fails with
+    /// `0xC0000142` / `STATUS_DLL_INIT_FAILURE` inside a Windows AppContainer) and exit 0.
+    #[tokio::test]
+    async fn test_bare_whoami_succeeds_under_isolation_fs() {
+        require_appcontainer!();
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            r"C:\Program Files\Git\usr\bin;C:\Windows\System32;C:\Windows".to_string(),
+        );
+        let task = Task::new(
+            TaskSpec::Command {
+                program: "whoami".into(),
+                args: Vec::new(),
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let res = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success() && !res.stdout_str().trim().is_empty(),
+            "bare `whoami` under IsolationLevel::Fs must exit 0 with username output: exit_code={}, error={:?}, stdout={:?}, stderr={:?}",
+            res.exit_code,
+            res.error,
+            res.stdout_str(),
+            res.stderr_str()
+        );
+    }
 }
 
 /// Where there is no implementation on an unsupported OS, isolation is refused

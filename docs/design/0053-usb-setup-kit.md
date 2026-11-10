@@ -218,6 +218,13 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   `workers --json` over P2P. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of
   the P2P ticket, which the legacy argument passing dropped. A P2P-only kit passed end to end under
   PowerShell 5.1 on Windows 11 and from a stick on macOS.
+- 2026-11-10: Opt-in Windows isolation in the kit ([design 0055](0055-usb-kit-windows-isolation.md),
+  `USB-2`): `make_kit.sh --isolation off|fs` bakes a kit default into `isolation` and ships
+  `revoke-isolation-acls.ps1`, `install.ps1` accepts `-Isolation off|fs` (default `off`) with
+  `[CmdletBinding()]`, `acl_grant_manifest_path` honours `OXIDESWARM_HOME` so an isolated USB-kit
+  worker writes `<InstallRoot>\home\windows_acl_grants.txt` and never touches
+  `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes all recorded `oxideswarm.toolchain` ACL
+  grants before deleting `<InstallRoot>`.
 - 2026-11-10: D2 `--gpu` in kit format v0. During the trial, a laptop with a discrete GPU joined
   with `GPU: none`, because the kit only held the plain archives. `make_kit.sh --gpu` adds the `-gpu`
   archive of each target. The installers ask whether this machine's GPU should do work and install
@@ -227,7 +234,7 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   cache in `%TEMP%` on drive C even with `-InstallRoot`. `install.ps1` now offers each fixed NTFS or
   ReFS drive other than the kit's, and checks a folder given with `-InstallRoot` the same way. A
   folder outside `%LOCALAPPDATA%` is limited to the user, `SYSTEM` and `Administrators` before
-  anything is written into it, and the worker gets `--sandbox-base-dir` and `--workspace-root`
+  anything is written into it, and the worker gets its sandbox base and `--workspace-root`
   inside it. The folder is recorded in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1`. The
   worker itself does not check the permissions of a custom sandbox base on Windows
   (`ensure_private_dir` acts on Unix only); that is a separate fix.

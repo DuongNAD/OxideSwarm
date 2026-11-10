@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `2f22c48` plus `ENROLL-1b`: 68 items Implemented, 5 Partial and 35 Planned. Five items
+On 2026-11-10, at `master` `2f22c48` plus USB-2, BUG-18 and ENROLL-1b: 70 items Implemented, 5 Partial and 35 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -153,6 +153,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
+| BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | (design 0055), (open) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -221,6 +222,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 (open) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
+| USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | (design 0055), (open) |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
@@ -1851,6 +1853,25 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
   `Endpoint dropped without calling` line in `stderr`, and parses the `stdout` of `workers --json`
   as JSON.
 
+### BUG-18: Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin`
+
+- **Evidence:** Reproduced on 2026-11-10 during the Windows USB kit isolation check: `oxideswarm submit -- whoami` against a worker started with `--isolation fs` failed with exit code `-1073741502` (`0xC0000142` / `STATUS_DLL_INIT_FAILURE`).
+- **Problem:** `augment_windows_path` and `resolve_windows_executable` (`crates/core/src/capabilities.rs:1602,1699`) checked `C:\Program Files\Git\usr\bin` ahead of `%SystemRoot%\System32`. Bare `whoami` therefore resolved to MSYS2's `C:\Program Files\Git\usr\bin\whoami.exe`, which links `msys-2.0.dll`. Inside a Win32 AppContainer, `msys-2.0.dll` fails during `DllMain(DLL_PROCESS_ATTACH)` Cygwin shared-heap initialization (`0xC0000142`), whereas `C:\Windows\System32\whoami.exe` is a native Win32 binary that exits `0`.
+- **Do:** Add `augment_windows_path_for_isolation` and `resolve_windows_executable_for_isolation` in `crates/core/src/capabilities.rs` and call them from `TaskRunner::execute_process_supervised_with_workspace` (`crates/worker/src/runner.rs`) when `self.config.isolation != IsolationLevel::Off`, so native directories (`%SystemRoot%\System32`, `Git\cmd`, `Git\bin`) are searched before MSYS2 `usr\bin` directories (`Git\usr\bin`, `msys64\usr\bin`).
+- **Done when:** `test_windows_executable_resolution_for_isolation_prefers_system32_over_msys_usr_bin` in `crates/core/src/capabilities.rs` and `test_bare_whoami_succeeds_under_isolation_fs` in `crates/worker/tests/test_feat3_os_isolation.rs` pass, and a live `oxideswarm submit -- whoami` against a Windows worker running with `--isolation fs` exits `0`.
+
+### USB-2: Opt-in Windows isolation in the USB kit
+
+- **Evidence:** Reproduced on 2026-11-10 ([design 0055](design/0055-usb-kit-windows-isolation.md)).
+- **Problem:**
+  1. `windows::acl_grant_manifest_path` in `crates/worker/src/isolation.rs` checked only `RUSTY_GRID_ACL_GRANT_LOG` and then `<user_home>/.oxideswarm/windows_acl_grants.txt`, ignoring `OXIDESWARM_HOME`. Starting a USB-kit worker with `--isolation fs` on Windows therefore wrote `windows_acl_grants.txt` into the machine owner's `%USERPROFILE%\.oxideswarm`.
+  2. `packaging/usb/install.ps1` had no `-Isolation` flag, `packaging/usb/make_kit.sh` could not bake an isolation mode into the kit, `packaging/usb/uninstall.ps1` deleted `$InstallRoot` without revoking `oxideswarm.toolchain` ACL grants on `%RUSTUP_HOME%` and `%CARGO_HOME%`, and neither `install.ps1` nor `uninstall.ps1` had `[CmdletBinding()]` to reject unknown parameters.
+- **Do:**
+  1. Update `windows::acl_grant_manifest_path` (and `windows/revoke-isolation-acls.ps1`) to use precedence `RUSTY_GRID_ACL_GRANT_LOG > <OXIDESWARM_HOME>/windows_acl_grants.txt > ~/.oxideswarm/windows_acl_grants.txt`, with unit test `test_acl_grant_manifest_path_precedence_honours_oxideswarm_home`.
+  2. Add `[CmdletBinding()]` to `packaging/usb/install.ps1` and `packaging/usb/uninstall.ps1`; add `-Isolation off|fs` (default `off`) to `install.ps1`, `--isolation off|fs` (default `fs`) to `install.sh`, and `--isolation off|fs` to `make_kit.sh` (writing `$KIT/isolation` and copying `windows/revoke-isolation-acls.ps1` into `$KIT/revoke-isolation-acls.ps1`).
+  3. Update `packaging/usb/uninstall.ps1` to stop the worker and run `revoke-isolation-acls.ps1` against `$InstallRoot\home\windows_acl_grants.txt` before deleting `$InstallRoot`.
+- **Done when:** `tests/test_launcher_scripts.py` passes, and a live Windows install with `-Isolation fs` runs the trial-guide checks, revokes all `oxideswarm.toolchain` ACEs on `uninstall.ps1`, and leaves `%USERPROFILE%\.oxideswarm` untouched.
+
 ## Phase 9: an open compute network
 
 Draft, added on 2026-11-10 from Phase H of [ROADMAP.md](ROADMAP.md). The architecture and the stage
@@ -2119,6 +2140,15 @@ Add one dated line per finished item, newest last.
   `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
   `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
   Index counts are now 68 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented USB-2 and BUG-18 ([design 0055](design/0055-usb-kit-windows-isolation.md), open):
+  `windows::acl_grant_manifest_path` and `windows/revoke-isolation-acls.ps1` now honour
+  `OXIDESWARM_HOME` (`RUSTY_GRID_ACL_GRANT_LOG > <OXIDESWARM_HOME>/windows_acl_grants.txt > ~/.oxideswarm/windows_acl_grants.txt`);
+  `packaging/usb/make_kit.sh` accepts `--isolation off|fs` and ships `revoke-isolation-acls.ps1`;
+  `packaging/usb/install.ps1` and `uninstall.ps1` declare `[CmdletBinding()]` and support
+  `-Isolation off|fs` (default `off`) with ACL revocation in `uninstall.ps1` before removing
+  `$InstallRoot`; and under `--isolation fs|fs+net` on Windows `TaskRunner` resolves bare commands
+  against `%SystemRoot%\System32` before `Git\usr\bin` so `whoami` exits `0`. The Index counts are
+  now 70 Implemented, 4 Partial and 36 Planned.
 - 2026-11-10: ENROLL-1 is Partial: `ENROLL-1a` merged in pull request 190 (per-machine X25519 keys,
   OXS-AUTH v3 Noise `IK` handshake and `Split()` record layer, `members.json` loaded at startup,
   `--master-key`, `master --auth secret|members|both`, `tests/enroll_v3_e2e.rs`), and `ENROLL-1b` is
@@ -2127,4 +2157,4 @@ Add one dated line per finished item, newest last.
   with use deducted at approval, auto-enrolment of the master's host `node.key` as `admin`,
   worker-id ownership per member, protocol version 8, `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live
   revocation across all lanes and task cancellation/requeue) and `ENROLL-1d` (dashboard members page
-  and docs/guide) are Planned. The Index counts are now 68 Implemented, 5 Partial and 35 Planned.
+  and docs/guide) are Planned. With USB-2 and BUG-18 the Index counts are now 70 Implemented, 5 Partial and 35 Planned.

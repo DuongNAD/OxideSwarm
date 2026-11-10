@@ -12,6 +12,7 @@
 #   --archives DIR   take the archives and SHA256SUMS from DIR instead of downloading them
 #   --replace        replace an existing <DIR>/OxideSwarm folder
 #   --no-autostart   the installers on this kit add no start at login (a trial on someone else's machine)
+#   --isolation MODE bake the default worker isolation mode (`off` or `fs`) into the kit
 #   --gpu            also put the `-gpu` archives (built with gpu-wgpu) on the kit; the installers ask
 #                    whether this machine's GPU should do work and then install that build
 #
@@ -25,6 +26,7 @@ ARCHIVES=""
 REPLACE=0
 NO_AUTOSTART=0
 GPU=0
+ISOLATION=""
 REPO="DuongNAD/OxideSwarm"
 TARGETS="aarch64-apple-darwin.tar.gz x86_64-apple-darwin.tar.gz x86_64-pc-windows-msvc.zip x86_64-unknown-linux-gnu.tar.gz"
 
@@ -37,13 +39,20 @@ while [ $# -gt 0 ]; do
     --replace) REPLACE=1 ;;
     --no-autostart) NO_AUTOSTART=1 ;;
     --gpu) GPU=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --isolation)
+      [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
+      case "$2" in
+        off|fs) ISOLATION=$2 ;;
+        *) fail "--isolation must be off or fs (got: $2)" ;;
+      esac
+      shift ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     -*) fail "unknown option: $1" ;;
     *) [ -z "$DEST" ] || fail "only one destination folder"; DEST=$1 ;;
   esac
   shift
 done
-[ -n "$DEST" ] || fail "usage: ... | bash make_kit.sh <DIR> [--version V] [--archives DIR] [--replace] [--gpu]"
+[ -n "$DEST" ] || fail "usage: ... | bash make_kit.sh <DIR> [--version V] [--archives DIR] [--replace] [--no-autostart] [--isolation off|fs] [--gpu]"
 [ -d "$DEST" ] || fail "$DEST is not a folder"
 # The release names a gpu-wgpu build <name>-<target>-gpu.<ext>, next to the plain one.
 if [ "$GPU" = 1 ]; then
@@ -85,6 +94,7 @@ for f in install.sh uninstall.sh install.ps1 uninstall.ps1 \
          "Update OxideSwarm.command" "Update OxideSwarm.cmd"; do
   copy "$HERE/$f" "$KIT/$f"
 done
+copy "$HERE/../../windows/revoke-isolation-acls.ps1" "$KIT/revoke-isolation-acls.ps1"
 copy "$HERE/KIT_README.txt" "$KIT/README.txt"
 chmod 755 "$KIT"/*.sh "$KIT"/*.command 2>/dev/null || true
 
@@ -118,6 +128,9 @@ done
 (umask 077; printf '%s\n' "$TOKEN" > "$KIT/join.token")
 if [ "$NO_AUTOSTART" = 1 ]; then
   printf 'The installers on this kit add no start at login.\n' > "$KIT/no-autostart"
+fi
+if [ -n "$ISOLATION" ]; then
+  printf '%s\n' "$ISOLATION" > "$KIT/isolation"
 fi
 sync 2>/dev/null || true
 printf 'Kit written to %s (OxideSwarm %s).\n' "$KIT" "$VERSION"
