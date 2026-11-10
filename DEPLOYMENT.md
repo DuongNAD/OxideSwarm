@@ -297,10 +297,11 @@ master also writes `master_noise.key` and `members.json` under `--state-dir` (or
 not set, once the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run)
 and auto-enrols the host's own `~/.oxideswarm/node.key` as `local-host` with the `admin` role in `members.json`. A
 worker running on the master's host continues to authenticate with `cluster.secret` (or loopback no-auth when no secret
-is configured) unless a `master_key` (`--master-key`, `RUSTY_GRID_MASTER_KEY`, or `[worker].master_key`) is explicitly
+is configured and no non-host member is enrolled in `members.json`) unless a `master_key` (`--master-key`, `RUSTY_GRID_MASTER_KEY`, or `[worker].master_key`) is explicitly
 configured for it; it never silently uses the host's `admin`-only `local-host` key. Loopback CLI commands (`status`,
 `workers`, `submit`, `invite`, `members`) prefer `cluster.secret` when present and fall back to the local `node.key` +
-`master_noise.key` pair (including when the master runs with `--auth members`).
+`master_noise.key` pair (including when the master runs with `--auth members`); member and invite administration always
+requires v2 cluster-secret or v3 `admin` authentication.
 With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
 (encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
 during the handshake (the newer side reports that the master speaks another cluster authentication version, the
