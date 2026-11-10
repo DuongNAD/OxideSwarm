@@ -144,6 +144,14 @@ pub struct MembersFile {
     /// Worker IDs owned by each member (`worker_id -> member_id`, design 0051 D5).
     #[serde(default)]
     pub worker_owners: BTreeMap<Uuid, String>,
+    /// Monotonic LRU sequence numbers for claimed worker IDs (`worker_id -> seq`), persisted so
+    /// LRU eviction order survives master restarts.
+    #[serde(default)]
+    pub worker_last_seq: BTreeMap<Uuid, u64>,
+    /// Worker IDs registered by cluster-secret (v2) workers (`worker_id -> seq`), persisted so
+    /// v3 members cannot squat a v2 worker's ID across master restarts (design 0051 D5).
+    #[serde(default)]
+    pub v2_worker_seq: BTreeMap<Uuid, u64>,
     /// Public keys of revoked members that are permanently refused re-enrollment (design 0051 G4).
     #[serde(default)]
     pub revoked_keys: Vec<PublicKey>,
@@ -156,6 +164,8 @@ impl Default for MembersFile {
             members: Vec::new(),
             invites: Vec::new(),
             worker_owners: BTreeMap::new(),
+            worker_last_seq: BTreeMap::new(),
+            v2_worker_seq: BTreeMap::new(),
             revoked_keys: Vec::new(),
         }
     }
@@ -267,7 +277,8 @@ struct PersistentMemberState {
     by_pubkey: HashMap<PublicKey, MemberEntry>,
     invites: Vec<InviteRecord>,
     worker_owners: BTreeMap<Uuid, String>,
-    worker_last_seq: HashMap<Uuid, u64>,
+    worker_last_seq: BTreeMap<Uuid, u64>,
+    v2_worker_seq: BTreeMap<Uuid, u64>,
     next_worker_seq: u64,
     revoked_keys: HashSet<PublicKey>,
 }
@@ -283,6 +294,8 @@ impl PersistentMemberState {
             members,
             invites: self.invites.clone(),
             worker_owners: self.worker_owners.clone(),
+            worker_last_seq: self.worker_last_seq.clone(),
+            v2_worker_seq: self.v2_worker_seq.clone(),
             revoked_keys,
         }
     }
@@ -805,11 +818,24 @@ impl MemberStore {
             let mut guard = store.inner.write().unwrap_or_else(|e| e.into_inner());
             guard.state.invites = parsed.invites;
             guard.state.prune_inactive_invites(now_unix_secs());
-            let mut seq = 0u64;
+            let mut seq = parsed
+                .worker_last_seq
+                .values()
+                .chain(parsed.v2_worker_seq.values())
+                .copied()
+                .max()
+                .map_or(0, |m| m.wrapping_add(1));
+            let mut worker_last_seq = BTreeMap::new();
             for wid in parsed.worker_owners.keys() {
-                guard.state.worker_last_seq.insert(*wid, seq);
-                seq = seq.wrapping_add(1);
+                if let Some(&saved_seq) = parsed.worker_last_seq.get(wid) {
+                    worker_last_seq.insert(*wid, saved_seq);
+                } else {
+                    worker_last_seq.insert(*wid, seq);
+                    seq = seq.wrapping_add(1);
+                }
             }
+            guard.state.worker_last_seq = worker_last_seq;
+            guard.state.v2_worker_seq = parsed.v2_worker_seq;
             guard.state.next_worker_seq = seq;
             guard.state.worker_owners = parsed.worker_owners;
             guard.state.revoked_keys = parsed.revoked_keys.into_iter().collect();
@@ -1653,13 +1679,21 @@ impl MemberStore {
         Ok((removed, owned_workers))
     }
 
-    /// Read-only check verifying that `worker_id` is not already owned by another member.
+    /// Read-only check verifying that `worker_id` is not already owned by another member or by a
+    /// cluster-secret (v2) worker.
     pub fn check_worker_id_owner(
         &self,
         worker_id: Uuid,
         member_id: Option<&str>,
     ) -> GridResult<()> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(mid) = member_id {
+            if guard.state.v2_worker_seq.contains_key(&worker_id) {
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it"
+                )));
+            }
+        }
         if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
             if member_id != Some(existing_owner.as_str()) {
                 return Err(GridError::AuthFailed(format!(
@@ -1679,6 +1713,13 @@ impl MemberStore {
         member_id: Option<&str>,
     ) -> GridResult<()> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(mid) = member_id {
+            if guard.state.v2_worker_seq.contains_key(&worker_id) {
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it"
+                )));
+            }
+        }
         if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
             if member_id != Some(existing_owner.as_str()) {
                 return Err(GridError::AuthFailed(format!(
@@ -1702,6 +1743,63 @@ impl MemberStore {
             }
         }
         Ok(())
+    }
+
+    /// Records or verifies ownership of `worker_id` by a non-v3 peer (`is_v2_secret = true` when
+    /// authenticated with the cluster secret, `false` when unauthenticated on loopback).
+    ///
+    /// A cluster-secret (v2) worker reclaims `worker_id` if it was held by a v3 member claim that
+    /// is not currently live (`!is_live(&worker_id)`), and records `worker_id` in `v2_worker_seq`
+    /// so v3 members cannot squat it across master restarts (design 0051 D5).
+    pub fn claim_v2_worker_id<F>(
+        &self,
+        worker_id: Uuid,
+        is_v2_secret: bool,
+        is_live: F,
+    ) -> GridResult<()>
+    where
+        F: Fn(&Uuid) -> bool,
+    {
+        const MAX_PERSISTED_V2_WORKERS: usize = 1024;
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id).cloned() {
+            if !is_v2_secret || is_live(&worker_id) {
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another member ({existing_owner}); {} cannot register it",
+                    if is_v2_secret { "v2 peer" } else { "unauthenticated peer" }
+                )));
+            }
+        }
+        if !is_v2_secret {
+            return Ok(());
+        }
+        let mut v2_to_evict = Vec::new();
+        if !guard.state.v2_worker_seq.contains_key(&worker_id)
+            && guard.state.v2_worker_seq.len() >= MAX_PERSISTED_V2_WORKERS
+        {
+            let needed = (guard.state.v2_worker_seq.len() + 1)
+                .saturating_sub(MAX_PERSISTED_V2_WORKERS);
+            let mut evictable: Vec<(u64, Uuid)> = guard
+                .state
+                .v2_worker_seq
+                .iter()
+                .filter(|(wid, _)| !is_live(wid))
+                .map(|(wid, seq)| (*seq, *wid))
+                .collect();
+            evictable.sort_by_key(|(seq, wid)| (*seq, *wid));
+            v2_to_evict.extend(evictable.into_iter().take(needed).map(|(_, wid)| wid));
+        }
+        guard.mutate_and_persist(|staged| {
+            staged.worker_owners.remove(&worker_id);
+            staged.worker_last_seq.remove(&worker_id);
+            for wid in &v2_to_evict {
+                staged.v2_worker_seq.remove(wid);
+            }
+            let seq = staged.next_worker_seq;
+            staged.next_worker_seq = seq.wrapping_add(1);
+            staged.v2_worker_seq.insert(worker_id, seq);
+            Ok(())
+        })
     }
 
     /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5), treating all
@@ -1728,15 +1826,23 @@ impl MemberStore {
         F: Fn(&Uuid) -> bool,
     {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if guard.state.v2_worker_seq.contains_key(&worker_id) {
+            return Err(GridError::AuthFailed(format!(
+                "worker_id {worker_id} is owned by another peer (v2 peer); member {member_id} cannot register it"
+            )));
+        }
         if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
             if existing_owner != member_id {
                 return Err(GridError::AuthFailed(format!(
                     "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
                 )));
             }
-            let seq = guard.state.next_worker_seq;
-            guard.state.next_worker_seq = seq.wrapping_add(1);
-            guard.state.worker_last_seq.insert(worker_id, seq);
+            guard.mutate_and_persist(|staged| {
+                let seq = staged.next_worker_seq;
+                staged.next_worker_seq = seq.wrapping_add(1);
+                staged.worker_last_seq.insert(worker_id, seq);
+                Ok(())
+            })?;
             return Ok(Vec::new());
         }
         let owned: Vec<Uuid> = guard
@@ -2537,6 +2643,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("maximum of 64"), "got: {err}");
+
+        // Item 8: Re-registering the oldest remaining claim (`history[6]`) bumps its persisted
+        // `worker_last_seq`; after reloading `MemberStore` from disk, evicting one more non-live
+        // claim drops `history[7]` (now oldest) rather than `history[6]` (which has the smallest
+        // UUID on average or was originally registered earliest).
+        let refreshed = history[6];
+        store
+            .claim_worker_id_evicting(refreshed, member_id, |_existing| false)
+            .expect("re-claiming owned worker_id must succeed and refresh LRU seq");
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let post_reload_wid = Uuid::new_v4();
+        let evicted_after_reload = reloaded
+            .claim_worker_id_evicting(post_reload_wid, member_id, |_existing| false)
+            .expect("LRU eviction after reload must succeed");
+        assert_eq!(
+            evicted_after_reload,
+            vec![history[7]],
+            "persisted worker_last_seq must preserve LRU order across master restart"
+        );
+        assert!(reloaded.workers_owned_by(member_id).contains(&refreshed));
     }
 
     #[test]

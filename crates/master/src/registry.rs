@@ -357,14 +357,76 @@ impl WorkerRegistry {
         abort_handle: Option<AbortHandle>,
         owner_member_id: Option<String>,
     ) -> GridResult<Registration> {
+        self.register_session_with_member_store(
+            worker_id,
+            capabilities,
+            features,
+            remote_addr,
+            sender,
+            abort_handle,
+            owner_member_id,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Registers a worker session while holding the registry write lock across both the in-memory
+    /// owner check and the persistent [`crate::server::members::MemberStore`] claim / LRU eviction
+    /// so that:
+    /// 1. `is_live` sees the exact live worker state under the registry write lock (no reconnecting
+    ///    live worker can be evicted between reading `live_worker_ids` and claiming);
+    /// 2. if registration is refused by the registry or member store, no session, claim, or
+    ///    eviction is left behind;
+    /// 3. a cluster-secret (v2) worker (`owner_member_id.is_none() && is_v2_authenticated`) can
+    ///    reclaim a `worker_id` held by a non-live v3 member claim and persist it in `v2_worker_seq`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_session_with_member_store(
+        &self,
+        worker_id: Uuid,
+        capabilities: WorkerCapabilities,
+        features: ProtocolCapabilities,
+        remote_addr: SocketAddr,
+        sender: mpsc::Sender<MasterMessage>,
+        abort_handle: Option<AbortHandle>,
+        owner_member_id: Option<String>,
+        is_v2_authenticated: bool,
+        members: Option<&crate::server::members::MemberStore>,
+    ) -> GridResult<Registration> {
         let mut inner = self.inner.write().await;
         if let Some(existing_owner) = inner.owner_member_ids.get(&worker_id) {
             if existing_owner.as_deref() != owner_member_id.as_deref() {
-                let owner_desc = existing_owner.as_deref().unwrap_or("v2 peer");
-                let caller_desc = owner_member_id.as_deref().unwrap_or("v2 peer");
-                return Err(GridError::AuthFailed(format!(
-                    "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration"
-                )));
+                let is_live_in_registry = inner
+                    .workers
+                    .get(&worker_id)
+                    .is_some_and(|e| e.status != WorkerStatus::Disconnected);
+                let v2_can_reclaim_non_live_v3 = owner_member_id.is_none()
+                    && is_v2_authenticated
+                    && existing_owner.is_some()
+                    && !is_live_in_registry;
+                if !v2_can_reclaim_non_live_v3 {
+                    let owner_desc = existing_owner.as_deref().unwrap_or("v2 peer");
+                    let caller_desc = owner_member_id.as_deref().unwrap_or("v2 peer");
+                    return Err(GridError::AuthFailed(format!(
+                        "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration"
+                    )));
+                }
+            }
+        }
+        if let Some(store) = members {
+            let workers_ref = &inner.workers;
+            let is_live = |wid: &Uuid| {
+                workers_ref
+                    .get(wid)
+                    .is_some_and(|e| e.status != WorkerStatus::Disconnected)
+            };
+            if let Some(ref mid) = owner_member_id {
+                let evicted = store.claim_worker_id_evicting(worker_id, mid, is_live)?;
+                for evicted_wid in evicted {
+                    inner.owner_member_ids.remove(&evicted_wid);
+                }
+            } else {
+                store.claim_v2_worker_id(worker_id, is_v2_authenticated, is_live)?;
             }
         }
         let session_id = inner.next_session_id;
@@ -613,6 +675,7 @@ impl WorkerRegistry {
     pub async fn remove_worker(&self, worker_id: &Uuid) -> Option<WorkerInfo> {
         let mut inner = self.inner.write().await;
         inner.network_types.remove(worker_id);
+        inner.owner_member_ids.remove(worker_id);
         if let Some(entry) = inner.workers.remove(worker_id) {
             inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
             if let Some(abort) = entry.abort_handle.clone() {
@@ -639,6 +702,7 @@ impl WorkerRegistry {
         let count = to_remove.len();
         for id in to_remove {
             inner.network_types.remove(&id);
+            inner.owner_member_ids.remove(&id);
             if let Some(entry) = inner.workers.remove(&id) {
                 if let Some(abort) = entry.abort_handle {
                     abort_unless_current(abort);

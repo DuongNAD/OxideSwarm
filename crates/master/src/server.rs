@@ -9922,4 +9922,198 @@ mod tests {
             "expected key mismatch error, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_and_item7_prune()
+    {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, v3_client_handshake, HandshakePurpose, MemberRole,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let member_kp = NodeKeypair::generate().unwrap();
+        let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+            .unwrap();
+        let h = [0x22u8; 32];
+        let proof = compute_enroll_proof(&inv.invite_secret.0, &h);
+        members
+            .handle_enroll_request(
+                *member_kp.public_key(),
+                &h,
+                "1111-2222-3333-4444",
+                "127.0.0.1:44000",
+                &inv.invite_id,
+                &proof,
+                "w-member".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+
+        let make_cfg = |members: MemberStore| {
+            let mut cfg = ServerConfig::default()
+                .with_state_dir(dir.path().to_path_buf())
+                .with_cluster_secret(secret.clone())
+                .with_auth_mode(AuthMode::Both)
+                .with_ephemeral_key(false)
+                .with_master_noise_key(master_kp.clone())
+                .with_members(members);
+            cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+            #[cfg(feature = "p2p")]
+            {
+                cfg.enable_p2p = false;
+            }
+            cfg.enable_discovery = false;
+            #[cfg(feature = "dashboard")]
+            {
+                cfg.enable_web_ui = false;
+            }
+            cfg
+        };
+
+        let handle = MasterServer::spawn(make_cfg(members)).await.unwrap();
+        let addr = handle.server_addr;
+        let v2_wid = Uuid::new_v4();
+        let caps = WorkerCapabilities::new("node", 2, 1024, false, false, None);
+
+        // 1. v3 member registers `v2_wid` first (squatting) and then disconnects.
+        {
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                t.recv_msg::<MasterMessage>().await.unwrap(),
+                Some(MasterMessage::RegisterAck { accepted: true, .. })
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.registry().live_worker_ids().await.contains(&v2_wid) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 2. While v3 member is still live on another session, v2 cannot hijack a live v3 session;
+        // once the squatted v3 session has disconnected, the v2 cluster-secret worker reclaims `v2_wid`.
+        {
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck { accepted: true, .. })
+                ),
+                "v2 cluster-secret worker must reclaim a non-live squatted worker_id"
+            );
+        }
+        let _ = handle.shutdown();
+
+        // 3. Master restarts from disk; v2 worker's ownership of `v2_wid` was persisted in
+        // `v2_worker_seq`, so v3 member is refused BEFORE v2 reconnects, and v2 reconnects cleanly.
+        let reloaded_members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let handle2 = MasterServer::spawn(make_cfg(reloaded_members))
+            .await
+            .unwrap();
+        let addr2 = handle2.server_addr;
+
+        // v3 member tries to re-squat `v2_wid` right after master restart -> refused!
+        {
+            let s = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck {
+                        accepted: false,
+                        ..
+                    })
+                ),
+                "v3 member must not reclaim a persisted v2 worker_id after master restart"
+            );
+        }
+
+        // v2 worker reconnects after master restart -> accepted!
+        {
+            let s = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck { accepted: true, .. })
+                ),
+                "v2 worker must reconnect after master restart"
+            );
+        }
+
+        // Item 7: remove_worker removes from owner_member_ids as well.
+        assert!(handle2
+            .registry()
+            .check_worker_owner(&v2_wid, None)
+            .await
+            .is_ok());
+        handle2.registry().remove_worker(&v2_wid).await;
+        assert!(
+            handle2
+                .registry()
+                .check_worker_owner(&v2_wid, Some("any-member"))
+                .await
+                .is_ok(),
+            "remove_worker must also remove the worker_id from in-memory owner_member_ids"
+        );
+
+        let _ = handle2.shutdown();
+    }
 }

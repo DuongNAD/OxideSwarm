@@ -198,6 +198,13 @@ impl<
         matches!(self, Self::Multiplexed { .. })
     }
 
+    fn is_encrypted(&self) -> bool {
+        match self {
+            Self::Single { transport, .. } => transport.is_encrypted(),
+            Self::Multiplexed { ctrl_transport, .. } => ctrl_transport.is_encrypted(),
+        }
+    }
+
     #[cfg(feature = "p2p")]
     fn p2p_conn(&self) -> Option<&iroh::endpoint::Connection> {
         match self {
@@ -628,65 +635,10 @@ impl<
         let remote_addr = pre_auth.remote_addr();
         let rx_clock = pre_auth.rx_clock().clone();
         let is_multiplexed = pre_auth.is_multiplexed();
-        let caller_member_id = v3_peer.map(|p| p.member_id.as_str());
+        let is_v2_authenticated = v3_peer.is_none() && pre_auth.is_encrypted();
 
-        if let Err(err) = registry
-            .check_worker_owner(&worker_id, caller_member_id)
-            .await
-        {
-            let reason = err.to_string();
-            let reject_ack = MasterMessage::RegisterAck {
-                accepted: false,
-                worker_id,
-                heartbeat_interval_secs: 0,
-                protocol_version: PROTOCOL_VERSION_CURRENT,
-                features: ProtocolCapabilities::empty(),
-                message: Some(reason),
-            };
-            pre_auth.send_handshake_refusal(&reject_ack).await;
-            return Err(err);
-        }
-
-        if let Some(peer) = v3_peer {
-            let live_ids = registry.live_worker_ids().await;
-            match auth_ctx
-                .members
-                .claim_worker_id_evicting(worker_id, &peer.member_id, |wid| live_ids.contains(wid))
-            {
-                Ok(evicted) => {
-                    for evicted_wid in evicted {
-                        registry.release_worker_owner(&evicted_wid).await;
-                    }
-                }
-                Err(err) => {
-                    let reason = err.to_string();
-                    let reject_ack = MasterMessage::RegisterAck {
-                        accepted: false,
-                        worker_id,
-                        heartbeat_interval_secs: 0,
-                        protocol_version: PROTOCOL_VERSION_CURRENT,
-                        features: ProtocolCapabilities::empty(),
-                        message: Some(reason),
-                    };
-                    pre_auth.send_handshake_refusal(&reject_ack).await;
-                    return Err(err);
-                }
-            }
-        } else if let Err(err) = auth_ctx.members.check_worker_id_claim(worker_id, None) {
-            let reason = err.to_string();
-            let reject_ack = MasterMessage::RegisterAck {
-                accepted: false,
-                worker_id,
-                heartbeat_interval_secs: 0,
-                protocol_version: PROTOCOL_VERSION_CURRENT,
-                features: ProtocolCapabilities::empty(),
-                message: Some(reason),
-            };
-            pre_auth.send_handshake_refusal(&reject_ack).await;
-            return Err(err);
-        }
-
-        // 3. Register in WorkerRegistry (checks and sets owner_member_id atomically under the write lock)
+        // 3. Register in WorkerRegistry (atomically checks/claims owner_member_id and MemberStore
+        // under the single registry write lock).
         let negotiated_features = worker_features
             & (ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES);
         let worker_supports_resume =
@@ -694,7 +646,7 @@ impl<
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
         let registration = match registry
-            .register_session_with_owner(
+            .register_session_with_member_store(
                 worker_id,
                 capabilities,
                 negotiated_features,
@@ -702,6 +654,8 @@ impl<
                 outbound_tx.clone(),
                 abort_handle,
                 v3_peer.map(|p| p.member_id.clone()),
+                is_v2_authenticated,
+                Some(&auth_ctx.members),
             )
             .await
         {
