@@ -5,6 +5,10 @@
 # through an HKCU Run entry. The user's own %USERPROFILE%\.oxideswarm is never read or written:
 # the installed worker keeps its state in <install folder>\home.
 #
+# The install folder is %LOCALAPPDATA%\OxideSwarm unless -InstallRoot names another one or the person
+# at the keyboard picks another fixed NTFS or ReFS drive. Such a folder holds the task folders and
+# the file cache too, and the installer limits it to this user, SYSTEM and Administrators.
+#
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Gpu | -NoGpu]
 param(
     [string]$Name = "",
@@ -35,6 +39,75 @@ if ($Gpu -and $NoGpu) { Fail "-Gpu and -NoGpu cannot be used together" }
 if ($Gpu -and -not $GpuArchive) { Fail "this kit has no GPU build for $Target (make it with make_kit.sh --gpu)" }
 
 Write-Host "OxideSwarm USB installer"
+
+# The install folder. The default lives in %LOCALAPPDATA%, which only this user can open. Any other
+# folder must be on a fixed NTFS or ReFS drive (FAT and exFAT keep no permissions, and a removable
+# drive can be pulled out mid-task), and is limited to this user, SYSTEM and Administrators below:
+# a new folder at the root of a data drive otherwise lets every local account change its content.
+$DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
+$PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
+$KitDrive = [IO.Path]::GetPathRoot($Kit)
+function Test-InstallDrive($root) {
+    # $null when $root may hold an install, else the reason it may not.
+    if ($root -match '^\\\\') { return "network folders are not supported" }
+    $driveRoot = [IO.Path]::GetPathRoot($root)
+    if (-not $driveRoot) { return "use a full path such as D:\OxideSwarm" }
+    if ($driveRoot -eq $KitDrive) { return "it is on the drive this kit runs from" }
+    $drive = New-Object IO.DriveInfo $driveRoot
+    if (-not $drive.IsReady) { return "drive $driveRoot is not ready" }
+    if ($drive.DriveType -ne 'Fixed') { return "drive $driveRoot is a $($drive.DriveType) drive, not a fixed one" }
+    if ($drive.DriveFormat -notin @('NTFS', 'ReFS')) { return "drive $driveRoot uses $($drive.DriveFormat), which keeps no permissions (NTFS or ReFS needed)" }
+    return $null
+}
+$explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
+if (-not $explicitRoot -and -not [Console]::IsInputRedirected) {
+    $choices = @($DefaultRoot)
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if ($d.Name -eq [IO.Path]::GetPathRoot($DefaultRoot)) { continue }
+        $candidate = Join-Path $d.Name 'OxideSwarm'
+        if (-not (Test-InstallDrive $candidate)) { $choices += $candidate }
+    }
+    if ($choices.Count -gt 1) {
+        Write-Host "Where should OxideSwarm keep its files (program, task folders, file cache)?"
+        for ($i = 0; $i -lt $choices.Count; $i++) {
+            $free = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($choices[$i]))).AvailableFreeSpace / 1GB
+            $note = if ($i -eq 0) { ' (default)' } else { '' }
+            Write-Host ("  {0}) {1}{2}  {3:N1} GB free" -f ($i + 1), $choices[$i], $note, $free)
+        }
+        $pick = Read-Host "Choose [1]"
+        if ($pick -match '^\s*(\d+)\s*$' -and [int]$Matches[1] -ge 1 -and [int]$Matches[1] -le $choices.Count) {
+            $InstallRoot = $choices[[int]$Matches[1] - 1]
+        } elseif ($pick.Trim()) {
+            Fail "there is no choice '$pick'; nothing was installed"
+        }
+    }
+}
+$InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+$PrivateRoot = $InstallRoot.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+if (-not $PrivateRoot) {
+    if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
+    $why = Test-InstallDrive $InstallRoot
+    if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
+    if (Test-Path -LiteralPath $InstallRoot) {
+        $item = Get-Item -LiteralPath $InstallRoot -Force
+        if (-not $item.PSIsContainer) { Fail "$InstallRoot is a file" }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$InstallRoot is a link; not using it" }
+        $ours = (Test-Path (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
+        if (-not $ours -and (Get-ChildItem -LiteralPath $InstallRoot -Force | Select-Object -First 1)) {
+            Fail "$InstallRoot already holds other files; choose a new or empty folder with -InstallRoot"
+        }
+    }
+}
+# One install per user: the uninstaller finds it through $PointerKey. An install somewhere else must
+# be removed first, unless -InstallRoot asked for this folder on purpose.
+$pointer = $null
+try { $pointer = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $pointer = $null }
+$previous = $pointer
+if (-not $previous -and (Test-Path (Join-Path $DefaultRoot 'bin\oxideswarm.exe'))) { $previous = $DefaultRoot }
+if ($previous -and $previous -ne $InstallRoot -and (Test-Path (Join-Path $previous 'bin\oxideswarm.exe'))) {
+    if (-not $explicitRoot) { Fail "OxideSwarm from a USB kit is already installed in $previous; run 'Uninstall OxideSwarm.cmd' first" }
+    Write-Host "  note:    another install in $previous stays as it is"
+}
 Write-Host "  folder:  $InstallRoot"
 if ($GpuArchive) {
     $useGpu = [bool]$Gpu
@@ -61,7 +134,21 @@ $actual = (Get-FileHash $Archive.FullName -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { Fail "checksum mismatch for $($Archive.Name): the copy on the stick is damaged" }
 Write-Host "  archive: $($Archive.Name) (checksum OK)"
 
-# 2. Unpack the binaries.
+# 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
+if (-not $PrivateRoot) {
+    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $InstallRoot /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "could not limit $InstallRoot to this user (icacls exit code $LASTEXITCODE)" }
+    New-Item -ItemType Directory -Force -Path (Join-Path $InstallRoot 'work') | Out-Null
+    Write-Host "  access:  this user, SYSTEM and Administrators only"
+}
+New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+Set-Content -Path (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
+if (-not ($pointer -and $pointer -ne $InstallRoot -and (Test-Path (Join-Path $pointer 'bin\oxideswarm.exe')))) {
+    foreach ($k in @('HKCU:\Software\OxideSwarm', $PointerKey)) { if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
+    Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
+}
 $Bin = Join-Path $InstallRoot 'bin'
 $State = Join-Path $InstallRoot 'home'
 $RunDir = Join-Path $InstallRoot 'run'
@@ -152,7 +239,12 @@ if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', 
 # Use at most half of the CPU cores, so the machine stays responsive for its owner.
 $slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots"
-if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) { $workerArgs += " --workspaces" }
+# Outside %LOCALAPPDATA%, the task folders, the file cache and the workspaces stay in the install folder.
+if (-not $PrivateRoot) { $workerArgs += ' --sandbox-base-dir "' + (Join-Path $InstallRoot 'work') + '"' }
+if (-not $NoWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $workerArgs += " --workspaces"
+    if (-not $PrivateRoot) { $workerArgs += ' --workspace-root "' + (Join-Path $InstallRoot 'workspaces') + '"' }
+}
 $log = Join-Path $LogDir 'worker.log'
 
 # A small launcher that starts the worker hidden with this install's state folder. The HKCU Run

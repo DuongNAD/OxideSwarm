@@ -223,3 +223,11 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   archive of each target. The installers ask whether this machine's GPU should do work and install
   the GPU build on yes; without a terminal they keep the plain build. `install.sh --gpu|--no-gpu` and
   `install.ps1 -Gpu|-NoGpu` answer in advance.
+- 2026-11-10: Install folder on another drive (Windows). The trial showed task folders and the file
+  cache in `%TEMP%` on drive C even with `-InstallRoot`. `install.ps1` now offers each fixed NTFS or
+  ReFS drive other than the kit's, and checks a folder given with `-InstallRoot` the same way. A
+  folder outside `%LOCALAPPDATA%` is limited to the user, `SYSTEM` and `Administrators` before
+  anything is written into it, and the worker gets `--sandbox-base-dir` and `--workspace-root`
+  inside it. The folder is recorded in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1`. The
+  worker itself does not check the permissions of a custom sandbox base on Windows
+  (`ensure_private_dir` acts on Unix only); that is a separate fix.

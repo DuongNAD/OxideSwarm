@@ -21,6 +21,10 @@ The installer:
 If the stick also holds a GPU build, the installer first asks whether the
 cluster may use this computer's GPU as well. Answer n to keep the GPU out.
 
+On Windows with a second NTFS drive (for example D:), the installer asks
+where to keep its files. A folder on that drive also holds the task folders
+and the file cache, and only your Windows account can open it.
+
 It never changes ~/.oxideswarm or any other OxideSwarm installation on the
 computer. To remove it, run "Uninstall OxideSwarm" from the same stick.
 

@@ -845,6 +845,27 @@ class UsbKitTests(unittest.TestCase):
         check = text.index("Get-FileHash $Archive.FullName")
         self.assertTrue(choice < check, "the GPU choice must come before the checksum check")
 
+    def test_windows_installer_keeps_another_drive_private(self):
+        # Static text: the live check runs on a Windows machine. An install outside %LOCALAPPDATA%
+        # must sit on a fixed NTFS or ReFS drive other than the kit's, be limited to this user,
+        # SYSTEM and Administrators before anything is written into it, and keep the task
+        # folders and the file cache inside it.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("[IO.DriveInfo]::GetDrives()", "@('NTFS', 'ReFS')", "$drive.DriveType -ne 'Fixed'",
+                       "it is on the drive this kit runs from", "not the root of a drive",
+                       "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+                       "/inheritance:r", "--sandbox-base-dir", "--workspace-root",
+                       "'HKCU:\\Software\\OxideSwarm\\UsbKit'"):
+            self.assertIn(needle, text)
+        ask = text.index('Read-Host "Choose [1]"')
+        self.assertIn("-not [Console]::IsInputRedirected", text[text.index("$explicitRoot ="):ask])
+        lock = text.index("/inheritance:r")
+        self.assertTrue(lock < text.index("foreach ($d in @($Bin, $State, $RunDir, $LogDir))"),
+                        "the folder must be limited before the installer writes into it")
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("'HKCU:\\Software\\OxideSwarm\\UsbKit'", uninstall)
+        self.assertIn("$run.IndexOf($InstallRoot + '\\'", uninstall)
+
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)
         kit = os.path.join(self.stick, "OxideSwarm")

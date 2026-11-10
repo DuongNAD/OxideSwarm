@@ -88,6 +88,27 @@ Each installer does the following, without administrator rights:
 `no-autostart` file in the kit. `--name` and `--install-root` (`-Name` and `-InstallRoot` on
 Windows) change the defaults.
 
+### Another drive on Windows
+
+When the machine has another fixed NTFS or ReFS drive, `install.ps1` asks where to keep its files
+and lists `%LOCALAPPDATA%\OxideSwarm` (the default) and `<drive>:\OxideSwarm` for each such drive,
+with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
+the folder in advance. A folder outside `%LOCALAPPDATA%`:
+
+- must be on a fixed NTFS or ReFS drive, not on the kit's drive, not the root of a drive, and new,
+  empty or an earlier install of the kit. FAT and exFAT keep no permissions, and a removable drive
+  can be pulled out while a task runs;
+- is limited to the current user, `SYSTEM` and `Administrators` (`icacls /inheritance:r`) before
+  anything is written into it, because a new folder at the root of a data drive lets every local
+  account change its content;
+- also holds the task folders and the file cache (`--sandbox-base-dir <folder>\work`) and the
+  workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
+  user's cache folder on drive C.
+
+The installer records the folder in `HKCU\Software\OxideSwarm\UsbKit`, and `uninstall.ps1` removes
+that install when it gets no `-InstallRoot`. While an install exists in one folder, the installer
+refuses another one unless `-InstallRoot` asks for it.
+
 The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
 logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P
 ticket before it passes the ticket to `oxideswarm`, because PowerShell 5.1 drops them.
