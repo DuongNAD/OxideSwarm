@@ -879,6 +879,8 @@ pub enum MembersAction {
     Revoke(MembersTargetArgs),
     /// Rename an enrolled member
     Rename(MembersRenameArgs),
+    /// Release a stopped worker's ID claim so an enrolled member can register with that worker_id
+    ReleaseWorker(MembersReleaseWorkerArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -982,6 +984,28 @@ pub struct MembersRenameArgs {
     pub insecure: bool,
 }
 
+#[derive(Parser, Debug, Clone)]
+pub struct MembersReleaseWorkerArgs {
+    /// Worker UUID to release (must not be currently connected)
+    pub worker_id: uuid::Uuid,
+
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        help = "Address of the Master's grid port (default 127.0.0.1:8088)"
+    )]
+    pub master: Option<String>,
+
+    #[arg(long, value_name = "URL", help = RELAY_URL_HELP)]
+    pub relay_url: Option<String>,
+
+    #[arg(long, help = "Format output as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
 impl MembersAction {
     fn common_opts(&self) -> (Option<String>, Option<String>, bool, bool) {
         match self {
@@ -993,6 +1017,7 @@ impl MembersAction {
                 (a.master.clone(), a.relay_url.clone(), a.json, a.insecure)
             }
             Self::Rename(a) => (a.master.clone(), a.relay_url.clone(), a.json, a.insecure),
+            Self::ReleaseWorker(a) => (a.master.clone(), a.relay_url.clone(), a.json, a.insecure),
         }
     }
 }
@@ -1181,6 +1206,9 @@ async fn run_members_inner(
             target: a.target.clone(),
             new_name: a.new_name.clone(),
         },
+        MembersAction::ReleaseWorker(a) => ClientMessage::ReleaseWorkerId {
+            worker_id: a.worker_id,
+        },
     };
 
     if let Err(e) = transport.send_msg(&req).await {
@@ -1264,6 +1292,19 @@ async fn run_members_inner(
                 );
             } else {
                 println!("Renamed member {member_id} to {safe_name}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Some(ClientResponse::WorkerIdReleased { worker_id })) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "released_worker_id": worker_id,
+                    })
+                );
+            } else {
+                println!("Released worker_id claim {worker_id}");
             }
             ExitCode::SUCCESS
         }

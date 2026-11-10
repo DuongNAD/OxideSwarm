@@ -673,6 +673,12 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
                 new_name: "gpu-rig".into(),
             },
         ),
+        (
+            "ReleaseWorkerId",
+            ClientMessage::ReleaseWorkerId {
+                worker_id: worker_id(),
+            },
+        ),
     ];
     check_instances("ClientMessage", &all, |msg| match msg {
         ClientMessage::SubmitTask { .. } => "SubmitTask",
@@ -695,6 +701,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ClientMessage::RejectEnrollment { .. } => "RejectEnrollment",
         ClientMessage::RevokeMember { .. } => "RevokeMember",
         ClientMessage::RenameMember { .. } => "RenameMember",
+        ClientMessage::ReleaseWorkerId { .. } => "ReleaseWorkerId",
     });
     all
 }
@@ -906,6 +913,12 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 name: "gpu-rig".into(),
             },
         ),
+        (
+            "WorkerIdReleased",
+            ClientResponse::WorkerIdReleased {
+                worker_id: worker_id(),
+            },
+        ),
     ];
     check_instances("ClientResponse", &all, |msg| match msg {
         ClientResponse::TaskSubmitted { .. } => "TaskSubmitted",
@@ -933,6 +946,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         ClientResponse::EnrollmentRejected { .. } => "EnrollmentRejected",
         ClientResponse::MemberRevoked { .. } => "MemberRevoked",
         ClientResponse::MemberRenamed { .. } => "MemberRenamed",
+        ClientResponse::WorkerIdReleased { .. } => "WorkerIdReleased",
     });
     all
 }

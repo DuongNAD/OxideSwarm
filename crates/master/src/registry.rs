@@ -404,15 +404,27 @@ impl WorkerRegistry {
                     && is_v2_authenticated
                     && existing_owner.is_some()
                     && !is_live_in_registry;
-                if !v2_can_reclaim_non_live_v3 {
+                let v3_can_reclaim_non_live_v2_in_members_mode = owner_member_id.is_some()
+                    && existing_owner.is_none()
+                    && !is_live_in_registry
+                    && members.is_some_and(|s| !s.auth_mode().allows_secret());
+                if !v2_can_reclaim_non_live_v3 && !v3_can_reclaim_non_live_v2_in_members_mode {
                     let owner_desc = existing_owner.as_deref().unwrap_or("v2 peer");
                     let caller_desc = owner_member_id.as_deref().unwrap_or("v2 peer");
+                    let release_hint = if existing_owner.is_none() && owner_member_id.is_some() {
+                        format!(
+                            " (an admin can release a stopped worker's ID with: oxideswarm members release-worker {worker_id})"
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(GridError::AuthFailed(format!(
-                        "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration"
+                        "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration{release_hint}"
                     )));
                 }
             }
         }
+        let mut pending_persist = None;
         if let Some(store) = members {
             let workers_ref = &inner.workers;
             let is_live = |wid: &Uuid| {
@@ -421,12 +433,15 @@ impl WorkerRegistry {
                     .is_some_and(|e| e.status != WorkerStatus::Disconnected)
             };
             if let Some(ref mid) = owner_member_id {
-                let evicted = store.claim_worker_id_evicting(worker_id, mid, is_live)?;
+                let (evicted, pending) =
+                    store.claim_worker_id_evicting_deferred(worker_id, mid, is_live)?;
                 for evicted_wid in evicted {
                     inner.owner_member_ids.remove(&evicted_wid);
                 }
+                pending_persist = pending;
             } else {
-                store.claim_v2_worker_id(worker_id, is_v2_authenticated, is_live)?;
+                pending_persist =
+                    store.claim_v2_worker_id_deferred(worker_id, is_v2_authenticated, is_live)?;
             }
         }
         let session_id = inner.next_session_id;
@@ -557,11 +572,40 @@ impl WorkerRegistry {
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
         }
         inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
+        drop(inner);
+
+        if let (Some(store), Some(pending)) = (members, pending_persist) {
+            store.flush_bookkeeping_persist(pending);
+        }
 
         Ok(Registration {
             session_id,
             superseded_session,
         })
+    }
+
+    /// Releases a non-live `worker_id` claim in both the in-memory registry and persistent
+    /// [`crate::server::members::MemberStore`]. Refuses if `worker_id` currently has a connected
+    /// worker session.
+    pub async fn release_non_live_worker_id(
+        &self,
+        worker_id: Uuid,
+        members: &crate::server::members::MemberStore,
+    ) -> GridResult<()> {
+        let mut inner = self.inner.write().await;
+        if inner
+            .workers
+            .get(&worker_id)
+            .is_some_and(|e| e.status != WorkerStatus::Disconnected)
+        {
+            return Err(GridError::Config(format!(
+                "worker {worker_id} is currently connected; stop the worker before releasing its worker_id"
+            )));
+        }
+        let had_registry_claim = inner.owner_member_ids.contains_key(&worker_id);
+        members.release_worker_id(worker_id, had_registry_claim)?;
+        inner.owner_member_ids.remove(&worker_id);
+        Ok(())
     }
 
     /// Read-only check verifying that `worker_id` is not already owned in this registry by another

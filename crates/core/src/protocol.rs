@@ -2125,6 +2125,9 @@ pub enum ClientMessage {
     RevokeMember { target: String },
     /// Renames an enrolled member by ID, prefix, or name (design 0051 D5; requires `admin` role).
     RenameMember { target: String, new_name: String },
+    /// Releases a non-live `worker_id` claim so an enrolled member can register with that ID
+    /// (design 0051 D5/D6; requires `admin` role).
+    ReleaseWorkerId { worker_id: Uuid },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2235,6 +2238,11 @@ enum HumanClientMessage {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    ReleaseWorkerId {
+        worker_id: Uuid,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2321,6 +2329,10 @@ enum BinaryClientMessage {
     RenameMember {
         target: String,
         new_name: String,
+        protocol_version: u32,
+    },
+    ReleaseWorkerId {
+        worker_id: Uuid,
         protocol_version: u32,
     },
 }
@@ -2478,6 +2490,10 @@ impl HumanClientMessage {
                 new_name,
                 protocol_version,
             },
+            ClientMessage::ReleaseWorkerId { worker_id } => HumanClientMessage::ReleaseWorkerId {
+                worker_id,
+                protocol_version,
+            },
         }
     }
 
@@ -2527,6 +2543,9 @@ impl HumanClientMessage {
                 protocol_version, ..
             }
             | Self::RenameMember {
+                protocol_version, ..
+            }
+            | Self::ReleaseWorkerId {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2625,6 +2644,10 @@ impl BinaryClientMessage {
                 new_name,
                 protocol_version,
             },
+            ClientMessage::ReleaseWorkerId { worker_id } => BinaryClientMessage::ReleaseWorkerId {
+                worker_id,
+                protocol_version,
+            },
         }
     }
 
@@ -2674,6 +2697,9 @@ impl BinaryClientMessage {
                 protocol_version, ..
             }
             | Self::RenameMember {
+                protocol_version, ..
+            }
+            | Self::ReleaseWorkerId {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2760,6 +2786,9 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::RenameMember {
                 target, new_name, ..
             } => ClientMessage::RenameMember { target, new_name },
+            HumanClientMessage::ReleaseWorkerId { worker_id, .. } => {
+                ClientMessage::ReleaseWorkerId { worker_id }
+            }
         }
     }
 }
@@ -2846,6 +2875,9 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::RenameMember {
                 target, new_name, ..
             } => ClientMessage::RenameMember { target, new_name },
+            BinaryClientMessage::ReleaseWorkerId { worker_id, .. } => {
+                ClientMessage::ReleaseWorkerId { worker_id }
+            }
         }
     }
 }
@@ -2992,6 +3024,10 @@ pub enum ClientResponse {
     MemberRenamed {
         member_id: String,
         name: String,
+    },
+    /// Answer to `ClientMessage::ReleaseWorkerId`.
+    WorkerIdReleased {
+        worker_id: Uuid,
     },
 }
 
@@ -3154,6 +3190,11 @@ enum HumanClientResponse {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    WorkerIdReleased {
+        worker_id: Uuid,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3284,6 +3325,10 @@ enum BinaryClientResponse {
     MemberRenamed {
         member_id: String,
         name: String,
+        protocol_version: u32,
+    },
+    WorkerIdReleased {
+        worker_id: Uuid,
         protocol_version: u32,
     },
 }
@@ -3557,6 +3602,12 @@ impl HumanClientResponse {
                     protocol_version,
                 }
             }
+            ClientResponse::WorkerIdReleased { worker_id } => {
+                HumanClientResponse::WorkerIdReleased {
+                    worker_id,
+                    protocol_version,
+                }
+            }
         }
     }
 
@@ -3633,6 +3684,9 @@ impl HumanClientResponse {
                 protocol_version, ..
             }
             | Self::MemberRenamed {
+                protocol_version, ..
+            }
+            | Self::WorkerIdReleased {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -3821,6 +3875,12 @@ impl BinaryClientResponse {
                     protocol_version,
                 }
             }
+            ClientResponse::WorkerIdReleased { worker_id } => {
+                BinaryClientResponse::WorkerIdReleased {
+                    worker_id,
+                    protocol_version,
+                }
+            }
         }
     }
 
@@ -3897,6 +3957,9 @@ impl BinaryClientResponse {
                 protocol_version, ..
             }
             | Self::MemberRenamed {
+                protocol_version, ..
+            }
+            | Self::WorkerIdReleased {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -4049,6 +4112,9 @@ impl From<HumanClientResponse> for ClientResponse {
             HumanClientResponse::MemberRenamed {
                 member_id, name, ..
             } => ClientResponse::MemberRenamed { member_id, name },
+            HumanClientResponse::WorkerIdReleased { worker_id, .. } => {
+                ClientResponse::WorkerIdReleased { worker_id }
+            }
         }
     }
 }
@@ -4195,6 +4261,9 @@ impl From<BinaryClientResponse> for ClientResponse {
             BinaryClientResponse::MemberRenamed {
                 member_id, name, ..
             } => ClientResponse::MemberRenamed { member_id, name },
+            BinaryClientResponse::WorkerIdReleased { worker_id, .. } => {
+                ClientResponse::WorkerIdReleased { worker_id }
+            }
         }
     }
 }

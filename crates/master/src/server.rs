@@ -541,6 +541,7 @@ impl ServerConfig {
     /// Sets the master authentication mode (`secret`, `members`, or `both`).
     pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
         self.auth_mode = mode;
+        self.members.set_auth_mode(mode);
         self
     }
 
@@ -565,6 +566,7 @@ impl ServerConfig {
 
     /// Sets the enrolled member store for OXS-AUTH v3 handshakes.
     pub fn with_members(mut self, members: MemberStore) -> Self {
+        members.set_auth_mode(self.auth_mode);
         self.members = Arc::new(members);
         self.members_explicit = true;
         self
@@ -660,22 +662,28 @@ impl MasterServer {
             config.p2p_relay_url.as_deref(),
         )?;
 
-        if !config.members_explicit {
+        if !config.members_explicit && config.auth_mode.allows_members() {
             if let Some(ref state_dir) = config.state_dir {
                 config.members = Arc::new(MemberStore::load_from_dir(Some(state_dir))?);
             }
         }
-        if config.master_noise_key_path.is_none() && !config.ephemeral_key {
+        config.members.set_auth_mode(config.auth_mode);
+        if config.master_noise_key_path.is_none()
+            && !config.ephemeral_key
+            && config.auth_mode.allows_members()
+        {
             if let Some(ref state_dir) = config.state_dir {
                 config.master_noise_key_path = master_noise_key_path(Some(state_dir));
             }
         }
         if config.master_noise_key.is_none() {
-            if let Some(ref state_dir) = config.state_dir {
-                if !config.ephemeral_key {
-                    if let Some(key_path) = master_noise_key_path(Some(state_dir)) {
-                        let (kp, _) = NodeKeypair::load_or_generate_file(&key_path)?;
-                        config.master_noise_key = Some(kp);
+            if config.auth_mode.allows_members() {
+                if let Some(ref state_dir) = config.state_dir {
+                    if !config.ephemeral_key {
+                        if let Some(key_path) = master_noise_key_path(Some(state_dir)) {
+                            let (kp, _) = NodeKeypair::load_or_generate_file(&key_path)?;
+                            config.master_noise_key = Some(kp);
+                        }
                     }
                 }
             }
@@ -1625,6 +1633,8 @@ impl MasterServer {
             master_noise_key: self.config.master_noise_key.clone(),
             master_noise_key_path: self.config.master_noise_key_path.clone(),
             local_node_key_path: self.config.local_node_key_path.clone(),
+            ephemeral_without_state_dir: self.config.ephemeral_key
+                && self.config.state_dir.is_none(),
             members: Arc::clone(&self.config.members),
             p2p_ticket: self.p2p_ticket.clone(),
             enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
@@ -3829,7 +3839,8 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
             | ClientMessage::ApproveEnrollment { .. }
             | ClientMessage::RejectEnrollment { .. }
             | ClientMessage::RevokeMember { .. }
-            | ClientMessage::RenameMember { .. }) => {
+            | ClientMessage::RenameMember { .. }
+            | ClientMessage::ReleaseWorkerId { .. }) => {
                 handle_member_admin_message(
                     &mut transport,
                     msg,
@@ -4534,6 +4545,33 @@ where
                 }
             }
         }
+        ClientMessage::ReleaseWorkerId { worker_id } => {
+            match registry
+                .release_non_live_worker_id(worker_id, &auth_ctx.members)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        worker_id = %worker_id,
+                        "Released non-live worker_id claim"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::WorkerIdReleased { worker_id },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => unreachable!("non-admin ClientMessage passed to handle_member_admin_message"),
     }
     Ok(())
@@ -4545,6 +4583,7 @@ pub(crate) struct MasterAuthContext {
     pub master_noise_key: Option<NodeKeypair>,
     pub master_noise_key_path: Option<PathBuf>,
     pub local_node_key_path: Option<PathBuf>,
+    pub ephemeral_without_state_dir: bool,
     pub members: Arc<MemberStore>,
     pub p2p_ticket: Option<String>,
     pub enroll_prompt_waiters: Arc<Semaphore>,
@@ -4557,6 +4596,7 @@ impl Default for MasterAuthContext {
             master_noise_key: None,
             master_noise_key_path: None,
             local_node_key_path: None,
+            ephemeral_without_state_dir: false,
             members: Arc::default(),
             p2p_ticket: None,
             enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
@@ -4573,7 +4613,9 @@ impl MasterAuthContext {
                 "Master has no OXS-AUTH v3 key (master_noise.key) configured".into(),
             ));
         };
-        if self.members.has_save_path() && self.master_noise_key_path.is_none() {
+        if self.ephemeral_without_state_dir
+            || (self.members.has_save_path() && self.master_noise_key_path.is_none())
+        {
             return Err(GridError::Config(
                 "cannot create an invite when the master is running with --ephemeral-key and no --state-dir".into(),
             ));
@@ -4591,6 +4633,12 @@ impl MasterAuthContext {
                 }
             } else {
                 master_key.save_file(key_path, false)?;
+            }
+            if !self.members.has_save_path() {
+                if let Some(dir) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    self.members
+                        .set_save_path(Some(dir.join(members::MEMBERS_FILE_NAME)));
+                }
             }
         }
         if let Some(ref node_key_path) = self.local_node_key_path {
@@ -4650,7 +4698,8 @@ fn check_v3_client_message_role(
         | ClientMessage::ApproveEnrollment { .. }
         | ClientMessage::RejectEnrollment { .. }
         | ClientMessage::RevokeMember { .. }
-        | ClientMessage::RenameMember { .. } => {
+        | ClientMessage::RenameMember { .. }
+        | ClientMessage::ReleaseWorkerId { .. } => {
             if member.has_admin_role() {
                 Ok(())
             } else {
@@ -10005,9 +10054,10 @@ mod tests {
             master_noise_key: Some(mem_kp),
             master_noise_key_path: Some(key_path),
             local_node_key_path: None,
+            ephemeral_without_state_dir: false,
             members: Arc::new(MemberStore::new()),
             p2p_ticket: None,
-            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
+            ..Default::default()
         };
         let err = mismatch_ctx
             .ensure_v3_key_persisted()

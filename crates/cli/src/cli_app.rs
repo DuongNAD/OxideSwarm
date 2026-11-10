@@ -1790,7 +1790,10 @@ async fn run_master_inner(
     };
     let in_unisolated_unit_test =
         cfg!(test) && state_dir.is_none() && std::env::var_os("OXIDESWARM_HOME").is_none();
-    let members = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+    let disable_v3_disk = in_unisolated_unit_test
+        || (ephemeral_key && state_dir.is_none())
+        || !auth_mode.allows_members();
+    let members = if disable_v3_disk {
         rusty_grid_master::server::MemberStore::new()
     } else {
         match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref()) {
@@ -1801,17 +1804,17 @@ async fn run_master_inner(
             }
         }
     };
-    let key_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+    let key_path = if disable_v3_disk {
         None
     } else {
         rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
     };
-    let members_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+    let members_path = if disable_v3_disk {
         None
     } else {
         rusty_grid_master::server::MemberStore::resolve_path(state_dir.as_deref())
     };
-    let local_node_key_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
+    let local_node_key_path = if disable_v3_disk {
         None
     } else if cfg!(test) && std::env::var_os("OXIDESWARM_HOME").is_none() {
         state_dir.as_deref().map(|d| d.join("node.key"))
@@ -1820,12 +1823,14 @@ async fn run_master_inner(
     };
     let existing_v3_files = key_path.as_ref().is_some_and(|p| p.is_file())
         || members_path.as_ref().is_some_and(|p| p.is_file());
-    // The v3 key is written to disk at startup when OXS-AUTH v3 is persisted: a state directory
-    // was given, `master_noise.key` or `members.json` already exists on disk, members exist, the
-    // master admits members only, or the master uses the default `~/.oxideswarm/cluster.secret`
-    // under `--auth both`. When started with an explicit `--secret-file`, `--insecure`, or bare
-    // loopback without existing v3 files, `master_noise.key` and `local-host` are persisted on
-    // demand if `CreateInvite` is called.
+    // OXS-AUTH v3 files (`master_noise.key`, `node.key`, `members.json`) are persisted at startup
+    // only when the master admits members (`--auth both` or `--auth members`) and one of: a state
+    // directory was given, `master_noise.key` or `members.json` already exists on disk, members
+    // are already present, `--auth members` is used, or the master uses the default
+    // `~/.oxideswarm/cluster.secret` under `--auth both`. With `--auth secret`, no v3 files are
+    // ever loaded or written; under `--auth both` with an explicit `--secret` / `--secret-file`,
+    // `--insecure`, or bare loopback without existing v3 files, `master_noise.key`, `members.json`,
+    // and `local-host` are persisted on demand only if `CreateInvite` is called.
     let has_explicit_secret =
         secret_opts.has_explicit_secret(config_file.as_ref(), SecretSection::Master);
     let uses_default_secret = matches!(
@@ -1835,12 +1840,15 @@ async fn run_master_inner(
         secret_outcome,
         crate::secret_cmd::MasterSecretOutcome::Configured(_)
     ) && !has_explicit_secret);
-    let persist_noise_key = !(in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()))
+    let persist_noise_key = !disable_v3_disk
         && (state_dir.is_some()
             || existing_v3_files
             || !members.is_empty()
             || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members)
-            || (auth_mode.allows_members() && uses_default_secret));
+            || uses_default_secret);
+    if !persist_noise_key {
+        members.set_save_path(None);
+    }
     let master_noise_key = if !persist_noise_key {
         match rusty_grid_core::noise_auth::NodeKeypair::generate() {
             Ok(kp) => kp,

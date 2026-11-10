@@ -661,14 +661,26 @@ impl<
         {
             Ok(reg) => reg,
             Err(err) => {
-                let reason = err.to_string();
+                let wire_reason = match &err {
+                    GridError::AuthFailed(msg) | GridError::RegistrationRejected(msg) => {
+                        msg.clone()
+                    }
+                    other => {
+                        tracing::warn!(
+                            worker_id = %worker_id,
+                            error = %other,
+                            "worker registration failed due to internal master error"
+                        );
+                        "worker registration refused by master".to_string()
+                    }
+                };
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
                     worker_id,
                     heartbeat_interval_secs: 0,
                     protocol_version: PROTOCOL_VERSION_CURRENT,
                     features: ProtocolCapabilities::empty(),
-                    message: Some(reason),
+                    message: Some(wire_reason),
                 };
                 pre_auth.send_handshake_refusal(&reject_ack).await;
                 return Err(err);

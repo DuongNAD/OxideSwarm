@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -357,6 +358,18 @@ struct MemberStoreInner {
     unconfirmed_approvals: HashMap<PublicKey, UnconfirmedMemberTracker>,
     active_approval_invites: HashMap<u64, String>,
     save_path: Option<PathBuf>,
+    auth_mode: AuthMode,
+    persist_count: AtomicU64,
+    write_generation: u64,
+}
+
+/// Token returned by [`MemberStore::claim_v2_worker_id_deferred`] and
+/// [`MemberStore::claim_worker_id_evicting_deferred`] when worker-claim bookkeeping changed and
+/// should be flushed to `members.json` after releasing the [`crate::registry::WorkerRegistry`]
+/// write lock.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingBookkeepingPersist {
+    write_generation: u64,
 }
 
 /// Thread-safe enrolled member, invite, pending-enrollment, and worker-ownership store.
@@ -600,6 +613,8 @@ impl MemberStoreInner {
         let out = f(&mut staged)?;
         if let Some(ref path) = self.save_path {
             write_members_file_atomic(path, &staged.to_members_file())?;
+            self.persist_count.fetch_add(1, Ordering::Relaxed);
+            self.write_generation = self.write_generation.wrapping_add(1);
         }
         self.state = staged;
         Ok(out)
@@ -688,11 +703,69 @@ impl MemberStore {
 
     /// Configures the on-disk path where mutations will be atomically persisted.
     pub fn with_save_path(self, path: impl Into<PathBuf>) -> Self {
-        {
-            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-            guard.save_path = Some(path.into());
-        }
+        self.set_save_path(Some(path.into()));
         self
+    }
+
+    /// Sets or clears the on-disk path where mutations are atomically persisted.
+    pub fn set_save_path(&self, path: Option<PathBuf>) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard.save_path = path;
+    }
+
+    /// Configures the master's active [`AuthMode`] on this store.
+    pub fn with_auth_mode(self, mode: AuthMode) -> Self {
+        self.set_auth_mode(mode);
+        self
+    }
+
+    /// Updates the master's active [`AuthMode`] on this store.
+    pub fn set_auth_mode(&self, mode: AuthMode) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard.auth_mode = mode;
+    }
+
+    /// Returns the master's active [`AuthMode`] configured on this store.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .auth_mode
+    }
+
+    /// Returns the number of times `members.json` has been written to disk by this store.
+    pub fn persist_count(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .persist_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Flushes a deferred worker-claim bookkeeping change to `members.json` outside the
+    /// [`crate::registry::WorkerRegistry`] write lock. Never fails the caller if the disk write
+    /// fails; logs a warning and keeps the in-memory claim.
+    pub fn flush_bookkeeping_persist(&self, pending: PendingBookkeepingPersist) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if !guard.auth_mode.allows_members() || guard.write_generation > pending.write_generation {
+            return;
+        }
+        let Some(ref path) = guard.save_path else {
+            return;
+        };
+        let file = guard.state.to_members_file();
+        match write_members_file_atomic(path, &file) {
+            Ok(()) => {
+                guard.persist_count.fetch_add(1, Ordering::Relaxed);
+                guard.write_generation = guard.write_generation.wrapping_add(1);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to persist worker claim bookkeeping to members.json; keeping claim in memory"
+                );
+            }
+        }
     }
 
     /// Builds an in-memory store from an iterator of [`MemberEntry`] items.
@@ -1719,9 +1792,10 @@ impl MemberStore {
     ) -> GridResult<()> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         if let Some(mid) = member_id {
-            if guard.state.v2_worker_seq.contains_key(&worker_id) {
+            if guard.auth_mode.allows_secret() && guard.state.v2_worker_seq.contains_key(&worker_id)
+            {
                 return Err(GridError::AuthFailed(format!(
-                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it"
+                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it (an admin can release a stopped worker's ID with: oxideswarm members release-worker {worker_id})"
                 )));
             }
         }
@@ -1745,9 +1819,10 @@ impl MemberStore {
     ) -> GridResult<()> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         if let Some(mid) = member_id {
-            if guard.state.v2_worker_seq.contains_key(&worker_id) {
+            if guard.auth_mode.allows_secret() && guard.state.v2_worker_seq.contains_key(&worker_id)
+            {
                 return Err(GridError::AuthFailed(format!(
-                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it"
+                    "worker_id {worker_id} is owned by another peer (v2 peer); member {mid} cannot register it (an admin can release a stopped worker's ID with: oxideswarm members release-worker {worker_id})"
                 )));
             }
         }
@@ -1777,17 +1852,15 @@ impl MemberStore {
     }
 
     /// Records or verifies ownership of `worker_id` by a non-v3 peer (`is_v2_secret = true` when
-    /// authenticated with the cluster secret, `false` when unauthenticated on loopback).
-    ///
-    /// A cluster-secret (v2) worker reclaims `worker_id` if it was held by a v3 member claim that
-    /// is not currently live (`!is_live(&worker_id)`), and records `worker_id` in `v2_worker_seq`
-    /// so v3 members cannot squat it across master restarts (design 0051 D5).
-    pub fn claim_v2_worker_id<F>(
+    /// authenticated with the cluster secret, `false` when unauthenticated on loopback), returning
+    /// a [`PendingBookkeepingPersist`] token when the persistent v2 set changed and the master
+    /// admits members (`auth_mode.allows_members()`).
+    pub fn claim_v2_worker_id_deferred<F>(
         &self,
         worker_id: Uuid,
         is_v2_secret: bool,
         is_live: F,
-    ) -> GridResult<()>
+    ) -> GridResult<Option<PendingBookkeepingPersist>>
     where
         F: Fn(&Uuid) -> bool,
     {
@@ -1802,12 +1875,11 @@ impl MemberStore {
             }
         }
         if !is_v2_secret {
-            return Ok(());
+            return Ok(None);
         }
+        let was_already_v2 = guard.state.v2_worker_seq.contains_key(&worker_id);
         let mut v2_to_evict = Vec::new();
-        if !guard.state.v2_worker_seq.contains_key(&worker_id)
-            && guard.state.v2_worker_seq.len() >= MAX_PERSISTED_V2_WORKERS
-        {
+        if !was_already_v2 && guard.state.v2_worker_seq.len() >= MAX_PERSISTED_V2_WORKERS {
             let needed =
                 (guard.state.v2_worker_seq.len() + 1).saturating_sub(MAX_PERSISTED_V2_WORKERS);
             let mut evictable: Vec<(u64, Uuid)> = guard
@@ -1820,17 +1892,44 @@ impl MemberStore {
             evictable.sort_by_key(|(seq, wid)| (*seq, *wid));
             v2_to_evict.extend(evictable.into_iter().take(needed).map(|(_, wid)| wid));
         }
-        guard.mutate_and_persist(|staged| {
-            staged.worker_owners.remove(&worker_id);
-            staged.worker_last_seq.remove(&worker_id);
-            for wid in &v2_to_evict {
-                staged.v2_worker_seq.remove(wid);
-            }
-            let seq = staged.next_worker_seq;
-            staged.next_worker_seq = seq.wrapping_add(1);
-            staged.v2_worker_seq.insert(worker_id, seq);
-            Ok(())
-        })
+        let reclaimed_v3 = guard.state.worker_owners.remove(&worker_id).is_some();
+        guard.state.worker_last_seq.remove(&worker_id);
+        for wid in &v2_to_evict {
+            guard.state.v2_worker_seq.remove(wid);
+        }
+        let seq = guard.state.next_worker_seq;
+        guard.state.next_worker_seq = seq.wrapping_add(1);
+        guard.state.v2_worker_seq.insert(worker_id, seq);
+
+        let changed = !was_already_v2 || reclaimed_v3 || !v2_to_evict.is_empty();
+        if changed && guard.auth_mode.allows_members() && guard.save_path.is_some() {
+            Ok(Some(PendingBookkeepingPersist {
+                write_generation: guard.write_generation,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Records or verifies ownership of `worker_id` by a non-v3 peer (`is_v2_secret = true` when
+    /// authenticated with the cluster secret, `false` when unauthenticated on loopback).
+    ///
+    /// A cluster-secret (v2) worker reclaims `worker_id` if it was held by a v3 member claim that
+    /// is not currently live (`!is_live(&worker_id)`), and records `worker_id` in `v2_worker_seq`
+    /// so v3 members cannot squat it across master restarts (design 0051 D5).
+    pub fn claim_v2_worker_id<F>(
+        &self,
+        worker_id: Uuid,
+        is_v2_secret: bool,
+        is_live: F,
+    ) -> GridResult<()>
+    where
+        F: Fn(&Uuid) -> bool,
+    {
+        if let Some(pending) = self.claim_v2_worker_id_deferred(worker_id, is_v2_secret, is_live)? {
+            self.flush_bookkeeping_persist(pending);
+        }
+        Ok(())
     }
 
     /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5), treating all
@@ -1840,26 +1939,23 @@ impl MemberStore {
             .map(|_| ())
     }
 
-    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5).
-    ///
-    /// When `member_id` already holds [`MAX_WORKERS_PER_MEMBER`] claims, any non-live claims
-    /// (`!is_live(wid)`) are evicted in least-recently-used order so restarting an unnamed worker
-    /// on a joined machine never permanently locks the member out once 64 past worker IDs have
-    /// accumulated. If all 64 claimed worker IDs currently have live sessions, the claim is
-    /// refused. Returns the list of evicted non-live worker IDs.
-    pub fn claim_worker_id_evicting<F>(
+    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5), returning any
+    /// evicted non-live worker IDs and a [`PendingBookkeepingPersist`] token when the persistent
+    /// ownership set changed. Reconnects of an already-owned `worker_id` update the LRU sequence in
+    /// memory only without touching disk.
+    pub fn claim_worker_id_evicting_deferred<F>(
         &self,
         worker_id: Uuid,
         member_id: &str,
         is_live: F,
-    ) -> GridResult<Vec<Uuid>>
+    ) -> GridResult<(Vec<Uuid>, Option<PendingBookkeepingPersist>)>
     where
         F: Fn(&Uuid) -> bool,
     {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if guard.state.v2_worker_seq.contains_key(&worker_id) {
+        if guard.auth_mode.allows_secret() && guard.state.v2_worker_seq.contains_key(&worker_id) {
             return Err(GridError::AuthFailed(format!(
-                "worker_id {worker_id} is owned by another peer (v2 peer); member {member_id} cannot register it"
+                "worker_id {worker_id} is owned by another peer (v2 peer); member {member_id} cannot register it (an admin can release a stopped worker's ID with: oxideswarm members release-worker {worker_id})"
             )));
         }
         if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
@@ -1868,13 +1964,10 @@ impl MemberStore {
                     "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
                 )));
             }
-            guard.mutate_and_persist(|staged| {
-                let seq = staged.next_worker_seq;
-                staged.next_worker_seq = seq.wrapping_add(1);
-                staged.worker_last_seq.insert(worker_id, seq);
-                Ok(())
-            })?;
-            return Ok(Vec::new());
+            let seq = guard.state.next_worker_seq;
+            guard.state.next_worker_seq = seq.wrapping_add(1);
+            guard.state.worker_last_seq.insert(worker_id, seq);
+            return Ok((Vec::new(), None));
         }
         let owned: Vec<Uuid> = guard
             .state
@@ -1905,20 +1998,75 @@ impl MemberStore {
             to_evict.extend(evictable.into_iter().take(needed).map(|(_, wid)| wid));
         }
         let evicted = to_evict.clone();
-        guard.mutate_and_persist(|staged| {
-            for wid in &to_evict {
-                staged.worker_owners.remove(wid);
-                staged.worker_last_seq.remove(wid);
-            }
-            let seq = staged.next_worker_seq;
-            staged.next_worker_seq = seq.wrapping_add(1);
-            staged.worker_last_seq.insert(worker_id, seq);
-            staged
-                .worker_owners
-                .insert(worker_id, member_id.to_string());
-            Ok(())
-        })?;
+        if !guard.auth_mode.allows_secret() {
+            guard.state.v2_worker_seq.remove(&worker_id);
+        }
+        for wid in &to_evict {
+            guard.state.worker_owners.remove(wid);
+            guard.state.worker_last_seq.remove(wid);
+        }
+        let seq = guard.state.next_worker_seq;
+        guard.state.next_worker_seq = seq.wrapping_add(1);
+        guard.state.worker_last_seq.insert(worker_id, seq);
+        guard
+            .state
+            .worker_owners
+            .insert(worker_id, member_id.to_string());
+        let pending = if guard.auth_mode.allows_members() && guard.save_path.is_some() {
+            Some(PendingBookkeepingPersist {
+                write_generation: guard.write_generation,
+            })
+        } else {
+            None
+        };
+        Ok((evicted, pending))
+    }
+
+    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5).
+    ///
+    /// When `member_id` already holds [`MAX_WORKERS_PER_MEMBER`] claims, any non-live claims
+    /// (`!is_live(wid)`) are evicted in least-recently-used order so restarting an unnamed worker
+    /// on a joined machine never permanently locks the member out once 64 past worker IDs have
+    /// accumulated. If all 64 claimed worker IDs currently have live sessions, the claim is
+    /// refused. Returns the list of evicted non-live worker IDs.
+    pub fn claim_worker_id_evicting<F>(
+        &self,
+        worker_id: Uuid,
+        member_id: &str,
+        is_live: F,
+    ) -> GridResult<Vec<Uuid>>
+    where
+        F: Fn(&Uuid) -> bool,
+    {
+        let (evicted, pending) =
+            self.claim_worker_id_evicting_deferred(worker_id, member_id, is_live)?;
+        if let Some(p) = pending {
+            self.flush_bookkeeping_persist(p);
+        }
         Ok(evicted)
+    }
+
+    /// Releases a non-live `worker_id` claim held in `v2_worker_seq` or `worker_owners` so an
+    /// enrolled member can register with that `worker_id` (design 0051 D5/D6).
+    pub fn release_worker_id(&self, worker_id: Uuid, had_registry_claim: bool) -> GridResult<()> {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let had_store_claim = guard.state.v2_worker_seq.contains_key(&worker_id)
+            || guard.state.worker_owners.contains_key(&worker_id)
+            || guard.state.worker_last_seq.contains_key(&worker_id);
+        if !had_store_claim && !had_registry_claim {
+            return Err(GridError::Config(format!(
+                "no worker_id claim found for {worker_id}"
+            )));
+        }
+        if had_store_claim {
+            guard.mutate_and_persist(|staged| {
+                staged.v2_worker_seq.remove(&worker_id);
+                staged.worker_owners.remove(&worker_id);
+                staged.worker_last_seq.remove(&worker_id);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Returns the worker IDs currently owned by `member_id`.
@@ -2675,14 +2823,25 @@ mod tests {
             .to_string();
         assert!(err.contains("maximum of 64"), "got: {err}");
 
-        // Item 8: Re-registering the oldest remaining claim (`history[6]`) bumps its persisted
-        // `worker_last_seq`; after reloading `MemberStore` from disk, evicting one more non-live
-        // claim drops `history[7]` (now oldest) rather than `history[6]` (which has the smallest
-        // UUID on average or was originally registered earliest).
+        // Item 8 + N1: Re-registering the oldest remaining claim (`history[6]`) bumps its
+        // `worker_last_seq` lazily in memory (zero disk writes on reconnect) and writes it out on
+        // the next eviction; after reloading `MemberStore` from disk, evicting another non-live
+        // claim drops `history[8]` rather than `history[6]`.
         let refreshed = history[6];
+        let writes_before_reconnect = store.persist_count();
         store
             .claim_worker_id_evicting(refreshed, member_id, |_existing| false)
-            .expect("re-claiming owned worker_id must succeed and refresh LRU seq");
+            .expect("re-claiming owned worker_id must succeed and refresh LRU seq in memory");
+        assert_eq!(
+            store.persist_count(),
+            writes_before_reconnect,
+            "reconnect of an already-owned worker_id must not write members.json"
+        );
+        let pre_reload_wid = Uuid::new_v4();
+        let evicted_before_reload = store
+            .claim_worker_id_evicting(pre_reload_wid, member_id, |_existing| false)
+            .expect("eviction must succeed and flush updated worker_last_seq");
+        assert_eq!(evicted_before_reload, vec![history[7]]);
         let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
         let post_reload_wid = Uuid::new_v4();
         let evicted_after_reload = reloaded
@@ -2690,10 +2849,125 @@ mod tests {
             .expect("LRU eviction after reload must succeed");
         assert_eq!(
             evicted_after_reload,
-            vec![history[7]],
+            vec![history[8]],
             "persisted worker_last_seq must preserve LRU order across master restart"
         );
         assert!(reloaded.workers_owned_by(member_id).contains(&refreshed));
+    }
+
+    #[test]
+    fn test_n1_reconnects_cause_zero_writes_and_secret_only_never_persists() {
+        // 1. Secret-only master never creates or writes members.json when v2 workers register.
+        let secret_dir = tempfile::tempdir().unwrap();
+        let secret_members_path = secret_dir.path().join(MEMBERS_FILE_NAME);
+        let secret_store = MemberStore::load_file(&secret_members_path)
+            .unwrap()
+            .with_auth_mode(AuthMode::Secret);
+        let v2_wid = Uuid::new_v4();
+        for _ in 0..10 {
+            secret_store
+                .claim_v2_worker_id(v2_wid, true, |_| false)
+                .unwrap();
+        }
+        assert_eq!(secret_store.persist_count(), 0);
+        assert!(
+            !secret_members_path.exists(),
+            "secret-only master must never create members.json"
+        );
+
+        // 2. Under `--auth both`, first registration of a new worker_id writes once; N reconnects
+        // of that known worker_id (both v2 and v3) cause zero writes.
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        store
+            .claim_v2_worker_id(v2_wid, true, |_| false)
+            .expect("initial v2 claim must succeed");
+        assert_eq!(store.persist_count(), 1);
+        for _ in 0..25 {
+            store
+                .claim_v2_worker_id(v2_wid, true, |_| false)
+                .expect("v2 reconnect must succeed");
+        }
+        assert_eq!(
+            store.persist_count(),
+            1,
+            "N reconnects of a known v2 worker_id must cause zero writes"
+        );
+
+        let v3_wid = Uuid::new_v4();
+        store
+            .claim_worker_id_evicting(v3_wid, "0123456789abcdef", |_| false)
+            .expect("initial v3 claim must succeed");
+        assert_eq!(store.persist_count(), 2);
+        for _ in 0..25 {
+            store
+                .claim_worker_id_evicting(v3_wid, "0123456789abcdef", |_| false)
+                .expect("v3 reconnect must succeed");
+        }
+        assert_eq!(
+            store.persist_count(),
+            2,
+            "N reconnects of a known v3 worker_id must cause zero writes"
+        );
+
+        // 3. A failed bookkeeping write (e.g. non-writable parent directory) logs a warning and
+        // does not refuse worker registration.
+        let unwritable_store = MemberStore::new()
+            .with_auth_mode(AuthMode::Both)
+            .with_save_path(dir.path().join("missing-file-as-dir").join(MEMBERS_FILE_NAME));
+        std::fs::write(dir.path().join("missing-file-as-dir"), b"not a directory").unwrap();
+        let new_v2 = Uuid::new_v4();
+        unwritable_store
+            .claim_v2_worker_id(new_v2, true, |_| false)
+            .expect("v2 worker registration must not fail when bookkeeping write fails");
+        let new_v3 = Uuid::new_v4();
+        unwritable_store
+            .claim_worker_id_evicting(new_v3, "0123456789abcdef", |_| false)
+            .expect("v3 worker registration must not fail when bookkeeping write fails");
+    }
+
+    #[test]
+    fn test_n2_v2_to_v3_worker_migration_in_members_and_both_modes() {
+        let store = MemberStore::new().with_auth_mode(AuthMode::Both);
+        let wid = Uuid::new_v4();
+        let mid = "0123456789abcdef";
+
+        // 1. Named worker registers as v2 under --auth both.
+        store.claim_v2_worker_id(wid, true, |_| false).unwrap();
+
+        // 2. Under --auth both, v3 member is refused with the `members release-worker` hint.
+        let err = store
+            .claim_worker_id_evicting(wid, mid, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("oxideswarm members release-worker {wid}")),
+            "expected release-worker hint, got: {err}"
+        );
+
+        // 3. Releasing the non-live worker_id allows the v3 member to claim it in --auth both.
+        store.release_worker_id(wid, false).unwrap();
+        store
+            .claim_worker_id_evicting(wid, mid, |_| false)
+            .expect("v3 member must claim worker_id after admin release-worker");
+
+        // 4. Under --auth members, `v2_worker_seq` is ignored automatically because no v2 peer can
+        // connect.
+        let wid2 = Uuid::new_v4();
+        store.claim_v2_worker_id(wid2, true, |_| false).unwrap();
+        store.set_auth_mode(AuthMode::Members);
+        store.check_worker_id_owner(wid2, Some(mid)).unwrap();
+        store.check_worker_id_claim(wid2, Some(mid)).unwrap();
+        store
+            .claim_worker_id_evicting(wid2, mid, |_| false)
+            .expect("under --auth members, v3 member must claim former v2 worker_id automatically");
     }
 
     #[test]

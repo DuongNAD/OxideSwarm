@@ -1298,9 +1298,9 @@ fn start_master(home: &Path, extra_args: &[&str]) -> (Service, String) {
     let log_file = home.join(format!("master-{id}.log"));
     let mut master_cmd = cli(home);
     master_cmd
-        .args(extra_args)
         .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
-        .arg(&port_file);
+        .arg(&port_file)
+        .args(extra_args);
     let master = Service::spawn(master_cmd, log_file);
     let mut port = None;
     assert!(
@@ -1435,6 +1435,25 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
         worker_b_to_a.log()
     );
     drop(worker_b_to_a);
+
+    // N1(b): Before `CreateInvite` is called, a `--secret-file` master must NOT have created
+    // `members.json`, `master_noise.key`, or `node.key` when a v2 worker registered.
+    assert!(
+        !home_a.path().join(".oxideswarm").join("members.json").exists(),
+        "N1(b) regression: v2 Register on --secret-file master created members.json before invite"
+    );
+    assert!(
+        !home_a
+            .path()
+            .join(".oxideswarm")
+            .join("master_noise.key")
+            .exists(),
+        "N1(b) regression: master_noise.key created before invite"
+    );
+    assert!(
+        !home_a.path().join(".oxideswarm").join("node.key").exists(),
+        "N1(b) regression: node.key created before invite"
+    );
 
     // Item 2: Master A (started with `--secret-file` and no `--state-dir`) creates an invite,
     // a member joins, Master A restarts with `--secret-file`, and the member still connects with
@@ -1661,5 +1680,409 @@ fn test_round3_two_unnamed_workers_slow_no_approval_confirm_and_paste_no_autocon
             .join("worker_id")
             .exists(),
         "Item 2 regression: unnamed `worker` must not write ~/.oxideswarm/worker_id"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_p2p_reclaim() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work_dir = TempDir::new().unwrap();
+    let secret_path = work_dir.path().join("cluster.secret");
+    fs::write(
+        &secret_path,
+        b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let secret_str = secret_path.to_str().unwrap();
+
+    // -------------------------------------------------------------------------
+    // 1. N1(a)/(b): Secret-only master (`--auth secret --secret-file X`) with a
+    //    read-only HOME / OXIDESWARM_HOME (0o500) accepts v2 workers, runs a
+    //    submitted task, and creates no `members.json`, `master_noise.key`, or
+    //    `node.key`.
+    // -------------------------------------------------------------------------
+    let ro_home = TempDir::new().unwrap();
+    let ro_oxs = ro_home.path().join(".oxideswarm");
+    fs::create_dir_all(&ro_oxs).unwrap();
+    fs::set_permissions(&ro_oxs, fs::Permissions::from_mode(0o500)).unwrap();
+    fs::set_permissions(ro_home.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+    let port_file_ro = work_dir.path().join("ro-master.port");
+    let log_file_ro = work_dir.path().join("ro-master.log");
+    let mut ro_master_cmd = cli(ro_home.path());
+    ro_master_cmd
+        .args([
+            "--secret-file",
+            secret_str,
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--auth",
+            "secret",
+            "--port-file",
+        ])
+        .arg(&port_file_ro);
+    let ro_master = Service::spawn(ro_master_cmd, log_file_ro);
+    let mut ro_port = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            ro_port = fs::read_to_string(&port_file_ro)
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok());
+            ro_port.is_some()
+        }),
+        "read-only HOME secret-only master did not start:\n{}",
+        ro_master.log()
+    );
+    let ro_addr = format!("127.0.0.1:{}", ro_port.unwrap());
+
+    let v2_worker_home = TempDir::new().unwrap();
+    let mut ro_worker_cmd = cli(v2_worker_home.path());
+    ro_worker_cmd
+        .args([
+            "--secret-file",
+            secret_str,
+            "worker",
+            "--name",
+            "ro-v2-worker",
+            "--master",
+            &ro_addr,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(work_dir.path().join("sb-ro"));
+    let ro_worker = Service::spawn(ro_worker_cmd, work_dir.path().join("ro-worker.log"));
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                v2_worker_home.path(),
+                &[
+                    "--secret-file",
+                    secret_str,
+                    "workers",
+                    "--master",
+                    &ro_addr,
+                    "--json",
+                ],
+            ));
+            out.status.success() && text(&out.stdout).contains("\"ro-v2-worker\"")
+        }),
+        "N1(a) regression: v2 worker rejected by secret-only master with read-only HOME:\nmaster:\n{}\nworker:\n{}",
+        ro_master.log(),
+        ro_worker.log()
+    );
+    let submit_out = run_cmd(with(
+        v2_worker_home.path(),
+        &[
+            "--secret-file",
+            secret_str,
+            "submit",
+            "--master",
+            &ro_addr,
+            "--wait",
+            "--",
+            "echo",
+            "ro-ok",
+        ],
+    ));
+    assert!(
+        submit_out.status.success() && text(&submit_out.stdout).contains("ro-ok"),
+        "task on secret-only master failed:\n{}\n{}",
+        text(&submit_out.stdout),
+        text(&submit_out.stderr)
+    );
+    assert!(!ro_oxs.join("members.json").exists());
+    assert!(!ro_oxs.join("master_noise.key").exists());
+    assert!(!ro_oxs.join("node.key").exists());
+    drop(ro_worker);
+    drop(ro_master);
+    // Restore permissions so TempDir cleanup succeeds.
+    let _ = fs::set_permissions(ro_home.path(), fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ro_oxs, fs::Permissions::from_mode(0o700));
+
+    // -------------------------------------------------------------------------
+    // 2. N2 (D6 end-to-end) + P2P v2 reclaim:
+    //    Start a master with `--p2p` (`--auth both`), register two named v2
+    //    workers (`gpu1` and `gpu2`), stop both, then join the worker machine
+    //    with a `--no-approval` invite.
+    //    - In `--auth both`: `gpu1` is refused with the `oxideswarm members
+    //      release-worker <id>` hint; after running `release-worker`, `gpu1`
+    //      registers as the enrolled v3 member with the same persisted
+    //      `worker_id.gpu1`.
+    //    - Over P2P (`--master <ticket>`): a v2 worker with the cluster secret
+    //      reclaims a non-live v3 worker_id over QUIC/P2P.
+    //    - In `--auth members`: restarting the master with `--auth members`
+    //      lets `gpu2` register as the enrolled v3 member automatically without
+    //      needing `release-worker`.
+    // -------------------------------------------------------------------------
+    let master_home = TempDir::new().unwrap();
+    let gen_out = run_cmd(with(master_home.path(), &["secret", "generate"]));
+    assert!(gen_out.status.success());
+
+    let port_file = master_home.path().join("master.port");
+    let ticket_file = master_home.path().join("master.ticket");
+    let mut master_cmd = cli(master_home.path());
+    master_cmd
+        .args(["master", "--listen", "127.0.0.1:0", "--p2p", "--port-file"])
+        .arg(&port_file)
+        .arg("--p2p-ticket-file")
+        .arg(&ticket_file);
+    let master = Service::spawn(master_cmd, master_home.path().join("master.log"));
+    let mut port = None;
+    let mut ticket = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            port = fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok());
+            ticket = fs::read_to_string(&ticket_file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            port.is_some() && ticket.is_some()
+        }),
+        "master did not start:\n{}",
+        master.log()
+    );
+    let addr = format!("127.0.0.1:{}", port.unwrap());
+    let ticket = ticket.unwrap();
+
+    let machine_home = TempDir::new().unwrap();
+    let machine_oxs = machine_home.path().join(".oxideswarm");
+    fs::create_dir_all(&machine_oxs).unwrap();
+    fs::set_permissions(&machine_oxs, fs::Permissions::from_mode(0o700)).unwrap();
+    let master_secret_path = master_home.path().join(".oxideswarm").join("cluster.secret");
+    let machine_secret_file = work_dir.path().join("machine-v2.secret");
+    fs::copy(&master_secret_path, &machine_secret_file).unwrap();
+    fs::set_permissions(&machine_secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let machine_secret_str = machine_secret_file.to_str().unwrap();
+
+    // Register `gpu1` and `gpu2` as v2 workers using `--secret-file`.
+    for name in ["gpu1", "gpu2"] {
+        let mut w_cmd = cli(machine_home.path());
+        w_cmd
+            .args([
+                "--secret-file",
+                machine_secret_str,
+                "worker",
+                "--name",
+                name,
+                "--master",
+                &addr,
+                "--cores",
+                "1",
+                "--no-portal",
+                "--sandbox-base-dir",
+            ])
+            .arg(work_dir.path().join(format!("sb-v2-{name}")));
+        let w = Service::spawn(w_cmd, work_dir.path().join(format!("w-v2-{name}.log")));
+        assert!(
+            wait_for(Duration::from_secs(15), || {
+                let out = run_cmd(with(
+                    master_home.path(),
+                    &["workers", "--master", &addr, "--json"],
+                ));
+                out.status.success() && text(&out.stdout).contains(&format!("\"{name}\""))
+            }),
+            "v2 worker {name} did not register:\n{}",
+            w.log()
+        );
+        drop(w);
+    }
+
+    let gpu1_id = fs::read_to_string(machine_oxs.join("worker_id.gpu1"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let gpu2_id = fs::read_to_string(machine_oxs.join("worker_id.gpu2"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Machine joins via `--no-approval` invite; `worker_id.gpu1` and `worker_id.gpu2` are kept.
+    let inv_out = run_cmd(with(
+        master_home.path(),
+        &["invite", "--master", &addr, "--no-approval"],
+    ));
+    assert!(inv_out.status.success());
+    let invite_str = text(&inv_out.stdout).trim().to_string();
+
+    let mut join_sess = InteractiveJoin::spawn(
+        with(machine_home.path(), &["join", "--no-doctor"]),
+        &invite_str,
+    );
+    join_sess.confirm("y");
+    let join_out = join_sess.wait_output(Duration::from_secs(20));
+    assert!(
+        join_out.status.success(),
+        "join failed:\n{}\n{}",
+        text(&join_out.stdout),
+        text(&join_out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(machine_oxs.join("worker_id.gpu1"))
+            .unwrap()
+            .trim(),
+        gpu1_id
+    );
+
+    // Under `--auth both`, restarting `worker --name gpu1` as v3 member is refused with the
+    // `oxideswarm members release-worker <gpu1_id>` hint.
+    let mut gpu1_v3_refused_cmd = cli(machine_home.path());
+    gpu1_v3_refused_cmd
+        .args([
+            "worker",
+            "--name",
+            "gpu1",
+            "--master",
+            &addr,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(work_dir.path().join("sb-v3-gpu1-refused"));
+    let gpu1_v3_refused = Service::spawn(
+        gpu1_v3_refused_cmd,
+        work_dir.path().join("w-v3-gpu1-refused.log"),
+    );
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            gpu1_v3_refused
+                .log()
+                .contains(&format!("oxideswarm members release-worker {gpu1_id}"))
+        }),
+        "expected release-worker hint in worker log:\n{}",
+        gpu1_v3_refused.log()
+    );
+    drop(gpu1_v3_refused);
+
+    // Admin releases `gpu1_id` via `oxideswarm members release-worker <gpu1_id>`.
+    let release_out = run_cmd(with(
+        master_home.path(),
+        &["members", "release-worker", &gpu1_id, "--master", &addr],
+    ));
+    assert!(
+        release_out.status.success(),
+        "release-worker failed:\n{}\n{}",
+        text(&release_out.stdout),
+        text(&release_out.stderr)
+    );
+    assert!(text(&release_out.stdout).contains(&gpu1_id));
+
+    // Now `worker --name gpu1` registers as the enrolled v3 member with the same `gpu1_id`!
+    let mut gpu1_v3_ok_cmd = cli(machine_home.path());
+    gpu1_v3_ok_cmd
+        .args([
+            "worker",
+            "--name",
+            "gpu1",
+            "--master",
+            &addr,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(work_dir.path().join("sb-v3-gpu1-ok"));
+    let gpu1_v3_ok = Service::spawn(gpu1_v3_ok_cmd, work_dir.path().join("w-v3-gpu1-ok.log"));
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                master_home.path(),
+                &["workers", "--master", &addr, "--json"],
+            ));
+            out.status.success()
+                && text(&out.stdout).contains("\"gpu1\"")
+                && text(&out.stdout).contains(&gpu1_id)
+        }),
+        "gpu1 did not register as v3 member after release-worker:\n{}",
+        gpu1_v3_ok.log()
+    );
+    drop(gpu1_v3_ok);
+
+    // Verify a v2 worker over P2P (`--master <ticket>`) can reclaim `gpu1_id` once `gpu1_v3_ok`
+    // is stopped!
+    let mut gpu1_p2p_v2_cmd = cli(v2_worker_home.path());
+    fs::create_dir_all(v2_worker_home.path().join(".oxideswarm")).unwrap();
+    fs::write(
+        v2_worker_home
+            .path()
+            .join(".oxideswarm")
+            .join("worker_id.gpu1"),
+        format!("{gpu1_id}\n"),
+    )
+    .unwrap();
+    gpu1_p2p_v2_cmd
+        .args([
+            "--secret-file",
+            machine_secret_str,
+            "worker",
+            "--name",
+            "gpu1",
+            "--master",
+            &ticket,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(work_dir.path().join("sb-p2p-v2-reclaim"));
+    let gpu1_p2p_v2 = Service::spawn(
+        gpu1_p2p_v2_cmd,
+        work_dir.path().join("w-p2p-v2-reclaim.log"),
+    );
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let out = run_cmd(with(
+                master_home.path(),
+                &["workers", "--master", &addr, "--json"],
+            ));
+            out.status.success()
+                && text(&out.stdout).contains("\"gpu1\"")
+                && text(&out.stdout).contains(&gpu1_id)
+        }),
+        "v2 worker over P2P ticket did not reclaim gpu1_id:\n{}",
+        gpu1_p2p_v2.log()
+    );
+    drop(gpu1_p2p_v2);
+    drop(master);
+
+    // Restart the master with `--auth members`; `gpu2` (which is still in `v2_worker_seq` in
+    // `members.json`) must be allowed to register as the enrolled v3 member automatically without
+    // needing `release-worker`.
+    let (_master_mem, addr_mem) = start_master(master_home.path(), &["--auth", "members"]);
+    let mut gpu2_v3_cmd = cli(machine_home.path());
+    gpu2_v3_cmd
+        .args([
+            "worker",
+            "--name",
+            "gpu2",
+            "--master",
+            &addr_mem,
+            "--cores",
+            "1",
+            "--no-portal",
+            "--sandbox-base-dir",
+        ])
+        .arg(work_dir.path().join("sb-v3-gpu2-members"));
+    let gpu2_v3 = Service::spawn(gpu2_v3_cmd, work_dir.path().join("w-v3-gpu2-members.log"));
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let out = run_cmd(with(
+                master_home.path(),
+                &["workers", "--master", &addr_mem, "--json"],
+            ));
+            out.status.success()
+                && text(&out.stdout).contains("\"gpu2\"")
+                && text(&out.stdout).contains(&gpu2_id)
+        }),
+        "N2 regression: under --auth members, v3 member gpu2 could not register its persisted worker_id:\n{}",
+        gpu2_v3.log()
     );
 }
