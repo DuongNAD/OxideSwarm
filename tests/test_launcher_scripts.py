@@ -855,6 +855,7 @@ class UsbKitTests(unittest.TestCase):
                        "it is on the drive this kit runs from", "not the root of a drive",
                        "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
                        "/inheritance:r", "--sandbox-base-dir", "--workspace-root",
+                       "AssocClass=Win32_LogicalDiskToPartition", "$disk.InterfaceType -eq 'USB'",
                        "'HKCU:\\Software\\OxideSwarm\\UsbKit'"):
             self.assertIn(needle, text)
         ask = text.index('Read-Host "Choose [1]"')

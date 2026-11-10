@@ -276,6 +276,20 @@ impl SandboxConfig {
     /// `<base_dir>/cache/blobs` untouched.
     pub async fn ensure_usable(&self) -> Result<(), SandboxError> {
         self.ensure_private_root().await?;
+        // Windows has no private root above the base: the base itself is created private, or
+        // checked when it exists (`ensure_private_dir`).
+        #[cfg(windows)]
+        {
+            let base = self.base_dir.clone();
+            tokio::task::spawn_blocking(move || ensure_private_dir(&base))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(SandboxError::BaseDirUnusable {
+                        path: self.base_dir.clone(),
+                        source: std::io::Error::other(e.to_string()),
+                    })
+                })?;
+        }
         let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
             path: self.base_dir.clone(),
             source,
@@ -672,8 +686,13 @@ fn current_euid() -> u32 {
 /// Creates `root` with mode 700 if it is missing and refuses it, as
 /// `SandboxError::BaseDirUnsafe`, when another local user could change what is inside it
 /// (design 0021): see `parent_refusal` and `root_refusal`. The mode of an existing `root` is never
-/// changed, because another user may already have put links into one that was open. Does nothing
-/// on systems without Unix modes.
+/// changed, because another user may already have put links into one that was open.
+///
+/// On Windows a missing `root` is created with the protected owner-only DACL of SEC-9 (the current
+/// user, `SYSTEM` and `Administrators`), so its task folders and files inherit only those three. An
+/// existing `root` is used as it is, with a warning and the `icacls` command that fixes it when any
+/// local account may read or change what is inside (see `warn_if_open_to_local_accounts`). It does
+/// nothing on other systems without Unix modes.
 pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
     #[cfg(unix)]
     {
@@ -713,10 +732,55 @@ pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
             None => Ok(()),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if root.exists() {
+            warn_if_open_to_local_accounts(root);
+        } else {
+            rusty_grid_core::private_file::create_private_dir_all(root).map_err(|source| {
+                SandboxError::BaseDirUnusable {
+                    path: root.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = root;
         Ok(())
+    }
+}
+
+/// Logs a warning when the DACL of the existing directory `dir` lets any local account
+/// (`Everyone`, `BUILTIN\Users`, `Authenticated Users`, ...) read or change what is inside, with
+/// the `icacls` command that limits it to the current user, `SYSTEM` and `Administrators`. A folder
+/// made at the root of a data drive has such entries by default. It warns rather than refuses, as
+/// SEC-9 does for an existing secret file, so a worker that ran before keeps starting.
+#[cfg(windows)]
+fn warn_if_open_to_local_accounts(dir: &Path) {
+    use rusty_grid_core::private_file::{local_account_grants, read_dacl, sid_label};
+    match read_dacl(dir) {
+        Ok((aces, _)) => {
+            let open = local_account_grants(&aces);
+            if !open.is_empty() {
+                let who: Vec<String> = open.iter().map(|s| sid_label(s)).collect();
+                let user = std::env::var("USERNAME").unwrap_or_else(|_| "%USERNAME%".to_string());
+                tracing::warn!(
+                    "'{path}' lets other local accounts ({who}) read or change task files; to make \
+                     it private run: icacls \"{path}\" /inheritance:r /grant:r \"{user}:(OI)(CI)F\" \
+                     \"SYSTEM:(OI)(CI)F\" \"Administrators:(OI)(CI)F\"",
+                    path = dir.display(),
+                    who = who.join(", "),
+                );
+            }
+        }
+        Err(e) => tracing::debug!(
+            path = %dir.display(),
+            error = %e,
+            "could not read the DACL of a task directory"
+        ),
     }
 }
 
@@ -2006,5 +2070,43 @@ mod tests {
                 .exists(),
             "lock file of swept retained sandbox must be removed"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_private_dir_tests {
+    use super::ensure_private_dir;
+    use rusty_grid_core::private_file::{current_user_sid, local_account_grants, read_dacl};
+
+    #[test]
+    fn a_missing_dir_is_created_with_the_protected_owner_only_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("work").join("sandboxes");
+        ensure_private_dir(&base).unwrap();
+        assert!(base.is_dir());
+        let (aces, protected) = read_dacl(&base).unwrap();
+        assert!(
+            protected,
+            "the DACL must not inherit entries from its parent"
+        );
+        assert!(local_account_grants(&aces).is_empty(), "{aces:?}");
+        let user = current_user_sid().unwrap();
+        assert!(
+            aces.iter().any(|a| a.sid.eq_ignore_ascii_case(&user)),
+            "{aces:?}"
+        );
+        // A task folder created inside inherits only the private entries.
+        let task = base.join("task");
+        std::fs::create_dir(&task).unwrap();
+        let (task_aces, _) = read_dacl(&task).unwrap();
+        assert!(local_account_grants(&task_aces).is_empty(), "{task_aces:?}");
+    }
+
+    #[test]
+    fn an_existing_dir_is_used_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = read_dacl(tmp.path()).unwrap();
+        ensure_private_dir(tmp.path()).unwrap();
+        assert_eq!(read_dacl(tmp.path()).unwrap(), before);
     }
 }

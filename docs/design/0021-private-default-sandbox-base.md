@@ -196,3 +196,16 @@ test. A test for it would have to replace the root while the task waits for a sl
   - The Android launches pass `--sandbox-base-dir`, and the Android bridge creates the private root
     itself.
   - Tests were added for a group-writable temp dir and for the client.
+- 2026-11-10: Windows. The USB kit trial put a worker's sandbox base on a data drive
+  (`E:\OxideSwarm\work`), where a new folder inherits `Authenticated Users: Modify`. The Windows
+  worker never checked its base. Now `ensure_usable` runs `ensure_private_dir` on the base itself
+  (Windows has no private root above it), and so does the workspace root:
+  - a missing directory is created with the protected owner-only DACL of SEC-9 (design 0047), so
+    task folders inherit only the current user, `SYSTEM` and `Administrators`;
+  - an existing directory is used as it is, with a warning that names the open groups (`Everyone`,
+    `BUILTIN\Users`, `Authenticated Users`, `INTERACTIVE`, `BUILTIN\Guests`) and the `icacls`
+    command that fixes it. It warns rather than refuses, as SEC-9 does for an existing secret file,
+    so a worker that ran before keeps starting.
+
+  `local_account_grants` (pure, tested on every system) picks the open groups; Windows-only tests
+  check the created DACL and that an existing directory is left as it is.

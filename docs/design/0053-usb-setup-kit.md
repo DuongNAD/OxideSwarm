@@ -231,3 +231,9 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   inside it. The folder is recorded in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1`. The
   worker itself does not check the permissions of a custom sandbox base on Windows
   (`ensure_private_dir` acts on Unix only); that is a separate fix.
+- 2026-11-10: The install-folder menu was checked on a Windows 11 laptop with an internal `E:`
+  (NTFS): it offered `E:\OxideSwarm`, skipped the kit stick (`D:`, exFAT, removable) and Google
+  Drive (`G:`, FAT32), and refused a second install while one existed on drive C. Google Drive is
+  skipped only because it reports FAT32, so the installer now also requires a disk partition behind
+  the drive letter (`Win32_LogicalDiskToPartition`; a cloud or virtual drive has none) and refuses
+  disks on the USB bus. The worker-side fix landed the same day (design 0021 status log).

@@ -274,7 +274,8 @@ impl WorkspaceStore {
                 reason: "the root must be an absolute path".to_string(),
             });
         }
-        #[cfg(not(unix))]
+        // On Unix and Windows `ensure_private_dir` creates the root private; elsewhere it is plain.
+        #[cfg(not(any(unix, windows)))]
         fs::create_dir_all(&root).map_err(io_err(format!("creating {}", root.display())))?;
         ensure_private_dir(&root).map_err(|e: SandboxError| WorkspaceError::Root {
             path: root.clone(),

@@ -27,6 +27,19 @@ pub const SID_EVERYONE: &str = "S-1-1-0";
 pub const SID_USERS: &str = "S-1-5-32-545";
 /// `NT AUTHORITY\Authenticated Users`.
 pub const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
+/// `NT AUTHORITY\INTERACTIVE`.
+pub const SID_INTERACTIVE: &str = "S-1-5-4";
+/// `BUILTIN\Guests`.
+pub const SID_GUESTS: &str = "S-1-5-32-546";
+
+/// The groups that stand for "any local account" in a DACL.
+const LOCAL_ACCOUNT_GROUPS: [&str; 5] = [
+    SID_EVERYONE,
+    SID_USERS,
+    SID_AUTHENTICATED_USERS,
+    SID_INTERACTIVE,
+    SID_GUESTS,
+];
 
 /// Access-mask bits that make an entry a problem for a private file: read, write, append, change
 /// the DACL, take ownership, or any of the generic rights.
@@ -75,12 +88,32 @@ pub fn open_grants(aces: &[DaclAce], current_user_sid: &str) -> Vec<String> {
     out
 }
 
+/// The groups in `aces` that stand for any local account (`Everyone`, `BUILTIN\Users`,
+/// `Authenticated Users`, `INTERACTIVE`, `BUILTIN\Guests`) and are granted data access, each once.
+/// Unlike [`open_grants`] it leaves out single trustees such as a service SID, the AppContainer
+/// SIDs that task isolation adds, or `CREATOR OWNER`: it answers "can any other local account read
+/// or change what is inside this directory".
+pub fn local_account_grants(aces: &[DaclAce]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ace in aces {
+        if ace.mask & SENSITIVE_MASK != 0
+            && LOCAL_ACCOUNT_GROUPS.contains(&ace.sid.as_str())
+            && !out.contains(&ace.sid)
+        {
+            out.push(ace.sid.clone());
+        }
+    }
+    out
+}
+
 /// A readable name for the well-known SIDs, the SID itself otherwise.
 pub fn sid_label(sid: &str) -> String {
     match sid {
         SID_EVERYONE => "Everyone".to_string(),
         SID_USERS => "BUILTIN\\Users".to_string(),
         SID_AUTHENTICATED_USERS => "Authenticated Users".to_string(),
+        SID_INTERACTIVE => "INTERACTIVE".to_string(),
+        SID_GUESTS => "BUILTIN\\Guests".to_string(),
         other => other.to_string(),
     }
 }
@@ -482,6 +515,29 @@ mod tests {
             open_grants(&aces, ME),
             vec![SID_USERS, SID_EVERYONE, SID_AUTHENTICATED_USERS]
         );
+    }
+
+    #[test]
+    fn local_account_grants_name_only_the_broad_groups() {
+        let user = "S-1-5-21-1-2-3-1001";
+        let aces = [
+            ace(user, 0x001F_01FF),
+            ace(SID_SYSTEM, 0x001F_01FF),
+            ace(SID_ADMINISTRATORS, 0x001F_01FF),
+            ace("S-1-3-0", 0x1000_0000),                // CREATOR OWNER
+            ace("S-1-15-2-1-2-3-4-5-6-7", 0x0012_019F), // an AppContainer SID
+            ace(SID_USERS, 0x0012_00A9),                // read and execute
+            ace(SID_AUTHENTICATED_USERS, 0x0013_01BF),  // modify
+            ace(SID_AUTHENTICATED_USERS, 0x0000_0004),  // add subdirectory, again
+            ace(SID_EVERYONE, 0x0010_0000),             // SYNCHRONIZE only
+        ];
+        assert_eq!(
+            local_account_grants(&aces),
+            vec![SID_USERS.to_string(), SID_AUTHENTICATED_USERS.to_string()]
+        );
+        assert!(local_account_grants(&aces[..5]).is_empty());
+        assert_eq!(sid_label(SID_INTERACTIVE), "INTERACTIVE");
+        assert_eq!(sid_label(SID_GUESTS), "BUILTIN\\Guests");
     }
 
     #[test]

@@ -57,6 +57,13 @@ function Test-InstallDrive($root) {
     if (-not $drive.IsReady) { return "drive $driveRoot is not ready" }
     if ($drive.DriveType -ne 'Fixed') { return "drive $driveRoot is a $($drive.DriveType) drive, not a fixed one" }
     if ($drive.DriveFormat -notin @('NTFS', 'ReFS')) { return "drive $driveRoot uses $($drive.DriveFormat), which keeps no permissions (NTFS or ReFS needed)" }
+    # A cloud or virtual drive (Google Drive, rclone and the like) sits on no disk partition, and an
+    # external USB disk reports itself as fixed but can be unplugged while a task runs.
+    $letter = $driveRoot.TrimEnd('\')
+    $parts = @(Get-CimInstance -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$letter'} WHERE AssocClass=Win32_LogicalDiskToPartition" -ErrorAction SilentlyContinue)
+    if ($parts.Count -eq 0) { return "drive $driveRoot is not a partition of a local disk (a cloud or virtual drive)" }
+    $disk = @(Get-CimInstance -Query ("ASSOCIATORS OF {Win32_DiskPartition.DeviceID='" + $parts[0].DeviceID + "'} WHERE AssocClass=Win32_DiskDriveToDiskPartition") -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($disk -and $disk.InterfaceType -eq 'USB') { return "drive $driveRoot is on an external USB disk, which can be unplugged while a task runs" }
     return $null
 }
 $explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')

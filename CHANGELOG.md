@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The Windows USB installer can keep its files on another fixed NTFS or ReFS drive: it asks when one exists (or takes `-InstallRoot`), limits that folder to the user, `SYSTEM` and `Administrators`, puts the task folders, file cache and workspaces inside it (`--sandbox-base-dir`, `--workspace-root`), and records it in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1` ([design 0053](docs/design/0053-usb-setup-kit.md)).
 
 ### Changed
+- Windows workers create a missing task sandbox base and workspace root with the owner-only DACL (current user, `SYSTEM`, `Administrators`), and warn with the `icacls` fix when an existing one lets any local account read or change task files ([design 0021](docs/design/0021-private-default-sandbox-base.md)).
+- The Windows USB installer skips cloud or virtual drives (no disk partition) and external USB disks when it offers or checks an install folder ([design 0053](docs/design/0053-usb-setup-kit.md)).
 - Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`): adds `ClientMessage` and `ClientResponse` variants for OXS-AUTH v3 enrollment, invites, and member management ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 
 ### Fixed
