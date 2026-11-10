@@ -1,7 +1,7 @@
 # OxideSwarm USB uninstaller for Windows (kit format v0, design 0053 / 0055).
 # Stops the worker this kit installed, revokes any oxideswarm.toolchain ACL grants recorded in its
-# manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry and its
-# folder (binaries, the cluster secret it received, logs). Nothing else is touched.
+# manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its
+# folder (binaries, the cluster secret it received, logs), and %TEMP%\oxideswarm-usb. Nothing else is touched.
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-Yes]
 [CmdletBinding()]
 param(
@@ -61,4 +61,24 @@ if (Test-Path -LiteralPath $Manifest) {
 }
 
 Remove-Item -Recurse -Force $InstallRoot
+$UsbTempRoot = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb'
+if (Test-Path -LiteralPath $UsbTempRoot) {
+    $usbTempItem = Get-Item -LiteralPath $UsbTempRoot -Force
+    if (($usbTempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Warning "Refusing to remove reparse point at $UsbTempRoot"
+    } else {
+        $hasReparseDescendant = $false
+        foreach ($child in Get-ChildItem -LiteralPath $UsbTempRoot -Recurse -Force -ErrorAction SilentlyContinue) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $hasReparseDescendant = $true
+                break
+            }
+        }
+        if ($hasReparseDescendant) {
+            Write-Warning "Refusing to remove $UsbTempRoot because it contains a reparse point."
+        } else {
+            Remove-Item -LiteralPath $UsbTempRoot -Recurse -Force
+        }
+    }
+}
 Write-Host "Removed. The cluster owner can also remove this machine from the cluster."

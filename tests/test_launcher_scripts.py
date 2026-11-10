@@ -848,10 +848,17 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("revoke-isolation-acls.ps1", uninst_text)
         self.assertIn("$global:LASTEXITCODE = 0", uninst_text)
         self.assertIn("keeping $InstallRoot and $Manifest", uninst_text)
+        self.assertIn("oxideswarm-usb", uninst_text)
+        self.assertIn("ReparsePoint", uninst_text)
         self.assertLess(
             uninst_text.index("revoke-isolation-acls.ps1"),
             uninst_text.index("Remove-Item -Recurse -Force $InstallRoot"),
             "uninstall.ps1 must revoke isolation ACLs before deleting $InstallRoot",
+        )
+        self.assertLess(
+            uninst_text.index("revoke-isolation-acls.ps1"),
+            uninst_text.index("$UsbTempRoot"),
+            "uninstall.ps1 must remove %TEMP%\\oxideswarm-usb only after ACL revocation succeeds",
         )
         self.assertIn("$env:OXIDESWARM_HOME", rev_text)
         self.assertIn("while another worker is running", rev_text)
@@ -1114,6 +1121,12 @@ public class Program {
                 with open(manifest_fs, "a", encoding="utf-8") as mf:
                     mf.write(f"SDDL|{non_sb_dir}|D:P(A;;FA;;;SY)\n")
 
+                usb_temp_root = os.path.join(tmp_temp, "oxideswarm-usb")
+                usb_temp_blob = os.path.join(usb_temp_root, "sandboxes", "blob_cache", "dummy.bin")
+                os.makedirs(os.path.dirname(usb_temp_blob), exist_ok=True)
+                with open(usb_temp_blob, "wb") as bf:
+                    bf.write(b"blob")
+
                 # Verify S2 + N5: when another task lock is held, uninstall.ps1 refuses to delete
                 # $InstallRoot or $Manifest and leaves the manifest intact.
                 import ctypes
@@ -1136,6 +1149,7 @@ public class Program {
                     self.assertIn("while another worker is running", uninst_busy.stdout)
                     self.assertIn("keeping", uninst_busy.stdout)
                     self.assertTrue(os.path.isfile(manifest_fs), "manifest must be preserved when revoke is blocked")
+                    self.assertTrue(os.path.isfile(usb_temp_blob), "%TEMP%\\oxideswarm-usb must not be removed before revoke succeeds")
                 finally:
                     if lock_handle not in (-1, 0):
                         kernel32.CloseHandle(lock_handle)
@@ -1155,6 +1169,7 @@ public class Program {
                 self.assertIn("Revoking isolation ACL grants recorded in", uninst_fs.stdout)
                 self.assertIn("Refusing SDDL restore on non-sandbox/workspace base path", uninst_fs.stdout)
                 self.assertFalse(os.path.exists(inst_root_fs))
+                self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed by uninstall.ps1")
 
                 # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
                 inst_root_off = os.path.join(tmp, "installed-off")
@@ -1173,6 +1188,10 @@ public class Program {
                 self.assertIn("--isolation off", vbs_off)
                 self.assertFalse(os.path.exists(os.path.join(inst_root_off, "home", "windows_acl_grants.txt")))
 
+                os.makedirs(os.path.dirname(usb_temp_blob), exist_ok=True)
+                with open(usb_temp_blob, "wb") as bf:
+                    bf.write(b"blob-off")
+
                 uninst_off = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1185,6 +1204,40 @@ public class Program {
                 self.assertEqual(uninst_off.returncode, 0, uninst_off.stdout)
                 self.assertIn("No isolation ACL grant manifest", uninst_off.stdout)
                 self.assertFalse(os.path.exists(inst_root_off))
+                self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed in off mode too")
+
+                # 2c. Verify uninstall.ps1 refuses to follow a reparse point at %TEMP%\oxideswarm-usb.
+                reparse_target = os.path.join(tmp, "reparse_canary_dir")
+                os.makedirs(reparse_target, exist_ok=True)
+                canary_file = os.path.join(reparse_target, "canary.txt")
+                with open(canary_file, "w", encoding="utf-8") as cf:
+                    cf.write("keep")
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", usb_temp_root, reparse_target],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=15, check=True,
+                )
+                fake_reparse_inst = os.path.join(tmp, "win-reparse-install")
+                os.makedirs(os.path.join(fake_reparse_inst, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_reparse_inst, "home"), exist_ok=True)
+                with open(os.path.join(fake_reparse_inst, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                uninst_reparse = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_reparse_inst, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_reparse.returncode, 0, uninst_reparse.stdout)
+                self.assertIn("Refusing to remove reparse point", uninst_reparse.stdout)
+                self.assertTrue(os.path.isfile(canary_file), "reparse target canary must not be deleted")
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", usb_temp_root],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=15,
+                )
             finally:
                 for pid_candidate in (
                     pids_log,
