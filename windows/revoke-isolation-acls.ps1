@@ -17,6 +17,9 @@
     AppContainer profiles so that turning off isolation or uninstalling OxideSwarm leaves zero
     permanent ACL changes behind.
 
+    Supports both Windows PowerShell 5.1 (`powershell.exe`, invoked by the `.cmd` launchers) and
+    PowerShell 7+ (`pwsh`).
+
 .PARAMETER ManifestPath
     Path to the ACL grant manifest written by the worker. Defaults to
     `$env:RUSTY_GRID_ACL_GRANT_LOG` if set, otherwise
@@ -43,6 +46,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ($PSVersionTable.PSVersion.Major -lt 6 -and $env:SystemRoot) {
+    $winPsModules = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+    if (Test-Path -LiteralPath $winPsModules) {
+        $env:PSModulePath = $winPsModules
+    }
+}
 
 if (-not ('OxideSwarmIsolationNative' -as [type])) {
 Add-Type -TypeDefinition @"
@@ -162,24 +172,19 @@ if (Test-Path -LiteralPath $ManifestPath) {
     Write-Host "No manifest file found at $ManifestPath"
 }
 
-$runningWorkers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -in @('oxideswarm.exe', 'rusty-grid.exe') -and $_.CommandLine -like '* worker*' })
-$lockHeld = $false
-if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
-    $manifestDir = Split-Path -Parent $ManifestPath
-    if (-not [string]::IsNullOrWhiteSpace($manifestDir)) {
-        $lockCandidate = Join-Path $manifestDir ".oxideswarm_worker_profile.lock"
-        if (Test-Path -LiteralPath $lockCandidate) {
-            try {
-                $fs = [System.IO.File]::Open($lockCandidate, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-                $fs.Close()
-            } catch {
-                $lockHeld = $true
-            }
-        }
-    }
+$cimQueryFailed = $false
+$runningWorkers = @()
+try {
+    $runningWorkers = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+        Where-Object {
+            $_.Name -in @('oxideswarm.exe', 'rusty-grid.exe') -and
+            $_.CommandLine -match '(?:oxideswarm|rusty-grid)(?:\.exe)?["'']?\s+(worker)(\s|$)'
+        })
+} catch {
+    $cimQueryFailed = $true
 }
-if (-not $lockHeld -and -not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-Path -LiteralPath $env:TEMP)) {
+$lockHeld = $false
+if (-not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-Path -LiteralPath $env:TEMP)) {
     foreach ($lf in Get-ChildItem -LiteralPath $env:TEMP -Filter "oxideswarm.task.*.lock" -File -Force -ErrorAction SilentlyContinue) {
         try {
             $fs = [System.IO.File]::Open($lf.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
@@ -191,8 +196,12 @@ if (-not $lockHeld -and -not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-
     }
 }
 
-if (($runningWorkers.Count -gt 0 -or $lockHeld) -and -not $Force -and -not $DryRun) {
-    Write-Warning "Refusing to revoke isolation ACL grants, restore sandbox_base SDDL, or sweep oxideswarm.task.* AppContainer profiles while another worker is running; stop all workers first (or pass -Force)."
+if (($cimQueryFailed -or $runningWorkers.Count -gt 0 -or $lockHeld) -and -not $Force -and -not $DryRun) {
+    if ($cimQueryFailed) {
+        Write-Warning "Refusing to revoke isolation ACL grants while Win32_Process query failed (worker status unknown); pass -Force to override."
+    } else {
+        Write-Warning "Refusing to revoke isolation ACL grants, restore sandbox_base SDDL, or sweep oxideswarm.task.* AppContainer profiles while another worker is running; stop all workers first (or pass -Force)."
+    }
     exit 2
 }
 
@@ -216,7 +225,12 @@ foreach ($restore in $sddlRestores) {
         continue
     }
     try {
-        $curAcl = [System.IO.Directory]::GetAccessControl($rPath, [System.Security.AccessControl.AccessControlSections]::Access)
+        $dirInfo = New-Object System.IO.DirectoryInfo($rPath)
+        if ('System.IO.FileSystemAclExtensions' -as [type]) {
+            $curAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl($dirInfo, [System.Security.AccessControl.AccessControlSections]::Access)
+        } else {
+            $curAcl = $dirInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+        }
         $curSddl = $curAcl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
         if ($curSddl -notlike "*$toolchainSid*") {
             Write-Host "Skipping SDDL restore on $rPath (current DACL does not contain *$toolchainSid)"
@@ -228,7 +242,11 @@ foreach ($restore in $sddlRestores) {
             Write-Host "Restoring original DACL SDDL on: $rPath"
             $acl = New-Object System.Security.AccessControl.DirectorySecurity
             $acl.SetSecurityDescriptorSddlForm($rSddl, [System.Security.AccessControl.AccessControlSections]::Access)
-            [System.IO.Directory]::SetAccessControl($rPath, $acl)
+            if ('System.IO.FileSystemAclExtensions' -as [type]) {
+                [System.IO.FileSystemAclExtensions]::SetAccessControl($dirInfo, $acl)
+            } else {
+                $dirInfo.SetAccessControl($acl)
+            }
         }
     } catch {
         Write-Warning "Failed to restore original DACL SDDL on $($rPath): $($_.Exception.Message)"

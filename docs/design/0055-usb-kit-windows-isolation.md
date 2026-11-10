@@ -90,13 +90,16 @@ In `crates/worker/src/isolation.rs`:
    arbitrary directories under `user_home`.
 4. `windows/revoke-isolation-acls.ps1` uses the same three-tier default for `-ManifestPath` and
    checks before modifying any ACL or SDDL whether any `oxideswarm.exe` / `rusty-grid.exe` worker
-   process (`CommandLine -like '* worker*'`, so a co-located `oxideswarm master` does not block
-   cleanup) or `oxideswarm.task.*.lock` file is active. If another worker or task is active (and
-   `-Force` was not passed), `revoke-isolation-acls.ps1` prints a warning and exits `2` without
-   modifying ACLs, SDDL, AppContainer profiles, or the manifest. When no worker is active, it
-   restores `SDDL\t<path>\t<sddl>` entries before running `icacls /remove` (only on existing
-   directories whose leaf name is `sandboxes` or `workspaces` and whose current on-disk DACL SDDL
-   still contains the `oxideswarm.toolchain` SID).
+   process (`CommandLine -match '(?:oxideswarm|rusty-grid)(?:\.exe)?["'']?\s+(worker)(\s|$)'`, so a
+   co-located `oxideswarm master` or `oxideswarm workers` call does not block cleanup) or
+   `oxideswarm.task.*.lock` file is active, and fails closed if `Get-CimInstance Win32_Process`
+   throws. If another worker or task is active (or the process query failed, and `-Force` was not
+   passed), `revoke-isolation-acls.ps1` prints a warning and exits `2` without modifying ACLs, SDDL,
+   AppContainer profiles, or the manifest. When no worker is active, it restores
+   `SDDL|<path>|<sddl>` entries before running `icacls /remove` (only on existing directories whose
+   leaf name is `sandboxes` or `workspaces` and whose current on-disk DACL SDDL still contains the
+   `oxideswarm.toolchain` SID), counts any SDDL restore or `icacls /remove` failures, keeps the
+   manifest and exits `1` if any failure occurred, and otherwise exits `0`.
 
 ### D2: Opt-in isolation in `make_kit.sh`, `install.ps1`, and `install.sh`
 
@@ -114,13 +117,18 @@ In `crates/worker/src/isolation.rs`:
    - resolves `$Isolation`: CLI `-Isolation` > `$Kit\isolation` file > `'off'`;
    - sets `$env:RUSTY_GRID_ACL_GRANT_LOG = Join-Path $State 'windows_acl_grants.txt'` and
      `$env:RUSTY_GRID_SANDBOX_BASE_DIR = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes'`
-     (and writes both into `start-worker.vbs` alongside `OXIDESWARM_HOME`), so even release **0.1.1**
-     worker binaries write `windows_acl_grants.txt` into `$InstallRoot\home`, use a dedicated USB
-     sandbox base directory, and never touch `%USERPROFILE%\.oxideswarm`;
+     (and writes both into `start-worker.vbs` alongside `OXIDESWARM_HOME`, `HOME = $State`, and
+     explicit `RUSTUP_HOME` / `CARGO_HOME`; setting `HOME = $State` in `start-worker.vbs` for both
+     `off` and `fs` kits also scopes `HOME`-based git/ssh configuration read by worker tasks to the
+     kit's state folder), so even release **0.1.1** worker binaries write `windows_acl_grants.txt`
+     into `$InstallRoot\home`, use a dedicated USB sandbox base directory, and never touch
+     `%USERPROFILE%\.oxideswarm`;
    - copies `revoke-isolation-acls.ps1` into `$InstallRoot\revoke-isolation-acls.ps1`;
    - passes `--isolation $Isolation` in `$workerArgs` (used for both the immediate `wscript.exe`
      launch and the `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` `OxideSwarmUsbWorker`
-     autostart launcher, overridable via `OXIDESWARM_USB_RUN_VALUE` for isolated tests);
+     autostart launcher, overridable via `OXIDESWARM_USB_RUN_VALUE` for isolated tests); if a
+     post-launch check fails under `-Isolation fs`, `install.ps1` reminds the user to run
+     `Uninstall OxideSwarm.cmd` or `uninstall.ps1` to revert any ACL grants;
    - prints `  connected (isolation: $Isolation)`.
 3. `packaging/usb/install.sh`:
    - adds `--isolation off|fs`;
@@ -144,7 +152,8 @@ In `crates/worker/src/isolation.rs`:
      script is missing, `uninstall.ps1` prints a clear error message and exits `1` while keeping
      `$InstallRoot` and `$Manifest` intact so ACLs can be revoked once the other worker stops;
    - if `$Manifest` does not exist, prints that no isolation ACL manifest was present.
-4. Deletes `$InstallRoot` (and removes `%TEMP%\oxideswarm-usb\sandboxes` when empty).
+4. Deletes `$InstallRoot` and removes `%TEMP%\oxideswarm-usb` (including `sandboxes` and any task
+   blob cache) after ACL revocation succeeds, refusing to follow reparse points.
 
 ### D4: Native Win32 command resolution under Windows isolation (`BUG-18`)
 

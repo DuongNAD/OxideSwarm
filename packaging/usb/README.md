@@ -12,8 +12,8 @@ works a limited number of times.
 | `make_kit.sh` | Writes `<DIR>/OxideSwarm/`: these installers, the release archives for macOS (arm64 and x86_64), Windows and Linux with `SHA256SUMS`, and the join token read from standard input |
 | `install.sh`, `Install OxideSwarm.command` | Install on Linux and macOS |
 | `install.ps1`, `Install OxideSwarm.cmd` | Install on Windows |
-| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added (on Windows, also revokes any `oxideswarm.toolchain` ACL grants recorded in `<folder>\home\windows_acl_grants.txt` via `revoke-isolation-acls.ps1`) |
-| `revoke-isolation-acls.ps1` |Copied from `windows/revoke-isolation-acls.ps1` so `uninstall.ps1` can revoke Windows isolation ACLs cleanly |
+| `uninstall.sh`, `Uninstall OxideSwarm.command`, `uninstall.ps1`, `Uninstall OxideSwarm.cmd` | Remove what the installer added (on Windows, also revokes any `oxideswarm.toolchain` ACL grants recorded in `<folder>\home\windows_acl_grants.txt` via `revoke-isolation-acls.ps1` and removes `%TEMP%\oxideswarm-usb`) |
+| `revoke-isolation-acls.ps1` | Copied from `windows/revoke-isolation-acls.ps1` so `uninstall.ps1` can revoke Windows isolation ACLs cleanly |
 | `KIT_README.txt` | Becomes `README.txt` on the stick |
 
 ## Make a kit
@@ -78,11 +78,14 @@ Each installer does the following, without administrator rights:
      and the host kernel cannot start an isolated worker; an explicit `--isolation fs` or baked `fs`
      in the kit's `isolation` file fails instead of falling back), and `--isolation off` by default
      on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs` when opted in; on Windows,
-     `install.ps1` and `start-worker.vbs` set `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`,
-     `RUSTY_GRID_SANDBOX_BASE_DIR=%TEMP%\oxideswarm-usb\sandboxes`, `OXIDESWARM_HOME=<folder>\home`,
-     `HOME=<folder>\home`, and explicit `RUSTUP_HOME` / `CARGO_HOME` so `oxideswarm.toolchain` ACL
-     grants are recorded in `<folder>\home\windows_acl_grants.txt` on release **0.1.1+** without
-     touching `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes them before deleting `<folder>`.
+     `install.ps1` and `start-worker.vbs` set `OXIDESWARM_HOME=<folder>\home`,
+     `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`, and
+     `RUSTY_GRID_SANDBOX_BASE_DIR=%TEMP%\oxideswarm-usb\sandboxes`, while `start-worker.vbs` also
+     sets `HOME=<folder>\home` — so worker child processes read `HOME`-based git/ssh config from
+     `<folder>\home` in both `off` and `fs` modes — and explicit `RUSTUP_HOME` / `CARGO_HOME` so
+     `oxideswarm.toolchain` ACL grants are recorded in `<folder>\home\windows_acl_grants.txt` on
+     release **0.1.1+** without touching `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes
+     them before deleting `<folder>` and `%TEMP%\oxideswarm-usb`.
      Note: release **0.1.1** predates `FEAT-3d` and `BUG-18`, so under `-Isolation fs` on `0.1.1`,
      `install.ps1` omits `--workspaces` and a bare `whoami` task resolves to `Git\usr\bin\whoami.exe`
      and exits `0xC0000142` unless invoked as `C:\Windows\System32\whoami.exe`; release **0.1.2+**

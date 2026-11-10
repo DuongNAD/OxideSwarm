@@ -18,6 +18,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+function FailAfterStart($msg) {
+    if ($Isolation -eq 'fs') {
+        Fail "$msg (if the worker already granted isolation ACLs, run 'Uninstall OxideSwarm.cmd' or uninstall.ps1 to revert them)"
+    }
+    Fail $msg
+}
 
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
@@ -191,13 +197,13 @@ $workerPid = $null
 for ($i = 0; $i -lt 10 -and -not $workerPid; $i++) {
     Start-Sleep -Seconds 1
     $workerPid = Get-CimInstance Win32_Process |
-        Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -like '* worker *' } |
+        Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -match '(?:oxideswarm|rusty-grid)(?:\.exe)?["'']?\s+(worker)(\s|$)' } |
         Select-Object -First 1 -ExpandProperty ProcessId
 }
-if (-not $workerPid) { Fail "the worker did not start; see $log" }
+if (-not $workerPid) { FailAfterStart "the worker did not start; see $log" }
 $workerPid | Set-Content $pidFile
 Start-Sleep -Seconds 3
-if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { Fail "the worker stopped right away; see $log" }
+if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { FailAfterStart "the worker stopped right away; see $log" }
 
 # 7. Wait until the master lists it. The checks run without log lines: release 0.1.x writes its
 # informational logs to standard output, which would break the JSON parsing below. The worker
@@ -211,7 +217,7 @@ for ($i = 0; $i -lt 30; $i++) {
     if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
     Start-Sleep -Seconds 1
 }
-if (-not $connected) { Fail "the worker runs but the master does not list it yet; see $log" }
+if (-not $connected) { FailAfterStart "the worker runs but the master does not list it yet; see $log" }
 Write-Host "  connected (isolation: $Isolation)"
 
 # 8. Start at logon (current user only, no administrator rights).
