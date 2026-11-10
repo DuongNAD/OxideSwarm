@@ -514,22 +514,25 @@ pub async fn connect_master_with_relay(
                 Err(GridError::AuthFailed(ref detail))
                     if detail.contains("no cluster secret configured") =>
                 {
-                    let stream2 =
-                        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await
-                        {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => {
-                                return Err(GridError::ConnectionFailed(format!(
-                                    "Failed to connect to Master at {addr}: {e}"
-                                )))
-                            }
-                            Err(_) => {
-                                return Err(GridError::ConnectionFailed(format!(
-                                    "Failed to connect to Master at {addr}: timed out after {}s",
-                                    CONNECT_TIMEOUT.as_secs()
-                                )))
-                            }
-                        };
+                    let stream2 = match tokio::time::timeout(
+                        CONNECT_TIMEOUT,
+                        TcpStream::connect(&addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            return Err(GridError::ConnectionFailed(format!(
+                                "Failed to connect to Master at {addr}: {e}"
+                            )))
+                        }
+                        Err(_) => {
+                            return Err(GridError::ConnectionFailed(format!(
+                                "Failed to connect to Master at {addr}: timed out after {}s",
+                                CONNECT_TIMEOUT.as_secs()
+                            )))
+                        }
+                    };
                     let _ = configure_tcp_stream(&stream2);
                     transport = MessageTransport::with_codec(GridStream::Tcp(stream2), codec);
                 }

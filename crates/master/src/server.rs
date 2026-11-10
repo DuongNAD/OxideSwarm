@@ -3847,11 +3847,8 @@ async fn handle_enroll_connection<S>(
                 ?roles,
                 "Enrolled v3 member (--no-approval)"
             );
-            let _ = send_client_response(
-                transport,
-                &ClientResponse::Enrolled { member_id, roles },
-            )
-            .await;
+            let _ = send_client_response(transport, &ClientResponse::Enrolled { member_id, roles })
+                .await;
             let _ = tokio::time::timeout(
                 REFUSAL_DRAIN_TIMEOUT,
                 transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
@@ -4076,12 +4073,10 @@ where
                     return Ok(());
                 }
             };
-            match auth_ctx.members.create_invite(
-                roles,
-                max_uses,
-                expires_in_secs,
-                require_approval,
-            ) {
+            match auth_ctx
+                .members
+                .create_invite(roles, max_uses, expires_in_secs, require_approval)
+            {
                 Ok(rec) => {
                     info!(
                         invite_id = %rec.invite_id,
@@ -4214,54 +4209,52 @@ where
                 }
             }
         }
-        ClientMessage::RevokeMember { target } => {
-            match auth_ctx.members.revoke_member(&target) {
-                Ok((entry, owned_workers)) => {
-                    let mut disconnected_sessions = 0usize;
-                    for wid in &owned_workers {
-                        if handle_worker_disconnect_with_broadcast(
-                            registry,
-                            queue,
-                            scheduler_notify,
-                            Some(waiters),
-                            wid,
-                            None,
-                            "Member revoked by admin",
-                            true,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx,
-                        )
-                        .await
-                        {
-                            disconnected_sessions += 1;
-                        }
+        ClientMessage::RevokeMember { target } => match auth_ctx.members.revoke_member(&target) {
+            Ok((entry, owned_workers)) => {
+                let mut disconnected_sessions = 0usize;
+                for wid in &owned_workers {
+                    if handle_worker_disconnect_with_broadcast(
+                        registry,
+                        queue,
+                        scheduler_notify,
+                        Some(waiters),
+                        wid,
+                        None,
+                        "Member revoked by admin",
+                        true,
+                        #[cfg(feature = "dashboard")]
+                        broadcast_tx,
+                    )
+                    .await
+                    {
+                        disconnected_sessions += 1;
                     }
-                    info!(
-                        member_id = %entry.id,
-                        name = %entry.name,
+                }
+                info!(
+                    member_id = %entry.id,
+                    name = %entry.name,
+                    disconnected_sessions,
+                    "Revoked cluster member"
+                );
+                send_client_response(
+                    transport,
+                    &ClientResponse::MemberRevoked {
+                        member_id: entry.id,
                         disconnected_sessions,
-                        "Revoked cluster member"
-                    );
-                    send_client_response(
-                        transport,
-                        &ClientResponse::MemberRevoked {
-                            member_id: entry.id,
-                            disconnected_sessions,
-                        },
-                    )
-                    .await?;
-                }
-                Err(e) => {
-                    send_client_response(
-                        transport,
-                        &ClientResponse::Error {
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?;
-                }
+                    },
+                )
+                .await?;
             }
-        }
+            Err(e) => {
+                send_client_response(
+                    transport,
+                    &ClientResponse::Error {
+                        message: e.to_string(),
+                    },
+                )
+                .await?;
+            }
+        },
         ClientMessage::RenameMember { target, new_name } => {
             match auth_ctx.members.rename_member(&target, &new_name) {
                 Ok(entry) => {
@@ -4326,11 +4319,8 @@ impl MasterAuthContext {
         }
         if let Some(ref node_key_path) = self.local_node_key_path {
             let (host_node_kp, _) = NodeKeypair::load_or_generate_file(node_key_path)?;
-            self.members.ensure_local_host_admin(
-                *host_node_kp.public_key(),
-                "local-host",
-                true,
-            )?;
+            self.members
+                .ensure_local_host_admin(*host_node_kp.public_key(), "local-host", true)?;
         }
         Ok(*master_key.public_key())
     }

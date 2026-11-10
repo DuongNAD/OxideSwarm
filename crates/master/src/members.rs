@@ -1697,7 +1697,9 @@ mod tests {
             store.claim_worker_id(Uuid::new_v4(), "member_a").unwrap();
         }
         let extra = Uuid::new_v4();
-        assert!(store.check_worker_id_claim(extra, Some("member_a")).is_err());
+        assert!(store
+            .check_worker_id_claim(extra, Some("member_a"))
+            .is_err());
         let bound_err = store.claim_worker_id(extra, "member_a").unwrap_err();
         assert!(bound_err.to_string().contains("maximum"));
     }

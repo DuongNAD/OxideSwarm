@@ -274,16 +274,16 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 ### 3.5 Upgrading a running grid (master and workers)
 All nodes in a cluster (`master`, `worker`, and CLI/MCP clients) must run one build: `Task`, `TaskResult`, and message
 frames are encoded positionally with bincode. Workers, clients, and the master exchange `PROTOCOL_VERSION_CURRENT`
-(currently version 7, `PROTOCOL_VERSION_MIN_COMPATIBLE = 7`; see `docs/design/0040-protocol-versioning.md`). Every
+(currently version 8, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`; see `docs/design/0040-protocol-versioning.md`). Every
 protocol version bump breaks older peers (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT`), and each side
-refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v7 refuses v6 and older peers).
+refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v8 refuses v7 and older peers).
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`
 and `ClientResponse` (unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and
 `connect_master` runs a side-effect-free `Hello` version check before sending any state-changing request so a
 newer CLI never executes a task on an older master (a master older than version 6 cannot decode `Hello` and drops the
 connection; the CLI then reports a closed connection, an I/O error or an unreadable reply to the version check, and
 in each case prints the "older or newer build, upgrade both Master and CLI" hint). Always **upgrade and restart the master first**, then the workers
-and CLIs: an upgraded v7 master immediately refuses v6 (and older) workers and clients before registration or task
+and CLIs: an upgraded v8 master immediately refuses v7 (and older) workers and clients before registration or task
 submission, whereas a newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`,
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
@@ -292,6 +292,15 @@ or `SIGTERM`) before replacing the binary across a protocol version bump: clean 
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message.
+Starting in protocol version 8 (`ENROLL-1a` / `ENROLL-1b`, `docs/design/0051-machine-identity-and-invites.md`), the
+master also writes `master_noise.key` and `members.json` under `--state-dir` (or `~/.oxideswarm/` when `--state-dir` is
+not set, once the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run)
+and auto-enrols the host's own `~/.oxideswarm/node.key` as `local-host` with the `admin` role in `members.json`. A
+worker running on the master's host continues to authenticate with `cluster.secret` (or loopback no-auth when no secret
+is configured) unless a `master_key` (`--master-key`, `RUSTY_GRID_MASTER_KEY`, or `[worker].master_key`) is explicitly
+configured for it; it never silently uses the host's `admin`-only `local-host` key. Loopback CLI commands (`status`,
+`workers`, `submit`, `invite`, `members`) prefer `cluster.secret` when present and fall back to the local `node.key` +
+`master_noise.key` pair (including when the master runs with `--auth members`).
 With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
 (encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
 during the handshake (the newer side reports that the master speaks another cluster authentication version, the

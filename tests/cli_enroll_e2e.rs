@@ -566,7 +566,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
         "worker-one did not appear in members pending"
     );
     assert_eq!(pending_1_code.len(), 6, "6-digit pairing code");
-    assert_eq!(pending_1_fp, master_fp, "pending entry carries master_fingerprint");
+    assert_eq!(
+        pending_1_fp, master_fp,
+        "pending entry carries master_fingerprint"
+    );
     assert!(
         pending_1_remote.starts_with("127.0.0.1:"),
         "pending entry carries remote_addr: {pending_1_remote}"
@@ -864,8 +867,10 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     ));
     assert!(inv_w2_out.status.success());
     let inv_w2 = text(&inv_w2_out.stdout).trim().to_string();
-    let mut join_w2_sess =
-        InteractiveJoin::spawn(with(worker_2_home.path(), &["join", "--no-doctor"]), &inv_w2);
+    let mut join_w2_sess = InteractiveJoin::spawn(
+        with(worker_2_home.path(), &["join", "--no-doctor"]),
+        &inv_w2,
+    );
     join_w2_sess.confirm("y");
     let join_w2 = join_w2_sess.wait_output(Duration::from_secs(15));
     assert!(
@@ -1068,8 +1073,10 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
     assert_eq!(decoded.ticket.as_deref(), Some(ticket.as_str()));
 
     // Redeem the P2P invite via `oxideswarm join --no-doctor`.
-    let mut join_sess =
-        InteractiveJoin::spawn(with(joiner_home.path(), &["join", "--no-doctor"]), &invite_str);
+    let mut join_sess = InteractiveJoin::spawn(
+        with(joiner_home.path(), &["join", "--no-doctor"]),
+        &invite_str,
+    );
     join_sess.confirm("y");
     let join_out = join_sess.wait_output(Duration::from_secs(20));
     assert!(
@@ -1180,8 +1187,7 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
 
     // Start Master A with `--secret-file` (and no `--state-dir` or `~/.oxideswarm/cluster.secret`).
     let secret_file_str = secret_file_a.to_str().unwrap();
-    let (master_a, addr_a) =
-        start_master(home_a.path(), &["--secret-file", secret_file_str]);
+    let (master_a, addr_a) = start_master(home_a.path(), &["--secret-file", secret_file_str]);
 
     let workers_from_b = run_cmd(with(
         home_b.path(),
@@ -1262,8 +1268,7 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
     // Restart Master A with `--secret-file` on a new port; the persisted `master_noise.key` and
     // `members.json` must be loaded so `member_home` connects with its pinned `master_key`.
     drop(master_a);
-    let (_master_a2, addr_a2) =
-        start_master(home_a.path(), &["--secret-file", secret_file_str]);
+    let (_master_a2, addr_a2) = start_master(home_a.path(), &["--secret-file", secret_file_str]);
 
     let status_after_restart = run_cmd(with(
         member_home.path(),

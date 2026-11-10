@@ -1813,6 +1813,8 @@ async fn run_master_inner(
     };
     let local_node_key_path = if in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()) {
         None
+    } else if cfg!(test) && std::env::var_os("OXIDESWARM_HOME").is_none() {
+        state_dir.as_deref().map(|d| d.join("node.key"))
     } else {
         rusty_grid_core::noise_auth::default_node_key_path()
     };
@@ -1824,7 +1826,8 @@ async fn run_master_inner(
     // under `--auth both`. When started with an explicit `--secret-file`, `--insecure`, or bare
     // loopback without existing v3 files, `master_noise.key` and `local-host` are persisted on
     // demand if `CreateInvite` is called.
-    let has_explicit_secret = secret_opts.has_explicit_secret(config_file.as_ref(), SecretSection::Master);
+    let has_explicit_secret =
+        secret_opts.has_explicit_secret(config_file.as_ref(), SecretSection::Master);
     let uses_default_secret = matches!(
         secret_outcome,
         crate::secret_cmd::MasterSecretOutcome::Generated { .. }
@@ -1832,8 +1835,7 @@ async fn run_master_inner(
         secret_outcome,
         crate::secret_cmd::MasterSecretOutcome::Configured(_)
     ) && !has_explicit_secret);
-    let persist_noise_key = !in_unisolated_unit_test
-        && !(ephemeral_key && state_dir.is_none())
+    let persist_noise_key = !(in_unisolated_unit_test || (ephemeral_key && state_dir.is_none()))
         && (state_dir.is_some()
             || existing_v3_files
             || !members.is_empty()

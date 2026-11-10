@@ -1055,12 +1055,9 @@ fn read_confirmation_from_terminal(stdin_is_terminal: bool) -> GridResult<bool> 
     use std::io::BufRead;
     let mut line = String::new();
     if stdin_is_terminal {
-        let n = std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| {
-                GridError::Config(format!("cannot read confirmation from terminal: {e}"))
-            })?;
+        let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| {
+            GridError::Config(format!("cannot read confirmation from terminal: {e}"))
+        })?;
         return Ok(n > 0 && parse_yes_no_confirmation(&line));
     }
     #[cfg(unix)]

@@ -1,7 +1,7 @@
 # 0051: A key per machine, invites and revocation
 
-Status: Accepted (direction chosen by the owner on 2026-11-09, decision Q13); not built
-Created: 2026-11-09    Updated: 2026-11-09
+Status: Accepted (direction chosen by the owner on 2026-11-09, decision Q13); Partial: ENROLL-1a and ENROLL-1b built; ENROLL-1c and ENROLL-1d planned
+Created: 2026-11-09    Updated: 2026-11-10
 
 ## Summary
 

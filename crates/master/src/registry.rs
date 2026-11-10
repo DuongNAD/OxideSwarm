@@ -111,8 +111,6 @@ pub struct WorkerEntry {
     /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
     /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
     pub preserved_thermal_until: Option<Instant>,
-    /// Enrolled member ID (`members.json`) that authenticated the live session, or `None` for v2/open sessions.
-    pub owner_member_id: Option<String>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -257,6 +255,7 @@ pub enum HeartbeatOutcome {
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
     network_types: HashMap<Uuid, Option<String>>,
+    owner_member_ids: HashMap<Uuid, Option<String>>,
     next_session_id: u64,
     registration_epoch: u64,
 }
@@ -282,6 +281,7 @@ impl WorkerRegistry {
             inner: Arc::new(RwLock::new(WorkerRegistryInner {
                 workers: HashMap::new(),
                 network_types: HashMap::new(),
+                owner_member_ids: HashMap::new(),
                 next_session_id: 1,
                 registration_epoch: 0,
             })),
@@ -417,12 +417,14 @@ impl WorkerRegistry {
                 .as_ref()
                 .map(|_| Duration::from_secs(60));
             inner.network_types.remove(&worker_id);
+            inner.owner_member_ids.remove(&worker_id);
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
             let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
             let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
             inner.network_types.remove(&worker_id);
+            inner.owner_member_ids.remove(&worker_id);
             // Hold a newly registered mobile worker connection until its first post-RegisterAck
             // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`, i.e.
             // `2 × MOBILE_TELEMETRY_CHECK_INTERVAL`) so the background scheduler does not place
@@ -453,7 +455,6 @@ impl WorkerRegistry {
                 heartbeat_interval: hb_interval,
                 mobile_status,
                 preserved_thermal_until: None,
-                owner_member_id: None,
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -474,7 +475,7 @@ impl WorkerRegistry {
         if entry.status == WorkerStatus::Disconnected {
             None
         } else {
-            Some(entry.owner_member_id.clone())
+            Some(inner.owner_member_ids.get(worker_id).cloned().flatten())
         }
     }
 
@@ -486,10 +487,12 @@ impl WorkerRegistry {
         owner_member_id: Option<String>,
     ) {
         let mut inner = self.inner.write().await;
-        if let Some(entry) = inner.workers.get_mut(worker_id) {
-            if entry.session_id == session_id {
-                entry.owner_member_id = owner_member_id;
-            }
+        if inner
+            .workers
+            .get(worker_id)
+            .is_some_and(|entry| entry.session_id == session_id)
+        {
+            inner.owner_member_ids.insert(*worker_id, owner_member_id);
         }
     }
 

@@ -184,6 +184,9 @@ impl SecretOpts {
 fn resolve_local_host_v3_auth(
     config: Option<&ConfigFile>,
 ) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
+    if cfg!(test) && std::env::var_os("OXIDESWARM_HOME").is_none() {
+        return Ok(None);
+    }
     if std::env::var("RUSTY_GRID_AUTH")
         .ok()
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("secret"))
