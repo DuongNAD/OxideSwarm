@@ -2398,10 +2398,13 @@ async fn run_worker(
     );
 
     // Decided here, before `name` moves into the config: see `identity::persistence_wanted`.
+    // A joined machine also creates `~/.oxideswarm/worker_id` during `oxideswarm join` so that
+    // plain `oxideswarm worker` keeps a stable worker_id across restarts without needing `--name`.
     let keep_worker_id = rusty_grid_worker::identity::persistence_wanted(
         name.as_deref(),
         std::env::var_os(rusty_grid_worker::identity::WORKER_ID_FILE_ENV).as_deref(),
-    );
+    ) || rusty_grid_worker::identity::default_worker_id_path(None)
+        .is_some_and(|p| p.is_file());
 
     let mut config = WorkerConfig::new(master_addr);
     if let Some((node_key, master_pub)) = v3_auth {

@@ -4213,6 +4213,7 @@ where
             Ok((entry, owned_workers)) => {
                 let mut disconnected_sessions = 0usize;
                 for wid in &owned_workers {
+                    registry.release_worker_owner(wid).await;
                     if handle_worker_disconnect_with_broadcast(
                         registry,
                         queue,
@@ -4565,7 +4566,7 @@ where
             if is_protocol_version_compatible(*protocol_version) && capabilities.cpu_cores > 0 {
                 if let Err(err) = auth_ctx
                     .members
-                    .check_worker_id_claim(*worker_id, Some(&auth_peer.member_id))
+                    .check_worker_id_owner(*worker_id, Some(&auth_peer.member_id))
                 {
                     let reason = err.to_string();
                     warn!(
@@ -9440,5 +9441,171 @@ mod tests {
                 .contains("this master admits enrolled machines only; join with an invite"),
             "expected members-only rejection reason, got: {v2_client_err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_v3_member_70_unnamed_worker_restarts_and_v2_offline_worker_ownership() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose};
+        use rusty_grid_core::WorkerCapabilities;
+
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let member_kp = NodeKeypair::generate().unwrap();
+        let members = MemberStore::from_entries(vec![super::members::MemberEntry::new(
+            "worker-box",
+            *member_kp.public_key(),
+            vec![super::members::MemberRole::Worker],
+        )]);
+        let mut caps = WorkerCapabilities::default();
+        caps.cpu_cores = 2;
+        caps.ram_mb = 2048;
+        let mut config = ServerConfig::default()
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(true)
+            .with_master_noise_key(master_kp.clone())
+            .with_members(members);
+        config.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            config.enable_p2p = false;
+        }
+        config.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            config.enable_web_ui = false;
+        }
+        let handle = MasterServer::spawn(config).await.unwrap();
+        let addr = handle.server_addr;
+        let master_pub = *master_kp.public_key();
+
+        // N1: 70 sequential worker registrations with a fresh UUID each time (simulating 70
+        // unnamed worker restarts) must all succeed; non-live worker_id claims are LRU-evicted.
+        for run in 0..70 {
+            let wid = Uuid::new_v4();
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            let ack = t.recv_msg::<MasterMessage>().await.unwrap().unwrap();
+            match ack {
+                MasterMessage::RegisterAck {
+                    accepted, message, ..
+                } => {
+                    assert!(accepted, "run {run} must be accepted: {message:?}");
+                }
+                other => panic!("expected RegisterAck on run {run}, got: {other:?}"),
+            }
+            drop(t);
+            // Wait until the server marks the session Disconnected before the next restart.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while handle.registry().live_worker_ids().await.contains(&wid) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "session for run {run} did not disconnect in time"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            handle
+                .members()
+                .workers_owned_by(&member_kp.member_id())
+                .len(),
+            64
+        );
+
+        // N7: A v2 worker registers and then disconnects (temporarily offline); the v3 member
+        // must NOT be able to claim the offline v2 worker's ID and lock the v2 worker out.
+        let v2_wid = Uuid::new_v4();
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck { accepted, .. } => assert!(accepted),
+                other => panic!("expected RegisterAck, got: {other:?}"),
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.registry().live_worker_ids().await.contains(&v2_wid) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // v3 member attempts to register `v2_wid` while the v2 worker is Disconnected -> refused!
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck {
+                    accepted, message, ..
+                } => {
+                    assert!(
+                        !accepted,
+                        "v3 member must not take over an offline v2 worker's ID"
+                    );
+                    assert!(
+                        message.unwrap_or_default().contains("owned by another"),
+                        "expected ownership refusal"
+                    );
+                }
+                other => panic!("expected RegisterAck refusal, got: {other:?}"),
+            }
+        }
+        // The v2 worker reconnects with `v2_wid` -> accepted!
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck { accepted, .. } => {
+                    assert!(accepted, "v2 worker must be able to reconnect with its ID");
+                }
+                other => panic!("expected RegisterAck, got: {other:?}"),
+            }
+        }
+
+        let _ = handle.shutdown();
     }
 }

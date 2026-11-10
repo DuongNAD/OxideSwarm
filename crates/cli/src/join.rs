@@ -966,6 +966,9 @@ pub async fn run_join(
     if token.ticket.is_some() {
         println!("The master's P2P ticket was saved as the worker's `p2p_ticket`.");
     }
+    if let Some(worker_id_path) = rusty_grid_worker::identity::default_worker_id_path(None) {
+        let _ = rusty_grid_worker::identity::load_or_create_worker_id(&worker_id_path);
+    }
     println!("Start a worker here with: oxideswarm worker");
 
     let Some(master) = master else {
@@ -1568,6 +1571,9 @@ async fn run_join_invite(
     }
     if token.ticket.is_some() {
         println!("The master's P2P ticket was saved as the worker's `p2p_ticket`.");
+    }
+    if let Some(worker_id_path) = rusty_grid_worker::identity::default_worker_id_path(None) {
+        let _ = rusty_grid_worker::identity::load_or_create_worker_id(&worker_id_path);
     }
     println!("Start a worker here with: oxideswarm worker");
 

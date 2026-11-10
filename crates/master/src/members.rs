@@ -202,6 +202,8 @@ struct PersistentMemberState {
     by_pubkey: HashMap<PublicKey, MemberEntry>,
     invites: Vec<InviteRecord>,
     worker_owners: BTreeMap<Uuid, String>,
+    worker_last_seq: HashMap<Uuid, u64>,
+    next_worker_seq: u64,
     revoked_keys: HashSet<PublicKey>,
 }
 
@@ -731,6 +733,12 @@ impl MemberStore {
             let mut guard = store.inner.write().unwrap_or_else(|e| e.into_inner());
             guard.state.invites = parsed.invites;
             guard.state.prune_inactive_invites(now_unix_secs());
+            let mut seq = 0u64;
+            for wid in parsed.worker_owners.keys() {
+                guard.state.worker_last_seq.insert(*wid, seq);
+                seq = seq.wrapping_add(1);
+            }
+            guard.state.next_worker_seq = seq;
             guard.state.worker_owners = parsed.worker_owners;
             guard.state.revoked_keys = parsed.revoked_keys.into_iter().collect();
         }
@@ -1323,6 +1331,9 @@ impl MemberStore {
                     true
                 }
             });
+            for wid in &owned_workers {
+                staged.worker_last_seq.remove(wid);
+            }
             Ok((removed, owned_workers))
         })?;
         let dropped_pending_ids: Vec<String> = guard
@@ -1339,6 +1350,24 @@ impl MemberStore {
             }
         }
         Ok((removed, owned_workers))
+    }
+
+    /// Read-only check verifying that `worker_id` is not already owned by another member.
+    pub fn check_worker_id_owner(
+        &self,
+        worker_id: Uuid,
+        member_id: Option<&str>,
+    ) -> GridResult<()> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
+            if member_id != Some(existing_owner.as_str()) {
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another member ({existing_owner}); {} cannot register it",
+                    member_id.unwrap_or("unauthenticated/v2 peer")
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read-only check verifying that `worker_id` is not owned by another member and that
@@ -1374,23 +1403,29 @@ impl MemberStore {
         Ok(())
     }
 
-    /// Records or verifies ownership of `worker_id` by `member_id` after worker registration has
-    /// succeeded (design 0051 D5).
-    ///
-    /// If `worker_id` is already recorded for `member_id`, returns immediately under a read lock
-    /// without rewriting `members.json`.
+    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5), treating all
+    /// existing claims as live.
     pub fn claim_worker_id(&self, worker_id: Uuid, member_id: &str) -> GridResult<()> {
-        {
-            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
-                if existing_owner != member_id {
-                    return Err(GridError::AuthFailed(format!(
-                        "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
-                    )));
-                }
-                return Ok(());
-            }
-        }
+        self.claim_worker_id_evicting(worker_id, member_id, |_| true)
+            .map(|_| ())
+    }
+
+    /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5).
+    ///
+    /// When `member_id` already holds [`MAX_WORKERS_PER_MEMBER`] claims, any non-live claims
+    /// (`!is_live(wid)`) are evicted in least-recently-used order so restarting an unnamed worker
+    /// on a joined machine never permanently locks the member out once 64 past worker IDs have
+    /// accumulated. If all 64 claimed worker IDs currently have live sessions, the claim is
+    /// refused. Returns the list of evicted non-live worker IDs.
+    pub fn claim_worker_id_evicting<F>(
+        &self,
+        worker_id: Uuid,
+        member_id: &str,
+        is_live: F,
+    ) -> GridResult<Vec<Uuid>>
+    where
+        F: Fn(&Uuid) -> bool,
+    {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing_owner) = guard.state.worker_owners.get(&worker_id) {
             if existing_owner != member_id {
@@ -1398,25 +1433,54 @@ impl MemberStore {
                     "worker_id {worker_id} is owned by another member ({existing_owner}); member {member_id} cannot register it"
                 )));
             }
-            return Ok(());
+            let seq = guard.state.next_worker_seq;
+            guard.state.next_worker_seq = seq.wrapping_add(1);
+            guard.state.worker_last_seq.insert(worker_id, seq);
+            return Ok(Vec::new());
         }
-        let owned_count = guard
+        let owned: Vec<Uuid> = guard
             .state
             .worker_owners
-            .values()
-            .filter(|owner| owner.as_str() == member_id)
-            .count();
-        if owned_count >= MAX_WORKERS_PER_MEMBER {
-            return Err(GridError::AuthFailed(format!(
-                "member {member_id} has reached the maximum of {MAX_WORKERS_PER_MEMBER} claimed worker IDs"
-            )));
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == member_id)
+            .map(|(wid, _)| *wid)
+            .collect();
+        let mut to_evict = Vec::new();
+        if owned.len() >= MAX_WORKERS_PER_MEMBER {
+            let needed = (owned.len() + 1).saturating_sub(MAX_WORKERS_PER_MEMBER);
+            let mut evictable: Vec<(u64, Uuid)> = owned
+                .into_iter()
+                .filter(|wid| !is_live(wid))
+                .map(|wid| {
+                    (
+                        guard.state.worker_last_seq.get(&wid).copied().unwrap_or(0),
+                        wid,
+                    )
+                })
+                .collect();
+            if evictable.len() < needed {
+                return Err(GridError::AuthFailed(format!(
+                    "member {member_id} has reached the maximum of {MAX_WORKERS_PER_MEMBER} claimed worker IDs"
+                )));
+            }
+            evictable.sort_by_key(|(seq, wid)| (*seq, *wid));
+            to_evict.extend(evictable.into_iter().take(needed).map(|(_, wid)| wid));
         }
+        let evicted = to_evict.clone();
         guard.mutate_and_persist(|staged| {
+            for wid in &to_evict {
+                staged.worker_owners.remove(wid);
+                staged.worker_last_seq.remove(wid);
+            }
+            let seq = staged.next_worker_seq;
+            staged.next_worker_seq = seq.wrapping_add(1);
+            staged.worker_last_seq.insert(worker_id, seq);
             staged
                 .worker_owners
                 .insert(worker_id, member_id.to_string());
             Ok(())
-        })
+        })?;
+        Ok(evicted)
     }
 
     /// Returns the worker IDs currently owned by `member_id`.
@@ -2120,5 +2184,57 @@ mod tests {
             "unexpected error: {err}"
         );
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let member_id = "8f14e45fceea167a";
+
+        // 70 consecutive unnamed worker runs (only the current run's worker_id is live):
+        // all 70 succeed, and the store retains the most recent 64 worker IDs.
+        let mut history = Vec::new();
+        for _ in 0..70 {
+            let wid = Uuid::new_v4();
+            let evicted = store
+                .claim_worker_id_evicting(wid, member_id, |_existing| false)
+                .expect("non-live claims must be LRU-evicted past 64");
+            if history.len() >= MAX_WORKERS_PER_MEMBER {
+                assert_eq!(evicted.len(), 1);
+                assert_eq!(
+                    evicted[0],
+                    history[history.len() - MAX_WORKERS_PER_MEMBER],
+                    "oldest non-live worker_id must be evicted first"
+                );
+            } else {
+                assert!(evicted.is_empty());
+            }
+            history.push(wid);
+        }
+        let owned = store.workers_owned_by(member_id);
+        assert_eq!(owned.len(), MAX_WORKERS_PER_MEMBER);
+        for wid in &history[..6] {
+            assert!(!owned.contains(wid), "evicted worker_id {wid} must be gone");
+        }
+        for wid in &history[6..] {
+            assert!(
+                owned.contains(wid),
+                "recent worker_id {wid} must still be owned"
+            );
+        }
+
+        // If all 64 currently claimed worker IDs are live, a 65th distinct worker_id is refused.
+        let live_65th = Uuid::new_v4();
+        let err = store
+            .claim_worker_id_evicting(live_65th, member_id, |_existing| true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("maximum of 64"), "got: {err}");
     }
 }

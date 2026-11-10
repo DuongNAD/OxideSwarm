@@ -3,7 +3,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -331,7 +331,42 @@ impl WorkerRegistry {
         sender: mpsc::Sender<MasterMessage>,
         abort_handle: Option<AbortHandle>,
     ) -> GridResult<Registration> {
+        self.register_session_with_owner(
+            worker_id,
+            capabilities,
+            features,
+            remote_addr,
+            sender,
+            abort_handle,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`register_session`](Self::register_session), but also atomically checks and records
+    /// `owner_member_id` (`Some(member_id)` for v3 members, `None` for v2/open) under the single
+    /// write lock before mutating or aborting any existing session (`N7`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_session_with_owner(
+        &self,
+        worker_id: Uuid,
+        capabilities: WorkerCapabilities,
+        features: ProtocolCapabilities,
+        remote_addr: SocketAddr,
+        sender: mpsc::Sender<MasterMessage>,
+        abort_handle: Option<AbortHandle>,
+        owner_member_id: Option<String>,
+    ) -> GridResult<Registration> {
         let mut inner = self.inner.write().await;
+        if let Some(existing_owner) = inner.owner_member_ids.get(&worker_id) {
+            if existing_owner.as_deref() != owner_member_id.as_deref() {
+                let owner_desc = existing_owner.as_deref().unwrap_or("v2 peer");
+                let caller_desc = owner_member_id.as_deref().unwrap_or("v2 peer");
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration"
+                )));
+            }
+        }
         let session_id = inner.next_session_id;
         inner.next_session_id += 1;
 
@@ -417,14 +452,14 @@ impl WorkerRegistry {
                 .as_ref()
                 .map(|_| Duration::from_secs(60));
             inner.network_types.remove(&worker_id);
-            inner.owner_member_ids.remove(&worker_id);
+            inner.owner_member_ids.insert(worker_id, owner_member_id);
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
             let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
             let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
             inner.network_types.remove(&worker_id);
-            inner.owner_member_ids.remove(&worker_id);
+            inner.owner_member_ids.insert(worker_id, owner_member_id);
             // Hold a newly registered mobile worker connection until its first post-RegisterAck
             // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`, i.e.
             // `2 × MOBILE_TELEMETRY_CHECK_INTERVAL`) so the background scheduler does not place
@@ -467,33 +502,42 @@ impl WorkerRegistry {
         })
     }
 
-    /// Returns `Some(owner_member_id)` if `worker_id` currently has a live (`Connected` or `Busy`)
-    /// session in the registry, or `None` if `worker_id` is not registered or is `Disconnected`.
-    pub async fn live_session_owner(&self, worker_id: &Uuid) -> Option<Option<String>> {
-        let inner = self.inner.read().await;
-        let entry = inner.workers.get(worker_id)?;
-        if entry.status == WorkerStatus::Disconnected {
-            None
-        } else {
-            Some(inner.owner_member_ids.get(worker_id).cloned().flatten())
-        }
-    }
-
-    /// Records the authenticated v3 `member_id` (or `None` for v2/open) that owns `session_id`.
-    pub async fn set_owner_member_id(
+    /// Read-only check verifying that `worker_id` is not already owned in this registry by another
+    /// peer (including a temporarily `Disconnected` v2 worker).
+    pub async fn check_worker_owner(
         &self,
         worker_id: &Uuid,
-        session_id: u64,
-        owner_member_id: Option<String>,
-    ) {
-        let mut inner = self.inner.write().await;
-        if inner
-            .workers
-            .get(worker_id)
-            .is_some_and(|entry| entry.session_id == session_id)
-        {
-            inner.owner_member_ids.insert(*worker_id, owner_member_id);
+        caller_member_id: Option<&str>,
+    ) -> GridResult<()> {
+        let inner = self.inner.read().await;
+        if let Some(existing_owner) = inner.owner_member_ids.get(worker_id) {
+            if existing_owner.as_deref() != caller_member_id {
+                let owner_desc = existing_owner.as_deref().unwrap_or("v2 peer");
+                let caller_desc = caller_member_id.unwrap_or("v2 peer");
+                return Err(GridError::AuthFailed(format!(
+                    "worker_id {worker_id} is owned by another peer ({owner_desc}); {caller_desc} cannot take over its registration"
+                )));
+            }
         }
+        Ok(())
+    }
+
+    /// Returns the set of `worker_id`s that currently have a live (`Connected` or `Busy`) session.
+    pub async fn live_worker_ids(&self) -> HashSet<Uuid> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .iter()
+            .filter(|(_, entry)| entry.status != WorkerStatus::Disconnected)
+            .map(|(wid, _)| *wid)
+            .collect()
+    }
+
+    /// Releases the recorded owner of `worker_id` (used when a member is revoked or a non-live
+    /// worker claim is LRU-evicted).
+    pub async fn release_worker_owner(&self, worker_id: &Uuid) {
+        let mut inner = self.inner.write().await;
+        inner.owner_member_ids.remove(worker_id);
     }
 
     /// Attaches the receive-side liveness clock of `session_id`'s connection.

@@ -630,9 +630,9 @@ impl<
         let is_multiplexed = pre_auth.is_multiplexed();
         let caller_member_id = v3_peer.map(|p| p.member_id.as_str());
 
-        if let Err(err) = auth_ctx
-            .members
-            .check_worker_id_claim(worker_id, caller_member_id)
+        if let Err(err) = registry
+            .check_worker_owner(&worker_id, caller_member_id)
+            .await
         {
             let reason = err.to_string();
             let reject_ack = MasterMessage::RegisterAck {
@@ -647,51 +647,66 @@ impl<
             return Err(err);
         }
 
-        if let Some(live_owner) = registry.live_session_owner(&worker_id).await {
-            if live_owner.as_deref() != caller_member_id {
-                let owner_desc = live_owner.as_deref().unwrap_or("an active session");
-                let reason = format!(
-                    "worker_id {worker_id} is owned by another member ({owner_desc}); {} cannot take over its live session",
-                    caller_member_id.unwrap_or("v2 peer")
-                );
-                let reject_ack = MasterMessage::RegisterAck {
-                    accepted: false,
-                    worker_id,
-                    heartbeat_interval_secs: 0,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features: ProtocolCapabilities::empty(),
-                    message: Some(reason.clone()),
-                };
-                pre_auth.send_handshake_refusal(&reject_ack).await;
-                return Err(GridError::AuthFailed(reason));
+        if let Some(peer) = v3_peer {
+            let live_ids = registry.live_worker_ids().await;
+            match auth_ctx
+                .members
+                .claim_worker_id_evicting(worker_id, &peer.member_id, |wid| live_ids.contains(wid))
+            {
+                Ok(evicted) => {
+                    for evicted_wid in evicted {
+                        registry.release_worker_owner(&evicted_wid).await;
+                    }
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    let reject_ack = MasterMessage::RegisterAck {
+                        accepted: false,
+                        worker_id,
+                        heartbeat_interval_secs: 0,
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features: ProtocolCapabilities::empty(),
+                        message: Some(reason),
+                    };
+                    pre_auth.send_handshake_refusal(&reject_ack).await;
+                    return Err(err);
+                }
             }
+        } else if let Err(err) = auth_ctx.members.check_worker_id_claim(worker_id, None) {
+            let reason = err.to_string();
+            let reject_ack = MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id,
+                heartbeat_interval_secs: 0,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+                message: Some(reason),
+            };
+            pre_auth.send_handshake_refusal(&reject_ack).await;
+            return Err(err);
         }
 
-        // 3. Register in WorkerRegistry
+        // 3. Register in WorkerRegistry (checks and sets owner_member_id atomically under the write lock)
         let negotiated_features = worker_features
             & (ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES);
         let worker_supports_resume =
             negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
-        let registration = registry
-            .register_session(
+        let registration = match registry
+            .register_session_with_owner(
                 worker_id,
                 capabilities,
                 negotiated_features,
                 remote_addr,
                 outbound_tx.clone(),
                 abort_handle,
+                v3_peer.map(|p| p.member_id.clone()),
             )
-            .await?;
-        let session_id = registration.session_id;
-        registry
-            .set_owner_member_id(&worker_id, session_id, v3_peer.map(|p| p.member_id.clone()))
-            .await;
-
-        if let Some(peer) = v3_peer {
-            if let Err(err) = auth_ctx.members.claim_worker_id(worker_id, &peer.member_id) {
-                let _ = registry.unregister(&worker_id, Some(session_id)).await;
+            .await
+        {
+            Ok(reg) => reg,
+            Err(err) => {
                 let reason = err.to_string();
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
@@ -704,7 +719,8 @@ impl<
                 pre_auth.send_handshake_refusal(&reject_ack).await;
                 return Err(err);
             }
-        }
+        };
+        let session_id = registration.session_id;
 
         queue.set_worker_session_resume(worker_id, worker_supports_resume);
         queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
