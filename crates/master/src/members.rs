@@ -196,6 +196,7 @@ struct UnconfirmedApprovalOp {
 struct UnconfirmedMemberTracker {
     baseline: Option<MemberEntry>,
     ops: Vec<UnconfirmedApprovalOp>,
+    deferred_invite_restores: Vec<String>,
     expected_generation: u64,
 }
 
@@ -1439,6 +1440,17 @@ impl MemberStore {
             ));
         }
 
+        if guard
+            .pending
+            .get(&id)
+            .is_none_or(|e| e.decision_tx.is_closed())
+        {
+            guard.pending.remove(&id);
+            return Err(GridError::Config(format!(
+                "pending enrollment '{id}' disconnected before approval could be delivered"
+            )));
+        }
+
         let gen_before = guard
             .member_generations
             .get(&pending_info.public_key)
@@ -1449,6 +1461,7 @@ impl MemberStore {
             _ => UnconfirmedMemberTracker {
                 baseline: guard.state.by_pubkey.get(&pending_info.public_key).cloned(),
                 ops: Vec::new(),
+                deferred_invite_restores: Vec::new(),
                 expected_generation: gen_before,
             },
         };
@@ -1493,12 +1506,29 @@ impl MemberStore {
             expected_generation: new_gen,
             invite_id: pending_info.invite_id,
         };
-        if let Some(pending) = guard.pending.remove(&id) {
-            let _ = pending.decision_tx.send(PendingDecision::Approved {
-                member_id: entry.id.clone(),
-                roles: entry.roles.clone(),
-                rollback: Box::new(rollback),
-            });
+        let send_failed = match guard.pending.remove(&id) {
+            Some(pending) => pending
+                .decision_tx
+                .send(PendingDecision::Approved {
+                    member_id: entry.id.clone(),
+                    roles: entry.roles.clone(),
+                    rollback: Box::new(rollback.clone()),
+                })
+                .is_err(),
+            None => true,
+        };
+        if send_failed {
+            drop(guard);
+            if let Err(rb_err) = self.rollback_approved_enrollment(rollback) {
+                tracing::warn!(
+                    pending_id = %id,
+                    error = %rb_err,
+                    "failed to persist rollback after pending enrollment disconnected during approval"
+                );
+            }
+            return Err(GridError::Config(format!(
+                "pending enrollment '{id}' disconnected before approval could be delivered"
+            )));
         }
         Ok(entry)
     }
@@ -1541,9 +1571,9 @@ impl MemberStore {
     ///
     /// Uses compare-and-swap against the member's generation and unconfirmed-approval tracker:
     /// - Never re-inserts a key that is in `revoked_keys`.
-    /// - If the member was modified externally (for example revoked or re-enrolled) since the
-    ///   approval, leaves the member entry untouched and only restores the invite use if this
-    ///   approval consumed it.
+    /// - Restores an invite's `uses_remaining` **only** when the key is no longer a member after
+    ///   the rollback (`N5`), so no sequence of renames or concurrent approvals can leave the key
+    ///   enrolled while also refunding its invite use.
     /// - Returns the list of `worker_id` claims released if the rollback removed the member or its
     ///   `worker` role.
     pub fn rollback_approved_enrollment(
@@ -1582,7 +1612,7 @@ impl MemberStore {
             for op in &tracker.ops {
                 apply_unconfirmed_op_to_entry(&mut rebuilt, rollback.public_key, op);
             }
-            let released_workers = guard.mutate_and_persist(|staged| {
+            let (released_workers, still_member) = guard.mutate_and_persist(|staged| {
                 let mut released = Vec::new();
                 if !staged.revoked_keys.contains(&rollback.public_key) {
                     match rebuilt {
@@ -1619,13 +1649,32 @@ impl MemberStore {
                         }
                     }
                 }
-                if let Some(ref inv_id) = invite_to_restore {
-                    if let Some(inv) = staged.invites.iter_mut().find(|i| i.invite_id == *inv_id) {
-                        inv.uses_remaining = inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+                let still_member = staged.by_pubkey.contains_key(&rollback.public_key);
+                if !still_member {
+                    for inv_id in tracker
+                        .deferred_invite_restores
+                        .iter()
+                        .chain(invite_to_restore.iter())
+                    {
+                        if let Some(inv) =
+                            staged.invites.iter_mut().find(|i| i.invite_id == *inv_id)
+                        {
+                            inv.uses_remaining =
+                                inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+                        }
                     }
                 }
-                Ok(released)
+                Ok((released, still_member))
             })?;
+            if still_member {
+                if !tracker.ops.is_empty() {
+                    if let Some(inv_id) = invite_to_restore {
+                        tracker.deferred_invite_restores.push(inv_id);
+                    }
+                }
+            } else {
+                tracker.deferred_invite_restores.clear();
+            }
             let new_gen = current_gen.wrapping_add(1);
             guard
                 .member_generations
@@ -1643,12 +1692,18 @@ impl MemberStore {
 
         guard.unconfirmed_approvals.remove(&rollback.public_key);
         if let Some(inv_id) = invite_to_restore {
-            guard.mutate_and_persist(|staged| {
-                if let Some(inv) = staged.invites.iter_mut().find(|i| i.invite_id == inv_id) {
-                    inv.uses_remaining = inv.uses_remaining.saturating_add(1).min(inv.max_uses);
-                }
-                Ok(())
-            })?;
+            if !guard.state.by_pubkey.contains_key(&rollback.public_key) {
+                guard.mutate_and_persist(|staged| {
+                    if !staged.by_pubkey.contains_key(&rollback.public_key) {
+                        if let Some(inv) = staged.invites.iter_mut().find(|i| i.invite_id == inv_id)
+                        {
+                            inv.uses_remaining =
+                                inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
         }
         Ok(Vec::new())
     }
@@ -1711,15 +1766,32 @@ impl MemberStore {
             entry.name = clean;
             Ok(entry.clone())
         })?;
-        let next_gen = guard
-            .member_generations
-            .get(&pubkey)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1);
+        let prev_gen = guard.member_generations.get(&pubkey).copied().unwrap_or(0);
+        let next_gen = prev_gen.wrapping_add(1);
         guard.member_generations.insert(pubkey, next_gen);
-        guard.unconfirmed_approvals.remove(&pubkey);
+        if let Some(tracker) = guard.unconfirmed_approvals.get_mut(&pubkey) {
+            if tracker.expected_generation == prev_gen {
+                if let Some(ref mut base) = tracker.baseline {
+                    base.name = updated.name.clone();
+                }
+                for op in &mut tracker.ops {
+                    op.name = updated.name.clone();
+                }
+                tracker.expected_generation = next_gen;
+            } else {
+                guard.unconfirmed_approvals.remove(&pubkey);
+            }
+        }
         Ok(updated)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unconfirmed_tracking_counts(&self) -> (usize, usize) {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        (
+            guard.unconfirmed_approvals.len(),
+            guard.active_approval_invites.len(),
+        )
     }
 
     /// Revokes an enrolled member by exact ID or unique hex ID prefix (`>= 4` chars), records its
@@ -2921,7 +2993,11 @@ mod tests {
         // does not refuse worker registration.
         let unwritable_store = MemberStore::new()
             .with_auth_mode(AuthMode::Both)
-            .with_save_path(dir.path().join("missing-file-as-dir").join(MEMBERS_FILE_NAME));
+            .with_save_path(
+                dir.path()
+                    .join("missing-file-as-dir")
+                    .join(MEMBERS_FILE_NAME),
+            );
         std::fs::write(dir.path().join("missing-file-as-dir"), b"not a directory").unwrap();
         let new_v2 = Uuid::new_v4();
         unwritable_store
@@ -3159,5 +3235,304 @@ mod tests {
             "fresh joiner declining both approvals must not remain a member"
         );
         assert_eq!(uses, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_n3_approve_pending_after_or_during_joiner_disconnect_rolls_back_and_leaves_no_tracker()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let inv = store
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+
+        // 1. Joiner disconnects (drops `decision_rx`) before `approve_pending` runs:
+        //    `approve_pending` fails, member is not enrolled, invite still has `uses_remaining == 1`,
+        //    and no unconfirmed tracker or active invite entry remains.
+        let j1 = NodeKeypair::generate().unwrap();
+        let h1 = [0x61u8; KEY_LEN];
+        let p1 = compute_enroll_proof(&inv.invite_secret.0, &h1);
+        let (pid1, rx1) = match store
+            .handle_enroll_request(
+                *j1.public_key(),
+                &h1,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50011",
+                &inv.invite_id,
+                &p1,
+                "joiner-1".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        drop(rx1);
+        assert!(store
+            .approve_pending(&pid1, derive_pairing_code(&h1).as_str())
+            .is_err());
+        assert!(!store.contains(j1.public_key()));
+        assert!(store.list_members().is_empty());
+        assert_eq!(store.list_invites()[0].uses_remaining, 1);
+        assert_eq!(store.unconfirmed_tracking_counts(), (0, 0));
+
+        // 2. Concurrent race (`fsync` under `approve_pending` vs joiner disconnect +
+        //    `decision_rx.close(); try_recv()`): across 20 runs on a disk-backed `MemberStore`,
+        //    whichever thread wins the lock race leaves zero enrolled members, `uses_remaining == 1`,
+        //    and zero leaked tracker entries.
+        for i in 0..20u8 {
+            let ji = NodeKeypair::generate().unwrap();
+            let hi = [0x70u8.wrapping_add(i); KEY_LEN];
+            let pi = compute_enroll_proof(&inv.invite_secret.0, &hi);
+            let code = derive_pairing_code(&hi).as_str().to_string();
+            let (pid, mut rx) = match store
+                .handle_enroll_request(
+                    *ji.public_key(),
+                    &hi,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50012",
+                    &inv.invite_id,
+                    &pi,
+                    format!("race-{i}"),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap()
+            {
+                EnrollOutcome::Pending {
+                    pending_id,
+                    decision_rx,
+                } => (pending_id, decision_rx),
+                _ => panic!("expected Pending"),
+            };
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let store_approve = store.clone();
+            let pid_approve = pid.clone();
+            let b_approve = barrier.clone();
+            let approve_thread = std::thread::spawn(move || {
+                b_approve.wait();
+                store_approve.approve_pending(&pid_approve, &code)
+            });
+
+            barrier.wait();
+            std::thread::yield_now();
+            rx.close();
+            store.remove_pending(&pid);
+            let approve_res = approve_thread.join().unwrap();
+            if let Ok(PendingDecision::Approved { rollback, .. }) = rx.try_recv() {
+                store.rollback_approved_enrollment(*rollback).unwrap();
+            } else {
+                assert!(
+                    approve_res.is_err(),
+                    "if Approved was not delivered to rx, approve_pending must have failed and rolled back inline"
+                );
+            }
+            assert!(
+                !store.contains(ji.public_key()),
+                "iteration {i}: disconnected joiner must not remain enrolled"
+            );
+            assert!(store.list_members().is_empty(), "iteration {i}");
+            assert_eq!(
+                store.list_invites()[0].uses_remaining,
+                1,
+                "iteration {i}: invite use must be restored"
+            );
+            assert_eq!(
+                store.unconfirmed_tracking_counts(),
+                (0, 0),
+                "iteration {i}: no unconfirmed tracker or active invite may leak"
+            );
+        }
+    }
+
+    #[test]
+    fn test_n5_rename_during_confirm_window_and_invite_use_restored_only_when_not_a_member() {
+        let enroll_and_approve = |store: &MemberStore,
+                                  kp: &NodeKeypair,
+                                  name: &str,
+                                  hash: [u8; KEY_LEN],
+                                  invite_id: &str,
+                                  secret: &[u8; 32]| {
+            let proof = compute_enroll_proof(secret, &hash);
+            let (pid, mut rx) = match store
+                .handle_enroll_request(
+                    *kp.public_key(),
+                    &hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50021",
+                    invite_id,
+                    &proof,
+                    name.into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap()
+            {
+                EnrollOutcome::Pending {
+                    pending_id,
+                    decision_rx,
+                } => (pending_id, decision_rx),
+                _ => panic!("expected Pending"),
+            };
+            store
+                .approve_pending(&pid, derive_pairing_code(&hash).as_str())
+                .unwrap();
+            match rx.try_recv().unwrap() {
+                PendingDecision::Approved { rollback, .. } => *rollback,
+                _ => panic!("expected Approved"),
+            }
+        };
+
+        // 1. Repro from N5: approve fresh joiner J on a 1-use invite, admin renames J during the
+        //    confirm window, then J declines -> J MUST be removed, invite uses_remaining == 1, and
+        //    no tracker remains; approving K on that invite then leaves only K enrolled.
+        let store = MemberStore::new();
+        let inv = store
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let j = NodeKeypair::generate().unwrap();
+        let rb_j = enroll_and_approve(
+            &store,
+            &j,
+            "j-initial",
+            [0x81u8; KEY_LEN],
+            &inv.invite_id,
+            &inv.invite_secret.0,
+        );
+        store.rename_member("j-initial", "j-renamed").unwrap();
+        store.rollback_approved_enrollment(rb_j).unwrap();
+        assert!(
+            !store.contains(j.public_key()),
+            "N5 regression: renamed unconfirmed member stayed enrolled after declining"
+        );
+        assert_eq!(store.list_invites()[0].uses_remaining, 1);
+        assert_eq!(store.unconfirmed_tracking_counts(), (0, 0));
+
+        let k = NodeKeypair::generate().unwrap();
+        let rb_k = enroll_and_approve(
+            &store,
+            &k,
+            "k-box",
+            [0x82u8; KEY_LEN],
+            &inv.invite_id,
+            &inv.invite_secret.0,
+        );
+        store.confirm_approved_enrollment(&rb_k);
+        assert_eq!(store.list_members().len(), 1);
+        assert!(store.contains(k.public_key()));
+        assert!(store.list_invites().is_empty() || store.list_invites()[0].uses_remaining == 0);
+
+        // 2. Rename during confirm window followed by confirmation keeps the renamed member and
+        //    consumes the 1-use invite.
+        let store2 = MemberStore::new();
+        let inv2 = store2
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let j2 = NodeKeypair::generate().unwrap();
+        let rb_j2 = enroll_and_approve(
+            &store2,
+            &j2,
+            "before-rename",
+            [0x83u8; KEY_LEN],
+            &inv2.invite_id,
+            &inv2.invite_secret.0,
+        );
+        store2
+            .rename_member("before-rename", "after-rename")
+            .unwrap();
+        store2.confirm_approved_enrollment(&rb_j2);
+        assert_eq!(store2.get(j2.public_key()).unwrap().name, "after-rename");
+        assert!(store2.list_invites().is_empty() || store2.list_invites()[0].uses_remaining == 0);
+        assert_eq!(store2.unconfirmed_tracking_counts(), (0, 0));
+
+        // 3. Concurrent approvals of the same key on two 1-use invites (`inv_a`, `inv_b`): when
+        //    the first confirms and the second times out / rolls back, `inv_b` must NOT restore its
+        //    use because the key is still an active member. Also verify the fallback (no-tracker)
+        //    path when `--no-approval` enrolls the key during the confirm window.
+        let store3 = MemberStore::new();
+        let inv_a = store3
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let inv_b = store3
+            .create_invite(vec![MemberRole::Client], 1, 3600, true)
+            .unwrap();
+        let j3 = NodeKeypair::generate().unwrap();
+        let rb_a = enroll_and_approve(
+            &store3,
+            &j3,
+            "j3-box",
+            [0x84u8; KEY_LEN],
+            &inv_a.invite_id,
+            &inv_a.invite_secret.0,
+        );
+        let rb_b = enroll_and_approve(
+            &store3,
+            &j3,
+            "j3-box",
+            [0x85u8; KEY_LEN],
+            &inv_b.invite_id,
+            &inv_b.invite_secret.0,
+        );
+        store3.confirm_approved_enrollment(&rb_a);
+        store3.rollback_approved_enrollment(rb_b).unwrap();
+        assert!(store3.contains(j3.public_key()));
+        for inv_rec in store3.list_invites() {
+            assert_eq!(
+                inv_rec.uses_remaining, 0,
+                "invite {} must not restore use while key remains a member",
+                inv_rec.invite_id
+            );
+        }
+        assert_eq!(store3.unconfirmed_tracking_counts(), (0, 0));
+
+        // Fallback path: J4 approved on 1-use approval invite `inv_c`, then enrolls via
+        // `--no-approval` invite `inv_noapp` (clearing tracker), then `inv_c` rolls back ->
+        // J4 is still a member so `inv_c` keeps `uses_remaining == 0`.
+        let store4 = MemberStore::new();
+        let inv_c = store4
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let inv_noapp = store4
+            .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+            .unwrap();
+        let j4 = NodeKeypair::generate().unwrap();
+        let rb_c = enroll_and_approve(
+            &store4,
+            &j4,
+            "j4-box",
+            [0x86u8; KEY_LEN],
+            &inv_c.invite_id,
+            &inv_c.invite_secret.0,
+        );
+        let h_noapp = [0x87u8; KEY_LEN];
+        let p_noapp = compute_enroll_proof(&inv_noapp.invite_secret.0, &h_noapp);
+        assert!(matches!(
+            store4
+                .handle_enroll_request(
+                    *j4.public_key(),
+                    &h_noapp,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50022",
+                    &inv_noapp.invite_id,
+                    &p_noapp,
+                    "j4-box".into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap(),
+            EnrollOutcome::ImmediateApproved { .. }
+        ));
+        store4.rollback_approved_enrollment(rb_c).unwrap();
+        assert!(store4.contains(j4.public_key()));
+        for inv_rec in store4.list_invites() {
+            assert_eq!(inv_rec.uses_remaining, 0);
+        }
+        assert_eq!(store4.unconfirmed_tracking_counts(), (0, 0));
     }
 }

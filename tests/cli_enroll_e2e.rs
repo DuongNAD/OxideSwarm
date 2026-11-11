@@ -1287,6 +1287,84 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
         text(&status_out.stdout),
         text(&status_out.stderr)
     );
+
+    // Also exercise the approval-required P2P invite path (`EnrollPending` -> `members approve` ->
+    // `Enrolled` -> post-approval `ClientMessage::Hello` confirmation window) over QUIC.
+    let approval_joiner_home = TempDir::new().unwrap();
+    let app_inv_out = run_cmd(with(
+        master_home.path(),
+        &["invite", "--master", &ticket, "--roles", "worker,client"],
+    ));
+    assert!(
+        app_inv_out.status.success(),
+        "approval invite over P2P ticket failed:\n{}\n{}",
+        text(&app_inv_out.stdout),
+        text(&app_inv_out.stderr)
+    );
+    let app_inv_str = text(&app_inv_out.stdout).trim().to_string();
+    let app_decoded = InviteToken::decode(&app_inv_str).unwrap();
+    let master_fp = app_decoded.master_key.fingerprint();
+
+    let mut app_join_sess = InteractiveJoin::spawn(
+        with(approval_joiner_home.path(), &["join", "--no-doctor"]),
+        &app_inv_str,
+    );
+    let app_code = app_join_sess.pairing_code();
+
+    let pending_out = run_cmd(with(
+        master_home.path(),
+        &["members", "pending", "--master", &ticket, "--json"],
+    ));
+    assert!(
+        pending_out.status.success(),
+        "members pending over P2P failed:\n{}",
+        text(&pending_out.stderr)
+    );
+    let pending_arr: serde_json::Value = serde_json::from_slice(&pending_out.stdout).unwrap();
+    let pending_id = pending_arr[0]["pending_id"]
+        .as_str()
+        .expect("pending_id present")
+        .to_string();
+
+    let approve_out = run_cmd(with(
+        master_home.path(),
+        &[
+            "members",
+            "approve",
+            &pending_id,
+            "--code",
+            &app_code,
+            "--fingerprint",
+            &master_fp,
+            "--master",
+            &ticket,
+        ],
+    ));
+    assert!(
+        approve_out.status.success(),
+        "members approve over P2P failed:\n{}\n{}",
+        text(&approve_out.stdout),
+        text(&approve_out.stderr)
+    );
+
+    // Wait > 1s after `Enrolled` before confirming `[y/N]` so the post-approval `Hello` window on
+    // the QUIC stream stays open and commits cleanly when the joiner confirms.
+    std::thread::sleep(Duration::from_millis(1200));
+    app_join_sess.confirm("y");
+    let app_join_out = app_join_sess.wait_output(Duration::from_secs(20));
+    assert!(
+        app_join_out.status.success(),
+        "approval-required P2P join failed:\nstdout:\n{}\nstderr:\n{}",
+        text(&app_join_out.stdout),
+        text(&app_join_out.stderr)
+    );
+    let app_status_out = run_cmd(with(approval_joiner_home.path(), &["status", "--json"]));
+    assert!(
+        app_status_out.status.success(),
+        "status over P2P after approval join failed:\n{}\n{}",
+        text(&app_status_out.stdout),
+        text(&app_status_out.stderr)
+    );
 }
 
 fn start_master(home: &Path, extra_args: &[&str]) -> (Service, String) {
@@ -1439,7 +1517,11 @@ fn test_secret_only_setups_repro_a_and_b_and_secret_file_invite_persistence() {
     // N1(b): Before `CreateInvite` is called, a `--secret-file` master must NOT have created
     // `members.json`, `master_noise.key`, or `node.key` when a v2 worker registered.
     assert!(
-        !home_a.path().join(".oxideswarm").join("members.json").exists(),
+        !home_a
+            .path()
+            .join(".oxideswarm")
+            .join("members.json")
+            .exists(),
         "N1(b) regression: v2 Register on --secret-file master created members.json before invite"
     );
     assert!(
@@ -1600,9 +1682,15 @@ fn test_round3_two_unnamed_workers_slow_no_approval_confirm_and_paste_no_autocon
     assert!(!paste_out.status.success(), "declined join must fail");
     assert!(!paste_home.path().join(".oxideswarm").exists());
 
-    // 2. Item 3: Answering `y` after 8 seconds on a `--no-approval` invite (> 5 s handshake
-    //    watchdog) must succeed because `ClientMessage::Hello` -> `ClientResponse::Hello`
-    //    completes before the `[y/N]` prompt.
+    // 2. Item 3 + Round 4 N4 + NIT 6:
+    //    - Answering `y` after 8 seconds on a `--no-approval` invite (> 5 s handshake watchdog)
+    //      succeeds because `[y/N]` is prompted on the pinned `master_key` BEFORE connecting.
+    //    - `--no-approval` omits `Pairing code:` (`NIT 6`) and prints `Master key fingerprint:`.
+    //    - 32 `Enroll` connections sending `ClientMessage::Hello` plus 32 idle `Enroll`
+    //      connections held open concurrently using only the public `master_key` cannot block a
+    //      legitimate `--no-approval` join (`N4`).
+    let decoded_no_app = InviteToken::decode(&invite_str).expect("decode --no-approval invite");
+    let master_pub = decoded_no_app.master_key;
     let joiner_home = TempDir::new().unwrap();
     let mut slow_sess = InteractiveJoin::spawn(
         with(joiner_home.path(), &["join", "--no-doctor"]),
@@ -1612,14 +1700,97 @@ fn test_round3_two_unnamed_workers_slow_no_approval_confirm_and_paste_no_autocon
         slow_sess.wait_for_pairing_prompt(Duration::from_secs(10)),
         "slow_sess did not reach [y/N] prompt"
     );
+    assert!(
+        !slow_sess.stdout().contains("Pairing code:"),
+        "NIT 6 regression: --no-approval prompt must not print Pairing code:\n{}",
+        slow_sess.stdout()
+    );
+    assert!(
+        slow_sess.stdout().contains("Master key fingerprint:"),
+        "expected Master key fingerprint on --no-approval prompt:\n{}",
+        slow_sess.stdout()
+    );
     std::thread::sleep(Duration::from_secs(8));
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let flood_addr = addr.clone();
+    let flood_handle = std::thread::spawn(move || {
+        use rusty_grid_core::noise_auth::{v3_client_handshake_with_hash, HandshakePurpose};
+        use rusty_grid_core::protocol::{ClientMessage, EndpointRole, MessageTransport};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current_thread runtime for N4 flood");
+        rt.block_on(async move {
+            // (a) 32 connections that complete the `Enroll` Noise IK handshake and send only `Hello`.
+            let mut hello_conns = Vec::with_capacity(32);
+            for _ in 0..32 {
+                let stream = tokio::net::TcpStream::connect(&flood_addr)
+                    .await
+                    .expect("connect N4 hello stream");
+                let mut transport = MessageTransport::new(stream);
+                let kp = NodeKeypair::generate().unwrap();
+                let (sk, _) = v3_client_handshake_with_hash(
+                    &mut transport,
+                    &kp,
+                    &master_pub,
+                    HandshakePurpose::Enroll,
+                )
+                .await
+                .expect("N4 hello enroll handshake");
+                transport.enable_encryption(&sk, EndpointRole::Client);
+                let _ = transport.send_msg(&ClientMessage::Hello).await;
+                hello_conns.push(transport);
+            }
+
+            // (b) 32 idle connections that complete the `Enroll` Noise IK handshake and sit open
+            //     without sending a post-handshake message while `slow_sess` confirms and enrolls.
+            let mut idle_conns = Vec::with_capacity(32);
+            for _ in 0..32 {
+                let stream = tokio::net::TcpStream::connect(&flood_addr)
+                    .await
+                    .expect("connect N4 idle stream");
+                let mut transport = MessageTransport::new(stream);
+                let kp = NodeKeypair::generate().unwrap();
+                let (sk, _) = v3_client_handshake_with_hash(
+                    &mut transport,
+                    &kp,
+                    &master_pub,
+                    HandshakePurpose::Enroll,
+                )
+                .await
+                .expect("N4 idle enroll handshake");
+                transport.enable_encryption(&sk, EndpointRole::Client);
+                idle_conns.push(transport);
+            }
+
+            ready_tx.send(()).expect("signal N4 connections held");
+            let _ = tokio::task::spawn_blocking(move || release_rx.recv()).await;
+            drop(idle_conns);
+            drop(hello_conns);
+        });
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("32+32 N4 enroll connections established");
+
     slow_sess.confirm("y");
     let slow_out = slow_sess.wait_output(Duration::from_secs(15));
+    let _ = release_tx.send(());
+    let _ = flood_handle.join();
+
     assert!(
         slow_out.status.success(),
-        "Item 3 regression: answering `y` after 8s on --no-approval invite failed:\nstdout:\n{}\nstderr:\n{}",
+        "Item 3 / N4 regression: answering `y` after 8s under 32 idle Enroll connections failed:\nstdout:\n{}\nstderr:\n{}",
         text(&slow_out.stdout),
         text(&slow_out.stderr)
+    );
+    assert!(
+        !text(&slow_out.stdout).contains("Pairing code:"),
+        "NIT 6 regression: --no-approval output must not contain Pairing code:\n{}",
+        text(&slow_out.stdout)
     );
     assert!(
         !joiner_home
@@ -1856,7 +2027,10 @@ fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_
     let machine_oxs = machine_home.path().join(".oxideswarm");
     fs::create_dir_all(&machine_oxs).unwrap();
     fs::set_permissions(&machine_oxs, fs::Permissions::from_mode(0o700)).unwrap();
-    let master_secret_path = master_home.path().join(".oxideswarm").join("cluster.secret");
+    let master_secret_path = master_home
+        .path()
+        .join(".oxideswarm")
+        .join("cluster.secret");
     let machine_secret_file = work_dir.path().join("machine-v2.secret");
     fs::copy(&master_secret_path, &machine_secret_file).unwrap();
     fs::set_permissions(&machine_secret_file, fs::Permissions::from_mode(0o600)).unwrap();

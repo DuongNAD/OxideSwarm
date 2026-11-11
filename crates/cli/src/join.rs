@@ -1391,13 +1391,48 @@ async fn run_join_invite(
 
     // Open the controlling terminal for `[y/N]` confirmation BEFORE connecting to the master so a
     // headless invocation without `/dev/tty` or `CONIN$` fails without touching the master.
-    let confirm_term = match open_confirmation_terminal(stdin_is_terminal) {
-        Ok(t) => t,
+    let mut confirm_term = match open_confirmation_terminal(stdin_is_terminal) {
+        Ok(t) => Some(t),
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+
+    let fp = token.master_key.fingerprint();
+
+    // `--no-approval` invite: prompt `[y/N]` on the pinned master key fingerprint BEFORE opening
+    // any connection to the master. The fingerprint comes from the `master_key` in the invite and
+    // the Noise IK handshake proves that exact static key, so prompting first needs nothing from
+    // the session, keeps the 5 s handshake watchdog intact without pre-auth waiter slots, and
+    // omits the pairing code nobody compares.
+    if !token.require_approval {
+        let term = confirm_term
+            .take()
+            .expect("confirm_term available for --no-approval invite");
+        flush_confirmation_terminal(&term);
+        println!("Master key fingerprint: {fp}");
+        println!(
+            "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
+        );
+        print!(
+            "Confirm that this master key fingerprint ({fp}) matches the cluster you intend to join [y/N]: "
+        );
+        let _ = std::io::stdout().flush();
+
+        let confirm_rx = spawn_confirmation_prompt(term);
+        match confirm_rx.await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) | Err(_) => {
+                eprintln!("Confirmation declined; nothing was written.");
+                return ExitCode::FAILURE;
+            }
+            Ok(Err(e)) => {
+                eprintln!("{e}; nothing was written.");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let stream = match open_enroll_stream(master.as_deref(), token.ticket.as_deref()).await {
         Ok(s) => s,
@@ -1433,8 +1468,6 @@ async fn run_join_invite(
     };
     transport.enable_encryption(&session_key, EndpointRole::Client);
 
-    let pairing_code = derive_pairing_code(&handshake_hash);
-    let fp = token.master_key.fingerprint();
     let proof = compute_enroll_proof(token.invite_secret.as_bytes(), &handshake_hash);
     let machine_name = config
         .and_then(|c| c.worker.as_ref())
@@ -1443,114 +1476,43 @@ async fn run_join_invite(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_machine_name);
 
-    let (member_id, roles) = if !token.require_approval {
-        // Complete the v3 first-record confirmation (`ClientMessage::Hello` -> `ClientResponse::Hello`)
-        // before pausing for the interactive `[y/N]` prompt (`Item 3`) so the master's 5 s handshake
-        // watchdog is satisfied and the connection enters the 120 s pre-Enroll prompt window.
-        if let Err(e) = transport.send_msg(&ClientMessage::Hello).await {
-            eprintln!("Enrollment handshake failed: {e}");
+    if let Err(e) = transport
+        .send_msg(&ClientMessage::Enroll {
+            invite_id: token.invite_id.clone(),
+            proof,
+            name: machine_name,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        })
+        .await
+    {
+        eprintln!("Failed to send enrollment request: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let first_reply = match tokio::time::timeout(
+        crate::connect::AUTH_TIMEOUT,
+        transport.recv_msg::<ClientResponse>(),
+    )
+    .await
+    {
+        Ok(Ok(Some(reply))) => reply,
+        Ok(Ok(None)) => {
+            eprintln!("Master closed connection during enrollment");
             return ExitCode::from(AUTH_EXIT_CODE);
         }
-        match tokio::time::timeout(
-            crate::connect::AUTH_TIMEOUT,
-            transport.recv_msg::<ClientResponse>(),
-        )
-        .await
-        {
-            Ok(Ok(Some(ClientResponse::Hello { .. }))) => {}
-            Ok(Ok(Some(
-                ClientResponse::EnrollRejected { message } | ClientResponse::Error { message },
-            ))) => {
-                eprintln!("Enrollment rejected: {message}");
-                return ExitCode::from(AUTH_EXIT_CODE);
-            }
-            Ok(Ok(Some(other))) => {
-                eprintln!("Unexpected enrollment handshake reply from Master: {other:?}");
-                return ExitCode::FAILURE;
-            }
-            Ok(Ok(None)) => {
-                eprintln!("Master closed connection during enrollment handshake");
-                return ExitCode::from(AUTH_EXIT_CODE);
-            }
-            Ok(Err(e)) => {
-                eprintln!("Enrollment handshake failed: {e}");
-                return ExitCode::from(AUTH_EXIT_CODE);
-            }
-            Err(_) => {
-                eprintln!(
-                    "Enrollment handshake timed out after {}s",
-                    crate::connect::AUTH_TIMEOUT.as_secs()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-
-        // `--no-approval` invite: require `[y/N]` confirmation BEFORE sending `ClientMessage::Enroll`
-        // so declining never enrolls the machine or consumes an invite use on the master.
-        flush_confirmation_terminal(&confirm_term);
-        println!(
-            "Pairing code: {}  (Master key fingerprint: {fp})",
-            pairing_code.as_str()
-        );
-        println!(
-            "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
-        );
-        print!(
-            "Confirm that this master key fingerprint ({fp}) matches the cluster you intend to join [y/N]: "
-        );
-        let _ = std::io::stdout().flush();
-
-        let confirm_rx = spawn_confirmation_prompt(confirm_term);
-        match confirm_rx.await {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) | Err(_) => {
-                drop(transport);
-                eprintln!("Confirmation declined; nothing was written.");
-                return ExitCode::FAILURE;
-            }
-            Ok(Err(e)) => {
-                drop(transport);
-                eprintln!("{e}; nothing was written.");
-                return ExitCode::FAILURE;
-            }
-        }
-
-        if let Err(e) = transport
-            .send_msg(&ClientMessage::Enroll {
-                invite_id: token.invite_id.clone(),
-                proof,
-                name: machine_name,
-                os: std::env::consts::OS.to_string(),
-                arch: std::env::consts::ARCH.to_string(),
-            })
-            .await
-        {
-            eprintln!("Failed to send enrollment request: {e}");
+        Ok(Err(e)) => {
+            eprintln!("Failed to read enrollment reply: {e}");
             return ExitCode::FAILURE;
         }
+        Err(_) => {
+            eprintln!("Timed out waiting for enrollment reply from Master");
+            return ExitCode::FAILURE;
+        }
+    };
 
-        let reply = match tokio::time::timeout(
-            crate::connect::AUTH_TIMEOUT,
-            transport.recv_msg::<ClientResponse>(),
-        )
-        .await
-        {
-            Ok(Ok(Some(reply))) => reply,
-            Ok(Ok(None)) => {
-                eprintln!("Master closed connection during enrollment");
-                return ExitCode::from(AUTH_EXIT_CODE);
-            }
-            Ok(Err(e)) => {
-                eprintln!("Failed to read enrollment reply: {e}");
-                return ExitCode::FAILURE;
-            }
-            Err(_) => {
-                eprintln!("Timed out waiting for enrollment reply from Master");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        match reply {
+    let (member_id, roles) = if !token.require_approval {
+        match first_reply {
             ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {
                 eprintln!("Enrollment rejected: {message}");
                 return ExitCode::from(AUTH_EXIT_CODE);
@@ -1562,40 +1524,10 @@ async fn run_join_invite(
             }
         }
     } else {
-        if let Err(e) = transport
-            .send_msg(&ClientMessage::Enroll {
-                invite_id: token.invite_id.clone(),
-                proof,
-                name: machine_name,
-                os: std::env::consts::OS.to_string(),
-                arch: std::env::consts::ARCH.to_string(),
-            })
-            .await
-        {
-            eprintln!("Failed to send enrollment request: {e}");
-            return ExitCode::FAILURE;
-        }
-
-        let first_reply = match tokio::time::timeout(
-            crate::connect::AUTH_TIMEOUT,
-            transport.recv_msg::<ClientResponse>(),
-        )
-        .await
-        {
-            Ok(Ok(Some(reply))) => reply,
-            Ok(Ok(None)) => {
-                eprintln!("Master closed connection during enrollment");
-                return ExitCode::from(AUTH_EXIT_CODE);
-            }
-            Ok(Err(e)) => {
-                eprintln!("Failed to read enrollment reply: {e}");
-                return ExitCode::FAILURE;
-            }
-            Err(_) => {
-                eprintln!("Timed out waiting for enrollment reply from Master");
-                return ExitCode::FAILURE;
-            }
-        };
+        let pairing_code = derive_pairing_code(&handshake_hash);
+        let confirm_term = confirm_term
+            .take()
+            .expect("confirm_term available for approval invite");
 
         let mut approved: Option<(String, Vec<MemberRole>)> = match first_reply {
             ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {

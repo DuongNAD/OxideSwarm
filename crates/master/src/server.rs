@@ -1637,7 +1637,7 @@ impl MasterServer {
                 && self.config.state_dir.is_none(),
             members: Arc::clone(&self.config.members),
             p2p_ticket: self.p2p_ticket.clone(),
-            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
+            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         };
 
         #[cfg(feature = "p2p")]
@@ -3482,73 +3482,6 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
         if let Some(ref peer) = v3_peer {
             match peer.purpose {
                 HandshakePurpose::Enroll => {
-                    if is_first && matches!(msg, ClientMessage::Hello) {
-                        let Ok(_prompt_permit) =
-                            Arc::clone(&auth_ctx.enroll_prompt_waiters).try_acquire_owned()
-                        else {
-                            warn!(
-                                member_id = %peer.member_id,
-                                "Refusing OXS-AUTH v3 pre-Enroll prompt wait: 32-waiter limit reached"
-                            );
-                            let _ = send_client_response(
-                                &mut transport,
-                                &ClientResponse::EnrollRejected {
-                                    message: members::GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                                },
-                            )
-                            .await;
-                            let _ = tokio::time::timeout(
-                                REFUSAL_DRAIN_TIMEOUT,
-                                transport.recv_raw_frame_max(
-                                    rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
-                                ),
-                            )
-                            .await;
-                            break;
-                        };
-                        send_client_response(
-                            &mut transport,
-                            &ClientResponse::Hello {
-                                min_compatible_version:
-                                    rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
-                            },
-                        )
-                        .await?;
-                        match tokio::time::timeout(
-                            ENROLL_PROMPT_IDLE_TIMEOUT,
-                            transport.recv_msg::<ClientMessage>(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(Some(enroll_msg @ ClientMessage::Enroll { .. }))) => {
-                                next_msg = Some(enroll_msg);
-                                first_iteration = true;
-                                continue;
-                            }
-                            Ok(Ok(Some(_))) => {
-                                warn!(
-                                    member_id = %peer.member_id,
-                                    "Refusing non-Enroll message after Hello on OXS-AUTH v3 enroll connection"
-                                );
-                                break;
-                            }
-                            Ok(Ok(None)) | Ok(Err(_)) => {
-                                debug!(
-                                    member_id = %peer.member_id,
-                                    "Enroll peer closed connection before sending ClientMessage::Enroll"
-                                );
-                                break;
-                            }
-                            Err(_) => {
-                                info!(
-                                    member_id = %peer.member_id,
-                                    timeout_secs = ENROLL_PROMPT_IDLE_TIMEOUT.as_secs(),
-                                    "Enroll connection timed out waiting at [y/N] prompt before ClientMessage::Enroll"
-                                );
-                                break;
-                            }
-                        }
-                    }
                     if !is_first || !matches!(msg, ClientMessage::Enroll { .. }) {
                         warn!(
                             member_id = %peer.member_id,
@@ -3863,18 +3796,11 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 
 const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
-/// Maximum concurrent `HandshakePurpose::Enroll` connections waiting at the pre-`Enroll`
-/// `[y/N]` prompt (`ClientMessage::Hello` received, `ClientMessage::Enroll` not yet sent).
-const MAX_ENROLL_PROMPT_WAITERS: usize = 32;
-
-/// Maximum time an enroll connection may sit at the `[y/N]` prompt after `ClientMessage::Hello`
-/// before sending `ClientMessage::Enroll` (`Item 3`).
-const ENROLL_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-
 #[allow(clippy::too_many_arguments)]
 async fn rollback_enrollment_and_disconnect_workers(
     auth_ctx: &MasterAuthContext,
     rollback: members::ApprovedEnrollmentRollback,
+    disconnect_reason: &str,
     registry: &WorkerRegistry,
     queue: &TaskQueue,
     scheduler_notify: &tokio::sync::Notify,
@@ -3885,10 +3811,17 @@ async fn rollback_enrollment_and_disconnect_workers(
 ) {
     let member_id = rollback.member_id.clone();
     let pubkey = rollback.public_key;
-    let released_claims = auth_ctx
-        .members
-        .rollback_approved_enrollment(rollback)
-        .unwrap_or_default();
+    let released_claims = match auth_ctx.members.rollback_approved_enrollment(rollback) {
+        Ok(claims) => claims,
+        Err(e) => {
+            warn!(
+                member_id = %member_id,
+                error = %e,
+                "Failed to persist rollback of unconfirmed OXS-AUTH v3 enrollment"
+            );
+            Vec::new()
+        }
+    };
     let still_has_worker_role = auth_ctx
         .members
         .get(&pubkey)
@@ -3909,7 +3842,7 @@ async fn rollback_enrollment_and_disconnect_workers(
                 Some(waiters),
                 wid,
                 None,
-                "Enrollment confirmation declined by joining machine",
+                disconnect_reason,
                 true,
                 #[cfg(feature = "dashboard")]
                 broadcast_tx,
@@ -4069,6 +4002,7 @@ async fn wait_for_pending_enrollment<S>(
         member_id = %member_id,
         "Queued v3 enrollment request for admin approval"
     );
+    let mut decision_consumed = false;
     if send_client_response(
         transport,
         &ClientResponse::EnrollPending {
@@ -4076,92 +4010,48 @@ async fn wait_for_pending_enrollment<S>(
         },
     )
     .await
-    .is_err()
+    .is_ok()
     {
-        auth_ctx.members.remove_pending(&pending_id);
-        return;
-    }
-    let enroll_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(members::PENDING_ENROLLMENT_TTL_SECS);
-    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
-    keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    keepalive_interval.tick().await;
-    loop {
-        tokio::select! {
-            dec = &mut decision_rx => {
-                match dec {
-                    Ok(members::PendingDecision::Approved {
-                        member_id,
-                        roles,
-                        rollback,
-                    }) => {
-                        info!(
-                            pending_id = %pending_id,
-                            member_id = %member_id,
-                            ?roles,
-                            "Admin approved pending v3 enrollment; waiting for joining machine confirmation"
-                        );
-                        if send_client_response(
-                            transport,
-                            &ClientResponse::Enrolled {
-                                member_id: member_id.clone(),
-                                roles,
-                            },
-                        )
-                        .await
-                        .is_err()
-                        {
+        let enroll_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(members::PENDING_ENROLLMENT_TTL_SECS);
+        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive_interval.tick().await;
+        loop {
+            tokio::select! {
+                dec = &mut decision_rx => {
+                    decision_consumed = true;
+                    match dec {
+                        Ok(members::PendingDecision::Approved {
+                            member_id,
+                            roles,
+                            rollback,
+                        }) => {
                             info!(
                                 pending_id = %pending_id,
                                 member_id = %member_id,
-                                "Joining machine disconnected while sending Enrolled; rolling back enrollment"
+                                ?roles,
+                                "Admin approved pending v3 enrollment; waiting for joining machine confirmation"
                             );
-                            rollback_enrollment_and_disconnect_workers(
-                                auth_ctx,
-                                *rollback,
-                                registry,
-                                queue,
-                                scheduler_notify,
-                                waiters,
-                                #[cfg(feature = "dashboard")]
-                                broadcast_tx,
+                            if send_client_response(
+                                transport,
+                                &ClientResponse::Enrolled {
+                                    member_id: member_id.clone(),
+                                    roles,
+                                },
                             )
-                            .await;
-                            break;
-                        }
-                        let confirm_deadline = tokio::time::Instant::now()
-                            + Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS);
-                        let confirm_res = tokio::time::timeout_at(
-                            confirm_deadline,
-                            transport.recv_msg::<ClientMessage>(),
-                        )
-                        .await;
-                        match confirm_res {
-                            Ok(Ok(Some(ClientMessage::Hello))) => {
-                                auth_ctx.members.confirm_approved_enrollment(&rollback);
+                            .await
+                            .is_err()
+                            {
                                 info!(
                                     pending_id = %pending_id,
                                     member_id = %member_id,
-                                    "Joining machine confirmed v3 enrollment"
-                                );
-                                let _ = send_client_response(
-                                    transport,
-                                    &ClientResponse::Hello {
-                                        min_compatible_version:
-                                            rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
-                                    },
-                                )
-                                .await;
-                            }
-                            _ => {
-                                info!(
-                                    pending_id = %pending_id,
-                                    member_id = %member_id,
-                                    "Joining machine declined confirmation or disconnected after approval; rolling back enrollment"
+                                    "Joining machine disconnected while sending Enrolled; rolling back enrollment"
                                 );
                                 rollback_enrollment_and_disconnect_workers(
                                     auth_ctx,
                                     *rollback,
+                                    "Enrollment confirmation declined by joining machine",
                                     registry,
                                     queue,
                                     scheduler_notify,
@@ -4170,101 +4060,217 @@ async fn wait_for_pending_enrollment<S>(
                                     broadcast_tx,
                                 )
                                 .await;
-                                let _ = send_client_response(
-                                    transport,
-                                    &ClientResponse::EnrollRejected {
-                                        message: "enrollment cancelled by joining machine".into(),
-                                    },
-                                )
-                                .await;
+                                break;
+                            }
+                            let confirm_deadline =
+                                tokio::time::Instant::now() + auth_ctx.enroll_confirm_timeout;
+                            let confirm_res = tokio::time::timeout_at(
+                                confirm_deadline,
+                                transport.recv_msg::<ClientMessage>(),
+                            )
+                            .await;
+                            match confirm_res {
+                                Ok(Ok(Some(ClientMessage::Hello))) => {
+                                    auth_ctx.members.confirm_approved_enrollment(&rollback);
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        "Joining machine confirmed v3 enrollment"
+                                    );
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::Hello {
+                                            min_compatible_version:
+                                                rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        timeout_secs = auth_ctx.enroll_confirm_timeout.as_secs(),
+                                        "Enrollment confirmation timed out after approval; rolling back enrollment"
+                                    );
+                                    rollback_enrollment_and_disconnect_workers(
+                                        auth_ctx,
+                                        *rollback,
+                                        "Enrollment confirmation timed out",
+                                        registry,
+                                        queue,
+                                        scheduler_notify,
+                                        waiters,
+                                        #[cfg(feature = "dashboard")]
+                                        broadcast_tx,
+                                    )
+                                    .await;
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::EnrollRejected {
+                                            message: "enrollment confirmation timed out".into(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Ok(_) => {
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        "Joining machine declined confirmation or disconnected after approval; rolling back enrollment"
+                                    );
+                                    rollback_enrollment_and_disconnect_workers(
+                                        auth_ctx,
+                                        *rollback,
+                                        "Enrollment confirmation declined by joining machine",
+                                        registry,
+                                        queue,
+                                        scheduler_notify,
+                                        waiters,
+                                        #[cfg(feature = "dashboard")]
+                                        broadcast_tx,
+                                    )
+                                    .await;
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::EnrollRejected {
+                                            message: "enrollment cancelled by joining machine".into(),
+                                        },
+                                    )
+                                    .await;
+                                }
                             }
                         }
+                        Ok(members::PendingDecision::Rejected { message }) => {
+                            info!(
+                                pending_id = %pending_id,
+                                "Admin rejected pending v3 enrollment"
+                            );
+                            let _ = send_client_response(
+                                transport,
+                                &ClientResponse::EnrollRejected { message },
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            let _ = send_client_response(
+                                transport,
+                                &ClientResponse::EnrollRejected {
+                                    message: "enrollment request was closed".into(),
+                                },
+                            )
+                            .await;
+                        }
                     }
-                    Ok(members::PendingDecision::Rejected { message }) => {
-                        info!(
+                    let _ = tokio::time::timeout(
+                        REFUSAL_DRAIN_TIMEOUT,
+                        transport.recv_raw_frame_max(
+                            rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
+                        ),
+                    )
+                    .await;
+                    break;
+                }
+                _ = keepalive_interval.tick() => {
+                    if send_client_response(
+                        transport,
+                        &ClientResponse::EnrollKeepalive,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        debug!(
                             pending_id = %pending_id,
-                            "Admin rejected pending v3 enrollment"
+                            "Pending enrollment peer disconnected during keepalive"
                         );
-                        let _ = send_client_response(
-                            transport,
-                            &ClientResponse::EnrollRejected { message },
-                        )
-                        .await;
-                    }
-                    Err(_) => {
-                        let _ = send_client_response(
-                            transport,
-                            &ClientResponse::EnrollRejected {
-                                message: "enrollment request was closed".into(),
-                            },
-                        )
-                        .await;
+                        break;
                     }
                 }
-                let _ = tokio::time::timeout(
-                    REFUSAL_DRAIN_TIMEOUT,
-                    transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
-                )
-                .await;
-                break;
-            }
-            _ = keepalive_interval.tick() => {
-                if send_client_response(
-                    transport,
-                    &ClientResponse::EnrollKeepalive,
-                )
-                .await
-                .is_err()
-                {
-                    debug!(
+                peer_frame = transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME) => {
+                    match peer_frame {
+                        Ok(None) | Err(_) => {
+                            debug!(
+                                pending_id = %pending_id,
+                                "Pending enrollment peer closed connection before approval; dropping pending entry"
+                            );
+                        }
+                        Ok(Some(_)) => {
+                            warn!(
+                                pending_id = %pending_id,
+                                "Pending enrollment peer sent unexpected frame while waiting for approval; dropping pending entry"
+                            );
+                        }
+                    }
+                    break;
+                }
+                _ = tokio::time::sleep_until(enroll_deadline) => {
+                    info!(
                         pending_id = %pending_id,
-                        "Pending enrollment peer disconnected during keepalive"
+                        "Pending enrollment timed out waiting for admin approval"
                     );
+                    decision_rx.close();
                     auth_ctx.members.remove_pending(&pending_id);
+                    if let Ok(members::PendingDecision::Approved { rollback, .. }) =
+                        decision_rx.try_recv()
+                    {
+                        decision_consumed = true;
+                        rollback_enrollment_and_disconnect_workers(
+                            auth_ctx,
+                            *rollback,
+                            "Enrollment request timed out before confirmation",
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            waiters,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                        )
+                        .await;
+                    }
+                    let _ = send_client_response(
+                        transport,
+                        &ClientResponse::EnrollRejected {
+                            message: "enrollment request timed out waiting for approval".into(),
+                        },
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        REFUSAL_DRAIN_TIMEOUT,
+                        transport.recv_raw_frame_max(
+                            rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
+                        ),
+                    )
+                    .await;
                     break;
                 }
             }
-            peer_frame = transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME) => {
-                match peer_frame {
-                    Ok(None) | Err(_) => {
-                        debug!(
-                            pending_id = %pending_id,
-                            "Pending enrollment peer closed connection before approval; dropping pending entry"
-                        );
-                    }
-                    Ok(Some(_)) => {
-                        warn!(
-                            pending_id = %pending_id,
-                            "Pending enrollment peer sent unexpected frame while waiting for approval; dropping pending entry"
-                        );
-                    }
-                }
-                auth_ctx.members.remove_pending(&pending_id);
-                break;
-            }
-            _ = tokio::time::sleep_until(enroll_deadline) => {
-                info!(
-                    pending_id = %pending_id,
-                    "Pending enrollment timed out waiting for admin approval"
-                );
-                auth_ctx.members.remove_pending(&pending_id);
-                let _ = send_client_response(
-                    transport,
-                    &ClientResponse::EnrollRejected {
-                        message: "enrollment request timed out waiting for approval".into(),
-                    },
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    REFUSAL_DRAIN_TIMEOUT,
-                    transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
-                )
-                .await;
-                break;
-            }
         }
     }
+    if !decision_consumed {
+        decision_rx.close();
+    }
     auth_ctx.members.remove_pending(&pending_id);
+    if !decision_consumed {
+        if let Ok(members::PendingDecision::Approved { rollback, .. }) = decision_rx.try_recv() {
+            info!(
+                pending_id = %pending_id,
+                member_id = %member_id,
+                "Pending enrollment disconnected concurrently with admin approval; rolling back unconfirmed enrollment"
+            );
+            rollback_enrollment_and_disconnect_workers(
+                auth_ctx,
+                *rollback,
+                "Enrollment confirmation declined by joining machine",
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4586,7 +4592,7 @@ pub(crate) struct MasterAuthContext {
     pub ephemeral_without_state_dir: bool,
     pub members: Arc<MemberStore>,
     pub p2p_ticket: Option<String>,
-    pub enroll_prompt_waiters: Arc<Semaphore>,
+    pub enroll_confirm_timeout: Duration,
 }
 
 impl Default for MasterAuthContext {
@@ -4599,7 +4605,7 @@ impl Default for MasterAuthContext {
             ephemeral_without_state_dir: false,
             members: Arc::default(),
             p2p_ticket: None,
-            enroll_prompt_waiters: Arc::new(Semaphore::new(MAX_ENROLL_PROMPT_WAITERS)),
+            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         }
     }
 }
@@ -4835,11 +4841,9 @@ where
     if auth_peer.purpose == HandshakePurpose::Enroll {
         if !matches!(
             first_msg,
-            InboundMessage::Client(ClientMessage::Enroll { .. } | ClientMessage::Hello)
+            InboundMessage::Client(ClientMessage::Enroll { .. })
         ) {
-            let reason =
-                "enroll handshake may only send ClientMessage::Enroll or ClientMessage::Hello"
-                    .to_string();
+            let reason = "enroll handshake may only send ClientMessage::Enroll".to_string();
             warn!(
                 remote = %peer,
                 lane,
@@ -10261,5 +10265,207 @@ mod tests {
         );
 
         let _ = handle2.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_round4_n3_server_disconnect_race_and_nit3_confirm_timeout_message() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, derive_pairing_code, v3_client_handshake_with_hash,
+            HandshakePurpose, MemberRole, RedactedString,
+        };
+        use rusty_grid_core::protocol::EndpointRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+
+        let mut cfg = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(false)
+            .with_master_noise_key(master_kp.clone())
+            .with_members(members.clone());
+        cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg.enable_p2p = false;
+        }
+        cfg.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg.enable_web_ui = false;
+        }
+
+        let handle = MasterServer::spawn(cfg).await.unwrap();
+        let addr = handle.server_addr;
+
+        // 1. N3 TCP race: joiner connects, sends Enroll, receives EnrollPending, and drops its
+        //    TCP stream concurrently with admin sending ApproveEnrollment over TCP.
+        for i in 0..15u32 {
+            let joiner_kp = NodeKeypair::generate().unwrap();
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut jt = MessageTransport::new(s);
+            let (sk, hh) = v3_client_handshake_with_hash(
+                &mut jt,
+                &joiner_kp,
+                &master_pub,
+                HandshakePurpose::Enroll,
+            )
+            .await
+            .unwrap();
+            jt.enable_encryption(&sk, EndpointRole::Client);
+            let code = derive_pairing_code(&hh).as_str().to_string();
+            let proof = compute_enroll_proof(&inv.invite_secret.0, &hh);
+            jt.send_msg(&ClientMessage::Enroll {
+                invite_id: inv.invite_id.clone(),
+                proof,
+                name: format!("tcp-race-{i}"),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            })
+            .await
+            .unwrap();
+            let pid = match jt.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+                ClientResponse::EnrollPending { pending_id } => pending_id,
+                other => panic!("expected EnrollPending, got: {other:?}"),
+            };
+
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+
+            let approve_fut = async move {
+                admin_t
+                    .send_msg(&ClientMessage::ApproveEnrollment {
+                        pending_id: pid,
+                        pairing_code: RedactedString(code),
+                    })
+                    .await
+                    .unwrap();
+                let _ = admin_t.recv_msg::<ClientResponse>().await;
+            };
+            let drop_fut = async move {
+                tokio::task::yield_now().await;
+                drop(jt);
+            };
+            tokio::join!(approve_fut, drop_fut);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if !members.contains(joiner_kp.public_key())
+                    && members.unconfirmed_tracking_counts() == (0, 0)
+                    && members.list_invites().first().map(|x| x.uses_remaining) == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !members.contains(joiner_kp.public_key()),
+                "iteration {i}: disconnected joiner stayed enrolled"
+            );
+            assert_eq!(members.list_invites()[0].uses_remaining, 1, "iteration {i}");
+            assert_eq!(
+                members.unconfirmed_tracking_counts(),
+                (0, 0),
+                "iteration {i}"
+            );
+        }
+
+        let _ = handle.shutdown();
+
+        // 2. NIT 3: verify distinct timeout message ("enrollment confirmation timed out") vs
+        //    client-cancelled message ("enrollment cancelled by joining machine").
+        let mem_nit3 = MemberStore::new();
+        let inv_nit3 = mem_nit3
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let j_nit3 = NodeKeypair::generate().unwrap();
+        let h_nit3 = [0x99u8; 32];
+        let p_nit3 = compute_enroll_proof(&inv_nit3.invite_secret.0, &h_nit3);
+        let (pid_nit3, rx_nit3) = match mem_nit3
+            .handle_enroll_request(
+                *j_nit3.public_key(),
+                &h_nit3,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50099",
+                &inv_nit3.invite_id,
+                &p_nit3,
+                "nit3-box".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            members::EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        let auth_ctx_nit3 = MasterAuthContext {
+            members: Arc::new(mem_nit3.clone()),
+            enroll_confirm_timeout: Duration::from_millis(80),
+            ..Default::default()
+        };
+        let reg_nit3 = WorkerRegistry::new();
+        let q_nit3 = TaskQueue::new();
+        let sched_nit3 = tokio::sync::Notify::new();
+        let waiters_nit3: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (c_dup, s_dup) = tokio::io::duplex(16 * 1024);
+        let mut c_trans = MessageTransport::new(c_dup);
+        let mut s_trans = MessageTransport::new(s_dup);
+
+        let j_nit3_mid = j_nit3.member_id();
+        let srv_fut = wait_for_pending_enrollment(
+            &mut s_trans,
+            &auth_ctx_nit3,
+            &reg_nit3,
+            &q_nit3,
+            &sched_nit3,
+            &waiters_nit3,
+            #[cfg(feature = "dashboard")]
+            None,
+            &j_nit3_mid,
+            pid_nit3.clone(),
+            rx_nit3,
+        );
+        let cli_fut = async {
+            assert!(matches!(
+                c_trans.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollPending { .. })
+            ));
+            mem_nit3
+                .approve_pending(&pid_nit3, derive_pairing_code(&h_nit3).as_str())
+                .unwrap();
+            assert!(matches!(
+                c_trans.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::Enrolled { .. })
+            ));
+            // Do not send Hello; wait for the 80 ms confirmation timeout to fire!
+            match c_trans.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::EnrollRejected { message }) => {
+                    assert_eq!(message, "enrollment confirmation timed out");
+                }
+                other => panic!("expected EnrollRejected timeout message, got: {other:?}"),
+            }
+        };
+        tokio::join!(srv_fut, cli_fut);
+        assert!(!mem_nit3.contains(j_nit3.public_key()));
+        assert_eq!(mem_nit3.list_invites()[0].uses_remaining, 1);
+        assert_eq!(mem_nit3.unconfirmed_tracking_counts(), (0, 0));
     }
 }
