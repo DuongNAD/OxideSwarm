@@ -1,7 +1,8 @@
 # 0059: First users (who gains what, and the order of work that serves them)
 
-Status: Draft (plan; builds nothing; decisions Q36 to Q39 are open)
-Created: 2026-11-10    Updated: 2026-11-10
+Status: Draft (plan; builds nothing; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are
+open)
+Created: 2026-11-10    Updated: 2026-11-11
 
 ## Summary
 
@@ -339,13 +340,13 @@ backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
 
 ## Decisions for the owner
 
-The right column is a recommended default, not a decision. They are listed in
-[ROADMAP.md](../ROADMAP.md) as Q36 to Q39.
+The right column is a recommended default, not a decision, unless it says "Decided". They are
+listed in [ROADMAP.md](../ROADMAP.md) as Q36 to Q39.
 
 | ID | Question | Recommended default |
 |---|---|---|
 | Q36 | Accept the first audience (A1, then A2) and the order of D3? | Yes |
-| Q37 | Will the owner run the first round of ADOPT-1, and with how many people? | Owner. Three to five people, before AX-1 starts |
+| Q37 | Will the owner run the first round of ADOPT-1, and with how many people? | Decided on 2026-11-11: the owner runs it, with three to five people, before AX-1 starts |
 | Q38 | Which items of this record enter the backlog first? | ADOPT-2 for one task now. ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Yes |
 
@@ -370,3 +371,7 @@ None yet.
 - 2026-11-10: Draft written at the owner's request: what does a user gain, and which upgrades make
   people use the project. The state was checked at `origin/master` `4a07fcb`. Nothing is built,
   and no item entered the backlog.
+- 2026-11-11: The owner accepted Q37 with the recommended default: the owner runs the first round
+  of ADOPT-1 with three to five people, before AX-1 starts. No session has run yet, so "Study
+  records" is still empty and ADOPT-1 stays Planned. Q36, Q38 and Q39 are open, and no item
+  entered the backlog.

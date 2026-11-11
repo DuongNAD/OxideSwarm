@@ -1,9 +1,10 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
-Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, and Q27 to Q29 (the charter
-of design 0057) on 2026-11-10.
-Created: 2026-11-07    Updated: 2026-11-10
+Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29 (the charter of
+design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059) on
+2026-11-11.
+Created: 2026-11-07    Updated: 2026-11-11
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -43,7 +44,8 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 - First users (Draft, 2026-11-10): who gains what from the grid today, and the order of work that
   serves them. The first audience is a developer with a coding agent and machines on more than one
   operating system. A study of first use comes before more is built. The plan is in
-  [design 0059](design/0059-first-users.md), and decisions Q36 to Q39 are open.
+  [design 0059](design/0059-first-users.md). The owner accepted Q37 on 2026-11-11 and runs the
+  first round of that study. Q36, Q38 and Q39 are open.
 
 ## Where the project stands
 
@@ -415,7 +417,7 @@ They are in [BACKLOG.md](BACKLOG.md) since 2026-11-10, as its Phase 10.
 
 ### First users: who gains what, and in which order
 
-Draft, proposed on 2026-11-10; decisions Q36 to Q39 are open.
+Draft, proposed on 2026-11-10. The owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are open.
 [Design 0059](design/0059-first-users.md) asks what a person gains from installing the grid, and
 orders the work by that. Its statements about users are reasoning until its study or a recorded
 run supports them.
@@ -495,7 +497,7 @@ answers.
 | Q34 | Will the owner apply for an independent security review and for funding (LV-6, LV-16)? | Open. Owner |
 | Q35 | May user guides be translated into Vietnamese, with English as the source? | Open. Recommended: yes. Writing standard rule 1 then says so |
 | Q36 | Accept the first audience of design 0059 (a developer with a coding agent and machines on more than one operating system, then one with a slow test suite) and its order of work? | Open. Recommended: yes |
-| Q37 | Will the owner run the first round of the study of first use (ADOPT-1), and with how many people? | Open. Owner. Recommended: three to five people, before AX-1 starts |
+| Q37 | Will the owner run the first round of the study of first use (ADOPT-1), and with how many people? | Yes, decided by the owner on 2026-11-11: the owner runs it with three to five people, before AX-1 starts. No session has run yet |
 | Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
@@ -583,3 +585,7 @@ answers.
   people use the project: [design 0059](design/0059-first-users.md), with items ADOPT-1 to
   ADOPT-4, measures M15 to M17 and open decisions Q36 to Q39. Nothing moved, and no item entered
   the backlog.
+- 2026-11-11: The owner accepted Q37 with the recommended default: the owner runs the first round
+  of the study of first use (ADOPT-1 of [design 0059](design/0059-first-users.md)) with three to
+  five people, before AX-1 starts. No session has run yet. Q36, Q38 and Q39 stay open, and no
+  item entered the backlog.
