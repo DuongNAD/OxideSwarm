@@ -225,5 +225,61 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   worker writes `<InstallRoot>\home\windows_acl_grants.txt` and never touches
   `%USERPROFILE%\.oxideswarm`, and `uninstall.ps1` revokes all recorded `oxideswarm.toolchain` ACL
   grants before deleting `<InstallRoot>`.
+- 2026-11-10: D2 `--gpu` in kit format v0. During the trial, a laptop with a discrete GPU joined
+  with `GPU: none`, because the kit only held the plain archives. `make_kit.sh --gpu` adds the `-gpu`
+  archive of each target. The installers ask whether this machine's GPU should do work and install
+  the GPU build on yes; without a terminal they keep the plain build. `install.sh --gpu|--no-gpu` and
+  `install.ps1 -Gpu|-NoGpu` answer in advance.
+- 2026-11-10: Install folder on another drive (Windows). The trial showed task folders and the file
+  cache in `%TEMP%` on drive C even with `-InstallRoot`. `install.ps1` now offers each fixed NTFS or
+  ReFS drive other than the kit's, and checks a folder given with `-InstallRoot` the same way. A
+  folder outside `%LOCALAPPDATA%` is limited to the user, `SYSTEM` and `Administrators` before
+  anything is written into it, and the worker gets its sandbox base and `--workspace-root`
+  inside it. The folder is recorded in `HKCU\Software\OxideSwarm\UsbKit` for `uninstall.ps1`. The
+  worker itself does not check the permissions of a custom sandbox base on Windows
+  (`ensure_private_dir` acts on Unix only); that is a separate fix.
+- 2026-11-10: The install-folder menu was checked on a Windows 11 laptop with an internal `E:`
+  (NTFS): it offered `E:\OxideSwarm`, skipped the kit stick (`D:`, exFAT, removable) and Google
+  Drive (`G:`, FAT32), and refused a second install while one existed on drive C. Google Drive is
+  skipped only because it reports FAT32, so the installer now also requires a disk partition behind
+  the drive letter (`Win32_LogicalDiskToPartition`; a cloud or virtual drive has none) and refuses
+  disks on the USB bus. The worker-side fix landed the same day (design 0021 status log).
+- 2026-11-10: Update in place (`install.sh --update`, `install.ps1 -Update`, and the `Update
+  OxideSwarm` launchers). During the trial every new kit meant uninstall and install on each
+  machine. The update keeps the folder, name, build and start at login, does not join again and
+  skips the doctor; the installer now records the name, build and workspace choice in
+  `kit-install.conf` / `kit-install.txt`. The normal installer also stops this install's LaunchAgent
+  or systemd unit before it replaces the binary.
+- 2026-11-10: One worker per machine, and a safe eject. Each reinstall during the trial left a
+  disconnected entry beside the new worker, because a fresh state folder got a fresh random id. The
+  installers now write the id file before the first start: a version 8 UUID from a SHA-256 over the
+  machine id (`MachineGuid`, `IOPlatformUUID`, `/etc/machine-id`), the worker name and the cluster
+  secret, so the machine id stays local and ids do not link one machine across clusters. With
+  ENROLL-1b's per-member worker ids, a reinstall that enrols a new key under the same id may be
+  refused (not checked yet); that interaction is open. The launchers end with an offer to eject the stick, run so that
+  the launcher read from the stick does not keep it busy (tested on macOS with a mounted exFAT image;
+  the Windows path is untested).
+- 2026-11-10: Review fixes. M1: `icacls /inheritance:r` kept explicit entries, the owner and the
+  children of a folder another local account had prepared, so that account could read the secret
+  and replace the worker the Run entry starts. `install.ps1` now builds the DACL itself
+  (`DirectorySecurity`, protected, three SIDs, owner = user), creates a new folder with it in one
+  `CreateDirectory` call, refuses an existing folder owned by someone else or holding entries
+  another account owns or has rights on, refuses a path whose folders another account may rename,
+  delete or re-permission, verifies the result, and runs these checks on `-Update` too. S5:
+  `uninstall.ps1` deletes only a folder with the kit's marker (or the default folder) and refuses
+  links, because PowerShell 5.1 follows junctions. S6: `-Update` keeps the `--isolation` of the
+  existing launcher when `kit-install.txt` lacks it. S7: `install.sh` and `uninstall.sh` stop a PID
+  from `run/worker.pid` only when that process runs this install's binary. `-Name` is limited to
+  `[A-Za-z0-9_.-]{1,64}`. Open: the USB-bus check reads `Win32_DiskDrive.InterfaceType`, which
+  reports SCSI for UASP and Thunderbolt enclosures, so such disks are still offered; the worker-side
+  findings S1 to S4 follow separately.
+- 2026-11-10: `USB-4`. The installers size the worker's task slots to the performance cores
+  (`GetSystemCpuSetInformation` efficiency classes on Windows, `hw.perflevel0.logicalcpu` on
+  macOS, `/sys/devices/cpu_core/cpus` on Linux), at most half of all processors and at least 1; a
+  quarter of the processors on a machine with a battery when the core types cannot be read.
+  `install.sh --slots N` / `install.ps1 -Slots N` override it, and `kit-install.conf` /
+  `kit-install.txt` keep an override across updates. Reason: on an i7-1355U laptop, 6 concurrent
+  tasks took 39.6 s each against 2.9 s for 2, and a 32-task batch waited 52 s on the laptop's 6
+  tasks (see `SCHED-4`, design 0060).
 - 2026-11-10: A bootable image stays a non-goal of the kit. [Design 0056](0056-frontier-program.md)
   plans one as a separate item (IMG-1), which reuses the kit's invite.
