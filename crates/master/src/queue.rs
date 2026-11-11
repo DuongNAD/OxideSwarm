@@ -315,12 +315,15 @@ pub struct RetryAttempt {
 #[derive(Debug, Clone)]
 pub struct TaskEntry {
     pub task: Task,
+    pub task_key: crate::speed::TaskKey,
     pub priority: u32,
     pub sequence: u64,
     pub state: TaskState,
     pub assigned_worker_id: Option<Uuid>,
     pub submitted_at_utc: u64,
     pub submitted_instant: Instant,
+    /// Timestamp when this task most recently became schedulable in `Queued` state (`0060` D2).
+    pub queued_instant: Instant,
     pub scheduled_instant: Option<Instant>,
     pub started_instant: Option<Instant>,
     pub retry_after_instant: Option<Instant>,
@@ -463,6 +466,10 @@ const RETAINED_ENTRY_OVERHEAD_BYTES: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskView {
     pub task_id: TaskId,
+    /// Speed-history key of the task (`0060` D1/D2).
+    pub task_key: crate::speed::TaskKey,
+    /// How long the task has waited in `Queued` state since it last became schedulable (`0060` D2).
+    pub queued_for: Duration,
     pub requirements: TaskRequirements,
     /// `requirements.gpu_required || spec.requires_gpu()`: only GPU-capable workers may run it.
     pub requires_gpu: bool,
@@ -483,10 +490,16 @@ pub struct TaskView {
 }
 
 impl TaskView {
-    /// The view of `task` with no avoided workers.
+    /// The view of `task` with no avoided workers and zero wait duration.
     pub fn of(task: &Task) -> Self {
+        Self::of_with_key(task, crate::speed::TaskKey::for_task(task))
+    }
+
+    pub(crate) fn of_with_key(task: &Task, task_key: crate::speed::TaskKey) -> Self {
         Self {
             task_id: task.id,
+            task_key,
+            queued_for: Duration::ZERO,
             requirements: task.requirements.clone(),
             requires_gpu: task.requirements.gpu_required || task.spec.requires_gpu(),
             heavy: matches!(
@@ -570,6 +583,10 @@ pub struct ResultOutcome {
     /// this worker and was adopted + completed in one step (e.g. a QUIC data-lane `TaskResult`
     /// arriving before `ResumeSession` on the control lane).
     pub adopted_from_hold: bool,
+    /// Speed-history key of the task (`0060` D1).
+    pub task_key: crate::speed::TaskKey,
+    /// Declared timeout of the task in seconds (`0060` D1).
+    pub timeout_secs: u64,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.
@@ -968,6 +985,9 @@ impl TaskQueueInner {
     fn insert_ready(&mut self, key: QueueOrderKey) {
         if self.ready_queue.insert(key) {
             self.ready_epoch = self.ready_epoch.wrapping_add(1);
+            if let Some(entry) = self.tasks.get_mut(&key.task_id) {
+                entry.queued_instant = Instant::now();
+            }
         }
     }
 
@@ -1448,6 +1468,7 @@ impl TaskQueue {
                     entry.adoptable_by = None;
                     entry.fail_if_not_adopted = false;
                     entry.pending_failover_charge = false;
+                    entry.queued_instant = Instant::now();
                     let attempt = RetryAttempt {
                         attempt: entry.retry_count,
                         timestamp_utc: now_epoch,
@@ -1545,6 +1566,7 @@ impl TaskQueue {
             entry.adoptable_by = None;
             entry.pending_failover_charge = false;
             entry.pending_failover_reason = None;
+            entry.queued_instant = Instant::now();
             inner.track_adoption_hold(task_id, false);
             if let Some(wid) = last_worker_id {
                 inner.refresh_worker_resume_protection(wid);
@@ -1839,14 +1861,17 @@ impl TaskQueue {
                 };
 
                 let has_hold = adoptable_by.is_some() || fail_if_not_adopted;
+                let task_key = crate::speed::TaskKey::for_task(&p.task);
                 let entry = TaskEntry {
                     task: p.task,
+                    task_key,
                     priority: p.priority,
                     sequence: p.sequence,
                     state,
                     assigned_worker_id,
                     submitted_at_utc: p.submitted_at_utc,
                     submitted_instant: now,
+                    queued_instant: now,
                     scheduled_instant: None,
                     started_instant: None,
                     retry_after_instant: None,
@@ -2449,16 +2474,19 @@ impl TaskQueue {
 
             let task = task_slot.take().expect("task_slot checked above");
             let task_id = task.id;
+            let task_key = crate::speed::TaskKey::for_task(&task);
             inner.next_sequence += 1;
 
             let entry = TaskEntry {
                 task,
+                task_key,
                 priority: 0,
                 sequence,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
                 submitted_instant: now_instant,
+                queued_instant: now_instant,
                 scheduled_instant: None,
                 started_instant: None,
                 retry_after_instant: None,
@@ -2588,16 +2616,19 @@ impl TaskQueue {
             };
 
             let task_id = task.id;
+            let task_key = crate::speed::TaskKey::for_task(&task);
             inner.next_sequence += 1;
 
             let entry = TaskEntry {
                 task,
+                task_key,
                 priority,
                 sequence,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
                 submitted_instant: now_instant,
+                queued_instant: now_instant,
                 scheduled_instant: None,
                 started_instant: None,
                 retry_after_instant: None,
@@ -2719,8 +2750,9 @@ impl TaskQueue {
             else {
                 continue;
             };
-            let mut view = TaskView::of(&entry.task);
+            let mut view = TaskView::of_with_key(&entry.task, entry.task_key);
             view.avoid = entry.avoid_workers.clone();
+            view.queued_for = now.saturating_duration_since(entry.queued_instant);
             views.push(view);
             if views.len() >= limit {
                 last_key = Some(*key);
@@ -2825,6 +2857,56 @@ impl TaskQueue {
             }
         }
         loads
+    }
+
+    /// For each worker with active (`Scheduled` or `Running`) or held tasks, returns
+    /// `(task_key, elapsed)` pairs used by [`crate::scheduler::WorkloadScheduler`] to estimate
+    /// when a slot on `best` next opens (`0060` D2 step 3).
+    pub async fn active_running_tasks(
+        &self,
+    ) -> HashMap<Uuid, Vec<(crate::speed::TaskKey, Duration)>> {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut running = HashMap::with_capacity(inner.worker_assignments.len());
+        for (worker_id, task_ids) in &inner.worker_assignments {
+            let mut items = Vec::new();
+            for task_id in task_ids {
+                let Some(entry) = inner.tasks.get(task_id) else {
+                    continue;
+                };
+                if !entry.state.is_active() {
+                    continue;
+                }
+                let elapsed = entry
+                    .started_instant
+                    .or(entry.scheduled_instant)
+                    .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+                items.push((entry.task_key, elapsed));
+            }
+            if !items.is_empty() {
+                running.insert(*worker_id, items);
+            }
+        }
+        for task_id in &inner.held_tasks {
+            let Some(entry) = inner.tasks.get(task_id) else {
+                continue;
+            };
+            if entry.state == TaskState::Queued {
+                if let Some((worker_id, until)) = entry.adoptable_by {
+                    if now < until {
+                        let elapsed = entry
+                            .started_instant
+                            .or(entry.scheduled_instant)
+                            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+                        running
+                            .entry(worker_id)
+                            .or_default()
+                            .push((entry.task_key, elapsed));
+                    }
+                }
+            }
+        }
+        running
     }
 
     /// For each of `task_ids` that has rejected-by workers, the workers the scheduler should avoid.
@@ -3701,7 +3783,7 @@ impl TaskQueue {
 
         let now_instant = Instant::now();
         let now_epoch = Utc::now().timestamp() as u64;
-        let (state, owner, adoptable_by_sender, priority, sequence) = {
+        let (state, owner, adoptable_by_sender, priority, sequence, task_key, timeout_secs) = {
             let entry = inner
                 .tasks
                 .get(&task_id)
@@ -3718,6 +3800,8 @@ impl TaskQueue {
                 adoptable,
                 entry.priority,
                 entry.sequence,
+                entry.task_key,
+                entry.task.requirements.timeout_secs,
             )
         };
 
@@ -3735,6 +3819,8 @@ impl TaskQueue {
                     state,
                     rejected: false,
                     adopted_from_hold: false,
+                    task_key,
+                    timeout_secs,
                 },
                 None,
             ));
@@ -3779,6 +3865,8 @@ impl TaskQueue {
                     state,
                     rejected: false,
                     adopted_from_hold: false,
+                    task_key,
+                    timeout_secs,
                 },
                 None,
             ));
@@ -3974,6 +4062,8 @@ impl TaskQueue {
                 state: res_state,
                 rejected,
                 adopted_from_hold: adoptable_by_sender,
+                task_key,
+                timeout_secs,
             },
             ack,
         ))
@@ -7008,16 +7098,20 @@ mod tests {
                 let mut inner = queue.inner.write().await;
                 let seq = inner.next_sequence;
                 inner.next_sequence += 1;
+                let submitted_key = crate::speed::TaskKey::for_task(&submitted_task);
+                let now_sub = Instant::now();
                 inner.tasks.insert(
                     submitted_id,
                     TaskEntry {
                         task: submitted_task,
+                        task_key: submitted_key,
                         priority: 0,
                         sequence: seq,
                         state: TaskState::Submitted,
                         assigned_worker_id: None,
                         submitted_at_utc: 100,
-                        submitted_instant: Instant::now(),
+                        submitted_instant: now_sub,
+                        queued_instant: now_sub,
                         scheduled_instant: None,
                         started_instant: None,
                         retry_after_instant: None,

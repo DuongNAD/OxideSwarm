@@ -999,15 +999,8 @@ impl MasterServer {
             server.broadcast_tx = Some(b_tx.clone());
         }
 
-        // 1. Spawn TCP server accept loop
-        let srv_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = server.run(srv_shutdown_rx).await {
-                error!(error = %e, "Master server accept loop terminated with error");
-            }
-        });
-
-        // 2. Spawn Background Scheduler loop
+        // Build scheduler before starting accept loop so its SpeedBook is attached to `registry`
+        // before any worker connection is handled.
         let sched = Arc::new(
             WorkloadScheduler::new(
                 sched_config,
@@ -1017,6 +1010,16 @@ impl MasterServer {
             )
             .with_waiters(Arc::clone(&waiters)),
         );
+
+        // 1. Spawn TCP server accept loop
+        let srv_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.run(srv_shutdown_rx).await {
+                error!(error = %e, "Master server accept loop terminated with error");
+            }
+        });
+
+        // 2. Spawn Background Scheduler loop
         let mut sched_shutdown_rx = shutdown_rx.clone();
         #[cfg(feature = "dashboard")]
         let sched_broadcast_tx = broadcast_tx.clone();
@@ -2522,6 +2525,14 @@ async fn apply_task_result_inner(
     //    input pins. When terminal, input pins are released and output pins stay held for
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
+        if let Some(sb) = registry.speed_book() {
+            sb.lock().unwrap_or_else(|e| e.into_inner()).record_result(
+                worker_id,
+                outcome.task_key,
+                outcome.timeout_secs,
+                &result,
+            );
+        }
         if let Some(store) = blob_store {
             store.unpin_task(&task_id).await;
         }

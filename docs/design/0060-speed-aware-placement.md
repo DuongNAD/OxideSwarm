@@ -1,7 +1,7 @@
 # 0060: Place tasks by measured worker speed and re-run stragglers (`SCHED-4`)
 
-Status: Planned
-Created: 2026-11-10    Updated: 2026-11-10
+Status: Partial
+Created: 2026-11-10    Updated: 2026-11-11
 
 ## Summary
 
@@ -149,11 +149,12 @@ worker table.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| SCHED-4a | Speed history | `crates/master/src/speed.rs`, `server.rs` | Unit tests of D1 | Planned |
-| SCHED-4b | Speed-aware placement | `crates/master/src/scheduler.rs` | Unit and integration tests of D2 | Planned |
+| SCHED-4a | Speed history | `crates/master/src/speed.rs`, `server.rs` | Unit tests of D1 | Implemented |
+| SCHED-4b | Speed-aware placement | `crates/master/src/scheduler.rs` | Unit and integration tests of D2 | Implemented |
 | SCHED-4c | Straggler re-run | `crates/master/src/reaper.rs`, `queue.rs`, `crates/core/src/placement.rs`, `crates/cli/src/cli_app.rs` | Integration tests of D3 | Planned |
 | SCHED-4d | Speed in `workers` and the dashboard | `registry.rs`, `web_ui.rs`, `dashboard.html` | `workers --json` shows `speed:` | Planned |
 
 ## Status log
 
 - 2026-11-10: Created from the two-machine trial measurements in Context. Planned.
+- 2026-11-11: Implemented `SCHED-4a` (`SpeedBook` in `crates/master/src/speed.rs`, updated on terminal results in `crates/master/src/server.rs` and cleared on worker removal/pruning in `crates/master/src/registry.rs`) and `SCHED-4b` (D2 speed-aware placement and `ScheduleSkipReason::WaitingForFasterWorker` in `crates/master/src/scheduler.rs`, verified by `tests/sched4_speed_aware.rs`). `SCHED-4c` and `SCHED-4d` remain Planned.
