@@ -59,7 +59,7 @@ The state at `master` `3ce2a65` on 2026-11-09, after the live two-machine run.
 | Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP | `crates/core/src/cluster_auth.rs`, `crates/core/src/transport.rs` |
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
 | Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
-| Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel` and `doctor`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
+| Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
 | Durability | `master --state-dir` keeps queued, running and finished tasks in a journal and replays it at start. A worker keeps its tasks across a short disconnect, and the master adopts them again (`ResumeSession`) | `crates/master/src/store.rs`, `crates/master/src/session.rs`, `tests/master_restart_recovery.rs` |
 | Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
 | Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
@@ -595,3 +595,6 @@ answers.
 - 2026-11-11: [Design 0059](design/0059-first-users.md) names LIVA, the owner's desktop assistant,
   as a first application for the audience with a GPU desktop and a laptop. It needs LLM-1 and
   LLM-6 here and an endpoint setting in LIVA; neither is built, and no order changed.
+- 2026-11-11: The table of what exists now lists the MCP tool `workspaces`, which
+  `crates/cli/src/mcp.rs` has had since FEAT-4. Designs 0033, 0038, 0054 and 0056 gained notes
+  from an outside reading of the plans on the same day; no item, order or decision changed.

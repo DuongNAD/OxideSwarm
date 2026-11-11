@@ -39,6 +39,12 @@ this code base.
   (pipeline parallelism) lets a model larger than one machine's memory run. The stages still run one
   after another for each token, and every stage boundary adds a network round trip. One request is
   not faster than on one machine with the same bandwidth.
+- **The prompt crosses every boundary before the first token.** While the prompt is read, the
+  hidden state of each prompt token passes each stage boundary once. The size is prompt tokens
+  times hidden size times bytes per value. For 4096 tokens, a hidden size of 8192 and 16-bit
+  values that is 64 MiB per boundary, about half a second on a 1 Gbit/s link before any compute,
+  and twice that with 32-bit values. This is arithmetic, not a measurement. A record of a split
+  run (LLM-5) states the time to the first token beside tokens per second.
 - **Mixture-of-experts sparsity does not remove the network.** A sparse model reads fewer weights
   per token, which helps on every machine. Placing the experts of every layer on different machines
   (expert parallelism) needs a round trip per layer per token. That works over data-centre
@@ -198,3 +204,5 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
   experts of one model on different machines needs a round trip per layer per token. The case that
   fits the question is D1, whole models on separate machines and one request per answer.
   [Design 0059](0059-first-users.md) names LIVA as a first application for it. Nothing is built.
+- 2026-11-11: Context gained the cost of the prompt at a stage boundary (arithmetic, not
+  measured), from an outside reading of the plans. No item changed.

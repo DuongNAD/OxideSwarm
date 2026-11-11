@@ -91,6 +91,16 @@ the host. They are optional and come later, for users who need confidentiality.
 
 - **Redundancy.** Run a task on k independent contributors and accept the result when they agree.
   Deterministic WebAssembly gives byte-identical outputs, so comparing hashes is enough.
+  - Hash agreement does not cover floating-point results from GPUs of different vendors or
+    drivers: a GPU may fuse multiply-adds or reorder a sum, so correct results differ in their
+    last bits. The worker's own check of a matrix product is tolerance based for this reason
+    (`verify_gemm` in `crates/worker/src/cpu_simd.rs`). Such a task class needs a comparison
+    that the task type declares (a domain check, below) or replicas on the same architecture
+    and adapter. NET-3 does not design a tolerance rule yet.
+  - A contributor that sees another replica's result before it reports can copy it. Results go
+    only to the cluster that asked. A public record of a redundant task is published after
+    every replica has reported, or each replica first sends a commitment: a hash of its result
+    with a random value that it reveals later. NET-3 chooses between the two.
 - **Spot checks.** Send tasks whose answers are known, unannounced. A wrong answer costs
   reputation.
 - **Reputation.** A per-key history of agreement and spot-check results lowers k for reliable
@@ -112,6 +122,9 @@ the host. They are optional and come later, for users who need confidentiality.
 - **Credits.** A contributor earns credits for verified work and spends them to run work, and a
   cluster can grant credits to its own users. Both sides sign each record of work, so the
   accounting can be checked.
+  - A credit is entered for a contributor only together with an equal debit of the account that
+    asked for the work, or of a grant that a cluster made. Keys that sign work for each other
+    then move credits between themselves and create none. NET-2 carries this rule.
 - **Payments later.** Money or tokens would bring payments, fraud and law in with them. Q14
   decides; the default is credits only.
 
@@ -197,3 +210,7 @@ Fuzzing covers every parser of network input.
 - 2026-11-10: The owner asked whether OxideSwarm should replace installed operating systems. The
   first non-goal of this record stands until Q30 is decided. Design 0056 adds a worker image that
   starts a whole machine without touching its installed system (IMG-1 to IMG-4).
+- 2026-11-11: D4 and D6 gained three notes from an outside reading of the plans: hash agreement
+  does not cover GPU results from different vendors, a replica must not be able to copy another
+  replica's result, and a credit needs an equal debit. They are notes for NET-2 and NET-3.
+  The same reading proposed staking and a protocol fee; Q14 stands, and neither is adopted.

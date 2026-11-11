@@ -354,6 +354,10 @@ are already BLAKE3 blobs, and ENROLL-1 gives each machine a key.
   - On a mismatch the result is a failure that names both digests and the first differing file,
     and it keeps both outputs.
   - Inside one cluster this already finds flaky tests and outputs that depend on the machine.
+  - Digest agreement fits tasks with deterministic outputs. Floating-point output from GPUs of
+    different vendors or drivers can differ in its last bits and still be correct (design 0054
+    D4). PROOF-2 builds no tolerance rule: such a task reports a mismatch, and its replicas
+    belong on the same architecture and adapter.
   - This is the redundancy part of NET-3, built early. Spot checks and reputation stay in NET-3.
 - **PROOF-3 A twice-built release.** Dogfood.
   - The release build becomes reproducible: remapped path prefixes, a fixed source date, locked
@@ -690,3 +694,5 @@ second one, the classroom. Accepting Q25 accepts the second story.
   IMG-4, D7 lighthouse L6, D9 spike R10 and D10 measure M8. Q30 is open.
 - 2026-11-10: [Design 0059](0059-first-users.md) proposes that its items ADOPT-2 and ADOPT-3 join
   wave 1 and that ADOPT-4 follows AX-1 (Q36). D8 is unchanged until the owner decides.
+- 2026-11-11: PROOF-2 gained a note on the limit of digest agreement for GPU results, from an
+  outside reading of the plans. No item changed.
