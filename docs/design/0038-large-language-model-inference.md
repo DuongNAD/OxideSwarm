@@ -193,3 +193,8 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
   slow on ordinary networks: about 1.5 tokens per second for a 70B model over Wi-Fi in the
   prima.cpp paper. Design 0056 adds LLM-6 to LLM-8 on the request path of D1. LLM-2 to LLM-5 keep
   their order. Nothing is built.
+- 2026-11-11: The owner asked whether a mixture-of-experts model can run over several machines
+  with the answer arriving on a weaker one. The physical limits in Context stand: placing the
+  experts of one model on different machines needs a round trip per layer per token. The case that
+  fits the question is D1, whole models on separate machines and one request per answer.
+  [Design 0059](0059-first-users.md) names LIVA as a first application for it. Nothing is built.

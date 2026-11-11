@@ -589,3 +589,9 @@ answers.
   of the study of first use (ADOPT-1 of [design 0059](design/0059-first-users.md)) with three to
   five people, before AX-1 starts. No session has run yet. Q36, Q38 and Q39 stay open, and no
   item entered the backlog.
+- 2026-11-11: [Design 0059](design/0059-first-users.md) gained a screening question before the
+  first round of ADOPT-1, from the owner's observation that fellow students have no job that
+  waits for a machine. The order of work stays as it is until the answers are in.
+- 2026-11-11: [Design 0059](design/0059-first-users.md) names LIVA, the owner's desktop assistant,
+  as a first application for the audience with a GPU desktop and a laptop. It needs LLM-1 and
+  LLM-6 here and an endpoint setting in LIVA; neither is built, and no order changed.

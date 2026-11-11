@@ -105,6 +105,24 @@ The first audience is A1, and A2 is the same person on another day. Reasons:
 A3 is the second audience. It waits for LLM-1 and LLM-6, and nothing in the product serves it
 today beyond transport.
 
+**A first application for A3 (added 2026-11-11).** The owner's second project,
+[LIVA](https://github.com/DuongNAD/LIVA), is a desktop assistant for Windows with voice, memory and
+desktop automation. It runs its chat model in its own process. Checked at its `main` `3057d35c` on
+2026-11-11:
+
+- Its `README.md` asks for 16 GB of RAM and recommends a GPU with 6 GB of memory.
+- Its recorded time to first token on a CPU is 4874 ms at the median of ten runs, from 2310 ms to
+  13476 ms (`ttft_bench`, recorded in its
+  `docs/99-luu-tru/bao-cao-lich-su/05-nang-cap-toan-dien.md`).
+- It has no setting that points the chat model at another machine. Its `llama-server` helper
+  listens on `127.0.0.1` only.
+
+A person with a weak laptop and a stronger desktop is A3, and LIVA is a program such a person
+would want to run that way. Two parts are missing, and neither is built: on LIVA's side a setting
+for an OpenAI-compatible endpoint (item KH-1 of the draft roadmap written for LIVA on 2026-11-11),
+and on this side LLM-1 and LLM-6. LIVA does not depend on the grid: such a setting works with any
+OpenAI-compatible server. The order of D3 stays as it is until the owner decides Q36.
+
 ### D2 What counts as adoption work
 
 An item belongs to this record when it does one of these:
@@ -148,6 +166,35 @@ The study finds obstacles. It does not measure a market.
 **Who.** Three to five people who write code and have two machines. People the owner knows are
 acceptable in the first round. The second round includes at least two people the owner has not
 helped before.
+In the first round they are people who named a job in the screening below.
+
+**Screening, before the first round.** Added on 2026-11-11 from an observation of the owner: the
+students around the owner use their machines for games and for course work in NetBeans and SSMS.
+Their own machine is enough for that, so the grid gives them nothing. A person with no job that
+waits cannot do step 4 below. The owner therefore first asks 10 to 20 people one question, with
+no install: "In the last week, did you wait more than five minutes for your computer to finish
+something? What was it?"
+
+- A person who answers "no" is not invited to the first round.
+- The owner records the answers under "Study records" as counts per kind of job. No name is kept.
+- The first round invites three to five of the people who named a job.
+
+**Jobs to listen for.** The rows are guesses, not findings. Nothing is built for them, and no
+row is an item. They say what the grid could offer when people name such a job.
+
+| Job a student may name | Closest audience | What the grid gives today | What is missing |
+|---|---|---|---|
+| A language model shared by a class or a dormitory, served from the gaming machines | A4, A3 | Transport only | LLM-1, LLM-6 and EDU-1. A local model server on one machine can serve a room without the grid, so the grid adds something only with several machines (reasoning) |
+| Course work that needs a GPU, run on a friend's gaming machine | A3 | A command task placed on a named worker (`submit --worker`, `--require-tag`), with files in and out. Not run: no record exists. The worker must already hold the interpreter and its libraries | A guide with a recorded run (ADOPT-4). A way to carry the environment |
+| A heavy build for mobile development, run on a stronger machine | A2 | A workspace that keeps the build directory, as in the [`cargo test` guide](../guides/offload-cargo-test.md). Not run: no record exists. A worker probes only `cargo`, `rustc` and `git` | A guide with a recorded run (ADOPT-4). A probe for the build tool |
+
+**How the screening changes the plan.**
+
+| Answers | Consequence |
+|---|---|
+| Most named jobs are slow builds or tests | The first round goes ahead with A1 and A2 as planned |
+| Most named jobs need a GPU or a language model | The first audience is reviewed with the owner before AX-1 starts. A3 and A4 wait for LLM-1, which is not built |
+| Fewer than three of the people asked name any job | The first round recruits outside the owner's circle, as the second round already requires |
 
 **What each person does.**
 
@@ -360,6 +407,7 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q36 to Q39.
 | The install script becomes a way to replace the binaries | A pinned release, the checksum, the attestation of LV-5, and launcher tests for the refusals |
 | The run summary is quoted as a speed-up | The labels of D5. The CLI prints no ratio. The comparison is M1, with its script |
 | Guides decay | Each names the release of its last run, and a failing guide is fixed or removed |
+| The people the owner can reach have no job that waits for a machine | The screening question of D4. The first round invites only people who named a job |
 | This record competes with design 0056 for the agents' time | It adds three small items to wave 1 and reorders nothing else without the study |
 
 ## Study records
@@ -375,3 +423,12 @@ None yet.
   of ADOPT-1 with three to five people, before AX-1 starts. No session has run yet, so "Study
   records" is still empty and ADOPT-1 stays Planned. Q36, Q38 and Q39 are open, and no item
   entered the backlog.
+- 2026-11-11: The owner observed that fellow students use their machines for games and for
+  course work in NetBeans and SSMS, and gain nothing from the grid. At the owner's word D4
+  gained a screening question before the first round, three jobs to listen for (guesses) and a
+  table of what the answers change. Risks gained one row. Nothing is built, and no item
+  entered the backlog.
+- 2026-11-11: The owner asked whether LIVA, the owner's desktop assistant, can give people a
+  reason to use the grid, and said that LIVA needs a light and capable open model that the owner
+  cannot supply soon. D1 now names LIVA as a first application for A3, with the facts checked in
+  its repository and the two missing parts. Nothing is built, and D3 did not move.
