@@ -50,6 +50,7 @@ before adding or changing a document.
 | [design/0053-usb-setup-kit.md](design/0053-usb-setup-kit.md) | Accepted, not built: `usb create`, an encrypted invite for N machines and per-user installers for macOS, Windows and Linux (`USB-1`) | Contributors |
 | [design/0054-open-compute-network.md](design/0054-open-compute-network.md) | Draft, long-term vision: an open compute network (WebAssembly and VM sandboxes, result verification, federation, credits, governance), stages H0 to H4 (`NET-1` to `NET-8`) | Contributors |
 | [design/0055-usb-kit-windows-isolation.md](design/0055-usb-kit-windows-isolation.md) | Implemented: opt-in Windows task isolation (`-Isolation off\|fs`) in the USB setup kit, `OXIDESWARM_HOME/windows_acl_grants.txt` manifest precedence, `uninstall.ps1` ACL revocation, and native `System32` resolution over `Git\usr\bin` inside Windows AppContainers (`USB-2`, `BUG-18`) | Contributors |
+| [design/0060-speed-aware-placement.md](design/0060-speed-aware-placement.md) | Planned: per-worker speed history, placement that waits for a clearly faster worker, opt-in re-run of stragglers (`--repeatable`), and a `speed:` worker tag (`SCHED-4`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
