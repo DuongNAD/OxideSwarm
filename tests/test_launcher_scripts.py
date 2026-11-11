@@ -1042,7 +1042,8 @@ class UsbKitTests(unittest.TestCase):
         for needle in ("SetAccessRuleProtection($true, $false)", "$sec.SetOwner($UserSid)",
                        "[IO.Directory]::CreateDirectory($InstallRoot, $sec)", "function Test-RootSafety",
                        "belongs to another account", "can rename or change", "$RenameRights",
-                       "could not make $InstallRoot private"):
+                       "could not make $InstallRoot private",
+                       "files appeared in $InstallRoot before it could be made private"):
             self.assertIn(needle, text)
         # Run for an update as well: directly in the `if (-not $PrivateRoot)` block, not nested deeper.
         check = text.index("\n    $why = Test-RootSafety $InstallRoot\n")
@@ -1773,6 +1774,9 @@ public class Program {
         self.assertIn("NT SERVICE", ps1)
         self.assertRegex(ps1, r"obj=\s*\$serviceStartName")
         self.assertIn("AcceptSystemRisk", ps1)
+        self.assertIn("Set-PrivateDirAcl -Path $DataDir", ps1)
+        self.assertIn("/inheritance:r", ps1)
+        self.assertNotIn("Grant-ServiceModify -Path $DataDir", ps1)
         # the P2P ticket must not travel on the service command line or in the registry any more
         wrapper = read(os.path.join(ROOT, "packaging", "windows", "ServiceWrapper.cs"))
         self.assertNotIn("--p2p-ticket", wrapper)

@@ -304,18 +304,37 @@ Write-Host "  archive: $($Archive.Name) (checksum OK)"
 # 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
 if (-not $PrivateRoot) {
     $sec = Get-PrivateSecurity
+    $recheckExisting = $false
+    $hadOurs = $false
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         # Created with its DACL in one call, so it never exists open to others.
         $sec.SetOwner($UserSid)
         [void][IO.Directory]::CreateDirectory($InstallRoot, $sec)
     } elseif (-not (Test-PrivateAcl (Get-Acl -LiteralPath $InstallRoot))) {
+        $recheckExisting = $true
+        $hadOurs = (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
         (Get-Item -LiteralPath $InstallRoot -Force).SetAccessControl($sec)
     }
     # CreateDirectory returns an existing folder as it is (one made in between by someone else), so
     # check what is there now.
+    if ((Get-Item -LiteralPath $InstallRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Fail "$InstallRoot is a link; remove it and run the installer again"
+    }
     $acl = Get-Acl -LiteralPath $InstallRoot
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value -or -not (Test-PrivateAcl $acl)) {
         Fail "could not make $InstallRoot private to this user; remove it and run the installer again"
+    }
+    if ($recheckExisting) {
+        # Close the Test-RootSafety -> SetAccessControl window on an existing folder that was open to others.
+        $afterChildren = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction Stop)
+        if (-not $hadOurs -and $afterChildren.Count -gt 0) {
+            Fail "files appeared in $InstallRoot before it could be made private; remove it or choose another folder"
+        }
+        foreach ($c in $afterChildren) {
+            if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$($c.FullName) is a link" }
+            $who = Get-ForeignGrant $c.FullName -1 $false
+            if ($who) { Fail "another account ($who) has rights on $($c.FullName); remove $InstallRoot or choose another folder" }
+        }
     }
     New-Item -ItemType Directory -Force -Path (Join-Path $InstallRoot 'work') | Out-Null
     Write-Host "  access:  this user, SYSTEM and Administrators only"
