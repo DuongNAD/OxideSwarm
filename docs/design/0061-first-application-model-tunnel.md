@@ -1,7 +1,7 @@
 # 0061: A first application for the model track: trial, client tunnel and usage records
 
 Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 to Q43 are open)
-Created: 2026-11-11    Updated: 2026-11-11
+Created: 2026-11-11    Updated: 2026-11-12
 
 ## Summary
 
@@ -171,6 +171,10 @@ request sent with `curl` checks the path, and the timing waits for Part B.
 Records go into "Trial records" below. No number from the trial is quoted anywhere without its
 record.
 
+**A spike on the same two machines.** Spike R14 of
+[design 0056](0056-frontier-program.md) (D9) times what comes before the first reply: moving
+the model file, loading it, and the first token. It can run in the same sitting as the trial.
+
 ### D4 Named model services and a client tunnel (LLM-9)
 
 **On the worker.**
@@ -337,3 +341,11 @@ None yet.
 - 2026-11-11: Written at the owner's request, from three statements of the same day (see
   Context). The owner set the trial first (Q40). Nothing is built, no item is in the backlog,
   and the texts of LLM-4 and LLM-6 are unchanged.
+- 2026-11-11: The owner asked to study how to get a model onto a machine and ready quickly. D3
+  now points to spike R14 of [design 0056](0056-frontier-program.md), which times the fetch,
+  the load and the first token on the trial's two machines. Training a model stays out of
+  scope (design 0038, Non-goals).
+- 2026-11-12: [Design 0062](0062-model-weights-into-remote-memory.md) builds on LLM-9. Its
+  model server (LLM-12) is a named service, and its client command (LLM-13) sends model
+  weights through a tunnel. The text of LLM-9 is unchanged. The spike that D3 names is R14;
+  it was numbered R11 on 2026-11-11.

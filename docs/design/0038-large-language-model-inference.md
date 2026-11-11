@@ -1,7 +1,7 @@
 # 0038: Large language model inference on the grid
 
 Status: Planned
-Created: 2026-11-07    Updated: 2026-11-11
+Created: 2026-11-07    Updated: 2026-11-12
 
 ## Summary
 
@@ -209,3 +209,9 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
 - 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes a client tunnel
   to a loopback model server (LLM-9) that uses the connection types of D4, and that LLM-4
   reuses it. Q41 decides, after a trial. D4 is unchanged.
+- 2026-11-12: [Design 0062](0062-model-weights-into-remote-memory.md) records a reading of
+  llama.cpp's RPC backend of 2026-11-11. It proposes that the head of a split model runs on a
+  worker and not on the machine that asks (its D5). It also records an upstream report that
+  the RPC server ends when a connection reaches it through a relay, which the tunnel of D4
+  is: its spike R16 tests that before LLM-4 is sized. The texts of LLM-4 and LLM-5 are
+  unchanged.

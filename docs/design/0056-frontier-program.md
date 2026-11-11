@@ -1,7 +1,7 @@
 # 0056: Frontier program (bets after the core)
 
 Status: Draft (research and plan; builds nothing; decisions Q19 to Q26 and Q30 are open)
-Created: 2026-11-10    Updated: 2026-11-11
+Created: 2026-11-10    Updated: 2026-11-12
 
 ## Summary
 
@@ -538,7 +538,9 @@ its lighthouse record, not on a day.
 ### D9 Spikes
 
 A spike is throwaway code on a branch, or a script under `benchmarks/`. It builds nothing in the
-product and ends with a dated record. Each is sized S.
+product and ends with a dated record. Each is sized S. The numbers R11 to R13 belong to
+[design 0058](0058-lasting-value.md), and R15 to R18 to
+[design 0062](0062-model-weights-into-remote-memory.md).
 
 | ID | Question | Method | Stop rule |
 |---|---|---|---|
@@ -552,6 +554,7 @@ product and ends with a dated record. Each is sized S.
 | R8 | Does a device lease work under isolation, and what does a graphical session need? | Run an instrumented Android test through `adb` from an isolated task on each desktop system. List what screen capture needs per system | A system where `adb` cannot run under `--isolation fs` documents `off` for device tasks |
 | R9 | Which features of hosted sandboxes do coding agents depend on? | Read the public interfaces of four sandbox products and of the vendors' self-hosted runners. List the calls an agent makes. This is the open question of the 2026-11-08 research | None. It sets the scope of AX-6 |
 | R10 | Which base system gives a worker image that starts on ordinary lab PCs with Secure Boot on? | Build the image from two distribution bases. Start it on real PCs: one with BitLocker, one Secured-core, one older than 2020 and one with an NVIDIA GPU. Record whether it starts, whether the installed system starts unchanged afterwards, whether the GPU is usable, the image size and the time to a registered worker | If most test machines need a firmware change, the image is documented for machines whose owner controls the firmware, and IMG-3 closes for locked labs |
+| R14 | Where does the time go between a machine with nothing on it and the first token of a reply? | On two machines of the owner, time three segments, each with a script. Fetch: one model file of about 4 GiB moved by a plain copy over SSH, by `submit --input` as it is today, and by `submit --input` a second time. Load: `llama-server` from its start to an answer on `/health`, after a restart of the machine and on a second start, with `--load-mode mmap` and with `--load-mode none`. First token: one prompt with a long fixed prefix, on the first and on the second request, with and without `--cache-prompt`, and after a slot restore (`--slot-save-path`). The record states the values of `--blob-store-mb` and `--blob-cache-mb` it used, because the defaults (4096 and 2048) are at or below the size of such a file | None. It names the slowest segment, and so the item to weigh first: LLM-7 for the fetch, a note in the guide of LLM-1 for the load, an item of the application's own plan for the first token |
 
 ### D10 Measures
 
@@ -644,7 +647,7 @@ Each measure has a script and a dated record before any document quotes it.
 | IMG-2 | Machine key on the stick and a verified update of the worker | E | M | IMG-1, ENROLL-1 | `packaging/image/`, `crates/cli/src/` | A stick made for one release joins a master of the next release after a verified update, and refuses a worker whose checksum does not verify | Planned |
 | IMG-3 | Network boot and a night schedule for a lab | E | M | IMG-2 | `packaging/image/`, `docs/guides/` | Lighthouse L6 is recorded | Planned |
 | IMG-4 | The image as a guest on macOS and Windows | E | L | IMG-1, NET-5 | to be designed | The image runs as a guest on both systems and registers as a Linux worker | Planned |
-| R1 to R10 | Spikes (D9) | all | S each | | `benchmarks/`, scratch branches | The dated record and the go or stop are in this record's status log | Planned |
+| R1 to R10, R14 | Spikes (D9) | all | S each | | `benchmarks/`, scratch branches | The dated record and the go or stop are in this record's status log | Planned |
 
 ## Decisions for the owner
 
@@ -699,3 +702,18 @@ second one, the classroom. Accepting Q25 accepts the second story.
 - 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes that the
   streaming version of LLM-6 uses a client tunnel (LLM-9) and comes before the version that
   returns each reply whole. Q41 decides, after a trial. The text of LLM-6 is unchanged.
+- 2026-11-11: Added spike R14 to D9 at the owner's word: where the time goes between a machine
+  with nothing on it and the first token (fetch, load, first token). It is not placed in a
+  wave. It can run on the two machines of the trial APP-1 of
+  [design 0061](0061-first-application-model-tunnel.md). No record exists yet.
+- 2026-11-11: A first script for R14 is in
+  [benchmarks/model-bringup](../../benchmarks/model-bringup/README.md): session 1 times the
+  fetch, the load and one decision of a small decision model (Laya) on one machine and counts
+  its answers on 20 Vietnamese sentences. One run is recorded there (2026-11-11, one Mac).
+  The method of R14 itself, a generative model under `llama-server` on two machines, has no
+  record yet.
+- 2026-11-12: The spike that was added on 2026-11-11 as R11 is R14, because R11 to R13 are the
+  spikes of [design 0058](0058-lasting-value.md).
+  [Design 0062](0062-model-weights-into-remote-memory.md) adds spikes R15 to R18 of its own, on
+  the push of model weights into the memory of another machine and on a split model. No
+  record exists for any of them.

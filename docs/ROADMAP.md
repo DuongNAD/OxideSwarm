@@ -2,9 +2,10 @@
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
 Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29 (the charter of
-design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059) and
-Q40 (a trial comes before any build item of design 0061) on 2026-11-11.
-Created: 2026-11-07    Updated: 2026-11-11
+design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059),
+Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
+memory of another machine with no file written there first, design 0062) on 2026-11-11.
+Created: 2026-11-07    Updated: 2026-11-12
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -50,6 +51,12 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
   records and a balance per member, all proposals. The plan is in
   [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
+- Model weights into the memory of another machine (Draft, 2026-11-11): a worker that holds no
+  model file runs a model whose file is on another machine, with no copy written to its disk
+  first (Q44, decided). Four spikes come first (R15 to R18). A model server that takes its
+  tensors from a stream, and the rule that the head of a split model runs on a worker, are
+  proposals. The plan is in [design 0062](design/0062-model-weights-into-remote-memory.md).
+  Q45 to Q47 are open.
 
 ## Where the project stands
 
@@ -390,8 +397,9 @@ machine it started on (movable), and leaves evidence of what it did (checkable).
 | D | Language models served by ordinary machines: one small model per machine behind a gateway | LLM-6 to LLM-8, EDU-1, EDU-2 | A school lab becomes a private assistant for the class from a USB stick, without Internet access |
 | E | The commons: Phase H with a first workload (independent rebuilds), rules for a good guest, and a worker image that starts a whole machine from USB or the network | GREEN-1, GREEN-2, EDU-3, IMG-1 to IMG-4, with NET-2 to NET-4 | A school lab works for the grid at night and is back on its own system in the morning. The stage checks of design 0054 |
 
-Order: each bet starts with a short spike that can end it (R1 to R10). Waves follow the releases:
-agents after `0.2.0`, then evidence and portability, then models and classrooms, then the commons.
+Order: each bet starts with a short spike that can end it (R1 to R10 and R14). Waves follow the
+releases: agents after `0.2.0`, then evidence and portability, then models and classrooms, then
+the commons.
 Each wave has one protocol version bump at most and ends with a recorded lighthouse run.
 
 The research also questions step 4 of "Launch". In the published run, one model split over home
@@ -444,6 +452,12 @@ row further for one application, LIVA. A trial comes first (APP-1, decided as Q4
 with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
 server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
 for the trial records. Q41 to Q43 are open.
+
+[Design 0062](design/0062-model-weights-into-remote-memory.md) (Draft, 2026-11-11) plans how a
+worker gets a model whose file is on another machine, with no copy on its disk first (Q44,
+decided). Spikes R15 to R18 first measure llama.cpp's own push of weights. A model server that
+takes its tensors from a stream (LLM-12), a client command that sends them (LLM-13) and the rule
+that the head of a split model runs on a worker are proposals. Q45 to Q47 are open.
 
 **Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
 0059.
@@ -514,6 +528,10 @@ answers.
 | Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
 | Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Open. Recommended: display only in the first version |
+| Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
+| Q45 | For design 0062, in which order: the spikes R15 to R18, then one worker that runs the whole model (LLM-12, LLM-13), then the head rule for a split model? | Open. Recommended: that order. The split keeps its place in design 0038 |
+| Q46 | How does the model server of design 0062 that loads from a stream exist: a patch to `llama-server`, offered upstream and built from source by the worker's owner, with no binary in a release? | Open. Recommended: yes, after spike R17; no server of our own |
+| Q47 | For a split model: the rule that the master runs on the head's machine, or a direct data channel between two nodes? | Open. Recommended: the rule; a channel gets a design record of its own if spike R18 shows that the extra hop matters |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -617,3 +635,14 @@ answers.
   [Design 0061](design/0061-first-application-model-tunnel.md) records that and sets a trial
   first (Q40, decided): LIVA on a Mac with the model on another machine. LLM-9 to LLM-11 are
   proposals, Q41 to Q43 are open, Q14 stays open, and no item entered the backlog.
+- 2026-11-11: Spike R14 joined [design 0056](design/0056-frontier-program.md) at the owner's
+  word: time the fetch of a model file, its load and the first token on two machines, to find
+  the slowest segment before anything is built for it. It can run with the trial of
+  [design 0061](design/0061-first-application-model-tunnel.md). No record exists yet.
+- 2026-11-12: Draft added at the owner's request of 2026-11-11:
+  [design 0062](design/0062-model-weights-into-remote-memory.md), on a worker that runs a model
+  whose file is on another machine, with no copy written to its disk first (Q44, decided), and
+  on the head of a split model. It has spikes R15 to R18, items LLM-12 and LLM-13 and open
+  decisions Q45 to Q47. Nothing is measured or built, and no item entered the backlog. The
+  spike of design 0056 that was numbered R11 on 2026-11-11 is R14, because R11 to R13 are the
+  spikes of design 0058.
