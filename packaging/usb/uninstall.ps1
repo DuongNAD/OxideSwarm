@@ -17,8 +17,21 @@ try { $pointer = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAct
 if (-not $InstallRoot) { $InstallRoot = if ($pointer) { $pointer } else { Join-Path $env:LOCALAPPDATA "OxideSwarm" } }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $Exe = Join-Path $InstallRoot 'bin\oxideswarm.exe'
-if (-not (Test-Path $InstallRoot)) { Write-Host "Nothing to remove: $InstallRoot does not exist."; exit 0 }
-if (-not (Test-Path $Exe)) { Write-Host "ERROR: $InstallRoot does not look like a USB-kit install; not touching it." -ForegroundColor Red; exit 1 }
+if (-not (Test-Path -LiteralPath $InstallRoot)) { Write-Host "Nothing to remove: $InstallRoot does not exist."; exit 0 }
+if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "ERROR: $InstallRoot does not look like a USB-kit install; not touching it." -ForegroundColor Red; exit 1 }
+# Only a folder this kit made is deleted: it carries the installer's marker (installs from before the
+# marker existed only in the default folder), it is not a link, and nothing inside is one, because
+# Windows PowerShell 5.1 follows junctions while it deletes.
+$rootItem = Get-Item -LiteralPath $InstallRoot -Force
+if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-Host "ERROR: $InstallRoot is a link; not touching it." -ForegroundColor Red; exit 1 }
+$isDefault = [string]::Equals($InstallRoot, [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm')).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+if (-not $isDefault -and -not (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install'))) {
+    Write-Host "ERROR: $InstallRoot has no .oxideswarm-usb-install marker; not touching it." -ForegroundColor Red; exit 1
+}
+$links = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | Select-Object -First 3)
+if ($links.Count -gt 0) {
+    Write-Host "ERROR: $InstallRoot contains links ($(($links | ForEach-Object { $_.FullName }) -join ', ')); remove them first, then run the uninstaller again." -ForegroundColor Red; exit 1
+}
 if (-not $Yes) {
     $ans = Read-Host "Remove the OxideSwarm worker installed in $InstallRoot? [y/N]"
     if ($ans -notmatch '^(y|yes)$') { Write-Host "Nothing removed."; exit 0 }

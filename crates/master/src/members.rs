@@ -547,7 +547,6 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
             path.display()
         ))
     })?;
-    let user_name = std::env::var("USERNAME").unwrap_or_else(|_| "%USERNAME%".to_string());
     let (aces, _) = read_dacl(path).map_err(|e| {
         GridError::Config(format!(
             "failed to read DACL of members file {}: {e}",
@@ -555,7 +554,7 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
         ))
     })?;
     let offenders = open_grants(&aces, &user_sid);
-    if let Some(msg) = open_acl_warning(path, "members file", &offenders, &user_name) {
+    if let Some(msg) = open_acl_warning(path, "members file", &offenders, &user_sid) {
         tracing::warn!("{msg}");
         return Err(GridError::Config(msg));
     }
@@ -563,7 +562,7 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
         if let Ok((dir_aces, _)) = read_dacl(parent) {
             let dir_offenders = open_grants(&dir_aces, &user_sid);
             if let Some(msg) =
-                open_acl_warning(parent, "members directory", &dir_offenders, &user_name)
+                open_acl_warning(parent, "members directory", &dir_offenders, &user_sid)
             {
                 tracing::warn!("{msg}");
                 return Err(GridError::Config(msg));

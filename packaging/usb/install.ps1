@@ -14,7 +14,10 @@
 # not join again, and only replaces the binaries and restarts the worker.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Isolation off|fs]
-#                                                 [-Gpu | -NoGpu] [-Update]
+#                                                 [-Gpu | -NoGpu] [-Slots N] [-Update]
+#
+# -Slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
+# processors of the performance cores, at most half of all processors (USB-4).
 [CmdletBinding()]
 param(
     [string]$Name = "",
@@ -24,13 +27,19 @@ param(
     [switch]$Gpu,
     [switch]$NoGpu,
     [switch]$Update,
+    [int]$Slots = 0,
     [ValidateSet('off', 'fs')]
     [string]$Isolation = ""
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
-$DefaultRoot = Join-Path $env:LOCALAPPDATA 'OxideSwarm'
+if ($PSBoundParameters.ContainsKey('Slots') -and ($Slots -lt 1 -or $Slots -gt 256)) { Fail "-Slots needs a number from 1 to 256 (got: $Slots)" }
+$slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
+# Full form of %LOCALAPPDATA%: GetFullPath on Windows PowerShell 5.1 expands 8.3 short names (a CI
+# runner's C:\Users\RUNNER~1), so both sides of every comparison below go through it.
+$LocalAppDataFull = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
+$DefaultRoot = Join-Path $LocalAppDataFull 'OxideSwarm'
 $PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
@@ -89,7 +98,16 @@ if ($Update) {
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
     if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
-    if (-not $PSBoundParameters.ContainsKey('Isolation') -and $settings['isolation'] -in @('off', 'fs')) { $Isolation = $settings['isolation'] }
+    # Slots chosen with -Slots at install time are kept; an automatic choice is made again.
+    if ($slotsSet -eq 0 -and $settings['slots'] -match '^\d+$' -and [int]$settings['slots'] -ge 1 -and [int]$settings['slots'] -le 256) { $slotsSet = [int]$settings['slots'] }
+    # The isolation it runs with is kept: kit-install.txt, else the --isolation in its launcher (an
+    # install made before kit-install.txt existed). An update never lowers it without -Isolation.
+    $recordedIso = $settings['isolation']
+    if (-not $recordedIso) {
+        $oldVbs = Join-Path $InstallRoot 'start-worker.vbs'
+        if ((Test-Path -LiteralPath $oldVbs) -and ((Get-Content -Raw -LiteralPath $oldVbs) -match '--isolation (off|fs)\b')) { $recordedIso = $Matches[1] }
+    }
+    if (-not $PSBoundParameters.ContainsKey('Isolation') -and $recordedIso -in @('off', 'fs')) { $Isolation = $recordedIso }
     # The start at logon stays as it is: only an install that has one gets it again.
     if (-not $PSBoundParameters.ContainsKey('NoAutostart')) {
         $run = $null
@@ -129,6 +147,90 @@ function Test-InstallDrive($root) {
     if ($disk -and $disk.InterfaceType -eq 'USB') { return "drive $driveRoot is on an external USB disk, which can be unplugged while a task runs" }
     return $null
 }
+# An install folder outside %LOCALAPPDATA% gets a DACL this installer builds itself: protected (no
+# inherited entries), full control for this user, SYSTEM and Administrators only, owned by this user.
+# Another local account must not be able to read the cluster secret in it, or replace the worker
+# that the start-at-logon entry runs as this user.
+$UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$TrustedSids = @($UserSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+$TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+function Get-PrivateSecurity {
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in $TrustedSids) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier $sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    }
+    return $sec
+}
+function Get-AccountName($sid) {
+    try { return (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value } catch { return $sid }
+}
+# The first account other than this user, SYSTEM, Administrators, TrustedInstaller or an app package
+# that owns $path or is granted one of the $mask rights on it; $null when there is none. Entries that
+# only flow to children (inherit-only) do not count for $path itself.
+function Get-ForeignGrant($path, [int]$mask, [bool]$inherited = $true) {
+    $acl = Get-Acl -LiteralPath $path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $TrustedSids -and $owner -ne $TrustedInstaller) { return "owner $(Get-AccountName $owner)" }
+    foreach ($r in $acl.GetAccessRules($true, $inherited, [Security.Principal.SecurityIdentifier])) {
+        if ($r.AccessControlType -ne 'Allow') { continue }
+        if ($r.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = $r.IdentityReference.Value
+        if ($sid -in $TrustedSids -or $sid -eq $TrustedInstaller -or $sid -like 'S-1-15-*') { continue }
+        # GENERIC_ALL (0x10000000) holds every right.
+        if (([int]$r.FileSystemRights -band $mask) -or ([int]$r.FileSystemRights -band 0x10000000)) { return Get-AccountName $sid }
+    }
+    return $null
+}
+# Whether $acl is the private DACL: protected, and only trusted accounts (app package SIDs that task
+# isolation adds are allowed).
+function Test-PrivateAcl($acl) {
+    if (-not $acl.AreAccessRulesProtected) { return $false }
+    foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $r.IdentityReference.Value
+        if ($r.AccessControlType -eq 'Allow' -and $sid -notin $TrustedSids -and $sid -notlike 'S-1-15-*') { return $false }
+    }
+    return $true
+}
+# DELETE 0x10000, WRITE_DAC 0x40000, WRITE_OWNER 0x80000, FILE_DELETE_CHILD 0x40.
+$RenameRights = 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40
+# Why $root may not be used: nobody else may rename, delete or re-permission a folder on the way to
+# it (or delete folders at the drive root), and an existing $root must belong to this user and hold
+# nothing another account wrote or may change.
+function Test-RootSafety($root) {
+    $drive = [IO.Path]::GetPathRoot($root)
+    $dir = Split-Path -Parent $root
+    while ($dir -and $dir.TrimEnd('\') -ne $drive.TrimEnd('\')) {
+        if (Test-Path -LiteralPath $dir) {
+            if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$dir is a link" }
+            $who = Get-ForeignGrant $dir $RenameRights
+            if ($who) { return "another account ($who) can rename or change $dir; choose a folder directly under the drive, such as $(Join-Path $drive 'OxideSwarm')" }
+        }
+        $dir = Split-Path -Parent $dir
+    }
+    $who = Get-ForeignGrant $drive (0x40 -bor 0x40000 -bor 0x80000)
+    if ($who) { return "another account ($who) can delete or re-permission folders at the root of $drive" }
+    if (-not (Test-Path -LiteralPath $root)) { return $null }
+    $item = Get-Item -LiteralPath $root -Force
+    if (-not $item.PSIsContainer) { return "$root is a file" }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$root is a link" }
+    $acl = Get-Acl -LiteralPath $root
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value) {
+        return "$root belongs to another account ($(Get-AccountName $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value)); remove it or choose another folder"
+    }
+    if (Test-PrivateAcl $acl) { return $null }
+    # Not made by this installer, or by an older one: every entry must be ours.
+    $ours = (Test-Path -LiteralPath (Join-Path $root '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $root 'bin\oxideswarm.exe'))
+    $children = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)
+    if (-not $ours -and $children.Count -gt 0) { return "$root already holds other files; choose a new or empty folder with -InstallRoot" }
+    foreach ($c in $children) {
+        if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$($c.FullName) is a link" }
+        $who = Get-ForeignGrant $c.FullName -1 $false
+        if ($who) { return "another account ($who) has rights on $($c.FullName); remove $root or choose another folder" }
+    }
+    return $null
+}
 $explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
 if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected) {
     $choices = @($DefaultRoot)
@@ -153,20 +255,15 @@ if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected)
     }
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
-$PrivateRoot = $InstallRoot.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
-if (-not $PrivateRoot -and -not $Update) {
+$PrivateRoot = $InstallRoot.StartsWith($LocalAppDataFull + '\', [StringComparison]::OrdinalIgnoreCase)
+if (-not $PrivateRoot) {
     if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
-    $why = Test-InstallDrive $InstallRoot
-    if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
-    if (Test-Path -LiteralPath $InstallRoot) {
-        $item = Get-Item -LiteralPath $InstallRoot -Force
-        if (-not $item.PSIsContainer) { Fail "$InstallRoot is a file" }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$InstallRoot is a link; not using it" }
-        $ours = (Test-Path (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
-        if (-not $ours -and (Get-ChildItem -LiteralPath $InstallRoot -Force | Select-Object -First 1)) {
-            Fail "$InstallRoot already holds other files; choose a new or empty folder with -InstallRoot"
-        }
+    if (-not $Update) {
+        $why = Test-InstallDrive $InstallRoot
+        if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
     }
+    $why = Test-RootSafety $InstallRoot
+    if ($why) { Fail "cannot use ${InstallRoot}: $why" }
 }
 # One install per user: the uninstaller finds it through $PointerKey. An install somewhere else must
 # be removed first, unless -InstallRoot asked for this folder on purpose.
@@ -206,15 +303,44 @@ Write-Host "  archive: $($Archive.Name) (checksum OK)"
 
 # 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
 if (-not $PrivateRoot) {
-    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $InstallRoot /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "could not limit $InstallRoot to this user (icacls exit code $LASTEXITCODE)" }
+    $sec = Get-PrivateSecurity
+    $recheckExisting = $false
+    $hadOurs = $false
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        # Created with its DACL in one call, so it never exists open to others.
+        $sec.SetOwner($UserSid)
+        [void][IO.Directory]::CreateDirectory($InstallRoot, $sec)
+    } elseif (-not (Test-PrivateAcl (Get-Acl -LiteralPath $InstallRoot))) {
+        $recheckExisting = $true
+        $hadOurs = (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
+        (Get-Item -LiteralPath $InstallRoot -Force).SetAccessControl($sec)
+    }
+    # CreateDirectory returns an existing folder as it is (one made in between by someone else), so
+    # check what is there now.
+    if ((Get-Item -LiteralPath $InstallRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Fail "$InstallRoot is a link; remove it and run the installer again"
+    }
+    $acl = Get-Acl -LiteralPath $InstallRoot
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value -or -not (Test-PrivateAcl $acl)) {
+        Fail "could not make $InstallRoot private to this user; remove it and run the installer again"
+    }
+    if ($recheckExisting) {
+        # Close the Test-RootSafety -> SetAccessControl window on an existing folder that was open to others.
+        $afterChildren = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction Stop)
+        if (-not $hadOurs -and $afterChildren.Count -gt 0) {
+            Fail "files appeared in $InstallRoot before it could be made private; remove it or choose another folder"
+        }
+        foreach ($c in $afterChildren) {
+            if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$($c.FullName) is a link" }
+            $who = Get-ForeignGrant $c.FullName -1 $false
+            if ($who) { Fail "another account ($who) has rights on $($c.FullName); remove $InstallRoot or choose another folder" }
+        }
+    }
     New-Item -ItemType Directory -Force -Path (Join-Path $InstallRoot 'work') | Out-Null
     Write-Host "  access:  this user, SYSTEM and Administrators only"
 }
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-Set-Content -Path (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
 if (-not ($pointer -and $pointer -ne $InstallRoot -and (Test-Path (Join-Path $pointer 'bin\oxideswarm.exe')))) {
     foreach ($k in @('HKCU:\Software\OxideSwarm', $PointerKey)) { if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
     Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
@@ -325,8 +451,101 @@ if ($ticket) {
 
 # 5. Worker options.
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
-# Use at most half of the CPU cores, so the machine stays responsive for its owner.
-$slots = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2))
+# The name goes into the worker's command line and the launcher, so only safe characters pass.
+if ($Name -notmatch '^[A-Za-z0-9_.-]{1,64}$') { Fail "the name '$Name' may only hold letters, digits, '.', '_' and '-' (at most 64)" }
+# A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
+# same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
+# machine's own id (MachineGuid), the name and the cluster secret: the machine id never leaves the
+# machine, and the same machine gets unrelated ids in different clusters. An existing id file is
+# kept. OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
+$idFile = Join-Path $State "worker_id.$Name"
+if (-not (Test-Path $idFile) -or (Get-Item $idFile).Length -eq 0) {
+    $machineId = $env:OXIDESWARM_USB_MACHINE_ID
+    if (-not $machineId) { try { $machineId = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid } catch { $machineId = $null } }
+    if (-not $machineId) { try { $machineId = (Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID } catch { $machineId = $null } }
+    if ($machineId) {
+        $secretFile = Join-Path $State 'cluster.secret'
+        $secretBytes = if (Test-Path $secretFile) { [IO.File]::ReadAllBytes($secretFile) } else { [byte[]]@() }
+        $seed = [Text.Encoding]::UTF8.GetBytes("oxideswarm-usb-worker-id-v1`n$machineId`n$Name`n") + $secretBytes
+        $h = [Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$seed)
+        $h[6] = ($h[6] -band 0x0f) -bor 0x80   # UUID version 8 (vendor-specific)
+        $h[8] = ($h[8] -band 0x3f) -bor 0x80   # RFC 9562 variant
+        $hex = -join ($h[0..15] | ForEach-Object { $_.ToString('x2') })
+        $uuid = '{0}-{1}-{2}-{3}-{4}' -f $hex.Substring(0, 8), $hex.Substring(8, 4), $hex.Substring(12, 4), $hex.Substring(16, 4), $hex.Substring(20, 12)
+        [IO.File]::WriteAllText($idFile, $uuid + "`n")
+    }
+}
+# Task slots (USB-4): the logical processors of the performance cores, at most half of all
+# processors and at least 1, so the machine stays responsive for its owner. A laptop chip with few
+# performance cores slows down far more than linearly when every efficient core is busy too. When
+# the core types cannot be read, a machine with a battery gets a quarter of its processors.
+# OXIDESWARM_USB_CPU_INFO="total=N perf=N|- battery=0|1" replaces the probe (tests).
+function Get-CpuInfo {
+    $info = @{ total = [Environment]::ProcessorCount; perf = 0; battery = $false }
+    if ($env:OXIDESWARM_USB_CPU_INFO) {
+        foreach ($kv in ($env:OXIDESWARM_USB_CPU_INFO -split '\s+')) {
+            if ($kv -match '^total=(\d+)$') { $info.total = [int]$Matches[1] }
+            elseif ($kv -match '^perf=(\d+)$') { $info.perf = [int]$Matches[1] }
+            elseif ($kv -match '^battery=1$') { $info.battery = $true }
+        }
+        return $info
+    }
+    try {
+        if (-not ('OxideSwarmCpuSets' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OxideSwarmCpuSets {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetSystemCpuSetInformation(IntPtr information, uint bufferLength, out uint returnedLength, IntPtr process, uint flags);
+    // Logical processors in the highest efficiency class (the performance cores), or -1.
+    public static int PerformanceThreads() {
+        uint needed;
+        GetSystemCpuSetInformation(IntPtr.Zero, 0, out needed, IntPtr.Zero, 0);
+        if (needed == 0) return -1;
+        IntPtr buffer = Marshal.AllocHGlobal((int)needed);
+        try {
+            uint got;
+            if (!GetSystemCpuSetInformation(buffer, needed, out got, IntPtr.Zero, 0)) return -1;
+            int best = -1, count = 0, offset = 0;
+            while (offset + 19 <= (int)got) {
+                int size = Marshal.ReadInt32(buffer, offset);
+                int type = Marshal.ReadInt32(buffer, offset + 4);
+                if (size <= 0) break;
+                if (type == 0) {
+                    // SYSTEM_CPU_SET_INFORMATION.CpuSet.EfficiencyClass
+                    int cls = Marshal.ReadByte(buffer, offset + 18);
+                    if (cls > best) { best = cls; count = 1; } else if (cls == best) { count++; }
+                }
+                offset += size;
+            }
+            return best < 0 ? -1 : count;
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+}
+'@
+        }
+        $perf = [OxideSwarmCpuSets]::PerformanceThreads()
+        if ($perf -ge 1) { $info.perf = $perf }
+    } catch { }
+    try { if (Get-CimInstance Win32_Battery -ErrorAction Stop) { $info.battery = $true } } catch { }
+    return $info
+}
+$cpu = Get-CpuInfo
+$cpuTotal = [Math]::Max(1, [int]$cpu.total)
+$half = [Math]::Max(1, [int][Math]::Floor($cpuTotal / 2))
+if ($slotsSet -ge 1) {
+    $slots = $slotsSet; $slotsWhy = 'set with -Slots'
+} elseif ($cpu.perf -ge 1) {
+    $slots = [Math]::Min([int]$cpu.perf, $half); $slotsWhy = "performance cores, at most half of $cpuTotal processors"
+} elseif ($cpu.battery) {
+    $slots = [Math]::Max(1, [int][Math]::Floor($cpuTotal / 4)); $slotsWhy = "a quarter of $cpuTotal processors on a machine with a battery"
+} else {
+    $slots = $half; $slotsWhy = "half of $cpuTotal processors"
+}
+Write-Host "  slots:   $slots ($slotsWhy; change it with -Slots N)"
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
 # Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
 $supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
@@ -386,7 +605,8 @@ Write-Host "  connected (isolation: $Isolation)"
 # What an update keeps: the name, the build, the workspace choice and the isolation.
 $builtWithGpu = if ($GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
 $withWorkspaces = if ($NoWorkspaces) { '0' } else { '1' }
-Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation")
+$recordedSlots = if ($slotsSet -ge 1) { "$slotsSet" } else { '' }
+Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation", "slots=$recordedSlots")
 
 # 8. Start at logon (current user only, no administrator rights).
 if (-not $NoAutostart) {
