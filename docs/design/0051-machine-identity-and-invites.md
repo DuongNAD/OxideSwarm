@@ -195,13 +195,14 @@ oxideswarm invite [--roles worker[,client]] [--uses N] [--expires 24h] [--no-app
   - the **worker ids each member owns** and the bounded `v2_worker_seq` map of seen v2 worker ids.
 - **Commands.** `oxideswarm members list | pending | approve | reject | revoke | rename | release-worker`
   reach the master as `ClientMessage` variants (`ReleaseWorkerId { worker_id }` ->
-  `WorkerIdReleased { worker_id, released }`).
+  `WorkerIdReleased { worker_id }`).
 - **Worker ids.** The first `Register` of a worker id from a member records that member as its
   owner (up to 64 worker ids per member, with persisted LRU eviction of non-live claims via
   `worker_last_seq`; reconnects of an already-owned id update in-memory LRU order without rewriting
-  `members.json`). A `Register` with an id owned by another member is refused with a generic wire
-  error (never exposing local master paths). Without this rule, member A could take over member B's
-  worker id, displace B's session and receive B's `require:worker=<id>` tasks.
+  `members.json`). A `Register` with an id owned by another member is refused with a specific
+  `AuthFailed` message naming the owning member id (without exposing local master paths; unexpected
+  internal store errors send a generic refusal). Without this rule, member A could take over member
+  B's worker id, displace B's session and receive B's `require:worker=<id>` tasks.
   - Under `--auth secret`, v2 peers share worker ids without touching `members.json`.
   - Under `--auth both`, v2 peers record newly seen worker ids in `v2_worker_seq` (persisting only
     when a new id is added or an entry past 1,024 is evicted, logging a local warning without
@@ -210,12 +211,17 @@ oxideswarm invite [--roles worker[,client]] [--uses N] [--expires 24h] [--no-app
   - Under `--auth members`, `v2_worker_seq` is ignored so former v2 workers can register directly as
     enrolled members; under `--auth both`, an admin releases a stopped worker's id with
     `oxideswarm members release-worker <WORKER_ID>` (D6).
-  - Known limits of `v2_worker_seq`:
-    1. it protects only v2 worker ids that have registered at least once since upgrading the master;
-    2. it is capped at 1,024 entries (`MAX_TRACKED_V2_WORKER_IDS`), and unnamed v2 workers generate a
-       new UUID per restart, so 1,024 unnamed v2 restarts can evict a stopped named v2 worker's
-       entry;
-    3. `ListWorkers` is permitted to any member (D6), so any member can read active worker ids.
+  - Known limits:
+    1. `v2_worker_seq` protects only v2 worker ids that have registered at least once since
+       upgrading the master;
+    2. `v2_worker_seq` is capped at 1,024 entries (`MAX_PERSISTED_V2_WORKERS` in
+       `crates/master/src/members.rs`), and unnamed v2 workers generate a new UUID per restart, so
+       1,024 unnamed v2 restarts can evict a stopped named v2 worker's entry;
+    3. `ListWorkers` is permitted to any member (D6), so any member can read active worker ids;
+    4. after `oxideswarm members release-worker <WORKER_ID>`, whoever registers that `worker_id`
+       first claims it (a v2 peer under `--auth both`, or any member with the `worker` role); a
+       **Planned** `release-worker <WORKER_ID> --to <MEMBER>` option can bind the released id to a
+       specific member.
 - **Revocation** removes the member and then:
   1. closes every connection the member has, from a registry of connections per member that
      covers worker sessions (both QUIC lanes), client connections, `BlobConnection`, P2P
@@ -346,3 +352,4 @@ joins through iroh, through the owner's relay if one is set (`--relay-url`,
 - 2026-11-10: `ENROLL-1b` round-2 review fixes (`N1..N13`): LRU eviction of non-live `worker_id` claims past `MAX_WORKERS_PER_MEMBER` (64) (`N1`); require v2 cluster-secret or v3 `admin` authentication on all member/invite administration messages (`N2`); check for a controlling terminal before opening `ENROLL`, confirm `[y/N]` before sending `Enroll` on `--no-approval` invites, and require post-approval `Hello` confirmation (rolling back on decline or disconnect) on approval invites (`N3`); omit `pairing_code` from `PendingEnrollmentInfo` / `members pending` and add `--fingerprint` verification to `members approve` (`N4`); skip `ensure_local_host_admin` when the host key is in `revoked_keys` (`N5`); verify existing `master_noise.key` matches `self.master_noise_key` in `ensure_v3_key_persisted` (`N6`); check and claim `worker_id` ownership atomically (`N7`, `N13`); preserve existing member `name` and `via_invite` on re-enrollment (`N8`); strip Unicode `Cf` format/BiDi characters (`is_control_or_format_char`) (`N9`); and clarify multi-line piped input errors and loopback no-auth documentation (`N10..N12`).
 - 2026-11-10: `ENROLL-1b` round-3 review fixes (`1..9` + nits): compare-and-swap post-approval rollback with generation tracking, `revoked_keys` check in `contains`/`get`/`rollback`, 120 s confirmation timeout, and worker session disconnect on rollback (`1`, `5`); revert unnamed `~/.oxideswarm/worker_id` persistence so multiple unnamed workers in one `HOME` keep distinct ephemeral UUIDs (`2`); complete `ClientMessage::Hello` -> `ClientResponse::Hello` before the `--no-approval` `[y/N]` prompt with a 32-waiter cap and 120 s prompt idle timeout (`3`); flush pending TTY input before the `[y/N]` prompt so a multi-line paste (`<invite>\ny\n`) cannot auto-confirm (`4`); hold the `WorkerRegistry` write lock across the `MemberStore` worker-id claim/eviction check, persist `worker_last_seq` and `v2_worker_seq`, allow v2 workers to reclaim non-live squatted worker ids, and prune `owner_member_ids` on `remove_worker`/`prune_stale_workers` (`6`, `7`, `8`); match `--fingerprint` against `<PENDING_ID>` on both client and server; and align `README.md` and design 0051 (`9`).
 - 2026-11-11: `ENROLL-1b` round-4 review fixes (`N1..N5` + nits): avoid per-`Register` `members.json` writes by keeping secret-only masters (`--auth secret`) purely in memory, persisting `worker_last_seq` / `v2_worker_seq` only on new ids or LRU evictions outside the `WorkerRegistry` write lock, and logging persistence warnings locally without refusing worker registration or leaking filesystem paths (`N1`, `NIT 4`, `NIT 7`); ignore `v2_worker_seq` under `--auth members` and add `oxideswarm members release-worker <WORKER_ID>` (`ClientMessage::ReleaseWorkerId` -> `ClientResponse::WorkerIdReleased`, `admin` role, refuses live workers) for migrating named workers from v2 to v3 under `--auth both` (`N2`); close and drain `decision_rx` on joiner disconnect/timeout and roll back inline in `approve_pending` when `decision_tx.send` fails (`N3`); prompt `[y/N]` on the pinned master key fingerprint (without a pairing code) before opening any connection on `--no-approval` invites, removing the pre-`Enroll` `Hello` waiter pool (`N4`, `NIT 6`); carry concurrent renames into `UnconfirmedMemberTracker` and restore invite uses only when the key is no longer a member (`N5`); and log rollback persistence errors, distinguish the 120 s confirmation timeout wire message, and document the in-memory rollback tracker and `v2_worker_seq` bounds (`NIT 1..3`, `NIT 5`).
+- 2026-11-11: `ENROLL-1b` round-5 review fixes (`R5-1` + nits): restore invite uses unconditionally on the compare-and-swap tracker rollback path so declined role upgrades and rolled-back concurrent approvals do not burn invite uses, keeping the non-member guard only on the fallback no-tracker path (`R5-1`); decouple `MemberStore` disk writes onto a dedicated write mutex with state-generation coalescing, offload `members.json` persistence onto `spawn_blocking`, and release non-live `worker_id` claims in memory under the `WorkerRegistry` write lock before flushing (`NIT 2..4`); commit in-memory rollback state atomically before writing `members.json` so a failed rollback write cannot leave an unconfirmed member enrolled or leak tracker ops (`NIT 5`); and align D5 `WorkerIdReleased` fields, `AuthFailed` refusal wording, `MAX_PERSISTED_V2_WORKERS`, and the first-register-wins limit after `release-worker` (`NIT 1`, `NIT 6`).
