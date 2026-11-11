@@ -252,6 +252,21 @@ pub enum HeartbeatOutcome {
     StaleSession,
 }
 
+async fn flush_bookkeeping_async(
+    store: &crate::server::members::MemberStore,
+    pending: crate::server::members::PendingBookkeepingPersist,
+) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let store = store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            store.flush_bookkeeping_persist(pending);
+        })
+        .await;
+    } else {
+        store.flush_bookkeeping_persist(pending);
+    }
+}
+
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
     network_types: HashMap<Uuid, Option<String>>,
@@ -372,14 +387,15 @@ impl WorkerRegistry {
     }
 
     /// Registers a worker session while holding the registry write lock across both the in-memory
-    /// owner check and the persistent [`crate::server::members::MemberStore`] claim / LRU eviction
-    /// so that:
+    /// owner check and the in-memory [`crate::server::members::MemberStore`] claim / LRU eviction
+    /// (flushing `members.json` bookkeeping after releasing the registry write lock) so that:
     /// 1. `is_live` sees the exact live worker state under the registry write lock (no reconnecting
     ///    live worker can be evicted between reading `live_worker_ids` and claiming);
     /// 2. if registration is refused by the registry or member store, no session, claim, or
     ///    eviction is left behind;
     /// 3. a cluster-secret (v2) worker (`owner_member_id.is_none() && is_v2_authenticated`) can
-    ///    reclaim a `worker_id` held by a non-live v3 member claim and persist it in `v2_worker_seq`.
+    ///    reclaim a `worker_id` held by a non-live v3 member claim in memory under the lock and
+    ///    flush the updated `v2_worker_seq` after the lock is released.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_session_with_member_store(
         &self,
@@ -575,7 +591,7 @@ impl WorkerRegistry {
         drop(inner);
 
         if let (Some(store), Some(pending)) = (members, pending_persist) {
-            store.flush_bookkeeping_persist(pending);
+            flush_bookkeeping_async(store, pending).await;
         }
 
         Ok(Registration {
@@ -584,27 +600,34 @@ impl WorkerRegistry {
         })
     }
 
-    /// Releases a non-live `worker_id` claim in both the in-memory registry and persistent
-    /// [`crate::server::members::MemberStore`]. Refuses if `worker_id` currently has a connected
+    /// Releases a non-live `worker_id` claim in memory in both the registry and
+    /// [`crate::server::members::MemberStore`] under the registry write lock, then flushes
+    /// `members.json` after releasing the lock. Refuses if `worker_id` currently has a connected
     /// worker session.
     pub async fn release_non_live_worker_id(
         &self,
         worker_id: Uuid,
         members: &crate::server::members::MemberStore,
     ) -> GridResult<()> {
-        let mut inner = self.inner.write().await;
-        if inner
-            .workers
-            .get(&worker_id)
-            .is_some_and(|e| e.status != WorkerStatus::Disconnected)
-        {
-            return Err(GridError::Config(format!(
-                "worker {worker_id} is currently connected; stop the worker before releasing its worker_id"
-            )));
+        let pending = {
+            let mut inner = self.inner.write().await;
+            if inner
+                .workers
+                .get(&worker_id)
+                .is_some_and(|e| e.status != WorkerStatus::Disconnected)
+            {
+                return Err(GridError::Config(format!(
+                    "worker {worker_id} is currently connected; stop the worker before releasing its worker_id"
+                )));
+            }
+            let had_registry_claim = inner.owner_member_ids.contains_key(&worker_id);
+            let pending = members.release_worker_id_deferred(worker_id, had_registry_claim)?;
+            inner.owner_member_ids.remove(&worker_id);
+            pending
+        };
+        if let Some(pending) = pending {
+            flush_bookkeeping_async(members, pending).await;
         }
-        let had_registry_claim = inner.owner_member_ids.contains_key(&worker_id);
-        members.release_worker_id(worker_id, had_registry_claim)?;
-        inner.owner_member_ids.remove(&worker_id);
         Ok(())
     }
 
@@ -2917,5 +2940,70 @@ mod tests {
             1,
             "Worker that was Normal in session 1 and re-registers must get 1 from matchmake after the hold cap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_release_non_live_worker_id_flushes_outside_registry_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = crate::server::members::MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .with_auth_mode(crate::server::members::AuthMode::Both);
+        let registry = WorkerRegistry::new();
+        let wid = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let reg = registry
+            .register_session_with_member_store(
+                wid,
+                WorkerCapabilities::new("v2-worker", 2, 4096, false, false, None),
+                ProtocolCapabilities::empty(),
+                "127.0.0.1:9040".parse().unwrap(),
+                tx.clone(),
+                None,
+                None,
+                true,
+                Some(&members),
+            )
+            .await
+            .unwrap();
+        assert_eq!(members.persist_count(), 1);
+
+        // Live worker cannot be released.
+        assert!(registry
+            .release_non_live_worker_id(wid, &members)
+            .await
+            .is_err());
+
+        // Disconnect, then release -> in-memory owner cleared and flushed to `members.json`.
+        registry
+            .unregister(&wid, Some(reg.session_id))
+            .await
+            .unwrap();
+        registry
+            .release_non_live_worker_id(wid, &members)
+            .await
+            .unwrap();
+        assert_eq!(members.persist_count(), 2);
+
+        // Enrolled member can now claim `wid` immediately.
+        let v3_member_id = "0123456789abcdef".to_string();
+        registry
+            .register_session_with_member_store(
+                wid,
+                WorkerCapabilities::new("v3-worker", 2, 4096, false, false, None),
+                ProtocolCapabilities::empty(),
+                "127.0.0.1:9041".parse().unwrap(),
+                tx,
+                None,
+                Some(v3_member_id.clone()),
+                false,
+                Some(&members),
+            )
+            .await
+            .unwrap();
+        assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid]);
+        let reloaded =
+            crate::server::members::MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert_eq!(reloaded.workers_owned_by(&v3_member_id), vec![wid]);
     }
 }

@@ -3796,6 +3796,16 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 
 const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
+async fn run_member_store_blocking<T, F>(f: F) -> GridResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> GridResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| GridError::Config(format!("member store task panicked: {e}")))?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn rollback_enrollment_and_disconnect_workers(
     auth_ctx: &MasterAuthContext,
@@ -3811,7 +3821,12 @@ async fn rollback_enrollment_and_disconnect_workers(
 ) {
     let member_id = rollback.member_id.clone();
     let pubkey = rollback.public_key;
-    let released_claims = match auth_ctx.members.rollback_approved_enrollment(rollback) {
+    let members_store = auth_ctx.members.clone();
+    let released_claims = match run_member_store_blocking(move || {
+        members_store.rollback_approved_enrollment(rollback)
+    })
+    .await
+    {
         Ok(claims) => claims,
         Err(e) => {
             warn!(
@@ -3892,17 +3907,28 @@ async fn handle_enroll_connection<S>(
         .await;
         return;
     }
-    match auth_ctx.members.handle_enroll_request(
-        peer.public_key,
-        peer.handshake_hash.as_bytes(),
-        &peer.master_fingerprint,
-        &peer.remote_addr,
-        invite_id,
-        proof,
-        name,
-        os,
-        arch,
-    ) {
+    let members_store = auth_ctx.members.clone();
+    let peer_pk = peer.public_key;
+    let hh_bytes = *peer.handshake_hash.as_bytes();
+    let master_fp = peer.master_fingerprint.clone();
+    let remote_addr = peer.remote_addr.clone();
+    let invite_id_owned = invite_id.to_string();
+    let proof_owned = *proof;
+    match run_member_store_blocking(move || {
+        members_store.handle_enroll_request(
+            peer_pk,
+            &hh_bytes,
+            &master_fp,
+            &remote_addr,
+            &invite_id_owned,
+            &proof_owned,
+            name,
+            os,
+            arch,
+        )
+    })
+    .await
+    {
         Ok(members::EnrollOutcome::Rejected {
             log_reason,
             wire_message,
@@ -4327,24 +4353,20 @@ where
                 .await?;
                 return Ok(());
             }
-            let master_key_pub = match auth_ctx.ensure_v3_key_persisted() {
-                Ok(pk) => pk,
-                Err(e) => {
-                    send_client_response(
-                        transport,
-                        &ClientResponse::Error {
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            match auth_ctx
-                .members
-                .create_invite(roles, max_uses, expires_in_secs, require_approval)
-            {
-                Ok(rec) => {
+            let auth_ctx_cloned = auth_ctx.clone();
+            let create_res = run_member_store_blocking(move || {
+                let pk = auth_ctx_cloned.ensure_v3_key_persisted()?;
+                let rec = auth_ctx_cloned.members.create_invite(
+                    roles,
+                    max_uses,
+                    expires_in_secs,
+                    require_approval,
+                )?;
+                Ok((pk, rec))
+            })
+            .await;
+            match create_res {
+                Ok((master_key_pub, rec)) => {
                     info!(
                         invite_id = %rec.invite_id,
                         roles = ?rec.roles,
@@ -4381,7 +4403,8 @@ where
             send_client_response(transport, &ClientResponse::InvitesList { invites }).await?;
         }
         ClientMessage::RevokeInvite { invite_id } => {
-            match auth_ctx.members.revoke_invite(&invite_id) {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.revoke_invite(&invite_id)).await {
                 Ok(resolved_id) => {
                     info!(invite_id = %resolved_id, "Revoked cluster invite");
                     send_client_response(
@@ -4419,9 +4442,12 @@ where
             pending_id,
             pairing_code,
         } => {
-            match auth_ctx
-                .members
-                .approve_pending(&pending_id, pairing_code.as_str())
+            let members_store = auth_ctx.members.clone();
+            let pid_clone = pending_id.clone();
+            match run_member_store_blocking(move || {
+                members_store.approve_pending(&pid_clone, pairing_code.as_str())
+            })
+            .await
             {
                 Ok(entry) => {
                     info!(
@@ -4476,55 +4502,61 @@ where
                 }
             }
         }
-        ClientMessage::RevokeMember { target } => match auth_ctx.members.revoke_member(&target) {
-            Ok((entry, owned_workers)) => {
-                let mut disconnected_sessions = 0usize;
-                for wid in &owned_workers {
-                    registry.release_worker_owner(wid).await;
-                    if handle_worker_disconnect_with_broadcast(
-                        registry,
-                        queue,
-                        scheduler_notify,
-                        Some(waiters),
-                        wid,
-                        None,
-                        "Member revoked by admin",
-                        true,
-                        #[cfg(feature = "dashboard")]
-                        broadcast_tx,
-                    )
-                    .await
-                    {
-                        disconnected_sessions += 1;
+        ClientMessage::RevokeMember { target } => {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.revoke_member(&target)).await {
+                Ok((entry, owned_workers)) => {
+                    let mut disconnected_sessions = 0usize;
+                    for wid in &owned_workers {
+                        registry.release_worker_owner(wid).await;
+                        if handle_worker_disconnect_with_broadcast(
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            Some(waiters),
+                            wid,
+                            None,
+                            "Member revoked by admin",
+                            true,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                        )
+                        .await
+                        {
+                            disconnected_sessions += 1;
+                        }
                     }
-                }
-                info!(
-                    member_id = %entry.id,
-                    name = %entry.name,
-                    disconnected_sessions,
-                    "Revoked cluster member"
-                );
-                send_client_response(
-                    transport,
-                    &ClientResponse::MemberRevoked {
-                        member_id: entry.id,
+                    info!(
+                        member_id = %entry.id,
+                        name = %entry.name,
                         disconnected_sessions,
-                    },
-                )
-                .await?;
+                        "Revoked cluster member"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::MemberRevoked {
+                            member_id: entry.id,
+                            disconnected_sessions,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
             }
-            Err(e) => {
-                send_client_response(
-                    transport,
-                    &ClientResponse::Error {
-                        message: e.to_string(),
-                    },
-                )
-                .await?;
-            }
-        },
+        }
         ClientMessage::RenameMember { target, new_name } => {
-            match auth_ctx.members.rename_member(&target, &new_name) {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.rename_member(&target, &new_name))
+                .await
+            {
                 Ok(entry) => {
                     info!(
                         member_id = %entry.id,

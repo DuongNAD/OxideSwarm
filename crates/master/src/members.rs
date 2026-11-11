@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::noise_auth::{
@@ -196,7 +196,6 @@ struct UnconfirmedApprovalOp {
 struct UnconfirmedMemberTracker {
     baseline: Option<MemberEntry>,
     ops: Vec<UnconfirmedApprovalOp>,
-    deferred_invite_restores: Vec<String>,
     expected_generation: u64,
 }
 
@@ -344,9 +343,15 @@ impl PersistentMemberState {
         }
     }
 
-    fn prune_inactive_invites(&mut self, now: u64) {
-        self.invites
-            .retain(|inv| !inv.revoked && inv.uses_remaining > 0 && now < inv.expires_at);
+    fn prune_inactive_invites(&mut self, now: u64, active_approval_invites: &HashMap<u64, String>) {
+        self.invites.retain(|inv| {
+            !inv.revoked
+                && now < inv.expires_at
+                && (inv.uses_remaining > 0
+                    || active_approval_invites
+                        .values()
+                        .any(|active_id| active_id == &inv.invite_id))
+        });
     }
 }
 
@@ -360,23 +365,38 @@ struct MemberStoreInner {
     active_approval_invites: HashMap<u64, String>,
     save_path: Option<PathBuf>,
     auth_mode: AuthMode,
-    persist_count: AtomicU64,
-    write_generation: u64,
+    state_generation: u64,
 }
 
-/// Token returned by [`MemberStore::claim_v2_worker_id_deferred`] and
-/// [`MemberStore::claim_worker_id_evicting_deferred`] when worker-claim bookkeeping changed and
+enum AdminMutationPlan<T, R> {
+    NoOp(R),
+    Persist {
+        staged: PersistentMemberState,
+        token: T,
+    },
+}
+
+/// Token returned by [`MemberStore::claim_v2_worker_id_deferred`],
+/// [`MemberStore::claim_worker_id_evicting_deferred`], and
+/// [`MemberStore::release_worker_id_deferred`] when worker-claim bookkeeping changed and
 /// should be flushed to `members.json` after releasing the [`crate::registry::WorkerRegistry`]
 /// write lock.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingBookkeepingPersist {
-    write_generation: u64,
+    target_generation: u64,
 }
 
 /// Thread-safe enrolled member, invite, pending-enrollment, and worker-ownership store.
+///
+/// Lock ordering: `write_lock` -> `inner` (`RwLock`). `inner` is never held across disk I/O
+/// (`write_members_file_atomic`), so worker registrations and reads never block on `fsync`.
 #[derive(Clone, Default)]
 pub struct MemberStore {
     inner: Arc<RwLock<MemberStoreInner>>,
+    /// Serializes `members.json` writes and multi-step persistent mutations; stores the highest
+    /// `state_generation` successfully written to disk.
+    write_lock: Arc<Mutex<u64>>,
+    persist_count: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for MemberStore {
@@ -606,21 +626,6 @@ fn write_members_file_atomic(path: &Path, file: &MembersFile) -> GridResult<()> 
 }
 
 impl MemberStoreInner {
-    fn mutate_and_persist<T, F>(&mut self, f: F) -> GridResult<T>
-    where
-        F: FnOnce(&mut PersistentMemberState) -> GridResult<T>,
-    {
-        let mut staged = self.state.clone();
-        let out = f(&mut staged)?;
-        if let Some(ref path) = self.save_path {
-            write_members_file_atomic(path, &staged.to_members_file())?;
-            self.persist_count.fetch_add(1, Ordering::Relaxed);
-            self.write_generation = self.write_generation.wrapping_add(1);
-        }
-        self.state = staged;
-        Ok(out)
-    }
-
     fn prune_pending(&mut self, now: u64) {
         self.pending
             .retain(|_, entry| now < entry.info.expires_at && !entry.decision_tx.is_closed());
@@ -736,36 +741,108 @@ impl MemberStore {
 
     /// Returns the number of times `members.json` has been written to disk by this store.
     pub fn persist_count(&self) -> u64 {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .persist_count
-            .load(Ordering::Relaxed)
+        self.persist_count.load(Ordering::Relaxed)
+    }
+
+    fn persist_snapshot_up_to(
+        &self,
+        target_generation: u64,
+        respect_auth_mode: bool,
+    ) -> GridResult<()> {
+        let mut persisted_gen = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *persisted_gen >= target_generation {
+            return Ok(());
+        }
+        let snapshot = {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            if respect_auth_mode && !guard.auth_mode.allows_members() {
+                return Ok(());
+            }
+            let Some(ref path) = guard.save_path else {
+                return Ok(());
+            };
+            if *persisted_gen >= guard.state_generation {
+                return Ok(());
+            }
+            (
+                path.clone(),
+                guard.state.to_members_file(),
+                guard.state_generation,
+            )
+        };
+        write_members_file_atomic(&snapshot.0, &snapshot.1)?;
+        *persisted_gen = (*persisted_gen).max(snapshot.2);
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn run_admin_mutation<P, C, T, R>(&self, prepare: P, commit: C) -> GridResult<R>
+    where
+        P: FnOnce(&mut MemberStoreInner) -> GridResult<AdminMutationPlan<T, R>>,
+        C: FnOnce(&mut MemberStoreInner, T, &mut bool) -> R,
+    {
+        let mut persisted_gen = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (token, gen_before, staged_write) = {
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            match prepare(&mut guard)? {
+                AdminMutationPlan::NoOp(out) => return Ok(out),
+                AdminMutationPlan::Persist { staged, token } => {
+                    let staged_write = guard
+                        .save_path
+                        .as_ref()
+                        .map(|p| (p.clone(), staged.to_members_file()));
+                    (token, guard.state_generation, staged_write)
+                }
+            }
+        };
+        if let Some((ref path, ref file)) = staged_write {
+            write_members_file_atomic(path, file)?;
+        }
+        let (out, resync_write) = {
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut force_resync = guard.state_generation != gen_before;
+            let out = commit(&mut guard, token, &mut force_resync);
+            guard.state_generation = guard.state_generation.saturating_add(1);
+            let new_gen = guard.state_generation;
+            let resync_write = if let Some((path, _)) = staged_write {
+                if force_resync {
+                    Some((path, guard.state.to_members_file(), new_gen))
+                } else {
+                    *persisted_gen = (*persisted_gen).max(new_gen);
+                    self.persist_count.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            } else {
+                None
+            };
+            (out, resync_write)
+        };
+        if let Some((path, file, new_gen)) = resync_write {
+            match write_members_file_atomic(&path, &file) {
+                Ok(()) => {
+                    *persisted_gen = (*persisted_gen).max(new_gen);
+                    self.persist_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to resync members.json after concurrent state update"
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Flushes a deferred worker-claim bookkeeping change to `members.json` outside the
     /// [`crate::registry::WorkerRegistry`] write lock. Never fails the caller if the disk write
     /// fails; logs a warning and keeps the in-memory claim.
     pub fn flush_bookkeeping_persist(&self, pending: PendingBookkeepingPersist) {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if !guard.auth_mode.allows_members() || guard.write_generation > pending.write_generation {
-            return;
-        }
-        let Some(ref path) = guard.save_path else {
-            return;
-        };
-        let file = guard.state.to_members_file();
-        match write_members_file_atomic(path, &file) {
-            Ok(()) => {
-                guard.persist_count.fetch_add(1, Ordering::Relaxed);
-                guard.write_generation = guard.write_generation.wrapping_add(1);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to persist worker claim bookkeeping to members.json; keeping claim in memory"
-                );
-            }
+        if let Err(e) = self.persist_snapshot_up_to(pending.target_generation, true) {
+            tracing::warn!(
+                error = %e,
+                "failed to persist worker claim bookkeeping to members.json; keeping claim in memory"
+            );
         }
     }
 
@@ -788,6 +865,8 @@ impl MemberStore {
                 },
                 ..Default::default()
             })),
+            write_lock: Arc::new(Mutex::new(0)),
+            persist_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -831,6 +910,8 @@ impl MemberStore {
                 },
                 ..Default::default()
             })),
+            write_lock: Arc::new(Mutex::new(0)),
+            persist_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -891,7 +972,10 @@ impl MemberStore {
         {
             let mut guard = store.inner.write().unwrap_or_else(|e| e.into_inner());
             guard.state.invites = parsed.invites;
-            guard.state.prune_inactive_invites(now_unix_secs());
+            let active_empty = HashMap::new();
+            guard
+                .state
+                .prune_inactive_invites(now_unix_secs(), &active_empty);
             let mut seq = parsed
                 .worker_last_seq
                 .values()
@@ -982,17 +1066,6 @@ impl MemberStore {
         host_name: impl Into<String>,
         persist: bool,
     ) -> GridResult<()> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if !persist {
-            guard.save_path = None;
-        }
-        if guard.state.revoked_keys.contains(&host_pubkey) {
-            tracing::warn!(
-                member_id = %host_pubkey.member_id(),
-                "Skipping auto-enrollment of local host node.key because its public key is in revoked_keys"
-            );
-            return Ok(());
-        }
         let now = now_unix_secs();
         let name = sanitize_display_field(&host_name.into(), MAX_MEMBER_NAME_CHARS);
         let name = if name.is_empty() {
@@ -1000,44 +1073,66 @@ impl MemberStore {
         } else {
             name
         };
-        let needs_update = match guard.state.by_pubkey.get(&host_pubkey) {
-            Some(entry) => !entry.roles.contains(&MemberRole::Admin),
-            None => true,
-        };
-        if !needs_update {
-            return Ok(());
-        }
-        guard.mutate_and_persist(|staged| {
-            match staged.by_pubkey.get_mut(&host_pubkey) {
-                Some(entry) => {
-                    if !entry.roles.contains(&MemberRole::Admin) {
-                        entry.roles.push(MemberRole::Admin);
-                    }
-                }
-                None => {
-                    let entry = MemberEntry {
-                        id: host_pubkey.member_id(),
-                        name,
-                        public_key: host_pubkey,
-                        roles: vec![MemberRole::Admin],
-                        enrolled_at: Some(now),
-                        last_seen: Some(now),
-                        via_invite: Some(LOCAL_HOST_INVITE_TAG.to_string()),
-                    };
-                    staged.by_pubkey.insert(host_pubkey, entry);
+        let apply_host_admin = |state: &mut PersistentMemberState, name: String| match state
+            .by_pubkey
+            .get_mut(&host_pubkey)
+        {
+            Some(entry) => {
+                if !entry.roles.contains(&MemberRole::Admin) {
+                    entry.roles.push(MemberRole::Admin);
                 }
             }
-            Ok(())
-        })?;
-        let next_gen = guard
-            .member_generations
-            .get(&host_pubkey)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1);
-        guard.member_generations.insert(host_pubkey, next_gen);
-        guard.unconfirmed_approvals.remove(&host_pubkey);
-        Ok(())
+            None => {
+                let entry = MemberEntry {
+                    id: host_pubkey.member_id(),
+                    name,
+                    public_key: host_pubkey,
+                    roles: vec![MemberRole::Admin],
+                    enrolled_at: Some(now),
+                    last_seen: Some(now),
+                    via_invite: Some(LOCAL_HOST_INVITE_TAG.to_string()),
+                };
+                state.by_pubkey.insert(host_pubkey, entry);
+            }
+        };
+        self.run_admin_mutation(
+            |guard| {
+                if !persist {
+                    guard.save_path = None;
+                }
+                if guard.state.revoked_keys.contains(&host_pubkey) {
+                    tracing::warn!(
+                        member_id = %host_pubkey.member_id(),
+                        "Skipping auto-enrollment of local host node.key because its public key is in revoked_keys"
+                    );
+                    return Ok(AdminMutationPlan::NoOp(()));
+                }
+                let needs_update = match guard.state.by_pubkey.get(&host_pubkey) {
+                    Some(entry) => !entry.roles.contains(&MemberRole::Admin),
+                    None => true,
+                };
+                if !needs_update {
+                    return Ok(AdminMutationPlan::NoOp(()));
+                }
+                let mut staged = guard.state.clone();
+                apply_host_admin(&mut staged, name.clone());
+                Ok(AdminMutationPlan::Persist {
+                    staged,
+                    token: name,
+                })
+            },
+            |guard, name, _| {
+                apply_host_admin(&mut guard.state, name);
+                let next_gen = guard
+                    .member_generations
+                    .get(&host_pubkey)
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                guard.member_generations.insert(host_pubkey, next_gen);
+                guard.unconfirmed_approvals.remove(&host_pubkey);
+            },
+        )
     }
 
     /// Creates and persists a new invite (design 0051 D3).
@@ -1081,13 +1176,24 @@ impl MemberStore {
             require_approval,
             revoked: false,
         };
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        guard.mutate_and_persist(|staged| {
-            staged.prune_inactive_invites(now);
-            staged.invites.push(record.clone());
-            Ok(())
-        })?;
-        Ok(record)
+        self.run_admin_mutation(
+            |guard| {
+                let mut staged = guard.state.clone();
+                staged.prune_inactive_invites(now, &guard.active_approval_invites);
+                staged.invites.push(record.clone());
+                Ok(AdminMutationPlan::Persist {
+                    staged,
+                    token: record,
+                })
+            },
+            |guard, record, _| {
+                guard
+                    .state
+                    .prune_inactive_invites(now, &guard.active_approval_invites);
+                guard.state.invites.push(record.clone());
+                record
+            },
+        )
     }
 
     /// Lists all invites (design 0051 D3).
@@ -1104,35 +1210,123 @@ impl MemberStore {
     /// Revokes an invite by ID or unique hex prefix (>= 4 chars) and rejects any pending
     /// enrollment requests waiting on that invite.
     pub fn revoke_invite(&self, target: &str) -> GridResult<String> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_or_prefix(
-            target,
-            guard.state.invites.iter().map(|inv| inv.invite_id.as_str()),
-            "invite",
-        )?;
-        guard.mutate_and_persist(|staged| {
-            let inv = staged
-                .invites
-                .iter_mut()
-                .find(|i| i.invite_id == id)
-                .ok_or_else(|| GridError::Config(format!("unknown invite '{target}'")))?;
-            inv.revoked = true;
-            Ok(())
-        })?;
-        let dropped_pending_ids: Vec<String> = guard
-            .pending
-            .iter()
-            .filter(|(_, entry)| entry.info.invite_id == id)
-            .map(|(pid, _)| pid.clone())
-            .collect();
-        for pid in dropped_pending_ids {
-            if let Some(entry) = guard.pending.remove(&pid) {
-                let _ = entry.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                });
-            }
+        self.run_admin_mutation(
+            |guard| {
+                let id = resolve_id_or_prefix(
+                    target,
+                    guard.state.invites.iter().map(|inv| inv.invite_id.as_str()),
+                    "invite",
+                )?;
+                let mut staged = guard.state.clone();
+                let inv = staged
+                    .invites
+                    .iter_mut()
+                    .find(|i| i.invite_id == id)
+                    .ok_or_else(|| GridError::Config(format!("unknown invite '{target}'")))?;
+                inv.revoked = true;
+                Ok(AdminMutationPlan::Persist { staged, token: id })
+            },
+            |guard, id, _| {
+                if let Some(inv) = guard.state.invites.iter_mut().find(|i| i.invite_id == id) {
+                    inv.revoked = true;
+                }
+                let dropped_pending_ids: Vec<String> = guard
+                    .pending
+                    .iter()
+                    .filter(|(_, entry)| entry.info.invite_id == id)
+                    .map(|(pid, _)| pid.clone())
+                    .collect();
+                for pid in dropped_pending_ids {
+                    if let Some(entry) = guard.pending.remove(&pid) {
+                        let _ = entry.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                }
+                id
+            },
+        )
+    }
+
+    fn validate_enroll_candidate(
+        guard: &mut MemberStoreInner,
+        now: u64,
+        peer_public_key: PublicKey,
+        handshake_hash: &[u8; KEY_LEN],
+        invite_id: &str,
+        proof: &RedactedBytes32,
+        name: &str,
+    ) -> Result<(usize, String), EnrollOutcome> {
+        guard.prune_pending(now);
+
+        if guard.state.revoked_keys.contains(&peer_public_key) {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!(
+                    "public key of candidate {} has been revoked",
+                    peer_public_key.member_id()
+                ),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
         }
-        Ok(id)
+
+        let Some(inv_idx) = guard
+            .state
+            .invites
+            .iter()
+            .position(|i| i.invite_id == invite_id)
+        else {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!("unknown invite_id '{invite_id}'"),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        };
+        let invite = &guard.state.invites[inv_idx];
+        if invite.revoked {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!("invite '{}' has been revoked", invite.invite_id),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        }
+        if now >= invite.expires_at {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!("invite '{}' has expired", invite.invite_id),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        }
+        if invite.uses_remaining == 0 {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!("invite '{}' has no remaining uses", invite.invite_id),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        }
+        if !verify_enroll_proof(&invite.invite_secret.0, handshake_hash, proof) {
+            return Err(EnrollOutcome::Rejected {
+                log_reason: format!(
+                    "invalid enrollment proof for invite '{}' from candidate {}",
+                    invite.invite_id,
+                    peer_public_key.member_id()
+                ),
+                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+            });
+        }
+
+        let clean_name = if name.trim().is_empty() {
+            peer_public_key.member_id()
+        } else {
+            match validate_member_name(name) {
+                Ok(valid) => valid,
+                Err(e) => {
+                    return Err(EnrollOutcome::Rejected {
+                        log_reason: format!(
+                            "invalid enrollment name from candidate {}: {e}",
+                            peer_public_key.member_id()
+                        ),
+                        wire_message: format!("enrollment rejected: {e}"),
+                    });
+                }
+            }
+        };
+        Ok((inv_idx, clean_name))
     }
 
     /// Processes an incoming `ClientMessage::Enroll` over a v3 `enroll` session (design 0051 D4).
@@ -1151,106 +1345,95 @@ impl MemberStore {
         os: String,
         arch: String,
     ) -> GridResult<EnrollOutcome> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let now = now_unix_secs();
-        guard.prune_pending(now);
-
-        if guard.state.revoked_keys.contains(&peer_public_key) {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!(
-                    "public key of candidate {} has been revoked",
-                    peer_public_key.member_id()
-                ),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
-        }
-
-        let Some(inv_idx) = guard
-            .state
-            .invites
-            .iter()
-            .position(|i| i.invite_id == invite_id)
-        else {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!("unknown invite_id '{invite_id}'"),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+        let maybe_no_approval = {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .state
+                .invites
+                .iter()
+                .find(|i| i.invite_id == invite_id)
+                .is_some_and(|i| !i.require_approval)
         };
-        let invite = &guard.state.invites[inv_idx];
-        if invite.revoked {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!("invite '{}' has been revoked", invite.invite_id),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
-        }
-        if now >= invite.expires_at {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!("invite '{}' has expired", invite.invite_id),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
-        }
-        if invite.uses_remaining == 0 {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!("invite '{}' has no remaining uses", invite.invite_id),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
-        }
-        if !verify_enroll_proof(&invite.invite_secret.0, handshake_hash, proof) {
-            return Ok(EnrollOutcome::Rejected {
-                log_reason: format!(
-                    "invalid enrollment proof for invite '{}' from candidate {}",
-                    invite.invite_id,
-                    peer_public_key.member_id()
-                ),
-                wire_message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-            });
+        let now = now_unix_secs();
+
+        if maybe_no_approval {
+            return self.run_admin_mutation(
+                |guard| {
+                    let (inv_idx, clean_name) = match Self::validate_enroll_candidate(
+                        guard,
+                        now,
+                        peer_public_key,
+                        handshake_hash,
+                        invite_id,
+                        proof,
+                        &name,
+                    ) {
+                        Ok(ok) => ok,
+                        Err(rejected) => return Ok(AdminMutationPlan::NoOp(rejected)),
+                    };
+                    let roles = guard.state.invites[inv_idx].roles.clone();
+                    let inv_id = guard.state.invites[inv_idx].invite_id.clone();
+                    let mut staged = guard.state.clone();
+                    staged.invites[inv_idx].uses_remaining -= 1;
+                    let entry = staged.upsert_member(
+                        peer_public_key,
+                        clean_name.clone(),
+                        roles.clone(),
+                        Some(inv_id.clone()),
+                        now,
+                    );
+                    Ok(AdminMutationPlan::Persist {
+                        staged,
+                        token: (inv_id, clean_name, roles, entry),
+                    })
+                },
+                |guard, (inv_id, clean_name, roles, _staged_entry), _| {
+                    if let Some(inv) = guard
+                        .state
+                        .invites
+                        .iter_mut()
+                        .find(|i| i.invite_id == inv_id)
+                    {
+                        inv.uses_remaining = inv.uses_remaining.saturating_sub(1);
+                    }
+                    let entry = guard.state.upsert_member(
+                        peer_public_key,
+                        clean_name,
+                        roles,
+                        Some(inv_id),
+                        now,
+                    );
+                    let next_gen = guard
+                        .member_generations
+                        .get(&peer_public_key)
+                        .copied()
+                        .unwrap_or(0)
+                        .wrapping_add(1);
+                    guard.member_generations.insert(peer_public_key, next_gen);
+                    guard.unconfirmed_approvals.remove(&peer_public_key);
+                    EnrollOutcome::ImmediateApproved {
+                        member_id: entry.id,
+                        roles: entry.roles,
+                    }
+                },
+            );
         }
 
-        let clean_name = if name.trim().is_empty() {
-            peer_public_key.member_id()
-        } else {
-            match validate_member_name(&name) {
-                Ok(valid) => valid,
-                Err(e) => {
-                    return Ok(EnrollOutcome::Rejected {
-                        log_reason: format!(
-                            "invalid enrollment name from candidate {}: {e}",
-                            peer_public_key.member_id()
-                        ),
-                        wire_message: format!("enrollment rejected: {e}"),
-                    });
-                }
-            }
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let (inv_idx, clean_name) = match Self::validate_enroll_candidate(
+            &mut guard,
+            now,
+            peer_public_key,
+            handshake_hash,
+            invite_id,
+            proof,
+            &name,
+        ) {
+            Ok(ok) => ok,
+            Err(rejected) => return Ok(rejected),
         };
         let clean_os = sanitize_display_field(&os, 32);
         let clean_arch = sanitize_display_field(&arch, 32);
-
-        if !invite.require_approval {
-            let roles = invite.roles.clone();
-            let inv_id = invite.invite_id.clone();
-            let entry = guard.mutate_and_persist(|staged| {
-                staged.invites[inv_idx].uses_remaining -= 1;
-                Ok(staged.upsert_member(
-                    peer_public_key,
-                    clean_name,
-                    roles.clone(),
-                    Some(inv_id),
-                    now,
-                ))
-            })?;
-            let next_gen = guard
-                .member_generations
-                .get(&peer_public_key)
-                .copied()
-                .unwrap_or(0)
-                .wrapping_add(1);
-            guard.member_generations.insert(peer_public_key, next_gen);
-            guard.unconfirmed_approvals.remove(&peer_public_key);
-            return Ok(EnrollOutcome::ImmediateApproved {
-                member_id: entry.id,
-                roles: entry.roles,
-            });
-        }
 
         if guard
             .pending
@@ -1273,6 +1456,7 @@ impl MemberStore {
             });
         }
 
+        let invite = &guard.state.invites[inv_idx];
         let member_id = peer_public_key.member_id();
         let pending_id = random_hex(8)?;
         let pairing_code = derive_pairing_code(handshake_hash);
@@ -1331,211 +1515,225 @@ impl MemberStore {
     /// Consumes one use from the invite at approval time and writes `members.json` before
     /// mutating in-memory state.
     pub fn approve_pending(&self, target: &str, pairing_code: &str) -> GridResult<MemberEntry> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
-        guard.prune_pending(now);
-
         let (code_part, fp_part) = match pairing_code.split_once('@') {
             Some((c, f)) => (c, Some(f)),
             None => (pairing_code, None),
         };
-        let id = resolve_id_or_prefix(
-            target,
-            guard.pending.values().map(|e| e.info.pending_id.as_str()),
-            "pending enrollment",
-        )?;
-        if let Some(expected_fp) = fp_part {
-            let expected_clean: String = expected_fp
-                .trim()
-                .chars()
-                .filter(|c| *c != '-')
-                .collect::<String>()
-                .to_ascii_lowercase();
-            if let Some(entry) = guard.pending.get(&id) {
-                let actual_clean: String = entry
-                    .info
-                    .master_fingerprint
-                    .chars()
-                    .filter(|c| *c != '-')
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                if actual_clean != expected_clean {
+        self.run_admin_mutation(
+            |guard| {
+                guard.prune_pending(now);
+                let id = resolve_id_or_prefix(
+                    target,
+                    guard.pending.values().map(|e| e.info.pending_id.as_str()),
+                    "pending enrollment",
+                )?;
+                if let Some(expected_fp) = fp_part {
+                    let expected_clean: String = expected_fp
+                        .trim()
+                        .chars()
+                        .filter(|c| *c != '-')
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if let Some(entry) = guard.pending.get(&id) {
+                        let actual_clean: String = entry
+                            .info
+                            .master_fingerprint
+                            .chars()
+                            .filter(|c| *c != '-')
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        if actual_clean != expected_clean {
+                            return Err(GridError::Config(format!(
+                                "master key fingerprint mismatch (joining machine showed {expected_fp}, master has {})",
+                                entry.info.master_fingerprint
+                            )));
+                        }
+                    }
+                }
+                let expected_code_matches = guard
+                    .pending
+                    .get(&id)
+                    .is_some_and(|e| verify_pairing_code(e.pairing_code.as_str(), code_part));
+                if !expected_code_matches {
                     return Err(GridError::Config(format!(
-                        "master key fingerprint mismatch (joining machine showed {expected_fp}, master has {})",
-                        entry.info.master_fingerprint
+                        "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
                     )));
                 }
-            }
-        }
-        let expected_code_matches = guard
-            .pending
-            .get(&id)
-            .is_some_and(|e| verify_pairing_code(e.pairing_code.as_str(), code_part));
-        if !expected_code_matches {
-            return Err(GridError::Config(format!(
-                "pairing code mismatch for pending enrollment '{id}'; verify the 6-digit code and master key fingerprint shown on the joining machine"
-            )));
-        }
 
-        let pending_info = guard
-            .pending
-            .get(&id)
-            .map(|e| e.info.clone())
-            .ok_or_else(|| GridError::Config(format!("no pending enrollment '{target}'")))?;
+                let pending_info = guard
+                    .pending
+                    .get(&id)
+                    .map(|e| e.info.clone())
+                    .ok_or_else(|| GridError::Config(format!("no pending enrollment '{target}'")))?;
 
-        if guard.state.revoked_keys.contains(&pending_info.public_key) {
-            if let Some(pending) = guard.pending.remove(&id) {
-                let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                if guard.state.revoked_keys.contains(&pending_info.public_key) {
+                    if let Some(pending) = guard.pending.remove(&id) {
+                        let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                    return Err(GridError::Config(
+                        "cannot approve: this machine's public key has been revoked".into(),
+                    ));
+                }
+
+                let inv_idx = guard
+                    .state
+                    .invites
+                    .iter()
+                    .position(|i| i.invite_id == pending_info.invite_id);
+                let Some(inv_idx) = inv_idx else {
+                    if let Some(pending) = guard.pending.remove(&id) {
+                        let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                    return Err(GridError::Config(
+                        "cannot approve: the invite for this request no longer exists".into(),
+                    ));
+                };
+                if guard.state.invites[inv_idx].revoked {
+                    if let Some(pending) = guard.pending.remove(&id) {
+                        let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                    return Err(GridError::Config(
+                        "cannot approve: the invite for this request has been revoked".into(),
+                    ));
+                }
+                if now >= guard.state.invites[inv_idx].expires_at {
+                    if let Some(pending) = guard.pending.remove(&id) {
+                        let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                    return Err(GridError::Config(
+                        "cannot approve: the invite for this request has expired".into(),
+                    ));
+                }
+                if guard.state.invites[inv_idx].uses_remaining == 0 {
+                    if let Some(pending) = guard.pending.remove(&id) {
+                        let _ = pending.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                    return Err(GridError::Config(
+                        "cannot approve: the invite for this request has no remaining uses".into(),
+                    ));
+                }
+
+                if guard
+                    .pending
+                    .get(&id)
+                    .is_none_or(|e| e.decision_tx.is_closed())
+                {
+                    guard.pending.remove(&id);
+                    return Err(GridError::Config(format!(
+                        "pending enrollment '{id}' disconnected before approval could be delivered"
+                    )));
+                }
+
+                let gen_before = guard
+                    .member_generations
+                    .get(&pending_info.public_key)
+                    .copied()
+                    .unwrap_or(0);
+                let mut tracker = match guard.unconfirmed_approvals.get(&pending_info.public_key) {
+                    Some(existing) if existing.expected_generation == gen_before => {
+                        existing.clone()
+                    }
+                    _ => UnconfirmedMemberTracker {
+                        baseline: guard.state.by_pubkey.get(&pending_info.public_key).cloned(),
+                        ops: Vec::new(),
+                        expected_generation: gen_before,
+                    },
+                };
+                let approval_id = guard.next_approval_id.wrapping_add(1);
+                guard.next_approval_id = approval_id;
+                tracker.ops.push(UnconfirmedApprovalOp {
+                    approval_id,
+                    name: pending_info.name.clone(),
+                    roles: pending_info.roles.clone(),
+                    invite_id: pending_info.invite_id.clone(),
+                    approved_at: now,
                 });
-            }
-            return Err(GridError::Config(
-                "cannot approve: this machine's public key has been revoked".into(),
-            ));
-        }
 
-        let inv_idx = guard
-            .state
-            .invites
-            .iter()
-            .position(|i| i.invite_id == pending_info.invite_id);
-        let Some(inv_idx) = inv_idx else {
-            if let Some(pending) = guard.pending.remove(&id) {
-                let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                });
-            }
-            return Err(GridError::Config(
-                "cannot approve: the invite for this request no longer exists".into(),
-            ));
-        };
-        if guard.state.invites[inv_idx].revoked {
-            if let Some(pending) = guard.pending.remove(&id) {
-                let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                });
-            }
-            return Err(GridError::Config(
-                "cannot approve: the invite for this request has been revoked".into(),
-            ));
-        };
-        if now >= guard.state.invites[inv_idx].expires_at {
-            if let Some(pending) = guard.pending.remove(&id) {
-                let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                });
-            }
-            return Err(GridError::Config(
-                "cannot approve: the invite for this request has expired".into(),
-            ));
-        }
-        if guard.state.invites[inv_idx].uses_remaining == 0 {
-            if let Some(pending) = guard.pending.remove(&id) {
-                let _ = pending.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
-                });
-            }
-            return Err(GridError::Config(
-                "cannot approve: the invite for this request has no remaining uses".into(),
-            ));
-        }
+                let mut staged = guard.state.clone();
+                staged.invites[inv_idx].uses_remaining -= 1;
+                let mut rebuilt = tracker.baseline.clone();
+                for op in &tracker.ops {
+                    apply_unconfirmed_op_to_entry(&mut rebuilt, pending_info.public_key, op);
+                }
+                let entry = rebuilt.expect("tracker has at least one approval op");
+                staged
+                    .by_pubkey
+                    .insert(pending_info.public_key, entry.clone());
 
-        if guard
-            .pending
-            .get(&id)
-            .is_none_or(|e| e.decision_tx.is_closed())
-        {
-            guard.pending.remove(&id);
-            return Err(GridError::Config(format!(
-                "pending enrollment '{id}' disconnected before approval could be delivered"
-            )));
-        }
-
-        let gen_before = guard
-            .member_generations
-            .get(&pending_info.public_key)
-            .copied()
-            .unwrap_or(0);
-        let mut tracker = match guard.unconfirmed_approvals.get(&pending_info.public_key) {
-            Some(existing) if existing.expected_generation == gen_before => existing.clone(),
-            _ => UnconfirmedMemberTracker {
-                baseline: guard.state.by_pubkey.get(&pending_info.public_key).cloned(),
-                ops: Vec::new(),
-                deferred_invite_restores: Vec::new(),
-                expected_generation: gen_before,
-            },
-        };
-        let approval_id = guard.next_approval_id.wrapping_add(1);
-        guard.next_approval_id = approval_id;
-        tracker.ops.push(UnconfirmedApprovalOp {
-            approval_id,
-            name: pending_info.name.clone(),
-            roles: pending_info.roles.clone(),
-            invite_id: pending_info.invite_id.clone(),
-            approved_at: now,
-        });
-
-        let entry = guard.mutate_and_persist(|staged| {
-            staged.invites[inv_idx].uses_remaining -= 1;
-            let mut rebuilt = tracker.baseline.clone();
-            for op in &tracker.ops {
-                apply_unconfirmed_op_to_entry(&mut rebuilt, pending_info.public_key, op);
-            }
-            let entry = rebuilt.expect("tracker has at least one approval op");
-            staged
-                .by_pubkey
-                .insert(pending_info.public_key, entry.clone());
-            Ok(entry)
-        })?;
-        let new_gen = gen_before.wrapping_add(1);
-        guard
-            .member_generations
-            .insert(pending_info.public_key, new_gen);
-        tracker.expected_generation = new_gen;
-        guard
-            .unconfirmed_approvals
-            .insert(pending_info.public_key, tracker);
-        guard
-            .active_approval_invites
-            .insert(approval_id, pending_info.invite_id.clone());
-
-        let rollback = ApprovedEnrollmentRollback {
-            approval_id,
-            public_key: pending_info.public_key,
-            member_id: entry.id.clone(),
-            expected_generation: new_gen,
-            invite_id: pending_info.invite_id,
-        };
-        let send_failed = match guard.pending.remove(&id) {
-            Some(pending) => pending
-                .decision_tx
-                .send(PendingDecision::Approved {
-                    member_id: entry.id.clone(),
-                    roles: entry.roles.clone(),
-                    rollback: Box::new(rollback.clone()),
+                Ok(AdminMutationPlan::Persist {
+                    staged,
+                    token: (id, approval_id, pending_info, gen_before, tracker, entry),
                 })
-                .is_err(),
-            None => true,
-        };
-        if send_failed {
-            drop(guard);
-            if let Err(rb_err) = self.rollback_approved_enrollment(rollback) {
-                tracing::warn!(
-                    pending_id = %id,
-                    error = %rb_err,
-                    "failed to persist rollback after pending enrollment disconnected during approval"
-                );
-            }
-            return Err(GridError::Config(format!(
-                "pending enrollment '{id}' disconnected before approval could be delivered"
-            )));
-        }
-        Ok(entry)
+            },
+            |guard,
+             (id, approval_id, pending_info, gen_before, mut tracker, entry),
+             force_resync| {
+                let new_gen = gen_before.wrapping_add(1);
+                let rollback = ApprovedEnrollmentRollback {
+                    approval_id,
+                    public_key: pending_info.public_key,
+                    member_id: entry.id.clone(),
+                    expected_generation: new_gen,
+                    invite_id: pending_info.invite_id.clone(),
+                };
+                let delivered = guard.pending.remove(&id).is_some_and(|pending| {
+                    pending
+                        .decision_tx
+                        .send(PendingDecision::Approved {
+                            member_id: entry.id.clone(),
+                            roles: entry.roles.clone(),
+                            rollback: Box::new(rollback),
+                        })
+                        .is_ok()
+                });
+                if !delivered {
+                    *force_resync = true;
+                    return Err(GridError::Config(format!(
+                        "pending enrollment '{id}' disconnected before approval could be delivered"
+                    )));
+                }
+                if let Some(inv) = guard
+                    .state
+                    .invites
+                    .iter_mut()
+                    .find(|i| i.invite_id == pending_info.invite_id)
+                {
+                    inv.uses_remaining = inv.uses_remaining.saturating_sub(1);
+                }
+                guard
+                    .state
+                    .by_pubkey
+                    .insert(pending_info.public_key, entry.clone());
+                guard
+                    .member_generations
+                    .insert(pending_info.public_key, new_gen);
+                tracker.expected_generation = new_gen;
+                guard
+                    .unconfirmed_approvals
+                    .insert(pending_info.public_key, tracker);
+                guard
+                    .active_approval_invites
+                    .insert(approval_id, pending_info.invite_id);
+                Ok(entry)
+            },
+        )?
     }
 
     /// Marks an approved enrollment as confirmed by the joining machine (`ClientMessage::Hello`)
     /// so its member state and invite consumption become permanent.
     pub fn confirm_approved_enrollment(&self, rollback: &ApprovedEnrollmentRollback) {
+        let _write_guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         guard.active_approval_invites.remove(&rollback.approval_id);
         let current_gen = guard
@@ -1571,56 +1769,62 @@ impl MemberStore {
     ///
     /// Uses compare-and-swap against the member's generation and unconfirmed-approval tracker:
     /// - Never re-inserts a key that is in `revoked_keys`.
-    /// - Restores an invite's `uses_remaining` **only** when the key is no longer a member after
-    ///   the rollback (`N5`), so no sequence of renames or concurrent approvals can leave the key
-    ///   enrolled while also refunding its invite use.
+    /// - When the CAS tracker removes the rolled-back approval op, restores its invite's
+    ///   `uses_remaining` unconditionally (`R5-1`, including role upgrades and concurrent
+    ///   approvals); on the fallback path where the tracker was invalidated (e.g. by
+    ///   `--no-approval`), restores the invite use only when the key is no longer a member (`N5`).
+    /// - Updates in-memory state atomically before writing `members.json` outside `self.inner` so
+    ///   a failed disk write still leaves in-memory membership and trackers consistent (`NIT 5`).
     /// - Returns the list of `worker_id` claims released if the rollback removed the member or its
     ///   `worker` role.
     pub fn rollback_approved_enrollment(
         &self,
         rollback: ApprovedEnrollmentRollback,
     ) -> GridResult<Vec<Uuid>> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let invite_to_restore = guard.active_approval_invites.remove(&rollback.approval_id);
-        let current_gen = guard
-            .member_generations
-            .get(&rollback.public_key)
-            .copied()
-            .unwrap_or(0);
-        let is_revoked = guard.state.revoked_keys.contains(&rollback.public_key);
-
-        let updated_tracker = if !is_revoked {
-            guard
-                .unconfirmed_approvals
+        let mut persisted_gen = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (released_workers, snapshot) = {
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            let invite_to_restore = guard.active_approval_invites.remove(&rollback.approval_id);
+            let current_gen = guard
+                .member_generations
                 .get(&rollback.public_key)
-                .filter(|t| {
-                    t.expected_generation == current_gen
-                        && t.ops
-                            .iter()
-                            .any(|op| op.approval_id == rollback.approval_id)
-                })
-                .cloned()
-        } else {
-            None
-        };
+                .copied()
+                .unwrap_or(0);
+            let is_revoked = guard.state.revoked_keys.contains(&rollback.public_key);
 
-        if let Some(mut tracker) = updated_tracker {
-            tracker
-                .ops
-                .retain(|op| op.approval_id != rollback.approval_id);
-            let mut rebuilt = tracker.baseline.clone();
-            for op in &tracker.ops {
-                apply_unconfirmed_op_to_entry(&mut rebuilt, rollback.public_key, op);
-            }
-            let (released_workers, still_member) = guard.mutate_and_persist(|staged| {
-                let mut released = Vec::new();
-                if !staged.revoked_keys.contains(&rollback.public_key) {
+            let updated_tracker = if !is_revoked {
+                guard
+                    .unconfirmed_approvals
+                    .get(&rollback.public_key)
+                    .filter(|t| {
+                        t.expected_generation == current_gen
+                            && t.ops
+                                .iter()
+                                .any(|op| op.approval_id == rollback.approval_id)
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+
+            let mut released = Vec::new();
+            let mut state_changed = false;
+
+            if let Some(mut tracker) = updated_tracker {
+                tracker
+                    .ops
+                    .retain(|op| op.approval_id != rollback.approval_id);
+                let mut rebuilt = tracker.baseline.clone();
+                for op in &tracker.ops {
+                    apply_unconfirmed_op_to_entry(&mut rebuilt, rollback.public_key, op);
+                }
+                if !guard.state.revoked_keys.contains(&rollback.public_key) {
                     match rebuilt {
                         Some(prev) => {
                             let has_worker = prev.has_worker_role();
-                            staged.by_pubkey.insert(rollback.public_key, prev);
+                            guard.state.by_pubkey.insert(rollback.public_key, prev);
                             if !has_worker {
-                                staged.worker_owners.retain(|wid, owner| {
+                                guard.state.worker_owners.retain(|wid, owner| {
                                     if *owner == rollback.member_id {
                                         released.push(*wid);
                                         false
@@ -1629,13 +1833,13 @@ impl MemberStore {
                                     }
                                 });
                                 for wid in &released {
-                                    staged.worker_last_seq.remove(wid);
+                                    guard.state.worker_last_seq.remove(wid);
                                 }
                             }
                         }
                         None => {
-                            staged.by_pubkey.remove(&rollback.public_key);
-                            staged.worker_owners.retain(|wid, owner| {
+                            guard.state.by_pubkey.remove(&rollback.public_key);
+                            guard.state.worker_owners.retain(|wid, owner| {
                                 if *owner == rollback.member_id {
                                     released.push(*wid);
                                     false
@@ -1644,68 +1848,72 @@ impl MemberStore {
                                 }
                             });
                             for wid in &released {
-                                staged.worker_last_seq.remove(wid);
+                                guard.state.worker_last_seq.remove(wid);
                             }
                         }
                     }
+                    state_changed = true;
                 }
-                let still_member = staged.by_pubkey.contains_key(&rollback.public_key);
-                if !still_member {
-                    for inv_id in tracker
-                        .deferred_invite_restores
-                        .iter()
-                        .chain(invite_to_restore.iter())
+                if let Some(ref inv_id) = invite_to_restore {
+                    if let Some(inv) = guard
+                        .state
+                        .invites
+                        .iter_mut()
+                        .find(|i| i.invite_id == *inv_id)
                     {
-                        if let Some(inv) =
-                            staged.invites.iter_mut().find(|i| i.invite_id == *inv_id)
-                        {
-                            inv.uses_remaining =
-                                inv.uses_remaining.saturating_add(1).min(inv.max_uses);
-                        }
+                        inv.uses_remaining = inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+                        state_changed = true;
                     }
                 }
-                Ok((released, still_member))
-            })?;
-            if still_member {
-                if !tracker.ops.is_empty() {
-                    if let Some(inv_id) = invite_to_restore {
-                        tracker.deferred_invite_restores.push(inv_id);
-                    }
-                }
-            } else {
-                tracker.deferred_invite_restores.clear();
-            }
-            let new_gen = current_gen.wrapping_add(1);
-            guard
-                .member_generations
-                .insert(rollback.public_key, new_gen);
-            if tracker.ops.is_empty() {
-                guard.unconfirmed_approvals.remove(&rollback.public_key);
-            } else {
-                tracker.expected_generation = new_gen;
+                let new_gen = current_gen.wrapping_add(1);
                 guard
-                    .unconfirmed_approvals
-                    .insert(rollback.public_key, tracker);
-            }
-            return Ok(released_workers);
-        }
-
-        guard.unconfirmed_approvals.remove(&rollback.public_key);
-        if let Some(inv_id) = invite_to_restore {
-            if !guard.state.by_pubkey.contains_key(&rollback.public_key) {
-                guard.mutate_and_persist(|staged| {
-                    if !staged.by_pubkey.contains_key(&rollback.public_key) {
-                        if let Some(inv) = staged.invites.iter_mut().find(|i| i.invite_id == inv_id)
+                    .member_generations
+                    .insert(rollback.public_key, new_gen);
+                if tracker.ops.is_empty() {
+                    guard.unconfirmed_approvals.remove(&rollback.public_key);
+                } else {
+                    tracker.expected_generation = new_gen;
+                    guard
+                        .unconfirmed_approvals
+                        .insert(rollback.public_key, tracker);
+                }
+            } else {
+                guard.unconfirmed_approvals.remove(&rollback.public_key);
+                if let Some(inv_id) = invite_to_restore {
+                    if !guard.state.by_pubkey.contains_key(&rollback.public_key) {
+                        if let Some(inv) = guard
+                            .state
+                            .invites
+                            .iter_mut()
+                            .find(|i| i.invite_id == inv_id)
                         {
                             inv.uses_remaining =
                                 inv.uses_remaining.saturating_add(1).min(inv.max_uses);
+                            state_changed = true;
                         }
                     }
-                    Ok(())
-                })?;
+                }
             }
+
+            let snapshot = if state_changed {
+                guard.state_generation = guard.state_generation.saturating_add(1);
+                let snap_gen = guard.state_generation;
+                guard
+                    .save_path
+                    .as_ref()
+                    .map(|p| (p.clone(), guard.state.to_members_file(), snap_gen))
+            } else {
+                None
+            };
+            (released, snapshot)
+        };
+
+        if let Some((path, file, snap_gen)) = snapshot {
+            write_members_file_atomic(&path, &file)?;
+            *persisted_gen = (*persisted_gen).max(snap_gen);
+            self.persist_count.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Vec::new())
+        Ok(released_workers)
     }
 
     /// Rejects a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)
@@ -1741,48 +1949,60 @@ impl MemberStore {
     /// Renames an enrolled member by ID, unique hex prefix, or current name.
     pub fn rename_member(&self, target: &str, new_name: &str) -> GridResult<MemberEntry> {
         let clean = validate_member_name(new_name)?;
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_prefix_or_name(
-            target,
-            guard
-                .state
-                .by_pubkey
-                .values()
-                .map(|m| (m.id.as_str(), m.name.as_str())),
-            "member",
-        )?;
-        let pubkey = *guard
-            .state
-            .by_pubkey
-            .iter()
-            .find(|(_, m)| m.id == id)
-            .map(|(k, _)| k)
-            .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-        let updated = guard.mutate_and_persist(|staged| {
-            let entry = staged
-                .by_pubkey
-                .get_mut(&pubkey)
-                .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-            entry.name = clean;
-            Ok(entry.clone())
-        })?;
-        let prev_gen = guard.member_generations.get(&pubkey).copied().unwrap_or(0);
-        let next_gen = prev_gen.wrapping_add(1);
-        guard.member_generations.insert(pubkey, next_gen);
-        if let Some(tracker) = guard.unconfirmed_approvals.get_mut(&pubkey) {
-            if tracker.expected_generation == prev_gen {
-                if let Some(ref mut base) = tracker.baseline {
-                    base.name = updated.name.clone();
+        self.run_admin_mutation(
+            |guard| {
+                let id = resolve_id_prefix_or_name(
+                    target,
+                    guard
+                        .state
+                        .by_pubkey
+                        .values()
+                        .map(|m| (m.id.as_str(), m.name.as_str())),
+                    "member",
+                )?;
+                let pubkey = *guard
+                    .state
+                    .by_pubkey
+                    .iter()
+                    .find(|(_, m)| m.id == id)
+                    .map(|(k, _)| k)
+                    .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+                let mut staged = guard.state.clone();
+                let entry = staged
+                    .by_pubkey
+                    .get_mut(&pubkey)
+                    .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+                entry.name = clean.clone();
+                let updated = entry.clone();
+                Ok(AdminMutationPlan::Persist {
+                    staged,
+                    token: (pubkey, clean, updated),
+                })
+            },
+            |guard, (pubkey, clean, mut updated), _| {
+                if let Some(entry) = guard.state.by_pubkey.get_mut(&pubkey) {
+                    entry.name = clean;
+                    updated = entry.clone();
                 }
-                for op in &mut tracker.ops {
-                    op.name = updated.name.clone();
+                let prev_gen = guard.member_generations.get(&pubkey).copied().unwrap_or(0);
+                let next_gen = prev_gen.wrapping_add(1);
+                guard.member_generations.insert(pubkey, next_gen);
+                if let Some(tracker) = guard.unconfirmed_approvals.get_mut(&pubkey) {
+                    if tracker.expected_generation == prev_gen {
+                        if let Some(ref mut base) = tracker.baseline {
+                            base.name = updated.name.clone();
+                        }
+                        for op in &mut tracker.ops {
+                            op.name = updated.name.clone();
+                        }
+                        tracker.expected_generation = next_gen;
+                    } else {
+                        guard.unconfirmed_approvals.remove(&pubkey);
+                    }
                 }
-                tracker.expected_generation = next_gen;
-            } else {
-                guard.unconfirmed_approvals.remove(&pubkey);
-            }
-        }
-        Ok(updated)
+                updated
+            },
+        )
     }
 
     #[cfg(test)]
@@ -1798,61 +2018,86 @@ impl MemberStore {
     /// public key in `revoked_keys`, and releases its owned worker IDs.
     /// Returns `(revoked_entry, owned_worker_ids)`.
     pub fn revoke_member(&self, target: &str) -> GridResult<(MemberEntry, Vec<Uuid>)> {
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let id = resolve_id_or_prefix(
-            target,
-            guard.state.by_pubkey.values().map(|m| m.id.as_str()),
-            "member",
-        )?;
-        let pubkey = *guard
-            .state
-            .by_pubkey
-            .iter()
-            .find(|(_, m)| m.id == id)
-            .map(|(k, _)| k)
-            .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-        let (removed, owned_workers) = guard.mutate_and_persist(|staged| {
-            let removed = staged
-                .by_pubkey
-                .remove(&pubkey)
-                .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
-            staged.revoked_keys.insert(pubkey);
-            let mut owned_workers = Vec::new();
-            staged.worker_owners.retain(|wid, owner| {
-                if *owner == removed.id {
-                    owned_workers.push(*wid);
-                    false
-                } else {
-                    true
-                }
-            });
-            for wid in &owned_workers {
-                staged.worker_last_seq.remove(wid);
-            }
-            Ok((removed, owned_workers))
-        })?;
-        let next_gen = guard
-            .member_generations
-            .get(&pubkey)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1);
-        guard.member_generations.insert(pubkey, next_gen);
-        guard.unconfirmed_approvals.remove(&pubkey);
-        let dropped_pending_ids: Vec<String> = guard
-            .pending
-            .iter()
-            .filter(|(_, entry)| entry.info.public_key == pubkey)
-            .map(|(pid, _)| pid.clone())
-            .collect();
-        for pid in dropped_pending_ids {
-            if let Some(entry) = guard.pending.remove(&pid) {
-                let _ = entry.decision_tx.send(PendingDecision::Rejected {
-                    message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+        self.run_admin_mutation(
+            |guard| {
+                let id = resolve_id_or_prefix(
+                    target,
+                    guard.state.by_pubkey.values().map(|m| m.id.as_str()),
+                    "member",
+                )?;
+                let pubkey = *guard
+                    .state
+                    .by_pubkey
+                    .iter()
+                    .find(|(_, m)| m.id == id)
+                    .map(|(k, _)| k)
+                    .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+                let mut staged = guard.state.clone();
+                let removed = staged
+                    .by_pubkey
+                    .remove(&pubkey)
+                    .ok_or_else(|| GridError::Config(format!("no member '{target}'")))?;
+                staged.revoked_keys.insert(pubkey);
+                let mut owned_workers = Vec::new();
+                staged.worker_owners.retain(|wid, owner| {
+                    if *owner == removed.id {
+                        owned_workers.push(*wid);
+                        false
+                    } else {
+                        true
+                    }
                 });
-            }
-        }
-        Ok((removed, owned_workers))
+                for wid in &owned_workers {
+                    staged.worker_last_seq.remove(wid);
+                }
+                Ok(AdminMutationPlan::Persist {
+                    staged,
+                    token: (pubkey, removed),
+                })
+            },
+            |guard, (pubkey, fallback_removed), _| {
+                let removed = guard
+                    .state
+                    .by_pubkey
+                    .remove(&pubkey)
+                    .unwrap_or(fallback_removed);
+                guard.state.revoked_keys.insert(pubkey);
+                let mut owned_workers = Vec::new();
+                guard.state.worker_owners.retain(|wid, owner| {
+                    if *owner == removed.id {
+                        owned_workers.push(*wid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for wid in &owned_workers {
+                    guard.state.worker_last_seq.remove(wid);
+                }
+                let next_gen = guard
+                    .member_generations
+                    .get(&pubkey)
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                guard.member_generations.insert(pubkey, next_gen);
+                guard.unconfirmed_approvals.remove(&pubkey);
+                let dropped_pending_ids: Vec<String> = guard
+                    .pending
+                    .iter()
+                    .filter(|(_, entry)| entry.info.public_key == pubkey)
+                    .map(|(pid, _)| pid.clone())
+                    .collect();
+                for pid in dropped_pending_ids {
+                    if let Some(entry) = guard.pending.remove(&pid) {
+                        let _ = entry.decision_tx.send(PendingDecision::Rejected {
+                            message: GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                        });
+                    }
+                }
+                (removed, owned_workers)
+            },
+        )
     }
 
     /// Read-only check verifying that `worker_id` is not already owned by another member or by a
@@ -1974,13 +2219,15 @@ impl MemberStore {
         guard.state.v2_worker_seq.insert(worker_id, seq);
 
         let changed = !was_already_v2 || reclaimed_v3 || !v2_to_evict.is_empty();
-        if changed && guard.auth_mode.allows_members() && guard.save_path.is_some() {
-            Ok(Some(PendingBookkeepingPersist {
-                write_generation: guard.write_generation,
-            }))
-        } else {
-            Ok(None)
+        if changed {
+            guard.state_generation = guard.state_generation.saturating_add(1);
+            if guard.auth_mode.allows_members() && guard.save_path.is_some() {
+                return Ok(Some(PendingBookkeepingPersist {
+                    target_generation: guard.state_generation,
+                }));
+            }
         }
+        Ok(None)
     }
 
     /// Records or verifies ownership of `worker_id` by a non-v3 peer (`is_v2_secret = true` when
@@ -2084,9 +2331,10 @@ impl MemberStore {
             .state
             .worker_owners
             .insert(worker_id, member_id.to_string());
+        guard.state_generation = guard.state_generation.saturating_add(1);
         let pending = if guard.auth_mode.allows_members() && guard.save_path.is_some() {
             Some(PendingBookkeepingPersist {
-                write_generation: guard.write_generation,
+                target_generation: guard.state_generation,
             })
         } else {
             None
@@ -2118,9 +2366,14 @@ impl MemberStore {
         Ok(evicted)
     }
 
-    /// Releases a non-live `worker_id` claim held in `v2_worker_seq` or `worker_owners` so an
-    /// enrolled member can register with that `worker_id` (design 0051 D5/D6).
-    pub fn release_worker_id(&self, worker_id: Uuid, had_registry_claim: bool) -> GridResult<()> {
+    /// Releases a non-live `worker_id` claim in memory from `v2_worker_seq`, `worker_owners`, and
+    /// `worker_last_seq`, returning a [`PendingBookkeepingPersist`] token when persistent state
+    /// changed so the caller can flush outside the [`crate::registry::WorkerRegistry`] write lock.
+    pub fn release_worker_id_deferred(
+        &self,
+        worker_id: Uuid,
+        had_registry_claim: bool,
+    ) -> GridResult<Option<PendingBookkeepingPersist>> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let had_store_claim = guard.state.v2_worker_seq.contains_key(&worker_id)
             || guard.state.worker_owners.contains_key(&worker_id)
@@ -2131,12 +2384,24 @@ impl MemberStore {
             )));
         }
         if had_store_claim {
-            guard.mutate_and_persist(|staged| {
-                staged.v2_worker_seq.remove(&worker_id);
-                staged.worker_owners.remove(&worker_id);
-                staged.worker_last_seq.remove(&worker_id);
-                Ok(())
-            })?;
+            guard.state.v2_worker_seq.remove(&worker_id);
+            guard.state.worker_owners.remove(&worker_id);
+            guard.state.worker_last_seq.remove(&worker_id);
+            guard.state_generation = guard.state_generation.saturating_add(1);
+            if guard.auth_mode.allows_members() && guard.save_path.is_some() {
+                return Ok(Some(PendingBookkeepingPersist {
+                    target_generation: guard.state_generation,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Releases a non-live `worker_id` claim held in `v2_worker_seq` or `worker_owners` so an
+    /// enrolled member can register with that `worker_id` (design 0051 D5/D6).
+    pub fn release_worker_id(&self, worker_id: Uuid, had_registry_claim: bool) -> GridResult<()> {
+        if let Some(pending) = self.release_worker_id_deferred(worker_id, had_registry_claim)? {
+            self.flush_bookkeeping_persist(pending);
         }
         Ok(())
     }
@@ -3452,9 +3717,10 @@ mod tests {
         assert_eq!(store2.unconfirmed_tracking_counts(), (0, 0));
 
         // 3. Concurrent approvals of the same key on two 1-use invites (`inv_a`, `inv_b`): when
-        //    the first confirms and the second times out / rolls back, `inv_b` must NOT restore its
-        //    use because the key is still an active member. Also verify the fallback (no-tracker)
-        //    path when `--no-approval` enrolls the key during the confirm window.
+        //    the first confirms and the second times out / rolls back (`R5-1`), `j3` keeps only
+        //    `inv_a`'s `[Worker]` role, `inv_a` stays at `uses_remaining == 0`, and the rolled-back
+        //    `inv_b` restores `uses_remaining == 1`. Also verify the fallback (no-tracker) path
+        //    below when `--no-approval` enrolls the key during the confirm window.
         let store3 = MemberStore::new();
         let inv_a = store3
             .create_invite(vec![MemberRole::Worker], 1, 3600, true)
@@ -3482,13 +3748,21 @@ mod tests {
         store3.confirm_approved_enrollment(&rb_a);
         store3.rollback_approved_enrollment(rb_b).unwrap();
         assert!(store3.contains(j3.public_key()));
-        for inv_rec in store3.list_invites() {
-            assert_eq!(
-                inv_rec.uses_remaining, 0,
-                "invite {} must not restore use while key remains a member",
-                inv_rec.invite_id
-            );
-        }
+        assert_eq!(
+            store3.get(j3.public_key()).unwrap().roles,
+            vec![MemberRole::Worker]
+        );
+        let invites3 = store3.list_invites();
+        let rec_a = invites3
+            .iter()
+            .find(|i| i.invite_id == inv_a.invite_id)
+            .unwrap();
+        let rec_b = invites3
+            .iter()
+            .find(|i| i.invite_id == inv_b.invite_id)
+            .unwrap();
+        assert_eq!(rec_a.uses_remaining, 0);
+        assert_eq!(rec_b.uses_remaining, 1);
         assert_eq!(store3.unconfirmed_tracking_counts(), (0, 0));
 
         // Fallback path: J4 approved on 1-use approval invite `inv_c`, then enrolls via
@@ -3534,5 +3808,281 @@ mod tests {
             assert_eq!(inv_rec.uses_remaining, 0);
         }
         assert_eq!(store4.unconfirmed_tracking_counts(), (0, 0));
+    }
+
+    #[test]
+    fn test_r5_role_upgrade_rollback_concurrent_approval_and_failed_write_consistency() {
+        let enroll_and_approve = |store: &MemberStore,
+                                  kp: &NodeKeypair,
+                                  name: &str,
+                                  hash: [u8; KEY_LEN],
+                                  invite_id: &str,
+                                  secret: &[u8; 32]| {
+            let proof = compute_enroll_proof(secret, &hash);
+            let (pid, mut rx) = match store
+                .handle_enroll_request(
+                    *kp.public_key(),
+                    &hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50031",
+                    invite_id,
+                    &proof,
+                    name.into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap()
+            {
+                EnrollOutcome::Pending {
+                    pending_id,
+                    decision_rx,
+                } => (pending_id, decision_rx),
+                _ => panic!("expected Pending"),
+            };
+            store
+                .approve_pending(&pid, derive_pairing_code(&hash).as_str())
+                .unwrap();
+            match rx.try_recv().unwrap() {
+                PendingDecision::Approved { rollback, .. } => *rollback,
+                _ => panic!("expected Approved"),
+            }
+        };
+
+        // 1. R5-1: Existing `client` member uses a 1-use approval invite to add the `worker` role,
+        //    then declines -> roles restored to `[Client]`, worker claims released, and the 1-use
+        //    invite's `uses_remaining` is restored to 1 (both in memory and on disk, even if
+        //    another invite was created during the confirm window).
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let existing_kp = NodeKeypair::generate().unwrap();
+        let seed_inv = store
+            .create_invite(vec![MemberRole::Client], 1, 3600, false)
+            .unwrap();
+        let seed_hash = [0x91u8; KEY_LEN];
+        let seed_proof = compute_enroll_proof(&seed_inv.invite_secret.0, &seed_hash);
+        assert!(matches!(
+            store
+                .handle_enroll_request(
+                    *existing_kp.public_key(),
+                    &seed_hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50030",
+                    &seed_inv.invite_id,
+                    &seed_proof,
+                    "client-only-box".into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap(),
+            EnrollOutcome::ImmediateApproved { .. }
+        ));
+        assert_eq!(
+            store.get(existing_kp.public_key()).unwrap().roles,
+            vec![MemberRole::Client]
+        );
+
+        let upgrade_inv = store
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let rb_upgrade = enroll_and_approve(
+            &store,
+            &existing_kp,
+            "client-only-box",
+            [0x92u8; KEY_LEN],
+            &upgrade_inv.invite_id,
+            &upgrade_inv.invite_secret.0,
+        );
+        assert_eq!(
+            store.get(existing_kp.public_key()).unwrap().roles,
+            vec![MemberRole::Client, MemberRole::Worker]
+        );
+        let transient_wid = Uuid::new_v4();
+        store
+            .claim_worker_id(transient_wid, &existing_kp.member_id())
+            .unwrap();
+        // Creating an unrelated invite during the confirm window must not prune `upgrade_inv` while
+        // its approval is still unconfirmed.
+        let _other_inv = store
+            .create_invite(vec![MemberRole::Worker], 2, 3600, true)
+            .unwrap();
+
+        let released = store.rollback_approved_enrollment(rb_upgrade).unwrap();
+        assert_eq!(released, vec![transient_wid]);
+        assert_eq!(
+            store.get(existing_kp.public_key()).unwrap().roles,
+            vec![MemberRole::Client],
+            "declined role upgrade must restore original roles"
+        );
+        let upgrade_rec = store
+            .list_invites()
+            .into_iter()
+            .find(|i| i.invite_id == upgrade_inv.invite_id)
+            .expect("rolled-back 1-use upgrade invite must still exist");
+        assert_eq!(
+            upgrade_rec.uses_remaining, 1,
+            "declined role upgrade must restore 1-use invite"
+        );
+        assert_eq!(store.unconfirmed_tracking_counts(), (0, 0));
+
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert_eq!(
+            reloaded.get(existing_kp.public_key()).unwrap().roles,
+            vec![MemberRole::Client]
+        );
+        assert_eq!(
+            reloaded
+                .list_invites()
+                .into_iter()
+                .find(|i| i.invite_id == upgrade_inv.invite_id)
+                .unwrap()
+                .uses_remaining,
+            1
+        );
+
+        // 2. R5-1: Two concurrent approvals of one key (`inv_a`, `inv_b`) where `rb_b` declines
+        //    BEFORE `rb_a` confirms -> `inv_b`'s use is restored to 1 and `inv_a` stays 0.
+        let store_conc = MemberStore::new();
+        let inv_a = store_conc
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let inv_b = store_conc
+            .create_invite(vec![MemberRole::Client], 1, 3600, true)
+            .unwrap();
+        let cand = NodeKeypair::generate().unwrap();
+        let rb_a = enroll_and_approve(
+            &store_conc,
+            &cand,
+            "cand-box",
+            [0x93u8; KEY_LEN],
+            &inv_a.invite_id,
+            &inv_a.invite_secret.0,
+        );
+        let rb_b = enroll_and_approve(
+            &store_conc,
+            &cand,
+            "cand-box",
+            [0x94u8; KEY_LEN],
+            &inv_b.invite_id,
+            &inv_b.invite_secret.0,
+        );
+        store_conc.rollback_approved_enrollment(rb_b).unwrap();
+        store_conc.confirm_approved_enrollment(&rb_a);
+        assert_eq!(
+            store_conc.get(cand.public_key()).unwrap().roles,
+            vec![MemberRole::Worker]
+        );
+        let invs = store_conc.list_invites();
+        assert_eq!(
+            invs.iter()
+                .find(|i| i.invite_id == inv_a.invite_id)
+                .unwrap()
+                .uses_remaining,
+            0
+        );
+        assert_eq!(
+            invs.iter()
+                .find(|i| i.invite_id == inv_b.invite_id)
+                .unwrap()
+                .uses_remaining,
+            1
+        );
+        assert_eq!(store_conc.unconfirmed_tracking_counts(), (0, 0));
+
+        // 3. NIT 5: If the disk write fails during `rollback_approved_enrollment`, in-memory state
+        //    must still be rolled back consistently (member removed, invite use restored, no
+        //    leaked tracker op) while returning `Err` so the caller logs it.
+        let dir_fail = tempfile::tempdir().unwrap();
+        let store_fail = MemberStore::load_from_dir(Some(dir_fail.path())).unwrap();
+        let inv_fail = store_fail
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let kp_fail = NodeKeypair::generate().unwrap();
+        let rb_fail = enroll_and_approve(
+            &store_fail,
+            &kp_fail,
+            "fail-write-box",
+            [0x95u8; KEY_LEN],
+            &inv_fail.invite_id,
+            &inv_fail.invite_secret.0,
+        );
+        let blocker = dir_fail.path().join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        store_fail.set_save_path(Some(blocker.join(MEMBERS_FILE_NAME)));
+        assert!(
+            store_fail.rollback_approved_enrollment(rb_fail).is_err(),
+            "disk failure on rollback must return Err for logging"
+        );
+        assert!(
+            !store_fail.contains(kp_fail.public_key()),
+            "NIT 5: unconfirmed member must not stay enrolled in memory when rollback write fails"
+        );
+        assert_eq!(store_fail.list_invites()[0].uses_remaining, 1);
+        assert_eq!(store_fail.unconfirmed_tracking_counts(), (0, 0));
+
+        // 4. NIT 4: Concurrent worker claim bookkeeping bursts alongside admin mutations persist
+        //    every claim and coalesce bursts without losing updates.
+        let dir_burst = tempfile::tempdir().unwrap();
+        let store_burst = MemberStore::load_from_dir(Some(dir_burst.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let burst_kp = NodeKeypair::generate().unwrap();
+        let burst_inv = store_burst
+            .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+            .unwrap();
+        let burst_hash = [0x96u8; KEY_LEN];
+        let burst_proof = compute_enroll_proof(&burst_inv.invite_secret.0, &burst_hash);
+        store_burst
+            .handle_enroll_request(
+                *burst_kp.public_key(),
+                &burst_hash,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50032",
+                &burst_inv.invite_id,
+                &burst_proof,
+                "burst-worker".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+        let burst_mid = burst_kp.member_id();
+        let wids: Vec<Uuid> = (0..16).map(|_| Uuid::new_v4()).collect();
+        let barrier = Arc::new(std::sync::Barrier::new(wids.len() + 1));
+        let mut handles = Vec::new();
+        for wid in &wids {
+            let s = store_burst.clone();
+            let b = barrier.clone();
+            let mid = burst_mid.clone();
+            let w = *wid;
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                s.claim_worker_id_evicting(w, &mid, |_| true).unwrap();
+            }));
+        }
+        let s_admin = store_burst.clone();
+        let b_admin = barrier.clone();
+        let admin_handle = std::thread::spawn(move || {
+            b_admin.wait();
+            s_admin
+                .rename_member("burst-worker", "burst-worker-renamed")
+                .unwrap();
+            s_admin
+                .create_invite(vec![MemberRole::Client], 2, 3600, true)
+                .unwrap();
+        });
+        for h in handles {
+            h.join().unwrap();
+        }
+        admin_handle.join().unwrap();
+
+        let reloaded_burst = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        assert_eq!(
+            reloaded_burst.get(burst_kp.public_key()).unwrap().name,
+            "burst-worker-renamed"
+        );
+        let persisted_owned = reloaded_burst.workers_owned_by(&burst_mid);
+        assert_eq!(persisted_owned.len(), wids.len());
+        for wid in &wids {
+            assert!(persisted_owned.contains(wid));
+        }
     }
 }
