@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - USB kit: the default number of tasks a worker runs at once follows the machine's performance cores, at most half of all processors (a quarter on a machine with a battery when the core types cannot be read), instead of half of all processors; `install.sh --slots N` and `install.ps1 -Slots N` set it, and an update keeps a value set this way (`USB-4`, [design 0053](docs/design/0053-usb-setup-kit.md)).
-- Windows workers create a missing task sandbox base and workspace root with the owner-only DACL (current user, `SYSTEM`, `Administrators`), and warn with the `icacls` fix when an existing one lets any local account read or change task files ([design 0021](docs/design/0021-private-default-sandbox-base.md)).
+- Windows workers create a missing task sandbox base, workspace root, and any missing intermediate ancestors with a protected owner-only DACL (current user, `SYSTEM`, `Administrators`), refuse reparse points, non-ACL volumes, untrusted owners, rename-capable ancestors, and foreign write grants at start-up and before each task, and warn once per path with an unlocalized SID `icacls` fix when an existing folder grants another account read-only access ([design 0021](docs/design/0021-private-default-sandbox-base.md)).
 - The Windows USB installer skips cloud or virtual drives (no disk partition) and external USB disks when it offers or checks an install folder ([design 0053](docs/design/0053-usb-setup-kit.md)).
 
 ### Fixed

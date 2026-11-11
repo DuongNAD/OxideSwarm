@@ -25,7 +25,9 @@ use rusty_grid_core::blob::{
 use rusty_grid_core::task::validate_workspace_name;
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::{ensure_private_dir, sanitize_relative_path, SandboxError};
+use crate::sandbox::{
+    ensure_private_dir, ensure_private_dir_recheck, sanitize_relative_path, SandboxError,
+};
 
 /// Environment variable that carries the workspace name into the task.
 pub const ENV_WORKSPACE: &str = "RUSTY_GRID_WORKSPACE";
@@ -310,7 +312,7 @@ impl WorkspaceStore {
     /// process or another worker on the same root) to end. [`WorkspaceError::Busy`] on timeout.
     pub fn acquire(&self, name: &str, wait: Duration) -> Result<WorkspaceGuard, WorkspaceError> {
         validate_workspace_name(name).map_err(WorkspaceError::InvalidName)?;
-        ensure_private_dir(&self.root).map_err(|e: SandboxError| WorkspaceError::Root {
+        ensure_private_dir_recheck(&self.root).map_err(|e: SandboxError| WorkspaceError::Root {
             path: self.root.clone(),
             reason: e.to_string(),
         })?;

@@ -302,9 +302,8 @@ impl SandboxConfig {
 
     /// Creates and checks the private root of the default base on Unix while `base_dir` lies
     /// inside it (doing nothing for an explicit directory on Unix), and on Windows creates or
-    /// checks `base_dir` itself (see `ensure_private_dir`). Call it before anything touches the
-    /// base: `WorkerClient` does when a task is assigned and again before it fetches the task's
-    /// input files, and `Sandbox::create` does too (design 0021).
+    /// checks `base_dir` itself (see `ensure_private_dir`). Emits a one-time warning per path when
+    /// an existing Windows directory has foreign read-only grants.
     pub async fn ensure_private_root(&self) -> Result<(), SandboxError> {
         let Some(root) = self.checked_private_root().map(Path::to_path_buf) else {
             return Ok(());
@@ -320,11 +319,37 @@ impl SandboxConfig {
             })
     }
 
-    /// `ensure_private_root` without a runtime, for a caller that must answer synchronously (the
-    /// Android bridge's start check, or lazy blob-cache creation).
+    /// Per-task re-check of `ensure_private_root` (`Sandbox::create`, task assignment, input
+    /// fetch): enforces all refusals and privately recreates a deleted root while keeping
+    /// read-only ACL warnings silent (design 0021).
+    pub async fn ensure_private_root_recheck(&self) -> Result<(), SandboxError> {
+        let Some(root) = self.checked_private_root().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        let path = root.clone();
+        tokio::task::spawn_blocking(move || ensure_private_dir_recheck(&root))
+            .await
+            .unwrap_or_else(|e| {
+                Err(SandboxError::BaseDirUnusable {
+                    path,
+                    source: std::io::Error::other(e.to_string()),
+                })
+            })
+    }
+
+    /// `ensure_private_root` without a runtime, for a caller that must answer synchronously (such
+    /// as the Android bridge's start check).
     pub fn ensure_private_root_blocking(&self) -> Result<(), SandboxError> {
         match self.checked_private_root() {
             Some(root) => ensure_private_dir(root),
+            None => Ok(()),
+        }
+    }
+
+    /// Silent re-check variant of `ensure_private_root_blocking` (for lazy blob-cache opening).
+    pub fn ensure_private_root_recheck_blocking(&self) -> Result<(), SandboxError> {
+        match self.checked_private_root() {
+            Some(root) => ensure_private_dir_recheck(root),
             None => Ok(()),
         }
     }
@@ -346,90 +371,13 @@ impl SandboxConfig {
     /// behind by older worker builds.
     ///
     /// Refuses to remove anything unless `<base_dir>` and `<base_dir>/cache` are real directories
-    /// (not symbolic links or junctions, and on Unix owned by the current effective user), and
-    /// deletes only the direct `objects` and `tmp` subdirectories of `<base_dir>/cache` without
-    /// following links. Logs a warning on failure and leaves `<base_dir>/cache/blobs` alone.
+    /// (not symbolic links or reparse points, and owned by a trusted account), and deletes only
+    /// the direct `objects` and `tmp` subdirectories of `<base_dir>/cache` without following
+    /// links. Logs a warning on failure and leaves `<base_dir>/cache/blobs` alone.
     pub async fn remove_legacy_staging_cache(&self) {
-        match tokio::fs::symlink_metadata(&self.base_dir).await {
-            Ok(meta) if is_real_owned_dir(&meta) => {}
-            Ok(meta) => {
-                warn!(
-                    path = %self.base_dir.display(),
-                    is_symlink = meta.file_type().is_symlink(),
-                    is_dir = meta.file_type().is_dir(),
-                    "Skipping legacy staging cache cleanup: sandbox base is not a real directory owned by the current user"
-                );
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                warn!(
-                    path = %self.base_dir.display(),
-                    error = %e,
-                    "Failed to inspect sandbox base directory for legacy staging cache cleanup"
-                );
-                return;
-            }
-        }
-
-        let cache_dir = self.base_dir.join("cache");
-        match tokio::fs::symlink_metadata(&cache_dir).await {
-            Ok(meta) if is_real_owned_dir(&meta) => {}
-            Ok(meta) => {
-                warn!(
-                    path = %cache_dir.display(),
-                    is_symlink = meta.file_type().is_symlink(),
-                    is_dir = meta.file_type().is_dir(),
-                    "Skipping legacy staging cache cleanup: cache path is not a real directory owned by the current user"
-                );
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                warn!(
-                    path = %cache_dir.display(),
-                    error = %e,
-                    "Failed to inspect legacy staging cache directory"
-                );
-                return;
-            }
-        }
-
-        for name in ["objects", "tmp"] {
-            let path = cache_dir.join(name);
-            match tokio::fs::symlink_metadata(&path).await {
-                Ok(meta) if is_real_owned_dir(&meta) => {
-                    if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-                        warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to remove legacy staging cache directory"
-                        );
-                    } else {
-                        debug!(
-                            path = %path.display(),
-                            "Removed legacy staging cache directory"
-                        );
-                    }
-                }
-                Ok(meta) => {
-                    warn!(
-                        path = %path.display(),
-                        is_symlink = meta.file_type().is_symlink(),
-                        is_dir = meta.file_type().is_dir(),
-                        "Skipping legacy staging cache child: not a real directory owned by the current user"
-                    );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to inspect legacy staging cache child"
-                    );
-                }
-            }
-        }
+        let base_dir = self.base_dir.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || remove_legacy_staging_cache_sync(&base_dir)).await;
     }
 
     /// Sweeps unlocked leftover `<base_dir>/<uuid>` task sandbox directories and orphan
@@ -440,167 +388,255 @@ impl SandboxConfig {
     /// `<base_dir>/<task_id>/`, so a running task that deletes everything inside its own sandbox
     /// still holds its advisory lock and is never swept by a second worker sharing `base_dir`.
     pub async fn sweep_leftover_sandboxes(&self) {
-        match tokio::fs::symlink_metadata(&self.base_dir).await {
-            Ok(meta) if is_real_owned_dir(&meta) => {}
+        let base_dir = self.base_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || sweep_leftover_sandboxes_sync(&base_dir)).await;
+    }
+}
+
+fn remove_legacy_staging_cache_sync(base_dir: &Path) {
+    match std::fs::symlink_metadata(base_dir) {
+        Ok(meta) if is_real_owned_dir(base_dir, &meta) => {}
+        Ok(meta) => {
+            warn!(
+                path = %base_dir.display(),
+                is_symlink = meta.file_type().is_symlink(),
+                is_dir = meta.file_type().is_dir(),
+                "Skipping legacy staging cache cleanup: sandbox base is not a real directory owned by the current user"
+            );
+            return;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(
+                path = %base_dir.display(),
+                error = %e,
+                "Failed to inspect sandbox base directory for legacy staging cache cleanup"
+            );
+            return;
+        }
+    }
+
+    let cache_dir = base_dir.join("cache");
+    match std::fs::symlink_metadata(&cache_dir) {
+        Ok(meta) if is_real_owned_dir(&cache_dir, &meta) => {}
+        Ok(meta) => {
+            warn!(
+                path = %cache_dir.display(),
+                is_symlink = meta.file_type().is_symlink(),
+                is_dir = meta.file_type().is_dir(),
+                "Skipping legacy staging cache cleanup: cache path is not a real directory owned by the current user"
+            );
+            return;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(
+                path = %cache_dir.display(),
+                error = %e,
+                "Failed to inspect legacy staging cache directory"
+            );
+            return;
+        }
+    }
+
+    for name in ["objects", "tmp"] {
+        let path = cache_dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if is_real_owned_dir(&path, &meta) => {
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to remove legacy staging cache directory"
+                    );
+                } else {
+                    debug!(
+                        path = %path.display(),
+                        "Removed legacy staging cache directory"
+                    );
+                }
+            }
             Ok(meta) => {
                 warn!(
-                    path = %self.base_dir.display(),
+                    path = %path.display(),
                     is_symlink = meta.file_type().is_symlink(),
                     is_dir = meta.file_type().is_dir(),
-                    "Skipping leftover sandbox sweep: sandbox base is not a real directory owned by the current user"
+                    "Skipping legacy staging cache child: not a real directory owned by the current user"
                 );
-                return;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 warn!(
-                    path = %self.base_dir.display(),
+                    path = %path.display(),
                     error = %e,
-                    "Failed to inspect sandbox base directory for leftover sandbox sweep"
+                    "Failed to inspect legacy staging cache child"
                 );
-                return;
             }
         }
+    }
+}
 
-        let mut swept_sandboxes: usize = 0;
+fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
+    match std::fs::symlink_metadata(base_dir) {
+        Ok(meta) if is_real_owned_dir(base_dir, &meta) => {}
+        Ok(meta) => {
+            warn!(
+                path = %base_dir.display(),
+                is_symlink = meta.file_type().is_symlink(),
+                is_dir = meta.file_type().is_dir(),
+                "Skipping leftover sandbox sweep: sandbox base is not a real directory owned by the current user"
+            );
+            return;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(
+                path = %base_dir.display(),
+                error = %e,
+                "Failed to inspect sandbox base directory for leftover sandbox sweep"
+            );
+            return;
+        }
+    }
 
-        let mut dir_entries = match tokio::fs::read_dir(&self.base_dir).await {
-            Ok(rd) => rd,
-            Err(e) => {
-                warn!(
-                    path = %self.base_dir.display(),
-                    error = %e,
-                    "Failed to read sandbox base directory during leftover sandbox sweep"
-                );
-                return;
-            }
+    let mut swept_sandboxes: usize = 0;
+
+    let dir_entries = match std::fs::read_dir(base_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warn!(
+                path = %base_dir.display(),
+                error = %e,
+                "Failed to read sandbox base directory during leftover sandbox sweep"
+            );
+            return;
+        }
+    };
+
+    for entry in dir_entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(name_str) else {
+            continue;
         };
 
-        while let Ok(Some(entry)) = dir_entries.next_entry().await {
-            let file_name = entry.file_name();
-            let Some(name_str) = file_name.to_str() else {
-                continue;
-            };
-            let Ok(uuid) = uuid::Uuid::parse_str(name_str) else {
-                continue;
-            };
+        let entry_path = entry.path();
+        match std::fs::symlink_metadata(&entry_path) {
+            Ok(meta) if is_real_owned_dir(&entry_path, &meta) => {}
+            _ => continue,
+        }
 
-            let entry_path = entry.path();
-            match tokio::fs::symlink_metadata(&entry_path).await {
-                Ok(meta) if is_real_owned_dir(&meta) => {}
-                _ => continue,
-            }
-
-            let task_id = TaskId::from_uuid(uuid);
-            match open_and_try_lock_task(&self.base_dir, task_id) {
-                Ok(Some((lock_path, lock_file))) => {
-                    if let Err(e) = tokio::fs::remove_dir_all(&entry_path).await {
-                        warn!(
-                            task_id = %task_id,
-                            path = %entry_path.display(),
-                            error = %e,
-                            "Failed to remove leftover task sandbox directory"
-                        );
-                    } else {
-                        swept_sandboxes += 1;
-                    }
-                    let _ = tokio::fs::remove_file(&lock_path).await;
-                    drop(lock_file);
-                }
-                Ok(None) => {
-                    // Held by a live worker / Sandbox; leave the sandbox directory untouched.
-                }
-                Err(e) => {
+        let task_id = TaskId::from_uuid(uuid);
+        match open_and_try_lock_task(base_dir, task_id) {
+            Ok(Some((lock_path, lock_file))) => {
+                if let Err(e) = std::fs::remove_dir_all(&entry_path) {
                     warn!(
                         task_id = %task_id,
                         path = %entry_path.display(),
                         error = %e,
-                        "Skipping leftover sandbox directory: failed to inspect or lock .locks entry"
+                        "Failed to remove leftover task sandbox directory"
                     );
+                } else {
+                    swept_sandboxes += 1;
                 }
+                let _ = std::fs::remove_file(&lock_path);
+                drop(lock_file);
             }
-        }
-
-        let locks_dir = self.base_dir.join(".locks");
-        match tokio::fs::symlink_metadata(&locks_dir).await {
-            Ok(meta) if is_real_owned_dir(&meta) => {}
-            Ok(meta) => {
-                warn!(
-                    path = %locks_dir.display(),
-                    is_symlink = meta.file_type().is_symlink(),
-                    is_dir = meta.file_type().is_dir(),
-                    "Skipping orphan lock sweep: .locks path is not a real directory owned by the current user"
-                );
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if swept_sandboxes > 0 {
-                    tracing::info!(
-                        swept_sandboxes,
-                        base_dir = %self.base_dir.display(),
-                        "Swept leftover task sandboxes at worker startup"
-                    );
-                }
-                return;
+            Ok(None) => {
+                // Held by a live worker / Sandbox; leave the sandbox directory untouched.
             }
             Err(e) => {
                 warn!(
-                    path = %locks_dir.display(),
+                    task_id = %task_id,
+                    path = %entry_path.display(),
                     error = %e,
-                    "Failed to inspect .locks directory during leftover sandbox sweep"
+                    "Skipping leftover sandbox directory: failed to inspect or lock .locks entry"
                 );
-                return;
             }
         }
+    }
 
-        if let Ok(mut lock_entries) = tokio::fs::read_dir(&locks_dir).await {
-            while let Ok(Some(entry)) = lock_entries.next_entry().await {
-                let file_name = entry.file_name();
-                let Some(name_str) = file_name.to_str() else {
-                    continue;
-                };
-                let Some(stem) = name_str.strip_suffix(".lock") else {
-                    continue;
-                };
-                let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
-                    continue;
-                };
-
-                let sandbox_dir = self.base_dir.join(uuid.to_string());
-                match tokio::fs::symlink_metadata(&sandbox_dir).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => continue,
-                }
-
-                let lock_path = entry.path();
-                match tokio::fs::symlink_metadata(&lock_path).await {
-                    Ok(meta) if is_real_owned_file(&meta) => {}
-                    _ => continue,
-                }
-
-                if let Ok(Some((locked_path, lock_file))) =
-                    open_and_try_lock_task(&self.base_dir, TaskId::from_uuid(uuid))
-                {
-                    // Re-check that the sandbox directory was not created concurrently before
-                    // unlinking the orphan lock file.
-                    if matches!(
-                        tokio::fs::symlink_metadata(&sandbox_dir).await,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-                    ) {
-                        let _ = tokio::fs::remove_file(&locked_path).await;
-                    }
-                    drop(lock_file);
-                }
-            }
-        }
-
-        if swept_sandboxes > 0 {
-            tracing::info!(
-                swept_sandboxes,
-                base_dir = %self.base_dir.display(),
-                "Swept leftover task sandboxes at worker startup"
+    let locks_dir = base_dir.join(".locks");
+    match std::fs::symlink_metadata(&locks_dir) {
+        Ok(meta) if is_real_owned_dir(&locks_dir, &meta) => {}
+        Ok(meta) => {
+            warn!(
+                path = %locks_dir.display(),
+                is_symlink = meta.file_type().is_symlink(),
+                is_dir = meta.file_type().is_dir(),
+                "Skipping orphan lock sweep: .locks path is not a real directory owned by the current user"
             );
+            return;
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if swept_sandboxes > 0 {
+                tracing::info!(
+                    swept_sandboxes,
+                    base_dir = %base_dir.display(),
+                    "Swept leftover task sandboxes at worker startup"
+                );
+            }
+            return;
+        }
+        Err(e) => {
+            warn!(
+                path = %locks_dir.display(),
+                error = %e,
+                "Failed to inspect .locks directory during leftover sandbox sweep"
+            );
+            return;
+        }
+    }
+
+    if let Ok(lock_entries) = std::fs::read_dir(&locks_dir) {
+        for entry in lock_entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name_str.strip_suffix(".lock") else {
+                continue;
+            };
+            let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+
+            let sandbox_dir = base_dir.join(uuid.to_string());
+            match std::fs::symlink_metadata(&sandbox_dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => continue,
+            }
+
+            let lock_path = entry.path();
+            match std::fs::symlink_metadata(&lock_path) {
+                Ok(meta) if is_real_owned_file(&lock_path, &meta) => {}
+                _ => continue,
+            }
+
+            if let Ok(Some((locked_path, lock_file))) =
+                open_and_try_lock_task(base_dir, TaskId::from_uuid(uuid))
+            {
+                // Re-check that the sandbox directory was not created concurrently before
+                // unlinking the orphan lock file.
+                if matches!(
+                    std::fs::symlink_metadata(&sandbox_dir),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    let _ = std::fs::remove_file(&locked_path);
+                }
+                drop(lock_file);
+            }
+        }
+    }
+
+    if swept_sandboxes > 0 {
+        tracing::info!(
+            swept_sandboxes,
+            base_dir = %base_dir.display(),
+            "Swept leftover task sandboxes at worker startup"
+        );
     }
 }
 
@@ -671,21 +707,37 @@ fn current_euid() -> u32 {
 /// (design 0021): see `parent_refusal` and `root_refusal`. The mode of an existing `root` is never
 /// changed, because another user may already have put links into one that was open.
 ///
-/// On Windows `root` is checked without following junctions or symbolic links:
-/// - a missing `root` is created with the protected owner-only DACL of SEC-9 (current user,
-///   `SYSTEM` and `Administrators`) and verified after creation;
-/// - any reparse point (junction, symlink), non-directory, volume without `FILE_PERSISTENT_ACLS`
-///   (`FAT`, `exFAT`), or directory owned by an account outside `{current user, SYSTEM,
-///   Administrators}` is refused with `SandboxError::BaseDirUnsafe` (including when another
+/// On Windows `root` and every ancestor up to its volume root are checked without following
+/// reparse points:
+/// - missing intermediate ancestors and `root` itself are created with the protected owner-only
+///   DACL of SEC-9 (current user, `SYSTEM` and `Administrators`) and verified after creation;
+/// - any reparse point (junction, symbolic link, mount point, OneDrive/Cloud Files placeholder,
+///   NTFS dedup, WOF), non-directory, volume without `FILE_PERSISTENT_ACLS` (`FAT`, `exFAT`),
+///   ancestor that another account can rename/delete/re-permission, directory owned outside
+///   `{current user, SYSTEM, Administrators}`, or existing directory granting write-class rights
+///   to any foreign SID is refused with `SandboxError::BaseDirUnsafe` (including when another
 ///   creator wins the `ERROR_ALREADY_EXISTS` race);
 /// - an existing real directory on a persistent-ACL volume owned by `{current user, SYSTEM,
-///   Administrators}` is kept so in-place upgrades keep starting, logging a `WARN` with a
-///   locale-independent SID `icacls` command when any other trustee has sensitive access (or when
-///   the DACL cannot be read).
+///   Administrators}` with foreign read-only grants logs a `WARN` at most once per path per
+///   process with a locale-independent `icacls` command (including `/remove:g` for each offender),
+///   and logs a `WARN` once when the DACL cannot be read.
 pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
+    ensure_private_dir_inner(root, true)
+}
+
+/// Silent re-check variant of [`ensure_private_dir`] for per-task checks (`Sandbox::create`,
+/// `WorkspaceStore::acquire`, task assignment, input fetch, `.locks`, and lazy blob-cache open):
+/// enforces every refusal and privately recreates a deleted root without repeating read-only ACL
+/// warnings.
+pub(crate) fn ensure_private_dir_recheck(root: &Path) -> Result<(), SandboxError> {
+    ensure_private_dir_inner(root, false)
+}
+
+fn ensure_private_dir_inner(root: &Path, emit_warnings: bool) -> Result<(), SandboxError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
+        let _ = emit_warnings;
 
         let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
             path: root.to_path_buf(),
@@ -728,6 +780,7 @@ pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
         };
         ensure_private_dir_windows_with(
             root,
+            emit_warnings,
             current_user_sid,
             create_or_open_private_dir_all,
             inspect_dir_security_no_follow,
@@ -735,23 +788,162 @@ pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = root;
+        let _ = (root, emit_warnings);
         Ok(())
     }
 }
 
 #[cfg(windows)]
+fn check_windows_ancestor(
+    root: &Path,
+    anc: &Path,
+    is_drive_root: bool,
+    snap: rusty_grid_core::private_file::DirSecuritySnapshot,
+    user_sid: &str,
+) -> Result<(), SandboxError> {
+    use rusty_grid_core::private_file::{
+        ancestor_unsafe_grants, icacls_private_dir_command, is_trusted_ancestor_owner_sid,
+        sid_label, ANCESTOR_RENAME_MASK, DRIVE_ROOT_UNSAFE_MASK,
+    };
+
+    let remove_remedy = "Remove it (this may need its owner or an Administrator)".to_string();
+
+    if !is_drive_root && snap.is_reparse_point {
+        return Err(SandboxError::BaseDirUnsafe {
+            path: anc.to_path_buf(),
+            reason: "an ancestor on the path to it is a link or reparse point".to_string(),
+            remedy: remove_remedy,
+        });
+    }
+    if !snap.is_dir {
+        return Err(SandboxError::BaseDirUnusable {
+            path: root.to_path_buf(),
+            source: std::io::Error::from_raw_os_error(267), // ERROR_DIRECTORY
+        });
+    }
+    let persistent_acls = snap
+        .persistent_acls
+        .map_err(|source| SandboxError::BaseDirUnusable {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    if !persistent_acls {
+        return Err(SandboxError::BaseDirUnsafe {
+            path: root.to_path_buf(),
+            reason: "its volume does not support persistent ACLs (such as FAT or exFAT)"
+                .to_string(),
+            remedy: "Place the directory on an NTFS volume".to_string(),
+        });
+    }
+
+    match &snap.owner_sid {
+        Ok(owner) if is_trusted_ancestor_owner_sid(owner, user_sid) => {}
+        Ok(owner) => {
+            return Err(SandboxError::BaseDirUnsafe {
+                path: anc.to_path_buf(),
+                reason: format!(
+                    "ancestor directory '{}' belongs to {owner}, not to {user_sid}, SYSTEM, \
+                     Administrators or TrustedInstaller",
+                    anc.display()
+                ),
+                remedy:
+                    "Choose a directory directly under the drive root (such as C:\\OxideSwarm) or \
+                     under %LOCALAPPDATA%"
+                        .to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(SandboxError::BaseDirUnsafe {
+                path: anc.to_path_buf(),
+                reason: format!(
+                    "the owner of ancestor directory '{}' could not be verified ({e})",
+                    anc.display()
+                ),
+                remedy:
+                    "Choose a directory directly under the drive root (such as C:\\OxideSwarm) or \
+                     under %LOCALAPPDATA%"
+                        .to_string(),
+            });
+        }
+    }
+
+    let mask = if is_drive_root {
+        DRIVE_ROOT_UNSAFE_MASK
+    } else {
+        ANCESTOR_RENAME_MASK
+    };
+    match snap.dacl {
+        Ok((aces, _)) => {
+            let offenders = ancestor_unsafe_grants(&aces, user_sid, mask);
+            if !offenders.is_empty() {
+                let who: Vec<String> = offenders.iter().map(|s| sid_label(s)).collect();
+                let (reason, remedy) = if is_drive_root {
+                    (
+                        format!(
+                            "another account ({}) can delete or re-permission folders at the root \
+                             of '{}'",
+                            who.join(", "),
+                            anc.display()
+                        ),
+                        "Place the directory on an NTFS volume whose root cannot be modified by \
+                         unprivileged accounts"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "another account ({}) can rename, delete or re-permission ancestor \
+                             directory '{}'",
+                            who.join(", "),
+                            anc.display()
+                        ),
+                        format!(
+                            "To make the ancestor private run: {}",
+                            icacls_private_dir_command(anc, &offenders, user_sid)
+                        ),
+                    )
+                };
+                return Err(SandboxError::BaseDirUnsafe {
+                    path: anc.to_path_buf(),
+                    reason,
+                    remedy,
+                });
+            }
+        }
+        Err(e) => {
+            return Err(SandboxError::BaseDirUnsafe {
+                path: anc.to_path_buf(),
+                reason: format!(
+                    "could not read the DACL of ancestor directory '{}' ({e})",
+                    anc.display()
+                ),
+                remedy:
+                    "Choose a directory directly under the drive root (such as C:\\OxideSwarm) or \
+                     under %LOCALAPPDATA%"
+                        .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn ensure_private_dir_windows_with(
     root: &Path,
+    emit_warnings: bool,
     current_sid: impl FnOnce() -> std::io::Result<String>,
     create_or_open: impl FnOnce(
         &Path,
     )
         -> std::io::Result<rusty_grid_core::private_file::PrivateDirOutcome>,
-    inspect: impl FnOnce(&Path) -> std::io::Result<rusty_grid_core::private_file::DirSecuritySnapshot>,
+    mut inspect: impl FnMut(
+        &Path,
+    ) -> std::io::Result<rusty_grid_core::private_file::DirSecuritySnapshot>,
 ) -> Result<(), SandboxError> {
     use rusty_grid_core::private_file::{
-        dir_open_grants, is_trusted_owner_sid, open_dir_acl_warning, PrivateDirOutcome,
+        claim_warning_for_path, dir_open_grants, dir_read_grants, dir_write_grants,
+        icacls_private_dir_command, is_trusted_owner_sid, open_dir_acl_warning, sid_label,
+        PrivateDirOutcome,
     };
 
     let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
@@ -761,7 +953,42 @@ fn ensure_private_dir_windows_with(
     let remove_remedy = "Remove it (this may need its owner or an Administrator)".to_string();
 
     let user_sid = current_sid().map_err(unusable)?;
+    let abs = std::path::absolute(root).map_err(unusable)?;
+    let mut ancestors: Vec<PathBuf> = abs
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    ancestors.reverse();
+
+    // Check existing ancestors top-down before creating anything inside them.
+    for anc in &ancestors {
+        match inspect(anc) {
+            Ok(anc_snap) => {
+                check_windows_ancestor(root, anc, anc.parent().is_none(), anc_snap, &user_sid)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(SandboxError::BaseDirUnusable {
+                    path: anc.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
     let outcome = create_or_open(root).map_err(unusable)?;
+
+    // Re-check all ancestors (including any intermediate directories just created).
+    for anc in &ancestors {
+        let anc_snap = inspect(anc).map_err(|source| SandboxError::BaseDirUnusable {
+            path: anc.clone(),
+            source,
+        })?;
+        check_windows_ancestor(root, anc, anc.parent().is_none(), anc_snap, &user_sid)?;
+    }
+
     let snap = inspect(root).map_err(unusable)?;
 
     if snap.is_reparse_point {
@@ -778,7 +1005,8 @@ fn ensure_private_dir_windows_with(
             remedy: remove_remedy,
         });
     }
-    if !snap.persistent_acls {
+    let persistent_acls = snap.persistent_acls.map_err(unusable)?;
+    if !persistent_acls {
         return Err(SandboxError::BaseDirUnsafe {
             path: root.to_path_buf(),
             reason: "its volume does not support persistent ACLs (such as FAT or exFAT)"
@@ -836,17 +1064,38 @@ fn ensure_private_dir_windows_with(
         PrivateDirOutcome::Existing => {
             match snap.dacl {
                 Ok((aces, _)) => {
-                    let open = dir_open_grants(&aces, &user_sid);
-                    if let Some(msg) = open_dir_acl_warning(root, &open, &user_sid) {
-                        tracing::warn!("{msg}");
+                    let write_offenders = dir_write_grants(&aces, &user_sid);
+                    if !write_offenders.is_empty() {
+                        let who: Vec<String> =
+                            write_offenders.iter().map(|s| sid_label(s)).collect();
+                        let all_offenders = dir_open_grants(&aces, &user_sid);
+                        let cmd = icacls_private_dir_command(root, &all_offenders, &user_sid);
+                        return Err(SandboxError::BaseDirUnsafe {
+                            path: root.to_path_buf(),
+                            reason: format!(
+                                "its DACL grants write access to other accounts ({})",
+                                who.join(", ")
+                            ),
+                            remedy: format!("To make it private run: {cmd}"),
+                        });
+                    }
+                    let read_offenders = dir_read_grants(&aces, &user_sid);
+                    if emit_warnings && !read_offenders.is_empty() && claim_warning_for_path(root) {
+                        if let Some(msg) = open_dir_acl_warning(root, &read_offenders, &user_sid) {
+                            tracing::warn!("{msg}");
+                        }
                     }
                 }
-                Err(e) => tracing::warn!(
-                    path = %root.display(),
-                    error = %e,
-                    "could not read the DACL of task directory '{}'",
-                    root.display()
-                ),
+                Err(e) => {
+                    if emit_warnings && claim_warning_for_path(root) {
+                        tracing::warn!(
+                            path = %root.display(),
+                            error = %e,
+                            "could not read the DACL of task directory '{}'",
+                            root.display()
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -915,7 +1164,7 @@ pub fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn is_real_owned_dir(meta: &std::fs::Metadata) -> bool {
+fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return false;
     }
@@ -925,18 +1174,26 @@ fn is_real_owned_dir(meta: &std::fs::Metadata) -> bool {
         if meta.file_attributes() & 0x0400 != 0 {
             return false;
         }
+        if !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(path) {
+            return false;
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = path;
         if meta.uid() != current_euid() {
             return false;
         }
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
     true
 }
 
-fn is_real_owned_file(meta: &std::fs::Metadata) -> bool {
+fn is_real_owned_file(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
@@ -946,27 +1203,64 @@ fn is_real_owned_file(meta: &std::fs::Metadata) -> bool {
         if meta.file_attributes() & 0x0400 != 0 {
             return false;
         }
+        if !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(path) {
+            return false;
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = path;
         if meta.uid() != current_euid() {
             return false;
         }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
+    true
+}
+
+fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x0400 != 0 {
+            return false;
+        }
+        if !rusty_grid_core::private_file::is_handle_trusted_owner(file) {
+            return false;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        if meta.uid() != current_euid() {
+            return false;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
     }
     true
 }
 
 fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
     #[cfg(windows)]
-    ensure_private_dir(base_dir).map_err(|e| match e {
+    ensure_private_dir_recheck(base_dir).map_err(|e| match e {
         SandboxError::BaseDirUnusable { source, .. } => source,
         other => std::io::Error::new(std::io::ErrorKind::PermissionDenied, other.to_string()),
     })?;
     #[cfg(not(windows))]
     std::fs::create_dir_all(base_dir)?;
     let base_meta = std::fs::symlink_metadata(base_dir)?;
-    if !is_real_owned_dir(&base_meta) {
+    if !is_real_owned_dir(base_dir, &base_meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "sandbox base directory is a symbolic link or not owned by the current user",
@@ -993,7 +1287,7 @@ fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
     }
 
     let locks_meta = std::fs::symlink_metadata(&locks_dir)?;
-    if !is_real_owned_dir(&locks_meta) {
+    if !is_real_owned_dir(&locks_dir, &locks_meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "sandbox .locks directory is a symbolic link or not owned by the current user",
@@ -1011,7 +1305,7 @@ fn open_and_try_lock_task(
     let lock_path = locks_dir.join(format!("{task_id}.lock"));
 
     if let Ok(meta) = std::fs::symlink_metadata(&lock_path) {
-        if !is_real_owned_file(&meta) {
+        if !is_real_owned_file(&lock_path, &meta) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "sandbox lock path is a symbolic link or not a regular file owned by the current user",
@@ -1026,10 +1320,16 @@ fn open_and_try_lock_task(
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: never follow a symbolic link or reparse point at lock_path.
+        opts.custom_flags(0x0020_0000);
+    }
 
     let file = opts.open(&lock_path)?;
     let file_meta = file.metadata()?;
-    if !is_real_owned_file(&file_meta) {
+    if !is_real_owned_open_file(&file, &file_meta) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "opened sandbox lock descriptor is not a regular file owned by the current user",
@@ -1058,11 +1358,11 @@ impl Sandbox {
     /// acquiring `<base_dir>/.locks/<task_id>.lock` before creating `<base_dir>/<task_id>`
     /// (design 0044 D5).
     ///
-    /// For the default base on Unix the private root is checked again first, because a temp
-    /// cleaner may have removed it since start-up and another user may have created one
-    /// (design 0021).
+    /// For the default base on Unix and every base on Windows, the private root is re-checked
+    /// silently first, because a temp cleaner or another user may have removed or replaced it
+    /// since start-up (design 0021).
     pub async fn create(config: &SandboxConfig, task_id: TaskId) -> Result<Self, SandboxError> {
-        config.ensure_private_root().await?;
+        config.ensure_private_root_recheck().await?;
         let path = config.base_dir.join(task_id.to_string());
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Err(SandboxError::AlreadyExists {
@@ -1071,17 +1371,24 @@ impl Sandbox {
             });
         }
 
-        let (lock_path, lock_file) = match open_and_try_lock_task(&config.base_dir, task_id)
-            .map_err(|e| SandboxError::Io { task_id, source: e })?
-        {
-            Some(pair) => pair,
-            None => {
-                return Err(SandboxError::AlreadyExists {
+        let base_dir = config.base_dir.clone();
+        let lock_res =
+            tokio::task::spawn_blocking(move || open_and_try_lock_task(&base_dir, task_id))
+                .await
+                .map_err(|e| SandboxError::Io {
                     task_id,
-                    path: path.clone(),
-                });
-            }
-        };
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+        let (lock_path, lock_file) =
+            match lock_res.map_err(|e| SandboxError::Io { task_id, source: e })? {
+                Some(pair) => pair,
+                None => {
+                    return Err(SandboxError::AlreadyExists {
+                        task_id,
+                        path: path.clone(),
+                    });
+                }
+            };
 
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
             let _ = tokio::fs::remove_file(&lock_path).await;
@@ -2173,13 +2480,14 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_private_dir_tests {
     use super::{
-        ensure_locks_dir, ensure_private_dir, ensure_private_dir_windows_with, Sandbox,
-        SandboxConfig, SandboxError,
+        ensure_locks_dir, ensure_private_dir, ensure_private_dir_recheck,
+        ensure_private_dir_windows_with, is_real_owned_dir, Sandbox, SandboxConfig, SandboxError,
     };
     use rusty_grid_core::private_file::{
         create_or_open_private_dir_all_with_hooks, current_user_sid, dir_open_grants,
         inspect_dir_security_no_follow, read_dacl, DirSecuritySnapshot, PrivateDirOutcome,
-        SID_ALL_APP_PACKAGES, SID_ANONYMOUS_LOGON, SID_NETWORK, SID_REMOTE_DESKTOP_USERS,
+        SID_ALL_APP_PACKAGES, SID_ANONYMOUS_LOGON, SID_AUTHENTICATED_USERS, SID_NETWORK,
+        SID_REMOTE_DESKTOP_USERS, SID_USERS,
     };
     use rusty_grid_core::task::TaskId;
     use std::path::Path;
@@ -2288,16 +2596,20 @@ mod windows_private_dir_tests {
         ensure_private_dir(&base).unwrap();
         assert!(base.is_dir());
         let user = current_user_sid().unwrap();
-        let (aces, protected) = read_dacl(&base).unwrap();
-        assert!(
-            protected,
-            "the DACL must not inherit entries from its parent"
-        );
-        assert!(dir_open_grants(&aces, &user).is_empty(), "{aces:?}");
-        assert!(
-            aces.iter().any(|a| a.sid.eq_ignore_ascii_case(&user)),
-            "{aces:?}"
-        );
+        // Both the missing intermediate ancestor (`work`) and `sandboxes` must be created private.
+        for dir in [tmp.path().join("work"), base.clone()] {
+            let (aces, protected) = read_dacl(&dir).unwrap();
+            assert!(
+                protected,
+                "the DACL of {} must not inherit entries from its parent",
+                dir.display()
+            );
+            assert!(dir_open_grants(&aces, &user).is_empty(), "{aces:?}");
+            assert!(
+                aces.iter().any(|a| a.sid.eq_ignore_ascii_case(&user)),
+                "{aces:?}"
+            );
+        }
         // A task folder created inside inherits only the private entries.
         let task = base.join("task");
         std::fs::create_dir(&task).unwrap();
@@ -2376,6 +2688,12 @@ mod windows_private_dir_tests {
                                 if path == &sys_path && reason.contains(owner)),
                             "{err:?}"
                         );
+                        if let Ok(sys_meta) = std::fs::symlink_metadata(&sys_path) {
+                            assert!(
+                                !is_real_owned_dir(&sys_path, &sys_meta),
+                                "is_real_owned_dir must reject directories owned by untrusted SIDs"
+                            );
+                        }
                     }
                 }
             }
@@ -2383,18 +2701,21 @@ mod windows_private_dir_tests {
 
         // 2. Deterministic check for another local user SID (`S-1-5-21-1-2-3-1002`) without elevation.
         let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path();
         let me = "S-1-5-21-1-2-3-1001";
         let other_local = "S-1-5-21-1-2-3-1002";
         let err = ensure_private_dir_windows_with(
-            tmp.path(),
+            target,
+            true,
             || Ok(me.to_string()),
             |_| Ok(PrivateDirOutcome::Existing),
-            |_| {
+            |p| {
+                let owner = if p == target { other_local } else { me };
                 Ok(DirSecuritySnapshot {
                     is_reparse_point: false,
                     is_dir: true,
-                    persistent_acls: true,
-                    owner_sid: Ok(other_local.to_string()),
+                    persistent_acls: Ok(true),
+                    owner_sid: Ok(owner.to_string()),
                     dacl: Ok((Vec::new(), true)),
                 })
             },
@@ -2408,31 +2729,89 @@ mod windows_private_dir_tests {
     }
 
     #[test]
-    fn s1_existing_dir_warns_for_untrusted_sids_and_when_dacl_cannot_be_read() {
+    fn s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("existing_open");
-        ensure_private_dir(&dir).unwrap();
         let user = current_user_sid().unwrap();
 
-        // Grant sensitive access to SIDs outside the old 5-group list:
-        // NETWORK, ANONYMOUS LOGON, Remote Desktop Users, and ALL APPLICATION PACKAGES.
+        // 1. Write-class foreign grant (`Modify` to Remote Desktop Users) is REFUSED.
+        let write_dir = tmp.path().join("existing_write_open");
+        ensure_private_dir(&write_dir).unwrap();
         let status = Command::new("icacls")
-            .arg(&dir)
+            .arg(&write_dir)
             .args([
                 "/grant",
-                &format!("*{SID_NETWORK}:(OI)(CI)R"),
-                &format!("*{SID_ANONYMOUS_LOGON}:(OI)(CI)R"),
                 &format!("*{SID_REMOTE_DESKTOP_USERS}:(OI)(CI)M"),
-                &format!("*{SID_ALL_APP_PACKAGES}:(OI)(CI)RX"),
+                &format!("*{SID_NETWORK}:(OI)(CI)R"),
             ])
             .status()
             .expect("icacls");
         assert!(status.success());
+        let err_write =
+            ensure_private_dir(&write_dir).expect_err("foreign write grant must be refused");
+        match &err_write {
+            SandboxError::BaseDirUnsafe {
+                path,
+                reason,
+                remedy,
+            } => {
+                assert_eq!(path, &write_dir);
+                assert!(reason.contains("BUILTIN\\Remote Desktop Users"), "{reason}");
+                assert!(remedy.contains("/remove:g"), "{remedy}");
+                assert!(remedy.contains(SID_REMOTE_DESKTOP_USERS), "{remedy}");
+                assert!(remedy.contains(SID_NETWORK), "{remedy}");
+            }
+            other => panic!("expected BaseDirUnsafe, got {other:?}"),
+        }
 
-        let (res, warnings) = capture_thread_warnings(|| ensure_private_dir(&dir));
-        res.expect("existing trusted-owner directory warns rather than refusing");
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let msg = &warnings[0];
+        // 1b. ProgramData-style `(CI)(WD,AD,WEA,WA)` + `(OI)(CI)RX` to `BUILTIN\Users` is REFUSED.
+        let programdata_like = tmp.path().join("programdata_like");
+        ensure_private_dir(&programdata_like).unwrap();
+        let status_pd = Command::new("icacls")
+            .arg(&programdata_like)
+            .args([
+                "/grant",
+                &format!("*{SID_USERS}:(OI)(CI)RX"),
+                &format!("*{SID_USERS}:(CI)(WD,AD,WEA,WA)"),
+            ])
+            .status()
+            .expect("icacls");
+        assert!(status_pd.success());
+        let err_pd = ensure_private_dir(&programdata_like)
+            .expect_err("ProgramData-style Users write grant must be refused");
+        assert!(
+            matches!(&err_pd, SandboxError::BaseDirUnsafe { path, reason, .. }
+                if path == &programdata_like && reason.contains("BUILTIN\\Users")),
+            "{err_pd:?}"
+        );
+
+        // 2. Read-only foreign grants warn ONCE per path per process, stay silent on recheck, and
+        //    executing the printed `icacls` remedy leaves zero foreign entries.
+        let read_dir = tmp.path().join("existing_read_open");
+        ensure_private_dir(&read_dir).unwrap();
+        let status_ro = Command::new("icacls")
+            .arg(&read_dir)
+            .args([
+                "/grant",
+                &format!("*{SID_NETWORK}:(OI)(CI)R"),
+                &format!("*{SID_ANONYMOUS_LOGON}:(OI)(CI)R"),
+                &format!("*{SID_REMOTE_DESKTOP_USERS}:(OI)(CI)RX"),
+                &format!("*{SID_ALL_APP_PACKAGES}:(OI)(CI)RX"),
+            ])
+            .status()
+            .expect("icacls");
+        assert!(status_ro.success());
+
+        // A per-task recheck before startup warning is silent and does not consume the one-time
+        // startup warning.
+        let (recheck_res, recheck_warnings) =
+            capture_thread_warnings(|| ensure_private_dir_recheck(&read_dir));
+        recheck_res.unwrap();
+        assert!(recheck_warnings.is_empty(), "{recheck_warnings:?}");
+
+        let (res1, warnings1) = capture_thread_warnings(|| ensure_private_dir(&read_dir));
+        res1.expect("read-only foreign grants warn rather than refusing");
+        assert_eq!(warnings1.len(), 1, "{warnings1:?}");
+        let msg = &warnings1[0];
         for expected in [
             "NETWORK",
             "ANONYMOUS LOGON",
@@ -2441,6 +2820,7 @@ mod windows_private_dir_tests {
             &format!("*{user}:(OI)(CI)F"),
             "*S-1-5-18:(OI)(CI)F",
             "*S-1-5-32-544:(OI)(CI)F",
+            "/remove:g",
         ] {
             assert!(
                 msg.contains(expected),
@@ -2448,21 +2828,62 @@ mod windows_private_dir_tests {
             );
         }
 
-        // Unreadable DACL on an existing trusted-owner directory must emit WARN (not DEBUG).
+        // Subsequent `ensure_private_dir` and `ensure_private_dir_recheck` calls on the same path
+        // do NOT repeat the warning.
+        let (res2, warnings2) = capture_thread_warnings(|| {
+            ensure_private_dir(&read_dir).unwrap();
+            ensure_private_dir_recheck(&read_dir).unwrap();
+        });
+        let () = res2;
+        assert!(warnings2.is_empty(), "{warnings2:?}");
+
+        // Execute the exact printed `icacls` command and verify no foreign entry remains.
+        use std::os::windows::process::CommandExt;
+        let cmd_str = msg
+            .split("to make it private run: ")
+            .nth(1)
+            .expect("warning must contain remedy command");
+        let fix_out = Command::new("cmd")
+            .arg("/C")
+            .raw_arg(cmd_str)
+            .output()
+            .expect("run icacls remedy");
+        assert!(
+            fix_out.status.success(),
+            "remedy failed: {cmd_str}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&fix_out.stdout),
+            String::from_utf8_lossy(&fix_out.stderr)
+        );
+        let (fixed_aces, fixed_protected) = read_dacl(&read_dir).unwrap();
+        assert!(fixed_protected);
+        assert!(
+            dir_open_grants(&fixed_aces, &user).is_empty(),
+            "foreign entries remained after running remedy: {fixed_aces:?}"
+        );
+
+        // 3. Unreadable DACL on an existing trusted-owner directory emits WARN once (not DEBUG).
+        let unreadable_dir = tmp.path().join("unreadable_dacl_dir");
+        ensure_private_dir(&unreadable_dir).unwrap();
+        let inspect_unreadable = |p: &Path| {
+            if p == unreadable_dir {
+                Ok(DirSecuritySnapshot {
+                    is_reparse_point: false,
+                    is_dir: true,
+                    persistent_acls: Ok(true),
+                    owner_sid: Ok(user.clone()),
+                    dacl: Err(std::io::Error::from_raw_os_error(5)),
+                })
+            } else {
+                inspect_dir_security_no_follow(p)
+            }
+        };
         let (res_unreadable, warn_unreadable) = capture_thread_warnings(|| {
             ensure_private_dir_windows_with(
-                &dir,
+                &unreadable_dir,
+                true,
                 || Ok(user.clone()),
                 |_| Ok(PrivateDirOutcome::Existing),
-                |_| {
-                    Ok(DirSecuritySnapshot {
-                        is_reparse_point: false,
-                        is_dir: true,
-                        persistent_acls: true,
-                        owner_sid: Ok(user.clone()),
-                        dacl: Err(std::io::Error::from_raw_os_error(5)),
-                    })
-                },
+                inspect_unreadable,
             )
         });
         res_unreadable.unwrap();
@@ -2471,6 +2892,83 @@ mod windows_private_dir_tests {
             warn_unreadable[0].contains("could not read the DACL of task directory"),
             "{warn_unreadable:?}"
         );
+        let (_, warn_unreadable_again) = capture_thread_warnings(|| {
+            ensure_private_dir_windows_with(
+                &unreadable_dir,
+                true,
+                || Ok(user.clone()),
+                |_| Ok(PrivateDirOutcome::Existing),
+                inspect_unreadable,
+            )
+            .unwrap();
+        });
+        assert!(
+            warn_unreadable_again.is_empty(),
+            "{warn_unreadable_again:?}"
+        );
+    }
+
+    #[test]
+    fn s2_parent_chain_refuses_mutable_or_reparse_ancestors_and_creates_missing_ancestors_privately(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = current_user_sid().unwrap();
+
+        // 1. Ancestor granting `Authenticated Users: (OI)(CI)M` (like an unprotected `D:\ox`
+        //    inheriting from a drive root) is refused BEFORE creating `sandboxes` inside it.
+        let open_anc = tmp.path().join("ox");
+        ensure_private_dir(&open_anc).unwrap();
+        let status = Command::new("icacls")
+            .arg(&open_anc)
+            .args(["/grant", &format!("*{SID_AUTHENTICATED_USERS}:(OI)(CI)M")])
+            .status()
+            .expect("icacls");
+        assert!(status.success());
+
+        let under_open_anc = open_anc.join("sandboxes");
+        let err_anc = ensure_private_dir(&under_open_anc)
+            .expect_err("ancestor mutable by Authenticated Users must be refused");
+        assert!(
+            matches!(&err_anc, SandboxError::BaseDirUnsafe { path, reason, .. }
+                if path == &open_anc && reason.contains("Authenticated Users")),
+            "{err_anc:?}"
+        );
+        assert!(
+            !under_open_anc.exists(),
+            "must not create target inside an unsafe ancestor"
+        );
+
+        // 2. Ancestor below the drive root that is a junction is refused before following it.
+        let real_anc = tmp.path().join("real_anc");
+        ensure_private_dir(&real_anc).unwrap();
+        let junc_anc = tmp.path().join("junc_anc");
+        make_junction(&junc_anc, &real_anc);
+        let under_junc = junc_anc.join("sandboxes");
+        let err_junc =
+            ensure_private_dir(&under_junc).expect_err("junction ancestor must be refused");
+        assert!(
+            matches!(&err_junc, SandboxError::BaseDirUnsafe { path, reason, .. }
+                if path == &junc_anc && reason.contains("reparse point")),
+            "{err_junc:?}"
+        );
+        assert!(!real_anc.join("sandboxes").exists());
+
+        // 3. Missing intermediate ancestors under a read-open parent are created with the
+        //    protected owner-only descriptor rather than `create_dir_all`.
+        let parent = open_parent();
+        let a = parent.path().join("missing_a");
+        let b = a.join("missing_b");
+        let leaf = b.join("sandboxes");
+        ensure_private_dir(&leaf).unwrap();
+        for dir in [&a, &b, &leaf] {
+            let (aces, protected) = read_dacl(dir).unwrap();
+            assert!(protected, "{} must be protected", dir.display());
+            assert!(
+                dir_open_grants(&aces, &user).is_empty(),
+                "{}: {aces:?}",
+                dir.display()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2482,7 +2980,7 @@ mod windows_private_dir_tests {
         let user = current_user_sid().unwrap();
 
         // 1. Delete the base after startup: `Sandbox::create` must recreate it via
-        //    `ensure_private_dir` (protected owner-only DACL), NOT `create_dir_all` (inherited).
+        //    `ensure_private_dir_recheck` (protected owner-only DACL), NOT `create_dir_all`.
         std::fs::remove_dir_all(&base).unwrap();
         let mut sb = Sandbox::create(&config, TaskId::new()).await.unwrap();
         let (aces, protected) = read_dacl(&base).unwrap();
@@ -2528,6 +3026,7 @@ mod windows_private_dir_tests {
         let race_junction = parent.path().join("race_junction");
         let err_j = ensure_private_dir_windows_with(
             &race_junction,
+            true,
             current_user_sid,
             |p| {
                 create_or_open_private_dir_all_with_hooks(
@@ -2549,6 +3048,7 @@ mod windows_private_dir_tests {
         let race_foreign = parent.path().join("race_foreign");
         let err_f = ensure_private_dir_windows_with(
             &race_foreign,
+            true,
             || Ok(user.clone()),
             |p| {
                 create_or_open_private_dir_all_with_hooks(
@@ -2559,7 +3059,9 @@ mod windows_private_dir_tests {
             },
             |p| {
                 let mut snap = inspect_dir_security_no_follow(p)?;
-                snap.owner_sid = Ok("S-1-5-21-1-2-3-1002".to_string());
+                if p == race_foreign {
+                    snap.owner_sid = Ok("S-1-5-21-1-2-3-1002".to_string());
+                }
                 Ok(snap)
             },
         )
@@ -2570,11 +3072,42 @@ mod windows_private_dir_tests {
             "{err_f:?}"
         );
 
-        // 3. Race lost to same user's open directory (`ERROR_ALREADY_EXISTS`): checked and warns.
+        // 3a. Race lost to same user's write-open directory (`ERROR_ALREADY_EXISTS`): refused.
+        let race_write_open = parent.path().join("race_write_open");
+        let err_w = ensure_private_dir_windows_with(
+            &race_write_open,
+            true,
+            current_user_sid,
+            |p| {
+                create_or_open_private_dir_all_with_hooks(
+                    p,
+                    |target| {
+                        std::fs::create_dir(target).unwrap();
+                        let status = Command::new("icacls")
+                            .arg(target)
+                            .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
+                            .status()
+                            .unwrap();
+                        assert!(status.success());
+                    },
+                    |_| {},
+                )
+            },
+            inspect_dir_security_no_follow,
+        )
+        .expect_err("write-open directory winning creation race must be refused");
+        assert!(
+            matches!(&err_w, SandboxError::BaseDirUnsafe { reason, .. }
+                if reason.contains("BUILTIN\\Users")),
+            "{err_w:?}"
+        );
+
+        // 3b. Race lost to same user's read-open directory (`ERROR_ALREADY_EXISTS`): checked and warns.
         let race_open = parent.path().join("race_open");
         let (res_open, warnings) = capture_thread_warnings(|| {
             ensure_private_dir_windows_with(
                 &race_open,
+                true,
                 current_user_sid,
                 |p| {
                     create_or_open_private_dir_all_with_hooks(
@@ -2590,7 +3123,7 @@ mod windows_private_dir_tests {
         assert_eq!(
             warnings.len(),
             1,
-            "open winner must still trigger ACL warning"
+            "read-open winner must still trigger one-time ACL warning"
         );
     }
 
@@ -2599,15 +3132,18 @@ mod windows_private_dir_tests {
         let parent = open_parent();
         let user = current_user_sid().unwrap();
 
-        // 1. Volume without `FILE_PERSISTENT_ACLS` (FAT / exFAT) is refused.
+        // 1a. Volume without `FILE_PERSISTENT_ACLS` (FAT / exFAT) is refused as BaseDirUnsafe.
         let fat_dir = parent.path().join("simulated_exfat");
         let err_fat = ensure_private_dir_windows_with(
             &fat_dir,
+            true,
             || Ok(user.clone()),
             |p| create_or_open_private_dir_all_with_hooks(p, |_| {}, |_| {}),
             |p| {
                 let mut snap = inspect_dir_security_no_follow(p)?;
-                snap.persistent_acls = false;
+                if p == fat_dir {
+                    snap.persistent_acls = Ok(false);
+                }
                 Ok(snap)
             },
         )
@@ -2618,11 +3154,35 @@ mod windows_private_dir_tests {
             "{err_fat:?}"
         );
 
+        // 1b. A real `GetVolumeInformationByHandleW` failure surfaces the real OS error as
+        //     `BaseDirUnusable`, not a misleading FAT/exFAT message.
+        let vol_err_dir = parent.path().join("vol_info_error");
+        let err_vol = ensure_private_dir_windows_with(
+            &vol_err_dir,
+            true,
+            || Ok(user.clone()),
+            |p| create_or_open_private_dir_all_with_hooks(p, |_| {}, |_| {}),
+            |p| {
+                let mut snap = inspect_dir_security_no_follow(p)?;
+                if p == vol_err_dir {
+                    snap.persistent_acls = Err(std::io::Error::from_raw_os_error(21));
+                }
+                Ok(snap)
+            },
+        )
+        .expect_err("GetVolumeInformationByHandleW failure must fail");
+        assert!(
+            matches!(&err_vol, SandboxError::BaseDirUnusable { path, source }
+                if path == &vol_err_dir && source.raw_os_error() == Some(21)),
+            "{err_vol:?}"
+        );
+
         // 2. Cloud/virtual volume that reports `FILE_PERSISTENT_ACLS` yet silently drops the
         //    protected descriptor on `CreateDirectoryW` is caught by the post-create read-back.
         let dropped_sd_dir = parent.path().join("dropped_sd");
         let err_drop = ensure_private_dir_windows_with(
             &dropped_sd_dir,
+            true,
             current_user_sid,
             |p| {
                 create_or_open_private_dir_all_with_hooks(
@@ -2651,7 +3211,10 @@ mod windows_private_dir_tests {
         //    (e.g. exFAT): `current_dir()` already exists so nothing is written there.
         if let Ok(cwd) = std::env::current_dir() {
             if let Ok(snap) = inspect_dir_security_no_follow(&cwd) {
-                if !snap.persistent_acls && !snap.is_reparse_point && snap.is_dir {
+                if matches!(snap.persistent_acls, Ok(false))
+                    && !snap.is_reparse_point
+                    && snap.is_dir
+                {
                     let err_live = ensure_private_dir(&cwd)
                         .expect_err("live exFAT/FAT directory must be refused");
                     assert!(

@@ -1975,7 +1975,7 @@ impl WorkerClient {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         if had_used_blobs {
-            if let Ok(cache) = self.runner.blob_cache() {
+            if let Some(cache) = self.runner.blob_cache_if_open() {
                 let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
             }
         }
@@ -2398,7 +2398,7 @@ impl WorkerClient {
             .runner
             .config()
             .sandbox_config
-            .ensure_private_root()
+            .ensure_private_root_recheck()
             .await
         {
             warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not safe");
@@ -2524,10 +2524,10 @@ impl WorkerClient {
                     runner
                         .config()
                         .sandbox_config
-                        .ensure_private_root()
+                        .ensure_private_root_recheck()
                         .await
                         .map_err(|e| e.to_string())?;
-                    let cache = runner.blob_cache()?;
+                    let cache = runner.ensure_blob_cache().await?;
                     fetch_task_inputs(&task, current_blob_client.as_deref(), &cache).await
                 };
                 let failure = tokio::select! {
@@ -2625,8 +2625,7 @@ impl WorkerClient {
             // Output files reach the Master's blob store before the result that names them.
             let used_blobs = _inputs.is_some() || !result.outputs.is_empty();
             let output_pin = runner
-                .blob_cache()
-                .ok()
+                .blob_cache_if_open()
                 .and_then(|cache| cache.take_task_outputs(task.id))
                 .map(Arc::new);
             // Ownership of this attempt's output pin now lives in `output_pin`; prevent `_guard`
@@ -2656,7 +2655,7 @@ impl WorkerClient {
                     (tx, evicted)
                 };
                 if evicted_used_blobs {
-                    if let Ok(cache) = runner.blob_cache() {
+                    if let Some(cache) = runner.blob_cache_if_open() {
                         let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                     }
                 }
@@ -2673,7 +2672,7 @@ impl WorkerClient {
                     .clone();
                 let had_outputs = !result.outputs.is_empty();
                 if had_outputs {
-                    match runner.blob_cache() {
+                    match runner.ensure_blob_cache().await {
                         Ok(cache) => {
                             tokio::select! {
                                 () = upload_task_outputs(&task, &mut result, current_blob_client.as_deref(), &cache) => {}
@@ -2721,7 +2720,7 @@ impl WorkerClient {
             drop(output_pin);
             drop(_inputs);
             if used_blobs {
-                if let Ok(cache) = runner.blob_cache() {
+                if let Some(cache) = runner.blob_cache_if_open() {
                     let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                 }
             }
@@ -2771,7 +2770,7 @@ impl WorkerClient {
                 .unwrap_or_else(|e| e.into_inner())
                 .ack_result(task_id, ack_token);
             if used_blobs {
-                if let Ok(cache) = self.runner.blob_cache() {
+                if let Some(cache) = self.runner.blob_cache_if_open() {
                     let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                 }
             }
@@ -2790,7 +2789,7 @@ impl WorkerClient {
         };
         if used_blobs {
             self.runner.release_task_outputs(task_id);
-            if let Ok(cache) = self.runner.blob_cache() {
+            if let Some(cache) = self.runner.blob_cache_if_open() {
                 let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
             }
         }
@@ -3458,7 +3457,7 @@ impl WorkerClient {
 
                     let mut result = item.result.clone();
                     if !result.outputs.is_empty() {
-                        match flush_runner.blob_cache() {
+                        match flush_runner.ensure_blob_cache().await {
                             Ok(cache) => {
                                 upload_task_outputs(
                                     &item.task,
