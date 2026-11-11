@@ -18,6 +18,20 @@ The installer:
   4. starts the worker and starts it again at every login,
   5. runs "oxideswarm doctor" and prints the result.
 
+If the stick also holds a GPU build, the installer first asks whether the
+cluster may use this computer's GPU as well. Answer n to keep the GPU out.
+
+On Windows with a second NTFS drive (for example D:), the installer asks
+where to keep its files. A folder on that drive also holds the task folders
+and the file cache, and only your Windows account can open it.
+
+When the installer is done, the window offers to eject the stick; say yes
+and remove it when it says so. The worker does not run from the stick.
+
+To update a computer that already runs the worker, double-click "Update
+OxideSwarm" instead (Linux: bash install.sh --update). It keeps the name, the
+GPU choice and the cluster membership, asks nothing and joins nothing.
+
 It never changes ~/.oxideswarm or any other OxideSwarm installation on the
 computer. To remove it, run "Uninstall OxideSwarm" from the same stick.
 
