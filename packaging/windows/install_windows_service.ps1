@@ -449,8 +449,78 @@ if ($existingService) {
 # ==============================================================================
 # 5. Create Filesystem Directory Hierarchy
 # ==============================================================================
+function Get-ExtraAllowSids {
+    param (
+        [string]$Path,
+        [string[]]$KeepSids
+    )
+    $extra = @()
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            $sid = $rule.IdentityReference.Value
+            if ($sid -notin $KeepSids -and ("*" + $sid) -notin $extra) {
+                $extra += ("*" + $sid)
+            }
+        }
+    } catch {}
+    return $extra
+}
+
+function Resolve-PrincipalSid {
+    param ([string]$Principal)
+    if (-not $Principal) { return "" }
+    if ($Principal.StartsWith("*")) { return $Principal.Substring(1) }
+    try {
+        return (New-Object Security.Principal.NTAccount($Principal)).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return ""
+    }
+}
+
+# Sandbox base directory ($DataDir): protected DACL (/inheritance:r) owned by Administrators and
+# granting full control only to SYSTEM, Administrators and the service SID (design 0021).
+function Set-PrivateDirAcl {
+    param (
+        [string]$Path,
+        [string]$Principal,
+        [string]$PrincipalRights = "(OI)(CI)(F)"
+    )
+    $keepSids = @("S-1-5-18", "S-1-5-32-544")
+    $principalSid = Resolve-PrincipalSid -Principal $Principal
+    if ($principalSid -and $principalSid -notin $keepSids) {
+        $keepSids += $principalSid
+    }
+    $grants = @("*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)")
+    if ($Principal -and $Principal -ne "*S-1-5-18") {
+        $grants += ($Principal + ":" + $PrincipalRights)
+    }
+    & icacls.exe $Path /setowner "*S-1-5-32-544" | Out-Null
+    $removeArgs = @(Get-ExtraAllowSids -Path $Path -KeepSids $keepSids)
+    $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $grants
+    if ($removeArgs.Count -gt 0) {
+        $icaclsArgs += "/remove:g"
+        $icaclsArgs += $removeArgs
+    }
+    & icacls.exe @icaclsArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not restrict the ACL of private task directory $Path (icacls exit code $LASTEXITCODE)."
+        exit 1
+    }
+}
+
 $binDir = Join-Path $InstallDir "bin"
 $configParent = Split-Path -Path $ConfigPath -Parent
+$dataParent = Split-Path -Path $DataDir -Parent
+$programDataRoot = if ($env:ProgramData) { [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\') } else { "C:\ProgramData" }
+$lockDataParent = $false
+if ($dataParent) {
+    $dataParentFull = [IO.Path]::GetFullPath($dataParent).TrimEnd('\')
+    $dataDriveRoot = [IO.Path]::GetPathRoot($dataParentFull + '\').TrimEnd('\')
+    if ($dataParentFull -ne $dataDriveRoot -and $dataParentFull -ne $programDataRoot -and $dataParentFull.StartsWith($programDataRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $lockDataParent = $true
+    }
+}
 
 $requiredDirs = @($InstallDir, $binDir, $LogDir, $DataDir, $configParent) | Select-Object -Unique
 
@@ -460,6 +530,12 @@ foreach ($dir in $requiredDirs) {
         Write-Host "[OK] Created directory: $dir" -ForegroundColor Green
     }
 }
+if ($lockDataParent) {
+    Set-PrivateDirAcl -Path $dataParent -Principal ""
+}
+# Lock $DataDir to SYSTEM and Administrators immediately on creation (before the service exists)
+# so it never inherits BUILTIN\Users access from ProgramData; section 9 adds the service SID.
+Set-PrivateDirAcl -Path $DataDir -Principal ""
 
 # ==============================================================================
 # 6. Deploy Executable Binaries
@@ -798,17 +874,28 @@ function Set-PrivateFileAcl {
         [string]$Path,
         [string]$Principal
     )
+    $keepSids = @("S-1-5-18", "S-1-5-32-544")
+    $principalSid = Resolve-PrincipalSid -Principal $Principal
+    if ($principalSid -and $principalSid -notin $keepSids) {
+        $keepSids += $principalSid
+    }
     $grants = @("*S-1-5-18:(F)", "*S-1-5-32-544:(F)")
     if ($Principal -and $Principal -ne "*S-1-5-18") {
         $grants += ($Principal + ":(R)")
     }
-    & icacls.exe $Path /inheritance:r /grant:r $grants | Out-Null
+    $removeArgs = @(Get-ExtraAllowSids -Path $Path -KeepSids $keepSids)
+    $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $grants
+    if ($removeArgs.Count -gt 0) {
+        $icaclsArgs += "/remove:g"
+        $icaclsArgs += $removeArgs
+    }
+    & icacls.exe @icaclsArgs | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "Could not restrict the ACL of $Path (icacls exit code $LASTEXITCODE). Restrict it manually: it holds the cluster secret / P2P ticket."
     }
 }
 
-# Log and sandbox directories: the service account must be able to write there.
+# Log directory: the service account must be able to write there.
 function Grant-ServiceModify {
     param (
         [string]$Path,
@@ -821,13 +908,16 @@ function Grant-ServiceModify {
     }
 }
 
+if ($lockDataParent) {
+    Set-PrivateDirAcl -Path $dataParent -Principal $aclPrincipal -PrincipalRights "(RX)"
+}
 Set-PrivateFileAcl -Path $ConfigPath -Principal $aclPrincipal
 if ($secretTarget) {
     Set-PrivateFileAcl -Path $secretTarget -Principal $aclPrincipal
 }
 Grant-ServiceModify -Path $LogDir -Principal $aclPrincipal
-Grant-ServiceModify -Path $DataDir -Principal $aclPrincipal
-Write-Host "[OK] Applied ACLs (config/secret private; log and sandbox directories writable by the service account)." -ForegroundColor Green
+Set-PrivateDirAcl -Path $DataDir -Principal $aclPrincipal
+Write-Host "[OK] Applied ACLs (config/secret and sandbox data directory private to SYSTEM, Administrators and the service account; log directory writable by the service account)." -ForegroundColor Green
 
 # ==============================================================================
 # 10. Configure SCM Recovery Actions & Auto-Start
