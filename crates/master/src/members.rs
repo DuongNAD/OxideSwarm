@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -386,6 +386,20 @@ pub struct PendingBookkeepingPersist {
     target_generation: u64,
 }
 
+/// Snapshot of the `MemberStore` worker-ID claim entries removed by
+/// [`MemberStore::release_worker_id_deferred`], used to restore in-memory state if the subsequent
+/// `members.json` write fails (`M1`).
+#[derive(Debug, Clone)]
+pub struct ReleasedWorkerClaim {
+    pub worker_id: Uuid,
+    pub v2_seq: Option<u64>,
+    pub worker_owner: Option<String>,
+    pub worker_last_seq: Option<u64>,
+}
+
+#[cfg(test)]
+type StagedWriteHook = Box<dyn FnOnce() + Send>;
+
 /// Thread-safe enrolled member, invite, pending-enrollment, and worker-ownership store.
 ///
 /// Lock ordering: `write_lock` -> `inner` (`RwLock`). `inner` is never held across disk I/O
@@ -397,6 +411,11 @@ pub struct MemberStore {
     /// `state_generation` successfully written to disk.
     write_lock: Arc<Mutex<u64>>,
     persist_count: Arc<AtomicU64>,
+    /// Set when an in-memory rollback, resync, or bookkeeping mutation could not be written to
+    /// `members.json`, leaving on-disk state behind in-memory state (`S1`, `NIT 2`).
+    dirty: Arc<AtomicBool>,
+    #[cfg(test)]
+    after_staged_write_hook: Arc<Mutex<Option<StagedWriteHook>>>,
 }
 
 impl fmt::Debug for MemberStore {
@@ -744,13 +763,63 @@ impl MemberStore {
         self.persist_count.load(Ordering::Relaxed)
     }
 
+    /// Returns `true` when an earlier rollback, resync, or bookkeeping mutation updated in-memory
+    /// state while its `members.json` write failed (`S1`, `NIT 2`).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Marks `members.json` as behind in-memory state so the next flush or resync writes a fresh
+    /// snapshot (`M1`, `S1`).
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_write_lock_for_test(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn set_after_staged_write_hook<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self
+            .after_staged_write_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Clears `dirty` while the caller holds `self.write_lock` if `persisted_gen_val` has caught
+    /// up to `state_generation`.
+    fn mark_clean_if_caught_up(&self, persisted_gen_val: u64) {
+        if !self.dirty.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if persisted_gen_val >= guard.state_generation {
+            self.dirty.store(false, Ordering::Release);
+        }
+    }
+
+    /// Flushes `members.json` if an earlier rollback, resync, or bookkeeping write failed (`S1`,
+    /// `NIT 2`). Returns `Ok(())` immediately without locking when `!self.is_dirty()`.
+    pub fn flush_dirty(&self) -> GridResult<()> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.persist_snapshot_up_to(u64::MAX, true)
+    }
+
     fn persist_snapshot_up_to(
         &self,
         target_generation: u64,
         respect_auth_mode: bool,
     ) -> GridResult<()> {
         let mut persisted_gen = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if *persisted_gen >= target_generation {
+        let is_dirty = self.dirty.load(Ordering::Acquire);
+        if !is_dirty && *persisted_gen >= target_generation {
             return Ok(());
         }
         let snapshot = {
@@ -761,7 +830,7 @@ impl MemberStore {
             let Some(ref path) = guard.save_path else {
                 return Ok(());
             };
-            if *persisted_gen >= guard.state_generation {
+            if !self.dirty.load(Ordering::Acquire) && *persisted_gen >= guard.state_generation {
                 return Ok(());
             }
             (
@@ -770,9 +839,13 @@ impl MemberStore {
                 guard.state_generation,
             )
         };
-        write_members_file_atomic(&snapshot.0, &snapshot.1)?;
+        if let Err(e) = write_members_file_atomic(&snapshot.0, &snapshot.1) {
+            self.dirty.store(true, Ordering::Release);
+            return Err(e);
+        }
         *persisted_gen = (*persisted_gen).max(snapshot.2);
         self.persist_count.fetch_add(1, Ordering::Relaxed);
+        self.mark_clean_if_caught_up(*persisted_gen);
         Ok(())
     }
 
@@ -798,18 +871,29 @@ impl MemberStore {
         if let Some((ref path, ref file)) = staged_write {
             write_members_file_atomic(path, file)?;
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_staged_write_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
         let (out, resync_write) = {
             let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
             let mut force_resync = guard.state_generation != gen_before;
             let out = commit(&mut guard, token, &mut force_resync);
             guard.state_generation = guard.state_generation.saturating_add(1);
             let new_gen = guard.state_generation;
-            let resync_write = if let Some((path, _)) = staged_write {
+            let resync_write = if let Some((staged_path, _)) = staged_write {
                 if force_resync {
-                    Some((path, guard.state.to_members_file(), new_gen))
+                    let current_path = guard.save_path.clone().unwrap_or(staged_path);
+                    Some((current_path, guard.state.to_members_file(), new_gen))
                 } else {
                     *persisted_gen = (*persisted_gen).max(new_gen);
                     self.persist_count.fetch_add(1, Ordering::Relaxed);
+                    self.dirty.store(false, Ordering::Release);
                     None
                 }
             } else {
@@ -822,8 +906,10 @@ impl MemberStore {
                 Ok(()) => {
                     *persisted_gen = (*persisted_gen).max(new_gen);
                     self.persist_count.fetch_add(1, Ordering::Relaxed);
+                    self.mark_clean_if_caught_up(*persisted_gen);
                 }
                 Err(e) => {
+                    self.dirty.store(true, Ordering::Release);
                     tracing::warn!(
                         error = %e,
                         "failed to resync members.json after concurrent state update"
@@ -836,7 +922,7 @@ impl MemberStore {
 
     /// Flushes a deferred worker-claim bookkeeping change to `members.json` outside the
     /// [`crate::registry::WorkerRegistry`] write lock. Never fails the caller if the disk write
-    /// fails; logs a warning and keeps the in-memory claim.
+    /// fails; logs a warning, marks `dirty = true` for later retry, and keeps the in-memory claim.
     pub fn flush_bookkeeping_persist(&self, pending: PendingBookkeepingPersist) {
         if let Err(e) = self.persist_snapshot_up_to(pending.target_generation, true) {
             tracing::warn!(
@@ -844,6 +930,14 @@ impl MemberStore {
                 "failed to persist worker claim bookkeeping to members.json; keeping claim in memory"
             );
         }
+    }
+
+    /// Flushes a deferred `members.json` bookkeeping change and propagates any write error (`M1`).
+    pub fn flush_bookkeeping_persist_checked(
+        &self,
+        pending: PendingBookkeepingPersist,
+    ) -> GridResult<()> {
+        self.persist_snapshot_up_to(pending.target_generation, true)
     }
 
     /// Builds an in-memory store from an iterator of [`MemberEntry`] items.
@@ -867,6 +961,9 @@ impl MemberStore {
             })),
             write_lock: Arc::new(Mutex::new(0)),
             persist_count: Arc::new(AtomicU64::new(0)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_staged_write_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -912,6 +1009,9 @@ impl MemberStore {
             })),
             write_lock: Arc::new(Mutex::new(0)),
             persist_count: Arc::new(AtomicU64::new(0)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_staged_write_hook: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1895,8 +1995,10 @@ impl MemberStore {
                 }
             }
 
-            let snapshot = if state_changed {
-                guard.state_generation = guard.state_generation.saturating_add(1);
+            let snapshot = if state_changed || self.dirty.load(Ordering::Acquire) {
+                if state_changed {
+                    guard.state_generation = guard.state_generation.saturating_add(1);
+                }
                 let snap_gen = guard.state_generation;
                 guard
                     .save_path
@@ -1909,9 +2011,13 @@ impl MemberStore {
         };
 
         if let Some((path, file, snap_gen)) = snapshot {
-            write_members_file_atomic(&path, &file)?;
+            if let Err(e) = write_members_file_atomic(&path, &file) {
+                self.dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
             *persisted_gen = (*persisted_gen).max(snap_gen);
             self.persist_count.fetch_add(1, Ordering::Relaxed);
+            self.mark_clean_if_caught_up(*persisted_gen);
         }
         Ok(released_workers)
     }
@@ -2221,11 +2327,14 @@ impl MemberStore {
         let changed = !was_already_v2 || reclaimed_v3 || !v2_to_evict.is_empty();
         if changed {
             guard.state_generation = guard.state_generation.saturating_add(1);
-            if guard.auth_mode.allows_members() && guard.save_path.is_some() {
-                return Ok(Some(PendingBookkeepingPersist {
-                    target_generation: guard.state_generation,
-                }));
-            }
+        }
+        if (changed || self.dirty.load(Ordering::Acquire))
+            && guard.auth_mode.allows_members()
+            && guard.save_path.is_some()
+        {
+            return Ok(Some(PendingBookkeepingPersist {
+                target_generation: guard.state_generation,
+            }));
         }
         Ok(None)
     }
@@ -2260,8 +2369,9 @@ impl MemberStore {
 
     /// Records or verifies ownership of `worker_id` by `member_id` (design 0051 D5), returning any
     /// evicted non-live worker IDs and a [`PendingBookkeepingPersist`] token when the persistent
-    /// ownership set changed. Reconnects of an already-owned `worker_id` update the LRU sequence in
-    /// memory only without touching disk.
+    /// ownership set changed (or an earlier `members.json` write left `dirty` set). Reconnects of
+    /// an already-owned `worker_id` otherwise update the LRU sequence in memory only without
+    /// touching disk.
     pub fn claim_worker_id_evicting_deferred<F>(
         &self,
         worker_id: Uuid,
@@ -2286,7 +2396,17 @@ impl MemberStore {
             let seq = guard.state.next_worker_seq;
             guard.state.next_worker_seq = seq.wrapping_add(1);
             guard.state.worker_last_seq.insert(worker_id, seq);
-            return Ok((Vec::new(), None));
+            let retry_dirty = if self.dirty.load(Ordering::Acquire)
+                && guard.auth_mode.allows_members()
+                && guard.save_path.is_some()
+            {
+                Some(PendingBookkeepingPersist {
+                    target_generation: guard.state_generation,
+                })
+            } else {
+                None
+            };
+            return Ok((Vec::new(), retry_dirty));
         }
         let owned: Vec<Uuid> = guard
             .state
@@ -2367,41 +2487,84 @@ impl MemberStore {
     }
 
     /// Releases a non-live `worker_id` claim in memory from `v2_worker_seq`, `worker_owners`, and
-    /// `worker_last_seq`, returning a [`PendingBookkeepingPersist`] token when persistent state
-    /// changed so the caller can flush outside the [`crate::registry::WorkerRegistry`] write lock.
+    /// `worker_last_seq`, returning a [`PendingBookkeepingPersist`] token and the removed
+    /// [`ReleasedWorkerClaim`] when persistent state changed so the caller can flush outside the
+    /// [`crate::registry::WorkerRegistry`] write lock and restore the claim on write error (`M1`).
     pub fn release_worker_id_deferred(
         &self,
         worker_id: Uuid,
         had_registry_claim: bool,
-    ) -> GridResult<Option<PendingBookkeepingPersist>> {
+    ) -> GridResult<Option<(PendingBookkeepingPersist, ReleasedWorkerClaim)>> {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let had_store_claim = guard.state.v2_worker_seq.contains_key(&worker_id)
-            || guard.state.worker_owners.contains_key(&worker_id)
-            || guard.state.worker_last_seq.contains_key(&worker_id);
+        let v2_seq = guard.state.v2_worker_seq.remove(&worker_id);
+        let worker_owner = guard.state.worker_owners.remove(&worker_id);
+        let worker_last_seq = guard.state.worker_last_seq.remove(&worker_id);
+        let had_store_claim =
+            v2_seq.is_some() || worker_owner.is_some() || worker_last_seq.is_some();
         if !had_store_claim && !had_registry_claim {
             return Err(GridError::Config(format!(
                 "no worker_id claim found for {worker_id}"
             )));
         }
         if had_store_claim {
-            guard.state.v2_worker_seq.remove(&worker_id);
-            guard.state.worker_owners.remove(&worker_id);
-            guard.state.worker_last_seq.remove(&worker_id);
             guard.state_generation = guard.state_generation.saturating_add(1);
             if guard.auth_mode.allows_members() && guard.save_path.is_some() {
-                return Ok(Some(PendingBookkeepingPersist {
-                    target_generation: guard.state_generation,
-                }));
+                return Ok(Some((
+                    PendingBookkeepingPersist {
+                        target_generation: guard.state_generation,
+                    },
+                    ReleasedWorkerClaim {
+                        worker_id,
+                        v2_seq,
+                        worker_owner,
+                        worker_last_seq,
+                    },
+                )));
             }
         }
         Ok(None)
     }
 
+    /// Restores `claim` into memory after a failed `release-worker` persistence write unless
+    /// another peer has already claimed `claim.worker_id` in the meantime (`M1`).
+    ///
+    /// Returns `true` if `claim` was restored, or `false` if `claim.worker_id` was claimed again
+    /// concurrently (marking `dirty = true` so a later flush persists the new claim).
+    pub fn restore_released_worker_claim_if_unclaimed(&self, claim: &ReleasedWorkerClaim) -> bool {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if guard.state.v2_worker_seq.contains_key(&claim.worker_id)
+            || guard.state.worker_owners.contains_key(&claim.worker_id)
+        {
+            self.dirty.store(true, Ordering::Release);
+            return false;
+        }
+        if let Some(seq) = claim.v2_seq {
+            guard.state.v2_worker_seq.insert(claim.worker_id, seq);
+        }
+        if let Some(ref owner) = claim.worker_owner {
+            guard
+                .state
+                .worker_owners
+                .insert(claim.worker_id, owner.clone());
+        }
+        if let Some(seq) = claim.worker_last_seq {
+            guard.state.worker_last_seq.insert(claim.worker_id, seq);
+        }
+        guard.state_generation = guard.state_generation.saturating_add(1);
+        true
+    }
+
     /// Releases a non-live `worker_id` claim held in `v2_worker_seq` or `worker_owners` so an
-    /// enrolled member can register with that `worker_id` (design 0051 D5/D6).
+    /// enrolled member can register with that `worker_id` (design 0051 D5/D6). Propagates any
+    /// `members.json` write error after restoring the claim in memory (`M1`).
     pub fn release_worker_id(&self, worker_id: Uuid, had_registry_claim: bool) -> GridResult<()> {
-        if let Some(pending) = self.release_worker_id_deferred(worker_id, had_registry_claim)? {
-            self.flush_bookkeeping_persist(pending);
+        if let Some((pending, released_claim)) =
+            self.release_worker_id_deferred(worker_id, had_registry_claim)?
+        {
+            if let Err(e) = self.flush_bookkeeping_persist_checked(pending) {
+                self.restore_released_worker_claim_if_unclaimed(&released_claim);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -4084,5 +4247,329 @@ mod tests {
         for wid in &wids {
             assert!(persisted_owned.contains(wid));
         }
+
+        // Deterministic generation-coalescing check (round 6 NIT 4): 8 concurrent deferred claims
+        // queued while `write_lock` is held coalesce into a single `members.json` write once
+        // released, and all 8 claims are persisted on disk.
+        let before_coalesce = store_burst.persist_count();
+        let coalesce_wids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+        let write_guard = store_burst.hold_write_lock_for_test();
+        let claimed_barrier = Arc::new(std::sync::Barrier::new(coalesce_wids.len() + 1));
+        let mut coalesce_handles = Vec::new();
+        for wid in &coalesce_wids {
+            let s = store_burst.clone();
+            let b = claimed_barrier.clone();
+            let mid = burst_mid.clone();
+            let w = *wid;
+            coalesce_handles.push(std::thread::spawn(move || {
+                let (_, pending) = s
+                    .claim_worker_id_evicting_deferred(w, &mid, |_| true)
+                    .unwrap();
+                b.wait();
+                s.flush_bookkeeping_persist(pending.expect("new claim must request persist"));
+            }));
+        }
+        claimed_barrier.wait();
+        drop(write_guard);
+        for h in coalesce_handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            store_burst.persist_count() - before_coalesce,
+            1,
+            "8 concurrent worker claims queued behind write_lock must coalesce into 1 disk write"
+        );
+        let reloaded_after_coalesce = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        let owned_after_coalesce = reloaded_after_coalesce.workers_owned_by(&burst_mid);
+        assert_eq!(owned_after_coalesce.len(), wids.len() + coalesce_wids.len());
+        for wid in &coalesce_wids {
+            assert!(owned_after_coalesce.contains(wid));
+        }
+    }
+
+    #[test]
+    fn test_r6_m1_release_worker_write_error_s1_dirty_retry_and_nit2_double_fault() {
+        let enroll_and_approve = |store: &MemberStore,
+                                  kp: &NodeKeypair,
+                                  name: &str,
+                                  hash: [u8; KEY_LEN],
+                                  invite_id: &str,
+                                  secret: &[u8; 32]| {
+            let proof = compute_enroll_proof(secret, &hash);
+            let (pid, mut rx) = match store
+                .handle_enroll_request(
+                    *kp.public_key(),
+                    &hash,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50041",
+                    invite_id,
+                    &proof,
+                    name.into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap()
+            {
+                EnrollOutcome::Pending {
+                    pending_id,
+                    decision_rx,
+                } => (pending_id, decision_rx),
+                _ => panic!("expected Pending"),
+            };
+            store
+                .approve_pending(&pid, derive_pairing_code(&hash).as_str())
+                .unwrap();
+            match rx.try_recv().unwrap() {
+                PendingDecision::Approved { rollback, .. } => *rollback,
+                _ => panic!("expected Approved"),
+            }
+        };
+
+        // 1. M1: `release_worker_id` fails when `members.json` cannot be written (save path under
+        //    a regular file) and restores both v3 and v2 claims in memory unless concurrently
+        //    reclaimed.
+        let dir_m1 = tempfile::tempdir().unwrap();
+        let store_m1 = MemberStore::load_from_dir(Some(dir_m1.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let v3_kp = NodeKeypair::generate().unwrap();
+        let other_kp = NodeKeypair::generate().unwrap();
+        let seed_inv = store_m1
+            .create_invite(vec![MemberRole::Worker], 2, 3600, false)
+            .unwrap();
+        for (kp, tag, byte) in [
+            (&v3_kp, "v3-owner", 0xA1u8),
+            (&other_kp, "v3-other", 0xA2u8),
+        ] {
+            let h = [byte; KEY_LEN];
+            let p = compute_enroll_proof(&seed_inv.invite_secret.0, &h);
+            store_m1
+                .handle_enroll_request(
+                    *kp.public_key(),
+                    &h,
+                    "1111-2222-3333-4444",
+                    "127.0.0.1:50042",
+                    &seed_inv.invite_id,
+                    &p,
+                    tag.into(),
+                    "linux".into(),
+                    "x86_64".into(),
+                )
+                .unwrap();
+        }
+        let v3_mid = v3_kp.member_id();
+        let other_mid = other_kp.member_id();
+        let wid_v3 = Uuid::new_v4();
+        let wid_v2 = Uuid::new_v4();
+        store_m1.claim_worker_id(wid_v3, &v3_mid).unwrap();
+        store_m1
+            .claim_v2_worker_id(wid_v2, true, |_| false)
+            .unwrap();
+
+        let blocker_m1 = dir_m1.path().join("regular-file-blocker");
+        std::fs::write(&blocker_m1, b"blocker").unwrap();
+        store_m1.set_save_path(Some(blocker_m1.join(MEMBERS_FILE_NAME)));
+
+        assert!(
+            store_m1.release_worker_id(wid_v3, false).is_err(),
+            "M1: failed members.json write during release_worker_id (v3) must return Err"
+        );
+        assert!(
+            store_m1.workers_owned_by(&v3_mid).contains(&wid_v3),
+            "M1: failed release_worker_id must restore v3 worker_owners claim in memory"
+        );
+        assert!(
+            store_m1.claim_worker_id(wid_v3, &other_mid).is_err(),
+            "M1: restored v3 claim must still block another member"
+        );
+
+        assert!(
+            store_m1.release_worker_id(wid_v2, false).is_err(),
+            "M1: failed members.json write during release_worker_id (v2) must return Err"
+        );
+        assert!(
+            store_m1.claim_worker_id(wid_v2, &v3_mid).is_err(),
+            "M1: restored v2_worker_seq claim must still block v3 member under AuthMode::Both"
+        );
+
+        // Concurrent re-claim guard: if another peer claimed `wid_v3` before the failed flush
+        // attempts to restore, `restore_released_worker_claim_if_unclaimed` keeps the new owner and
+        // marks the store dirty for retry.
+        let (pending_rel, released_claim) = store_m1
+            .release_worker_id_deferred(wid_v3, false)
+            .unwrap()
+            .unwrap();
+        store_m1
+            .claim_worker_id_evicting_deferred(wid_v3, &other_mid, |_| false)
+            .unwrap();
+        assert!(store_m1
+            .flush_bookkeeping_persist_checked(pending_rel)
+            .is_err());
+        assert!(!store_m1.restore_released_worker_claim_if_unclaimed(&released_claim));
+        assert!(store_m1.workers_owned_by(&other_mid).contains(&wid_v3));
+        assert!(!store_m1.workers_owned_by(&v3_mid).contains(&wid_v3));
+        assert!(store_m1.is_dirty());
+
+        // 2. S1: Failed `rollback_approved_enrollment` write sets `dirty = true`, and a subsequent
+        //    retry (`flush_dirty` or a reconnect bookkeeping flush) writes the rollback to disk so
+        //    the declined member cannot come back after a restart and the 1-use invite stays valid.
+        let dir_s1 = tempfile::tempdir().unwrap();
+        let store_s1 = MemberStore::load_from_dir(Some(dir_s1.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let inv_s1 = store_s1
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let cand_s1 = NodeKeypair::generate().unwrap();
+        let rb_s1 = enroll_and_approve(
+            &store_s1,
+            &cand_s1,
+            "s1-declining-box",
+            [0xA3u8; KEY_LEN],
+            &inv_s1.invite_id,
+            &inv_s1.invite_secret.0,
+        );
+        let blocker_s1 = dir_s1.path().join("s1-blocker");
+        std::fs::write(&blocker_s1, b"blocker").unwrap();
+        store_s1.set_save_path(Some(blocker_s1.join(MEMBERS_FILE_NAME)));
+
+        assert!(store_s1.rollback_approved_enrollment(rb_s1).is_err());
+        assert!(!store_s1.contains(cand_s1.public_key()));
+        assert!(store_s1.is_dirty());
+        // Before retry, disk still holds the pre-rollback approved member.
+        assert!(MemberStore::load_from_dir(Some(dir_s1.path()))
+            .unwrap()
+            .contains(cand_s1.public_key()));
+
+        // Restore valid save path and retry via `flush_dirty()`.
+        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        store_s1.flush_dirty().unwrap();
+        assert!(!store_s1.is_dirty());
+        let reloaded_s1 = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        assert!(
+            !reloaded_s1.contains(cand_s1.public_key()),
+            "S1: retried rollback write must remove unconfirmed member on disk"
+        );
+        assert_eq!(
+            reloaded_s1.list_invites()[0].uses_remaining,
+            1,
+            "S1: retried rollback write must restore 1-use invite on disk"
+        );
+
+        // S1b: Verify that even a normally write-free worker reconnect (`already owned`) honours
+        // `dirty == true` and flushes the rollback to disk.
+        let existing_worker_kp = NodeKeypair::generate().unwrap();
+        let seed_w_inv = store_s1
+            .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+            .unwrap();
+        let h_sw = [0xA4u8; KEY_LEN];
+        let p_sw = compute_enroll_proof(&seed_w_inv.invite_secret.0, &h_sw);
+        store_s1
+            .handle_enroll_request(
+                *existing_worker_kp.public_key(),
+                &h_sw,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50043",
+                &seed_w_inv.invite_id,
+                &p_sw,
+                "s1-existing-worker".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+        let existing_wid = Uuid::new_v4();
+        store_s1
+            .claim_worker_id(existing_wid, &existing_worker_kp.member_id())
+            .unwrap();
+
+        let cand_s1b = NodeKeypair::generate().unwrap();
+        let rb_s1b = enroll_and_approve(
+            &store_s1,
+            &cand_s1b,
+            "s1b-declining-box",
+            [0xA5u8; KEY_LEN],
+            &inv_s1.invite_id,
+            &inv_s1.invite_secret.0,
+        );
+        store_s1.set_save_path(Some(blocker_s1.join(MEMBERS_FILE_NAME)));
+        assert!(store_s1.rollback_approved_enrollment(rb_s1b).is_err());
+        assert!(store_s1.is_dirty());
+        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        // Reconnect of already-owned `existing_wid` flushes because `dirty == true`.
+        store_s1
+            .claim_worker_id(existing_wid, &existing_worker_kp.member_id())
+            .unwrap();
+        assert!(!store_s1.is_dirty());
+        let reloaded_s1b = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        assert!(!reloaded_s1b.contains(cand_s1b.public_key()));
+        assert_eq!(reloaded_s1b.list_invites()[0].uses_remaining, 1);
+
+        // 3. NIT 2: Double fault in `approve_pending` — `staged_write` succeeds, joiner
+        //    disconnects before `commit` (`delivered == false`), and `resync_write` fails.
+        //    `dirty` must be set and honoured by a later flush so disk drops the staged member and
+        //    restores the invite use.
+        let dir_nit2 = tempfile::tempdir().unwrap();
+        let store_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let inv_nit2 = store_nit2
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let cand_nit2 = NodeKeypair::generate().unwrap();
+        let hash_nit2 = [0xA6u8; KEY_LEN];
+        let proof_nit2 = compute_enroll_proof(&inv_nit2.invite_secret.0, &hash_nit2);
+        let (pending_id_nit2, decision_rx_nit2) = match store_nit2
+            .handle_enroll_request(
+                *cand_nit2.public_key(),
+                &hash_nit2,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50044",
+                &inv_nit2.invite_id,
+                &proof_nit2,
+                "nit2-double-fault-box".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        let blocker_nit2 = dir_nit2.path().join("nit2-blocker");
+        std::fs::write(&blocker_nit2, b"blocker").unwrap();
+        let store_for_hook = store_nit2.clone();
+        let bad_save_path = blocker_nit2.join(MEMBERS_FILE_NAME);
+        store_nit2.set_after_staged_write_hook(move || {
+            drop(decision_rx_nit2);
+            store_for_hook.set_save_path(Some(bad_save_path));
+        });
+
+        assert!(
+            store_nit2
+                .approve_pending(&pending_id_nit2, derive_pairing_code(&hash_nit2).as_str())
+                .is_err(),
+            "approve_pending must fail when joiner disconnected before commit"
+        );
+        assert!(!store_nit2.contains(cand_nit2.public_key()));
+        assert_eq!(store_nit2.list_invites()[0].uses_remaining, 1);
+        assert!(
+            store_nit2.is_dirty(),
+            "NIT 2: failed resync_write after staged_write + disconnect must mark store dirty"
+        );
+        // Confirm `staged_write` really landed on disk and `resync_write` really failed.
+        assert!(MemberStore::load_from_dir(Some(dir_nit2.path()))
+            .unwrap()
+            .contains(cand_nit2.public_key()));
+
+        // Restore valid save path and flush dirty state -> disk matches memory again.
+        store_nit2.set_save_path(Some(dir_nit2.path().join(MEMBERS_FILE_NAME)));
+        store_nit2.flush_dirty().unwrap();
+        assert!(!store_nit2.is_dirty());
+        let reloaded_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path())).unwrap();
+        assert!(!reloaded_nit2.contains(cand_nit2.public_key()));
+        assert_eq!(reloaded_nit2.list_invites()[0].uses_remaining, 1);
     }
 }

@@ -1639,6 +1639,9 @@ impl MasterServer {
             p2p_ticket: self.p2p_ticket.clone(),
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         };
+        if auth_ctx.auth_mode.allows_members() {
+            spawn_member_store_resync(Arc::clone(&auth_ctx.members), shutdown_rx.clone());
+        }
 
         #[cfg(feature = "p2p")]
         if let Some(endpoint) = self.p2p_endpoint {
@@ -1969,6 +1972,17 @@ impl MasterServer {
         }
 
         self.queue.close_and_compact_store().await;
+        if auth_ctx.auth_mode.allows_members() && auth_ctx.members.is_dirty() {
+            let members_for_shutdown = Arc::clone(&auth_ctx.members);
+            if let Err(e) =
+                run_member_store_blocking(move || members_for_shutdown.flush_dirty()).await
+            {
+                warn!(
+                    error = %e,
+                    "Failed to flush dirty members.json during master server shutdown"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -3796,6 +3810,10 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 
 const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
+/// How often the master retries flushing `members.json` when an earlier rollback, resync, or
+/// bookkeeping write failed (`S1`, `NIT 2`).
+const MEMBER_STORE_RESYNC_INTERVAL: Duration = Duration::from_secs(2);
+
 async fn run_member_store_blocking<T, F>(f: F) -> GridResult<T>
 where
     T: Send + 'static,
@@ -3804,6 +3822,38 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| GridError::Config(format!("member store task panicked: {e}")))?
+}
+
+fn spawn_member_store_resync(members: Arc<MemberStore>, mut shutdown_rx: watch::Receiver<bool>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MEMBER_STORE_RESYNC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if members.is_dirty() {
+                        let m = Arc::clone(&members);
+                        match run_member_store_blocking(move || m.flush_dirty()).await {
+                            Ok(()) => {
+                                info!("Flushed previously failed members.json update to disk");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Periodic retry failed to flush dirty members.json"
+                                );
+                            }
+                        }
+                    }
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4097,7 +4147,14 @@ async fn wait_for_pending_enrollment<S>(
                             .await;
                             match confirm_res {
                                 Ok(Ok(Some(ClientMessage::Hello))) => {
-                                    auth_ctx.members.confirm_approved_enrollment(&rollback);
+                                    let members_store = auth_ctx.members.clone();
+                                    let rollback_to_confirm = *rollback;
+                                    let _ = run_member_store_blocking(move || {
+                                        members_store
+                                            .confirm_approved_enrollment(&rollback_to_confirm);
+                                        Ok(())
+                                    })
+                                    .await;
                                     info!(
                                         pending_id = %pending_id,
                                         member_id = %member_id,
@@ -4600,6 +4657,11 @@ where
                     .await?;
                 }
                 Err(e) => {
+                    warn!(
+                        worker_id = %worker_id,
+                        error = %e,
+                        "Failed to release non-live worker_id claim"
+                    );
                     send_client_response(
                         transport,
                         &ClientResponse::Error {
@@ -5897,6 +5959,14 @@ impl MasterHandle {
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
         self.queue.close_and_compact_store_sync();
+        if self.auth_mode.allows_members() && self.members.is_dirty() {
+            if let Err(e) = self.members.flush_dirty() {
+                warn!(
+                    error = %e,
+                    "Failed to flush dirty members.json on shutdown"
+                );
+            }
+        }
         self.shutdown_tx
             .send(true)
             .map_err(|_| GridError::ConnectionClosed)
@@ -10499,5 +10569,301 @@ mod tests {
         assert!(!mem_nit3.contains(j_nit3.public_key()));
         assert_eq!(mem_nit3.list_invites()[0].uses_remaining, 1);
         assert_eq!(mem_nit3.unconfirmed_tracking_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, derive_pairing_code, v3_client_handshake_with_hash,
+            HandshakePurpose, MemberRole, RedactedString,
+        };
+        use rusty_grid_core::protocol::{
+            EndpointRole, ProtocolCapabilities, PROTOCOL_VERSION_CURRENT,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let members = MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+
+        let mut cfg = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(false)
+            .with_master_noise_key(master_kp)
+            .with_members(members.clone());
+        cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg.enable_p2p = false;
+        }
+        cfg.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg.enable_web_ui = false;
+        }
+
+        let handle = MasterServer::spawn(cfg).await.unwrap();
+        let addr = handle.server_addr;
+
+        // 1. Register a v2 worker, then disconnect it cleanly so its `worker_id` is non-live.
+        let v2_wid = Uuid::new_v4();
+        {
+            let ws = TcpStream::connect(addr).await.unwrap();
+            let mut wt = MessageTransport::new(ws);
+            let wsk = client_handshake(&mut wt, &secret).await.unwrap();
+            wt.enable_encryption(&wsk, EndpointRole::Client);
+            wt.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: WorkerCapabilities::new("v2-m1-box", 2, 4096, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                wt.recv_msg::<MasterMessage>().await.unwrap(),
+                Some(MasterMessage::RegisterAck { accepted: true, .. })
+            ));
+            wt.send_msg(&WorkerMessage::Disconnecting {
+                worker_id: v2_wid,
+                reason: "stop before release-worker test".into(),
+            })
+            .await
+            .unwrap();
+        }
+        let wait_disc = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_disc {
+            if handle.registry().list_all_workers().await.iter().all(|w| {
+                w.worker_id != v2_wid || w.status == crate::registry::WorkerStatus::Disconnected
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Point `save_path` under a regular file so the `members.json` write fails (`M1`).
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        members.set_save_path(Some(blocker.join("members.json")));
+
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ReleaseWorkerId { worker_id: v2_wid })
+                .await
+                .unwrap();
+            match admin_t.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::Error { .. }) => {}
+                other => panic!(
+                    "M1: ReleaseWorkerId must return ClientResponse::Error on failed write, got: {other:?}"
+                ),
+            }
+        }
+        assert!(
+            handle
+                .registry()
+                .check_worker_owner(&v2_wid, Some("0123456789abcdef"))
+                .await
+                .is_err(),
+            "M1: failed ReleaseWorkerId must retain v2 claim in WorkerRegistry"
+        );
+        assert!(
+            members.claim_worker_id(v2_wid, "0123456789abcdef").is_err(),
+            "M1: failed ReleaseWorkerId must retain v2_worker_seq claim in MemberStore"
+        );
+
+        // Restore valid `save_path` for `S1` enrollment + approval, then break `save_path` for
+        // the post-approval rollback write and verify `handle.shutdown()` flushes the rollback.
+        let valid_members_path = dir.path().join("members.json");
+        members.set_save_path(Some(valid_members_path.clone()));
+
+        let joiner_kp = NodeKeypair::generate().unwrap();
+        let js = TcpStream::connect(addr).await.unwrap();
+        let mut jt = MessageTransport::new(js);
+        let (jsk, jhh) = v3_client_handshake_with_hash(
+            &mut jt,
+            &joiner_kp,
+            &master_pub,
+            HandshakePurpose::Enroll,
+        )
+        .await
+        .unwrap();
+        jt.enable_encryption(&jsk, EndpointRole::Client);
+        let code = derive_pairing_code(&jhh).as_str().to_string();
+        let proof = compute_enroll_proof(&inv.invite_secret.0, &jhh);
+        jt.send_msg(&ClientMessage::Enroll {
+            invite_id: inv.invite_id.clone(),
+            proof,
+            name: "s1-shutdown-box".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        })
+        .await
+        .unwrap();
+        let pid = match jt.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+            ClientResponse::EnrollPending { pending_id } => pending_id,
+            other => panic!("expected EnrollPending, got: {other:?}"),
+        };
+
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ApproveEnrollment {
+                    pending_id: pid,
+                    pairing_code: RedactedString(code),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                admin_t.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollmentApproved { .. })
+            ));
+        }
+        assert!(matches!(
+            jt.recv_msg::<ClientResponse>().await.unwrap(),
+            Some(ClientResponse::Enrolled { .. })
+        ));
+
+        // Break `save_path` before dropping `jt` (simulating joiner declining `[y/N]` while disk
+        // cannot be written).
+        members.set_save_path(Some(blocker.join("members.json")));
+        drop(jt);
+
+        let wait_rb = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_rb {
+            if !members.contains(joiner_kp.public_key()) && members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!members.contains(joiner_kp.public_key()));
+        assert!(members.is_dirty());
+        // Disk still has `joiner_kp` before retry/shutdown flush.
+        assert!(MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .contains(joiner_kp.public_key()));
+
+        // Restore valid path while the server is still running -> `spawn_member_store_resync`
+        // periodically flushes the dirty rollback without waiting for shutdown.
+        members.set_save_path(Some(valid_members_path.clone()));
+        let wait_resync = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < wait_resync {
+            if !members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !members.is_dirty(),
+            "S1: periodic resync task must clear dirty flag once save_path recovers"
+        );
+        let reloaded_periodic = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert!(
+            !reloaded_periodic.contains(joiner_kp.public_key()),
+            "S1: periodic resync must remove declined unconfirmed member from members.json"
+        );
+
+        // Now repeat with a second declined enrollment and verify `handle.shutdown()` flushes
+        // synchronously before any periodic tick needs to run.
+        let joiner_kp2 = NodeKeypair::generate().unwrap();
+        let js2 = TcpStream::connect(addr).await.unwrap();
+        let mut jt2 = MessageTransport::new(js2);
+        let (jsk2, jhh2) = v3_client_handshake_with_hash(
+            &mut jt2,
+            &joiner_kp2,
+            &master_pub,
+            HandshakePurpose::Enroll,
+        )
+        .await
+        .unwrap();
+        jt2.enable_encryption(&jsk2, EndpointRole::Client);
+        let code2 = derive_pairing_code(&jhh2).as_str().to_string();
+        let proof2 = compute_enroll_proof(&inv.invite_secret.0, &jhh2);
+        jt2.send_msg(&ClientMessage::Enroll {
+            invite_id: inv.invite_id.clone(),
+            proof: proof2,
+            name: "s1-shutdown-box-2".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        })
+        .await
+        .unwrap();
+        let pid2 = match jt2.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+            ClientResponse::EnrollPending { pending_id } => pending_id,
+            other => panic!("expected EnrollPending, got: {other:?}"),
+        };
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ApproveEnrollment {
+                    pending_id: pid2,
+                    pairing_code: RedactedString(code2),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                admin_t.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollmentApproved { .. })
+            ));
+        }
+        assert!(matches!(
+            jt2.recv_msg::<ClientResponse>().await.unwrap(),
+            Some(ClientResponse::Enrolled { .. })
+        ));
+        members.set_save_path(Some(blocker.join("members.json")));
+        drop(jt2);
+        let wait_rb2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_rb2 {
+            if !members.contains(joiner_kp2.public_key()) && members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(members.is_dirty());
+        assert!(MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .contains(joiner_kp2.public_key()));
+
+        members.set_save_path(Some(valid_members_path));
+        handle.shutdown().unwrap();
+        assert!(!members.is_dirty());
+
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert!(
+            !reloaded.contains(joiner_kp2.public_key()),
+            "S1: shutdown flush must remove declined unconfirmed member from members.json"
+        );
+        assert_eq!(
+            reloaded
+                .list_invites()
+                .into_iter()
+                .find(|i| i.invite_id == inv.invite_id)
+                .expect("1-use invite must not be pruned after retried rollback")
+                .uses_remaining,
+            1
+        );
     }
 }

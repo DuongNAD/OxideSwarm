@@ -267,6 +267,20 @@ async fn flush_bookkeeping_async(
     }
 }
 
+async fn flush_bookkeeping_checked_async(
+    store: &crate::server::members::MemberStore,
+    pending: crate::server::members::PendingBookkeepingPersist,
+) -> GridResult<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.flush_bookkeeping_persist_checked(pending))
+            .await
+            .map_err(|e| GridError::Config(format!("member store flush task panicked: {e}")))?
+    } else {
+        store.flush_bookkeeping_persist_checked(pending)
+    }
+}
+
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
     network_types: HashMap<Uuid, Option<String>>,
@@ -603,13 +617,13 @@ impl WorkerRegistry {
     /// Releases a non-live `worker_id` claim in memory in both the registry and
     /// [`crate::server::members::MemberStore`] under the registry write lock, then flushes
     /// `members.json` after releasing the lock. Refuses if `worker_id` currently has a connected
-    /// worker session.
+    /// worker session, and restores the claim in memory if the `members.json` write fails (`M1`).
     pub async fn release_non_live_worker_id(
         &self,
         worker_id: Uuid,
         members: &crate::server::members::MemberStore,
     ) -> GridResult<()> {
-        let pending = {
+        let (prev_registry_owner, pending) = {
             let mut inner = self.inner.write().await;
             if inner
                 .workers
@@ -620,13 +634,29 @@ impl WorkerRegistry {
                     "worker {worker_id} is currently connected; stop the worker before releasing its worker_id"
                 )));
             }
-            let had_registry_claim = inner.owner_member_ids.contains_key(&worker_id);
-            let pending = members.release_worker_id_deferred(worker_id, had_registry_claim)?;
+            let prev_registry_owner = inner.owner_member_ids.get(&worker_id).cloned();
+            let pending =
+                members.release_worker_id_deferred(worker_id, prev_registry_owner.is_some())?;
             inner.owner_member_ids.remove(&worker_id);
-            pending
+            (prev_registry_owner, pending)
         };
-        if let Some(pending) = pending {
-            flush_bookkeeping_async(members, pending).await;
+        if let Some((pending, released_claim)) = pending {
+            if let Err(e) = flush_bookkeeping_checked_async(members, pending).await {
+                let mut inner = self.inner.write().await;
+                match inner.owner_member_ids.entry(worker_id) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        members.mark_dirty();
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        if members.restore_released_worker_claim_if_unclaimed(&released_claim) {
+                            if let Some(prev_owner) = prev_registry_owner {
+                                vacant.insert(prev_owner);
+                            }
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -2974,14 +3004,84 @@ mod tests {
             .await
             .is_err());
 
-        // Disconnect, then release -> in-memory owner cleared and flushed to `members.json`.
+        // Disconnect, then hold `members.write_lock` on a blocking thread while spawning
+        // `release_non_live_worker_id` so the disk flush blocks; verify another task can acquire
+        // the `WorkerRegistry` write lock before `members.write_lock` is released (round 6 NIT 4).
         registry
             .unregister(&wid, Some(reg.session_id))
             .await
             .unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
+        let members_blocker = members.clone();
+        let blocker_thread = std::thread::spawn(move || {
+            let _guard = members_blocker.hold_write_lock_for_test();
+            locked_tx.send(()).unwrap();
+            unlock_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let release_reg = registry.clone();
+        let release_members = members.clone();
+        let release_task = tokio::spawn(async move {
+            release_reg
+                .release_non_live_worker_id(wid, &release_members)
+                .await
+        });
+
+        // Wait until `release_non_live_worker_id` has exited `registry.inner.write()` (observable
+        // by `check_worker_owner` seeing `wid` cleared in memory while the flush is still blocked).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry
+                    .check_worker_owner(&wid, Some("probe-member"))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("in-memory release must complete before flush finishes");
+        assert!(
+            !release_task.is_finished(),
+            "release_non_live_worker_id flush must still be blocked on members.write_lock"
+        );
+        assert_eq!(members.persist_count(), 1);
+
+        // Take the `WorkerRegistry` write lock (`register` + `unregister`) while the flush is
+        // still blocked on `members.write_lock`.
+        let wid_concurrent = Uuid::new_v4();
+        let reg_concurrent = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.register_session(
+                wid_concurrent,
+                WorkerCapabilities::new("concurrent-peer", 2, 4096, false, false, None),
+                ProtocolCapabilities::empty(),
+                "127.0.0.1:9042".parse().unwrap(),
+                tx.clone(),
+                None,
+            ),
+        )
+        .await
+        .expect("WorkerRegistry write lock must not be held across blocked MemberStore flush")
+        .unwrap();
         registry
-            .release_non_live_worker_id(wid, &members)
+            .unregister(&wid_concurrent, Some(reg_concurrent.session_id))
             .await
+            .unwrap();
+        assert!(!release_task.is_finished());
+
+        // Unblock `members.write_lock` and verify the flush finishes cleanly.
+        unlock_tx.send(()).unwrap();
+        blocker_thread.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), release_task)
+            .await
+            .unwrap()
+            .unwrap()
             .unwrap();
         assert_eq!(members.persist_count(), 2);
 
@@ -3005,5 +3105,96 @@ mod tests {
         let reloaded =
             crate::server::members::MemberStore::load_from_dir(Some(dir.path())).unwrap();
         assert_eq!(reloaded.workers_owned_by(&v3_member_id), vec![wid]);
+    }
+
+    #[tokio::test]
+    async fn test_release_non_live_worker_id_propagates_write_error_and_restores_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = crate::server::members::MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .with_auth_mode(crate::server::members::AuthMode::Both);
+        let registry = WorkerRegistry::new();
+        let wid_v2 = Uuid::new_v4();
+        let wid_v3 = Uuid::new_v4();
+        let v3_member_id = "fedcba9876543210".to_string();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let reg_v2 = registry
+            .register_session_with_member_store(
+                wid_v2,
+                WorkerCapabilities::new("v2-worker", 2, 4096, false, false, None),
+                ProtocolCapabilities::empty(),
+                "127.0.0.1:9050".parse().unwrap(),
+                tx.clone(),
+                None,
+                None,
+                true,
+                Some(&members),
+            )
+            .await
+            .unwrap();
+        registry
+            .unregister(&wid_v2, Some(reg_v2.session_id))
+            .await
+            .unwrap();
+
+        let reg_v3 = registry
+            .register_session_with_member_store(
+                wid_v3,
+                WorkerCapabilities::new("v3-worker", 2, 4096, false, false, None),
+                ProtocolCapabilities::empty(),
+                "127.0.0.1:9051".parse().unwrap(),
+                tx,
+                None,
+                Some(v3_member_id.clone()),
+                false,
+                Some(&members),
+            )
+            .await
+            .unwrap();
+        registry
+            .unregister(&wid_v3, Some(reg_v3.session_id))
+            .await
+            .unwrap();
+
+        // Point `save_path` under a regular file (works on Unix, Windows, and as root).
+        let blocker = dir.path().join("regular-file");
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        members.set_save_path(Some(blocker.join("members.json")));
+
+        assert!(
+            registry
+                .release_non_live_worker_id(wid_v2, &members)
+                .await
+                .is_err(),
+            "M1: release_non_live_worker_id must return Err when members.json write fails (v2)"
+        );
+        assert!(
+            registry
+                .check_worker_owner(&wid_v2, Some(&v3_member_id))
+                .await
+                .is_err(),
+            "M1: failed release must restore v2 owner in WorkerRegistry"
+        );
+        assert!(
+            members.claim_worker_id(wid_v2, &v3_member_id).is_err(),
+            "M1: failed release must restore v2_worker_seq claim in MemberStore"
+        );
+
+        assert!(
+            registry
+                .release_non_live_worker_id(wid_v3, &members)
+                .await
+                .is_err(),
+            "M1: release_non_live_worker_id must return Err when members.json write fails (v3)"
+        );
+        assert!(
+            registry
+                .check_worker_owner(&wid_v3, Some("other-member-id0"))
+                .await
+                .is_err(),
+            "M1: failed release must restore v3 owner in WorkerRegistry"
+        );
+        assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid_v3]);
     }
 }
