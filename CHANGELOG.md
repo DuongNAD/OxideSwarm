@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-12
+
+A patch release for the USB setup kit and for Windows workers. The protocol is still version 7, so
+0.1.0, 0.1.1 and 0.1.2 machines work together; upgrade in any order. Machine identity
+(`master --auth members|both`) is opt-in: a master started without it authenticates exactly as
+0.1.1 does.
+
+### Upgrading
+- Windows workers check their task folders more strictly at start-up. A sandbox base or workspace
+  root that another account can write to, that another account owns, or whose parent folders let
+  another account rename it, is refused with a message that names the account and an `icacls`
+  command that fixes it. The USB kit's `Update` launcher and the Windows service installer
+  (`-Force`) set these permissions before they start the new worker; a folder you made by hand on
+  another drive may need the printed `icacls` command.
+
 ### Added
 - Machine identity and OXS-AUTH v3 (`ENROLL-1a`): per-machine X25519 static keys (`~/.oxideswarm/node.key` and `master_noise.key`, or in `--state-dir` when set, stored as private files and printed with key fingerprint on master startup), Noise `IK` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) authentication with cleartext `HELLO` prologue and `Split()` key derivation into the `0x04` ChaCha20-Poly1305 record layer, `members.json` read at master startup with worker-role enforcement on `Register`, `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`, `master_key`), and `master --auth secret|members|both` (`RUSTY_GRID_AUTH`, `[master].auth`) ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 - Windows AppContainer support for offline `cargo` builds and `--workspaces` under `--isolation fs|fs+net` on non-elevated workers (`FEAT-3d`, [design 0033](docs/design/0033-os-level-task-isolation.md) D4, [design 0039](docs/design/0039-agent-workspaces.md)): `<ws>/tree` and `<ws>/tmp` are confined to the per-attempt AppContainer SID `oxideswarm.task.<worker8>.<run_token>` while `<ws>/state.json`, `<ws>/lock`, and sibling workspaces stay unreadable and unwritable; `validate_sandbox_base_safe` accepts the default `%TEMP%\rusty_grid\sandboxes` directory under `host.user_home`; and a Windows worker started elevated with `--isolation fs|fs+net` logs a startup warning and omits `tool:cargo` from its advertised capability tags because elevated logon sessions disallow opening `NUL` inside an AppContainer (`crates/worker/src/isolation.rs`, `crates/worker/src/client.rs`, `crates/worker/src/runner.rs`).

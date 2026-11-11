@@ -90,7 +90,8 @@ To set up several machines, a USB stick can carry the program for every system a
 see [packaging/usb/README.md](packaging/usb/README.md). The stick installs, joins and starts the
 worker with one double-click on macOS and Windows, or `bash install.sh` on Linux. With a token that
 carries the master's P2P ticket, it also works on school or office Wi-Fi where the machines cannot
-reach each other. The kit scripts are in the repository and install release `0.1.1` or newer.
+reach each other. The kit scripts are in the repository and install release `0.1.1` or newer (`0.1.2` or newer for
+Windows workers that run workspace tasks under `-Isolation fs`).
 
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
@@ -101,7 +102,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.1.1`), or [build from source](#build-from-source).
+(the latest is `v0.1.2`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -112,19 +113,19 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf oxideswarm-0.1.2-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.1.1-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.1.1-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.1.2-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.1.2-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.1.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.1.1-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.1.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.1.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.1.1-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.1.2-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
@@ -347,14 +348,14 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.1.1` covers the user story above. What it does not do yet:
+OxideSwarm `0.1.2` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
 | Delivery is at least once | A task can run twice after a worker is lost, so tasks with side effects must be idempotent | None; session resume (FEAT-1) and crash containment (FEAT-2) shrink the window |
 | One master, no automatic failover | The master is a single point of failure; `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 ([design 0050](docs/design/0050-scale-out-architecture.md)) |
-| Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1 ([design 0051](docs/design/0051-machine-identity-and-invites.md)): a key per machine and the OXS-AUTH v3 handshake are on `master` (ENROLL-1a, not released yet); invites and removing one machine are ENROLL-1b |
-| On Windows, `cargo` under isolation needs a worker that is not elevated | In release `0.1.1` a Windows workspace worker runs with `--isolation off`; on `master` (FEAT-3d) it runs with `--isolation fs`, and an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
+| Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1 ([design 0051](docs/design/0051-machine-identity-and-invites.md)): a key per machine and the OXS-AUTH v3 handshake ship in `0.1.2` as an opt-in (`master --auth members|both`, ENROLL-1a); invites and removing one machine are ENROLL-1b |
+| On Windows, `cargo` under isolation needs a worker that is not elevated | Since release `0.1.2` (FEAT-3d) a Windows workspace worker runs with `--isolation fs`; an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
 | Workspace trees skip symbolic links and empty directories | A project that relies on a link inside its tree may not build remotely | W11 ([design 0039](docs/design/0039-agent-workspaces.md)) |
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | GPU support is a verified matrix-multiply benchmark | No user workload runs on the GPU yet | FEAT-9 |
