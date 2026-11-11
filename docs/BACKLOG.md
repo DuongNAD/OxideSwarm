@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `a67a3eb`: 70 items Implemented, 4 Partial and 39 Planned. Five items
+On 2026-11-11, at `master` `0354b28`: 70 items Implemented, 4 Partial and 40 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -212,6 +212,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Planned |  |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -1395,6 +1396,48 @@ Each item below needs a design record before code.
   session state machine. Add the sweep.
 - **Done when:** Each listed symbol has a production caller or is gone.
 
+### MAINT-1: Split the six largest source files and cap file size in CI
+
+- **Evidence:** Measured on `master` `0354b28` on 2026-11-11 (lines; the test part is everything
+  from the file's first `#[cfg(test)]`; commits are those on `master` since 2026-10-11):
+
+  | File | Lines | Production | Tests | Commits |
+  |---|---|---|---|---|
+  | `crates/master/src/queue.rs` | 8,639 | 5,044 | 3,595 | 36 |
+  | `crates/master/src/server.rs` | 8,593 | 4,941 | 3,652 | 73 |
+  | `crates/worker/src/client.rs` | 8,252 | 4,361 | 3,891 | 87 |
+  | `crates/cli/src/cli_app.rs` | 8,099 | 5,149 | 2,950 | 101 |
+  | `crates/worker/src/runner.rs` | 6,293 | 4,141 | 2,152 | 79 |
+  | `crates/core/src/protocol.rs` | 6,184 | 3,232 | 2,952 | 41 |
+
+  Each holds 120 to 243 functions. FEAT-11 merged the two connection loops into
+  `crates/master/src/session.rs` and removed dead code, but split none of these files.
+- **Problem:** Each of these files mixes several jobs, so a reviewer has to read thousands of lines
+  to judge one change, and parallel pull requests are likely to collide in them: `cli_app.rs`
+  changed 101 times in a month. ENROLL-1b adds more to `server.rs`. Nothing stops a file from growing further.
+- **Do:** one pull request per file, with no change in behaviour, starting each only after the open
+  pull requests that touch that file have merged (ENROLL-1b for `server.rs` and `cli_app.rs`,
+  SCHED-4 for `scheduler.rs`):
+  1. Move each file's `#[cfg(test)]` module to a file of its own next to it (`mod tests;` with the
+     tests in `<module>/tests.rs`). This alone removes about 40 % of the lines.
+  2. Split the production code by job, keeping the public API through `pub use` re-exports:
+     - `cli_app.rs`: one module per subcommand (`master`, `worker`, `submit`, `status`/`result`/
+       `cancel`, `mapreduce`, `workspaces`), with the clap types and `run_cli` dispatch left in
+       `cli_app.rs`;
+     - `client.rs`: connection, registration and reconnect; the active-task table and assignment
+       handling; blob and staging glue;
+     - `runner.rs`: process spawning and supervision; output capture and limits; Windows executable
+       resolution;
+     - `server.rs`: listeners and handshakes; client request handlers; enrollment and members;
+     - `queue.rs`: the task state machine; retention and eviction; checkpoints;
+     - `protocol.rs`: the message enums; the `Human*`/`Binary*` mirrors and their `From` impls; the
+       codec.
+  3. Add a size check to `cargo xtask`/`ox-mode test lint` and CI: a Rust source file whose
+     production part exceeds 3,000 lines fails, except files on an allowlist that may only shrink.
+- **Done when:** none of the six files has a production part above 3,000 lines, the allowlist is
+  empty or only shrinks, the CI size check runs on every pull request, and the full test suite and
+  `crates/core/tests/data/wire_layout.txt` are unchanged by the split.
+
 ### CACHE-1: Reuse the result of an identical task
 
 - **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. No code in `crates/` maps a task to an
@@ -2236,3 +2279,6 @@ Add one dated line per finished item, newest last.
   Planned) from a two-machine trial: a 32-task batch took 52 s because 6 tasks landed on a slow
   laptop, while the desktop alone would have taken about 12 s. The Index counts are now
   70 Implemented, 4 Partial and 39 Planned.
+- 2026-11-11: Added MAINT-1 (Planned): the six largest source files hold 6,184 to 8,639 lines each,
+  about 40 % of it tests, and `cli_app.rs` changed 101 times in a month. The Index counts are now
+  70 Implemented, 4 Partial and 40 Planned.
