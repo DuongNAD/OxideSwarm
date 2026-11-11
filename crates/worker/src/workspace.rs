@@ -310,6 +310,10 @@ impl WorkspaceStore {
     /// process or another worker on the same root) to end. [`WorkspaceError::Busy`] on timeout.
     pub fn acquire(&self, name: &str, wait: Duration) -> Result<WorkspaceGuard, WorkspaceError> {
         validate_workspace_name(name).map_err(WorkspaceError::InvalidName)?;
+        ensure_private_dir(&self.root).map_err(|e: SandboxError| WorkspaceError::Root {
+            path: self.root.clone(),
+            reason: e.to_string(),
+        })?;
         let dir = self.ws_dir(name);
         make_private_dir(&dir)?;
         let lock_path = dir.join("lock");
@@ -1891,6 +1895,67 @@ mod tests {
         assert_eq!(mode(s.root()), 0o700);
         let g = s.acquire("w", Duration::ZERO).unwrap();
         assert_eq!(mode(&g.dir), 0o700);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_checks_refuse_a_junction_and_recreate_a_deleted_root_privately() {
+        use rusty_grid_core::private_file::{current_user_sid, dir_open_grants, read_dacl};
+        use std::process::Command;
+
+        let td = tempfile::tempdir().unwrap();
+        let status = Command::new("icacls")
+            .arg(td.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .status()
+            .expect("icacls");
+        assert!(status.success());
+
+        let real = td.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let junction = td.path().join("junction");
+        let mk = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .output()
+            .expect("mklink /J");
+        assert!(mk.status.success());
+
+        assert!(matches!(
+            WorkspaceStore::open(Some(junction), WorkspaceLimits::default()),
+            Err(WorkspaceError::Root { .. })
+        ));
+
+        let fresh_root = td.path().join("fresh");
+        let s = WorkspaceStore::open(Some(fresh_root.clone()), WorkspaceLimits::default()).unwrap();
+        let user = current_user_sid().unwrap();
+        let (aces, prot) = read_dacl(s.root()).unwrap();
+        assert!(prot);
+        assert!(dir_open_grants(&aces, &user).is_empty(), "{aces:?}");
+
+        // Deleting the root after `open` must recreate it privately on the next `acquire`, and
+        // replacing it with a junction must refuse `acquire`.
+        fs::remove_dir_all(&fresh_root).unwrap();
+        let g = s.acquire("w", Duration::ZERO).unwrap();
+        let (re_aces, re_prot) = read_dacl(s.root()).unwrap();
+        assert!(re_prot);
+        assert!(dir_open_grants(&re_aces, &user).is_empty(), "{re_aces:?}");
+        drop(g);
+
+        fs::remove_dir_all(&fresh_root).unwrap();
+        let mk2 = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&fresh_root)
+            .arg(&real)
+            .output()
+            .expect("mklink /J");
+        assert!(mk2.status.success());
+        assert!(matches!(
+            s.acquire("w", Duration::ZERO),
+            Err(WorkspaceError::Root { .. })
+        ));
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
     }
 
     #[test]

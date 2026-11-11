@@ -920,6 +920,10 @@ impl TaskRunner {
     pub fn blob_cache(&self) -> Result<Arc<BlobCache>, String> {
         self.blob_cache
             .get_or_init(|| {
+                self.config
+                    .sandbox_config
+                    .ensure_private_root_blocking()
+                    .map_err(|e| e.to_string())?;
                 let dir = self
                     .config
                     .sandbox_config

@@ -4808,6 +4808,57 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_assign_refuses_a_task_before_touching_a_replaced_sandbox_base_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let base_junction = temp.path().join("sandboxes_junction");
+        let mk = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&base_junction)
+            .arg(&elsewhere)
+            .output()
+            .expect("mklink /J");
+        assert!(mk.status.success());
+
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_cores(2)
+                .with_no_battery(true)
+                .with_sandbox_base_dir(&base_junction),
+        );
+        let task = Task::new(
+            rusty_grid_core::task::TaskSpec::command("cmd", vec!["/C".into(), "echo".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        let leftover = elsewhere.join(task.id.to_string());
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("keep"), b"x").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        client.handle_assign_task(task.clone(), tx).await;
+        match rx.recv().await.expect("a result for the refused task") {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, task.id);
+                assert_eq!(exit_code, EXIT_CODE_GENERAL_ERROR);
+                let error = error.unwrap_or_default();
+                assert!(error.contains("reparse point"), "{error}");
+            }
+            other => panic!("expected the refusal as a TaskResult, got {other:?}"),
+        }
+        assert!(
+            leftover.join("keep").exists(),
+            "the reclaim must not run behind a junction base"
+        );
+    }
+
     #[tokio::test]
     async fn test_worker_client_handle_assign_and_cancel_task() {
         let config = WorkerConfig::new("127.0.0.1:9999")

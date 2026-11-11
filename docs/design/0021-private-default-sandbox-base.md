@@ -1,14 +1,18 @@
 # 0021: Private default sandbox base on Unix
 
 Status: Implemented
-Created: 2026-11-04    Updated: 2026-11-04
+Created: 2026-11-04    Updated: 2026-11-11
 
 ## Summary
 
-On Unix the default sandbox base is now `<temp>/rusty_grid-<euid>/sandboxes`.
-The worker creates the `rusty_grid-<euid>` directory with mode 700, and refuses it when another local
-user could change what is inside it. It checks at start-up, and before a task touches the base.
-A sandbox directory the operator names is used as given, and Windows is unchanged.
+On Unix the default sandbox base is `<temp>/rusty_grid-<euid>/sandboxes`. The worker creates the
+`rusty_grid-<euid>` directory with mode 700, and refuses it when another local user could change
+what is inside it. On Windows the worker treats `base_dir` itself (and the workspace root) as the
+private root: a missing directory is created with a protected owner-only DACL, an unsafe one
+(junction or link, non-directory, volume without persistent ACLs, or owner outside the current
+user, `SYSTEM` and `Administrators`) is refused, and an existing trusted-owner directory with wider
+DACL grants logs a warning with a locale-independent SID `icacls` command. The check runs at
+start-up and before each task touches the directory.
 
 ## Context
 
@@ -39,13 +43,13 @@ cleanup of `<base>/cache` must not follow such links. That check covers the clea
 
 ## Non-goals
 
-- Directories the operator names: `--sandbox-base-dir`, `RUSTY_GRID_SANDBOX_BASE_DIR`,
+- Directories the operator names on Unix: `--sandbox-base-dir`, `RUSTY_GRID_SANDBOX_BASE_DIR`,
   `WorkerConfig::with_sandbox_base_dir` and `SandboxConfig::new`. The Android app passes its cache
-  directory this way. These are used as given, as before.
-- Windows. A user's temp directory (`%LOCALAPPDATA%\Temp`) belongs to that user, and its access
-  control lists are not Unix modes. The default stays `<temp>\rusty_grid\sandboxes`. Service
-  accounts can share `C:\Windows\Temp`, but the Windows service installer names its own sandbox
-  directory.
+  directory this way. On Unix these are used as given, as before. On Windows the check covers
+  explicit sandbox bases as well, because installers such as the USB kit pass a folder on a data
+  drive where new directories otherwise inherit `Authenticated Users: Modify`.
+- Changing the default Windows sandbox path. It stays `<temp>\rusty_grid\sandboxes`; section D4
+  describes how `ensure_private_dir` creates and checks it on Windows.
 - Checking the directories above the temp directory. `TMPDIR` is trusted to name a real temp
   directory.
 - Isolating a task from the worker's own account. A task still runs as that account (see
@@ -101,9 +105,63 @@ and `ensure_private_root_blocking` serves callers without a runtime, such as the
   A refused task fails with `BaseDirUnsafe` and runs nowhere. Each check costs two `mkdir` and three
   `stat` calls.
 
-The check applies only while the base lies inside the private root. Code that sets
+The check applies on Unix only while the base lies inside the private root. Code on Unix that sets
 `SandboxConfig::base_dir` to another directory (`WorkerClient::new` does this for an explicit
 directory) therefore skips it.
+
+### D4 Windows sandbox base and workspace root
+
+Windows has no per-user root directory above `base_dir`. Instead `SandboxConfig::checked_private_root`
+returns `Some(&self.base_dir)`, `ensure_locks_dir` recreates a missing base only through
+`ensure_private_dir`, `TaskRunner::blob_cache` runs `ensure_private_root_blocking` before opening
+`<base_dir>/cache/blobs`, and `WorkspaceStore` runs `ensure_private_dir` in both `open` and
+`acquire`. Every start-up and per-task check from D3 therefore runs on Windows as well.
+
+`ensure_private_dir` (`crates/worker/src/sandbox.rs`) calls `create_or_open_private_dir_all` and
+`inspect_dir_security_no_follow` (`crates/core/src/private_file.rs`). Both inspect the entry
+without following links (`symlink_metadata` and `CreateFileW` with
+`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`):
+
+1. **Creation and creation race.** When nothing exists at `root`, `CreateDirectoryW` creates it
+   with the protected owner-only descriptor (`D:P` granting `(OI)(CI)FA` to the current user SID,
+   `SYSTEM` and `BUILTIN\Administrators`). If another creator wins the race (`ERROR_ALREADY_EXISTS`),
+   the outcome is `Existing` rather than an unchecked `Ok(())`, so all checks below run on the
+   winner's entry.
+2. **Hard refusals (`SandboxError::BaseDirUnsafe`).** `ensure_private_dir` refuses `root` when:
+   - `FILE_ATTRIBUTE_REPARSE_POINT` is set (junction, symbolic link or mount point), or `root` is
+     not a directory;
+   - `GetVolumeInformationByHandleW` lacks `FILE_PERSISTENT_ACLS` (`FAT`, `exFAT` and non-ACL
+     virtual drives);
+   - the owner SID cannot be read or is outside `{current user, S-1-5-18 (SYSTEM), S-1-5-32-544
+     (BUILTIN\Administrators)}`;
+   - `CreateDirectoryW` created the directory in this call (`Outcome::Created`), yet reading back
+     its security descriptor fails, shows `SE_DACL_PROTECTED == false`, or shows any sensitive
+     grant in `dir_open_grants`. This catches cloud or virtual filesystems that advertise
+     `FILE_PERSISTENT_ACLS` while silently dropping the security descriptor.
+3. **Existing trusted-owner directories: warn rather than refuse on wider DACL grants.** When an
+   existing real directory on a persistent-ACL volume is owned by the current user, `SYSTEM` or
+   `Administrators`, `dir_open_grants` checks all five Windows allow ACE types (`ACCESS_ALLOWED`,
+   `ACCESS_ALLOWED_CALLBACK`, `ACCESS_ALLOWED_COMPOUND`, `ACCESS_ALLOWED_OBJECT` and
+   `ACCESS_ALLOWED_CALLBACK_OBJECT`). Any sensitive grant to a SID outside `{current user, SYSTEM,
+   Administrators, S-1-3-0 (CREATOR OWNER), S-1-3-4 (OWNER RIGHTS)}` logs a `WARN` (never `DEBUG`,
+   including when reading the DACL fails) with a locale-independent SID `icacls` command:
+   `icacls "<path>" /inheritance:r /grant:r "*<user_sid>:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"`.
+
+   We chose **warn** rather than **refuse** for existing trusted-owner directories for two reasons:
+   - Standard Windows 11 user profiles leave inherited `Everyone` and `BUILTIN\Users` read/execute
+     entries on `%TEMP%` and `%LOCALAPPDATA%`. Refusing existing trusted-owner directories with
+     inherited entries would break in-place upgrades of `0.1.0` and `0.1.1` workers whose sandbox
+     base or workspace root already exists, and would reject caller-created temp directories passed
+     to `SandboxConfig::new`.
+   - Unprivileged local accounts lack `SeRestorePrivilege` and cannot assign ownership of a
+     directory or junction to another user, `SYSTEM` or `Administrators`. Pre-creation squatting and
+     `ERROR_ALREADY_EXISTS` races by another account are therefore caught unconditionally by the
+     owner and reparse-point refusals in step 2.
+
+   `DIR_SENSITIVE_MASK` leaves out traverse-only (`FILE_TRAVERSE | FILE_READ_ATTRIBUTES |
+   SYNCHRONIZE` = `0x0010_00A0`), so the non-inherited `oxideswarm.toolchain` traverse entry that
+   Windows task isolation (`protect_sandbox_base` in `crates/worker/src/isolation.rs`) places on
+   `sandbox_base` and `workspace_root` does not trigger a warning.
 
 ## Compatibility
 
@@ -209,3 +267,21 @@ test. A test for it would have to replace the root while the task waits for a sl
 
   `local_account_grants` (pure, tested on every system) picks the open groups; Windows-only tests
   check the created DACL and that an existing directory is left as it is.
+- 2026-11-11: Windows review fixes (PR 207 findings S1 to S4):
+  - S1: `ensure_private_dir` refuses junctions/reparse points, non-directories, and owners outside
+    the current user, `SYSTEM` and `Administrators` (`BaseDirUnsafe`), warns at `WARN` when the
+    DACL cannot be read, and replaces `local_account_grants` with `dir_open_grants` so any untrusted
+    grantee SID (another local user, `Domain Users`, `NETWORK`, `ANONYMOUS LOGON`, `Remote Desktop
+    Users`, `ALL APPLICATION PACKAGES`, as well as the broad local groups) triggers a warning while
+    allowing `CREATOR OWNER`, `OWNER RIGHTS` and FEAT-3d's traverse-only `oxideswarm.toolchain`
+    ACE. Documented in D4 why existing trusted-owner directories warn rather than refuse.
+  - S2: `SandboxConfig::checked_private_root` returns `Some(&self.base_dir)` on Windows,
+    `ensure_locks_dir` and `TaskRunner::blob_cache` go through `ensure_private_dir`, and
+    `WorkspaceStore::acquire` re-checks the workspace root before each task.
+  - S3: `create_or_open_private_dir_all` treats `ERROR_ALREADY_EXISTS` as `Existing` so the
+    winner's entry undergoes the full reparse-point, volume, owner and DACL checks.
+  - S4: `inspect_dir_security_no_follow` checks `FILE_PERSISTENT_ACLS` via
+    `GetVolumeInformationByHandleW`, and newly created directories verify the read-back protected
+    DACL, refusing `FAT`, `exFAT` and security-dropping virtual volumes.
+  - Nits: `open_dir_acl_warning` uses locale-independent SIDs (`*<user_sid>`, `*S-1-5-18` and
+    `*S-1-5-32-544`), and `read_dacl` parses all five Windows allow ACE types.
