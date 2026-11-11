@@ -1,7 +1,7 @@
 # 0038: Large language model inference on the grid
 
 Status: Planned
-Created: 2026-11-07    Updated: 2026-11-07
+Created: 2026-11-07    Updated: 2026-11-11
 
 ## Summary
 
@@ -206,3 +206,6 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
   [Design 0059](0059-first-users.md) names LIVA as a first application for it. Nothing is built.
 - 2026-11-11: Context gained the cost of the prompt at a stage boundary (arithmetic, not
   measured), from an outside reading of the plans. No item changed.
+- 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes a client tunnel
+  to a loopback model server (LLM-9) that uses the connection types of D4, and that LLM-4
+  reuses it. Q41 decides, after a trial. D4 is unchanged.

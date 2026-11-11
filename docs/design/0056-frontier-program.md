@@ -1,7 +1,7 @@
 # 0056: Frontier program (bets after the core)
 
 Status: Draft (research and plan; builds nothing; decisions Q19 to Q26 and Q30 are open)
-Created: 2026-11-10    Updated: 2026-11-10
+Created: 2026-11-10    Updated: 2026-11-11
 
 ## Summary
 
@@ -696,3 +696,6 @@ second one, the classroom. Accepting Q25 accepts the second story.
   wave 1 and that ADOPT-4 follows AX-1 (Q36). D8 is unchanged until the owner decides.
 - 2026-11-11: PROOF-2 gained a note on the limit of digest agreement for GPU results, from an
   outside reading of the plans. No item changed.
+- 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes that the
+  streaming version of LLM-6 uses a client tunnel (LLM-9) and comes before the version that
+  returns each reply whole. Q41 decides, after a trial. The text of LLM-6 is unchanged.

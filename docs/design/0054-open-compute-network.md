@@ -1,7 +1,7 @@
 # 0054: An open compute network (long-term vision)
 
 Status: Draft (vision; the owner's long-term goal of 2026-11-10; decisions Q14 to Q18 are open)
-Created: 2026-11-10    Updated: 2026-11-10
+Created: 2026-11-10    Updated: 2026-11-11
 
 ## Summary
 
@@ -214,3 +214,6 @@ Fuzzing covers every parser of network input.
   does not cover GPU results from different vendors, a replica must not be able to copy another
   replica's result, and a credit needs an equal debit. They are notes for NET-2 and NET-3.
   The same reading proposed staking and a protocol fee; Q14 stands, and neither is adopted.
+- 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes usage records
+  and a balance per member inside one cluster (LLM-10, LLM-11), under the rule of D6. It keeps
+  model traffic inside clusters of people who trust each other. Q14 and Q16 stay open.

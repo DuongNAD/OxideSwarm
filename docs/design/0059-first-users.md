@@ -432,3 +432,6 @@ None yet.
   reason to use the grid, and said that LIVA needs a light and capable open model that the owner
   cannot supply soon. D1 now names LIVA as a first application for A3, with the facts checked in
   its repository and the two missing parts. Nothing is built, and D3 did not move.
+- 2026-11-11: The first application that D1 names for A3 has a record of its own,
+  [design 0061](0061-first-application-model-tunnel.md). The owner set a trial first: LIVA on
+  a Mac with the model on another machine. D3 did not move.

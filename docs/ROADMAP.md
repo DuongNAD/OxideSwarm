@@ -2,8 +2,8 @@
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
 Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29 (the charter of
-design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059) on
-2026-11-11.
+design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059) and
+Q40 (a trial comes before any build item of design 0061) on 2026-11-11.
 Created: 2026-11-07    Updated: 2026-11-11
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -46,6 +46,10 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   operating system. A study of first use comes before more is built. The plan is in
   [design 0059](design/0059-first-users.md). The owner accepted Q37 on 2026-11-11 and runs the
   first round of that study. Q36, Q38 and Q39 are open.
+- A first application for the model track (Draft, 2026-11-11): LIVA, the owner's desktop
+  assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
+  records and a balance per member, all proposals. The plan is in
+  [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
 
 ## Where the project stands
 
@@ -435,6 +439,12 @@ AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for
 (ADOPT-4), then LLM-1 and LLM-6. The study may reorder the later steps. No item of design 0059 is
 in [BACKLOG.md](BACKLOG.md).
 
+[Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
+row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
+with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
+server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
+for the trial records. Q41 to Q43 are open.
+
 **Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
 0059.
 
@@ -500,6 +510,10 @@ answers.
 | Q37 | Will the owner run the first round of the study of first use (ADOPT-1), and with how many people? | Yes, decided by the owner on 2026-11-11: the owner runs it with three to five people, before AX-1 starts. No session has run yet |
 | Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
+| Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
+| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
+| Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
+| Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Open. Recommended: display only in the first version |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -598,3 +612,8 @@ answers.
 - 2026-11-11: The table of what exists now lists the MCP tool `workspaces`, which
   `crates/cli/src/mcp.rs` has had since FEAT-4. Designs 0033, 0038, 0054 and 0056 gained notes
   from an outside reading of the plans on the same day; no item, order or decision changed.
+- 2026-11-11: The owner described the roles of the owner's two projects: OxideSwarm carries
+  model traffic, secures it and keeps the account, and LIVA gives people a reason to use it.
+  [Design 0061](design/0061-first-application-model-tunnel.md) records that and sets a trial
+  first (Q40, decided): LIVA on a Mac with the model on another machine. LLM-9 to LLM-11 are
+  proposals, Q41 to Q43 are open, Q14 stays open, and no item entered the backlog.
