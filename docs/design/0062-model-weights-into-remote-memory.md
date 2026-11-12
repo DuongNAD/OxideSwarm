@@ -43,7 +43,7 @@ Four statements of 2026-11-11, paraphrased from Vietnamese:
 ### What llama.cpp does today
 
 Rows 1 to 15 were read on 2026-11-11 from the `master` branch of
-[llama.cpp](https://github.com/ggml-org/llama.cpp), which was at `f7b886fe6fe5`. Rows 16 to 26
+[llama.cpp](https://github.com/ggml-org/llama.cpp), which was at `f7b886fe6fe5`. Rows 16 to 34
 were read on 2026-11-12, when it was at `cb44fdb1892e`. Line numbers are those of that commit.
 "Basis" says how:
 
@@ -80,9 +80,17 @@ were read on 2026-11-12, when it was at `cb44fdb1892e`. Line numbers are those o
 | 21 | The reason for row 11, in a maintainer's reply: RPC devices go first so that logits are not copied over the network. The output layer is placed as the layer after the last one (`dev_output`), which is the last device when every layer is offloaded. The input embedding stays on the CPU of the head (`dev_input`) | [Discussion 16625](https://github.com/ggml-org/llama.cpp/discussions/16625); `src/llama-model.cpp`, lines 1766 to 1791 | discussion, source | A head with a GPU of its own holds the last layers and the output, and the state at the boundary crosses the network. A head with no device of its own gets the logits of every token from the remote machine, unless the token is sampled there (row 13). The head always holds the embedding table in RAM |
 | 22 | The RPC client reports every operation as supported by the remote device: `ggml_backend_rpc_device_supports_op` returns true, with a TODO. Issues [24177](https://github.com/ggml-org/llama.cpp/issues/24177) and [27865](https://github.com/ggml-org/llama.cpp/issues/27865) report an RPC server on an AMD GPU that ends on a top-k operation. The first names sampling on the backend. Both were closed as not planned | `ggml/src/ggml-rpc/ggml-rpc.cpp`; GitHub | source, issue | Step 6 of R15 may end the RPC server. The record of R15 names the GPU of the target |
 | 23 | The major version of the RPC protocol is 9. Issue 26680 named version 4.0.0 on 2026-08-06. A client refuses a server whose major version differs | `ggml/include/ggml-rpc.h`, `ggml/src/ggml-rpc/ggml-rpc.cpp` | source | The head and every RPC server come from one upstream commit (Compatibility). Nothing in the grid speaks this protocol: a tunnel carries its bytes unchanged |
-| 24 | The RPC server listens with a backlog of one connection (`listen(sockfd, 1)`). The report of row 5 names this as its most specific suspect and says that it is not proven. The reporter's build had no RDMA. A search of `transport.cpp`, `ggml-rpc.cpp` and `tools/rpc/rpc-server.cpp` for `SIGPIPE`, `MSG_NOSIGNAL` and `SO_NOSIGPIPE` found nothing | `ggml/src/ggml-rpc/transport.cpp`, line 760; GitHub | source, issue | The cause is still not known. R16 gains two variants. `GGML_RPC_NO_RDMA` is no remedy for that report |
+| 24 | The RPC server listens with a backlog of one connection (`listen(sockfd, 1)`). The report of row 5 names this as its most specific suspect and says that it is not proven. It names a second one: a `SIGPIPE` on a write to a connection that was reset, because it found no handling of that signal in `transport.cpp`. A search of `transport.cpp`, `ggml-rpc.cpp` and `tools/rpc/rpc-server.cpp` for `SIGPIPE`, `MSG_NOSIGNAL` and `SO_NOSIGPIPE` found nothing either. The reporter's build had no RDMA. No maintainer answered before a bot closed the report | `ggml/src/ggml-rpc/transport.cpp`, line 760; GitHub | source, issue | The cause is still not known. R16 gains two variants. `GGML_RPC_NO_RDMA` is no remedy for that report |
 | 25 | The repository's own list of published advisories has 13 entries. The newest, CVE-2026-34159 of 2026-03-26, is a remote code execution in the RPC backend. GitHub's advisory database also holds six entries, marked unreviewed, that name the RPC server: CVE-2026-39909, CVE-2026-78147, CVE-2026-78148, CVE-2026-86317, CVE-2026-118375 and CVE-2026-119052, published from 2026-08-21 to 2026-10-29. [PR 30399](https://github.com/ggml-org/llama.cpp/pull/30399), a bounds check in the RDMA receive path, was merged on 2026-10-24 | GitHub | advisory, issue | Row 7 stands. The spikes build a commit of `master` from November 2026 or later |
 | 26 | A split against one machine, in [an outside repository](https://github.com/kjaiswal/llama-cpp-distributed-benchmarks) of 2026-03-30. The head is a Mac on Metal, the one remote device is on CUDA, and the direct cable was measured at 9.41 Gbit/s. Both models fit the head alone. For a 7B model its README gives 91.8 reply tokens per second on the head alone and 52.7 through RPC, and the prompt was processed 4.2 times faster through RPC. For a 72B model it gives 11.1 and 5.9. The commands are in the README | its README | outside | One source, from before the asynchronous commands of the RPC backend ([PR 18626](https://github.com/ggml-org/llama.cpp/pull/18626), merged 2026-08-26). It agrees with D1: a model that fits one machine is not split. G2 is a target for case 1 only. R15 and R18 measure on the owner's machines |
+| 27 | A loopback RPC server behind an SSH tunnel is reported to work outside WSL2. [Issue 31723](https://github.com/ggml-org/llama.cpp/issues/31723), open since 2026-11-05, describes a split run on two aarch64 machines with CUDA, with the server bound to loopback and reached through an SSH tunnel. A maintainer's test of 2024 did the same between two containers ([discussion 9142](https://github.com/ggml-org/llama.cpp/discussions/9142)). The report of row 5 is from Windows 10 with WSL2 | GitHub | issue, discussion | The failure of row 5 may belong to WSL2. R16 runs the server as a native program on each target system |
+| 28 | The RPC server serves one connection at a time. [Issue 28908](https://github.com/ggml-org/llama.cpp/issues/28908) reports that its accept loop starves every connection after the first. It was closed as not planned on 2026-10-30, and [PR 28916](https://github.com/ggml-org/llama.cpp/pull/28916), which gives each connection a thread, is open. The maintainer of the RPC backend wrote in [discussion 14932](https://github.com/ggml-org/llama.cpp/discussions/14932) that the server serves one client at a time and that clients of separate privilege levels are out of scope | GitHub | issue, discussion | Nothing opens a second connection to an RPC server: one tunnel for each server, and no probe of the port. Liveness is read from the process |
+| 29 | A split can hang with no process ending. [Issue 31847](https://github.com/ggml-org/llama.cpp/issues/31847), open since 2026-11-07: `llama-server` hangs without end while it loads a model of about 19 GB across two RPC backends, and a load on one backend works | GitHub | issue | A supervisor that waits for a process to end misses this. The supervisor of LLM-2 also needs time limits (D5) |
+| 30 | For an environment or a network that is not trusted, llama.cpp's `SECURITY.md` says: do not use the RPC backend, `ggml-rpc-server` or `llama-server`, confirm the hash of downloaded weights, and encrypt data that is sent over the network. The report behind CVE-2026-78147, [issue 25289](https://github.com/ggml-org/llama.cpp/issues/25289), was closed as not planned, and at this commit the server still takes the `op` of a tensor from the wire. [Issue 30458](https://github.com/ggml-org/llama.cpp/issues/30458), a tensor whose dimensions abort the server, is open | `SECURITY.md`, `ggml/src/ggml-rpc/ggml-rpc.cpp`; GitHub | source, issue | Whoever can send bytes to an RPC port is treated as able to run code as that server. Encryption and access control around the port are the grid's work, which is LLM-4. A split stays among machines of people who trust each other (design 0038) |
+| 31 | prima.cpp, [a fork of llama.cpp](https://github.com/OpenCPIL/prima.cpp) for models that are too large for one home device. Its README gives the latency of one token on its authors' devices, for llama.cpp on one device against prima.cpp on several: 15 ms against 15 ms for Llama 3-8B, 202 against 72 for a 30B model, 10120 against 674 for Llama 3-70B, and 12227 against 867 for Qwen-2.5-72B | its README | outside | A split gains there only when the model does not fit the one device, which agrees with D1. It is the comparison for case 2. It is a fork and not upstream. R18 gains one run with it |
+| 32 | The one published case found in which several machines beat one for a model that fits one: [distributed-llama, discussion 147](https://github.com/b4rtaz/distributed-llama/discussions/147) of 2025-01-08. It is an engine of its own with tensor parallelism, on CPUs only, on Mac Mini M4 Pro machines. For Llama 3.1 8B it gives 16.91 tokens per second on one machine, 30.27 on two and 38.83 on four over Thunderbolt 5, and 34.61 on four over 10 Gbit/s Ethernet. A 70B model does not fit one machine and gives 3.31 on two and 6.51 on four | the discussion | outside | No run on a GPU stands beside it, so it shows no gain over one machine that uses its GPU. Tensor parallelism and an engine of our own stay non-goals. Upstream has an experimental tensor split over RPC ([PR 26610](https://github.com/ggml-org/llama.cpp/pull/26610), merged 2026-10-06) |
+| 33 | Metal inside a macOS sandbox. [An outside report](https://github.com/anthropics/sandbox-runtime/issues/560) of 2026-09-17 found that a profile which allows only three IOKit classes denies `AGXDeviceUserClient`, and that Metal worked, 0 to 6 % slower, once that class and five mach services were allowed. The worker's own profile starts from `(allow default)` and denies file writes, some reads and, under `fs+net`, the network | the report; `crates/worker/src/isolation.rs` | outside, source | The worker's profile does not deny that class. It does deny a write outside the sandbox directory. Whether Metal needs one, for a shader cache for example, is not known. Not tried |
+| 34 | Two reports about a Mac as the head of a split. [Issue 27667](https://github.com/ggml-org/llama.cpp/issues/27667), closed as not planned on 2026-10-16: with the default load mode, which maps the file, the head keeps the whole model in memory. [Issue 12655](https://github.com/ggml-org/llama.cpp/issues/12655), closed in 2025: flash attention failed in a setup that mixed Metal and CUDA. `llama-bench` takes `--rpc` and `--device` | GitHub; `tools/llama-bench/README.md` | issue, source | In R15 and R18 a head on a Mac loads without mapping the file, and the record names the flash attention setting. `llama-bench` can give the tokens per second |
 
 ### What OxideSwarm has
 
@@ -144,8 +152,8 @@ not read this repository.
   numbers.
 - **Found wrong:** CVE-2026-76905 belongs to another project. Issue 27964 was closed as not
   planned on 2026-11-11 and is not open. PR 22341 has another author than the one named.
-  `gguf_init_from_callback` does take an expected size. The report of row 5 does not name
-  `SIGPIPE`, and its build had no RDMA.
+  `gguf_init_from_callback` does take an expected size. `GGML_RPC_NO_RDMA` is offered as a
+  remedy for the report of row 5, whose build had no RDMA.
 - **Not checked, and not repeated here:** the byte counts of each RPC command, the number of
   tensors that the head sends for each token, every measurement but row 26, the statements
   about four other programs, the file systems in memory of the three desktop systems, the
@@ -166,6 +174,37 @@ not read this repository.
 | A lower precision of the KV cache before a model is split | Not examined. It belongs to LLM-3 of design 0038 |
 | A signature on the list of tensors, by the owner's key | Not examined. It needs the keys of ENROLL-1 |
 | The link is measured with one stream and with several, and the baseline with the file in the page cache and without | Taken: R15, steps 1 and 2 |
+
+### Six more outside documents
+
+Later on 2026-11-12 the owner supplied six more answers of the research tool: on the stability
+and security of the RPC backend, on tools that load weights from the network into a GPU, on
+systems that split a model, on building and measuring the RPC backend, on a GPU inside a
+sandbox, and on the throughput of ciphers, hashes and links. All six were read in full.
+
+- **Checked against their sources and used:** rows 27 to 34.
+- **Found wrong or doubtful:** one document lists only the two loaders of `llama.h` that take
+  a path and leaves out the call of row 9. One describes the failure of row 5 without its WSL2
+  setting (row 27). Issue 20315 is called closed as not planned and was closed as completed.
+  CVE-2026-39909 is called rejected, and GitHub's advisory database does not show it as
+  withdrawn. One figure cannot be right as stated: 64.32 tokens per second through a pipeline
+  of two machines whose round trip is given as 18.6 ms.
+- **Not checked, and not repeated here:** the load times that four loaders publish for links of
+  80 Gbit/s and more, and the statement that none of them reads GGUF; the statement that no
+  project loads a GGUF from the network with no file; the bytes for each token in other
+  systems; the throughput of ciphers and hashes, and the conclusion that the link is the limit
+  at 1 and 2.5 Gbit/s; QUIC against TCP; the sandbox rules for Windows and Linux; the build
+  steps, the firewall rules and the format of the debug log.
+
+| Its proposal | Where it stands here |
+|---|---|
+| A supervisor outside the RPC connection: it watches the processes, sets time limits, restarts both ends in order and never probes the port | Taken: D5, items 3 and 6 (rows 28 and 29) |
+| Load through `memfd_create` and a stock `llama-server` | It is way 3 of D3, for a Linux target only. macOS and Windows have no such call |
+| prima.cpp for a model that is too large for one machine | One run in R18 (row 31). No fork or engine of our own |
+| The Seatbelt rules that Metal needs | D3, Isolation (row 33) |
+| A master that forwards sealed bytes, so that it does not decrypt and encrypt again | Not changed here. Encryption is per hop (Q42 of design 0061) |
+| AES-256-GCM in place of ChaCha20-Poly1305 | Not proposed, as before |
+| A build of `b11935` or later | D2 asks for a commit of November 2026 or later (row 25) |
 
 ## Goals
 
@@ -230,10 +269,10 @@ Conditions for all four:
 
 | ID | Question | Method | Stop rule |
 |---|---|---|---|
-| R15 | What does the push of weights cost as upstream does it, against the link and against a local file, and what crosses the network for each token? | The source is the head, and the target runs `ggml-rpc-server`. (1) The throughput of the link in both directions, with one stream and with four. (2) Baseline on the target: `llama-server` from a local file, from its start to an answer on `/health`, once after a restart of the machine and once with the file already in the cache of the operating system, and tokens per second for one fixed prompt and a fixed number of reply tokens. (3) The head on the source, limited to the remote device with `--device` (names from `--list-devices`), all layers offloaded, the RPC server without `-c`: the same two numbers. (4) The same with `-c`, on a first and on a second start. (5) One short run with `GGML_RPC_DEBUG=3` on both sides and `-lv 5` on the head: the bytes of each command for one reply token. (6) Step 3 with `--backend-sampling`, which may end the RPC server (row 22). The record names the GPU of the target | If step 3 or step 6 reaches 95 % of the baseline's tokens per second, LLM-12 is not needed for speed, and LLM-4 serves case 1 |
-| R16 | Does `ggml-rpc-server` survive a connection that arrives through a relay (row 5)? | The RPC server listens on loopback on the target. Through an `ssh -L` forward from the source: a connection that sends nothing and closes, then a real load with `llama-server --rpc`. The same through a second relay that is not SSH. Each system that will be a target takes the server's role once. The record says, after each step, whether the server process is alive, and holds its last log lines. If the server ends, two variants follow (row 24): a relay that connects to the server only when the first bytes arrive and holds one connection, and, on a Unix target, a server that is started with `SIGPIPE` ignored | If the server ends in any step, LLM-4 of design 0038 is not sized until the cause is known |
+| R15 | What does the push of weights cost as upstream does it, against the link and against a local file, and what crosses the network for each token? | The source is the head, and the target runs `ggml-rpc-server`. (1) The throughput of the link in both directions, with one stream and with four. (2) Baseline on the target: `llama-server` from a local file, from its start to an answer on `/health`, once after a restart of the machine and once with the file already in the cache of the operating system, and tokens per second for one fixed prompt and a fixed number of reply tokens. (3) The head on the source, limited to the remote device with `--device` (names from `--list-devices`), all layers offloaded, the RPC server without `-c`: the same two numbers. (4) The same with `-c`, on a first and on a second start. (5) One short run with `GGML_RPC_DEBUG=3` on both sides and `-lv 5` on the head: the bytes of each command for one reply token. (6) Step 3 with `--backend-sampling`, which may end the RPC server (row 22). The record names the GPU of the target. A head on a Mac loads without mapping the file (row 34). `llama-bench --rpc` may give the tokens per second | If step 3 or step 6 reaches 95 % of the baseline's tokens per second, LLM-12 is not needed for speed, and LLM-4 serves case 1 |
+| R16 | Does `ggml-rpc-server` survive a connection that arrives through a relay (row 5)? | The RPC server listens on loopback on the target. Through an `ssh -L` forward from the source: a connection that sends nothing and closes, then a real load with `llama-server --rpc`. The same through a second relay that is not SSH. Each system that will be a target takes the server's role once, as a native program: on Windows not inside WSL2 (row 27). The record says, after each step, whether the server process is alive, and holds its last log lines. If the server ends, two variants follow (row 24): a relay that connects to the server only when the first bytes arrive and holds one connection, and, on a Unix target, a server that is started with `SIGPIPE` ignored | If the server ends in any step, LLM-4 of design 0038 is not sized until the cause is known |
 | R17 | Does `llama_model_init_from_user` build a usable quantised model from memory? | By the source, the types are kept and each tensor has its device buffer when the callback runs (rows 16 and 17). The run confirms it. A throwaway program on one machine builds the metadata of a quantised GGUF with `gguf_init_from_buffer` from the first bytes of the file (row 19), and builds the model with a callback that fills each tensor, part by part, from bytes held in memory. The record holds: the order in which the callback asks for tensors, against the order in the file; the type and the byte size of each tensor, against the file; whether the tensor has a device buffer when the callback runs; the peak memory of the process, against a load from the file; and the first 64 tokens of a greedy reply, against the same model loaded from the file. It runs on each system that will be a target. The record also lists the places in `llama-server` that a patch for D3 would touch (row 20) | If a quantised model does not load this way, or the load needs a second full copy of the weights in RAM, LLM-12 closes, and case 1 uses a file: the path that R14 times |
-| R18 | What does a boundary cost in a split whose head is on a worker with a GPU? | Two machines. The head is on the one with more memory, and the other runs `ggml-rpc-server`. With a model that fits the head alone: the whole model on the head as the baseline, then split in halves with `--tensor-split`. With a model that fits only when split, if the two machines allow one. The record holds the time to the first token for a prompt of about 4096 tokens, tokens per second, and the bytes for one reply token as in R15 step 5. The same split then runs with the head on the other machine, and once with the head's own GPU first in the device order (`--device`), which upstream's default avoids (row 21) | If the head on the stronger machine is not faster than the head on the other, the rule of D5 is dropped |
+| R18 | What does a boundary cost in a split whose head is on a worker with a GPU? | Two machines. The head is on the one with more memory, and the other runs `ggml-rpc-server`. With a model that fits the head alone: the whole model on the head as the baseline, then split in halves with `--tensor-split`. With a model that fits only when split, if the two machines allow one. The record holds the time to the first token for a prompt of about 4096 tokens, tokens per second, and the bytes for one reply token as in R15 step 5. The same split then runs with the head on the other machine, and once with the head's own GPU first in the device order (`--device`), which upstream's default avoids (row 21). A head on a Mac loads without mapping the file (row 34). With a model that fits neither machine alone, one more run uses prima.cpp in place of the RPC backend (row 31) | If the head on the stronger machine is not faster than the head on the other, the rule of D5 is dropped |
 
 ### D3 Case 1: a model server that takes its model from a stream (LLM-12)
 
@@ -257,7 +296,9 @@ This record calls it the runner.
 - **How it is reached.** `worker --serve` names both ports (LLM-9). After the load, a reply does
   not involve the source, which is G2.
 - **Isolation.** Whether a process under `--isolation fs` or `fs+net` can use the GPU is not
-  known on any of the three desktop systems. The guide for LLM-12 states what was tried.
+  tried on any of the three desktop systems. On macOS the worker's profile does not deny the
+  IOKit class that Metal opens, and it does deny writes outside the sandbox directory (row
+  33). For Windows and Linux nothing is known. The guide for LLM-12 states what was tried.
 
 Row 10 means that such a server has to be made. Three ways, for Q46:
 
@@ -332,7 +373,8 @@ that is. The proposal for the text of LLM-5:
 2. The head's `llama-server` listens on loopback and is a named service. The asking machine
    reaches it through a tunnel of LLM-9.
 3. Every other chosen worker runs `ggml-rpc-server` on loopback. The head reaches each through a
-   tunnel of LLM-4.
+   tunnel of LLM-4. Each server gets one connection at a time, and nothing probes its port (row
+   28).
 4. In the first version the master runs on the head's machine. Clients and workers connect to
    the master, so each path is then one hop on the network. With the master elsewhere, every
    exchange between the head and an RPC server passes the master in both directions. A direct
@@ -341,7 +383,10 @@ that is. The proposal for the text of LLM-5:
    1). The head therefore needs the model: from a file, or from a stream once LLM-12 exists.
    The other workers receive their tensors from the head, not from the source.
 6. One failed RPC call ends the head (row 4). The supervisor of LLM-2 starts the whole pipeline
-   again. A request that was in flight fails and is not sent again, as in LLM-9.
+   again: the RPC servers first, then the head. A request that was in flight fails and is not
+   sent again, as in LLM-9. A head or a server can also hang with no process ending (row 29).
+   The supervisor therefore sets a time limit on the load and on the gap between two reply
+   tokens, and it reads liveness from the processes, never from an RPC port.
 
 By the source, and not measured (rows 11 and 21): upstream places the RPC devices first and the
 output with the last layer. A head with a GPU of its own then holds the last layers and the
@@ -387,7 +432,8 @@ Step 1 can start now. Steps 2 to 4 are proposals (Q45).
   above a bound that the worker's owner sets, before it allocates. The bytes in flight are
   bounded.
 - **The cache** verifies an entry when it reads it, which is the lesson of row 6.
-- **The RPC ports of case 2** never listen beyond loopback (rows 4 to 7 and 25).
+- **The RPC ports of case 2** never listen beyond loopback (rows 4 to 7, 25 and 30). Whoever
+  can send bytes to such a port is treated as able to run code as that server.
 - **The master relays the weights** and can read them. Encryption is per hop (Q42 of design
   0061).
 - **The spikes** run the unauthenticated RPC port between two machines. D2 limits where.
@@ -438,6 +484,9 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q44 to Q47.
 | `llama_model_init_from_user` was made for tests (PR 19802). It reports no progress, does not check the data, and its callback cannot report a failure (row 18) | The runner does the first two itself and ends its process on a failed fetch (D3). The stop rule of R17 |
 | The RPC path does not reach G2: one outside measurement gives a split a little over half the reply rate of one machine (row 26) | G2 is a target for case 1, which has no RPC in its path once LLM-12 exists. R15 and R18 measure the RPC path on the owner's machines |
 | The patch of way 1 is more than one call: the fit step also reads the file by path (row 20) | The first patch covers the main model only, with the fit step off |
+| The tunnel fails on a Windows target: the one report is from WSL2 (rows 5 and 27) | R16 on native Windows, before LLM-4 is sized |
+| A split hangs and no process ends (row 29) | The time limits of D5, item 6 |
+| For a model that is too large for one machine, a fork of llama.cpp is ahead of the RPC backend (row 31) | One run in R18. Its result goes to the status log, and Q45 is asked again if the fork is far ahead |
 | The records show that the link is the only limit | Then any path meets G1, and what remains worth building is the cache (G3) |
 | A split is slow on a home network (design 0038, status log of 2026-11-10) | The rule of D1, and R18 before LLM-5 |
 | The target is a Windows PC: no RDMA, and no file system in memory that this record knows of | TCP, and way 1 |
@@ -460,3 +509,14 @@ None yet.
   asks for each tensor by name, in the loader's order. D5 names a head with a GPU of its own.
   R15 to R18 each gained a step or a variant. Nothing is measured or built, and Q45 to Q47
   stay open.
+- 2026-11-12: Correction. The first text of row 24 and of "Found wrong" said that the report
+  of issue 26680 does not name `SIGPIPE`. It does, as its second suspect. The search that led
+  to the wrong sentence had cut the long line of the report. Both places now say what the
+  report says.
+- 2026-11-12: Six more research documents from the owner were read in full, and the
+  statements used were checked against their sources (Context, rows 27 to 34). An SSH tunnel
+  to a loopback RPC server is reported to work outside WSL2, so R16 runs on native Windows.
+  D5 gained time limits against a hang, one connection for each server and no probe of a
+  port. R15 and R18 load without mapping the file on a Mac, and R18 gained one run with
+  prima.cpp. These documents hold no approach that makes one request faster on several
+  machines with GPUs than on the best one of them. Nothing is measured or built.
