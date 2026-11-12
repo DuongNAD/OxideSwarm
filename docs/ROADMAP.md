@@ -4,7 +4,8 @@ Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7
 Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29 (the charter of
 design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059),
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
-memory of another machine with no file written there first, design 0062) on 2026-11-11.
+memory of another machine with no file written there first, design 0062) on 2026-11-11, and
+Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
 Created: 2026-11-07    Updated: 2026-11-12
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -57,6 +58,10 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   tensors from a stream, and the rule that the head of a split model runs on a worker, are
   proposals. The plan is in [design 0062](design/0062-model-weights-into-remote-memory.md).
   Q45 to Q47 are open.
+- Two directions in parallel (Draft, 2026-11-12): compute for coding agents, which is bet A
+  of design 0056, and a study kit for a class (Q48, decided). Each gets one trial that needs
+  nothing built (APP-2, APP-3). The plan is in
+  [design 0063](design/0063-two-directions-in-parallel.md). Q49 and Q50 are open.
 
 ## Where the project stands
 
@@ -459,6 +464,11 @@ decided). Spikes R15 to R18 first measure llama.cpp's own push of weights. A mod
 takes its tensors from a stream (LLM-12), a client command that sends them (LLM-13) and the rule
 that the head of a split model runs on a worker are proposals. Q45 to Q47 are open.
 
+[Design 0063](design/0063-two-directions-in-parallel.md) (Draft, 2026-11-12) records the owner's
+decision to follow two directions in parallel (Q48): compute for coding agents, and a study
+kit for a class. It adds one trial to each (APP-2, APP-3) and no feature. Q49 and Q50 are
+open.
+
 **Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
 0059.
 
@@ -532,6 +542,10 @@ answers.
 | Q45 | For design 0062, in which order: the spikes R15 to R18, then one worker that runs the whole model (LLM-12, LLM-13), then the head rule for a split model? | Open. Recommended: that order. The split keeps its place in design 0038 |
 | Q46 | How does the model server of design 0062 that loads from a stream exist: a patch to `llama-server`, offered upstream and built from source by the worker's owner, with no binary in a release? | Open. Recommended: yes, after spike R17; no server of our own |
 | Q47 | For a split model: the rule that the master runs on the head's machine, or a direct data channel between two nodes? | Open. Recommended: the rule; a channel gets a design record of its own if spike R18 shows that the extra hop matters |
+| Q48 | Are two directions followed in parallel: compute for coding agents (bet A of design 0056) and a study kit for a class (design 0063)? | Yes, decided by the owner on 2026-11-12. No trial has run yet |
+| Q49 | Does `README.md` get a sentence that puts compute for coding agents first (design 0063)? | Open. Recommended: not yet; after trial APP-2 and after the neighbours are read |
+| Q50 | After trial APP-3 of design 0063, how do the owner's study tools reach a fellow student: through the student's own agent, or through a model served from one strong machine of the class? | Open. Recommended: wait for the notes of APP-3 |
+| Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -646,3 +660,14 @@ answers.
   decisions Q45 to Q47. Nothing is measured or built, and no item entered the backlog. The
   spike of design 0056 that was numbered R11 on 2026-11-11 is R14, because R11 to R13 are the
   spikes of design 0058.
+- 2026-11-12: Draft added at the owner's word:
+  [design 0063](design/0063-two-directions-in-parallel.md). The owner agreed to follow two
+  directions in parallel (Q48, decided): compute for coding agents, and a study kit for a
+  class. It has trials APP-2 and APP-3 and open decisions Q49 and Q50. On the same day design
+  0062 gained rows 16 to 34 of what llama.cpp does today, from nine research documents that
+  the owner supplied and that were checked against their sources. Nothing is measured or
+  built.
+- 2026-11-12: [Design 0045](design/0045-distributed-training.md) gained D6 at the owner's
+  word: a workload for independent runs that grades, on several workers, edits which another
+  model wrote into the weights of a small model. It has spike R19 and decision Q51. Nothing is
+  built or measured.

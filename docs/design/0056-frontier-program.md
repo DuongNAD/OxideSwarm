@@ -539,8 +539,9 @@ its lighthouse record, not on a day.
 
 A spike is throwaway code on a branch, or a script under `benchmarks/`. It builds nothing in the
 product and ends with a dated record. Each is sized S. The numbers R11 to R13 belong to
-[design 0058](0058-lasting-value.md), and R15 to R18 to
-[design 0062](0062-model-weights-into-remote-memory.md).
+[design 0058](0058-lasting-value.md), R15 to R18 to
+[design 0062](0062-model-weights-into-remote-memory.md), and R19 to
+[design 0045](0045-distributed-training.md).
 
 | ID | Question | Method | Stop rule |
 |---|---|---|---|
@@ -717,3 +718,7 @@ second one, the classroom. Accepting Q25 accepts the second story.
   [Design 0062](0062-model-weights-into-remote-memory.md) adds spikes R15 to R18 of its own, on
   the push of model weights into the memory of another machine and on a split model. No
   record exists for any of them.
+- 2026-11-12: [Design 0063](0063-two-directions-in-parallel.md) gives bet A a trial before any item
+  is built: for one week the owner's coding agent verifies its changes on a second operating
+  system through the grid (APP-2). The classroom items wait for its second trial (APP-3). The
+  texts of AX-1 to AX-7 and of EDU-1 to EDU-3 are unchanged.

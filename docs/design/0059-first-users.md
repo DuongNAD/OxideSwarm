@@ -2,7 +2,7 @@
 
 Status: Draft (plan; builds nothing; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are
 open)
-Created: 2026-11-10    Updated: 2026-11-11
+Created: 2026-11-10    Updated: 2026-11-12
 
 ## Summary
 
@@ -435,3 +435,6 @@ None yet.
 - 2026-11-11: The first application that D1 names for A3 has a record of its own,
   [design 0061](0061-first-application-model-tunnel.md). The owner set a trial first: LIVA on
   a Mac with the model on another machine. D3 did not move.
+- 2026-11-12: [Design 0063](0063-two-directions-in-parallel.md) adds a trial with fellow students
+  that watches one lesson with the owner's study tools (APP-3). It can run in the same week as
+  round one of ADOPT-1, and it asks another question. The text of ADOPT-1 is unchanged.
