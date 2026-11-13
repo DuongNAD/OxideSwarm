@@ -6,7 +6,7 @@ design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of de
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
-Created: 2026-11-07    Updated: 2026-11-12
+Created: 2026-11-07    Updated: 2026-11-13
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -60,8 +60,14 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   Q45 to Q47 are open.
 - Two directions in parallel (Draft, 2026-11-12): compute for coding agents, which is bet A
   of design 0056, and a study kit for a class (Q48, decided). Each gets one trial that needs
-  nothing built (APP-2, APP-3). The plan is in
-  [design 0063](design/0063-two-directions-in-parallel.md). Q49 and Q50 are open.
+  nothing built (APP-2, APP-3). The owner's simulation project, Anima Engine, is read as a
+  first workload of the owner's own (APP-4). The plan is in
+  [design 0063](design/0063-two-directions-in-parallel.md). Q49, Q50, Q52 and Q53 are open.
+- Research of 2026-11-13 and the route that follows (Draft, 2026-11-13): what five research
+  documents found, which statements were checked, and the order of work that follows. Two
+  spikes come first: a GPU inside the sandbox (R20) and a reading of Mesh-LLM (R21). The
+  plan is in [design 0064](design/0064-research-of-2026-11-13-and-route.md). Q54 to Q56 are
+  open.
 
 ## Where the project stands
 
@@ -466,8 +472,16 @@ that the head of a split model runs on a worker are proposals. Q45 to Q47 are op
 
 [Design 0063](design/0063-two-directions-in-parallel.md) (Draft, 2026-11-12) records the owner's
 decision to follow two directions in parallel (Q48): compute for coding agents, and a study
-kit for a class. It adds one trial to each (APP-2, APP-3) and no feature. Q49 and Q50 are
-open.
+kit for a class. It adds one trial to each (APP-2, APP-3) and no feature. It also reads the
+owner's simulation project, Anima Engine, as a first workload of the owner's own (APP-4), and
+maps what the owner's other projects could give and what the grid does with CPU and GPU. Q49,
+Q50, Q52 and Q53 are open.
+
+[Design 0064](design/0064-research-of-2026-11-13-and-route.md) (Draft, 2026-11-13) records what five
+research documents found and which statements were checked, and orders the existing items in
+seven steps. The first two steps build nothing: the trials of design 0063, then spikes R20 (a
+GPU inside the sandbox) and R21 (what Mesh-LLM already does). It adds item SCHED-5. Q54 to Q56
+are open.
 
 **Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
 0059.
@@ -546,6 +560,11 @@ answers.
 | Q49 | Does `README.md` get a sentence that puts compute for coding agents first (design 0063)? | Open. Recommended: not yet; after trial APP-2 and after the neighbours are read |
 | Q50 | After trial APP-3 of design 0063, how do the owner's study tools reach a fellow student: through the student's own agent, or through a model served from one strong machine of the class? | Open. Recommended: wait for the notes of APP-3 |
 | Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
+| Q52 | Does Anima Engine, the owner's simulation project, become the public showcase of the grid: a world that the machines of several people evolve together (design 0063, D5)? | Open. Recommended: not yet; after trial APP-4 and after Anima Engine has a release of its own |
+| Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
+| Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
+| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Open. Recommended: yes, after spike R20; it is a wire change and gets a design record |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -671,3 +690,15 @@ answers.
   word: a workload for independent runs that grades, on several workers, edits which another
   model wrote into the weights of a small model. It has spike R19 and decision Q51. Nothing is
   built or measured.
+- 2026-11-13: [Design 0063](design/0063-two-directions-in-parallel.md) gained D5 at the
+  owner's word: Anima Engine, the owner's simulation project, read as a first workload of the
+  owner's own and not yet as a reason for other people to install a worker. It has trial APP-4
+  and decision Q52. No code of it was run.
+- 2026-11-13: Design 0063 gained D6 at the owner's word: a map of what the owner's other
+  projects could give, and a statement from the code of what the grid does with CPU and GPU
+  today and what is missing (FEAT-9, video memory for a task, SCHED-4). It has decision Q53.
+- 2026-11-13: Draft added at the owner's request:
+  [design 0064](design/0064-research-of-2026-11-13-and-route.md), from five research documents
+  that the owner supplied. It names the basis of each finding, orders the existing items in
+  seven steps, and adds spikes R20 and R21, item SCHED-5 and open decisions Q54 to Q56.
+  Nothing is built or measured, and no item entered the backlog.
