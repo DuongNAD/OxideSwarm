@@ -198,6 +198,13 @@ impl<
         matches!(self, Self::Multiplexed { .. })
     }
 
+    fn is_encrypted(&self) -> bool {
+        match self {
+            Self::Single { transport, .. } => transport.is_encrypted(),
+            Self::Multiplexed { ctrl_transport, .. } => ctrl_transport.is_encrypted(),
+        }
+    }
+
     #[cfg(feature = "p2p")]
     fn p2p_conn(&self) -> Option<&iroh::endpoint::Connection> {
         match self {
@@ -420,8 +427,8 @@ impl<
         // Authenticated (or rejected): release the pre-auth handshake slot immediately.
         drop(handshake_permit);
 
-        let (first_msg, detected_codec) = match first_res {
-            Ok(pair) => pair,
+        let (first_msg, detected_codec, v3_peer) = match first_res {
+            Ok(triple) => triple,
             Err(e) => {
                 if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
                     match pre_auth {
@@ -504,6 +511,8 @@ impl<
                         waiters,
                         mapreduce_parallelism,
                         blob_store,
+                        auth_ctx,
+                        v3_peer,
                         #[cfg(feature = "dashboard")]
                         broadcast_tx,
                         #[cfg(feature = "p2p")]
@@ -532,6 +541,8 @@ impl<
             shutdown_rx,
             abort_handle,
             blob_store,
+            &auth_ctx,
+            v3_peer.as_ref(),
             #[cfg(feature = "dashboard")]
             broadcast_tx,
         )
@@ -555,6 +566,8 @@ impl<
         shutdown_rx: watch::Receiver<bool>,
         abort_handle: Option<AbortHandle>,
         blob_store: Option<Arc<BlobStore>>,
+        auth_ctx: &MasterAuthContext,
+        v3_peer: Option<&rusty_grid_core::noise_auth::AuthenticatedV3Peer>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
     ) -> GridResult<Option<Self>> {
         // 2. Validate Register message
@@ -622,26 +635,60 @@ impl<
         let remote_addr = pre_auth.remote_addr();
         let rx_clock = pre_auth.rx_clock().clone();
         let is_multiplexed = pre_auth.is_multiplexed();
+        let is_v2_authenticated = v3_peer.is_none() && pre_auth.is_encrypted();
 
-        // 3. Register in WorkerRegistry
+        // 3. Register in WorkerRegistry (atomically checks/claims owner_member_id and MemberStore
+        // under the single registry write lock).
         let negotiated_features = worker_features
             & (ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES);
         let worker_supports_resume =
             negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
-        let registration = registry
-            .register_session(
+        let registration = match registry
+            .register_session_with_member_store(
                 worker_id,
                 capabilities,
                 negotiated_features,
                 remote_addr,
                 outbound_tx.clone(),
                 abort_handle,
+                v3_peer.map(|p| p.member_id.clone()),
+                is_v2_authenticated,
+                Some(&auth_ctx.members),
             )
-            .await?;
-        queue.set_worker_session_resume(worker_id, worker_supports_resume);
+            .await
+        {
+            Ok(reg) => reg,
+            Err(err) => {
+                let wire_reason = match &err {
+                    GridError::AuthFailed(msg) | GridError::RegistrationRejected(msg) => {
+                        msg.clone()
+                    }
+                    other => {
+                        tracing::warn!(
+                            worker_id = %worker_id,
+                            error = %other,
+                            "worker registration failed due to internal master error"
+                        );
+                        "worker registration refused by master".to_string()
+                    }
+                };
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(wire_reason),
+                };
+                pre_auth.send_handshake_refusal(&reject_ack).await;
+                return Err(err);
+            }
+        };
         let session_id = registration.session_id;
+
+        queue.set_worker_session_resume(worker_id, worker_supports_resume);
         queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
         registry
             .set_rx_clock(&worker_id, session_id, rx_clock)
