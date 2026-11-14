@@ -6,7 +6,15 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
+#                   [--gpu|--no-gpu] [--slots N] [--update]
+#
+# --slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
+# processors of the performance cores, at most half of all processors (USB-4).
+#
+# --update (what "Update OxideSwarm.command" runs) updates an existing install in place: it keeps
+# its folder, name, GPU choice, isolation, cluster membership and start at login, asks nothing,
+# does not join again, and only replaces the binaries and restarts the worker.
 #
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -eu
@@ -16,6 +24,12 @@ NAME=""
 ROOT=""
 AUTOSTART=1
 WORKSPACES=1
+GPU=""
+UPDATE=0
+ISOLATION=""
+EXPLICIT_ISOLATION=0
+ISO_SET_BY_FLAG=0
+SLOTS_SET=""
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -26,7 +40,25 @@ while [ $# -gt 0 ]; do
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-workspaces) WORKSPACES=0 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --update) UPDATE=1 ;;
+    --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
+    --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
+    --isolation)
+      [ $# -ge 2 ] || fail "--isolation needs a value (off or fs)"
+      case "$2" in
+        off|fs) ISOLATION=$2; EXPLICIT_ISOLATION=1; ISO_SET_BY_FLAG=1 ;;
+        *) fail "--isolation must be off or fs (got: $2)" ;;
+      esac
+      shift ;;
+    --slots)
+      [ $# -ge 2 ] || fail "--slots needs a number from 1 to 256"
+      case "$2" in
+        ''|*[!0-9]*) fail "--slots needs a number from 1 to 256 (got: $2)" ;;
+      esac
+      { [ "$2" -ge 1 ] && [ "$2" -le 256 ]; } || fail "--slots needs a number from 1 to 256 (got: $2)"
+      SLOTS_SET=$2
+      shift ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
   esac
   shift
@@ -49,21 +81,90 @@ if [ -z "$ROOT" ]; then
   fi
 fi
 
-[ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+[ "$UPDATE" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
+if [ -z "$ISOLATION" ]; then
+  if [ -f "$KIT_DIR/isolation" ]; then
+    BAKED_ISO=$(tr -d ' \r\n\t' < "$KIT_DIR/isolation")
+    case "$BAKED_ISO" in
+      off|fs) ISOLATION=$BAKED_ISO; EXPLICIT_ISOLATION=1 ;;
+      *) fail "the kit's isolation file holds '$BAKED_ISO' (expected 'off' or 'fs')" ;;
+    esac
+  else
+    ISOLATION=fs
+  fi
+fi
 [ -f "$KIT_DIR/archives/SHA256SUMS" ] || fail "archives/SHA256SUMS is missing from the kit"
+
+PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
+UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/oxideswarm-usb-worker.service"
+# Whether this install's worker is started at login now (a LaunchAgent or a systemd user unit that
+# runs this install's binary).
+has_autostart() {
+  { [ -f "$PLIST" ] && grep -qF "$ROOT/bin/oxideswarm" "$PLIST"; } ||
+    { [ -f "$UNIT" ] && grep -qF "$ROOT/bin/oxideswarm" "$UNIT"; }
+}
+if [ "$UPDATE" = 1 ]; then
+  [ -x "$ROOT/bin/oxideswarm" ] || fail "there is no OxideSwarm from a USB kit in $ROOT; run the installer first"
+  # Its settings: kit-install.conf (written since the update mode exists), else what is on disk.
+  if [ -f "$ROOT/kit-install.conf" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        name) [ -n "$NAME" ] || NAME=$value ;;
+        gpu) [ -n "$GPU" ] || case "$value" in 0|1) GPU=$value ;; esac ;;
+        workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
+        # The isolation the worker ran with is kept, and an update never weakens it silently.
+        isolation) [ "$ISO_SET_BY_FLAG" = 1 ] || case "$value" in off|fs) ISOLATION=$value; EXPLICIT_ISOLATION=1 ;; esac ;;
+        # Slots chosen with --slots at install time are kept; an automatic choice is made again.
+        slots) [ -n "$SLOTS_SET" ] || case "$value" in ''|*[!0-9]*) ;; *) [ "$value" -ge 1 ] && [ "$value" -le 256 ] && SLOTS_SET=$value ;; esac ;;
+      esac
+    done < "$ROOT/kit-install.conf"
+  fi
+  if [ -z "$NAME" ]; then
+    ID_FILE=$(ls -t "$ROOT"/home/worker_id.* 2>/dev/null | head -n 1 || true)
+    [ -n "$ID_FILE" ] && NAME=${ID_FILE##*/worker_id.}
+  fi
+  case "$NAME" in *[!A-Za-z0-9_.-]*) NAME="" ;; esac
+  # The start at login stays as it is.
+  if has_autostart; then AUTOSTART=1; else AUTOSTART=0; fi
+fi
 
 ARCHIVE=""
 for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
   [ -f "$f" ] && ARCHIVE=$f
 done
 [ -n "$ARCHIVE" ] || fail "no archive for $TARGET in $KIT_DIR/archives"
-ARCHIVE_NAME=$(basename "$ARCHIVE")
+# A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
+# when it finds one. It is installed only when the person at the keyboard agrees (or --gpu).
+GPU_ARCHIVE=""
+for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
+  [ -f "$f" ] && GPU_ARCHIVE=$f
+done
+if [ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ]; then
+  [ "$UPDATE" = 1 ] && fail "this install uses the GPU build, which this kit lacks; update from a kit made with make_kit.sh --gpu, or add --no-gpu"
+  fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
+fi
 
-say "OxideSwarm USB installer"
+if [ "$UPDATE" = 1 ]; then say "OxideSwarm USB installer (update)"; else say "OxideSwarm USB installer"; fi
 say "  system:  $OS $ARCH ($TARGET)"
 say "  folder:  $ROOT"
+
+if [ -n "$GPU_ARCHIVE" ] && [ -z "$GPU" ]; then
+  GPU=0
+  if [ -t 0 ]; then
+    printf "Let the cluster use this computer's GPU as well? [Y/n] "
+    read -r answer || answer=n
+    case "$answer" in [Nn]*) ;; *) GPU=1 ;; esac
+  fi
+fi
+if [ -n "$GPU_ARCHIVE" ] && [ "$GPU" = 1 ]; then
+  ARCHIVE=$GPU_ARCHIVE
+  say "  gpu:     yes (GPU build; the worker offers the GPU it finds)"
+elif [ -n "$GPU_ARCHIVE" ]; then
+  say "  gpu:     no (CPU build; run the installer with --gpu to change that)"
+fi
+ARCHIVE_NAME=$(basename "$ARCHIVE")
 
 # 1. Check the archive against the kit's SHA256SUMS. This catches a corrupted or outdated copy;
 #    it cannot catch a deliberate swap of the whole stick (design 0053, Security).
@@ -76,6 +177,16 @@ else
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || fail "checksum mismatch for $ARCHIVE_NAME: the copy on the stick is damaged"
 say "  archive: $ARCHIVE_NAME (checksum OK)"
+
+# Stop the worker this install's start-at-login entry keeps alive before its binary changes; step 8
+# puts the entry back.
+if has_autostart; then
+  if [ "$OS" = Darwin ]; then
+    launchctl bootout "gui/$(id -u)/com.oxideswarm.usb-worker" 2>/dev/null || true
+  else
+    systemctl --user stop oxideswarm-usb-worker.service 2>/dev/null || true
+  fi
+fi
 
 # 2. Unpack the binaries.
 BIN_DIR="$ROOT/bin"
@@ -109,6 +220,12 @@ cd "$ROOT"
 # 3. Stop a worker that an earlier run of this installer started.
 if [ -f "$RUN_DIR/worker.pid" ]; then
   OLD=$(cat "$RUN_DIR/worker.pid" 2>/dev/null || true)
+  # A PID file can outlive a reboot, and its number then names another process: only one that runs
+  # this install's binary is stopped.
+  case "$(ps -ww -p "$OLD" -o command= 2>/dev/null)" in
+    *"$BIN_DIR/oxideswarm "*) ;;
+    *) OLD="" ;;
+  esac
   if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
     say "  stopping the worker started earlier (PID $OLD)"
     kill "$OLD" 2>/dev/null || true
@@ -117,11 +234,14 @@ if [ -f "$RUN_DIR/worker.pid" ]; then
   rm -f "$RUN_DIR/worker.pid"
 fi
 
-# 4. Join: the token is read from standard input only, never from the command line.
-say ""
-say "Joining the cluster ..."
-if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
-  fail "join failed (see the message above); nothing was started"
+# 4. Join: the token is read from standard input only, never from the command line. An update keeps
+# the existing membership.
+if [ "$UPDATE" = 0 ]; then
+  say ""
+  say "Joining the cluster ..."
+  if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
+    fail "join failed (see the message above); nothing was started"
+  fi
 fi
 
 # The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
@@ -144,14 +264,89 @@ if [ -z "$NAME" ]; then
   NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
   [ -n "$NAME" ] || NAME=worker
 fi
-# Use at most half of the CPU cores, so the machine stays responsive for its owner.
-if [ "$OS" = Darwin ]; then CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 2); else CORES=$(nproc 2>/dev/null || echo 2); fi
-SLOTS=$((CORES / 2)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+# A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
+# same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
+# machine's own id, the name and the cluster secret: the machine id never leaves the machine, and the
+# same machine gets unrelated ids in different clusters. An existing id file is kept.
+# OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
+ID_FILE="$STATE/worker_id.$NAME"
+if [ ! -s "$ID_FILE" ]; then
+  MACHINE_ID=${OXIDESWARM_USB_MACHINE_ID:-}
+  if [ -z "$MACHINE_ID" ] && [ "$OS" = Darwin ]; then
+    MACHINE_ID=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4; exit }' || true)
+  fi
+  if [ -z "$MACHINE_ID" ]; then
+    for f in /etc/machine-id /var/lib/dbus/machine-id; do
+      if [ -s "$f" ]; then MACHINE_ID=$(cat "$f"); break; fi
+    done
+  fi
+  if [ -n "$MACHINE_ID" ]; then
+    if command -v shasum >/dev/null 2>&1; then SHA="shasum -a 256"; else SHA=sha256sum; fi
+    H=$({ printf 'oxideswarm-usb-worker-id-v1\n%s\n%s\n' "$MACHINE_ID" "$NAME"; cat "$STATE/cluster.secret" 2>/dev/null || true; } | $SHA | cut -c1-32)
+    # UUID version 8 (vendor-specific) with the RFC 9562 variant bits.
+    VARIANT=$(printf '%x' $(( (0x$(printf '%s' "$H" | cut -c17) & 3) | 8 )))
+    UUID="$(printf '%s' "$H" | cut -c1-8)-$(printf '%s' "$H" | cut -c9-12)-8$(printf '%s' "$H" | cut -c14-16)-$VARIANT$(printf '%s' "$H" | cut -c18-20)-$(printf '%s' "$H" | cut -c21-32)"
+    (umask 077; printf '%s\n' "$UUID" > "$ID_FILE")
+  fi
+fi
+# Task slots (USB-4): the logical processors of the performance cores, at most half of all
+# processors and at least 1, so the machine stays responsive for its owner. A laptop chip with few
+# performance cores slows down far more than linearly when every efficient core is busy too. When
+# the core types cannot be read, a machine with a battery gets a quarter of its processors.
+# OXIDESWARM_USB_CPU_INFO="total=N perf=N|- battery=0|1" replaces the probe (tests).
+count_cpu_list() {
+  n=0
+  old_ifs=$IFS; IFS=,
+  for part in $1; do
+    case "$part" in
+      *-*) a=${part%-*}; b=${part#*-}; n=$((n + b - a + 1)) ;;
+      '') ;;
+      *) n=$((n + 1)) ;;
+    esac
+  done
+  IFS=$old_ifs
+  printf '%s\n' "$n"
+}
+CPU_TOTAL=""; CPU_PERF=""; CPU_BATTERY=0
+if [ -n "${OXIDESWARM_USB_CPU_INFO:-}" ]; then
+  for kv in $OXIDESWARM_USB_CPU_INFO; do
+    case "$kv" in
+      total=*) CPU_TOTAL=${kv#total=} ;;
+      perf=*) CPU_PERF=${kv#perf=} ;;
+      battery=*) CPU_BATTERY=${kv#battery=} ;;
+    esac
+  done
+elif [ "$OS" = Darwin ]; then
+  CPU_TOTAL=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  CPU_PERF=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || true)
+  if pmset -g batt 2>/dev/null | grep -q InternalBattery; then CPU_BATTERY=1; fi
+else
+  CPU_TOTAL=$(nproc 2>/dev/null || true)
+  if [ -r /sys/devices/cpu_core/cpus ]; then CPU_PERF=$(count_cpu_list "$(cat /sys/devices/cpu_core/cpus)"); fi
+  for b in /sys/class/power_supply/BAT*; do
+    if [ -e "$b" ]; then CPU_BATTERY=1; break; fi
+  done
+fi
+case "$CPU_TOTAL" in ''|*[!0-9]*) CPU_TOTAL=2 ;; esac
+case "$CPU_PERF" in ''|*[!0-9]*) CPU_PERF="" ;; esac
+[ "$CPU_TOTAL" -ge 1 ] || CPU_TOTAL=1
+HALF=$((CPU_TOTAL / 2)); [ "$HALF" -ge 1 ] || HALF=1
+if [ -n "$SLOTS_SET" ]; then
+  SLOTS=$SLOTS_SET; SLOTS_WHY="set with --slots"
+elif [ -n "$CPU_PERF" ] && [ "$CPU_PERF" -ge 1 ]; then
+  SLOTS=$CPU_PERF; [ "$SLOTS" -le "$HALF" ] || SLOTS=$HALF
+  SLOTS_WHY="performance cores, at most half of $CPU_TOTAL processors"
+elif [ "$CPU_BATTERY" = 1 ]; then
+  SLOTS=$((CPU_TOTAL / 4)); [ "$SLOTS" -ge 1 ] || SLOTS=1
+  SLOTS_WHY="a quarter of $CPU_TOTAL processors on a machine with a battery"
+else
+  SLOTS=$HALF; SLOTS_WHY="half of $CPU_TOTAL processors"
+fi
+say "  slots:   $SLOTS ($SLOTS_WHY; change it with --slots N)"
 WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi
-ISOLATION=fs
 start_worker() {
   # shellcheck disable=SC2086
   nohup "$BIN" $WORKER_ARGS --isolation "$ISOLATION" >> "$LOG_DIR/worker.log" 2>&1 &
@@ -164,11 +359,13 @@ say "Starting worker '$NAME' ..."
 start_worker
 sleep 4
 if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
-  say "  the worker stopped with --isolation fs (see $LOG_DIR/worker.log); trying --isolation off"
-  ISOLATION=off
-  start_worker
-  sleep 3
-  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start; see $LOG_DIR/worker.log"
+  if [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
+    say "  the worker stopped with --isolation $ISOLATION (see $LOG_DIR/worker.log); trying --isolation off"
+    ISOLATION=off
+    start_worker
+    sleep 3
+  fi
+  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start with --isolation $ISOLATION; see $LOG_DIR/worker.log"
 fi
 
 # 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
@@ -189,11 +386,14 @@ while [ $i -lt 30 ]; do
 done
 [ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
 say "  connected (isolation: $ISOLATION)"
+# What an update keeps: the name, the build, the workspace choice and the isolation.
+GPU_USED=0
+if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
+printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\nslots=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" "$SLOTS_SET" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$OS" = Darwin ]; then
-    PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     {
       printf '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -219,7 +419,7 @@ if [ "$AUTOSTART" = 1 ]; then
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     say "  autostart: LaunchAgent com.oxideswarm.usb-worker"
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    UNIT_DIR=$(dirname "$UNIT")
     mkdir -p "$UNIT_DIR"
     {
       printf '[Unit]\nDescription=OxideSwarm worker (USB kit)\n\n[Service]\n'
@@ -239,6 +439,12 @@ if [ "$AUTOSTART" = 1 ]; then
   fi
 else
   say "  autostart: skipped (--no-autostart); worker PID $(cat "$RUN_DIR/worker.pid")"
+fi
+
+if [ "$UPDATE" = 1 ]; then
+  say ""
+  say "Updated. Worker '$NAME' runs $("$BIN" --version) from $ROOT."
+  exit 0
 fi
 
 # 9. Check the cluster.

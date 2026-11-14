@@ -90,7 +90,8 @@ To set up several machines, a USB stick can carry the program for every system a
 see [packaging/usb/README.md](packaging/usb/README.md). The stick installs, joins and starts the
 worker with one double-click on macOS and Windows, or `bash install.sh` on Linux. With a token that
 carries the master's P2P ticket, it also works on school or office Wi-Fi where the machines cannot
-reach each other. The kit scripts are in the repository and install release `0.1.1` or newer.
+reach each other. The kit scripts are in the repository and install release `0.1.1` or newer (`0.1.2` or newer for
+Windows workers that run workspace tasks under `-Isolation fs`).
 
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
@@ -101,7 +102,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.1.1`), or [build from source](#build-from-source).
+(the latest is `v0.1.2`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -112,19 +113,19 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf oxideswarm-0.1.2-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.1.1-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.1.1-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.1.2-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.1.2-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.1.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.1.1-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.1.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.1.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.1.1-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.1.2-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
@@ -347,15 +348,15 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.1.1` covers the user story above. What it does not do yet:
+OxideSwarm `0.1.2` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
 | Delivery is at least once | A task can run twice after a worker is lost, so tasks with side effects must be idempotent | None; session resume (FEAT-1) and crash containment (FEAT-2) shrink the window |
 | One master, no automatic failover | The master is a single point of failure; `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 ([design 0050](docs/design/0050-scale-out-architecture.md)) |
-| Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1 ([design 0051](docs/design/0051-machine-identity-and-invites.md)): a key per machine and the OXS-AUTH v3 handshake are on `master` (ENROLL-1a, not released yet); invites and removing one machine are ENROLL-1b |
-| On Windows, `cargo` under isolation needs a worker that is not elevated | In release `0.1.1` a Windows workspace worker runs with `--isolation off`; on `master` (FEAT-3d) it runs with `--isolation fs`, and an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
-| Workspace trees skip symbolic links and empty directories | A project that relies on a link inside its tree may not build remotely | W11 ([design 0039](docs/design/0039-agent-workspaces.md)) |
+| Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1 ([design 0051](docs/design/0051-machine-identity-and-invites.md)): a key per machine and the OXS-AUTH v3 handshake ship in `0.1.2` as an opt-in (`master --auth members|both`, ENROLL-1a); invites and removing one machine are ENROLL-1b |
+| On Windows, `cargo` under isolation needs a worker that is not elevated | Since release `0.1.2` (FEAT-3d) a Windows workspace worker runs with `--isolation fs`; an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
+| Workspace trees skip symbolic links that leave the tree or traverse another link, and creating links on Windows needs Developer Mode | Out-of-tree or chained links are skipped with a notice; a Windows worker without Developer Mode fails when syncing a link | By design ([design 0039](docs/design/0039-agent-workspaces.md) W11) |
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | GPU support is a verified matrix-multiply benchmark | No user workload runs on the GPU yet | FEAT-9 |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
@@ -632,7 +633,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--max-concurrency <N>` (alias `--max-concurrent-tasks`) | `max(1, cores - 1)` (`cores` when `--cores <N>` is given; `RUSTY_GRID_MAX_CONCURRENCY`, `RUSTY_GRID_MAX_CONCURRENT_TASKS`, `[worker].max_concurrency`) | Maximum concurrent tasks executed simultaneously on this worker |
 | `--heartbeat-interval-secs <SECS>` (alias `--heartbeat-interval`) | `3` (`RUSTY_GRID_HEARTBEAT_INTERVAL_SECS`, `[worker].heartbeat_interval_secs`) | Fallback heartbeat interval in seconds |
 | `--session-resume-grace-secs <SECS>` | Master hold window (`RUSTY_GRID_SESSION_RESUME_GRACE_SECS`, `[worker].session_resume_grace_secs`) | Upper bound in seconds on how long running tasks keep executing across a master disconnect (`0` disables session resumption on this worker, [design 0046](docs/design/0046-master-durability.md)) |
-| `--sandbox-base-dir <DIR>` | `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix (private mode `0700`, [design 0021](docs/design/0021-private-default-sandbox-base.md)) and `%TEMP%\rusty_grid\sandboxes` on Windows (`RUSTY_GRID_SANDBOX_BASE_DIR`, `[worker].sandbox_base_dir`) | Base directory for isolated task execution sandboxes (used as given when set explicitly) |
+| `--sandbox-base-dir <DIR>` | `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix (private mode `0700`, [design 0021](docs/design/0021-private-default-sandbox-base.md)) and `%TEMP%\rusty_grid\sandboxes` on Windows (`RUSTY_GRID_SANDBOX_BASE_DIR`, `[worker].sandbox_base_dir`) | Base directory for isolated task execution sandboxes (used as given when set explicitly on Unix; created with a protected owner-only DACL and checked at start-up and per task on Windows, [design 0021](docs/design/0021-private-default-sandbox-base.md)) |
 | `--task-priority <PRIORITY>` | `below-normal` (`RUSTY_GRID_TASK_PRIORITY`) | OS scheduling priority for task child processes: `normal`, `below-normal`, or `idle` |
 | `--isolation <LEVEL>` | `off` (`RUSTY_GRID_ISOLATION`, `[worker].isolation`) | OS-level confinement of task processes ([design 0033](docs/design/0033-os-level-task-isolation.md)): `off`; `fs` (a task writes only its own sandbox and cannot read the owner's home, other sandboxes, the blob cache or the shared temp areas; the Rust toolchain is read-only); `fs+net` (`fs` plus no network sockets). A confined task gets an allowlisted environment (`PATH`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `COLORTERM`, `NO_COLOR`, `DEVELOPER_DIR`, `SDKROOT`, `RUSTUP_TOOLCHAIN`, its own `env`, the `RUSTY_GRID_*` task variables), `RUSTUP_HOME` and `CARGO_HOME` pinned to the host's, and `HOME` and the temp variables inside its sandbox. macOS (`sandbox-exec`), Linux (Landlock for files, `seccomp` for sockets, `io_uring` and `TIOCSTI`, a private network namespace under `fs+net` when the host allows user namespaces; needs Linux 5.13+ with Landlock enabled, `x86_64` or `aarch64`, and the worker refuses to start otherwise; signals to the worker are only blocked from Linux 6.12), and Windows (`FEAT-3c`: per-attempt AppContainer profile `oxideswarm.task.<worker8>.<run_token>`, custom capability SID `oxideswarm.toolchain` granted on toolchain roots at worker start-up and recorded in `~/.oxideswarm/windows_acl_grants.txt` for `windows/revoke-isolation-acls.ps1`, `WinCapabilityInternetClientSid` + `WinCapabilityPrivateNetworkClientServerSid` under `fs` and zero network capabilities under `fs+net`, and a per-task private Desktop `ox_desk_<pid>_<run_token>`). A confined Linux task cannot create `AF_UNIX` sockets (ssh-agent, `docker.sock` and the D-Bus bus are out of reach; `socketpair` works) or use the kernel keyring and, under `fs+net`, no socket at all (the start-up log says whether a private network namespace is also available). `$CARGO_HOME/config.toml` is readable to tasks: keep registry tokens in `credentials.toml`. The worker also refuses to start when the cluster secret comes from `OXIDESWARM_SECRET` or `--secret`: on macOS a task running as the worker's user can read the environment and command line of every process of that user, so use `--secret-file`, `OXIDESWARM_SECRET_FILE` or the default file. Advertised as the reserved `iso:<level>` tag |
 | `--keep-sandboxes` | `false` (`RUSTY_GRID_KEEP_SANDBOXES`, `[worker].keep_sandboxes`) | Retain task sandbox directories after execution for debugging (skips both per-task teardown and the worker start-up leftover-sandbox sweep; a later worker start on the same `--sandbox-base-dir` without `--keep-sandboxes` sweeps any unlocked retained `<task_id>` directories) |
@@ -744,7 +745,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (`--secret-file`, mode `0600`; preferred over inline hex) |
 | `RUSTY_GRID_MASTER_KEY` | Worker, CLI & MCP | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 Noise `IK` authentication (`--master-key`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file (`--config`) |
-| `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
+| `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, `windows_acl_grants.txt`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
 | `RUST_LOG` | Global | Standard `tracing_subscriber::EnvFilter` directive overriding `--verbose` / `--quiet` |
 
 #### Tier B: Master Coordinator & Scheduling
@@ -838,9 +839,10 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_ENABLE_PHYSICAL_GPU` | Worker | Force-enables hardware wgpu engine initialization when set to `1` |
 | `RUSTY_GRID_REQUIRE_GPU` | Worker (Tests) | In tests (`1`), asserts that failure to initialize a physical GPU is fatal instead of skipping |
 | `RUSTY_GRID_REQUIRE_BLENDER` | Worker (Tests) | In tests (`1` or `true`), asserts that a missing host Blender binary is fatal instead of skipping |
+| `RUSTY_GRID_REQUIRE_SYMLINKS` | Worker / CLI (Tests) | In tests (`1`), asserts that Windows `ERROR_PRIVILEGE_NOT_HELD` (`1314`) on symbolic link creation is fatal instead of skipping |
 | `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed (`--max-concurrency`) |
 | `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks (`--max-concurrent-tasks`) |
-| `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes, used as given (`--sandbox-base-dir` outranks it). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |
+| `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes (`--sandbox-base-dir` outranks it; used as given on Unix, checked and created with a protected owner-only DACL on Windows). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |
 | `RUSTY_GRID_ISOLATION` | Worker | Isolation level of task processes (`--isolation`): `off`, `fs`, or `fs+net` |
 | `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority (`--task-priority`): `normal`, `below-normal`, or `idle` |
 | `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion (`--keep-sandboxes`) |

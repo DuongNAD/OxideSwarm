@@ -1629,6 +1629,91 @@ pub fn augment_windows_path(existing_path: &str) -> String {
     }
 }
 
+/// Returns `true` when `dir` is an MSYS2 or Cygwin POSIX binary directory (`...\Git\usr\bin`,
+/// `...\git\current\usr\bin`, `...\msys64\usr\bin`, `...\cygwin64\bin`, or any folder containing
+/// `msys-2.0.dll` or `cygwin1.dll`) whose executables link against `msys-2.0.dll` / `cygwin1.dll`.
+///
+/// Inside a Windows AppContainer (`--isolation fs` or `--isolation fs+net`), `msys-2.0.dll` and
+/// `cygwin1.dll` fail during `DllMain(DLL_PROCESS_ATTACH)` Cygwin shared-heap initialization and
+/// terminate the child process with `0xC0000142` (`STATUS_DLL_INIT_FAILURE`). Native Win32 tools
+/// in `%SystemRoot%\System32` (`whoami.exe`, `cmd.exe`, `powershell.exe`, `where.exe`, `tar.exe`,
+/// `curl.exe`, `find.exe`, `sort.exe`, `timeout.exe`) and `Git\cmd` / `Git\bin` (`git.exe`) do
+/// not link `msys-2.0.dll` and run cleanly inside an AppContainer.
+#[cfg(windows)]
+pub fn is_msys_usr_bin_dir(dir: &std::path::Path) -> bool {
+    if dir.join("msys-2.0.dll").is_file() || dir.join("cygwin1.dll").is_file() {
+        return true;
+    }
+    let norm = dir
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    norm.ends_with(r"\git\usr\bin")
+        || norm.ends_with(r"\git\current\usr\bin")
+        || norm.ends_with(r"\msys64\usr\bin")
+        || norm.ends_with(r"\msys32\usr\bin")
+        || norm.ends_with(r"\cygwin64\bin")
+        || norm.ends_with(r"\cygwin\bin")
+}
+
+/// Augments `existing_path` for a task running inside a Windows AppContainer (`--isolation fs`
+/// or `--isolation fs+net`): keeps native directories (such as `%SystemRoot%\System32` and
+/// `Git\cmd` / `Git\bin`) ahead of MSYS2 `usr\bin` directories so bare command names resolve to
+/// native Win32 binaries instead of `msys-2.0.dll` tools that fail with `0xC0000142`.
+#[cfg(windows)]
+pub fn augment_windows_path_for_isolation(existing_path: &str) -> String {
+    let mut native_parts: Vec<String> = Vec::new();
+    let mut msys_parts: Vec<String> = Vec::new();
+    for part in existing_path.split(';').filter(|s| !s.is_empty()) {
+        if is_msys_usr_bin_dir(std::path::Path::new(part)) {
+            msys_parts.push(part.to_string());
+        } else {
+            native_parts.push(part.to_string());
+        }
+    }
+
+    let contains_ci = |list: &[String], candidate: &str| {
+        let cand_norm = candidate
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        list.iter().any(|entry| {
+            entry
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+                == cand_norm
+        })
+    };
+
+    for native_git in [
+        r"C:\Program Files\Git\cmd",
+        r"C:\Program Files\Git\bin",
+        r"C:\Program Files (x86)\Git\cmd",
+        r"C:\Program Files (x86)\Git\bin",
+    ] {
+        let p = std::path::Path::new(native_git);
+        if p.exists() && !contains_ci(&native_parts, native_git) {
+            native_parts.push(native_git.to_string());
+        }
+    }
+
+    for msys_dir in [
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files (x86)\Git\usr\bin",
+        r"C:\msys64\usr\bin",
+    ] {
+        let p = std::path::Path::new(msys_dir);
+        if p.exists() && !contains_ci(&msys_parts, msys_dir) {
+            msys_parts.push(msys_dir.to_string());
+        }
+    }
+
+    native_parts.extend(msys_parts);
+    native_parts.join(";")
+}
+
 #[cfg(windows)]
 const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
 
@@ -1727,6 +1812,77 @@ pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String
         if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
             return found;
         }
+    }
+
+    program.to_string()
+}
+
+/// Resolves `program` on Windows for a task running inside a Windows AppContainer
+/// (`--isolation fs` or `--isolation fs+net`).
+///
+/// Unlike [`resolve_windows_executable`], this function searches native directories in
+/// `effective_path` (such as `%SystemRoot%\System32` and `Git\cmd` / `Git\bin`) **before**
+/// MSYS2 `usr\bin` directories (`...\Git\usr\bin`, `...\msys64\usr\bin`). MSYS2 `usr\bin`
+/// executables link against `msys-2.0.dll`, which fails during `DllMain(DLL_PROCESS_ATTACH)`
+/// Cygwin shared-heap initialization inside a Windows AppContainer with `0xC0000142`
+/// (`STATUS_DLL_INIT_FAILURE`), whereas native Win32 binaries in `%SystemRoot%\System32`
+/// (`whoami.exe`, `cmd.exe`, `powershell.exe`, `where.exe`, `tar.exe`, `curl.exe`, `find.exe`,
+/// `sort.exe`, `timeout.exe`) and `Git\cmd` / `Git\bin` (`git.exe`) do not link `msys-2.0.dll`
+/// and run cleanly inside an AppContainer.
+#[cfg(windows)]
+pub fn resolve_windows_executable_for_isolation(program: &str, effective_path: &str) -> String {
+    let p = std::path::Path::new(program);
+    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
+    if has_path_sep {
+        if is_valid_windows_executable(p) {
+            return program.to_string();
+        }
+        for ext in WINDOWS_EXEC_EXTS {
+            let with_ext = format!("{program}{ext}");
+            if is_valid_windows_executable(std::path::Path::new(&with_ext)) {
+                return with_ext;
+            }
+        }
+        return program.to_string();
+    }
+
+    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+
+    // 1. Search all non-MSYS2 directories in `effective_path` first (preserving caller order).
+    let mut deferred_msys_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for dir in std::env::split_paths(effective_path) {
+        if is_msys_usr_bin_dir(&dir) {
+            deferred_msys_dirs.push(dir);
+            continue;
+        }
+        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
+            return found;
+        }
+    }
+
+    // 2. Fallback to %SystemRoot%\System32 and native Git wrapper directories if not in PATH.
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let sys32 = std::path::Path::new(&sys_root).join("System32");
+    if let Some(found) = probe_candidate_in_dir(&sys32, bare_name) {
+        return found;
+    }
+    for base in &[r"C:\Program Files\Git\cmd", r"C:\Program Files\Git\bin"] {
+        if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), bare_name) {
+            return found;
+        }
+    }
+
+    // 3. Only check MSYS2 `usr\bin` directories as a last resort when no native binary exists.
+    for dir in &deferred_msys_dirs {
+        if let Some(found) = probe_candidate_in_dir(dir, bare_name) {
+            return found;
+        }
+    }
+    if let Some(found) = probe_candidate_in_dir(
+        std::path::Path::new(r"C:\Program Files\Git\usr\bin"),
+        bare_name,
+    ) {
+        return found;
     }
 
     program.to_string()
@@ -3463,5 +3619,72 @@ Now drawing from 'AC Power'
             });
             assert_eq!(caps.tags, vec!["tool:git".to_string()]);
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_executable_resolution_for_isolation_prefers_system32_over_msys_usr_bin() {
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Program Files\Git\usr\bin"
+        )));
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Users\dev\scoop\apps\git\current\usr\bin"
+        )));
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\msys64\usr\bin\"
+        )));
+        assert!(is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\cygwin64\bin"
+        )));
+        assert!(!is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Windows\System32"
+        )));
+        assert!(!is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Program Files\Git\cmd"
+        )));
+        assert!(!is_msys_usr_bin_dir(std::path::Path::new(
+            r"C:\Program Files\Git\bin"
+        )));
+
+        // A custom folder containing msys-2.0.dll or cygwin1.dll is also detected (N4).
+        let custom_msys = tempfile::tempdir().expect("tempdir");
+        assert!(!is_msys_usr_bin_dir(custom_msys.path()));
+        std::fs::write(custom_msys.path().join("msys-2.0.dll"), b"MZ").unwrap();
+        assert!(is_msys_usr_bin_dir(custom_msys.path()));
+
+        // Even when the caller's PATH places Git\usr\bin ahead of System32 (e.g. Git Bash),
+        // augment_windows_path_for_isolation moves MSYS2 usr\bin after native directories,
+        // and resolve_windows_executable_for_isolation resolves bare `whoami` to
+        // System32\whoami.exe instead of Git\usr\bin\whoami.exe (BUG-18).
+        let git_bash_path = r"C:\Program Files\Git\usr\bin;C:\Windows\System32;C:\Windows";
+        let eff_path = augment_windows_path_for_isolation(git_bash_path);
+        let parts: Vec<&str> = eff_path.split(';').collect();
+        let sys32_idx = parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case(r"C:\Windows\System32"))
+            .expect("System32 in effective PATH");
+        if let Some(msys_idx) = parts
+            .iter()
+            .position(|p| is_msys_usr_bin_dir(std::path::Path::new(p)))
+        {
+            assert!(
+                sys32_idx < msys_idx,
+                "System32 must precede MSYS2 usr\\bin in isolated PATH: {eff_path}"
+            );
+        }
+
+        let resolved_whoami = resolve_windows_executable_for_isolation("whoami", git_bash_path);
+        assert!(
+            !resolved_whoami
+                .to_ascii_lowercase()
+                .contains(r"\git\usr\bin\"),
+            "whoami under isolation must not resolve to MSYS2 Git\\usr\\bin: {resolved_whoami}"
+        );
+        assert!(
+            resolved_whoami
+                .to_ascii_lowercase()
+                .ends_with(r"\system32\whoami.exe"),
+            "whoami under isolation must resolve to System32\\whoami.exe, got: {resolved_whoami}"
+        );
     }
 }

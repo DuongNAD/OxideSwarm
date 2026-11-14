@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-10, at `master` `cf664ee` plus TEST-21, TEST-22, DOC-8 and LOG-1: 68 items Implemented, 4 Partial and 36 Planned. Five items
+On 2026-11-11, at `master` `0354b28`: 70 items Implemented, 4 Partial and 40 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
@@ -153,6 +153,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
+| BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -203,7 +204,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
 | FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented | 183 (open) |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177, 186 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
@@ -211,6 +212,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Planned |  |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -221,8 +223,12 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Planned | (design 0051) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
+| USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
+| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
+| USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Planned |  |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
+| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Planned | (design 0060) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned |  |
@@ -1390,6 +1396,48 @@ Each item below needs a design record before code.
   session state machine. Add the sweep.
 - **Done when:** Each listed symbol has a production caller or is gone.
 
+### MAINT-1: Split the six largest source files and cap file size in CI
+
+- **Evidence:** Measured on `master` `0354b28` on 2026-11-11 (lines; the test part is everything
+  from the file's first `#[cfg(test)]`; commits are those on `master` since 2026-10-11):
+
+  | File | Lines | Production | Tests | Commits |
+  |---|---|---|---|---|
+  | `crates/master/src/queue.rs` | 8,639 | 5,044 | 3,595 | 36 |
+  | `crates/master/src/server.rs` | 8,593 | 4,941 | 3,652 | 73 |
+  | `crates/worker/src/client.rs` | 8,252 | 4,361 | 3,891 | 87 |
+  | `crates/cli/src/cli_app.rs` | 8,099 | 5,149 | 2,950 | 101 |
+  | `crates/worker/src/runner.rs` | 6,293 | 4,141 | 2,152 | 79 |
+  | `crates/core/src/protocol.rs` | 6,184 | 3,232 | 2,952 | 41 |
+
+  Each holds 120 to 243 functions. FEAT-11 merged the two connection loops into
+  `crates/master/src/session.rs` and removed dead code, but split none of these files.
+- **Problem:** Each of these files mixes several jobs, so a reviewer has to read thousands of lines
+  to judge one change, and parallel pull requests are likely to collide in them: `cli_app.rs`
+  changed 101 times in a month. ENROLL-1b adds more to `server.rs`. Nothing stops a file from growing further.
+- **Do:** one pull request per file, with no change in behaviour, starting each only after the open
+  pull requests that touch that file have merged (ENROLL-1b for `server.rs` and `cli_app.rs`,
+  SCHED-4 for `scheduler.rs`):
+  1. Move each file's `#[cfg(test)]` module to a file of its own next to it (`mod tests;` with the
+     tests in `<module>/tests.rs`). This alone removes about 40 % of the lines.
+  2. Split the production code by job, keeping the public API through `pub use` re-exports:
+     - `cli_app.rs`: one module per subcommand (`master`, `worker`, `submit`, `status`/`result`/
+       `cancel`, `mapreduce`, `workspaces`), with the clap types and `run_cli` dispatch left in
+       `cli_app.rs`;
+     - `client.rs`: connection, registration and reconnect; the active-task table and assignment
+       handling; blob and staging glue;
+     - `runner.rs`: process spawning and supervision; output capture and limits; Windows executable
+       resolution;
+     - `server.rs`: listeners and handshakes; client request handlers; enrollment and members;
+     - `queue.rs`: the task state machine; retention and eviction; checkpoints;
+     - `protocol.rs`: the message enums; the `Human*`/`Binary*` mirrors and their `From` impls; the
+       codec.
+  3. Add a size check to `cargo xtask`/`ox-mode test lint` and CI: a Rust source file whose
+     production part exceeds 3,000 lines fails, except files on an allowlist that may only shrink.
+- **Done when:** none of the six files has a production part above 3,000 lines, the allowlist is
+  empty or only shrinks, the CI size check runs on every pull request, and the full test suite and
+  `crates/core/tests/data/wire_layout.txt` are unchanged by the split.
+
 ### CACHE-1: Reuse the result of an identical task
 
 - **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. No code in `crates/` maps a task to an
@@ -1705,6 +1753,36 @@ owner's decisions Q8, Q9 and Q12 are open.
 - **Done when:** A task submitted at one site runs at a worker of another, and its input blob is not
   sent twice. A site without the forward permission is refused.
 
+### SCHED-4: Place tasks by measured worker speed and re-run stragglers
+
+- **Evidence:** Reproduced on 2026-11-10 on a two-worker cluster over direct P2P links: a desktop
+  (Intel Core i5-14600KF, 20 threads, 10 slots) and a laptop (Intel Core i7-1355U, 2 performance
+  and 8 efficient cores, 12 threads, 6 slots). One PowerShell task that sums 1 to 2,000,000 takes
+  about 2.3 s on the desktop and 3.5 s on the laptop when run alone. A batch of 32 such tasks with no
+  worker pinned put 26 on the desktop (2.4 to 4.6 s each) and 6 on the laptop (about 51 s each), so
+  the batch took 52 s; the desktop alone would have finished in about 12 s. Pinned to the laptop,
+  2, 4 and 6 concurrent tasks took 2.9 s, 12.5 s and 39.6 s each (about 112 MB per task, so not
+  memory). GPU work shows the same gap: a verified 8192 GEMM took 855 ms on an RTX 5060 Ti and
+  11.9 s on an MX550, and 12 unpinned 4096 GEMMs went 9 and 3.
+- **Problem:** `Engine::rank` (`crates/master/src/scheduler.rs`) orders candidates by load per core
+  and reported CPU use; it knows nothing about how fast a worker actually runs a task. Every free
+  slot is filled, so one slow or overloaded worker sets the finish time of a whole batch, and a task
+  stuck on it is never moved while faster workers sit idle.
+- **Do:** follow [design 0060](design/0060-speed-aware-placement.md):
+  1. Record per worker an exponential moving average of the run time of each task key (task type,
+     program and arguments), bounded in size, from the results the master already receives.
+  2. In placement, when a worker's expected run time for the key is at least 1.5 times what a
+     faster matching worker would take, counting the time until that worker frees a slot, leave the
+     task queued for the faster worker. Keys with no history keep today's placement.
+  3. Opt-in straggler re-run: a task the submitter marks as safe to repeat runs a second copy on an
+     idle faster worker once it runs past 3 times the expected time; the first result wins and the
+     other copy is cancelled.
+  4. Show each worker's measured speed in `workers --json` and the dashboard.
+- **Done when:** a scheduler test with one fast and one slow simulated worker shows a batch of
+  identical tasks finishing at least 30 % sooner than with today's placement, unknown keys keep
+  today's placement exactly (the existing scheduler tests pass unchanged), and a live two-machine
+  batch like the one above finishes within 1.5 times the fast machine's own time.
+
 ## Phase 8: product and ecosystem
 
 Draft, added on 2026-11-09 with Phase G of [ROADMAP.md](ROADMAP.md). The items start after the
@@ -1850,6 +1928,68 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
   output blob transfers) over a P2P ticket with `RUST_LOG=info,iroh=info`, finds no
   `Endpoint dropped without calling` line in `stderr`, and parses the `stdout` of `workers --json`
   as JSON.
+
+### BUG-18: Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin`
+
+- **Evidence:** Reproduced on 2026-11-10 during the Windows USB kit isolation check: `oxideswarm submit -- whoami` against a worker started with `--isolation fs` failed with exit code `-1073741502` (`0xC0000142` / `STATUS_DLL_INIT_FAILURE`).
+- **Problem:** `augment_windows_path` and `resolve_windows_executable` (`crates/core/src/capabilities.rs:1602,1699`) checked `C:\Program Files\Git\usr\bin` ahead of `%SystemRoot%\System32`. Bare `whoami` therefore resolved to MSYS2's `C:\Program Files\Git\usr\bin\whoami.exe`, which links `msys-2.0.dll`. Inside a Win32 AppContainer, `msys-2.0.dll` fails during `DllMain(DLL_PROCESS_ATTACH)` Cygwin shared-heap initialization (`0xC0000142`), whereas `C:\Windows\System32\whoami.exe` is a native Win32 binary that exits `0`.
+- **Do:** Add `augment_windows_path_for_isolation` and `resolve_windows_executable_for_isolation` in `crates/core/src/capabilities.rs` and call them from `TaskRunner::execute_process_supervised_with_workspace` (`crates/worker/src/runner.rs`) when `self.config.isolation != IsolationLevel::Off`, so native directories (`%SystemRoot%\System32`, `Git\cmd`, `Git\bin`) are searched before MSYS2 `usr\bin` directories (`Git\usr\bin`, `msys64\usr\bin`).
+- **Done when:** `test_windows_executable_resolution_for_isolation_prefers_system32_over_msys_usr_bin` in `crates/core/src/capabilities.rs` and `test_bare_whoami_succeeds_under_isolation_fs` in `crates/worker/tests/test_feat3_os_isolation.rs` pass, and a live `oxideswarm submit -- whoami` against a Windows worker running with `--isolation fs` exits `0`.
+
+### USB-2: Opt-in Windows isolation in the USB kit
+
+- **Evidence:** Reproduced on 2026-11-10 ([design 0055](design/0055-usb-kit-windows-isolation.md)).
+- **Problem:**
+  1. `windows::acl_grant_manifest_path` in `crates/worker/src/isolation.rs` checked only `RUSTY_GRID_ACL_GRANT_LOG` and then `<user_home>/.oxideswarm/windows_acl_grants.txt`, ignoring `OXIDESWARM_HOME`. Starting a USB-kit worker with `--isolation fs` on Windows therefore wrote `windows_acl_grants.txt` into the machine owner's `%USERPROFILE%\.oxideswarm`.
+  2. `packaging/usb/install.ps1` had no `-Isolation` flag, `packaging/usb/make_kit.sh` could not bake an isolation mode into the kit, `packaging/usb/uninstall.ps1` deleted `$InstallRoot` without revoking `oxideswarm.toolchain` ACL grants on `%RUSTUP_HOME%` and `%CARGO_HOME%`, and neither `install.ps1` nor `uninstall.ps1` had `[CmdletBinding()]` to reject unknown parameters.
+- **Do:**
+  1. Update `windows::acl_grant_manifest_path` (and `windows/revoke-isolation-acls.ps1`) to use precedence `RUSTY_GRID_ACL_GRANT_LOG > <OXIDESWARM_HOME>/windows_acl_grants.txt > ~/.oxideswarm/windows_acl_grants.txt`, with unit test `test_acl_grant_manifest_path_precedence_honours_oxideswarm_home`.
+  2. Add `[CmdletBinding()]` to `packaging/usb/install.ps1` and `packaging/usb/uninstall.ps1`; add `-Isolation off|fs` (default `off`) to `install.ps1`, `--isolation off|fs` (default `fs`) to `install.sh`, and `--isolation off|fs` to `make_kit.sh` (writing `$KIT/isolation` and copying `windows/revoke-isolation-acls.ps1` into `$KIT/revoke-isolation-acls.ps1`).
+  3. Update `packaging/usb/uninstall.ps1` to stop the worker and run `revoke-isolation-acls.ps1` against `$InstallRoot\home\windows_acl_grants.txt` before deleting `$InstallRoot`.
+- **Done when:** `tests/test_launcher_scripts.py` passes, and a live Windows install with `-Isolation fs` runs the trial-guide checks, revokes all `oxideswarm.toolchain` ACEs on `uninstall.ps1`, and leaves `%USERPROFILE%\.oxideswarm` untouched.
+
+### USB-3: Keep the Windows USB install folder apart from the default workspace root
+
+- **Evidence:** Found by reading on 2026-11-10 during the review of pull request 204. On Windows the
+  USB kit installs into `%LOCALAPPDATA%\OxideSwarm` (`packaging/usb/install.ps1` and
+  `uninstall.ps1`, parameter `-InstallRoot`), and `worker::workspace::default_root_with`
+  (`crates/worker/src/workspace.rs`) puts the default workspace root at
+  `%LOCALAPPDATA%\oxideswarm\workspaces`. NTFS compares names without case, so both are the same
+  folder.
+- **Problem:** `uninstall.ps1` removes `$InstallRoot` recursively. On a user account that also runs
+  a worker from a normal install with `--workspaces` and the default root, removing the USB kit
+  deletes that worker's workspaces. The reverse also holds: the other worker's workspace store sits
+  inside the kit's private install folder and its lock and state files can make the kit's checks
+  refuse the folder or the uninstall fail half way.
+- **Do:**
+  1. Give the kit an install folder name that no other component uses (for example
+     `%LOCALAPPDATA%\OxideSwarm-USB`), and keep reading the old name for upgrades and uninstall.
+  2. Make the kit always pass `--workspace-root <install folder>\workspaces`, also for the default
+     folder, so the kit never shares the default root.
+  3. Make `uninstall.ps1` refuse to delete a folder that holds a `workspaces` directory the kit did
+     not create, and say which worker uses it.
+- **Done when:** a test in `tests/test_launcher_scripts.py` shows that the kit's install folder and
+  workspace root never equal `default_root_with(Platform::Windows, ..)` for any case spelling, and a
+  live Windows run with a normal worker using the default root plus the USB kit installed and then
+  uninstalled leaves the normal worker's workspaces intact.
+
+### USB-4: Size the kit's task slots to the machine's fast cores
+
+- **Evidence:** Measured on 2026-11-10 (see SCHED-4): the kit gives a worker half of the logical
+  processors as task slots (`packaging/usb/install.ps1`, `[Environment]::ProcessorCount / 2`, and
+  the same rule in `install.sh`). On an Intel Core i7-1355U laptop that is 6 slots, and 6 concurrent
+  CPU tasks took 39.6 s each against 2.9 s for 2.
+- **Problem:** Laptop processors with few performance cores, a low power limit and the owner's own
+  programs running slow down far more than linearly when every slot is busy, so the kit's default
+  makes a borrowed laptop both slow for the cluster and sluggish for its owner.
+- **Do:**
+  1. On Windows, count the performance cores (`GetSystemCpuSetInformation`, highest
+     `EfficiencyClass`) and on macOS the performance level (`sysctl hw.perflevel0.logicalcpu`); use
+     their logical processors, at most half of all, as the default slots. Fall back to a quarter of
+     the logical processors when the count is unavailable and the machine has a battery.
+  2. Let `-Slots N` / `--slots N` override it, keep it on `-Update`, and print the chosen value.
+- **Done when:** `tests/test_launcher_scripts.py` covers the rule with fake processor data, and on
+  the i7-1355U laptop the kit picks 4 slots or fewer.
 
 ## Phase 9: an open compute network
 
@@ -2119,3 +2259,31 @@ Add one dated line per finished item, newest last.
   `status`, `result`, `cancel`, `workers`, `workspaces`, `mapreduce`, `doctor`, `join`, `secret`,
   `mcp`) to `stderr` so `iroh` `INFO` lines never land on `stdout` ahead of `--json` output. The
   Index counts are now 68 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: Added and implemented USB-2 and BUG-18 ([design 0055](design/0055-usb-kit-windows-isolation.md), open):
+  `windows::acl_grant_manifest_path` and `windows/revoke-isolation-acls.ps1` now honour
+  `OXIDESWARM_HOME` (`RUSTY_GRID_ACL_GRANT_LOG > <OXIDESWARM_HOME>/windows_acl_grants.txt > ~/.oxideswarm/windows_acl_grants.txt`);
+  `packaging/usb/make_kit.sh` accepts `--isolation off|fs` and ships `revoke-isolation-acls.ps1`;
+  `packaging/usb/install.ps1` and `uninstall.ps1` declare `[CmdletBinding()]` and support
+  `-Isolation off|fs` (default `off`) with ACL revocation in `uninstall.ps1` before removing
+  `$InstallRoot`; and under `--isolation fs|fs+net` on Windows `TaskRunner` resolves bare commands
+  against `%SystemRoot%\System32` before `Git\usr\bin` so `whoami` exits `0`. The Index counts are
+  now 70 Implemented, 4 Partial and 36 Planned.
+- 2026-11-10: USB-2 and BUG-18 merged in pull request 204 (`4a07fcb`). A live run on Windows 11
+  as a normal user with a binary built from `4a07fcb` passed the Done when of USB-2: install with
+  `-Isolation fs`, the trial guide's `cmd /c ver`, the PowerShell sum and bare `whoami` exit `0`,
+  reading and listing `Documents` is denied, and `uninstall.ps1 -Yes` restores the sandbox base
+  SDDL and leaves no `oxideswarm.toolchain` ACE. Release 0.1.1 lacks BUG-18, and `install.ps1`
+  keeps `--workspaces` off under isolation for 0.1.0 and 0.1.1, so a kit needs 0.1.2 or later to
+  use both. Added USB-3 (Planned). The Index counts are now 70 Implemented, 4 Partial and 37 Planned.
+- 2026-11-10: Added SCHED-4 ([design 0060](design/0060-speed-aware-placement.md)) and USB-4 (both
+  Planned) from a two-machine trial: a 32-task batch took 52 s because 6 tasks landed on a slow
+  laptop, while the desktop alone would have taken about 12 s. The Index counts are now
+  70 Implemented, 4 Partial and 39 Planned.
+- 2026-11-11: Added MAINT-1 (Planned): the six largest source files hold 6,184 to 8,639 lines each,
+  about 40 % of it tests, and `cli_app.rs` changed 101 times in a month. The Index counts are now
+  70 Implemented, 4 Partial and 40 Planned.
+- 2026-11-14: Completed design 0039 W11 under FEAT-4 (pull request 186): symbolic links and empty
+  directories in `TreeManifest` (`oxideswarm-tree/2`, `ProtocolCapabilities::TREE_V2`), with
+  case- and Unicode-folded `FoldedSymlinkTrie` / `FoldedPathTrie` validation, manifest complexity
+  budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
+  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 4 Partial and 40 Planned.

@@ -297,11 +297,25 @@ pub enum TaskRunnerError {
 }
 
 #[cfg(windows)]
-use rusty_grid_core::capabilities::resolve_windows_executable;
+use rusty_grid_core::capabilities::{
+    resolve_windows_executable, resolve_windows_executable_for_isolation,
+};
 
 #[cfg(windows)]
 fn augment_windows_path(existing_path: &str) -> String {
     let augmented = rusty_grid_core::capabilities::augment_windows_path(existing_path);
+    prepend_msvc_bin_if_present(augmented)
+}
+
+#[cfg(windows)]
+fn augment_windows_path_for_isolation(existing_path: &str) -> String {
+    let augmented =
+        rusty_grid_core::capabilities::augment_windows_path_for_isolation(existing_path);
+    prepend_msvc_bin_if_present(augmented)
+}
+
+#[cfg(windows)]
+fn prepend_msvc_bin_if_present(augmented: String) -> String {
     if let Some((msvc_bin, _)) = crate::isolation::windows::resolve_windows_msvc_env() {
         let msvc_str = msvc_bin.to_string_lossy();
         let lower_existing = augmented.to_ascii_lowercase();
@@ -849,13 +863,28 @@ fn spawn_simulated_gpu_job(
     })
 }
 
+struct BlobCacheSlot {
+    cache: std::sync::RwLock<Option<Arc<BlobCache>>>,
+    init_lock: std::sync::Mutex<()>,
+}
+
+impl BlobCacheSlot {
+    fn new() -> Self {
+        Self {
+            cache: std::sync::RwLock::new(None),
+            init_lock: std::sync::Mutex::new(()),
+        }
+    }
+}
+
 /// Core computational workload execution engine for Worker nodes.
 pub struct TaskRunner {
     worker_id: Uuid,
     capabilities: WorkerCapabilities,
     config: RunnerConfig,
-    /// The blob cache, opened on first use (see [`TaskRunner::blob_cache`]).
-    blob_cache: std::sync::OnceLock<Result<Arc<BlobCache>, String>>,
+    /// The blob cache, opened lazily and retried on subsequent tasks if an earlier open failed
+    /// (see [`TaskRunner::ensure_blob_cache`] and [`TaskRunner::blob_cache`]).
+    blob_cache: Arc<BlobCacheSlot>,
     /// Persistent named workspace store, opened at worker start-up or on first workspace task
     /// when `config.workspaces` is true.
     workspace_store: std::sync::RwLock<Option<WorkspaceStore>>,
@@ -872,7 +901,7 @@ impl TaskRunner {
             worker_id,
             capabilities,
             config,
-            blob_cache: std::sync::OnceLock::new(),
+            blob_cache: Arc::new(BlobCacheSlot::new()),
             workspace_store: std::sync::RwLock::new(initial_store),
             #[cfg(feature = "gpu-wgpu")]
             gpu_engine: crate::wgpu_engine::EngineProvider::shared(),
@@ -902,26 +931,68 @@ impl TaskRunner {
         &self.config
     }
 
-    /// The worker's blob cache in `<sandbox base>/cache/blobs`, opened on first use.
-    pub fn blob_cache(&self) -> Result<Arc<BlobCache>, String> {
+    fn open_blob_cache_blocking(
+        slot: &BlobCacheSlot,
+        sandbox_config: &SandboxConfig,
+        max_bytes: u64,
+    ) -> Result<Arc<BlobCache>, String> {
+        if let Some(cache) = slot.cache.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(cache);
+        }
+        let _guard = slot.init_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = slot.cache.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(cache);
+        }
+        sandbox_config
+            .ensure_private_root_recheck_blocking()
+            .map_err(|e| e.to_string())?;
+        let dir = sandbox_config.base_dir.join("cache").join("blobs");
+        let opened = BlobCache::open(&dir, max_bytes)
+            .map_err(|e| format!("cannot open the blob cache in '{}': {e}", dir.display()))?;
+        *slot.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Returns the blob cache if it has already been opened, without touching disk.
+    pub fn blob_cache_if_open(&self) -> Option<Arc<BlobCache>> {
         self.blob_cache
-            .get_or_init(|| {
-                let dir = self
-                    .config
-                    .sandbox_config
-                    .base_dir
-                    .join("cache")
-                    .join("blobs");
-                BlobCache::open(&dir, self.config.blob_cache_bytes)
-                    .map_err(|e| format!("cannot open the blob cache in '{}': {e}", dir.display()))
-            })
+            .cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The worker's blob cache in `<sandbox base>/cache/blobs`, opened on first use (and retried
+    /// on subsequent calls if an earlier open failed).
+    pub fn blob_cache(&self) -> Result<Arc<BlobCache>, String> {
+        Self::open_blob_cache_blocking(
+            &self.blob_cache,
+            &self.config.sandbox_config,
+            self.config.blob_cache_bytes,
+        )
+    }
+
+    /// Async counterpart to [`TaskRunner::blob_cache`]: returns the already-open cache immediately
+    /// or runs the cold/retry open inside `spawn_blocking` so Win32/filesystem checks never block
+    /// an async worker thread.
+    pub async fn ensure_blob_cache(&self) -> Result<Arc<BlobCache>, String> {
+        if let Some(cache) = self.blob_cache_if_open() {
+            return Ok(cache);
+        }
+        let slot = Arc::clone(&self.blob_cache);
+        let sandbox_config = self.config.sandbox_config.clone();
+        let max_bytes = self.config.blob_cache_bytes;
+        tokio::task::spawn_blocking(move || {
+            Self::open_blob_cache_blocking(&slot, &sandbox_config, max_bytes)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// Releases any output blobs pinned in the cache for `task_id`, without opening the cache if
     /// it was never used.
     pub fn release_task_outputs(&self, task_id: TaskId) {
-        if let Some(Ok(cache)) = self.blob_cache.get() {
+        if let Some(cache) = self.blob_cache_if_open() {
             cache.release_task_outputs(task_id);
         }
     }
@@ -1793,7 +1864,7 @@ impl TaskRunner {
         if task.inputs.is_empty() {
             return Ok(());
         }
-        let cache = self.blob_cache()?;
+        let cache = self.ensure_blob_cache().await?;
         let root = sandbox.path().to_path_buf();
         let inputs = task.inputs.clone();
         let placed =
@@ -1835,7 +1906,7 @@ impl TaskRunner {
         if patterns.is_empty() || result.exit_code == EXIT_CODE_CANCELLED {
             return result;
         }
-        let collected = match self.blob_cache() {
+        let collected = match self.ensure_blob_cache().await {
             Ok(cache) => {
                 let root = root_dir.to_path_buf();
                 let limits = self.config.output_limits;
@@ -1916,7 +1987,7 @@ impl TaskRunner {
         };
 
         let cache = if ws.source.is_some() {
-            match self.blob_cache() {
+            match self.ensure_blob_cache().await {
                 Ok(c) => Some(c),
                 Err(e) => return fail(e),
             }
@@ -3384,7 +3455,11 @@ impl TaskRunner {
             Some(p) => {
                 #[cfg(windows)]
                 {
-                    augment_windows_path(p)
+                    if self.config.isolation != IsolationLevel::Off {
+                        augment_windows_path_for_isolation(p)
+                    } else {
+                        augment_windows_path(p)
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -3395,7 +3470,11 @@ impl TaskRunner {
                 let base = std::env::var("PATH").unwrap_or_default();
                 #[cfg(windows)]
                 {
-                    augment_windows_path(&base)
+                    if self.config.isolation != IsolationLevel::Off {
+                        augment_windows_path_for_isolation(&base)
+                    } else {
+                        augment_windows_path(&base)
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -3426,7 +3505,11 @@ impl TaskRunner {
         };
 
         #[cfg(windows)]
-        let resolved_program = resolve_windows_executable(program, &effective_path);
+        let resolved_program = if self.config.isolation != IsolationLevel::Off {
+            resolve_windows_executable_for_isolation(program, &effective_path)
+        } else {
+            resolve_windows_executable(program, &effective_path)
+        };
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
 
@@ -6273,5 +6356,31 @@ echo "KEPT=$(cat target/artifact.txt)"
             res.error.as_deref(),
             Some("Cancelled: WorkerClient dropped")
         );
+    }
+
+    #[tokio::test]
+    async fn test_runner_blob_cache_retries_after_initial_base_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_path = tmp.path().join("sandboxes");
+        std::fs::write(&base_path, b"blocking file").expect("write file");
+
+        let runner = TaskRunner::new(
+            Uuid::new_v4(),
+            WorkerCapabilities::default(),
+            RunnerConfig::new(SandboxConfig::new(&base_path)),
+        );
+        assert!(
+            runner.ensure_blob_cache().await.is_err(),
+            "blob cache open must fail while base_dir is a regular file"
+        );
+        assert!(runner.blob_cache_if_open().is_none());
+
+        std::fs::remove_file(&base_path).expect("remove blocking file");
+        let cache = runner
+            .ensure_blob_cache()
+            .await
+            .expect("blob cache open must retry and succeed once base_dir is fixed");
+        assert!(runner.blob_cache_if_open().is_some());
+        let _ = cache;
     }
 }

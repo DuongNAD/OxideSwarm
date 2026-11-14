@@ -579,6 +579,8 @@ exit 0
 
 KIT_TARGETS = ("aarch64-apple-darwin.tar.gz", "x86_64-apple-darwin.tar.gz",
                "x86_64-pc-windows-msvc.zip", "x86_64-unknown-linux-gnu.tar.gz")
+# The release also carries a gpu-wgpu build of each target, named <target>-gpu.<ext>.
+KIT_GPU_TARGETS = tuple(t.replace(".tar.gz", "-gpu.tar.gz").replace(".zip", "-gpu.zip") for t in KIT_TARGETS)
 KIT_TOKEN = "oxs1-join:" + "QUJD" * 10 + "." + "0" * 32
 
 
@@ -597,15 +599,18 @@ class UsbKitTests(unittest.TestCase):
         self.archives = os.path.join(self.tmp, "archives")
         os.makedirs(self.archives)
         sums = []
-        for target in KIT_TARGETS:
+        for target in KIT_TARGETS + KIT_GPU_TARGETS:
             name = "oxideswarm-9.9.9-" + target
             path = os.path.join(self.archives, name)
             if target.endswith(".tar.gz"):
                 stage = os.path.join(self.tmp, "stage", name[:-len(".tar.gz")])
                 os.makedirs(stage)
                 exe = os.path.join(stage, "oxideswarm")
+                binary = FAKE_KIT_BINARY
+                if "-gpu." in target:
+                    binary = binary.replace('echo "rusty-grid 9.9.9"', 'echo "rusty-grid 9.9.9 gpu-build"')
                 with open(exe, "w") as f:
-                    f.write(FAKE_KIT_BINARY)
+                    f.write(binary)
                 os.chmod(exe, 0o755)
                 subprocess.run(["tar", "-czf", path, "-C", os.path.dirname(stage), os.path.basename(stage)], check=True)
             else:
@@ -643,6 +648,7 @@ class UsbKitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         kit = os.path.join(self.stick, "OxideSwarm")
         for name in ("install.sh", "install.ps1", "Install OxideSwarm.cmd", "Install OxideSwarm.command",
+                     "Update OxideSwarm.cmd", "Update OxideSwarm.command",
                      "README.txt", "archives/SHA256SUMS"):
             self.assertTrue(os.path.isfile(os.path.join(kit, name)), name)
         token_path = os.path.join(kit, "join.token")
@@ -748,6 +754,382 @@ class UsbKitTests(unittest.TestCase):
         worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
         self.assertTrue(worker_calls and "--max-concurrency " in worker_calls[0], worker_calls)
 
+    def install_with_cpu(self, cpu_info, *args, root_name="install-root"):
+        root = os.path.join(self.tmp, root_name)
+        env = self.env()
+        env["OXIDESWARM_USB_CPU_INFO"] = cpu_info
+        res = subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-slots"] + list(args),
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        open(self.args_log, "w").close()
+        return root, res, worker_calls
+
+    def test_install_sizes_the_slots_to_the_performance_cores(self):
+        # USB-4: on 2026-11-10 an i7-1355U laptop (2 performance cores, 4 of its 12 threads)
+        # with half its threads as slots ran 6 concurrent tasks at 39.6 s each against 2.9 s
+        # for 2. The default now follows the performance cores, at most half of all threads.
+        self.assertEqual(self.make_kit().returncode, 0)
+        cases = [
+            ("total=12 perf=4 battery=1", "4", "performance cores"),   # i7-1355U laptop
+            ("total=20 perf=12 battery=0", "10", "performance cores"),  # i5-14600KF: capped at half
+            ("total=8 perf=8 battery=0", "4", "performance cores"),    # one core type: half, as before
+            ("total=12 perf=- battery=1", "3", "a quarter"),           # unknown core types, battery
+            ("total=8 perf=- battery=0", "4", "half of 8"),            # unknown core types, no battery
+            ("total=1 perf=- battery=1", "1", "a quarter"),
+        ]
+        for i, (cpu, slots, why) in enumerate(cases):
+            root, res, calls = self.install_with_cpu(cpu, root_name="root-%d" % i)
+            self.assertEqual(res.returncode, 0, res.stdout)
+            self.assertIn("slots:   %s (%s" % (slots, why), res.stdout)
+            self.assertTrue(calls and "--max-concurrency %s " % slots in calls[0] + " ", (cpu, calls))
+            self.assertIn("slots=\n", read(os.path.join(root, "kit-install.conf")))
+
+    def test_slots_flag_overrides_and_survives_an_update(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, res, calls = self.install_with_cpu("total=12 perf=4 battery=1", "--slots", "2")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("slots:   2 (set with --slots", res.stdout)
+        self.assertTrue(calls and "--max-concurrency 2 " in calls[0] + " ", calls)
+        self.assertIn("slots=2\n", read(os.path.join(root, "kit-install.conf")))
+        # The update keeps a value chosen with --slots, even where the rule would pick another.
+        env = self.env()
+        env["OXIDESWARM_USB_CPU_INFO"] = "total=20 perf=12 battery=0"
+        res = subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                              "--update"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--max-concurrency 2 " in worker_calls[0] + " ", worker_calls)
+        for bad in ("0", "257", "abc"):
+            _, res, _ = self.install_with_cpu("total=8 perf=- battery=0", "--slots", bad, root_name="bad-" + bad)
+            self.assertNotEqual(res.returncode, 0, res.stdout)
+            self.assertIn("--slots needs a number from 1 to 256", res.stdout)
+
+    def test_windows_installer_sizes_the_slots_to_the_performance_cores(self):
+        # The same rule in install.ps1 (USB-4); the live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("GetSystemCpuSetInformation", text)
+        self.assertIn("ReadByte(buffer, offset + 18)", text)  # SYSTEM_CPU_SET_INFORMATION EfficiencyClass
+        self.assertIn("OXIDESWARM_USB_CPU_INFO", text)
+        self.assertIn("[int]$Slots = 0", text)
+        self.assertIn("-Slots needs a number from 1 to 256", text)
+        self.assertIn("$slots = [Math]::Min([int]$cpu.perf, $half)", text)
+        self.assertIn("[Math]::Floor($cpuTotal / 4)", text)
+        self.assertIn('"slots=$recordedSlots"', text)
+        self.assertIn("$settings['slots']", text)
+        self.assertNotIn("[Environment]::ProcessorCount / 2", text)
+
+    def test_windows_installers_compare_full_paths_of_localappdata(self):
+        # Windows PowerShell 5.1's GetFullPath expands 8.3 short names (a CI runner's
+        # C:\\Users\\RUNNER~1), so %LOCALAPPDATA% must go through it before any comparison with an
+        # install folder that did; otherwise a folder in %LOCALAPPDATA% looked like one outside it.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("$LocalAppDataFull = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\\')", text)
+        self.assertIn("$InstallRoot.StartsWith($LocalAppDataFull + '\\'", text)
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("[IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm'))", uninstall)
+
+    def install(self, *args):
+        root = os.path.join(self.tmp, "install-root")
+        return root, subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                                     "--no-autostart", "--name", "kit-gpu"] + list(args),
+                                    env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, timeout=90)
+
+    def test_make_kit_adds_the_gpu_builds_only_with_gpu(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        names = os.listdir(os.path.join(self.stick, "OxideSwarm", "archives"))
+        self.assertEqual([n for n in names if "-gpu." in n], [])
+        res = self.make_kit(extra=["--replace", "--gpu"])
+        self.assertEqual(res.returncode, 0, res.stdout)
+        names = os.listdir(os.path.join(self.stick, "OxideSwarm", "archives"))
+        for target in KIT_TARGETS + KIT_GPU_TARGETS:
+            self.assertIn("oxideswarm-9.9.9-" + target, names)
+
+    def test_install_takes_the_gpu_build_with_gpu(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("gpu:     yes", res.stdout)
+        self.assertIn("-gpu.tar.gz (checksum OK)", res.stdout)
+        self.assertIn("gpu-build", res.stdout)
+
+    def test_install_without_a_terminal_keeps_the_cpu_build(self):
+        # Nobody can be asked, so the GPU is not offered unless --gpu says so.
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("gpu:     no", res.stdout)
+        self.assertNotIn("gpu-build", res.stdout)
+
+    def install_on_a_terminal(self, answer):
+        # The question needs a terminal on standard input; a pseudo-terminal stands in for one.
+        import pty
+        root = os.path.join(self.tmp, "install-root")
+        argv = ["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                "--no-autostart", "--name", "kit-tty"]
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve("/bin/bash", argv, self.env())
+        out, sent, deadline = b"", False, time.time() + 90
+        while time.time() < deadline:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if not sent and b"[Y/n]" in out:
+                os.write(fd, answer)
+                sent = True
+        os.close(fd)
+        _, status = os.waitpid(pid, 0)
+        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1, out.decode("utf-8", "replace")
+
+    def test_install_asks_about_the_gpu_on_a_terminal(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        code, out = self.install_on_a_terminal(b"n\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[Y/n]", out)
+        self.assertIn("gpu:     no", out)
+        self.assertNotIn("gpu-build", out)
+        subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "uninstall.sh"), "--install-root",
+                        os.path.join(self.tmp, "install-root"), "--yes"], env=self.env(),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        code, out = self.install_on_a_terminal(b"\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("gpu:     yes", out)
+        self.assertIn("gpu-build", out)
+
+    def test_install_gpu_needs_a_gpu_build_on_the_kit(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no GPU build", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
+        root, res = self.install("--gpu", "--no-gpu")
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_windows_installer_offers_the_gpu_build(self):
+        # Static text: the live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn('-Filter "oxideswarm-*-$Target-gpu.zip"', text)
+        self.assertIn("[Console]::IsInputRedirected", text)
+        self.assertIn("$Archive = $GpuArchive", text)
+        choice = text.index("$Archive = $GpuArchive")
+        check = text.index("Get-FileHash $Archive.FullName")
+        self.assertTrue(choice < check, "the GPU choice must come before the checksum check")
+
+    def update(self, *args):
+        root = os.path.join(self.tmp, "install-root")
+        return subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                               "--update"] + list(args),
+                              env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=90)
+
+    def test_update_keeps_the_name_the_build_and_the_membership(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        old_pid = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        open(self.args_log, "w").close()
+        res = self.update()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("(update)", res.stdout)
+        self.assertIn("Updated. Worker 'kit-gpu'", res.stdout)
+        self.assertIn("-gpu.tar.gz (checksum OK)", res.stdout)
+        self.assertIn("gpu-build", res.stdout)
+        self.assertNotIn("[Y/n]", res.stdout)
+        calls = [c for c in read(self.args_log).splitlines() if c.strip()]
+        self.assertFalse(any(c.startswith("join") for c in calls), calls)
+        self.assertFalse(any(c.startswith("doctor") for c in calls), calls)
+        worker_calls = [c for c in calls if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--name kit-gpu" in worker_calls[0], calls)
+        new_pid = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        self.assertNotEqual(old_pid, new_pid)
+        self.assertTrue(wait_until(lambda: not pid_alive(old_pid), timeout=10), "the old worker kept running")
+        self.assertTrue(pid_alive(new_pid))
+        self.assertIn("gpu=1", read(os.path.join(root, "kit-install.conf")))
+
+    def test_update_of_an_older_install_takes_the_name_from_its_worker_id_file(self):
+        # Installs made before the update mode have no kit-install.conf: the name comes from the
+        # worker's id file, and without a terminal the plain build is kept.
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        os.remove(os.path.join(root, "kit-install.conf"))
+        with open(os.path.join(root, "home", "worker_id.kit-legacy"), "w") as f:
+            f.write("00000000-0000-0000-0000-000000000000\n")
+        open(self.args_log, "w").close()
+        res = self.update()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--name kit-legacy" in worker_calls[0], worker_calls)
+        self.assertNotIn("gpu-build", res.stdout)
+
+    def test_update_needs_an_install(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        res = self.update()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("run the installer first", res.stdout)
+        self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
+
+    def test_update_of_a_gpu_install_refuses_a_kit_without_the_gpu_build(self):
+        self.assertEqual(self.make_kit(extra=["--gpu"]).returncode, 0)
+        root, res = self.install("--gpu")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(self.make_kit(extra=["--replace"]).returncode, 0)
+        res = self.update()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("lacks", res.stdout)
+        self.assertEqual(self.update("--no-gpu").returncode, 0)
+
+    def install_as(self, machine, name, root_name="install-root"):
+        root = os.path.join(self.tmp, root_name)
+        env = dict(self.env(), OXIDESWARM_USB_MACHINE_ID=machine)
+        res = subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", name],
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        return root, read(os.path.join(root, "home", "worker_id." + name)).strip()
+
+    def uninstall_root(self, root):
+        res = subprocess.run(["bash", os.path.join(self.stick, "OxideSwarm", "uninstall.sh"), "--install-root", root, "--yes"],
+                             env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout)
+
+    def test_a_reinstall_keeps_the_worker_id_of_the_machine(self):
+        # A reinstall must show up as the same worker, not as a new one beside a disconnected entry.
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, first = self.install_as("machine-a", "kit-id")
+        self.assertRegex(first, r"^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+        self.assertNotIn("machine-a", first)
+        self.uninstall_root(root)
+        root, again = self.install_as("machine-a", "kit-id")
+        self.assertEqual(first, again)
+        self.uninstall_root(root)
+        _, other_machine = self.install_as("machine-b", "kit-id", "root-b")
+        _, other_name = self.install_as("machine-a", "kit-id-2", "root-c")
+        self.assertEqual(len({first, other_machine, other_name}), 3)
+
+    def test_an_existing_worker_id_is_kept(self):
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, _ = self.install_as("machine-a", "kit-keep")
+        id_file = os.path.join(root, "home", "worker_id.kit-keep")
+        with open(id_file, "w") as f:
+            f.write("11111111-2222-4333-8444-555555555555\n")
+        self.assertEqual(self.update().returncode, 0)
+        self.assertEqual(read(id_file).strip(), "11111111-2222-4333-8444-555555555555")
+
+    def test_windows_installer_derives_the_worker_id_from_the_machine(self):
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("MachineGuid", "oxideswarm-usb-worker-id-v1", 'Join-Path $State "worker_id.$Name"',
+                       "($h[6] -band 0x0f) -bor 0x80", "($h[8] -band 0x3f) -bor 0x80"):
+            self.assertIn(needle, text)
+        self.assertLess(text.index("oxideswarm-usb-worker-id-v1"), text.index("Start-Process -FilePath 'wscript.exe'"))
+
+    def test_windows_installer_refuses_folders_another_account_controls(self):
+        # Review M1: the folder gets a DACL built here (protected, three trusted SIDs, owner = this
+        # user), a new one is created with it in one call, an existing one must belong to this user
+        # and hold nothing another account may change, the folders on the way to it must not be
+        # renamable by others, the result is verified, and an update runs the same checks.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertNotIn("icacls", text)
+        for needle in ("SetAccessRuleProtection($true, $false)", "$sec.SetOwner($UserSid)",
+                       "[IO.Directory]::CreateDirectory($InstallRoot, $sec)", "function Test-RootSafety",
+                       "belongs to another account", "can rename or change", "$RenameRights",
+                       "could not make $InstallRoot private",
+                       "files appeared in $InstallRoot before it could be made private"):
+            self.assertIn(needle, text)
+        # Run for an update as well: directly in the `if (-not $PrivateRoot)` block, not nested deeper.
+        check = text.index("\n    $why = Test-RootSafety $InstallRoot\n")
+        self.assertTrue(text.rindex("if (-not $PrivateRoot) {", 0, check) > text.rindex("\n}", 0, check))
+        self.assertLess(check, text.index("[IO.Directory]::CreateDirectory($InstallRoot, $sec)"))
+        self.assertIn("'^[A-Za-z0-9_.-]{1,64}$'", text)
+        # S6: an update keeps the isolation of the existing launcher when kit-install.txt lacks it.
+        self.assertIn("'--isolation (off|fs)\\b'", text)
+        # S5: the uninstaller deletes only a marked folder without links.
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        delete = uninstall.index("Remove-Item -Recurse -Force -LiteralPath $InstallRoot")
+        for needle in (".oxideswarm-usb-install", "contains links", "is a link; not touching it"):
+            self.assertLess(uninstall.index(needle), delete, needle)
+
+    def test_a_stale_pid_file_never_stops_another_process(self):
+        # Review S7: a PID file can outlive a reboot; its number may then name any process.
+        self.assertEqual(self.make_kit().returncode, 0)
+        root, res = self.install()
+        self.assertEqual(res.returncode, 0, res.stdout)
+        decoy = subprocess.Popen(["/bin/sleep", "300"])
+        self.addCleanup(decoy.kill)
+        worker = int(read(os.path.join(root, "run", "worker.pid")).strip())
+        self.addCleanup(lambda: pid_alive(worker) and os.kill(worker, signal.SIGKILL))
+        with open(os.path.join(root, "run", "worker.pid"), "w") as f:
+            f.write("%d\n" % decoy.pid)
+        self.assertEqual(self.update().returncode, 0)
+        self.assertIsNone(decoy.poll(), "the update stopped a process that is not this install's worker")
+        with open(os.path.join(root, "run", "worker.pid"), "w") as f:
+            f.write("%d\n" % decoy.pid)
+        self.uninstall_root(root)
+        self.assertIsNone(decoy.poll(), "the uninstaller stopped a process that is not this install's worker")
+
+    def test_launchers_offer_to_eject_the_stick(self):
+        # macOS: the prompt runs in a new shell after `cd /`, so the script read from the stick does
+        # not keep the volume busy (checked by hand with a mounted exFAT image).
+        for name in ("Install OxideSwarm.command", "Update OxideSwarm.command", "Uninstall OxideSwarm.command"):
+            text = read(os.path.join(ROOT, "packaging", "usb", name))
+            self.assertIn('diskutil eject "$1"', text, name)
+            self.assertLess(text.index("cd / ||"), text.index("exec /bin/bash -c"), name)
+        # Windows: cmd reads the batch file line by line from the stick, so everything after the
+        # question sits on one line that is parsed before the eject.
+        for name in ("Install OxideSwarm.cmd", "Update OxideSwarm.cmd", "Uninstall OxideSwarm.cmd"):
+            text = read(os.path.join(ROOT, "packaging", "usb", name))
+            lines = text.replace("\r\n", "\n").split("\n")
+            last = [l for l in lines if l.startswith("if errorlevel 2 (")]
+            self.assertEqual(len(last), 1, name)
+            for part in ("InvokeVerb('Eject')", "pause", "exit /b %status%"):
+                self.assertIn(part, last[0], name)
+            self.assertEqual([l for l in lines[lines.index(last[0]) + 1:] if l.strip()], [], name)
+            self.assertLess(text.index('cd /d "%SystemRoot%"'), text.index("choice /c YN"), name)
+
+    def test_windows_installer_updates_in_place(self):
+        # Static text: the live check runs on a Windows machine.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("[switch]$Update", "if (-not $Update) {", "kit-install.txt", "worker_id.*",
+                       "Updated. Worker", "if (-not $Update -and -not (Test-Path $TokenFile))"):
+            self.assertIn(needle, text)
+        join = text.index("& $Exe join --no-doctor")
+        self.assertIn("if (-not $Update) {", text[join - 200:join])
+        self.assertTrue(text.index('Write-Host "Updated. Worker') < text.index("& $Exe doctor"),
+                        "an update must end before the doctor check")
+        launcher = read(os.path.join(ROOT, "packaging", "usb", "Update OxideSwarm.cmd"))
+        self.assertIn("install.ps1\" -Update", launcher)
+
+    def test_windows_installer_keeps_another_drive_private(self):
+        # Static text: the live check runs on a Windows machine. An install outside %LOCALAPPDATA%
+        # must sit on a fixed NTFS or ReFS drive other than the kit's, be limited to this user,
+        # SYSTEM and Administrators before anything is written into it, and keep the task
+        # folders and the file cache inside it.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("[IO.DriveInfo]::GetDrives()", "@('NTFS', 'ReFS')", "$drive.DriveType -ne 'Fixed'",
+                       "it is on the drive this kit runs from", "not the root of a drive",
+                       "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User",
+                       "SetAccessRuleProtection($true, $false)", "$SandboxBase = if ($PrivateRoot)", "--workspace-root",
+                       "AssocClass=Win32_LogicalDiskToPartition", "$disk.InterfaceType -eq 'USB'",
+                       "'HKCU:\\Software\\OxideSwarm\\UsbKit'"):
+            self.assertIn(needle, text)
+        ask = text.index('Read-Host "Choose [1]"')
+        self.assertIn("-not [Console]::IsInputRedirected", text[text.index("$explicitRoot ="):ask])
+        lock = text.index("[IO.Directory]::CreateDirectory($InstallRoot, $sec)")
+        self.assertTrue(lock < text.index("foreach ($d in @($Bin, $State, $RunDir, $LogDir))"),
+                        "the folder must be limited before the installer writes into it")
+        uninstall = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("'HKCU:\\Software\\OxideSwarm\\UsbKit'", uninstall)
+        self.assertIn("$run.IndexOf($InstallRoot + '\\'", uninstall)
+
     def test_install_refuses_a_damaged_archive_before_installing_anything(self):
         self.assertEqual(self.make_kit().returncode, 0)
         kit = os.path.join(self.stick, "OxideSwarm")
@@ -763,8 +1145,524 @@ class UsbKitTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
         self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
 
+    def test_make_kit_and_install_support_isolation_option_and_reject_invalid_values(self):
+        bad_kit = self.make_kit(extra=["--isolation", "bogus"])
+        self.assertNotEqual(bad_kit.returncode, 0)
+        self.assertIn("--isolation must be off or fs", bad_kit.stdout)
+
+        ok_kit = self.make_kit(extra=["--no-autostart", "--isolation", "off"])
+        self.assertEqual(ok_kit.returncode, 0, ok_kit.stdout)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        self.assertTrue(os.path.isfile(os.path.join(kit, "revoke-isolation-acls.ps1")))
+        self.assertEqual(read(os.path.join(kit, "isolation")).strip(), "off")
+
+        # Baked kit isolation=off is honoured by install.sh when --isolation is not passed.
+        root1 = os.path.join(self.tmp, "install-baked-off")
+        res1 = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root1, "--name", "kit-iso-off"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res1.returncode, 0, res1.stdout)
+        self.assertIn("connected (isolation: off)", res1.stdout)
+        worker_calls = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls and "--isolation off" in worker_calls[-1], worker_calls)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root1, "--yes"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+
+        # CLI --isolation fs overrides baked kit isolation=off.
+        root2 = os.path.join(self.tmp, "install-cli-fs")
+        res2 = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root2, "--name", "kit-iso-fs", "--isolation", "fs"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res2.returncode, 0, res2.stdout)
+        self.assertIn("connected (isolation: fs)", res2.stdout)
+        worker_calls2 = [c for c in read(self.args_log).splitlines() if c.startswith("worker ")]
+        self.assertTrue(worker_calls2 and "--isolation fs" in worker_calls2[-1], worker_calls2)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root2, "--yes"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+
+        # Invalid --isolation value on install.sh fails immediately.
+        bad_inst = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root2, "--isolation", "invalid"],
+            env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+        self.assertNotEqual(bad_inst.returncode, 0)
+        self.assertIn("--isolation must be off or fs", bad_inst.stdout)
+
 
 class StaticRepositoryChecks(unittest.TestCase):
+    def test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation(self):
+        install_ps1 = os.path.join(ROOT, "packaging", "usb", "install.ps1")
+        uninstall_ps1 = os.path.join(ROOT, "packaging", "usb", "uninstall.ps1")
+        install_cmd = os.path.join(ROOT, "packaging", "usb", "Install OxideSwarm.cmd")
+        uninstall_cmd = os.path.join(ROOT, "packaging", "usb", "Uninstall OxideSwarm.cmd")
+        revoke_ps1 = os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1")
+
+        inst_text = read(install_ps1)
+        uninst_text = read(uninstall_ps1)
+        inst_cmd_text = read(install_cmd)
+        uninst_cmd_text = read(uninstall_cmd)
+        rev_text = read(revoke_ps1)
+
+        for cmd_text in (inst_cmd_text, uninst_cmd_text):
+            self.assertIn("set PSModulePath=", cmd_text)
+            self.assertLess(cmd_text.index("set PSModulePath="), cmd_text.index("powershell"))
+
+        self.assertIn("[CmdletBinding()]", inst_text)
+        self.assertIn("[ValidateSet('off', 'fs')]", inst_text)
+        self.assertIn("--isolation $Isolation", inst_text)
+        self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", inst_text)
+        self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", inst_text)
+        self.assertIn("FailAfterStart", inst_text)
+        self.assertIn("revert them", inst_text)
+        self.assertIn("connected (isolation: $Isolation)", inst_text)
+
+        self.assertIn("[CmdletBinding()]", uninst_text)
+        self.assertIn("windows_acl_grants.txt", uninst_text)
+        self.assertIn("revoke-isolation-acls.ps1", uninst_text)
+        self.assertIn("$global:LASTEXITCODE = 0", uninst_text)
+        self.assertIn("keeping $InstallRoot and $Manifest", uninst_text)
+        self.assertIn("oxideswarm-usb", uninst_text)
+        self.assertIn("ReparsePoint", uninst_text)
+        self.assertLess(
+            uninst_text.index("revoke-isolation-acls.ps1"),
+            uninst_text.index("Remove-Item -Recurse -Force -LiteralPath $InstallRoot"),
+            "uninstall.ps1 must revoke isolation ACLs before deleting $InstallRoot",
+        )
+        self.assertLess(
+            uninst_text.index("revoke-isolation-acls.ps1"),
+            uninst_text.index("$UsbTempRoot"),
+            "uninstall.ps1 must remove %TEMP%\\oxideswarm-usb only after ACL revocation succeeds",
+        )
+        self.assertIn("$env:OXIDESWARM_HOME", rev_text)
+        self.assertIn("while another worker is running", rev_text)
+        self.assertIn(r"\s+(worker)(\s|$)", rev_text)
+        self.assertIn("$cimQueryFailed", rev_text)
+        self.assertIn("System.IO.FileSystemAclExtensions", rev_text)
+        self.assertNotIn(".oxideswarm_worker_profile.lock", rev_text)
+        self.assertNotIn("[System.IO.Directory]::GetAccessControl", rev_text)
+        self.assertIn("-notin @('sandboxes', 'workspaces')", rev_text)
+        self.assertIn("$failures = 0", rev_text)
+        self.assertIn("icacls /remove exited with code", rev_text)
+        self.assertIn("exit 1", rev_text)
+        self.assertIn("exit 0", rev_text)
+        self.assertLess(
+            rev_text.index("foreach ($restore in $sddlRestores)"),
+            rev_text.index("foreach ($target in $targetPaths)"),
+            "revoke-isolation-acls.ps1 must restore SDDL before icacls /remove",
+        )
+        self.assertLess(
+            rev_text.index("if ($failures -gt 0)"),
+            rev_text.index("Remove-Item -LiteralPath $ManifestPath -Force"),
+            "revoke-isolation-acls.ps1 must refuse to remove the manifest when any failure occurred",
+        )
+
+        if os.name == "nt" and shutil.which("powershell"):
+            ps_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+            for script in (install_ps1, uninstall_ps1):
+                bad_param = subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-NoSuchParam"],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(bad_param.returncode, 0, bad_param.stdout)
+                self.assertIn("NoSuchParam", bad_param.stdout)
+
+            bad_iso = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1, "-Isolation", "bogus"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertNotEqual(bad_iso.returncode, 0, bad_iso.stdout)
+
+            tmp = tempfile.mkdtemp(prefix="ox_win_usb_test_")
+            tmp_home = os.path.join(tmp, "userprofile")
+            tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
+            tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
+            tmp_temp = os.path.join(tmp_localappdata, "Temp")
+            for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+                os.makedirs(d, exist_ok=True)
+            test_run_val = f"OxideSwarmUsbWorkerTest_{os.getpid()}"
+            ps_env = dict(
+                ps_env,
+                USERPROFILE=tmp_home,
+                HOME=tmp_home,
+                LOCALAPPDATA=tmp_localappdata,
+                APPDATA=tmp_appdata,
+                TEMP=tmp_temp,
+                TMP=tmp_temp,
+                OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            )
+            pids_log = os.path.join(tmp, "spawned_workers.pids")
+            ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
+            try:
+                # 1. Verify uninstall.ps1 is idempotent when no manifest file exists in $InstallRoot\home.
+                fake_install = os.path.join(tmp, "win-fake-install")
+                os.makedirs(os.path.join(fake_install, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_install, "home"), exist_ok=True)
+                with open(os.path.join(fake_install, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_install, ".oxideswarm-usb-install"), "w").close()
+                uninst_res = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_install, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_res.returncode, 0, uninst_res.stdout)
+                self.assertIn("No isolation ACL grant manifest", uninst_res.stdout)
+                self.assertFalse(os.path.exists(fake_install))
+
+                # 1b. R2-S1 Scenario B: manifest exists, but all recorded paths are already gone
+                # (so zero icacls invocations run). revoke-isolation-acls.ps1 must exit 0 and
+                # uninstall.ps1 must not fail with a null $LASTEXITCODE.
+                fake_no_icacls = os.path.join(tmp, "win-no-icacls")
+                os.makedirs(os.path.join(fake_no_icacls, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_no_icacls, "home"), exist_ok=True)
+                shutil.copyfile(revoke_ps1, os.path.join(fake_no_icacls, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(fake_no_icacls, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_no_icacls, ".oxideswarm-usb-install"), "w").close()
+                with open(os.path.join(fake_no_icacls, "home", "windows_acl_grants.txt"), "w", encoding="utf-8") as f:
+                    f.write(os.path.join(tmp, "already-deleted-sandbox-base") + "\n")
+                uninst_no_icacls = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_no_icacls, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_no_icacls.returncode, 0, uninst_no_icacls.stdout)
+                self.assertIn("Skipping missing path:", uninst_no_icacls.stdout)
+                self.assertFalse(os.path.exists(fake_no_icacls))
+
+                # 1c. R2-S1 Scenario A: an earlier icacls fails (exit 5), a later icacls succeeds (exit 0).
+                # revoke-isolation-acls.ps1 must exit 1 and keep the manifest; uninstall.ps1 must exit 1
+                # and keep both $InstallRoot and $Manifest.
+                fake_icacls_dir = os.path.join(tmp, "fake_icacls_bin")
+                os.makedirs(fake_icacls_dir, exist_ok=True)
+                fake_icacls_cs = os.path.join(tmp, "FakeIcacls.cs")
+                fake_icacls_exe = os.path.join(fake_icacls_dir, "icacls.exe")
+                with open(fake_icacls_cs, "w", encoding="utf-8") as f:
+                    f.write(
+                        "using System;\n"
+                        "public class Program {\n"
+                        "    public static int Main(string[] args) {\n"
+                        "        if (args.Length > 0 && args[0].Contains(\"fail_acl_dir\")) return 5;\n"
+                        "        return 0;\n"
+                        "    }\n"
+                        "}\n"
+                    )
+                comp_icacls = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        f"Add-Type -Path '{fake_icacls_cs}' -OutputAssembly '{fake_icacls_exe}' -OutputType ConsoleApplication",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(comp_icacls.returncode, 0, comp_icacls.stdout)
+                fake_partial = os.path.join(tmp, "win-partial-icacls")
+                fail_acl_dir = os.path.join(tmp, "fail_acl_dir")
+                ok_acl_dir = os.path.join(tmp, "ok_acl_dir")
+                for d in (os.path.join(fake_partial, "bin"), os.path.join(fake_partial, "home"), fail_acl_dir, ok_acl_dir):
+                    os.makedirs(d, exist_ok=True)
+                shutil.copyfile(revoke_ps1, os.path.join(fake_partial, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(fake_partial, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_partial, ".oxideswarm-usb-install"), "w").close()
+                partial_manifest = os.path.join(fake_partial, "home", "windows_acl_grants.txt")
+                with open(partial_manifest, "w", encoding="utf-8") as f:
+                    f.write(fail_acl_dir + "\n" + ok_acl_dir + "\n")
+                ps_env_fake_icacls = dict(ps_env, PATH=fake_icacls_dir + os.pathsep + ps_env.get("PATH", ""))
+                uninst_partial = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_partial, "-Yes",
+                    ],
+                    env=ps_env_fake_icacls, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(uninst_partial.returncode, 0, uninst_partial.stdout)
+                self.assertIn("icacls /remove exited with code 5", uninst_partial.stdout)
+                self.assertIn("keeping", uninst_partial.stdout)
+                self.assertTrue(os.path.isfile(partial_manifest), "manifest must be kept when an earlier icacls fails")
+                self.assertTrue(os.path.isdir(fake_partial), "install root must be kept when an earlier icacls fails")
+
+                # 2. Fake-binary end-to-end test of install.ps1 and uninstall.ps1 on Windows.
+                kit_dir = os.path.join(tmp, "kit")
+                os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+                for name in ("install.ps1", "uninstall.ps1"):
+                    shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+                shutil.copyfile(revoke_ps1, os.path.join(kit_dir, "revoke-isolation-acls.ps1"))
+                with open(os.path.join(kit_dir, "join.token"), "w", encoding="utf-8") as f:
+                    f.write(KIT_TOKEN + "\n")
+                with open(os.path.join(kit_dir, "no-autostart"), "w", encoding="utf-8") as f:
+                    f.write("trial\n")
+                with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                    f.write("fs\n")
+
+                fake_exe = os.path.join(tmp, "oxideswarm.exe")
+                cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string joined = string.Join(" ", args);
+        string home = Environment.GetEnvironmentVariable("OXIDESWARM_HOME") ?? "";
+        if (!string.IsNullOrEmpty(home) && Directory.Exists(home)) {
+            try { File.AppendAllText(Path.Combine(home, "args.log"), joined + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            Console.In.ReadToEnd();
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            if (joined.Contains("--isolation fs") && !string.IsNullOrEmpty(home)) {
+                string dummyTarget = Path.Combine(home, "dummy_toolchain_dir");
+                Directory.CreateDirectory(dummyTarget);
+                string grantLog = Environment.GetEnvironmentVariable("RUSTY_GRID_ACL_GRANT_LOG");
+                if (string.IsNullOrEmpty(grantLog)) {
+                    grantLog = Path.Combine(home, "windows_acl_grants.txt");
+                }
+                File.WriteAllText(grantLog, dummyTarget + Environment.NewLine);
+            }
+            Thread.Sleep(25000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            Console.WriteLine("[{\"name\":\"win-kit-test\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+                cs_file = os.path.join(tmp, "FakeOxide.cs")
+                with open(cs_file, "w", encoding="utf-8") as f:
+                    f.write(cs_code)
+                compile_res = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+                import zipfile
+                zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+                zip_path = os.path.join(kit_dir, "archives", zip_name)
+                with zipfile.ZipFile(zip_path, "w") as zf:
+                    zf.write(fake_exe, "oxideswarm.exe")
+                zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+                with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                    f.write(f"{zip_sha}  {zip_name}\n")
+
+                # 2a. Install using baked isolation=fs from kit\isolation, then uninstall (revoking manifest).
+                # Under %LOCALAPPDATA%, where a double-clicked install goes: a folder elsewhere on the
+                # kit's own drive is refused (a CI runner has only one drive).
+                inst_root_fs = os.path.join(tmp_localappdata, "installed-fs")
+                inst_fs = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "install.ps1"),
+                        "-InstallRoot", inst_root_fs, "-Name", "win-kit-test",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(inst_fs.returncode, 0, inst_fs.stdout)
+                self.assertIn("connected (isolation: fs)", inst_fs.stdout)
+                vbs_text = read(os.path.join(inst_root_fs, "start-worker.vbs"))
+                self.assertIn("--isolation fs", vbs_text)
+                self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", vbs_text)
+                self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", vbs_text)
+                manifest_fs = os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")
+                self.assertTrue(os.path.isfile(manifest_fs))
+
+                # Append a non-sandboxes SDDL entry to verify N1 skips SDDL restore on arbitrary directories.
+                non_sb_dir = os.path.join(tmp, "not_a_sandbox_root")
+                os.makedirs(non_sb_dir, exist_ok=True)
+                with open(manifest_fs, "a", encoding="utf-8") as mf:
+                    mf.write(f"SDDL|{non_sb_dir}|D:P(A;;FA;;;SY)\n")
+
+                usb_temp_root = os.path.join(tmp_temp, "oxideswarm-usb")
+                usb_temp_blob = os.path.join(usb_temp_root, "sandboxes", "blob_cache", "dummy.bin")
+                os.makedirs(os.path.dirname(usb_temp_blob), exist_ok=True)
+                with open(usb_temp_blob, "wb") as bf:
+                    bf.write(b"blob")
+
+                # Verify S2 + N5: when another task lock is held, uninstall.ps1 refuses to delete
+                # $InstallRoot or $Manifest and leaves the manifest intact.
+                import ctypes
+                lock_file = os.path.join(tmp_temp, "oxideswarm.task.active.lock")
+                kernel32 = ctypes.windll.kernel32
+                lock_handle = kernel32.CreateFileW(
+                    lock_file, 0x40000000, 0, None, 2, 0x80, None
+                )
+                try:
+                    uninst_busy = subprocess.run(
+                        [
+                            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                            "-InstallRoot", inst_root_fs, "-Yes",
+                        ],
+                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, timeout=60,
+                    )
+                    self.assertNotEqual(uninst_busy.returncode, 0, uninst_busy.stdout)
+                    self.assertIn("while another worker is running", uninst_busy.stdout)
+                    self.assertIn("keeping", uninst_busy.stdout)
+                    self.assertTrue(os.path.isfile(manifest_fs), "manifest must be preserved when revoke is blocked")
+                    self.assertTrue(os.path.isfile(usb_temp_blob), "%TEMP%\\oxideswarm-usb must not be removed before revoke succeeds")
+                finally:
+                    if lock_handle not in (-1, 0):
+                        kernel32.CloseHandle(lock_handle)
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+
+                uninst_fs = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                        "-InstallRoot", inst_root_fs, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(uninst_fs.returncode, 0, uninst_fs.stdout)
+                self.assertIn("Revoking isolation ACL grants recorded in", uninst_fs.stdout)
+                self.assertIn("Refusing SDDL restore on non-sandbox/workspace base path", uninst_fs.stdout)
+                self.assertFalse(os.path.exists(inst_root_fs))
+                self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed by uninstall.ps1")
+
+                # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
+                inst_root_off = os.path.join(tmp_localappdata, "installed-off")
+                inst_off = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "install.ps1"),
+                        "-InstallRoot", inst_root_off, "-Name", "win-kit-test", "-Isolation", "off",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(inst_off.returncode, 0, inst_off.stdout)
+                self.assertIn("connected (isolation: off)", inst_off.stdout)
+                vbs_off = read(os.path.join(inst_root_off, "start-worker.vbs"))
+                self.assertIn("--isolation off", vbs_off)
+                self.assertFalse(os.path.exists(os.path.join(inst_root_off, "home", "windows_acl_grants.txt")))
+
+                os.makedirs(os.path.dirname(usb_temp_blob), exist_ok=True)
+                with open(usb_temp_blob, "wb") as bf:
+                    bf.write(b"blob-off")
+
+                uninst_off = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                        "-InstallRoot", inst_root_off, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60,
+                )
+                self.assertEqual(uninst_off.returncode, 0, uninst_off.stdout)
+                self.assertIn("No isolation ACL grant manifest", uninst_off.stdout)
+                self.assertFalse(os.path.exists(inst_root_off))
+                self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed in off mode too")
+
+                # 2c. Verify uninstall.ps1 refuses to follow a reparse point at %TEMP%\oxideswarm-usb.
+                reparse_target = os.path.join(tmp, "reparse_canary_dir")
+                os.makedirs(reparse_target, exist_ok=True)
+                canary_file = os.path.join(reparse_target, "canary.txt")
+                with open(canary_file, "w", encoding="utf-8") as cf:
+                    cf.write("keep")
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", usb_temp_root, reparse_target],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=15, check=True,
+                )
+                fake_reparse_inst = os.path.join(tmp, "win-reparse-install")
+                os.makedirs(os.path.join(fake_reparse_inst, "bin"), exist_ok=True)
+                os.makedirs(os.path.join(fake_reparse_inst, "home"), exist_ok=True)
+                with open(os.path.join(fake_reparse_inst, "bin", "oxideswarm.exe"), "wb") as f:
+                    f.write(b"MZfake")
+                # A kit install carries the installer's marker; uninstall.ps1 deletes nothing without it.
+                open(os.path.join(fake_reparse_inst, ".oxideswarm-usb-install"), "w").close()
+                uninst_reparse = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", uninstall_ps1, "-InstallRoot", fake_reparse_inst, "-Yes",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertEqual(uninst_reparse.returncode, 0, uninst_reparse.stdout)
+                self.assertIn("Refusing to remove reparse point", uninst_reparse.stdout)
+                self.assertTrue(os.path.isfile(canary_file), "reparse target canary must not be deleted")
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", usb_temp_root],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=15,
+                )
+            finally:
+                for pid_candidate in (
+                    pids_log,
+                    os.path.join(tmp_localappdata, "installed-fs", "run", "worker.pid"),
+                    os.path.join(tmp_localappdata, "installed-off", "run", "worker.pid"),
+                ):
+                    if os.path.isfile(pid_candidate):
+                        try:
+                            for line in read(pid_candidate).splitlines():
+                                p_str = line.strip()
+                                if p_str.isdigit():
+                                    subprocess.run(
+                                        ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {p_str} -Force -ErrorAction SilentlyContinue"],
+                                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                    )
+                        except Exception:
+                            pass
+                subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-Command",
+                        f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                )
+                shutil.rmtree(tmp, ignore_errors=True)
+
     def test_gitattributes_pins_line_endings(self):
         path = os.path.join(ROOT, ".gitattributes")
         self.assertTrue(os.path.isfile(path), ".gitattributes is missing")
@@ -876,6 +1774,9 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertIn("NT SERVICE", ps1)
         self.assertRegex(ps1, r"obj=\s*\$serviceStartName")
         self.assertIn("AcceptSystemRisk", ps1)
+        self.assertIn("Set-PrivateDirAcl -Path $DataDir", ps1)
+        self.assertIn("/inheritance:r", ps1)
+        self.assertNotIn("Grant-ServiceModify -Path $DataDir", ps1)
         # the P2P ticket must not travel on the service command line or in the registry any more
         wrapper = read(os.path.join(ROOT, "packaging", "windows", "ServiceWrapper.cs"))
         self.assertNotIn("--p2p-ticket", wrapper)
