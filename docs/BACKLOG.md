@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `8596c5fd`: 71 items Implemented, 7 Partial and 44 Planned. Five items
+On 2026-11-14, at `master` `321fe9b` plus JOIN-2: 72 items Implemented, 7 Partial and 43 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -229,7 +229,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 |
-| JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
+| JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented | (design 0052), 221 (open) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), 185, 195, 207 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
@@ -2568,3 +2568,4 @@ Add one dated line per finished item, newest last.
   `681012d`: `crates/worker/src/client.rs` unit tests moved to `crates/worker/src/client/tests.rs`,
   8,252 to 4,363 lines); USB-1 lists merged pull requests 185, 195 and 207; and ENROLL-1b merged in
   pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
+- 2026-11-14: Implemented JOIN-2 ([design 0052](design/0052-short-code-pairing.md), pull request 221, open): BIP-0039 CC0-1.0 2048-word list (`crates/cli/src/wordlist.rs`), UDP port 8087 broadcast discovery, SPAKE2 over Ed25519 with joiner-first confirmation and single-guess burn rule, and HKDF/ChaCha20-Poly1305 invite and `PairPendingNotice` handoff (`crates/cli/src/pair.rs`), `invite --code`, `join --code [--pair-host]`, `tests/cli_pair_e2e.rs` green on Linux, macOS and Windows (CI run `43590921426`), and a live LAN run between macOS arm64 and Windows 11 x86_64 recorded in [guides/add-a-machine.md](guides/add-a-machine.md#recorded-two-machine-run) (UDP 8087 broadcast with `422-tool-humor`, matching pairing check `711 627`, member `269b134d8914e3de`, `submit --wait -- echo paired-ok` exit `0` in `348 ms`). The Index counts are now 72 Implemented, 7 Partial and 43 Planned.
