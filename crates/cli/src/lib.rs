@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod members_cmd;
 pub mod mode_cli;
 pub mod pair;
+pub mod rendezvous_cmd;
 pub mod secret_cmd;
 pub mod wordlist;
 

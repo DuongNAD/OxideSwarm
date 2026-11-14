@@ -5612,6 +5612,15 @@ async fn spawn_master_rendezvous_registration(
     cluster_secret: Option<ClusterSecret>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    if let Err(e) = rusty_grid_core::discovery::parse_rendezvous_url(&rendezvous_url) {
+        tracing::error!(
+            url = %rendezvous_url,
+            error = %e,
+            "Invalid Master rendezvous URL; disabling rendezvous registration"
+        );
+        return;
+    }
+
     let cluster_addr = if let Ok(parsed) = cluster_addr.parse::<std::net::SocketAddr>() {
         if parsed.ip().is_unspecified() {
             let local_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
@@ -5622,28 +5631,41 @@ async fn spawn_master_rendezvous_registration(
     } else {
         cluster_addr
     };
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let workers_count = registry.list_workers().await.len();
-                let mut lease = rusty_grid_core::discovery::RendezvousLease::new(
-                    &cluster_addr,
-                    &web_ui_url,
-                    &hostname,
-                    p2p_ticket.clone(),
-                    workers_count,
-                    120,
-                );
-                if let Some(ref secret) = cluster_secret {
-                    lease.sign(secret);
-                }
-                if let Err(e) = rusty_grid_core::discovery::register_rendezvous_lease(&rendezvous_url, &lease).await {
-                    warn!(url = %rendezvous_url, error = %e, "Failed to register Master lease with rendezvous registry");
-                } else {
-                    debug!(url = %rendezvous_url, "Successfully renewed Master lease in rendezvous registry");
-                }
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let workers_count = registry.list_workers().await.len();
+        let mut lease = rusty_grid_core::discovery::RendezvousLease::new(
+            &cluster_addr,
+            &web_ui_url,
+            &hostname,
+            p2p_ticket.clone(),
+            workers_count,
+            120,
+        );
+        if let Some(ref secret) = cluster_secret {
+            lease.sign(secret);
+        }
+        let retry_delay = match rusty_grid_core::discovery::register_rendezvous_lease(
+            &rendezvous_url,
+            &lease,
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!(url = %rendezvous_url, "Successfully renewed Master lease in rendezvous registry");
+                Duration::from_secs(30)
             }
+            Err(e) => {
+                warn!(url = %rendezvous_url, error = %e, "Failed to register Master lease with rendezvous registry");
+                Duration::from_secs(2)
+            }
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(retry_delay) => {}
             res = shutdown_rx.changed() => {
                 if (res.is_ok() && *shutdown_rx.borrow()) || res.is_err() {
                     break;
