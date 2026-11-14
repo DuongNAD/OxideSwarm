@@ -2230,7 +2230,7 @@ Write-Output 'USB_HELPERS_OK'
             self.skipTest("powershell is not available")
         import zipfile
 
-        tmp = tempfile.mkdtemp(prefix="ox_win_usb3_")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_usb3_"))
         tmp_home = os.path.join(tmp, "userprofile")
         tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
         tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
