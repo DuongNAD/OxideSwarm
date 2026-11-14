@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Upgraded optional GPU compute dependencies in `rusty_grid_worker` (`--features gpu-wgpu`) from `wgpu` `22.1.0` to `30.0.2` and `pollster` `0.3.0` to `1.0.1` (`crates/worker/Cargo.toml`, `crates/worker/src/wgpu_engine.rs`).
+
 ## [0.1.2] - 2026-11-12
 
 A patch release for the USB setup kit and for Windows workers. The protocol is still version 7, so
