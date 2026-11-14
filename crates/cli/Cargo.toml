@@ -40,6 +40,8 @@ sysinfo = { workspace = true }
 ignore = "0.4"
 base64 = "0.23"
 toml_edit = "0.25"
+ring = "0.17"
+spake2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -200,5 +202,9 @@ path = "../../tests/enroll_v3_e2e.rs"
 [[test]]
 name = "cli_enroll_e2e"
 path = "../../tests/cli_enroll_e2e.rs"
+
+[[test]]
+name = "cli_pair_e2e"
+path = "../../tests/cli_pair_e2e.rs"
 
 
