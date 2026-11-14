@@ -188,8 +188,12 @@ flowchart LR
   ([design 0016](docs/design/0016-mapreduce-cli-script-shipping.md)).
 - **Web dashboard:** live workers, tasks and links over plain HTTP. It listens on loopback by
   default, and needs a token once the master has a secret.
-- **Discovery:** `--master auto` finds a master on the LAN through an authenticated UDP beacon. An
-  HTTP probe and a rendezvous registry exist, with gaps that FEAT-7 tracks.
+- **Discovery:** `--master auto` finds a master on the LAN through an authenticated UDP beacon,
+  falls back to an HTTP `/api/discovery/probe` on `--web-ui-addr` / candidate hosts, and falls back
+  across subnets to a standalone keyed HTTP rendezvous registry (`oxideswarm rendezvous` on `:8090`,
+  [design 0066](docs/design/0066-usable-rendezvous-discovery.md)) using deterministic Ed25519 lease
+  keys, MAC-protected `p2p_ticket` P2P fallback, and upfront rejection of unsupported `https://`
+  rendezvous URLs (terminate TLS in a local reverse proxy).
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker
   (`--max-host-cpu-pct`). Tasks run at below-normal priority.
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
@@ -210,6 +214,7 @@ flowchart LR
 | `8088/tcp` | Cluster port: workers and clients connect here. It is the only valid `--master` target |
 | `8080/tcp` | Dashboard, REST and WebSocket (loopback unless you ask). Also a worker's standby portal, which listens on all interfaces without authentication unless the worker runs with `--no-portal` |
 | `8089/udp` | LAN discovery beacon (`--master auto`) |
+| `8090/tcp` | Standalone HTTP rendezvous registry (`oxideswarm rendezvous`; `http://` only, use a reverse proxy for TLS) |
 
 Details and the full table: [Network port topology](#network-port-topology) and
 [docs/SECURITY.md](docs/SECURITY.md#4-what-each-port-exposes).
@@ -478,8 +483,10 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --max-active-mb 512 --max-retained-mb 512
 # Dashboard on the LAN as well (explicit; default is loopback):
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
-# Register with Tier 3 HTTP rendezvous registry:
-./target/release/oxideswarm master --listen 0.0.0.0:8088 --rendezvous http://rendezvous.example.com:8080
+# Start a standalone Tier 3 HTTP rendezvous registry (multi-cluster via Ed25519 keyed leases; put behind a TLS reverse proxy if exposed publicly):
+./target/release/oxideswarm rendezvous --listen 0.0.0.0:8090
+# Register a master with a Tier 3 HTTP rendezvous registry (`https://` URLs are rejected; use `http://`):
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --rendezvous http://rendezvous.example.com:8090
 
 # Invite and enrol a machine with its own key (design 0051): create an invite on the master, redeem on the new machine, approve on the master
 ./target/release/oxideswarm invite --master 192.168.1.100:8088 [--roles worker,client] [--uses 1] [--expires 24h] [--p2p-ticket-file ~/.oxideswarm/master_ticket.txt]
@@ -499,7 +506,7 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm worker --master 192.168.1.100:8088                  # a --features gpu-wgpu build finds and uses the GPU itself
 ./target/release/oxideswarm worker --master 192.168.1.100:8088 --gpu            # insist: warns and advertises no GPU if there is none / no wgpu
 ./target/release/oxideswarm worker --master 192.168.1.100:8088 --no-gpu         # keep this machine's GPU out of the grid
-./target/release/oxideswarm worker --master auto --rendezvous http://rendezvous.example.com:8080  # discover via Tier 3 fallback
+./target/release/oxideswarm worker --master auto --rendezvous http://rendezvous.example.com:8090  # discover via Tier 3 fallback
 
 # Submit work (--command is the executable, arguments follow after --; the file must exist on the worker)
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --command echo --wait -- hello
@@ -617,7 +624,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--mapreduce-parallelism <N>` | `256` (`RUSTY_GRID_MAPREDUCE_PARALLELISM`, `[master].mapreduce_parallelism`) | Maximum map or reduce chunk tasks of one `mapreduce` job in flight at once |
 | `--max-connections <N>` | `1024` (`RUSTY_GRID_MAX_CONNECTIONS`, `[master].max_connections`) | Maximum concurrent connections kept open on the grid port |
 | `--max-pending-handshakes <N>` | `64` (`RUSTY_GRID_MAX_PENDING_HANDSHAKES`, `[master].max_pending_handshakes`) | Maximum connections allowed in the pre-authentication handshake state at once |
-| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
+| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
 
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
@@ -656,7 +663,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `:8080` (`127.0.0.1:8080` when targeting a loopback master, `0.0.0.0:8080` otherwise) |
 | `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
-| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
+| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
 
 #### `oxideswarm submit` Flags
 | Flag / Alias | Default / Env / Config | Description |
@@ -732,6 +739,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm join` | `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | Read an invite (`oxs1-invite:...`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) or a shared-secret join token (`oxs1-join:...`, [design 0048](docs/design/0048-join-token.md)) from **standard input** (piped, or pasted at a no-echo prompt on a terminal; an argument is refused). For an invite, `join` requires a controlling terminal (`stdin` when interactive, or `/dev/tty` on Unix and `CONIN$` on Windows when the invite is piped in via e.g. `pbpaste \| oxideswarm join`) to read the `[y/N]` confirmation: for `--no-approval` invites it flushes pending terminal input, prints the pinned master fingerprint and code-execution warning (without a pairing code), and asks `[y/N]` before opening any connection; for approval-required invites it connects with OXS-AUTH v3 purpose `enroll` and the pinned `master_key`, prints the 6-digit pairing check, master fingerprint, and warning, waits for admin approval (`ENROLLED`) and user confirmation (`[y/N]`), and confirms on the stream within 120 s. Only after confirmation does `join` write `~/.oxideswarm/node.key` and `master_key` in `~/.oxideswarm/rusty-grid.toml` and run the checks its roles allow (a worker-only member runs read-only checks; `doctor` task probes require `client`; when migrating a stopped named worker from v2 to v3 under `--auth both`, an admin runs `oxideswarm members release-worker <WORKER_ID>` so it keeps its persisted `worker_id`). For a join token, `join` saves the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` and runs `doctor` |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
 | `oxideswarm mcp` | `--master <ADDR\|auto\|TICKET>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
+| `oxideswarm rendezvous` | `--listen <ADDR>` (default `127.0.0.1:8090`, `OXIDESWARM_RENDEZVOUS_LISTEN`), `--port-file <PATH>`, `--max-leases <N>` (default `256`), `--max-ttl-secs <SECS>` (default `3600`), `--allow-unsigned`, `--insecure`, `--secret <HEX>`, `--secret-file <PATH>` | Run the standalone Tier 3 HTTP rendezvous registry ([design 0066](docs/design/0066-usable-rendezvous-discovery.md)). Serves multiple clusters isolated by deterministic Ed25519 `lease_key` slots (`X-OxideSwarm-Lease-Auth` required on read) without holding cluster secrets unless `--secret` or `--secret-file` is passed explicitly; refuses unsigned non-loopback binds without `--insecure` |
 
 #### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
 | Subcommand | Flags | Description |
@@ -749,6 +757,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--port 8090`) when co-locating services. |
 | **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
 | **8089** | UDP | Master Discovery Beacon | When the master listens on a non-loopback address, it binds `0.0.0.0:8089` and broadcasts its cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`); when the master listens on loopback, it binds that loopback address (`127.0.0.1:8089`), answers local unicast probes only, and does not broadcast. When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
+| **8090** | TCP (HTTP) | Standalone Rendezvous Registry | Default listener for `oxideswarm rendezvous` (`127.0.0.1:8090`; override with `--listen` or `OXIDESWARM_RENDEZVOUS_LISTEN`). Accepts signed `POST /api/rendezvous/register` leases and serves `GET /api/rendezvous/master?key=<hex>` to requests with a valid `X-OxideSwarm-Lease-Auth` signature (`http://` only; terminate TLS in a local reverse proxy). **Port Note:** `README.md` `agent-mesh hub` examples also show `8090`; bind one to an alternate port when running both on the same host. |
 | **8085** | TCP (HTTP) | Cross-Machine Sync Probe | Standalone reachability probe used strictly by `scripts/sync_network` to verify LAN connectivity between nodes using cloud-shared mailboxes. Completely independent of the Rust grid runtime. |
 | **8086** | TCP (HTTP, removed) | Former Secret Bootstrap Helper | Previously used by the removed `agent_bridge.py serve-secret` plain-HTTP secret transfer helper (`SEC-4`). No component opens port 8086; cluster secrets must be copied over an authenticated channel (`scp`, `sftp`, `adb push`, or physical media). |
 ### Environment variables
@@ -809,8 +818,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_DISABLE_WEB_UI` | Master | Disables embedding of Axum web dashboard server when set |
 | `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server (`1` or `true`) |
 | `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster when set |
-| `OXIDESWARM_RENDEZVOUS` | Master & Worker | HTTP rendezvous registry URL for publishing or discovering the coordinator address lease (`--rendezvous`) |
-| `RUSTY_GRID_RENDEZVOUS` | Master & Worker | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
+| `OXIDESWARM_RENDEZVOUS` | Master, Worker & Clients | `http://HOST[:PORT][/PATH]` rendezvous registry URL for publishing or discovering the coordinator lease (`--rendezvous`; `https://` is rejected upfront) |
+| `OXIDESWARM_RENDEZVOUS_LISTEN` | Rendezvous | Listen address for `oxideswarm rendezvous` (`--listen`; default `127.0.0.1:8090`) |
+| `RUSTY_GRID_RENDEZVOUS` | Master, Worker & Clients | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
 | `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces (`1` or `true`; equivalent to `--dev`) |
 
 #### Tier C: Worker Node Engine, GPU, CUDA, Blender & 3D Subsystem

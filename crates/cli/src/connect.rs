@@ -247,15 +247,48 @@ pub fn normalize_master_addr(addr: &str) -> String {
 ///
 /// Discovery that finds nothing is an error. There is deliberately no silent fallback to a
 /// guessed address: it would hide that no (authentic) master answered.
-pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> GridResult<String> {
+/// Resolves and validates an optional rendezvous registry URL (`cli_flag` >
+/// `OXIDESWARM_RENDEZVOUS` > `RUSTY_GRID_RENDEZVOUS`) using [`parse_rendezvous_url`].
+pub fn resolve_and_validate_rendezvous_url(
+    cli_flag: Option<&str>,
+) -> Result<Option<String>, String> {
+    let candidate = cli_flag
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(rusty_grid_core::discovery::RENDEZVOUS_ENV)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("RUSTY_GRID_RENDEZVOUS")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(ref url) = candidate {
+        rusty_grid_core::discovery::parse_rendezvous_url(url)?;
+    }
+    Ok(candidate)
+}
+
+/// Resolves `--master auto` / `auto:<port>` into `(cluster_addr, optional_p2p_ticket)`, or passes
+/// explicit `host[:port]` / `p2p` tickets through unchanged.
+pub async fn resolve_master_target(
+    addr: &str,
+    secret: Option<&ClusterSecret>,
+) -> GridResult<(String, Option<String>)> {
     let addr = addr.trim();
     if is_p2p_ticket(addr) {
-        return Ok(addr.to_string());
+        return Ok((addr.to_string(), None));
     }
     if !is_auto(addr) {
-        return Ok(normalize_master_addr(addr));
+        return Ok((normalize_master_addr(addr), None));
     }
 
+    let rendezvous_url = resolve_and_validate_rendezvous_url(None).map_err(GridError::Config)?;
     let disc_port = addr
         .split_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
@@ -265,10 +298,11 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
         authenticated = secret.is_some(),
         "Master address set to 'auto'; performing LAN UDP discovery probe..."
     );
-    match rusty_grid_core::discovery::discover_master_with_secret(
+    match rusty_grid_core::discovery::discover_master_with_secret_and_rendezvous(
         DISCOVERY_TIMEOUT,
         disc_port,
         secret,
+        rendezvous_url.as_deref(),
     )
     .await
     {
@@ -276,9 +310,9 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
             info!(
                 master = %beacon.cluster_addr,
                 hostname = %beacon.hostname,
-                "Discovered active Master via UDP LAN beacon"
+                "Discovered active Master via discovery"
             );
-            Ok(beacon.cluster_addr)
+            Ok((beacon.cluster_addr, beacon.p2p_ticket))
         }
         None => Err(GridError::ConnectionFailed(format!(
             "Auto-discovery found no Master on UDP port {disc_port}{}; start a Master or pass --master HOST:{DEFAULT_MASTER_PORT}",
@@ -289,6 +323,10 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
             }
         ))),
     }
+}
+
+pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> GridResult<String> {
+    resolve_master_target(addr, secret).await.map(|(a, _)| a)
 }
 
 /// Connects to the Master at `addr` and, when a `secret` is given, authenticates with it.
@@ -330,6 +368,32 @@ pub async fn connect_master(
     connect_master_with_relay(addr, secret, relay_url.as_deref()).await
 }
 
+async fn connect_p2p_ticket_stream(
+    ticket: &str,
+    minimal: bool,
+    relay_url: Option<&str>,
+) -> GridResult<(String, GridStream, bool)> {
+    let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket)?;
+    let label = format!("iroh://{}", endpoint_addr.id);
+    let stream = rusty_grid_core::transport::connect_p2p_client_stream_with_relay(
+        endpoint_addr,
+        CONNECT_TIMEOUT,
+        minimal,
+        relay_url,
+    )
+    .await
+    .map_err(|e| match e {
+        GridError::Timeout { duration_secs, .. } => GridError::ConnectionFailed(format!(
+            "Failed to connect to Master at {label}: timed out after {duration_secs}s"
+        )),
+        GridError::ConnectionFailed(detail) => {
+            GridError::ConnectionFailed(format!("Failed to connect to Master at {label}: {detail}"))
+        }
+        other => other,
+    })?;
+    Ok((label, stream, true))
+}
+
 /// Opens an unauthenticated raw TCP or P2P `STREAM_CLIENT` stream to `addr`.
 pub async fn open_raw_master_stream(
     addr: &str,
@@ -345,39 +409,37 @@ pub async fn open_raw_master_stream(
 
     let trimmed = addr.trim();
     if is_p2p_ticket(trimmed) {
-        let endpoint_addr = rusty_grid_core::transport::parse_p2p_ticket(trimmed)?;
-        let label = format!("iroh://{}", endpoint_addr.id);
-        let stream = rusty_grid_core::transport::connect_p2p_client_stream_with_relay(
-            endpoint_addr,
-            CONNECT_TIMEOUT,
-            minimal,
-            relay_url,
-        )
-        .await
-        .map_err(|e| match e {
-            GridError::Timeout { duration_secs, .. } => GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {label}: timed out after {duration_secs}s"
-            )),
-            GridError::ConnectionFailed(detail) => GridError::ConnectionFailed(format!(
-                "Failed to connect to Master at {label}: {detail}"
-            )),
-            other => other,
-        })?;
-        Ok((label, stream, true))
+        connect_p2p_ticket_stream(trimmed, minimal, relay_url).await
     } else {
-        let addr = resolve_master_addr(trimmed, secret).await?;
+        let (addr, discovered_ticket) = resolve_master_target(trimmed, secret).await?;
         let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
+                if let Some(ticket) = discovered_ticket.as_deref().filter(|t| !t.is_empty()) {
+                    tracing::info!(
+                        tcp_addr = %addr,
+                        error = %e,
+                        "TCP connect to discovered Master failed; falling back to discovered P2P ticket"
+                    );
+                    return connect_p2p_ticket_stream(ticket, minimal, relay_url).await;
+                }
                 return Err(GridError::ConnectionFailed(format!(
                     "Failed to connect to Master at {addr}: {e}"
-                )))
+                )));
             }
             Err(_) => {
+                if let Some(ticket) = discovered_ticket.as_deref().filter(|t| !t.is_empty()) {
+                    tracing::info!(
+                        tcp_addr = %addr,
+                        timeout_secs = CONNECT_TIMEOUT.as_secs(),
+                        "TCP connect to discovered Master timed out; falling back to discovered P2P ticket"
+                    );
+                    return connect_p2p_ticket_stream(ticket, minimal, relay_url).await;
+                }
                 return Err(GridError::ConnectionFailed(format!(
                     "Failed to connect to Master at {addr}: timed out after {}s",
                     CONNECT_TIMEOUT.as_secs()
-                )))
+                )));
             }
         };
         // Best effort: a failure here only costs latency / dead-peer detection.

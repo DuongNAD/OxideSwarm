@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `fc33c9e7` plus ENROLL-1b: 70 items Implemented, 6 Partial and 46 Planned. Five items
+On 2026-11-14, at `master` `8596c5fd` plus FEAT-7: 71 items Implemented, 6 Partial and 45 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -215,7 +215,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
-| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
+| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented | (design 0066), (open) |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
@@ -1445,6 +1445,14 @@ Each item below needs a design record before code.
   `https://` or implement TLS. State the real preconditions in `README.md`.
 - **Done when:** A worker with `--master auto --rendezvous <URL>` registers in a test with Tiers 1 and
   2 blocked. A tampered ticket fails verification.
+- **Status (2026-11-14):** `Implemented` ([design 0066](design/0066-usable-rendezvous-discovery.md)):
+  added `oxideswarm rendezvous` on `:8090` (`crates/cli/src/rendezvous_cmd.rs`,
+  `crates/master/src/rendezvous.rs`) with deterministic Ed25519 `lease_key` / `key_signature`
+  multi-cluster isolation and `X-OxideSwarm-Lease-Auth` anti-harvesting read checks, covered
+  `p2p_ticket` under `MasterBeacon`/`RendezvousLease` authentication with worker and CLI P2P
+  fallback, rejected `https://` URLs upfront in `parse_rendezvous_url` / `master` / `worker` /
+  `connect`, documented preconditions in `README.md` / `CLAUDE.md`, and verified with
+  `tests/rendezvous_discovery_e2e.rs`.
 
 ### FEAT-8: Real protocol versioning
 
@@ -2559,3 +2567,10 @@ Add one dated line per finished item, newest last.
   `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live revocation across all lanes and task
   cancellation/requeue) and `ENROLL-1d` (dashboard members page and docs/guide) are Planned. The
   Index counts are now 70 Implemented, 6 Partial and 46 Planned.
+- 2026-11-14: Implemented FEAT-7 ([design 0066](design/0066-usable-rendezvous-discovery.md),
+  `mac/feat-7-rendezvous`): standalone `oxideswarm rendezvous` registry on `:8090` with Ed25519
+  `lease_key` / `key_signature` multi-cluster isolation and `X-OxideSwarm-Lease-Auth` read auth,
+  MAC-covered `p2p_ticket` + P2P fallback on `auto`, upfront `https://` rejection, `2 s` master
+  registration retries, updated `README.md` / `CLAUDE.md` / `CHANGELOG.md`, and added
+  `tests/rendezvous_discovery_e2e.rs`. The Index counts are now 71 Implemented, 6 Partial and 45
+  Planned.

@@ -9,6 +9,7 @@ pub mod join;
 pub mod mcp;
 pub mod members_cmd;
 pub mod mode_cli;
+pub mod rendezvous_cmd;
 pub mod secret_cmd;
 
 pub use cli_app::run_cli;
