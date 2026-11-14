@@ -488,15 +488,17 @@ mod win {
         Ok(v)
     }
 
-    fn sid_to_string(sid: PSID) -> io::Result<String> {
+    /// # Safety
+    /// `sid` must point to a valid Win32 `SID` allocation for the duration of this call.
+    unsafe fn sid_to_string(sid: PSID) -> io::Result<String> {
         let mut raw: *mut u16 = null_mut();
-        // SAFETY: `sid` is a valid SID and `raw` receives a system allocation freed below.
+        // SAFETY: caller guarantees `sid` is a valid SID; `raw` receives a system allocation freed below.
         if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let _guard = LocalBuf(raw.cast());
         let mut len = 0;
-        // SAFETY: `raw` is a NUL-terminated wide string.
+        // SAFETY: `raw` is a NUL-terminated wide string returned by `ConvertSidToStringSidW`.
         while unsafe { *raw.add(len) } != 0 {
             len += 1;
         }
@@ -535,7 +537,8 @@ mod win {
             }
             // SAFETY: the buffer now holds a TOKEN_USER whose SID points into the same buffer.
             let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-            sid_to_string(sid)
+            // SAFETY: `sid` points to a valid SID inside `buf`, which stays live through this call.
+            unsafe { sid_to_string(sid) }
         })();
         // SAFETY: `token` was opened above and is closed once.
         unsafe { CloseHandle(token) };
@@ -766,7 +769,8 @@ mod win {
                 "ACE contains an invalid SID",
             ));
         }
-        Ok((sid_to_string(sid_ptr)?, sid_len))
+        // SAFETY: `sid_ptr` was just validated by `IsValidSid` and `GetLengthSid` inside `aligned`.
+        Ok((unsafe { sid_to_string(sid_ptr) }?, sid_len))
     }
 
     /// Extracts `(sid, mask, flags)` grants from one raw ACE slice across all Windows allow ACE
@@ -856,7 +860,13 @@ mod win {
         }
     }
 
-    pub(super) fn parse_dacl_aces_bounded(
+    /// Parses up to `ace_count` ACEs from `dacl`, bounding every header and payload read within
+    /// `bytes_in_use` and `acl_size`.
+    ///
+    /// # Safety
+    /// `dacl` must be non-null and point to a readable allocation of at least `acl_size` bytes
+    /// starting with an `ACL` header (though `dacl` itself need not be `DWORD`-aligned).
+    pub(super) unsafe fn parse_dacl_aces_bounded(
         dacl: *const ACL,
         acl_size: usize,
         ace_count: u32,
@@ -874,7 +884,8 @@ mod win {
         let mut aces = Vec::new();
         for i in 0..ace_count {
             let mut ace: *mut c_void = null_mut();
-            // SAFETY: `i` is below the ACE count of `dacl`.
+            // SAFETY: caller guarantees `dacl` points to an `ACL` allocation of `acl_size` bytes,
+            // and `i < ace_count`.
             if unsafe { GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -913,7 +924,13 @@ mod win {
         Ok(aces)
     }
 
-    pub(super) fn parse_dacl_aces(dacl: *const ACL) -> io::Result<Vec<DaclAce>> {
+    /// Parses all allow ACEs from `dacl` (treating a null `dacl` as a Win32 NULL DACL granting
+    /// full access to `Everyone`).
+    ///
+    /// # Safety
+    /// Either `dacl` is null, or `dacl` points to a readable `ACL` allocation of at least
+    /// `(*dacl).AclSize` bytes.
+    pub(super) unsafe fn parse_dacl_aces(dacl: *const ACL) -> io::Result<Vec<DaclAce>> {
         if dacl.is_null() {
             return Ok(vec![DaclAce {
                 sid: super::SID_EVERYONE.to_string(),
@@ -921,7 +938,7 @@ mod win {
                 flags: 0,
             }]);
         }
-        // SAFETY: `dacl` is non-null and points to a Win32 `ACL` header.
+        // SAFETY: `dacl` is non-null and caller guarantees it points to a readable `ACL` header.
         let acl_header = unsafe { std::ptr::read_unaligned(dacl) };
         let acl_size = usize::from(acl_header.AclSize);
         let mut info = ACL_SIZE_INFORMATION {
@@ -929,7 +946,7 @@ mod win {
             AclBytesInUse: 0,
             AclBytesFree: 0,
         };
-        // SAFETY: `info` is large enough for `AclSizeInformation`.
+        // SAFETY: `dacl` points to a valid `ACL` and `info` is sized for `AclSizeInformation`.
         if unsafe {
             GetAclInformation(
                 dacl,
@@ -941,21 +958,28 @@ mod win {
         {
             return Err(io::Error::last_os_error());
         }
-        parse_dacl_aces_bounded(dacl, acl_size, info.AceCount, info.AclBytesInUse as usize)
+        // SAFETY: caller guarantees `dacl` points to at least `acl_size` readable bytes.
+        unsafe {
+            parse_dacl_aces_bounded(dacl, acl_size, info.AceCount, info.AclBytesInUse as usize)
+        }
     }
 
-    fn parse_dacl_from_sd(
+    /// # Safety
+    /// `sd` must be a valid Win32 `SECURITY_DESCRIPTOR` and `dacl` must be either null or a valid
+    /// `ACL` pointer within `sd`.
+    unsafe fn parse_dacl_from_sd(
         sd: PSECURITY_DESCRIPTOR,
         dacl: *const ACL,
     ) -> io::Result<(Vec<DaclAce>, bool)> {
         let mut control = 0u16;
         let mut revision = 0u32;
-        // SAFETY: `sd` is a valid security descriptor returned by Win32.
+        // SAFETY: caller guarantees `sd` is a valid security descriptor.
         if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let protected = control & SE_DACL_PROTECTED != 0;
-        let aces = parse_dacl_aces(dacl)?;
+        // SAFETY: caller guarantees `dacl` is null or a valid `ACL` inside `sd`.
+        let aces = unsafe { parse_dacl_aces(dacl) }?;
         Ok((aces, protected))
     }
 
@@ -985,7 +1009,8 @@ mod win {
                 "security descriptor has no owner SID",
             ));
         }
-        sid_to_string(owner)
+        // SAFETY: `owner` is a non-null SID inside `sd`, kept alive by `_guard`.
+        unsafe { sid_to_string(owner) }
     }
 
     fn read_dacl_handle(handle: HANDLE) -> io::Result<(Vec<DaclAce>, bool)> {
@@ -1008,7 +1033,8 @@ mod win {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _guard = LocalBuf(sd);
-        parse_dacl_from_sd(sd, dacl)
+        // SAFETY: `sd` and `dacl` were returned by `GetSecurityInfo` and stay live via `_guard`.
+        unsafe { parse_dacl_from_sd(sd, dacl) }
     }
 
     fn handle_attributes_and_volume(handle: HANDLE) -> io::Result<(bool, bool, io::Result<bool>)> {
@@ -1067,7 +1093,8 @@ mod win {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _guard = LocalBuf(sd);
-        parse_dacl_from_sd(sd, dacl)
+        // SAFETY: `sd` and `dacl` were returned by `GetNamedSecurityInfoW` and stay live via `_guard`.
+        unsafe { parse_dacl_from_sd(sd, dacl) }
     }
 
     /// Inspects `path` using a single `READ_CONTROL` handle opened with
@@ -1711,7 +1738,8 @@ mod windows_tests {
             0
         );
 
-        let parsed = win::parse_dacl_aces(acl_ptr).unwrap();
+        // SAFETY: `acl_ptr` points to the 1024-byte `acl_buf` initialized by `InitializeAcl`.
+        let parsed = unsafe { win::parse_dacl_aces(acl_ptr) }.unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -1793,7 +1821,11 @@ mod windows_tests {
             },
             0
         );
-        assert_eq!(win::parse_dacl_aces(aligned_ptr).unwrap().len(), 2);
+        // SAFETY: `aligned_ptr` points to the 96-byte `aligned_acl` initialized by `InitializeAcl`.
+        assert_eq!(
+            unsafe { win::parse_dacl_aces(aligned_ptr) }.unwrap().len(),
+            2
+        );
 
         // Copy into a 1-byte-misaligned slice to verify unaligned `ACE_HEADER` reads + bounds checks.
         let mut unaligned_buf = [0u8; 128];
@@ -1803,8 +1835,9 @@ mod windows_tests {
         acl_slice.copy_from_slice(aligned_bytes);
         let unaligned_ptr = acl_slice.as_mut_ptr().cast::<ACL>();
         // 8-byte ACL header + two 20-byte ACEs = 48 bytes in use.
+        // SAFETY: `unaligned_ptr` points to the 96-byte `acl_slice` slice.
         assert_eq!(
-            win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48)
+            unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48) }
                 .unwrap()
                 .len(),
             2
@@ -1814,30 +1847,34 @@ mod windows_tests {
         //    `AclBytesInUse` is 40 (`8 + 20 + 12`): `ace_size (24) <= bytes_in_use (40)` would
         //    pass a naive size-only check, whereas `off + ace_size = 28 + 24 = 52 > 40` catches it.
         acl_slice[30..32].copy_from_slice(&24u16.to_le_bytes());
+        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
         assert!(
-            win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 40).is_err(),
+            unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 40) }.is_err(),
             "ACE running past AclBytesInUse must be refused"
         );
 
         // 2. Corrupt the second ACE's `AceSize` to 80 so `off + ace_size = 28 + 80 = 108 > AclSize (96)`
         //    on both the unaligned buffer and the aligned ACL passed to `parse_dacl_aces`.
         acl_slice[30..32].copy_from_slice(&80u16.to_le_bytes());
+        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
         assert!(
-            win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48).is_err(),
+            unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48) }.is_err(),
             "unaligned malformed ACL running past AclSize must be refused"
         );
         let aligned_bytes_mut: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(aligned_ptr.cast::<u8>(), 96) };
         aligned_bytes_mut[30..32].copy_from_slice(&80u16.to_le_bytes());
+        // SAFETY: `aligned_ptr` points to 96 readable bytes (`(*aligned_ptr).AclSize == 96`).
         assert!(
-            win::parse_dacl_aces(aligned_ptr).is_err(),
+            unsafe { win::parse_dacl_aces(aligned_ptr) }.is_err(),
             "malformed ACL running past AclSize must be refused without panicking"
         );
 
         // 3. `ACE_HEADER` itself extending past `AclBytesInUse` (`off = 28, bytes_in_use = 30`).
         acl_slice[30..32].copy_from_slice(&20u16.to_le_bytes());
+        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
         assert!(
-            win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 30).is_err(),
+            unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 30) }.is_err(),
             "ACE header extending past AclBytesInUse must be refused"
         );
     }

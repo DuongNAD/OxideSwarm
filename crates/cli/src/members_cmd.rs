@@ -122,11 +122,11 @@ impl std::fmt::Display for InviteTokenError {
     }
 }
 
-fn field_ok(value: &str) -> bool {
+pub(crate) fn field_ok(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_FIELD_LEN && !value.chars().any(char::is_whitespace)
 }
 
-fn sanitize_terminal_text(raw: &str) -> String {
+pub(crate) fn sanitize_terminal_text(raw: &str) -> String {
     raw.chars()
         .filter(|c| !rusty_grid_core::noise_auth::is_control_or_format_char(*c))
         .collect()
@@ -372,6 +372,13 @@ pub struct InviteArgs {
     )]
     pub revoke: Option<String>,
 
+    #[arg(
+        long,
+        conflicts_with_all = ["list", "revoke", "no_approval", "uses", "json"],
+        help = "Pair interactively with a new machine on the LAN using a short one-time code instead of printing an invite string"
+    )]
+    pub code: bool,
+
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
 
@@ -389,7 +396,7 @@ fn cfg_client_master(config_file: Option<&ConfigFile>) -> Option<String> {
     })
 }
 
-fn cfg_client_insecure(config_file: Option<&ConfigFile>) -> Option<bool> {
+pub(crate) fn cfg_client_insecure(config_file: Option<&ConfigFile>) -> Option<bool> {
     config_file.and_then(|c| {
         c.submit
             .as_ref()
@@ -398,7 +405,7 @@ fn cfg_client_insecure(config_file: Option<&ConfigFile>) -> Option<bool> {
     })
 }
 
-fn resolve_admin_connect_addr(
+pub(crate) fn resolve_admin_connect_addr(
     cli_master: Option<String>,
     config_file: Option<&ConfigFile>,
 ) -> String {
@@ -421,7 +428,7 @@ fn resolve_admin_connect_addr(
 /// Resolves and validates the local `--master`, `--p2p-ticket`, and `--p2p-ticket-file` inputs
 /// before connecting to the master so invalid files or malformed addresses never create an
 /// orphaned invite on the master.
-fn resolve_local_invite_targets(
+pub(crate) fn resolve_local_invite_targets(
     args: &InviteArgs,
     config_file: Option<&ConfigFile>,
 ) -> GridResult<(Option<String>, Option<String>)> {
@@ -527,7 +534,7 @@ fn resolve_local_invite_targets(
     Ok((master, ticket))
 }
 
-fn finalize_invite_targets(
+pub(crate) fn finalize_invite_targets(
     local_master: Option<String>,
     local_ticket: Option<String>,
     master_reported_ticket: Option<String>,
@@ -592,6 +599,10 @@ async fn run_invite_inner(
             .ok()
             .flatten()
             .is_some();
+
+    if args.code {
+        return crate::pair::run_invite_code(args, config_file, secret_opts).await;
+    }
 
     if args.list {
         let mut transport = match connect_master(&connect_addr, cluster_secret.as_ref()).await {
@@ -1470,5 +1481,16 @@ mod tests {
         );
         assert!(parse_roles_csv("").is_err());
         assert!(parse_roles_csv("superadmin").is_err());
+    }
+
+    #[test]
+    fn invite_args_code_flag_conflicts() {
+        let ok = InviteArgs::try_parse_from(["invite", "--code"]).unwrap();
+        assert!(ok.code);
+        assert!(InviteArgs::try_parse_from(["invite", "--code", "--list"]).is_err());
+        assert!(InviteArgs::try_parse_from(["invite", "--code", "--revoke", "abc"]).is_err());
+        assert!(InviteArgs::try_parse_from(["invite", "--code", "--no-approval"]).is_err());
+        assert!(InviteArgs::try_parse_from(["invite", "--code", "--uses", "2"]).is_err());
+        assert!(InviteArgs::try_parse_from(["invite", "--code", "--json"]).is_err());
     }
 }
