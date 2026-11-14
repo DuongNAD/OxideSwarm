@@ -1235,7 +1235,7 @@ class UsbKitTests(unittest.TestCase):
         extra = ["--no-autostart"] if no_autostart else []
         res = self.make_kit(extra=extra)
         self.assertEqual(res.returncode, 0, res.stdout)
-        kit = os.path.join(self.out, "OxideSwarm")
+        kit = os.path.join(self.stick, "OxideSwarm")
         tok_path = os.path.join(kit, "join.token")
         if os.path.exists(tok_path):
             os.remove(tok_path)
@@ -1273,7 +1273,7 @@ class UsbKitTests(unittest.TestCase):
 
         # Worker-only kit skips doctor, omits --workspaces when kit says false, writes install.log.
         root = os.path.join(self.tmp, "v1-worker")
-        env1 = dict(self.env(), FAKE_MASTER_KEY="11" * 32)
+        env1 = dict(self.env(), FAKE_MASTER_KEY="11" * 32, OXIDESWARM_USB_MACHINE_ID="machine-v1-test")
         res = subprocess.run(
             ["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--name", "v1-worker"],
             env=env1, input="valid kit passphrase\n", stdout=subprocess.PIPE,
@@ -1313,7 +1313,7 @@ class UsbKitTests(unittest.TestCase):
             cf.write("#!/bin/sh\necho cargo 1.90.0\n")
         os.chmod(cargo_exe, 0o755)
         root_ws = os.path.join(self.tmp, "v1-worker-ws")
-        env2 = dict(self.env(), FAKE_MASTER_KEY="22" * 32)
+        env2 = dict(self.env(), FAKE_MASTER_KEY="22" * 32, OXIDESWARM_USB_MACHINE_ID="machine-v1-test")
         env2["PATH"] = fake_bin + os.pathsep + env2["PATH"]
         res_ws = subprocess.run(
             ["bash", os.path.join(kit, "install.sh"), "--install-root", root_ws, "--name", "v1-worker", "--workspaces"],

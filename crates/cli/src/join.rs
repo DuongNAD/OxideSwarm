@@ -1316,14 +1316,13 @@ async fn run_join_invite_file(
             return ExitCode::FAILURE;
         }
     };
-    let mut is_reparse = meta.file_type().is_symlink();
     #[cfg(windows)]
-    {
+    let is_reparse = {
         use std::os::windows::fs::MetadataExt;
-        if (meta.file_attributes() & 0x0400) != 0 {
-            is_reparse = true;
-        }
-    }
+        meta.file_type().is_symlink() || (meta.file_attributes() & 0x0400) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
     if is_reparse || !meta.is_file() {
         eprintln!(
             "Refusing invite file '{}': must be a regular file (not a symbolic link)",
