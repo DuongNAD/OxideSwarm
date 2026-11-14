@@ -84,6 +84,7 @@ pub struct MasterFileConfig {
     pub max_host_cpu_pct: Option<f32>,
     pub preserve_gpu: Option<bool>,
     pub fail_unfulfillable_tasks: Option<bool>,
+    pub speed_hold_factor: Option<f64>,
     pub p2p: Option<bool>,
     pub p2p_ticket_file: Option<String>,
     pub p2p_key_file: Option<String>,

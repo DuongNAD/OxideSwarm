@@ -159,6 +159,7 @@ pub struct RunnerConfig {
     /// Maximum time a task waits to acquire a workspace lock before failing as busy.
     pub workspace_lock_wait: Duration,
     /// Multiplier applied to `BuiltinTest` sleep durations in integration tests (`1` in production).
+    #[doc(hidden)]
     pub test_sleep_multiplier: u32,
 }
 
@@ -192,7 +193,8 @@ impl RunnerConfig {
     }
 
     /// Scales `BuiltinTest` sleep durations by `multiplier.max(1)` (test hook for speed-aware
-    /// scheduling integration tests).
+    /// scheduling integration tests). Exists for integration tests only.
+    #[doc(hidden)]
     pub fn with_test_sleep_multiplier(mut self, multiplier: u32) -> Self {
         self.test_sleep_multiplier = multiplier.max(1);
         self

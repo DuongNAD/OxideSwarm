@@ -33,7 +33,7 @@ use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use crate::queue::{AssignedLoad, QueueOrderKey, TaskQueue, TaskView};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::server::WaiterMap;
-use crate::speed::{SpeedBook, TaskKey};
+use crate::speed::{new_shared_speed_book, SharedSpeedBook, SpeedBook, TaskKey};
 
 /// Queued tasks examined per page of a scheduling pass (each page is one short read lock).
 const SCAN_PAGE: usize = 256;
@@ -250,6 +250,24 @@ impl SchedulerConfig {
         self.speed_min_samples = min_samples;
         self
     }
+
+    /// Validates `speed_hold_factor` (`0.0` to disable, or a finite number `> 1.0`).
+    pub fn validate_speed_hold_factor(factor: f64) -> Result<f64, String> {
+        if factor == 0.0 {
+            return Ok(0.0);
+        }
+        if factor.is_finite() && factor > 1.0 {
+            return Ok(factor);
+        }
+        Err(format!(
+            "speed_hold_factor must be 0 (off) or a finite number > 1.0 (got {factor})"
+        ))
+    }
+
+    /// Validates configuration invariants before starting the scheduler.
+    pub fn validate(&self) -> Result<(), String> {
+        Self::validate_speed_hold_factor(self.speed_hold_factor).map(|_| ())
+    }
 }
 
 /// Matchmaking decision pairing a task with an eligible worker.
@@ -428,6 +446,10 @@ struct Engine<'a> {
     active_workspaces: HashSet<String>,
     /// Optional measured task-duration history (`0060` D1/D2).
     speed_book: Option<&'a SpeedBook>,
+    /// Per-(TaskKey, Shape) hold cache within a pass (`0060` D2): stores `min_expected` so
+    /// tasks with `avoid.is_empty() && workspace.is_none()` and `waited_ms < min_expected`
+    /// skip re-scanning every worker in the pass without bypassing the Step 5 wait cap.
+    dead_speed: HashMap<TaskKey, HashMap<Shape, f64>>,
 }
 
 /// Returns the latest [`MobileLiveStatus`] for `worker`, preferring the live telemetry snapshot
@@ -570,6 +592,7 @@ impl<'a> Engine<'a> {
             workspace_affinity: HashMap::new(),
             active_workspaces: HashSet::new(),
             speed_book: None,
+            dead_speed: HashMap::new(),
         }
     }
 
@@ -698,6 +721,18 @@ impl<'a> Engine<'a> {
             self.dead.insert(shape, verdict.clone());
             return verdict;
         }
+        if view.avoid.is_empty() && view.workspace.is_none() {
+            if let Some(&min_expected) = self
+                .dead_speed
+                .get(&view.task_key)
+                .and_then(|by_shape| by_shape.get(&shape))
+            {
+                let waited_ms = view.queued_for.as_secs_f64() * 1_000.0;
+                if waited_ms < min_expected {
+                    return Verdict::Skip(ScheduleSkipReason::WaitingForFasterWorker);
+                }
+            }
+        }
 
         let weight = view.requirements.cpu_cores.max(1);
         let mut full = Vec::new();
@@ -728,9 +763,12 @@ impl<'a> Engine<'a> {
                     .any(|&c| self.seats[c].worker.worker_id == *aff_worker)
             });
 
-        // Speed-aware placement (`0060` D2): active when `speed_hold_factor > 0` and at least one
-        // matching worker has at least `speed_min_samples` samples for `view.task_key`.
-        if !has_workspace_affinity && self.config.speed_hold_factor > 0.0 {
+        // Speed-aware placement (`0060` D2): active when `speed_hold_factor > 1.0` (finite) and at
+        // least one matching worker has at least `speed_min_samples` samples for `view.task_key`.
+        if !has_workspace_affinity
+            && self.config.speed_hold_factor.is_finite()
+            && self.config.speed_hold_factor > 1.0
+        {
             if let Some(speed_book) = self.speed_book {
                 let min_samples = self.config.speed_min_samples.max(1) as u64;
                 let best = matching
@@ -763,6 +801,7 @@ impl<'a> Engine<'a> {
                     let expected_for = |idx: usize| -> f64 {
                         speed_book
                             .get(&self.seats[idx].worker.worker_id, view.task_key)
+                            .filter(|entry| entry.samples >= min_samples)
                             .map_or(best_avg, |entry| entry.avg_ms)
                     };
                     let min_expected = candidates
@@ -787,24 +826,30 @@ impl<'a> Engine<'a> {
 
                     // Step 5 wait cap: never hold a task longer than its expected run time on the
                     // fastest currently available candidate.
-                    // NOTE: `WaitingForFasterWorker` is intentionally NOT cached in `self.dead`
-                    // because `Shape` does not carry `task_key` or `queued_for`.
                     let waited_ms = view.queued_for.as_secs_f64() * 1_000.0;
                     if waited_ms < min_expected {
                         if let Some(ready_ms) = ready_best {
                             let threshold = self.config.speed_hold_factor * (ready_ms + best_avg);
                             if min_expected >= threshold {
-                                self.hold_back(&[best_idx], weight);
+                                if full.contains(&best_idx) {
+                                    self.hold_back(&[best_idx], weight);
+                                }
+                                if view.avoid.is_empty() && view.workspace.is_none() {
+                                    self.dead_speed
+                                        .entry(view.task_key)
+                                        .or_default()
+                                        .insert(shape, min_expected);
+                                }
                                 return Verdict::Skip(ScheduleSkipReason::WaitingForFasterWorker);
                             }
                         }
                     }
 
-                    // Otherwise re-order candidates by expected finish time (`ready + expected`,
-                    // where `ready == 0` for every candidate with a free slot), keeping today's
-                    // `rank` order as the tie break.
-                    let eps = 1e-9 * min_expected.max(1.0);
-                    candidates.retain(|&c| (expected_for(c) - min_expected).abs() <= eps);
+                    // D2 step 4: exclude only candidates that are clearly slower
+                    // (`expected(c) >= speed_hold_factor * min_expected`), keeping today's
+                    // `rank` order among the rest without re-ordering by expected finish time.
+                    let cutoff = self.config.speed_hold_factor * min_expected;
+                    candidates.retain(|&c| expected_for(c) < cutoff);
                 }
             }
         }
@@ -1195,7 +1240,7 @@ pub struct WorkloadScheduler {
     /// reached so subsequent saturated passes with unchanged epochs make no `ready_views` call.
     unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>,
     /// Measured per-(worker, task-key) run-time history (`0060` D1/D2).
-    speed_book: Arc<std::sync::Mutex<SpeedBook>>,
+    speed_book: SharedSpeedBook,
 }
 
 impl WorkloadScheduler {
@@ -1206,7 +1251,7 @@ impl WorkloadScheduler {
         queue: TaskQueue,
         trigger: Arc<Notify>,
     ) -> Self {
-        let speed_book = Arc::new(std::sync::Mutex::new(SpeedBook::new()));
+        let speed_book = new_shared_speed_book();
         registry.set_speed_book(Arc::clone(&speed_book));
         Self {
             config,
@@ -1230,12 +1275,12 @@ impl WorkloadScheduler {
     /// Replaces the initial contents of the scheduler's [`SpeedBook`] (preserving the shared
     /// handle attached to [`WorkerRegistry`]).
     pub fn with_speed_book(self, book: SpeedBook) -> Self {
-        *self.speed_book.lock().unwrap_or_else(|e| e.into_inner()) = book;
+        *self.speed_book.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(book);
         self
     }
 
     /// Returns the shared [`SpeedBook`] owned by this scheduler.
-    pub fn speed_book(&self) -> &Arc<std::sync::Mutex<SpeedBook>> {
+    pub fn speed_book(&self) -> &SharedSpeedBook {
         &self.speed_book
     }
 
@@ -1494,12 +1539,13 @@ impl WorkloadScheduler {
         let loads = self.queue.assigned_loads().await;
         let (workspace_affinity, active_workspaces) = self.queue.workspace_scheduling_state().await;
         let (gpu_waiting, gpu_recent) = self.gpu_demand(&workers).await;
-        let speed_snapshot = if self.config.speed_hold_factor > 0.0 {
-            let guard = self.speed_book.lock().unwrap_or_else(|e| e.into_inner());
-            (!guard.is_empty()).then(|| guard.clone())
-        } else {
-            None
-        };
+        let speed_snapshot =
+            if self.config.speed_hold_factor.is_finite() && self.config.speed_hold_factor > 1.0 {
+                let guard = self.speed_book.lock().unwrap_or_else(|e| e.into_inner());
+                (!guard.is_empty()).then(|| Arc::clone(&guard))
+            } else {
+                None
+            };
         let running_tasks = if speed_snapshot.is_some() {
             self.queue.active_running_tasks().await
         } else {
@@ -1515,7 +1561,7 @@ impl WorkloadScheduler {
         )
         .with_workspaces(workspace_affinity, active_workspaces);
         if let Some(ref book) = speed_snapshot {
-            engine = engine.with_speed(book, &running_tasks);
+            engine = engine.with_speed(book.as_ref(), &running_tasks);
         }
         engine.rr_cursor = self.rr_cursor.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -4784,27 +4830,35 @@ mod tests {
         );
         assert_eq!(today.assignments, with_one.assignments);
 
-        // Single task on an idle cluster -> places identically to today.
-        let mut two_sample_book = one_sample_book.clone();
-        two_sample_book.record_sample(fast.worker_id, key, 200, 30);
-        two_sample_book.record_sample(slow.worker_id, key, 10_000, 30);
-
-        let mut big_fast = make_worker("big-fast", 16, 32768, false, false);
-        big_fast.worker_id = fast.worker_id;
+        // Single task on an idle cluster (`fast` = 8 cores at 1,000 ms vs `big_slow` = 16 cores at
+        // 1,010 ms, only 1% slower) -> goes to 16-core `big_slow`, identical to today's `rank`.
+        let mut big_slow = make_worker("big-slow", 16, 32768, false, false);
+        big_slow.worker_id = slow.worker_id;
+        let mut near_equal_book = SpeedBook::new();
+        for _ in 0..2 {
+            near_equal_book.record_sample(fast.worker_id, key, 1_000, 30);
+            near_equal_book.record_sample(big_slow.worker_id, key, 1_010, 30);
+        }
         let single = vec![Task::new(spec.clone(), TaskRequirements::generic(1, 30))];
         let today_single =
-            WorkloadScheduler::matchmake(&cfg, &single, &[big_fast.clone(), slow.clone()]);
+            WorkloadScheduler::matchmake(&cfg, &single, &[fast.clone(), big_slow.clone()]);
         let speed_single = WorkloadScheduler::matchmake_with_speed(
             &cfg,
             &single,
-            &[big_fast, slow.clone()],
+            &[fast.clone(), big_slow.clone()],
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
-            &two_sample_book,
+            &near_equal_book,
             &HashMap::new(),
         );
+        assert_eq!(today_single.assignments.len(), 1);
+        assert_eq!(today_single.assignments[0].worker_id, big_slow.worker_id);
         assert_eq!(today_single.assignments, speed_single.assignments);
+
+        let mut two_sample_book = one_sample_book.clone();
+        two_sample_book.record_sample(fast.worker_id, key, 200, 30);
+        two_sample_book.record_sample(slow.worker_id, key, 10_000, 30);
 
         // Unknown worker (`0` samples) gets `expected = avg(best) * 1.0`, so it receives work and
         // gets measured while `slow` is still avoided.
@@ -5009,5 +5063,323 @@ mod tests {
         assert!(r_at.skipped.is_empty());
         assert_eq!(r_at.assignments.len(), 1);
         assert_eq!(r_at.assignments[0].worker_id, slow1.worker_id);
+    }
+
+    #[test]
+    fn test_sched4_near_equal_workers_spread_instead_of_packing() {
+        let mut w_a = make_worker("worker-a", 8, 16384, false, false);
+        w_a.capabilities.tags = vec!["slots:8".into()];
+        let mut w_b = make_worker("worker-b", 8, 16384, false, false);
+        w_b.capabilities.tags = vec!["slots:8".into()];
+
+        let spec = TaskSpec::new_command("map", vec!["chunk.py".into()]);
+        let key = TaskKey::of(&spec);
+        let mut book = SpeedBook::new();
+        for _ in 0..3 {
+            book.record_sample(w_a.worker_id, key, 1_000, 60);
+            book.record_sample(w_b.worker_id, key, 1_010, 60);
+        }
+
+        let cfg = SchedulerConfig::default();
+        let batch: Vec<Task> = (0..8)
+            .map(|_| Task::new(spec.clone(), TaskRequirements::generic(1, 60)))
+            .collect();
+
+        // 1. Two 8-core workers with averages 1000 and 1010 ms and 8 tasks split 4/4 as today.
+        let today = WorkloadScheduler::matchmake(&cfg, &batch, &[w_a.clone(), w_b.clone()]);
+        let speed = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &batch,
+            &[w_a.clone(), w_b.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &book,
+            &HashMap::new(),
+        );
+        let today_a = today
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == w_a.worker_id)
+            .count();
+        let today_b = today
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == w_b.worker_id)
+            .count();
+        let speed_a = speed
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == w_a.worker_id)
+            .count();
+        let speed_b = speed
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == w_b.worker_id)
+            .count();
+        assert_eq!((today_a, today_b), (4, 4));
+        assert_eq!((speed_a, speed_b), (4, 4));
+
+        // 2. Idle cluster, 8-core worker (1000 ms) vs 16-core worker (1010 ms): single task goes to
+        //    the 16-core worker per today's `rank`.
+        let mut w_big = make_worker("worker-big", 16, 32768, false, false);
+        w_big.capabilities.tags = vec!["slots:16".into()];
+        let mut idle_book = SpeedBook::new();
+        for _ in 0..3 {
+            idle_book.record_sample(w_a.worker_id, key, 1_000, 60);
+            idle_book.record_sample(w_big.worker_id, key, 1_010, 60);
+        }
+        let single = vec![Task::new(spec.clone(), TaskRequirements::generic(1, 60))];
+        let today_single =
+            WorkloadScheduler::matchmake(&cfg, &single, &[w_a.clone(), w_big.clone()]);
+        let speed_single = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &single,
+            &[w_a.clone(), w_big.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &idle_book,
+            &HashMap::new(),
+        );
+        assert_eq!(today_single.assignments[0].worker_id, w_big.worker_id);
+        assert_eq!(speed_single.assignments[0].worker_id, w_big.worker_id);
+
+        // 3. Full fast worker (1000 ms) vs idle 5x slow worker (5000 ms) still holds.
+        let mut w_fast_full = w_a;
+        w_fast_full.capabilities.tags = vec!["slots:1".into()];
+        w_fast_full.active_tasks = 1;
+        let w_slow = make_worker("worker-slow", 8, 16384, false, false);
+        let mut fast_slow_book = SpeedBook::new();
+        for _ in 0..3 {
+            fast_slow_book.record_sample(w_fast_full.worker_id, key, 1_000, 60);
+            fast_slow_book.record_sample(w_slow.worker_id, key, 5_000, 60);
+        }
+        let mut running = HashMap::new();
+        running.insert(w_fast_full.worker_id, vec![(key, Duration::ZERO)]);
+        let held = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &single,
+            &[w_fast_full, w_slow],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &fast_slow_book,
+            &running,
+        );
+        assert_eq!(
+            held.skipped,
+            vec![(single[0].id, ScheduleSkipReason::WaitingForFasterWorker)]
+        );
+    }
+
+    #[test]
+    fn test_sched4_dead_speed_cache_and_cap_bypass() {
+        let mut fast = make_worker("fast", 4, 8192, false, false);
+        fast.capabilities.tags = vec!["slots:1".into()];
+        fast.active_tasks = 1;
+        fast.features.insert(ProtocolCapabilities::WORKSPACES);
+        let mut slow = make_worker("slow", 4, 8192, false, false);
+        slow.capabilities.tags = vec!["slots:4".into()];
+        slow.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let spec = TaskSpec::new_command("batch", vec!["--step".into()]);
+        let key = TaskKey::of(&spec);
+        let mut book = SpeedBook::new();
+        for _ in 0..2 {
+            book.record_sample(fast.worker_id, key, 500, 60);
+            book.record_sample(slow.worker_id, key, 5_000, 60);
+        }
+        let mut running = HashMap::new();
+        running.insert(fast.worker_id, vec![(key, Duration::ZERO)]);
+
+        // 1. Batch of 200 identical tasks + 1 trailing task past the wait cap + 1 task with
+        //    `avoid = [fast]` + 1 workspace-affine task on `slow`.
+        //    First 200 hit `WaitingForFasterWorker` (via `dead_speed`), while the trailing tasks
+        //    must NOT be swallowed by the `(Shape, TaskKey)` cache.
+        let mut tasks: Vec<Task> = (0..200)
+            .map(|_| Task::new(spec.clone(), TaskRequirements::generic(1, 60)))
+            .collect();
+        let overdue = Task::new(spec.clone(), TaskRequirements::generic(1, 60));
+        let mut avoided = Task::new(spec.clone(), TaskRequirements::generic(1, 60));
+        avoided.id = TaskId::new();
+        let mut ws_task = Task::new(spec, TaskRequirements::generic(1, 60))
+            .with_workspace(rusty_grid_core::task::WorkspaceRef::new("slow-ws"));
+        ws_task.id = TaskId::new();
+
+        tasks.push(overdue.clone());
+        tasks.push(avoided.clone());
+        tasks.push(ws_task.clone());
+
+        let mut queued_for_overrides = HashMap::new();
+        queued_for_overrides.insert(overdue.id, Duration::from_millis(5_000));
+        let mut avoid_map = HashMap::new();
+        avoid_map.insert(avoided.id, vec![fast.worker_id]);
+        let mut affinity = HashMap::new();
+        affinity.insert("slow-ws".to_string(), slow.worker_id);
+
+        let report = WorkloadScheduler::matchmake_inner(
+            &SchedulerConfig::default(),
+            &tasks,
+            &[fast, slow.clone()],
+            &avoid_map,
+            &affinity,
+            &HashSet::new(),
+            Some(&book),
+            &running,
+            &queued_for_overrides,
+        );
+        assert_eq!(report.skipped.len(), 200);
+        assert!(report
+            .skipped
+            .iter()
+            .all(|(_, r)| *r == ScheduleSkipReason::WaitingForFasterWorker));
+        let assigned_ids: Vec<TaskId> = report.assignments.iter().map(|a| a.task_id).collect();
+        assert_eq!(assigned_ids, vec![overdue.id, avoided.id, ws_task.id]);
+        assert!(report
+            .assignments
+            .iter()
+            .all(|a| a.worker_id == slow.worker_id));
+    }
+
+    #[test]
+    fn test_sched4_ram_short_hold_does_not_starve_small_task() {
+        // `fast` still has free CPU slots (`active_tasks = 1`, `slots:4`) and free RAM for a
+        // small task (2048 MB available), but not enough RAM for a 4096 MB task.
+        // Holding the 4096 MB task MUST NOT reserve `fast`, so a smaller 512 MB task of the
+        // same `TaskKey` behind it still places on `fast` instead of `slow`.
+        let mut fast = make_worker("fast", 8, 16384, false, false);
+        fast.capabilities.tags = vec!["slots:4".into()];
+        fast.active_tasks = 1;
+        fast.ram_available_mb = 2_048;
+
+        let mut slow = make_worker("slow", 8, 32768, false, false);
+        slow.capabilities.tags = vec!["slots:4".into()];
+        slow.ram_available_mb = 16_384;
+
+        let spec = TaskSpec::new_command("worker", vec!["--run".into()]);
+        let key = TaskKey::of(&spec);
+        let mut book = SpeedBook::new();
+        for _ in 0..2 {
+            book.record_sample(fast.worker_id, key, 200, 60);
+            book.record_sample(slow.worker_id, key, 5_000, 60);
+        }
+
+        let mut req_big = TaskRequirements::generic(1, 60);
+        req_big.ram_mb = 4_096;
+        let big_task = Task::new(spec.clone(), req_big);
+
+        let mut req_small = TaskRequirements::generic(1, 60);
+        req_small.ram_mb = 512;
+        let small_task = Task::new(spec, req_small);
+        let mut running = HashMap::new();
+        running.insert(fast.worker_id, vec![(key, Duration::ZERO)]);
+
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &SchedulerConfig::default(),
+            &[big_task.clone(), small_task.clone()],
+            &[fast.clone(), slow],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &book,
+            &running,
+        );
+        assert_eq!(
+            report.skipped,
+            vec![(big_task.id, ScheduleSkipReason::WaitingForFasterWorker)]
+        );
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, small_task.id);
+        assert_eq!(report.assignments[0].worker_id, fast.worker_id);
+    }
+
+    #[test]
+    fn test_sched4_cold_start_outlier_still_gets_work() {
+        let mut fast = make_worker("fast", 8, 16384, false, false);
+        fast.capabilities.tags = vec!["slots:4".into()];
+        let mut cold = make_worker("cold", 8, 16384, false, false);
+        cold.capabilities.tags = vec!["slots:4".into()];
+
+        let spec = TaskSpec::new_command("coldcheck", vec!["--run".into()]);
+        let key = TaskKey::of(&spec);
+        let mut book = SpeedBook::new();
+        // `fast` has 2 samples at 200 ms; `cold` has only 1 cold-start outlier sample at 10,000 ms
+        // (`< speed_min_samples = 2`).
+        book.record_sample(fast.worker_id, key, 200, 60);
+        book.record_sample(fast.worker_id, key, 200, 60);
+        book.record_sample(cold.worker_id, key, 10_000, 60);
+
+        let batch: Vec<Task> = (0..8)
+            .map(|_| Task::new(spec.clone(), TaskRequirements::generic(1, 60)))
+            .collect();
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &SchedulerConfig::default(),
+            &batch,
+            &[fast.clone(), cold.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &book,
+            &HashMap::new(),
+        );
+        let fast_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == fast.worker_id)
+            .count();
+        let cold_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == cold.worker_id)
+            .count();
+        assert_eq!((fast_count, cold_count), (4, 4));
+    }
+
+    #[tokio::test]
+    async fn test_sched4_validate_speed_hold_factor() {
+        for valid in [0.0, -0.0, 1.01, 1.5, 10.0] {
+            assert!(
+                SchedulerConfig::validate_speed_hold_factor(valid).is_ok(),
+                "expected {valid} to be accepted"
+            );
+            assert!(SchedulerConfig::default()
+                .with_speed_hold_factor(valid)
+                .validate()
+                .is_ok());
+        }
+        for invalid in [
+            1.0,
+            0.99,
+            0.5,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(
+                SchedulerConfig::validate_speed_hold_factor(invalid).is_err(),
+                "expected {invalid} to be rejected"
+            );
+            assert!(SchedulerConfig::default()
+                .with_speed_hold_factor(invalid)
+                .validate()
+                .is_err());
+        }
+
+        let err = match crate::server::MasterServer::spawn_with_config(
+            crate::server::ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+            SchedulerConfig::default().with_speed_hold_factor(1.0),
+            crate::reaper::ReaperConfig::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected spawn_with_config to reject invalid speed_hold_factor"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, rusty_grid_core::error::GridError::Config(_)),
+            "expected GridError::Config for invalid speed_hold_factor, got: {err:?}"
+        );
     }
 }

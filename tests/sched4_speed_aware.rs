@@ -162,23 +162,22 @@ async fn sched4_batch_finishes_within_1_5x_fast_worker_and_zero_factor_restores_
     solo.teardown().await;
 
     // 2. Two in-process workers (`fast` at 1x and `slow` at 5x) under default `SchedulerConfig`.
-    //    Run a 4-task unpinned warmup so both workers record >= 2 samples naturally in `SpeedBook`.
+    //    Run an 8-task concurrent warmup so both workers saturate slots and record >= 2 samples
+    //    naturally in `SpeedBook` without depending on single-task CPU telemetry ordering.
     let d2_cluster = TwoSpeedCluster::spawn(SchedulerConfig::default(), true).await;
-    let (_, warmup_results) = d2_cluster.run_batch(4, BASE_SLEEP_MS).await;
+    let (_, warmup_results) = d2_cluster.run_batch(8, BASE_SLEEP_MS).await;
     let slow_id = d2_cluster.slow_id.expect("slow worker present");
-    assert_eq!(
-        warmup_results
-            .iter()
-            .filter(|r| r.worker_id == d2_cluster.fast_id)
-            .count(),
-        2
-    );
-    assert_eq!(
-        warmup_results
-            .iter()
-            .filter(|r| r.worker_id == slow_id)
-            .count(),
-        2
+    let fast_warmup = warmup_results
+        .iter()
+        .filter(|r| r.worker_id == d2_cluster.fast_id)
+        .count();
+    let slow_warmup = warmup_results
+        .iter()
+        .filter(|r| r.worker_id == slow_id)
+        .count();
+    assert!(
+        fast_warmup >= 2 && slow_warmup >= 2,
+        "concurrent warmup must give both workers >= 2 samples (got fast={fast_warmup}, slow={slow_warmup})"
     );
 
     // Measured batch with D2 active: all 8 tasks stay off the 5x-slower worker and finish within
@@ -198,10 +197,10 @@ async fn sched4_batch_finishes_within_1_5x_fast_worker_and_zero_factor_restores_
     );
 
     // 3. Same two workers and warmup, but `speed_hold_factor = 0.0`: D2 turns off and the old slow
-    //    timing returns (`slow` receives half of Wave 1 and drags the batch to ~5x single-task time).
+    //    timing returns (`slow` receives Wave 1 work and drags the batch above `cap`).
     let off_cluster =
         TwoSpeedCluster::spawn(SchedulerConfig::default().with_speed_hold_factor(0.0), true).await;
-    let _ = off_cluster.run_batch(4, BASE_SLEEP_MS).await;
+    let _ = off_cluster.run_batch(8, BASE_SLEEP_MS).await;
     let off_slow_id = off_cluster.slow_id.expect("slow worker present");
     let (off_elapsed, off_results) = off_cluster.run_batch(BATCH_TASKS, BASE_SLEEP_MS).await;
     let off_slow_count = off_results
@@ -217,5 +216,114 @@ async fn sched4_batch_finishes_within_1_5x_fast_worker_and_zero_factor_restores_
     assert!(
         off_elapsed > cap,
         "with speed_hold_factor = 0, old slow timing should return (> {cap:?}, got {off_elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn sched4_near_equal_workers_spread_after_warmup() {
+    const BASE_SLEEP_MS: u64 = 180;
+    const TASKS: usize = 8;
+
+    let sandbox_dir = TempDir::new().expect("tempdir for worker sandboxes");
+    let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+    let master = MasterServer::spawn_with_config(
+        server_cfg,
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn_with_config failed");
+    let master_addr = master.server_addr().to_string();
+
+    let mut ids = Vec::new();
+    let mut shutdowns = Vec::new();
+    for name in ["worker-a", "worker-b"] {
+        let cfg = WorkerConfig::new(master_addr.clone())
+            .with_name(name)
+            .with_cores(4)
+            .with_ram_mb(16_384)
+            .with_no_gpu(true)
+            .with_max_concurrency(4)
+            .with_sandbox_base_dir(sandbox_dir.path().join(name));
+        let mut client = WorkerClient::new(cfg);
+        ids.push(client.worker_id());
+        let (tx, rx) = watch::channel(false);
+        shutdowns.push(tx);
+        tokio::spawn(async move {
+            let _ = client.run(rx).await;
+        });
+    }
+
+    let ready = wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || async {
+            let workers = master.list_workers().await.unwrap_or_default();
+            workers.len() == 2 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
+        },
+    )
+    .await;
+    assert!(ready, "both near-equal workers failed to connect");
+
+    let spec = sleep_spec(BASE_SLEEP_MS);
+    // Warmup of 8 tasks so both workers record >= 2 samples in SpeedBook.
+    let mut warm_ids = Vec::with_capacity(TASKS);
+    for _ in 0..TASKS {
+        warm_ids.push(
+            master
+                .submit_task(Task::new(spec.clone(), TaskRequirements::generic(1, 30)))
+                .await
+                .unwrap(),
+        );
+    }
+    let warm_results: Vec<TaskResult> = join_all(
+        warm_ids
+            .into_iter()
+            .map(|id| master.wait_task(id, Some(Duration::from_secs(20)))),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.unwrap())
+    .collect();
+    assert!(warm_results.iter().all(TaskResult::is_success));
+
+    // Measured batch with SpeedBook populated: both 1x workers still share the 8-task batch.
+    let mut batch_ids = Vec::with_capacity(TASKS);
+    for _ in 0..TASKS {
+        batch_ids.push(
+            master
+                .submit_task(Task::new(spec.clone(), TaskRequirements::generic(1, 30)))
+                .await
+                .unwrap(),
+        );
+    }
+    let batch_results: Vec<TaskResult> = join_all(
+        batch_ids
+            .into_iter()
+            .map(|id| master.wait_task(id, Some(Duration::from_secs(20)))),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.unwrap())
+    .collect();
+    assert!(batch_results.iter().all(TaskResult::is_success));
+
+    let count_a = batch_results
+        .iter()
+        .filter(|r| r.worker_id == ids[0])
+        .count();
+    let count_b = batch_results
+        .iter()
+        .filter(|r| r.worker_id == ids[1])
+        .count();
+
+    for tx in shutdowns {
+        let _ = tx.send(true);
+    }
+    let _ = master.shutdown();
+
+    assert!(
+        count_a >= 2 && count_b >= 2,
+        "near-equal workers must spread work instead of packing onto one (a={count_a}, b={count_b})"
     );
 }

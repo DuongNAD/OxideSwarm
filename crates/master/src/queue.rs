@@ -345,6 +345,8 @@ pub struct TaskEntry {
     /// assignments made without session information). Results, progress and checkpoints are only
     /// accepted from this worker *and* session, so a superseded or reaped session cannot touch it.
     pub assigned_session: Option<u64>,
+    /// True when the current dispatch resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
+    pub resumed_from_checkpoint: bool,
     /// When set (`Some((worker_id, hold_until))`), this `Queued` task is held for `worker_id` to
     /// resume via `WorkerMessage::ResumeSession` until `hold_until` expires.
     pub adoptable_by: Option<(Uuid, Instant)>,
@@ -587,6 +589,8 @@ pub struct ResultOutcome {
     pub task_key: crate::speed::TaskKey,
     /// Declared timeout of the task in seconds (`0060` D1).
     pub timeout_secs: u64,
+    /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
+    pub resumed_from_checkpoint: bool,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.
@@ -1881,6 +1885,7 @@ impl TaskQueue {
                     rejection_count: p.rejection_count,
                     avoid_workers: p.avoid_workers,
                     assigned_session: None,
+                    resumed_from_checkpoint: false,
                     adoptable_by,
                     fail_if_not_adopted,
                     pending_failover_charge: false,
@@ -2496,6 +2501,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
                 pending_failover_charge: false,
@@ -2638,6 +2644,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
                 pending_failover_charge: false,
@@ -3269,6 +3276,7 @@ impl TaskQueue {
                     entry.state = TaskState::Scheduled;
                     entry.assigned_worker_id = Some(worker_id);
                     entry.assigned_session = session_id;
+                    entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
                     entry.adoptable_by = None;
                     entry.fail_if_not_adopted = false;
                     entry.pending_failover_charge = false;
@@ -3783,7 +3791,16 @@ impl TaskQueue {
 
         let now_instant = Instant::now();
         let now_epoch = Utc::now().timestamp() as u64;
-        let (state, owner, adoptable_by_sender, priority, sequence, task_key, timeout_secs) = {
+        let (
+            state,
+            owner,
+            adoptable_by_sender,
+            priority,
+            sequence,
+            task_key,
+            timeout_secs,
+            resumed_from_checkpoint,
+        ) = {
             let entry = inner
                 .tasks
                 .get(&task_id)
@@ -3802,6 +3819,7 @@ impl TaskQueue {
                 entry.sequence,
                 entry.task_key,
                 entry.task.requirements.timeout_secs,
+                entry.resumed_from_checkpoint,
             )
         };
 
@@ -3821,6 +3839,7 @@ impl TaskQueue {
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
+                    resumed_from_checkpoint,
                 },
                 None,
             ));
@@ -3867,6 +3886,7 @@ impl TaskQueue {
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
+                    resumed_from_checkpoint,
                 },
                 None,
             ));
@@ -4064,6 +4084,7 @@ impl TaskQueue {
                 adopted_from_hold: adoptable_by_sender,
                 task_key,
                 timeout_secs,
+                resumed_from_checkpoint,
             },
             ack,
         ))
@@ -7121,6 +7142,7 @@ mod tests {
                         rejection_count: 0,
                         avoid_workers: Vec::new(),
                         assigned_session: None,
+                        resumed_from_checkpoint: false,
                         adoptable_by: None,
                         fail_if_not_adopted: false,
                         pending_failover_charge: false,

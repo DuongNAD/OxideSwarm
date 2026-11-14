@@ -265,7 +265,7 @@ struct WorkerRegistryInner {
 #[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<RwLock<WorkerRegistryInner>>,
-    speed_book: Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<crate::speed::SpeedBook>>>>>,
+    speed_book: Arc<std::sync::Mutex<Option<crate::speed::SharedSpeedBook>>>,
 }
 
 impl Default for WorkerRegistry {
@@ -290,16 +290,13 @@ impl WorkerRegistry {
 
     /// Attaches the scheduler's [`crate::speed::SpeedBook`] so terminal task results and worker
     /// pruning update it under the scheduler's own lock (`0060` D1).
-    pub(crate) fn set_speed_book(
-        &self,
-        speed_book: Arc<std::sync::Mutex<crate::speed::SpeedBook>>,
-    ) {
+    pub(crate) fn set_speed_book(&self, speed_book: crate::speed::SharedSpeedBook) {
         *self.speed_book.lock().unwrap_or_else(|e| e.into_inner()) = Some(speed_book);
     }
 
     /// Returns the attached [`crate::speed::SpeedBook`], if a [`crate::scheduler::WorkloadScheduler`]
     /// has been bound to this registry.
-    pub fn speed_book(&self) -> Option<Arc<std::sync::Mutex<crate::speed::SpeedBook>>> {
+    pub fn speed_book(&self) -> Option<crate::speed::SharedSpeedBook> {
         self.speed_book
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -554,9 +551,7 @@ impl WorkerRegistry {
         };
         if removed.is_some() {
             if let Some(sb) = self.speed_book() {
-                sb.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove_worker(worker_id);
+                crate::speed::mutate_shared_speed_book(&sb, |book| book.remove_worker(worker_id));
             }
         }
         removed
@@ -591,9 +586,9 @@ impl WorkerRegistry {
         let count = to_remove.len();
         if count > 0 {
             if let Some(sb) = self.speed_book() {
-                sb.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove_workers(&to_remove);
+                crate::speed::mutate_shared_speed_book(&sb, |book| {
+                    book.remove_workers(&to_remove);
+                });
             }
         }
         count

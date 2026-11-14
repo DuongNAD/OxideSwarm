@@ -1822,7 +1822,9 @@ impl WorkerClient {
     }
 
     /// Test hook scaling `BuiltinTest` sleep durations by `multiplier.max(1)` on this worker's
-    /// [`TaskRunner`] (`docs/design/0060-speed-aware-placement.md` integration test).
+    /// [`TaskRunner`] (`docs/design/0060-speed-aware-placement.md` integration test). Exists for
+    /// integration tests only and is not exposed via CLI, environment variables, or wire messages.
+    #[doc(hidden)]
     pub fn with_test_sleep_multiplier(mut self, multiplier: u32) -> Self {
         let runner_cfg = self
             .runner

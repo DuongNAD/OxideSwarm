@@ -1,7 +1,7 @@
 # 0060: Place tasks by measured worker speed and re-run stragglers (`SCHED-4`)
 
 Status: Partial
-Created: 2026-11-10    Updated: 2026-11-11
+Created: 2026-11-10    Updated: 2026-11-14
 
 ## Summary
 
@@ -65,11 +65,15 @@ no history keep today's placement exactly.
   Inputs and environment are not part of the key.
 - **Entry** per (worker id, key): an exponential moving average of `duration_ms` with weight 0.3,
   the sample count, and the time of the last sample. Only successful results count; a result whose
-  `duration_ms` is 0 or above the task's timeout is ignored.
-- **Bounds:** at most 4,096 keys, least recently used evicted first, and at most 64 workers per key.
-  A worker that leaves (its sessions swept and its registry entry pruned) loses its entries.
+  `duration_ms` is 0 or above the task's timeout is ignored, and an attempt that resumed from a
+  checkpoint (`AssignTaskWithCheckpoint`) is ignored because its `duration_ms` covers only the
+  remainder after the checkpoint (normal tasks that emit checkpoints along the way still record).
+- **Bounds:** at most 4,096 keys, least recently recorded evicted first (`get` does not refresh key
+  recency), and at most 64 workers per key. A worker that leaves (its sessions swept and its
+  registry entry pruned) loses its entries.
 - **Update** happens where the master records a terminal result, under the scheduler's own lock,
-  not the queue lock.
+  not the queue lock. `SpeedBook` stores each key's bucket behind copy-on-write `Arc` and shares an
+  `Arc<SpeedBook>` snapshot with `schedule_batch` in O(1) without cloning all 4,096 buckets.
 
 ### D2: Placement
 
@@ -77,20 +81,29 @@ In `Engine::place`, after `candidates` and before `rank`, for a task whose key h
 2 samples on at least one matching worker:
 
 1. `best` is the matching worker (ignoring free slots) with the lowest average for the key.
-2. For each candidate `c` with a free slot: `expected(c)` is its average, or `best`'s average
-   times 1.0 when `c` has no samples (unknown workers are treated as equal, so they still get work
-   and get measured).
+2. For each candidate `c` with a free slot: `expected(c)` is its average when `c` has at least
+   `speed_min_samples` samples for the key, or `best`'s average times 1.0 otherwise (unknown and
+   under-sampled workers are treated as equal so a single cold-start outlier does not mark a worker
+   slow and starve it of re-measurement).
 3. `ready(best)` is 0 when `best` has a free slot in this pass, else the shortest time left among
    its running tasks of known key: its average minus how long the task has run, at least 0.
-4. If `expected(c) >= 1.5 * (ready(best) + avg(best))` for every candidate, the task stays queued
-   with a new skip reason `WaitingForFasterWorker`, and `hold_back` reserves `best` for it in this
-   pass. Otherwise the candidates are re-ordered by expected finish time
-   (`ready + expected`), with today's `rank` order as the tie break.
-5. A task never waits longer than its expected time on the slow worker: once it has waited that
-   long, the rule above is skipped for it.
+4. If `expected(c) >= speed_hold_factor * (ready(best) + avg(best))` for every candidate, the task
+   stays queued with skip reason `WaitingForFasterWorker`. `hold_back` reserves `best` in this pass
+   only when the task waits for `best`'s slots (`full`), not when `best` still has free slots and
+   was excluded for another reason such as `ram_short`, `host_busy`, or GPU preservation. The hold
+   decision and `min_expected` are cached per `(Shape, TaskKey)` within the pass when `avoid` and
+   `workspace` are empty. Otherwise only candidates that are clearly slower
+   (`expected(c) >= speed_hold_factor * min_expected`, where `min_expected` is the minimum over
+   `candidates`) are excluded, and the remaining candidates keep today's `rank` order with no
+   re-ordering by expected finish time.
+5. A task never waits longer than `min_expected` (the fastest free candidate's expected time): once
+   it has waited that long, the hold rule above is skipped for it.
 
 The factor 1.5 and the minimum of 2 samples are `SchedulerConfig` fields (`speed_hold_factor`,
-`speed_min_samples`) with these defaults; `speed_hold_factor = 0` turns D2 off.
+`speed_min_samples`) with these defaults; `speed_hold_factor = 0` turns D2 off, and any value other
+than `0` or a finite number `> 1.0` is refused at configuration and startup time. Operators can set
+it via `master --speed-hold-factor <FACTOR>`, `RUSTY_GRID_SPEED_HOLD_FACTOR`, or
+`[master].speed_hold_factor`.
 
 ### D3: Straggler re-run (opt-in)
 
@@ -150,7 +163,7 @@ worker table.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | SCHED-4a | Speed history | `crates/master/src/speed.rs`, `server.rs` | Unit tests of D1 | Implemented |
-| SCHED-4b | Speed-aware placement | `crates/master/src/scheduler.rs` | Unit and integration tests of D2 | Implemented |
+| SCHED-4b | Speed-aware placement | `crates/master/src/scheduler.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Unit and integration tests of D2 | Implemented |
 | SCHED-4c | Straggler re-run | `crates/master/src/reaper.rs`, `queue.rs`, `crates/core/src/placement.rs`, `crates/cli/src/cli_app.rs` | Integration tests of D3 | Planned |
 | SCHED-4d | Speed in `workers` and the dashboard | `registry.rs`, `web_ui.rs`, `dashboard.html` | `workers --json` shows `speed:` | Planned |
 
@@ -158,3 +171,4 @@ worker table.
 
 - 2026-11-10: Created from the two-machine trial measurements in Context. Planned.
 - 2026-11-11: Implemented `SCHED-4a` (`SpeedBook` in `crates/master/src/speed.rs`, updated on terminal results in `crates/master/src/server.rs` and cleared on worker removal/pruning in `crates/master/src/registry.rs`) and `SCHED-4b` (D2 speed-aware placement and `ScheduleSkipReason::WaitingForFasterWorker` in `crates/master/src/scheduler.rs`, verified by `tests/sched4_speed_aware.rs`). `SCHED-4c` and `SCHED-4d` remain Planned.
+- 2026-11-14: Amended D1 and D2 for review round 1: excluded only candidates with `expected(c) >= speed_hold_factor * min_expected` while preserving `rank` order among near-equal workers, added `Engine::dead_speed` per-pass cache and `Arc<SpeedBook>` copy-on-write snapshots, restricted `hold_back` reservation of `best` to `full` slot waits, added `speed_hold_factor` validation (`0` or finite `> 1.0`) plus `--speed-hold-factor` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`), treated `< speed_min_samples` candidates as unknown (`best_avg`), skipped recording checkpoint-resumed attempts (`AssignTaskWithCheckpoint`), and documented least-recently-recorded D1 eviction.

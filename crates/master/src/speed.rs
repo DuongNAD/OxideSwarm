@@ -6,6 +6,7 @@
 //! instead of filling slow slots that would stretch total batch time.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -140,10 +141,34 @@ struct KeyBucket {
     workers: HashMap<Uuid, SpeedEntry>,
 }
 
+/// Shared copy-on-write handle to [`SpeedBook`].
+///
+/// Readers clone the inner `Arc<SpeedBook>` in `O(1)` without copying buckets; writers mutate via
+/// [`Arc::make_mut`], cloning only the outer map and the touched [`TaskKey`] bucket when a snapshot
+/// is currently held by a scheduling pass.
+pub type SharedSpeedBook = Arc<Mutex<Arc<SpeedBook>>>;
+
+/// Allocates a new [`SharedSpeedBook`].
+pub fn new_shared_speed_book() -> SharedSpeedBook {
+    Arc::new(Mutex::new(Arc::new(SpeedBook::new())))
+}
+
+/// Applies `f` to `shared` under its mutex via copy-on-write (`Arc::make_mut`).
+pub fn mutate_shared_speed_book<R>(
+    shared: &SharedSpeedBook,
+    f: impl FnOnce(&mut SpeedBook) -> R,
+) -> R {
+    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    f(Arc::make_mut(&mut *guard))
+}
+
 /// Bounded in-memory table of per-worker task execution speeds (`0060` D1).
+///
+/// Key eviction (`4,096` keys max) is **least-recently-recorded**: [`Self::get`] does not refresh
+/// key recency. Per-key worker eviction (`64` workers max) evicts the oldest recorded sample.
 #[derive(Debug, Clone)]
 pub struct SpeedBook {
-    buckets: HashMap<TaskKey, KeyBucket>,
+    buckets: HashMap<TaskKey, Arc<KeyBucket>>,
     max_keys: usize,
     max_workers_per_key: usize,
     next_seq: u64,
@@ -186,7 +211,8 @@ impl SpeedBook {
         self.buckets.get(&key).map_or(0, |b| b.workers.len())
     }
 
-    /// Looks up the speed entry for `(worker_id, key)` without mutating LRU order.
+    /// Looks up the speed entry for `(worker_id, key)` without mutating least-recently-recorded
+    /// eviction order (`get` does not refresh key recency).
     pub fn get(&self, worker_id: &Uuid, key: TaskKey) -> Option<&SpeedEntry> {
         self.buckets.get(&key)?.workers.get(worker_id)
     }
@@ -256,10 +282,13 @@ impl SpeedBook {
         }
 
         let max_workers = self.max_workers_per_key;
-        let bucket = self.buckets.entry(key).or_insert_with(|| KeyBucket {
-            last_used_seq: seq,
-            workers: HashMap::new(),
+        let bucket_arc = self.buckets.entry(key).or_insert_with(|| {
+            Arc::new(KeyBucket {
+                last_used_seq: seq,
+                workers: HashMap::new(),
+            })
         });
+        let bucket = Arc::make_mut(bucket_arc);
         bucket.last_used_seq = seq;
 
         if !bucket.workers.contains_key(&worker_id) && bucket.workers.len() >= max_workers {
@@ -294,7 +323,11 @@ impl SpeedBook {
     /// Removes all recorded speed entries for `worker_id` (called when a disconnected worker is
     /// pruned or removed from [`crate::registry::WorkerRegistry`]).
     pub fn remove_worker(&mut self, worker_id: &Uuid) {
-        self.buckets.retain(|_, bucket| {
+        self.buckets.retain(|_, bucket_arc| {
+            if !bucket_arc.workers.contains_key(worker_id) {
+                return true;
+            }
+            let bucket = Arc::make_mut(bucket_arc);
             bucket.workers.remove(worker_id);
             !bucket.workers.is_empty()
         });
@@ -305,7 +338,14 @@ impl SpeedBook {
         if worker_ids.is_empty() || self.buckets.is_empty() {
             return;
         }
-        self.buckets.retain(|_, bucket| {
+        self.buckets.retain(|_, bucket_arc| {
+            if !worker_ids
+                .iter()
+                .any(|id| bucket_arc.workers.contains_key(id))
+            {
+                return true;
+            }
+            let bucket = Arc::make_mut(bucket_arc);
             for id in worker_ids {
                 bucket.workers.remove(id);
             }
@@ -598,7 +638,6 @@ mod tests {
 
     #[tokio::test]
     async fn registry_remove_and_prune_drop_worker_speed_entries() {
-        use std::sync::{Arc, Mutex};
         use tokio::sync::mpsc;
 
         use rusty_grid_core::capabilities::WorkerCapabilities;
@@ -606,7 +645,7 @@ mod tests {
         use crate::registry::WorkerRegistry;
 
         let registry = WorkerRegistry::new();
-        let book = Arc::new(Mutex::new(SpeedBook::new()));
+        let book = new_shared_speed_book();
         registry.set_speed_book(Arc::clone(&book));
 
         let w1 = Uuid::new_v4();
@@ -635,23 +674,28 @@ mod tests {
             .unwrap();
 
         let key = TaskKey(77);
-        {
-            let mut sb = book.lock().unwrap();
+        mutate_shared_speed_book(&book, |sb| {
             // Also verify timeout_secs == 0 uses the 60 s fallback like TaskRunner::execute.
             assert!(sb.record_sample(w1, key, 250, 0));
             assert!(sb.record_sample(w2, key, 900, 60));
             assert_eq!(sb.worker_count(key), 2);
-        }
+        });
 
         // Direct removal drops w1's speed entries immediately.
         assert!(registry.remove_worker(&w1).await.is_some());
-        assert!(book.lock().unwrap().get(&w1, key).is_none());
-        assert!(book.lock().unwrap().get(&w2, key).is_some());
+        {
+            let guard = book.lock().unwrap();
+            assert!(guard.get(&w1, key).is_none());
+            assert!(guard.get(&w2, key).is_some());
+        }
 
         // Sweeping w2's session and pruning its stale disconnected entry drops w2's speed entries.
         registry.mark_disconnected(&w2).await.unwrap();
         assert_eq!(registry.prune_stale_workers(Duration::ZERO).await, 1);
-        assert!(book.lock().unwrap().get(&w2, key).is_none());
-        assert!(book.lock().unwrap().is_empty());
+        {
+            let guard = book.lock().unwrap();
+            assert!(guard.get(&w2, key).is_none());
+            assert!(guard.is_empty());
+        }
     }
 }
