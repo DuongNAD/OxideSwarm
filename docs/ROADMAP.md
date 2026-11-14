@@ -68,6 +68,11 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   spikes come first: a GPU inside the sandbox (R20) and a reading of Mesh-LLM (R21). The
   plan is in [design 0064](design/0064-research-of-2026-11-13-and-route.md). Q54 to Q56 are
   open.
+- Tests for large transfers and long runs (Draft, 2026-11-14): a harness that moves files of 1 to
+  8 GiB and large trees between machines, and a 24-hour run under load and faults. It comes after
+  0.2.0 and before the model items of design 0062. The plan is in
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
+  Q57 to Q59 are open.
 
 ## Where the project stands
 
@@ -565,6 +570,9 @@ answers.
 | Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Open. Recommended: yes, after spike R20; it is a wire change and gets a design record |
+| Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
+| Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
+| Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -702,3 +710,8 @@ answers.
   that the owner supplied. It names the basis of each finding, orders the existing items in
   seven steps, and adds spikes R20 and R21, item SCHED-5 and open decisions Q54 to Q56.
   Nothing is built or measured, and no item entered the backlog.
+- 2026-11-14: Draft added at the owner's request:
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md), tests for large transfers and
+  long runs. The end-to-end blob tests move at most about 5 MiB per file, and no record measures a
+  cluster over hours. It adds TEST-24 to TEST-26 (Planned) and open decisions Q57 to Q59. Nothing
+  is built.
