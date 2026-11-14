@@ -354,6 +354,7 @@ async fn test_token_less_legacy_registration_still_works_on_a_loopback_hub_witho
 #[tokio::test]
 async fn test_rest_endpoints_need_the_token_and_send_no_cors_headers() {
     let (hub, _url, port) = start_hub(token_config()).await;
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
 

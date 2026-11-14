@@ -56,6 +56,7 @@ fn strict() -> AuthConfig {
 }
 
 fn http_client() -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

@@ -41,6 +41,14 @@ use rusty_grid_master::queue::TaskInfo;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use rusty_grid_worker::client::WorkerClient;
 
+fn http_client(timeout: Duration) -> Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client")
+}
+
 /// Helper: wait up to `timeout` for a file to exist on disk.
 async fn wait_file_exists(path: &std::path::Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
@@ -116,10 +124,7 @@ async fn test_malformed_queries_to_api_tasks() {
         assert_eq!(res.exit_code, 0);
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client(Duration::from_secs(5));
 
     // Baseline: verify 2 tasks in total
     let resp = client
@@ -357,10 +362,7 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
         .expect("wait task");
     assert_eq!(res.exit_code, 0);
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client(Duration::from_secs(5));
 
     // 1. Verify the valid task returns HTTP 200 with accurate TaskInfo
     let valid_url = format!("{}/api/tasks/{}", base_url, valid_task_id);
@@ -467,10 +469,7 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
 ///      verifying zero port collisions and independent clean shutdowns.
 #[tokio::test]
 async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .expect("reqwest client");
+    let client = http_client(Duration::from_secs(3));
 
     // --- Part A: Rapid Sequential Spin-Up & Shutdown (20 iterations) ---
     const SEQUENTIAL_CYCLES: usize = 20;
@@ -688,10 +687,7 @@ async fn test_concurrent_rest_bombardment_under_load() {
     let total_404_requests = Arc::new(AtomicUsize::new(0));
     let total_500_errors = Arc::new(AtomicUsize::new(0));
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client(Duration::from_secs(5));
 
     // Launch 8 concurrent bombardment tasks issuing 50 requests each (400 requests total)
     let num_bombard_tasks = 8;

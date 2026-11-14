@@ -9544,6 +9544,7 @@ mod tests {
         let dash_addr = h
             .dashboard_addr()
             .expect("dashboard must be enabled in this test");
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let status_dto: crate::dashboard::dto::ClusterStatusDto =
             reqwest::get(format!("http://{dash_addr}/api/status"))
                 .await
