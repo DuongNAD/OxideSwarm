@@ -1059,7 +1059,7 @@ pub async fn run_invite_code(
                 let pt = p2p_ticket.clone();
                 let cm = cli_master_flag.clone();
                 let iid = invite_id.clone();
-                let isec = invite_secret.clone();
+                let isec = invite_secret;
                 let mk = master_key;
                 let rls = roles.clone();
                 let ca = connect_addr.clone();

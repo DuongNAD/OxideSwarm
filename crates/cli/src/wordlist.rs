@@ -17,7 +17,7 @@ pub const MIN_NAMEPLATE: u16 = 1;
 pub const MAX_NAMEPLATE: u16 = 999;
 
 /// BIP-0039 English word list (2048 strictly sorted lowercase ASCII words).
-pub const WORDS: [&str; 2048] = [
+pub static WORDS: [&str; 2048] = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire",
     "across", "act", "action", "actor", "actress", "actual", "adapt", "add", "addict", "address",
@@ -358,8 +358,8 @@ fn damerau_levenshtein(a: &[u8], b: &[u8]) -> usize {
     for (i, cell) in dp.iter_mut().step_by(cols).enumerate().take(m + 1) {
         *cell = i;
     }
-    for j in 0..=n {
-        dp[j] = j;
+    for (j, cell) in dp.iter_mut().enumerate().take(n + 1) {
+        *cell = j;
     }
     for i in 1..=m {
         for j in 1..=n {
