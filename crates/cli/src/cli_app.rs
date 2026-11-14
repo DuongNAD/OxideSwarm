@@ -174,6 +174,9 @@ pub enum Commands {
     /// Create, list, or revoke OXS-AUTH v3 machine enrollment invites
     Invite(crate::members_cmd::InviteArgs),
 
+    /// Create encrypted USB setup kits (`oxideswarm usb create <DIR>`)
+    Usb(crate::usb_kit::UsbCliArgs),
+
     /// List, approve, reject, revoke, or rename enrolled cluster members
     Members(crate::members_cmd::MembersCliArgs),
 
@@ -1261,6 +1264,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Invite(args) => {
             crate::members_cmd::run_invite(args, config_file, secret_opts).await
         }
+        Commands::Usb(args) => crate::usb_kit::run_usb(args, config_file, secret_opts).await,
         Commands::Members(args) => {
             crate::members_cmd::run_members(args, config_file, secret_opts).await
         }

@@ -42,6 +42,11 @@ base64 = "0.23"
 toml_edit = "0.25"
 ring = "0.17"
 spake2 = "0.4"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+tokio-rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+url = "2"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -212,5 +217,9 @@ path = "../../tests/cli_pair_e2e.rs"
 [[test]]
 name = "rendezvous_discovery_e2e"
 path = "../../tests/rendezvous_discovery_e2e.rs"
+
+[[test]]
+name = "cli_usb_kit_e2e"
+path = "../../tests/cli_usb_kit_e2e.rs"
 
 

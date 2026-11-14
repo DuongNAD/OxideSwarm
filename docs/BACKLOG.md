@@ -232,7 +232,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), 185, 195, 207 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
-| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented | 226 (open) |
+| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented | 226 |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
@@ -2579,7 +2579,7 @@ Add one dated line per finished item, newest last.
   (`tests/observability_metrics_otel_test.rs`). The Index counts are now 74 Implemented, 7 Partial
   and 41 Planned.
 - 2026-11-14: Implemented USB-3 (Keep the Windows USB install folder apart from the default
-  workspace root, pull request 226, open): `packaging/usb/install.ps1` defaults `-InstallRoot` to
+  workspace root, pull request 226): `packaging/usb/install.ps1` defaults `-InstallRoot` to
   `%LOCALAPPDATA%\OxideSwarm-USB` (and `<drive>:\OxideSwarm-USB`), refuses fresh installs in
   `%LOCALAPPDATA%\OxideSwarm` or `%LOCALAPPDATA%\oxideswarm\workspaces` while continuing `-Update`
   and `uninstall.ps1` fallback for legacy `%LOCALAPPDATA%\OxideSwarm` installs, always passes
@@ -2588,3 +2588,10 @@ Add one dated line per finished item, newest last.
   folder containing an unmarked or foreign-used `workspaces` directory while naming the worker using
   it (`tests/test_launcher_scripts.py` + isolated live Windows cluster check). The Index counts are
   now 75 Implemented, 7 Partial and 40 Planned.
+- 2026-11-14: `USB-1a` and `USB-1b` implemented (`win2`): added `oxideswarm usb create`
+  (`crates/cli/src/usb_kit.rs`), `oxideswarm join --invite-file` (`crates/cli/src/join.rs`),
+  `invite.oxs` + `kit.json`, v1 `packaging/usb/` installers and uninstallers, `tests/cli_usb_kit_e2e.rs`,
+  Windows/POSIX v1 launcher tests in `tests/test_launcher_scripts.py`, and docs updates across
+  [design 0053](design/0053-usb-setup-kit.md), [guides/add-a-machine.md](guides/add-a-machine.md),
+  and [README.md](../README.md). `USB-1` stays `Partial` until the cross-machine live stick test is
+  recorded; the Index counts remain 75 Implemented, 7 Partial and 40 Planned.

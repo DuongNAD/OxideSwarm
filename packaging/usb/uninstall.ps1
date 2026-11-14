@@ -1,14 +1,15 @@
-# OxideSwarm USB uninstaller for Windows (kit format v0, design 0053 / 0055).
+# OxideSwarm USB uninstaller for Windows (kit format v0 / v1, design 0053 / 0055).
 # Stops the worker this kit installed, revokes any oxideswarm.toolchain ACL grants recorded in its
 # manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its folder
-# (binaries, the cluster secret it received, logs, task folders and file cache), and
-# %TEMP%\oxideswarm-usb. Nothing else is touched. Without -InstallRoot it removes the install the
-# installer recorded in HKCU (another drive included), else %LOCALAPPDATA%\OxideSwarm-USB (or
-# %LOCALAPPDATA%\OxideSwarm for an older install).
-#   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-Yes]
+# (binaries, credentials, logs, task folders and file cache), and %TEMP%\oxideswarm-usb. Nothing else
+# is touched. Without -InstallRoot it removes the install the installer recorded in HKCU (another
+# drive included), else %LOCALAPPDATA%\OxideSwarm-USB (or %LOCALAPPDATA%\OxideSwarm for an older
+# install). Pass -KeepKey to retain <install folder>\home\node.key for rejoining with the same identity.
+#   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-KeepKey] [-Yes]
 [CmdletBinding()]
 param(
     [string]$InstallRoot = "",
+    [switch]$KeepKey,
     [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
@@ -117,9 +118,14 @@ if (Test-Path -LiteralPath $WorkspacesDir) {
         exit 1
     }
 }
+$NodeKeyPath = Join-Path $InstallRoot 'home\node.key'
 if (-not $Yes) {
-    $ans = Read-Host "Remove the OxideSwarm worker installed in $InstallRoot? [y/N]"
+    $ans = Read-Host "Remove the OxideSwarm install in $InstallRoot? [y/N]"
     if ($ans -notmatch '^(y|yes)$') { Write-Host "Nothing removed."; exit 0 }
+    if (-not $KeepKey -and (Test-Path -LiteralPath $NodeKeyPath)) {
+        $keepAns = Read-Host "Keep machine identity key ($NodeKeyPath) so rejoining keeps the same identity? [y/N]"
+        if ($keepAns -match '^(y|yes)$') { $KeepKey = $true }
+    }
 }
 # The start at logon belongs to this install only if it runs this install's launcher.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -171,7 +177,19 @@ if (Test-Path -LiteralPath $Manifest) {
     Write-Host "No isolation ACL grant manifest in $Manifest (nothing to revoke)."
 }
 
-Remove-Item -Recurse -Force -LiteralPath $InstallRoot
+if ($KeepKey -and (Test-Path -LiteralPath $NodeKeyPath)) {
+    foreach ($child in @(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue)) {
+        if ($child.Name -in @('home', '.oxideswarm-usb-install')) { continue }
+        Remove-Item -LiteralPath $child.FullName -Recurse -Force
+    }
+    foreach ($homeChild in @(Get-ChildItem -LiteralPath (Join-Path $InstallRoot 'home') -Force -ErrorAction SilentlyContinue)) {
+        if ($homeChild.Name -eq 'node.key') { continue }
+        Remove-Item -LiteralPath $homeChild.FullName -Recurse -Force
+    }
+    Write-Host "Kept machine identity key at $NodeKeyPath."
+} else {
+    Remove-Item -Recurse -Force -LiteralPath $InstallRoot
+}
 $pointerFull = if ($pointer) { [IO.Path]::GetFullPath($pointer).TrimEnd('\') } else { $null }
 if ($pointerFull -and [string]::Equals($pointerFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase)) {
     Remove-Item -Path $PointerKey -Force
