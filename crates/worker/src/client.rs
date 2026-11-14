@@ -3146,6 +3146,7 @@ impl WorkerClient {
     /// Connects over plain TCP, discovering the Master first when the address is `auto`.
     async fn establish_tcp(&self) -> GridResult<(WorkerStreamMode, String)> {
         let mut target_addr = self.config.master_addr.clone();
+        #[cfg(feature = "p2p")]
         let mut discovered_p2p_ticket: Option<String> = None;
         if target_addr.is_empty()
             || target_addr.eq_ignore_ascii_case("auto")
@@ -3179,7 +3180,10 @@ impl WorkerClient {
                         hostname = %beacon.hostname,
                         "Discovered active Master via discovery"
                     );
-                    discovered_p2p_ticket = beacon.p2p_ticket.clone();
+                    #[cfg(feature = "p2p")]
+                    {
+                        discovered_p2p_ticket = beacon.p2p_ticket.clone();
+                    }
                     *self.master_beacon.write().await = Some(beacon.clone());
                     target_addr = beacon.cluster_addr;
                 }
