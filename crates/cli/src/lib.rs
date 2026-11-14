@@ -11,6 +11,7 @@ pub mod members_cmd;
 pub mod mode_cli;
 pub mod pair;
 pub mod secret_cmd;
+pub mod usb_kit;
 pub mod wordlist;
 
 pub use cli_app::run_cli;
