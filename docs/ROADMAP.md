@@ -1,8 +1,12 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, Q6 and Q7 on 2026-11-08, and
-Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09.
-Created: 2026-11-07    Updated: 2026-11-09
+Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29 (the charter of
+design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059),
+Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
+memory of another machine with no file written there first, design 0062) on 2026-11-11, and
+Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
+Created: 2026-11-07    Updated: 2026-11-13
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -30,6 +34,45 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 - Long-term goal (Draft, 2026-11-10): an open compute network where anyone can offer and use idle
   compute, safely and with checkable results. Phase H carries it, and the architecture is in
   [design 0054](design/0054-open-compute-network.md).
+- Frontier program (Draft, 2026-11-10): what a person outside the project would switch to
+  OxideSwarm for. Tasks become portable, movable and checkable, through bets A to E. Each bet
+  starts with a spike that can end it and finishes with a recorded run on real machines. The plan
+  is in [design 0056](design/0056-frontier-program.md), and decisions Q19 to Q26 and Q30 are open.
+- Lasting value (Draft, 2026-11-10): why anyone should trust the grid, build on it, cite it and
+  find it alive after its founder. Fuzzing, deterministic simulation, a written specification with
+  a second decoder, citable releases, and a release without the owner. The plan is in
+  [design 0058](design/0058-lasting-value.md). Its first four items are in the backlog, and
+  decisions Q31 and Q33 to Q35 are open.
+- First users (Draft, 2026-11-10): who gains what from the grid today, and the order of work that
+  serves them. The first audience is a developer with a coding agent and machines on more than one
+  operating system. A study of first use comes before more is built. The plan is in
+  [design 0059](design/0059-first-users.md). The owner accepted Q37 on 2026-11-11 and runs the
+  first round of that study. Q36, Q38 and Q39 are open.
+- A first application for the model track (Draft, 2026-11-11): LIVA, the owner's desktop
+  assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
+  records and a balance per member, all proposals. The plan is in
+  [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
+- Model weights into the memory of another machine (Draft, 2026-11-11): a worker that holds no
+  model file runs a model whose file is on another machine, with no copy written to its disk
+  first (Q44, decided). Four spikes come first (R15 to R18). A model server that takes its
+  tensors from a stream, and the rule that the head of a split model runs on a worker, are
+  proposals. The plan is in [design 0062](design/0062-model-weights-into-remote-memory.md).
+  Q45 to Q47 are open.
+- Two directions in parallel (Draft, 2026-11-12): compute for coding agents, which is bet A
+  of design 0056, and a study kit for a class (Q48, decided). Each gets one trial that needs
+  nothing built (APP-2, APP-3). The owner's simulation project, Anima Engine, is read as a
+  first workload of the owner's own (APP-4). The plan is in
+  [design 0063](design/0063-two-directions-in-parallel.md). Q49, Q50, Q52 and Q53 are open.
+- Research of 2026-11-13 and the route that follows (Draft, 2026-11-13): what five research
+  documents found, which statements were checked, and the order of work that follows. Two
+  spikes come first: a GPU inside the sandbox (R20) and a reading of Mesh-LLM (R21). The
+  plan is in [design 0064](design/0064-research-of-2026-11-13-and-route.md). Q54 to Q56 are
+  open.
+- Tests for large transfers and long runs (Draft, 2026-11-14): a harness that moves files of 1 to
+  8 GiB and large trees between machines, and a 24-hour run under load and faults. It comes after
+  0.2.0 and before the model items of design 0062. The plan is in
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
+  Q57 to Q59 are open.
 
 ## Where the project stands
 
@@ -43,7 +86,7 @@ The state at `master` `3ce2a65` on 2026-11-09, after the live two-machine run.
 | Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP | `crates/core/src/cluster_auth.rs`, `crates/core/src/transport.rs` |
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
 | Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
-| Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel` and `doctor`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
+| Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
 | Durability | `master --state-dir` keeps queued, running and finished tasks in a journal and replays it at start. A worker keeps its tasks across a short disconnect, and the master adopts them again (`ResumeSession`) | `crates/master/src/store.rs`, `crates/master/src/session.rs`, `tests/master_restart_recovery.rs` |
 | Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
 | Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
@@ -345,7 +388,108 @@ The hard problems are not the network. They are:
 H0 can start after ENROLL-1, because it is useful inside trusted clusters. H1 needs SCALE-6. H2
 needs ECO-3 and an independent security review of its threat model.
 
+A project that receives donated compute publishes its outputs and its task code. The draft charter
+is [design 0057](design/0057-open-results-charter.md). The owner accepted its principle on
+2026-11-10 (Q27 to Q29), and its text still needs a legal review. It is a
+condition for using the public pool, not a term of the software licence, and it does not cover a
+cluster on its owner's machines.
+
 **Exit check per stage:** the stage table of design 0054, each result recorded with its date.
+
+### Frontier program: bets across the phases
+
+Draft, proposed on 2026-11-10; decisions Q19 to Q26 and Q30 are open. The phases above say how the
+grid grows. [Design 0056](design/0056-frontier-program.md) says what a person outside the project
+would switch to it for, from a research run of 2026-11-10. It moves nothing the owner accepted.
+
+Three properties are the test for its work. A task runs on any machine (portable), outlives the
+machine it started on (movable), and leaves evidence of what it did (checkable).
+
+| Bet | What it builds | Items | Lighthouse run |
+|---|---|---|---|
+| A | Compute shaped for coding agents: several operating systems in one call, sharded test runs, live output, workspace forks, device leases | AX-1 to AX-7, CACHE-1 | One call from an agent tests a change on macOS, Windows, Linux and a real Android phone |
+| B | Portable and movable tasks on WebAssembly, with checkpoints a task takes itself | NET-1, WASM-2 to WASM-5 | A job starts on a laptop, the lid closes, and it finishes on another machine with identical output |
+| C | Signed receipts, quorum runs, a reproducible release, independent rebuilds | PROOF-1 to PROOF-5 | Two machines with different owners build a release, and the archives match |
+| D | Language models served by ordinary machines: one small model per machine behind a gateway | LLM-6 to LLM-8, EDU-1, EDU-2 | A school lab becomes a private assistant for the class from a USB stick, without Internet access |
+| E | The commons: Phase H with a first workload (independent rebuilds), rules for a good guest, and a worker image that starts a whole machine from USB or the network | GREEN-1, GREEN-2, EDU-3, IMG-1 to IMG-4, with NET-2 to NET-4 | A school lab works for the grid at night and is back on its own system in the morning. The stage checks of design 0054 |
+
+Order: each bet starts with a short spike that can end it (R1 to R10 and R14). Waves follow the
+releases: agents after `0.2.0`, then evidence and portability, then models and classrooms, then
+the commons.
+Each wave has one protocol version bump at most and ends with a recorded lighthouse run.
+
+The research also questions step 4 of "Launch". In the published run, one model split over home
+machines reached about 1.5 tokens per second over Wi-Fi. Design 0056 proposes the classroom run as
+the model demo instead (Q25).
+
+**Exit check per bet:** its lighthouse run in design 0056 D7, recorded with script and date.
+
+### Lasting value: trust, a specification, evidence and stewardship
+
+Draft, proposed on 2026-11-10; decisions Q31 and Q33 to Q35 are open.
+[Design 0058](design/0058-lasting-value.md) adds no feature. It plans why anyone should trust the
+grid, build on it, cite it, and find it alive after its founder has moved on.
+
+| Track | What it builds | Items | Proof run |
+|---|---|---|---|
+| Assurance | Fuzzing of every parser, deterministic simulation of master and workers with injected faults, a checked model of failover, an inventory of `unsafe`, provenance for releases, an independent review | LV-1 to LV-7 | The nightly simulation ran its seeds and every invariant held |
+| Specification | The cluster protocol and the formats written down, with test vectors | LV-8, LV-9 | A decoder written from the specification alone reads every vector |
+| Evidence | A citation file and a DOI per release, a measurement study of a school lab, a case study of the development method | LV-10 to LV-13 | The records and the texts are public |
+| Stewardship | Governance files, a release runbook, a second person who can release, funding applications | LV-14 to LV-17 | A second person cuts a release from the runbook alone |
+
+Rule: every release ships at least one item of design 0058, and the record takes one lane of work
+at most. The first items need nothing else: LV-10, LV-14, LV-5 and the first fuzz targets of LV-1.
+They are in [BACKLOG.md](BACKLOG.md) since 2026-11-10, as its Phase 10.
+
+**Exit check per track:** its proof run in design 0058 D6, recorded with its date.
+
+### First users: who gains what, and in which order
+
+Draft, proposed on 2026-11-10. The owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are open.
+[Design 0059](design/0059-first-users.md) asks what a person gains from installing the grid, and
+orders the work by that. Its statements about users are reasoning until its study or a recorded
+run supports them.
+
+| Audience | The job they already have | What is missing | Items |
+|---|---|---|---|
+| A developer with a coding agent and machines on more than one operating system (first) | Checking a change on Windows, macOS and Linux | One call that fans out and returns one table | AX-1, AX-3 |
+| A developer with a slow test suite and a second machine | Waiting for the suite | Shards over several machines, and a number that shows the gain | AX-2, ADOPT-2 |
+| The owner of a desktop with a GPU who works on a laptop | Using a local model away from the desk | A routed prompt, and an endpoint that existing clients call | LLM-1, LLM-6 |
+| A small team, a lab or a class with idle machines | Batch jobs that run on one machine | A guide per job, batch inference, the classroom profile | ADOPT-4, LLM-8, EDU-1 |
+| A maintainer who waits for hosted CI runners or pays for them | CI on three operating systems | Their own machines as runners | AX-7 |
+
+Order: a study of first use with three to five people (ADOPT-1), a run summary (ADOPT-2), AX-1,
+AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for common jobs
+(ADOPT-4), then LLM-1 and LLM-6. The study may reorder the later steps. No item of design 0059 is
+in [BACKLOG.md](BACKLOG.md).
+
+[Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
+row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
+with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
+server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
+for the trial records. Q41 to Q43 are open.
+
+[Design 0062](design/0062-model-weights-into-remote-memory.md) (Draft, 2026-11-11) plans how a
+worker gets a model whose file is on another machine, with no copy on its disk first (Q44,
+decided). Spikes R15 to R18 first measure llama.cpp's own push of weights. A model server that
+takes its tensors from a stream (LLM-12), a client command that sends them (LLM-13) and the rule
+that the head of a split model runs on a worker are proposals. Q45 to Q47 are open.
+
+[Design 0063](design/0063-two-directions-in-parallel.md) (Draft, 2026-11-12) records the owner's
+decision to follow two directions in parallel (Q48): compute for coding agents, and a study
+kit for a class. It adds one trial to each (APP-2, APP-3) and no feature. It also reads the
+owner's simulation project, Anima Engine, as a first workload of the owner's own (APP-4), and
+maps what the owner's other projects could give and what the grid does with CPU and GPU. Q49,
+Q50, Q52 and Q53 are open.
+
+[Design 0064](design/0064-research-of-2026-11-13-and-route.md) (Draft, 2026-11-13) records what five
+research documents found and which statements were checked, and orders the existing items in
+seven steps. The first two steps build nothing: the trials of design 0063, then spikes R20 (a
+GPU inside the sandbox) and R21 (what Mesh-LLM already does). It adds item SCHED-5. Q54 to Q56
+are open.
+
+**Exit check:** the second round of the study is recorded, with measures M15 to M17 of design
+0059.
 
 ## What waits, and why
 
@@ -388,6 +532,47 @@ answers.
 | Q16 | Which workloads does the public pool take first? | Open. Recommended: open-source CI builds and tests, Monte Carlo and parameter sweeps, rendering; all split well and can be checked |
 | Q17 | Who governs the network once it has outside users? | Open. Recommended: the owner until then, then a neutral steward with an open specification |
 | Q18 | When does Phase H start? | Open. Recommended: H0 after ENROLL-1; H1 after SCALE-6; H2 after ECO-3 and an external security review |
+| Q19 | Accept the direction of design 0056: tasks that are portable, movable and checkable, and the dogfood rule? | Open. Recommended: yes |
+| Q20 | May the spikes R1 to R4 of design 0056 run now, beside Phase E? | Open. Recommended: yes. A spike builds nothing in the product |
+| Q21 | Move NET-1, the WebAssembly task type, from stage H0 into the second wave of design 0056? | Open. Recommended: yes, after spike R1, behind a Cargo feature |
+| Q22 | Which bet follows the `0.2.0` release? | Open. Recommended: bet A (AX-1, AX-2, AX-3) |
+| Q23 | Which format do execution receipts use, and where is the log? | Open. Recommended: an in-toto statement with a SLSA provenance predicate, and a log of our own first |
+| Q24 | Does spike R6, GPU for WebAssembly tasks, reopen decision D6? | Open. Recommended: no. D6 stands until R6 has a record |
+| Q25 | Is there a lab for the classroom run (EDU-1), and in which term? Accepting it adds a second user story | Open. Owner |
+| Q26 | How does the agents' time split between design 0056 and Phases F and G? | Open. Recommended: one lane on Phases F and G, two on the current wave |
+| Q27 | Accept the principle of the charter in design 0057: outputs and task code of donated compute are open, later products are free, private clusters are not covered, and the charter binds the owner? | Yes, decided by the owner on 2026-11-10. The charter's text still needs a legal review (CHARTER-1) |
+| Q28 | How long may a project keep outputs of donated compute before it publishes them? | At most six months after a batch ends, and no delay for outputs that are checks. Decided by the owner on 2026-11-10 |
+| Q29 | Which licences do the outputs and the task code of donated compute use? | CC BY 4.0 for outputs, CC0 allowed; any licence the Open Source Initiative approves for code. Decided by the owner on 2026-11-10 |
+| Q30 | Does OxideSwarm aim to replace the operating systems installed on machines? The owner raised it on 2026-11-10 | Open. Recommended: no. It stays a program on every system. The worker image of design 0056 (IMG-1 to IMG-4), which the owner added to the plan the same day, is the part that is built |
+| Q31 | Accept design 0058 and its rule: every release ships at least one of its items, and it takes one lane at most? | Open. Recommended: yes |
+| Q32 | Which items of design 0058 come first? | Decided by the owner on 2026-11-10 for the first items: LV-10, LV-14, LV-5 and the first targets of LV-1 are in the backlog. The order of the rest is open. Recommended: LV-2 and LV-8 next |
+| Q33 | May the repository's history and review records be the data of a published case study (LV-12)? | Open. Owner. Recommended: yes for what is already public in the repository |
+| Q34 | Will the owner apply for an independent security review and for funding (LV-6, LV-16)? | Open. Owner |
+| Q35 | May user guides be translated into Vietnamese, with English as the source? | Open. Recommended: yes. Writing standard rule 1 then says so |
+| Q36 | Accept the first audience of design 0059 (a developer with a coding agent and machines on more than one operating system, then one with a slow test suite) and its order of work? | Open. Recommended: yes |
+| Q37 | Will the owner run the first round of the study of first use (ADOPT-1), and with how many people? | Yes, decided by the owner on 2026-11-11: the owner runs it with three to five people, before AX-1 starts. No session has run yet |
+| Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
+| Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
+| Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
+| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
+| Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
+| Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Open. Recommended: display only in the first version |
+| Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
+| Q45 | For design 0062, in which order: the spikes R15 to R18, then one worker that runs the whole model (LLM-12, LLM-13), then the head rule for a split model? | Open. Recommended: that order. The split keeps its place in design 0038 |
+| Q46 | How does the model server of design 0062 that loads from a stream exist: a patch to `llama-server`, offered upstream and built from source by the worker's owner, with no binary in a release? | Open. Recommended: yes, after spike R17; no server of our own |
+| Q47 | For a split model: the rule that the master runs on the head's machine, or a direct data channel between two nodes? | Open. Recommended: the rule; a channel gets a design record of its own if spike R18 shows that the extra hop matters |
+| Q48 | Are two directions followed in parallel: compute for coding agents (bet A of design 0056) and a study kit for a class (design 0063)? | Yes, decided by the owner on 2026-11-12. No trial has run yet |
+| Q49 | Does `README.md` get a sentence that puts compute for coding agents first (design 0063)? | Open. Recommended: not yet; after trial APP-2 and after the neighbours are read |
+| Q50 | After trial APP-3 of design 0063, how do the owner's study tools reach a fellow student: through the student's own agent, or through a model served from one strong machine of the class? | Open. Recommended: wait for the notes of APP-3 |
+| Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
+| Q52 | Does Anima Engine, the owner's simulation project, become the public showcase of the grid: a world that the machines of several people evolve together (design 0063, D5)? | Open. Recommended: not yet; after trial APP-4 and after Anima Engine has a release of its own |
+| Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
+| Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
+| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Open. Recommended: yes, after spike R20; it is a wire change and gets a design record |
+| Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
+| Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
+| Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -449,3 +634,84 @@ answers.
 - 2026-11-10: The owner set a long-term goal: an open, worldwide compute network on top of
   OxideSwarm. Phase H (NET-1 to NET-8) is added from [design 0054](design/0054-open-compute-network.md)
   (Draft), with open decisions Q14 to Q18. Nothing in Phases E to G moved.
+- 2026-11-10: Draft added at the owner's request for a research and development plan: the frontier
+  program of [design 0056](design/0056-frontier-program.md), with bets A to E, spikes R1 to R9,
+  lighthouse runs and open decisions Q19 to Q26. A web research run of 2026-11-10 supplied its
+  findings. Nothing in Phases E to H moved.
+- 2026-11-10: The owner proposed that research done with compute the project mobilises is free and
+  public. [Design 0057](design/0057-open-results-charter.md) (Draft) turns this into a charter for
+  the public pool of Phase H, with open decisions Q27 to Q29. It builds nothing.
+- 2026-11-10: The owner accepted Q27 to Q29 with their recommended defaults: the charter's
+  principle, an embargo of at most six months, and CC BY 4.0 for outputs. The charter's text still
+  needs a legal review (CHARTER-1), and nothing is built.
+- 2026-11-10: The owner asked whether OxideSwarm should become an operating system that replaces
+  the installed ones, and then added a bootable worker image to the plan. Design 0056 gained IMG-1
+  to IMG-4, spike R10 and lighthouse L6. Q30 is open, and the first non-goal of design 0054
+  stands until it is decided.
+- 2026-11-10: Draft added at the owner's request for further directions that make the project
+  worth remembering: [design 0058](design/0058-lasting-value.md), with items LV-1 to LV-17, spikes
+  R11 to R13, proof runs V1 to V4 and open decisions Q31 to Q35. It adds no feature, and nothing
+  moved.
+- 2026-11-10: The owner put the first items of design 0058 into the backlog (LV-1, LV-5, LV-10 and
+  LV-14, Phase 10 of [BACKLOG.md](BACKLOG.md)). Q32 is decided for these.
+- 2026-11-10: Draft added at the owner's request on what a user gains and which upgrades make
+  people use the project: [design 0059](design/0059-first-users.md), with items ADOPT-1 to
+  ADOPT-4, measures M15 to M17 and open decisions Q36 to Q39. Nothing moved, and no item entered
+  the backlog.
+- 2026-11-11: The owner accepted Q37 with the recommended default: the owner runs the first round
+  of the study of first use (ADOPT-1 of [design 0059](design/0059-first-users.md)) with three to
+  five people, before AX-1 starts. No session has run yet. Q36, Q38 and Q39 stay open, and no
+  item entered the backlog.
+- 2026-11-11: [Design 0059](design/0059-first-users.md) gained a screening question before the
+  first round of ADOPT-1, from the owner's observation that fellow students have no job that
+  waits for a machine. The order of work stays as it is until the answers are in.
+- 2026-11-11: [Design 0059](design/0059-first-users.md) names LIVA, the owner's desktop assistant,
+  as a first application for the audience with a GPU desktop and a laptop. It needs LLM-1 and
+  LLM-6 here and an endpoint setting in LIVA; neither is built, and no order changed.
+- 2026-11-11: The table of what exists now lists the MCP tool `workspaces`, which
+  `crates/cli/src/mcp.rs` has had since FEAT-4. Designs 0033, 0038, 0054 and 0056 gained notes
+  from an outside reading of the plans on the same day; no item, order or decision changed.
+- 2026-11-11: The owner described the roles of the owner's two projects: OxideSwarm carries
+  model traffic, secures it and keeps the account, and LIVA gives people a reason to use it.
+  [Design 0061](design/0061-first-application-model-tunnel.md) records that and sets a trial
+  first (Q40, decided): LIVA on a Mac with the model on another machine. LLM-9 to LLM-11 are
+  proposals, Q41 to Q43 are open, Q14 stays open, and no item entered the backlog.
+- 2026-11-11: Spike R14 joined [design 0056](design/0056-frontier-program.md) at the owner's
+  word: time the fetch of a model file, its load and the first token on two machines, to find
+  the slowest segment before anything is built for it. It can run with the trial of
+  [design 0061](design/0061-first-application-model-tunnel.md). No record exists yet.
+- 2026-11-12: Draft added at the owner's request of 2026-11-11:
+  [design 0062](design/0062-model-weights-into-remote-memory.md), on a worker that runs a model
+  whose file is on another machine, with no copy written to its disk first (Q44, decided), and
+  on the head of a split model. It has spikes R15 to R18, items LLM-12 and LLM-13 and open
+  decisions Q45 to Q47. Nothing is measured or built, and no item entered the backlog. The
+  spike of design 0056 that was numbered R11 on 2026-11-11 is R14, because R11 to R13 are the
+  spikes of design 0058.
+- 2026-11-12: Draft added at the owner's word:
+  [design 0063](design/0063-two-directions-in-parallel.md). The owner agreed to follow two
+  directions in parallel (Q48, decided): compute for coding agents, and a study kit for a
+  class. It has trials APP-2 and APP-3 and open decisions Q49 and Q50. On the same day design
+  0062 gained rows 16 to 34 of what llama.cpp does today, from nine research documents that
+  the owner supplied and that were checked against their sources. Nothing is measured or
+  built.
+- 2026-11-12: [Design 0045](design/0045-distributed-training.md) gained D6 at the owner's
+  word: a workload for independent runs that grades, on several workers, edits which another
+  model wrote into the weights of a small model. It has spike R19 and decision Q51. Nothing is
+  built or measured.
+- 2026-11-13: [Design 0063](design/0063-two-directions-in-parallel.md) gained D5 at the
+  owner's word: Anima Engine, the owner's simulation project, read as a first workload of the
+  owner's own and not yet as a reason for other people to install a worker. It has trial APP-4
+  and decision Q52. No code of it was run.
+- 2026-11-13: Design 0063 gained D6 at the owner's word: a map of what the owner's other
+  projects could give, and a statement from the code of what the grid does with CPU and GPU
+  today and what is missing (FEAT-9, video memory for a task, SCHED-4). It has decision Q53.
+- 2026-11-13: Draft added at the owner's request:
+  [design 0064](design/0064-research-of-2026-11-13-and-route.md), from five research documents
+  that the owner supplied. It names the basis of each finding, orders the existing items in
+  seven steps, and adds spikes R20 and R21, item SCHED-5 and open decisions Q54 to Q56.
+  Nothing is built or measured, and no item entered the backlog.
+- 2026-11-14: Draft added at the owner's request:
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md), tests for large transfers and
+  long runs. The end-to-end blob tests move at most about 5 MiB per file, and no record measures a
+  cluster over hours. It adds TEST-24 to TEST-26 (Planned) and open decisions Q57 to Q59. Nothing
+  is built.

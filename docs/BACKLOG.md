@@ -127,10 +127,14 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-11, at `master` `0354b28`: 70 items Implemented, 4 Partial and 40 Planned. Five items
+On 2026-11-14, at `master` `f486885`: 70 items Implemented, 4 Partial and 48 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
-2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). "Pull requests" lists them by number, "(open)" marks one
+2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
+One item (TEST-23) was added on 2026-11-11 from a CI failure on Windows.
+Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
+[design 0065](design/0065-large-transfer-and-long-run-tests.md).
+"Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
@@ -166,6 +170,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Planned |  |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
+| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -249,6 +257,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | (design 0054) |
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | (design 0054) |
+| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Planned | (design 0058) |
+| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
+| LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 
 ## Phase 0: integrate open work
 
@@ -783,6 +795,95 @@ The full suite must pass on a clean machine before CI can require it.
 - **Problem:** `generate_research_report` writes `expected_task_id` and `codec_decoded_task_id` (random UUIDv4 strings `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`) plus integer RAM/timing metrics into `target/research_report.json`. `contains_standalone_number` only checked `c.is_ascii_digit() || c == '.'` on the characters immediately before and after `"4090"`, so a UUIDv4 with `-4090-` in its third hyphen-delimited group (or `4090` adjacent to hex digits `'a'..='f'`), or a JSON/unit-labelled metric equal to `4090`, was mistaken for an `"RTX 4090"` GPU model name.
 - **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
 - **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
+
+### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
+
+- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
+  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
+  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
+  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
+  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
+  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
+  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
+- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
+  and waits for a gate file. The first master shuts down, a second one starts on the same address
+  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
+  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
+  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
+  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
+  `out.txt`. Two explanations fit the message, and neither has been tested:
+  1. The test is at fault: the PowerShell command ends without writing the file where the worker
+     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
+  2. The product is at fault: after the worker is adopted by a restarted master, output
+     collection reads the sandbox before the file is there, or reads another sandbox. That would
+     be a defect in the recovery path of FEAT-1, not in the test.
+- **Do:**
+  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
+     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
+  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
+     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
+     the marker file holds, and the time from assignment to the gate file (compare it with
+     `execution_time_ms`).
+  3. If the test is at fault, change only the test, and keep every assertion. If the product is
+     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
+- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
+  on Windows under CPU load. If production code changed, a regression test covers the cause.
+
+### TEST-24: Test large transfers between machines
+
+- **Evidence:** Read, on 2026-11-14 at `master` `f486885`. The largest file in the end-to-end
+  blob tests is 5 MiB plus 123 bytes (`tests/blob_transfer_e2e.rs:183`). The largest tree is
+  10,000 small files (`tests/blob_upload_pipelining_e2e.rs`). The defaults allow far more: the
+  master's blob store holds 4 GiB (`DEFAULT_BLOB_STORE_MAX_BYTES`), the worker cache 2 GiB
+  (`DEFAULT_BLOB_CACHE_MAX_BYTES`) and a task's outputs 1 GiB (`DEFAULT_OUTPUT_LIMIT_BYTES`).
+  From the code, a dropped upload starts again at offset 0 (`blob_store.rs`: `write_chunk`), and
+  one blob moves at most 4 MiB per round trip (`blob_transfer.rs`: `upload_blob`,
+  `download_blob`).
+- **Problem:** Nobody knows whether memory stays flat as a file grows, how long a large input
+  takes over LAN or a relay, or whether a slow TCP link can delay a heartbeat past the 10 s
+  timeout during a transfer. Design 0062 plans to move model weights of several GB.
+- **Do:** Follow D1 and D2 of [design 0065](design/0065-large-transfer-and-long-run-tests.md).
+  1. Add `benchmarks/endurance/endurance.py` with the subcommands `transfer`, `throttle` and
+     `sample`, standard library only, under the rules of `benchmarks/grid/bench_grid.py`: own
+     processes, private homes, stop by handle, no host names in records.
+  2. Run scenarios T1 to T9 on loopback, then on two machines over LAN TCP, LAN QUIC and a relay.
+     Use a master started for the run with a temporary home and its own ports, never the trial
+     cluster or `~/.oxideswarm`.
+  3. Add `tests/test_endurance_harness.py` (helpers without a binary) and run it in the CI job
+     `agent-bridge`.
+  4. For every failed check, open an item or write a failing regression test (rule 4).
+- **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
+  `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
+
+### TEST-25: Run a cluster for 24 hours under load and faults
+
+- **Evidence:** Read, on 2026-11-14 at `master` `f486885`. Every CI job has a timeout of at most
+  90 minutes (`.github/workflows/ci.yml`). The longest script outside CI, `bench_grid.py`, takes
+  about 10 minutes. No committed record measures the memory, handles or disk of a cluster over
+  hours.
+- **Problem:** A slow leak of memory, handles or disk, or a task lost after many restarts, shows up
+  only after hours. The USB kit runs workers for days on other people's machines.
+- **Do:** Follow D3 of [design 0065](design/0065-large-transfer-and-long-run-tests.md).
+  1. Add the subcommand `soak` to `benchmarks/endurance/endurance.py`, with a seeded load, the
+     faults of D3 (worker kill, master restart on its state directory, link cuts, bursts to the
+     queue cap) and a ledger of every task submitted.
+  2. Run it for 24 hours on a Mac master and two Windows workers, with temporary homes and their
+     own ports (Q57).
+- **Done when:** The 24-hour record is committed. It passes the checks of D3, or every failed
+  check has its own item or regression test.
+
+### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
+
+- **Evidence:** `.github/workflows/ci.yml` already runs the jobs `audit` and `p2p-wan-relay` on a
+  weekly schedule and on `workflow_dispatch`.
+- **Problem:** Without a scheduled run, a change can bring back a defect that TEST-24 or TEST-25
+  found, and nothing notices until the next full run.
+- **Do:** Add a job `endurance` on `ubuntu-latest` for `workflow_dispatch` and the weekly
+  schedule, never for pull requests. It runs T1 at 1 GiB, T2 at 20,000 files, T4, T6, T7 and T8 on
+  loopback and a soak of 45 minutes, and uploads the JSON record as an artifact. It is not a
+  required check.
+- **Done when:** The job is green on two scheduled runs.
 
 ## Phase 3: make the documents true
 
@@ -1899,6 +2000,8 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
      reporting policy with a contact, and issue and discussion templates. The owner decides each
      (owner item, and Q11 for licence).
   3. Link all of it from `README.md`.
+- **Note (2026-11-10):** LV-14 carries out step 2, except the security reporting policy, which
+  REL-5 delivered.
 - **Done when:** The site builds in CI and is reachable, `README.md` links the governance and the
   security policy, and a test report of a vulnerability reaches the named contact.
 
@@ -2007,6 +2110,150 @@ roadmap are open. Each item starts with a threat model of its own and an indepen
 | NET-6 | Clusters publish capacity and task classes through gossip or a DHT over iroh | Clusters find each other with no central server |
 | NET-7 | A written protocol specification, a conformance test suite, a security process and a neutral steward | Two independent implementations pass the suite together |
 | NET-8 | Optional trusted execution (AMD SEV-SNP, Intel TDX, GPU confidential computing) with attestation | A task's attestation is checked before its inputs are released |
+
+## Phase 10: lasting value
+
+Added on 2026-11-10 from [design 0058](design/0058-lasting-value.md), at the owner's word, for its
+first items. The record plans assurance, a written specification, citable evidence and stewardship,
+and adds no feature. Its other items (LV-2 to LV-4, LV-6 to LV-9, LV-11 to LV-13 and LV-15 to
+LV-17) stay in the design record until the owner adds them here. The four items below do not depend
+on each other and can run in parallel. None changes the wire format, a CLI flag or a default, so
+none needs a design record of its own.
+
+### LV-1: Fuzz targets for the parsers of untrusted bytes (first targets)
+
+- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. The repository has no `fuzz/` directory
+  and no property-testing dependency. Bytes from another machine reach these parsers, the first two
+  before authentication completes: the frame reader and format dispatch of `MessageTransport`
+  (`crates/core/src/protocol.rs`: `recv_raw_frame_max`, `recv_msg_with_codec_max`, frames up to
+  `MAX_FRAME_SIZE`, 64 MiB), the handshake frames (`crates/core/src/cluster_auth.rs`,
+  `crates/core/src/noise_auth.rs`), and `TreeManifest::decode` (`crates/core/src/blob.rs`). The
+  `audit` job of CI reports `bincode` 1.x as unmaintained.
+- **Problem:** Nothing has fed these parsers malformed input at scale. A panic or an unbounded
+  allocation in one of them is a remote denial of service, and before the handshake it needs no
+  secret.
+- **Do:**
+  1. Add a `fuzz/` crate for `cargo fuzz` (libFuzzer), outside the workspace members (add it to
+     `exclude` in the root `Cargo.toml`), with a `Cargo.lock` of its own. List its dependencies for
+     the owner in the pull request.
+  2. Write three targets:
+     - `inbound_frame`: the input is a byte stream that a `MessageTransport` over an in-memory
+       stream reads as `InboundMessage`, once per `WireCodec`, with a small frame limit. The frame
+       reader, the format byte dispatch and both decoders are then in the path.
+     - `server_handshake`: the input is what a peer sends first. Run the server side of the
+       handshake against it over an in-memory stream, with a fixed test secret and a fixed test
+       key.
+     - `tree_manifest`: the input goes to `TreeManifest::decode`.
+
+     If a parser is only reachable through private functions, expose it behind a Cargo feature
+     `fuzzing` of `rusty_grid_core` that is off by default. Do not change a normal build.
+  3. Seed each target's corpus with valid encodings, for example the messages that
+     `crates/core/src/wire_layout_tests.rs` builds.
+  4. Run each target for one hour locally. Record the date, the machine, the number of executions
+     and every finding in `fuzz/README.md`. This is spike R12 of design 0058.
+  5. For each finding follow rule 4: a failing test first, then the fix. A finding that a remote
+     peer can trigger goes through the private route of `docs/SECURITY.md` before any public pull
+     request.
+  6. Add a CI job on Linux that builds the targets and runs each for 60 seconds on pull requests,
+     and for 10 minutes each on the weekly schedule. The job pins a dated nightly toolchain,
+     because `cargo fuzz` needs one. Keep crash inputs as files under `fuzz/regressions/`, and run
+     them in the same job.
+- **Done when:** The three targets build and run in CI. `fuzz/README.md` holds the one-hour record.
+  A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
+  design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
+  the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
+
+### LV-5: Supply chain: dependency policy, release provenance, outside checklist
+
+- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. CI runs `cargo audit`
+  (`.github/workflows/ci.yml`, job `audit`), and Dependabot is configured. No `deny.toml` exists.
+  `.github/workflows/release.yml` writes `SHA256SUMS` and attaches no signature and no provenance.
+  The workflows name actions by tag (`actions/checkout@v7`, `Swatinem/rust-cache@v2`,
+  `taiki-e/install-action@v2`), not by commit.
+- **Problem:** A checksum proves that a download is intact. It does not prove where and from which
+  commit an archive was built. A dependency with an unwanted licence or from an unexpected source
+  would pass CI. A moved action tag would change what CI runs.
+- **Do:**
+  1. Add `deny.toml` and a CI job on Linux that runs
+     `cargo deny --locked check licenses bans sources`. `cargo audit` keeps the advisories. Allow
+     the licences that the current dependency tree uses, and list them for the owner in the pull
+     request. Allow crates.io as the only source, plus any git source that `Cargo.lock` already
+     has.
+  2. Build provenance. In `release.yml`, attest every archive with `actions/attest`, in the job
+     that holds the archives, with the permissions `id-token: write` and `attestations: write` on
+     that job only. Add a manual `workflow_dispatch` run that builds and attests and creates no
+     release, so that the step can be checked without a tag. Skip the step on pull requests from
+     forks.
+  3. Add the verify command to the install section of `README.md`:
+     `gh attestation verify <ARCHIVE> --repo <OWNER>/<REPO>`. Say what it proves (where and from
+     which commit the archive was built) and what it does not prove (that the source is safe).
+  4. Pin every `uses:` in `.github/workflows/` to a full commit hash, with the tag in a comment.
+     Dependabot keeps them current. Keep `permissions: contents: read` as the default of every
+     workflow.
+  5. Add the OpenSSF Scorecard workflow, on a schedule and on pushes to `master`, and its badge to
+     `README.md`.
+  6. Owner: make the `cargo deny` job a required check once it is green on `master`, and fill in
+     the OpenSSF Best Practices questionnaire.
+- **Done when:** The `cargo deny` job passes on `master`. A manual run of `release.yml` produces an
+  attestation per archive, `gh attestation verify` accepts an archive of that run and refuses a
+  copy with one changed byte, and both outputs are in the pull request. No `uses:` line in
+  `.github/workflows/` names a tag or a branch. The Scorecard workflow has run once.
+
+### LV-10: Citation file and a DOI per release
+
+- **Evidence:** Reproduced on 2026-11-10 at `master` `2f22c48`. The repository root has no
+  `CITATION.cff`, and `README.md` has no section on how to cite the project.
+- **Problem:** A paper, a course or another project that uses OxideSwarm has nothing stable to
+  cite, and a release has no identifier that outlives the repository.
+- **Do:**
+  1. Add `CITATION.cff` in the repository root, in format version 1.2.0, with the keys
+     `cff-version`, `message`, `title`, `abstract`, `authors`, `version`, `date-released`,
+     `license`, `repository-code` and `keywords`. Take `version` and the licences (`MIT`,
+     `Apache-2.0`) from `[workspace.package]` in `Cargo.toml`. Use the entity "The OxideSwarm
+     Authors" as the author, as `Cargo.toml` does, unless the owner gives a personal name and an
+     ORCID.
+  2. Add a test to `tests/test_m1_challenger_hygiene.py`, with the standard library only: the file
+     has every key listed above, and its `version` equals the workspace version in `Cargo.toml`. A
+     version bump without the citation file then fails CI.
+  3. Add a "How to cite" section to `README.md`, above "License".
+  4. Owner: switch the repository on in Zenodo, so that Zenodo archives each GitHub release and
+     gives it a DOI. After the next release, add the DOI to `CITATION.cff` (`identifiers`) and to
+     the "How to cite" section.
+- **Done when:** The new test passes on Linux, macOS and Windows, and the repository page shows
+  "Cite this repository". Step 4 is finished when the DOI of a release is in `README.md`. Until
+  then the item is Partial.
+
+### LV-14: Governance files and a licence that GitHub detects
+
+- **Evidence:** Reproduced on 2026-11-10 at `master` `2f22c48`. The repository has no
+  `CODE_OF_CONDUCT.md`, no `GOVERNANCE.md` and no `.github/FUNDING.yml`.
+  `gh api repos/<OWNER>/<REPO> --jq .license.spdx_id` prints `NOASSERTION`: the root holds
+  `LICENSE-MIT`, `LICENSE-APACHE` and a four-line `LICENSE` that points to both. `git shortlog -sn`
+  lists one human author.
+- **Problem:** A newcomer cannot tell who decides, how a change is accepted or how to become a
+  maintainer. Funds ask for a governance file. Tools that read the licence from GitHub see none.
+- **Do:** This item carries out step 2 of ECO-8, except the security reporting policy, which REL-5
+  delivered. ECO-8 keeps the documentation site.
+  1. Add `GOVERNANCE.md`. State the facts as they are: one owner decides, through design records
+     and the decisions table of `docs/ROADMAP.md`; coding agents implement and review; a pull
+     request merges when its required checks are green and it has a review. Say how a person
+     becomes a maintainer and which rights that gives, and that a neutral steward is planned for
+     the public network (decision Q17). Write nothing that is not true today.
+  2. Add `CODE_OF_CONDUCT.md`. Propose the Contributor Covenant 2.1 to the owner, with the private
+     reporting route of `docs/SECURITY.md` as the contact. The owner decides the text.
+  3. Licence detection. Ask the owner before changing any licence file. The proposal: remove the
+     pointer file `LICENSE`, keep `LICENSE-MIT` and `LICENSE-APACHE`, and update what names the
+     pointer file (`.github/workflows/release.yml` copies it into the archives). Check the
+     repository page after the change. If GitHub still shows no licence, restore the file and
+     record the result in the status log.
+  4. Add `.github/FUNDING.yml` only when the owner has a sponsorship account and names it.
+  5. Link `GOVERNANCE.md` and `CODE_OF_CONDUCT.md` from `README.md` and `CONTRIBUTING.md`.
+  6. Add a short section to `README.md` that says how the project is built: coding agents write
+     and review the code, and the owner decides and approves. The owner approves the wording.
+     Funds and journals ask for this statement.
+- **Done when:** The two files and the `README.md` section exist and are linked, the links test of
+  `tests/test_m1_challenger_hygiene.py` passes, and the status log records what the repository
+  page shows as the licence after step 3.
 
 ## Status log
 
@@ -2279,11 +2526,24 @@ Add one dated line per finished item, newest last.
   Planned) from a two-machine trial: a 32-task batch took 52 s because 6 tasks landed on a slow
   laptop, while the desktop alone would have taken about 12 s. The Index counts are now
   70 Implemented, 4 Partial and 39 Planned.
+- 2026-11-10: Added LV-1, LV-5, LV-10 and LV-14 as Phase 10, from
+  [design 0058](design/0058-lasting-value.md), at the owner's word. Nothing is built. The Index
+  counts are now 70 Implemented, 4 Partial and 43 Planned.
+- 2026-11-11: Added TEST-23 (Planned) at the owner's word.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` failed once in
+  "workspace tests (windows-latest)" on pull request 206 at `e1fcf70` (run `42817398752`, job
+  `129833857865`); that pull request changes only `docs/`. The same job passed on `master`
+  `0354b28` and on the rerun. The cause is not known. The Index counts are now 70 Implemented,
+  4 Partial and 44 Planned.
 - 2026-11-11: Added MAINT-1 (Planned): the six largest source files hold 6,184 to 8,639 lines each,
   about 40 % of it tests, and `cli_app.rs` changed 101 times in a month. The Index counts are now
-  70 Implemented, 4 Partial and 40 Planned.
+  70 Implemented, 4 Partial and 45 Planned.
+- 2026-11-14: Added TEST-24, TEST-25 and TEST-26 (Planned) at the owner's request, from
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md): the end-to-end blob tests move
+  at most about 5 MiB per file, and no record measures a cluster over hours. Nothing is built.
+  The Index counts are now 70 Implemented, 4 Partial and 48 Planned.
 - 2026-11-14: Completed design 0039 W11 under FEAT-4 (pull request 186): symbolic links and empty
   directories in `TreeManifest` (`oxideswarm-tree/2`, `ProtocolCapabilities::TREE_V2`), with
   case- and Unicode-folded `FoldedSymlinkTrie` / `FoldedPathTrie` validation, manifest complexity
   budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
-  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 4 Partial and 40 Planned.
+  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 4 Partial and 48 Planned.
