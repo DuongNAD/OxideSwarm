@@ -240,10 +240,10 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
 - 2026-11-10: Protocol version 8 (design 0051 `ENROLL-1b`): added `ClientMessage` variants
   (`Enroll`, `CreateInvite`, `ListInvites`, `RevokeInvite`, `ListMembers`, `ListPendingEnrollments`,
   `ApproveEnrollment { pending_id, pairing_code }`, `RejectEnrollment`, `RevokeMember`,
-  `RenameMember`) and `ClientResponse` variants (`EnrollPending`, `EnrollKeepalive`, `Enrolled`,
-  `EnrollRejected`, `InviteCreated`, `InviteList`, `InviteRevoked`, `MemberList`,
-  `PendingEnrollments`, `EnrollmentApproved`, `EnrollmentRejected`, `MemberRevoked`,
-  `MemberRenamed`), all appended after `ListWorkspaces` / `Workspaces` so every v7 request and
-  response keeps the v8 layout and is refused by the version check with a clear
-  `Incompatible protocol version 7` error in both directions. Regenerated
+  `RenameMember`, `ReleaseWorkerId`) and `ClientResponse` variants (`EnrollPending`,
+  `EnrollKeepalive`, `Enrolled`, `EnrollRejected`, `InviteCreated`, `InvitesList`, `InviteRevoked`,
+  `MembersList`, `PendingEnrollmentsList`, `EnrollmentApproved`, `EnrollmentRejected`,
+  `MemberRevoked`, `MemberRenamed`, `WorkerIdReleased`), all appended after `ListWorkspaces` /
+  `Workspaces` so every v7 request and response keeps the v8 layout and is refused by the version
+  check with a clear `Incompatible protocol version 7` error in both directions. Regenerated
   `crates/core/tests/data/wire_layout.txt`.
