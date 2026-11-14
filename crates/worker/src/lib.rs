@@ -19,6 +19,7 @@ pub mod isolation;
 pub mod process_tree;
 pub mod runner;
 pub mod sandbox;
+pub mod sim;
 pub mod staging;
 #[cfg(feature = "gpu-wgpu")]
 pub mod wgpu_engine;
@@ -41,6 +42,10 @@ pub use runner::{
     EXIT_CODE_TIMEOUT,
 };
 pub use sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
+pub use sim::{
+    FakeRunnerConfig, LinkLossAction, SimulatedLinkConfig, SimulatedLinkStream,
+    SimulatedNetworkControl, SimulatedNetworkSnapshot,
+};
 pub use staging::{OutputLimits, DEFAULT_MAX_OUTPUT_FILES, DEFAULT_OUTPUT_LIMIT_BYTES};
 pub use workspace::{
     WorkspaceLimits, WorkspaceStore, DEFAULT_MAX_WORKSPACES, DEFAULT_WORKSPACE_LIMIT_MB,
