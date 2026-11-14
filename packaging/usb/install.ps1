@@ -5,9 +5,11 @@
 # through an HKCU Run entry. The user's own %USERPROFILE%\.oxideswarm is never read or written:
 # the installed worker keeps its state in <install folder>\home.
 #
-# The install folder is %LOCALAPPDATA%\OxideSwarm unless -InstallRoot names another one or the person
-# at the keyboard picks another fixed NTFS or ReFS drive. Such a folder holds the task folders and
-# the file cache too, and the installer limits it to this user, SYSTEM and Administrators.
+# The install folder is %LOCALAPPDATA%\OxideSwarm-USB unless -InstallRoot names another one or the
+# person at the keyboard picks another fixed NTFS or ReFS drive. Workspaces stay in
+# <install folder>\workspaces so the kit never shares the default worker workspace root
+# (%LOCALAPPDATA%\oxideswarm\workspaces). Outside %LOCALAPPDATA%, the install folder holds the task
+# folders and file cache too, and the installer limits it to this user, SYSTEM and Administrators.
 #
 # -Update (what "Update OxideSwarm.cmd" runs) updates an existing install in place: it keeps its
 # folder, name, GPU choice, isolation, cluster membership and start at logon, asks nothing, does
@@ -21,7 +23,7 @@
 [CmdletBinding()]
 param(
     [string]$Name = "",
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm"),
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm-USB"),
     [switch]$NoAutostart,
     [switch]$NoWorkspaces,
     [switch]$Gpu,
@@ -39,8 +41,10 @@ $slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
 # Full form of %LOCALAPPDATA%: GetFullPath on Windows PowerShell 5.1 expands 8.3 short names (a CI
 # runner's C:\Users\RUNNER~1), so both sides of every comparison below go through it.
 $LocalAppDataFull = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
-$DefaultRoot = Join-Path $LocalAppDataFull 'OxideSwarm'
-$PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
+$DefaultRoot = Join-Path $LocalAppDataFull 'OxideSwarm-USB'
+$LegacyDefaultRoot = Join-Path $LocalAppDataFull 'OxideSwarm'
+$DefaultWorkerWorkspaceRoot = Join-Path $LegacyDefaultRoot 'workspaces'
+$PointerKey = if ($env:OXIDESWARM_USB_POINTER_KEY) { $env:OXIDESWARM_USB_POINTER_KEY } else { 'HKCU:\Software\OxideSwarm\UsbKit' }
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValueName = if ($env:OXIDESWARM_USB_RUN_VALUE) { $env:OXIDESWARM_USB_RUN_VALUE } else { 'OxideSwarmUsbWorker' }
 function FailAfterStart($msg) {
@@ -76,11 +80,16 @@ if (-not $Archive) { Fail "no archive for $Target in the kit" }
 # when it finds one. It is installed only when the person at the keyboard agrees (or -Gpu).
 $GpuArchive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target-gpu.zip" | Select-Object -First 1
 if ($Update) {
-    # The install to update: -InstallRoot, else the one the installer recorded, else the default.
+    # The install to update: -InstallRoot, else the one the installer recorded, else the default
+    # (%LOCALAPPDATA%\OxideSwarm-USB), falling back to legacy %LOCALAPPDATA%\OxideSwarm.
     if (-not $PSBoundParameters.ContainsKey('InstallRoot')) {
         $recorded = $null
         try { $recorded = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $recorded = $null }
-        if ($recorded) { $InstallRoot = $recorded }
+        if ($recorded) {
+            $InstallRoot = $recorded
+        } elseif (-not (Test-Path -LiteralPath (Join-Path $DefaultRoot 'bin\oxideswarm.exe')) -and (Test-Path -LiteralPath (Join-Path $LegacyDefaultRoot 'bin\oxideswarm.exe'))) {
+            $InstallRoot = $LegacyDefaultRoot
+        }
     }
     $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
     if (-not (Test-Path (Join-Path $InstallRoot 'bin\oxideswarm.exe'))) { Fail "there is no OxideSwarm from a USB kit in $InstallRoot; run 'Install OxideSwarm.cmd' first" }
@@ -374,7 +383,7 @@ if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected)
     $choices = @($DefaultRoot)
     foreach ($d in [IO.DriveInfo]::GetDrives()) {
         if ($d.Name -eq [IO.Path]::GetPathRoot($DefaultRoot)) { continue }
-        $candidate = Join-Path $d.Name 'OxideSwarm'
+        $candidate = Join-Path $d.Name 'OxideSwarm-USB'
         if (-not (Test-InstallDrive $candidate)) { $choices += $candidate }
     }
     if ($choices.Count -gt 1) {
@@ -393,9 +402,18 @@ if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected)
     }
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+# Keep fresh installs out of %LOCALAPPDATA%\OxideSwarm and its workspaces child, which is the
+# default workspace root (%LOCALAPPDATA%\oxideswarm\workspaces) used by non-USB Windows workers.
+if (-not $Update -and (
+    [string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    [string]::Equals($InstallRoot, $DefaultWorkerWorkspaceRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    $InstallRoot.StartsWith($DefaultWorkerWorkspaceRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+)) {
+    Fail "cannot install in ${InstallRoot}: $DefaultWorkerWorkspaceRoot is the default worker workspace root; omit -InstallRoot to use $DefaultRoot, or pass -Update to update an older install"
+}
 $PrivateRoot = $InstallRoot.StartsWith($LocalAppDataFull + '\', [StringComparison]::OrdinalIgnoreCase)
 if (-not $PrivateRoot) {
-    if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm, not the root of a drive" }
+    if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm-USB, not the root of a drive" }
     if (-not $Update) {
         $why = Test-InstallDrive $InstallRoot
         if ($why) { Fail "cannot install in ${InstallRoot}: $why" }
@@ -409,9 +427,11 @@ $pointer = $null
 try { $pointer = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $pointer = $null }
 $previous = $pointer
 if (-not $previous -and (Test-Path (Join-Path $DefaultRoot 'bin\oxideswarm.exe'))) { $previous = $DefaultRoot }
-if (-not $Update -and $previous -and $previous -ne $InstallRoot -and (Test-Path (Join-Path $previous 'bin\oxideswarm.exe'))) {
-    if (-not $explicitRoot) { Fail "OxideSwarm from a USB kit is already installed in $previous; run 'Uninstall OxideSwarm.cmd' first" }
-    Write-Host "  note:    another install in $previous stays as it is"
+if (-not $previous -and (Test-Path (Join-Path $LegacyDefaultRoot 'bin\oxideswarm.exe'))) { $previous = $LegacyDefaultRoot }
+$previousFull = if ($previous) { [IO.Path]::GetFullPath($previous).TrimEnd('\') } else { $null }
+if (-not $Update -and $previousFull -and -not [string]::Equals($previousFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path (Join-Path $previousFull 'bin\oxideswarm.exe'))) {
+    if (-not $explicitRoot) { Fail "OxideSwarm from a USB kit is already installed in $previousFull; run 'Uninstall OxideSwarm.cmd' first" }
+    Write-Host "  note:    another install in $previousFull stays as it is"
 }
 Write-Host "  folder:  $InstallRoot"
 if ($GpuArchive) {
@@ -485,8 +505,10 @@ if (-not $PrivateRoot) {
 }
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
 Set-Content -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
-if (-not ($pointer -and $pointer -ne $InstallRoot -and (Test-Path (Join-Path $pointer 'bin\oxideswarm.exe')))) {
-    foreach ($k in @('HKCU:\Software\OxideSwarm', $PointerKey)) { if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
+$pointerParent = Split-Path -Parent $PointerKey
+$pointerFull = if ($pointer) { [IO.Path]::GetFullPath($pointer).TrimEnd('\') } else { $null }
+if (-not ($pointerFull -and -not [string]::Equals($pointerFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path (Join-Path $pointerFull 'bin\oxideswarm.exe')))) {
+    foreach ($k in @($pointerParent, $PointerKey)) { if ($k -and -not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
     Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
 }
 $Bin = Join-Path $InstallRoot 'bin'
@@ -694,9 +716,27 @@ $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolat
 # Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
 $supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
 if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    $workerArgs += " --workspaces"
-    # Outside %LOCALAPPDATA% the workspaces stay in the install folder, like the task folders ($SandboxBase).
-    if (-not $PrivateRoot) { $workerArgs += ' --workspace-root "' + (Join-Path $InstallRoot 'workspaces') + '"' }
+    # Always pass an explicit workspace root inside the install folder so the USB worker never shares
+    # %LOCALAPPDATA%\oxideswarm\workspaces (the default workspace root used by non-USB workers).
+    $WorkspaceRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
+    $WorkspaceMarker = Join-Path $WorkspaceRoot '.oxideswarm-usb-workspaces'
+    if (-not (Test-Path -LiteralPath $WorkspaceRoot)) {
+        New-Item -ItemType Directory -Force -Path $WorkspaceRoot | Out-Null
+        Set-Content -LiteralPath $WorkspaceMarker -Value 'Created by an OxideSwarm USB kit install.' -Encoding ASCII
+    } elseif (-not (Test-Path -LiteralPath $WorkspaceMarker)) {
+        $existingWsEntries = @(Get-ChildItem -LiteralPath $WorkspaceRoot -Force -ErrorAction SilentlyContinue)
+        $hadPrevWsRoot = $false
+        if ($Update) {
+            $prevVbs = Join-Path $InstallRoot 'start-worker.vbs'
+            if ((Test-Path -LiteralPath $prevVbs) -and ((Get-Content -Raw -LiteralPath $prevVbs) -match '--workspace-root')) {
+                $hadPrevWsRoot = $true
+            }
+        }
+        if ($existingWsEntries.Count -eq 0 -or $hadPrevWsRoot) {
+            Set-Content -LiteralPath $WorkspaceMarker -Value 'Created by an OxideSwarm USB kit install.' -Encoding ASCII
+        }
+    }
+    $workerArgs += ' --workspaces --workspace-root "' + $WorkspaceRoot + '"'
 }
 $log = Join-Path $LogDir 'worker.log'
 
