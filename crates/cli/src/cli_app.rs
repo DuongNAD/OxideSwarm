@@ -182,6 +182,9 @@ pub enum Commands {
 
     /// Model Context Protocol (MCP) server for external AI coding agents (Claude Desktop, Cline, Cursor)
     Mcp(crate::mcp::McpArgs),
+
+    /// Standalone HTTP rendezvous registry for cross-subnet discovery
+    Rendezvous(crate::rendezvous_cmd::RendezvousArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1149,7 +1152,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     let is_mcp = matches!(cli.command, Commands::Mcp(_));
     let info_to_stdout = matches!(
         cli.command,
-        Commands::Master(_) | Commands::Worker(_) | Commands::Mode(_)
+        Commands::Master(_) | Commands::Worker(_) | Commands::Rendezvous(_) | Commands::Mode(_)
     );
     let _ = if !info_to_stdout {
         builder.with_writer(std::io::stderr).try_init()
@@ -1208,6 +1211,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
             }
         }
         Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
+        Commands::Rendezvous(args) => {
+            crate::rendezvous_cmd::run_rendezvous(args, secret_opts).await
+        }
     };
     rusty_grid_core::transport::drain_pending_p2p_client_closes().await;
     exit_code
@@ -1517,6 +1523,15 @@ async fn run_master_inner(
 ) -> ExitCode {
     let master_cfg = config_file.as_ref().and_then(|c| c.master.clone());
 
+    let rendezvous_url =
+        match crate::connect::resolve_and_validate_rendezvous_url(args.rendezvous.as_deref()) {
+            Ok(url) => url,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Loopback by default: a bare `master` works with a bare `worker` on the same machine, and
     // reaching other machines is an explicit `--listen 0.0.0.0:8088` that brings in the secret policy.
     let listen_addr_str = resolve_string(
@@ -1649,7 +1664,7 @@ async fn run_master_inner(
         server_config = server_config.with_p2p_ticket_file(tf);
     }
 
-    if let Some(r_url) = args.rendezvous {
+    if let Some(r_url) = rendezvous_url {
         server_config = server_config.with_rendezvous_url(r_url);
     }
 
@@ -2156,6 +2171,14 @@ async fn run_worker(
     secret_opts: SecretOpts,
 ) -> ExitCode {
     rusty_grid_core::capabilities::suppress_windows_error_dialogs();
+    let rendezvous_url =
+        match crate::connect::resolve_and_validate_rendezvous_url(args.rendezvous.as_deref()) {
+            Ok(url) => url,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
@@ -2174,10 +2197,6 @@ async fn run_worker(
 
     let (master_addr, p2p_ticket) =
         resolve_worker_target(args.master, args.p2p_ticket, worker_cfg.as_ref());
-
-    if let Some(ref r_url) = args.rendezvous {
-        std::env::set_var(rusty_grid_core::discovery::RENDEZVOUS_ENV, r_url);
-    }
 
     let v3_auth = match secret_opts.resolve_v3_auth(config_file.as_ref(), SecretSection::Worker) {
         Ok(v3) => v3,
@@ -2469,7 +2488,9 @@ async fn run_worker(
     if p2p_minimal {
         config = config.with_p2p_minimal_preset(true);
     }
-    config = config.with_relay_url(relay_url);
+    config = config
+        .with_relay_url(relay_url)
+        .with_rendezvous_url(rendezvous_url);
     if let Some(n) = name {
         config = config.with_name(n);
     }

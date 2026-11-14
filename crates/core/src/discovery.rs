@@ -43,6 +43,7 @@
 //! 3. Tier 3: Authenticated Rendezvous Registry service (`OXIDESWARM_RENDEZVOUS` or
 //!    `--rendezvous`) querying a signed Master lease.
 
+use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -83,6 +84,9 @@ pub struct MasterBeacon {
     pub web_ui_url: String,
     /// Hostname of the Master node
     pub hostname: String,
+    /// Optional iroh P2P ticket carried from an authenticated rendezvous lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_ticket: Option<String>,
     /// Current number of connected workers
     pub worker_count: usize,
     /// Timestamp (epoch seconds)
@@ -107,6 +111,7 @@ impl MasterBeacon {
             cluster_addr: cluster_addr.into(),
             web_ui_url: web_ui_url.into(),
             hostname: hostname.into(),
+            p2p_ticket: None,
             worker_count,
             timestamp: chrono::Utc::now().timestamp() as u64,
             mac: None,
@@ -131,11 +136,14 @@ impl MasterBeacon {
     /// `label || (len || field)*` over the probe nonce and the fields a client acts on. The length
     /// prefixes keep the variable-length fields from sliding into each other.
     fn mac_input(&self, probe_nonce: &[u8]) -> Vec<u8> {
-        let fields = [
+        let mut fields = vec![
             probe_nonce,
             self.cluster_addr.as_bytes(),
             self.web_ui_url.as_bytes(),
         ];
+        if let Some(ref ticket) = self.p2p_ticket {
+            fields.push(ticket.as_bytes());
+        }
         let mut buf = Vec::with_capacity(
             BEACON_MAC_LABEL.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>(),
         );
@@ -166,8 +174,98 @@ impl MasterBeacon {
 /// Domain separation label for rendezvous lease MAC.
 pub const RENDEZVOUS_MAC_LABEL: &[u8] = b"oxs1-rendezvous";
 
+/// Domain separation label for deriving the deterministic Ed25519 keypair from a ClusterSecret.
+pub const RENDEZVOUS_ED25519_SEED_LABEL: &[u8] = b"oxs1-rendezvous-ed25519";
+
+/// Domain separation label for rendezvous lease read authorization signatures.
+pub const RENDEZVOUS_READ_AUTH_LABEL: &[u8] = b"oxs1-rendezvous-read";
+
+/// HTTP request header carrying a signed timestamp authorizing a read of a keyed rendezvous lease.
+pub const RENDEZVOUS_READ_AUTH_HEADER: &str = "x-oxideswarm-lease-auth";
+
+/// Default TCP port for the standalone `oxideswarm rendezvous` registry server.
+pub const DEFAULT_RENDEZVOUS_PORT: u16 = 8090;
+
 /// Environment variable specifying rendezvous registry URL.
 pub const RENDEZVOUS_ENV: &str = "OXIDESWARM_RENDEZVOUS";
+
+/// Derives the Ed25519 keypair used for keyed rendezvous leases from `secret`.
+fn derive_rendezvous_keypair(secret: &ClusterSecret) -> Ed25519KeyPair {
+    let seed = secret.mac(&[RENDEZVOUS_ED25519_SEED_LABEL]);
+    Ed25519KeyPair::from_seed_unchecked(&seed)
+        .expect("32-byte HMAC-SHA256 output is always a valid Ed25519 seed")
+}
+
+/// Returns the deterministic 64-char hex Ed25519 public key used as the rendezvous `lease_key` for
+/// the cluster sharing `secret`.
+pub fn derive_rendezvous_key(secret: &ClusterSecret) -> String {
+    let kp = derive_rendezvous_keypair(secret);
+    hex_encode(kp.public_key().as_ref())
+}
+
+/// Returns `true` when `key` is safe to use as a keyed rendezvous slot identifier (and URL query param).
+pub fn is_valid_lease_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn read_auth_payload(key: &str, timestamp_str: &str) -> Vec<u8> {
+    let mut buf =
+        Vec::with_capacity(RENDEZVOUS_READ_AUTH_LABEL.len() + 8 + key.len() + timestamp_str.len());
+    buf.extend_from_slice(RENDEZVOUS_READ_AUTH_LABEL);
+    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    buf.extend_from_slice(key.as_bytes());
+    buf.extend_from_slice(&(timestamp_str.len() as u32).to_be_bytes());
+    buf.extend_from_slice(timestamp_str.as_bytes());
+    buf
+}
+
+/// Builds the `X-OxideSwarm-Lease-Auth` header value (`<unix_ts>:<ed25519_sig_hex>`) authorizing
+/// reads of the rendezvous slot identified by `key`.
+pub fn sign_rendezvous_read_auth(secret: &ClusterSecret, key: &str, timestamp: u64) -> String {
+    let ts_str = timestamp.to_string();
+    let payload = read_auth_payload(key, &ts_str);
+    let kp = derive_rendezvous_keypair(secret);
+    let sig = kp.sign(&payload);
+    format!("{}:{}", ts_str, hex_encode(sig.as_ref()))
+}
+
+/// Verifies an `X-OxideSwarm-Lease-Auth` header value against the slot's 64-char hex Ed25519
+/// public `key_hex` and ensures the signed timestamp is within `max_skew_secs` of the current time.
+pub fn verify_rendezvous_read_auth(key_hex: &str, header_val: &str, max_skew_secs: u64) -> bool {
+    if key_hex.len() != 64 {
+        return false;
+    }
+    let Some(key_bytes) = hex_decode(key_hex) else {
+        return false;
+    };
+    if key_bytes.len() != 32 {
+        return false;
+    }
+    let Some((ts_str, sig_hex)) = header_val.trim().split_once(':') else {
+        return false;
+    };
+    let Ok(ts) = ts_str.parse::<u64>() else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp() as u64;
+    if now + max_skew_secs < ts || now > ts.saturating_add(max_skew_secs) {
+        return false;
+    }
+    let Some(sig_bytes) = hex_decode(sig_hex) else {
+        return false;
+    };
+    if sig_bytes.len() != 64 {
+        return false;
+    }
+    let payload = read_auth_payload(key_hex, ts_str);
+    UnparsedPublicKey::new(&ED25519, &key_bytes)
+        .verify(&payload, &sig_bytes)
+        .is_ok()
+}
 
 /// Master Registration Payload published to Rendezvous Registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,12 +277,16 @@ pub struct RendezvousLease {
     pub web_ui_url: String,
     pub hostname: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_ticket: Option<String>,
     pub worker_count: usize,
     pub timestamp: u64,
     pub ttl_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_signature: Option<String>,
 }
 
 impl RendezvousLease {
@@ -202,20 +304,35 @@ impl RendezvousLease {
             cluster_addr: cluster_addr.into(),
             web_ui_url: web_ui_url.into(),
             hostname: hostname.into(),
+            lease_key: None,
             p2p_ticket,
             worker_count,
             timestamp: chrono::Utc::now().timestamp() as u64,
             ttl_secs,
             signature: None,
+            key_signature: None,
         }
     }
 
+    pub fn with_lease_key(mut self, key: impl Into<String>) -> Self {
+        self.lease_key = Some(key.into());
+        self
+    }
+
     pub fn sign(&mut self, secret: &ClusterSecret) {
-        let tag = secret.mac(&[&self.mac_input()]);
+        let kp = derive_rendezvous_keypair(secret);
+        self.lease_key = Some(hex_encode(kp.public_key().as_ref()));
+        let msg = self.mac_input();
+        let tag = secret.mac(&[&msg]);
         self.signature = Some(hex_encode(&tag));
+        let sig = kp.sign(&msg);
+        self.key_signature = Some(hex_encode(sig.as_ref()));
     }
 
     pub fn verify(&self, secret: &ClusterSecret, max_skew_secs: u64) -> bool {
+        if self.service != DISCOVERY_SERVICE_NAME || self.ttl_secs == 0 {
+            return false;
+        }
         let now = chrono::Utc::now().timestamp() as u64;
         if now + max_skew_secs < self.timestamp {
             return false;
@@ -228,19 +345,87 @@ impl RendezvousLease {
         {
             return false;
         }
+        if let Some(ref key) = self.lease_key {
+            if key != &derive_rendezvous_key(secret) {
+                return false;
+            }
+        }
         match self.signature.as_deref().and_then(hex_decode) {
             Some(tag) => secret.verify_mac(&[&self.mac_input()], &tag),
             None => false,
         }
     }
 
+    /// Verifies this lease's self-authenticating Ed25519 `key_signature` using its embedded
+    /// `lease_key` (used by standalone `oxideswarm rendezvous` registries that do not hold cluster
+    /// secrets).
+    pub fn verify_key_signature(&self, max_skew_secs: u64) -> bool {
+        if self.service != DISCOVERY_SERVICE_NAME || self.ttl_secs == 0 {
+            return false;
+        }
+        if sanitize_host_port(&self.cluster_addr).is_none() {
+            return false;
+        }
+        if !self.web_ui_url.is_empty() && sanitize_http_origin(&self.web_ui_url).is_none() {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp() as u64;
+        if now + max_skew_secs < self.timestamp {
+            return false;
+        }
+        if now
+            > self
+                .timestamp
+                .saturating_add(self.ttl_secs)
+                .saturating_add(max_skew_secs)
+        {
+            return false;
+        }
+        let Some(ref key_hex) = self.lease_key else {
+            return false;
+        };
+        if key_hex.len() != 64 {
+            return false;
+        }
+        let Some(key_bytes) = hex_decode(key_hex) else {
+            return false;
+        };
+        if key_bytes.len() != 32 {
+            return false;
+        }
+        let Some(ref sig_hex) = self.key_signature else {
+            return false;
+        };
+        let Some(sig_bytes) = hex_decode(sig_hex) else {
+            return false;
+        };
+        if sig_bytes.len() != 64 {
+            return false;
+        }
+        UnparsedPublicKey::new(&ED25519, &key_bytes)
+            .verify(&self.mac_input(), &sig_bytes)
+            .is_ok()
+    }
+
     fn mac_input(&self) -> Vec<u8> {
         let ts_str = self.timestamp.to_string();
         let ttl_str = self.ttl_secs.to_string();
-        let fields = [
+        let has_key: &[u8] = if self.lease_key.is_some() { &[1] } else { &[0] };
+        let key_bytes = self.lease_key.as_deref().unwrap_or("").as_bytes();
+        let has_ticket: &[u8] = if self.p2p_ticket.is_some() {
+            &[1]
+        } else {
+            &[0]
+        };
+        let ticket_bytes = self.p2p_ticket.as_deref().unwrap_or("").as_bytes();
+        let fields: [&[u8]; 9] = [
             self.cluster_addr.as_bytes(),
             self.web_ui_url.as_bytes(),
             self.hostname.as_bytes(),
+            has_key,
+            key_bytes,
+            has_ticket,
+            ticket_bytes,
             ts_str.as_bytes(),
             ttl_str.as_bytes(),
         ];
@@ -262,6 +447,7 @@ impl RendezvousLease {
             &self.hostname,
             self.worker_count,
         );
+        beacon.p2p_ticket = self.p2p_ticket.clone();
         beacon.timestamp = self.timestamp;
         beacon
     }
@@ -785,32 +971,132 @@ pub async fn probe_http_candidates(timeout: Duration, web_ui_port: u16) -> Optio
     probe_http_candidates_with_secret(timeout, web_ui_port, None).await
 }
 
-/// Parses an HTTP/HTTPS URL into (host, port, path_prefix).
-fn parse_http_url(url_str: &str) -> Option<(String, u16, String)> {
-    let stripped = url_str
-        .trim()
-        .strip_prefix("http://")
-        .or_else(|| url_str.trim().strip_prefix("https://"))?;
+/// Validates and parses an `http://` rendezvous URL into `(host, port, path_prefix)`.
+///
+/// Rejects `https://` explicitly so callers never silently downgrade an HTTPS URL to plain TCP.
+pub fn parse_rendezvous_url(url_str: &str) -> Result<(String, u16, String), String> {
+    let trimmed = url_str.trim();
+    if trimmed.is_empty() {
+        return Err("Rendezvous URL cannot be empty".to_string());
+    }
+    if trimmed
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+    {
+        return Err(
+            "Invalid rendezvous URL: whitespace, control characters, query strings, and fragments are not allowed"
+                .to_string(),
+        );
+    }
+    if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        return Err(
+            "https:// rendezvous URLs are not supported (the rendezvous registry speaks HTTP with signed leases); use http://HOST:PORT or terminate TLS in a local reverse proxy"
+                .to_string(),
+        );
+    }
+    let stripped = trimmed
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("http://"))
+        .map(|_| &trimmed[7..])
+        .ok_or_else(|| {
+            format!("Invalid rendezvous URL '{trimmed}': expected http://HOST[:PORT][/PATH]")
+        })?;
     let (authority, path_prefix) = match stripped.split_once('/') {
-        Some((auth, path)) => (auth, format!("/{}", path.trim_end_matches('/'))),
+        Some((auth, path)) => {
+            let clean = path.trim_matches('/');
+            if clean.is_empty() {
+                (auth, String::new())
+            } else {
+                (auth, format!("/{clean}"))
+            }
+        }
         None => (stripped, String::new()),
     };
-    let (host, port) = if authority.starts_with('[') {
-        let closing = authority.find(']')?;
-        let host = &authority[1..closing];
-        let rest = &authority[closing + 1..];
-        let port = if let Some(p) = rest.strip_prefix(':') {
-            p.parse::<u16>().ok()?
-        } else {
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!(
+            "Invalid rendezvous URL '{trimmed}': missing host or forbidden userinfo"
+        ));
+    }
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (inner, tail) = after_bracket
+            .split_once(']')
+            .ok_or_else(|| format!("Invalid rendezvous URL '{trimmed}': unclosed IPv6 host"))?;
+        inner
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("Invalid rendezvous URL '{trimmed}': invalid IPv6 address"))?;
+        let port = if tail.is_empty() {
             80
+        } else if let Some(p) = tail.strip_prefix(':') {
+            p.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("Invalid rendezvous URL '{trimmed}': invalid port"))?
+        } else {
+            return Err(format!(
+                "Invalid rendezvous URL '{trimmed}': malformed authority"
+            ));
         };
-        (host.to_string(), port)
+        (inner.to_string(), port)
     } else if let Some((h, p)) = authority.split_once(':') {
-        (h.to_string(), p.parse::<u16>().ok()?)
+        let port = p
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("Invalid rendezvous URL '{trimmed}': invalid port"))?;
+        (h.to_string(), port)
     } else {
         (authority.to_string(), 80)
     };
-    Some((host, port, path_prefix))
+    if !is_valid_host(&host) {
+        return Err(format!(
+            "Invalid rendezvous URL '{trimmed}': host '{host}' is not a valid IP or DNS name"
+        ));
+    }
+    Ok((host, port, path_prefix))
+}
+
+fn format_connect_addr(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn format_host_header(host: &str, port: u16) -> String {
+    let base = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 80 {
+        base
+    } else {
+        format!("{base}:{port}")
+    }
+}
+
+fn is_usable_rendezvous_cluster_addr(cluster_addr: &str) -> bool {
+    let Some((host, _port)) = split_host_port(cluster_addr) else {
+        return false;
+    };
+    if !is_valid_host(host) {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_multicast()
+            || ip.is_unspecified()
+            || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Discovers an active Master node by querying a signed rendezvous lease from the specified URL.
@@ -822,8 +1108,15 @@ pub async fn discover_master_rendezvous(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let (host, port, path_prefix) = parse_http_url(rendezvous_url)?;
-    let addr_str = format!("{}:{}", host, port);
+    let (host, port, path_prefix) = match parse_rendezvous_url(rendezvous_url) {
+        Ok(parts) => parts,
+        Err(err) => {
+            tracing::warn!(url = %rendezvous_url, "{err}");
+            return None;
+        }
+    };
+    let addr_str = format_connect_addr(&host, port);
+    let host_header = format_host_header(&host, port);
     let connect_future = TcpStream::connect(&addr_str);
     let mut stream = tokio::time::timeout(timeout, connect_future)
         .await
@@ -831,13 +1124,22 @@ pub async fn discover_master_rendezvous(
         .ok()?;
     let _ = stream.set_nodelay(true);
 
-    let path = format!(
-        "{}/api/rendezvous/master",
-        path_prefix.trim_end_matches('/')
-    );
+    let (path, auth_line) = if let Some(sec) = secret {
+        let key = derive_rendezvous_key(sec);
+        let now = chrono::Utc::now().timestamp() as u64;
+        let auth_val = sign_rendezvous_read_auth(sec, &key, now);
+        (
+            format!("{}/api/rendezvous/master?key={key}", path_prefix),
+            format!("X-OxideSwarm-Lease-Auth: {auth_val}\r\n"),
+        )
+    } else {
+        (
+            format!("{}/api/rendezvous/master", path_prefix),
+            String::new(),
+        )
+    };
     let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: OxideSwarm-Discovery/1.0\r\nConnection: close\r\n\r\n",
-        path, host
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\n{auth_line}User-Agent: OxideSwarm-Discovery/1.0\r\nConnection: close\r\n\r\n"
     );
     tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
         .await
@@ -870,6 +1172,11 @@ pub async fn discover_master_rendezvous(
     }
     let json_start = resp_str.find("\r\n\r\n").map(|i| i + 4)?;
     let lease: RendezvousLease = serde_json::from_str(&resp_str[json_start..]).ok()?;
+    if lease.service != DISCOVERY_SERVICE_NAME
+        || !is_usable_rendezvous_cluster_addr(&lease.cluster_addr)
+    {
+        return None;
+    }
 
     if let Some(secret) = secret {
         if !lease.verify(secret, 30) {
@@ -889,9 +1196,9 @@ pub async fn register_rendezvous_lease(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let (host, port, path_prefix) = parse_http_url(rendezvous_url)
-        .ok_or_else(|| format!("Invalid rendezvous URL: {rendezvous_url}"))?;
-    let addr_str = format!("{}:{}", host, port);
+    let (host, port, path_prefix) = parse_rendezvous_url(rendezvous_url)?;
+    let addr_str = format_connect_addr(&host, port);
+    let host_header = format_host_header(&host, port);
     let timeout = Duration::from_secs(5);
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr_str))
         .await
@@ -899,18 +1206,12 @@ pub async fn register_rendezvous_lease(
         .map_err(|e| format!("Failed to connect to rendezvous registry at {addr_str}: {e}"))?;
     let _ = stream.set_nodelay(true);
 
-    let path = format!(
-        "{}/api/rendezvous/register",
-        path_prefix.trim_end_matches('/')
-    );
+    let path = format!("{}/api/rendezvous/register", path_prefix);
     let body = serde_json::to_string(lease)
         .map_err(|e| format!("Failed to serialize rendezvous lease: {e}"))?;
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path,
-        host,
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
-        body
     );
     tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
         .await
@@ -1052,6 +1353,24 @@ pub async fn discover_master_with_secret(
     discover_master_tiered(timeout, port, secret, DEFAULT_WEB_UI_PORT).await
 }
 
+/// Like [`discover_master_with_secret`], with an explicit optional rendezvous registry URL overriding
+/// [`RENDEZVOUS_ENV`].
+pub async fn discover_master_with_secret_and_rendezvous(
+    timeout: Duration,
+    port: u16,
+    secret: Option<&ClusterSecret>,
+    rendezvous_override: Option<&str>,
+) -> Option<MasterBeacon> {
+    discover_master_tiered_with_rendezvous(
+        timeout,
+        port,
+        secret,
+        DEFAULT_WEB_UI_PORT,
+        rendezvous_override,
+    )
+    .await
+}
+
 /// Port of the master's dashboard, probed by the HTTP fallback.
 const DEFAULT_WEB_UI_PORT: u16 = 8080;
 
@@ -1060,6 +1379,16 @@ pub async fn discover_master_tiered(
     port: u16,
     secret: Option<&ClusterSecret>,
     web_ui_port: u16,
+) -> Option<MasterBeacon> {
+    discover_master_tiered_with_rendezvous(timeout, port, secret, web_ui_port, None).await
+}
+
+pub async fn discover_master_tiered_with_rendezvous(
+    timeout: Duration,
+    port: u16,
+    secret: Option<&ClusterSecret>,
+    web_ui_port: u16,
+    rendezvous_override: Option<&str>,
 ) -> Option<MasterBeacon> {
     let udp_timeout = timeout.min(Duration::from_millis(1500));
     if let Some(beacon) = discover_master_udp_with_secret(udp_timeout, port, secret).await {
@@ -1075,11 +1404,18 @@ pub async fn discover_master_tiered(
         return Some(beacon);
     }
 
-    // Tier 3: Rendezvous Registry Fallback (OXIDESWARM_RENDEZVOUS or RUSTY_GRID_RENDEZVOUS)
-    let rendezvous_url = std::env::var(RENDEZVOUS_ENV)
-        .or_else(|_| std::env::var("RUSTY_GRID_RENDEZVOUS"))
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    // Tier 3: Rendezvous Registry Fallback (explicit override, OXIDESWARM_RENDEZVOUS, or RUSTY_GRID_RENDEZVOUS)
+    let rendezvous_url = rendezvous_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(RENDEZVOUS_ENV)
+                .or_else(|_| std::env::var("RUSTY_GRID_RENDEZVOUS"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
     if let Some(url) = rendezvous_url {
         if let Some(beacon) = discover_master_rendezvous(&url, secret, http_timeout).await {
             return Some(beacon);
@@ -1870,32 +2206,111 @@ mod tests {
 
         // Verification with correct secret and within TTL succeeds
         assert!(lease.verify(&secret, 30));
+        assert!(lease.verify_key_signature(30));
+        assert_eq!(
+            lease.lease_key.as_deref(),
+            Some(derive_rendezvous_key(&secret).as_str())
+        );
 
         // Verification with wrong secret fails
         assert!(!lease.verify(&other_secret, 30));
 
-        // Tampering with cluster_addr invalidates signature
+        // Tampering with cluster_addr invalidates signature and key_signature
         let mut tampered = lease.clone();
         tampered.cluster_addr = "192.168.1.200:8088".to_string();
         assert!(!tampered.verify(&secret, 30));
+        assert!(!tampered.verify_key_signature(30));
 
         // Tampering with hostname invalidates signature
         let mut tampered_host = lease.clone();
         tampered_host.hostname = "host-evil".to_string();
         assert!(!tampered_host.verify(&secret, 30));
+        assert!(!tampered_host.verify_key_signature(30));
 
-        // Expiry check
+        // Tampering with p2p_ticket (mutating, dropping, or adding) invalidates MAC and key_signature
+        let mut tampered_ticket = lease.clone();
+        tampered_ticket.p2p_ticket = Some("p2p-ticket-evil".to_string());
+        assert!(!tampered_ticket.verify(&secret, 30));
+        assert!(!tampered_ticket.verify_key_signature(30));
+
+        let mut dropped_ticket = lease.clone();
+        dropped_ticket.p2p_ticket = None;
+        assert!(!dropped_ticket.verify(&secret, 30));
+        assert!(!dropped_ticket.verify_key_signature(30));
+
+        let mut none_lease = RendezvousLease::new(
+            "192.168.1.100:8088",
+            "http://192.168.1.100:8080",
+            "host-alpha",
+            None,
+            3,
+            60,
+        );
+        none_lease.sign(&secret);
+        assert!(none_lease.verify(&secret, 30));
+        let mut injected_ticket = none_lease.clone();
+        injected_ticket.p2p_ticket = Some("injected-ticket".to_string());
+        assert!(!injected_ticket.verify(&secret, 30));
+        assert!(!injected_ticket.verify_key_signature(30));
+        let mut empty_ticket = none_lease.clone();
+        empty_ticket.p2p_ticket = Some(String::new());
+        assert!(!empty_ticket.verify(&secret, 30));
+
+        // Expiry check (Unix epoch checked_sub avoids any subtraction underflow)
         let mut expired_lease = lease.clone();
-        expired_lease.timestamp = chrono::Utc::now().timestamp() as u64 - 1000;
+        expired_lease.timestamp = (chrono::Utc::now().timestamp() as u64).saturating_sub(1000);
         expired_lease.sign(&secret);
         assert!(!expired_lease.verify(&secret, 30));
+        assert!(!expired_lease.verify_key_signature(30));
 
-        // Conversion to beacon
+        // Conversion to beacon preserves p2p_ticket
         let beacon = lease.to_beacon();
         assert_eq!(beacon.cluster_addr, "192.168.1.100:8088");
         assert_eq!(beacon.web_ui_url, "http://192.168.1.100:8080");
         assert_eq!(beacon.hostname, "host-alpha");
+        assert_eq!(beacon.p2p_ticket.as_deref(), Some("p2p-ticket-xyz"));
         assert_eq!(beacon.worker_count, 3);
+    }
+
+    #[test]
+    fn test_parse_rendezvous_url_rejects_https_and_invalid_inputs() {
+        let https_err = parse_rendezvous_url("https://rendezvous.example.com:8090")
+            .expect_err("https:// must be refused explicitly");
+        assert!(
+            https_err.contains("https://"),
+            "error must name https://: {https_err}"
+        );
+        assert!(parse_rendezvous_url("HTTPS://rendezvous.example.com").is_err());
+        assert!(parse_rendezvous_url("http://127.0.0.1:8090\r\nInjected: 1").is_err());
+        assert!(parse_rendezvous_url("http://user:pass@127.0.0.1:8090").is_err());
+        assert!(parse_rendezvous_url("http://127.0.0.1:8090?foo=bar").is_err());
+        assert!(parse_rendezvous_url("http://127.0.0.1:0").is_err());
+
+        assert_eq!(
+            parse_rendezvous_url("http://127.0.0.1:8090/").unwrap(),
+            ("127.0.0.1".to_string(), 8090, String::new())
+        );
+        assert_eq!(
+            parse_rendezvous_url("http://[::1]:8091/prefix/").unwrap(),
+            ("::1".to_string(), 8091, "/prefix".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rendezvous_read_auth_sign_and_verify() {
+        let secret = ClusterSecret::generate().unwrap();
+        let other = ClusterSecret::generate().unwrap();
+        let key = derive_rendezvous_key(&secret);
+        let other_key = derive_rendezvous_key(&other);
+        assert_ne!(key, other_key);
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let hdr = sign_rendezvous_read_auth(&secret, &key, now);
+        assert!(verify_rendezvous_read_auth(&key, &hdr, 30));
+        assert!(!verify_rendezvous_read_auth(&other_key, &hdr, 30));
+
+        let expired_hdr = sign_rendezvous_read_auth(&secret, &key, now.saturating_sub(120));
+        assert!(!verify_rendezvous_read_auth(&key, &expired_hdr, 30));
     }
 
     #[test]
