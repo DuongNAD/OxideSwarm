@@ -36,7 +36,10 @@ elif command -v systemctl >/dev/null 2>&1; then
 fi
 if [ -f "$ROOT/run/worker.pid" ]; then
   PID=$(cat "$ROOT/run/worker.pid" 2>/dev/null || true)
-  [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+  # Only a process that runs this install's binary (a PID file can outlive a reboot).
+  case "$(ps -ww -p "$PID" -o command= 2>/dev/null)" in
+    *"$ROOT/bin/oxideswarm "*) kill "$PID" 2>/dev/null || true ;;
+  esac
   sleep 1
 fi
 rm -rf "$ROOT"
