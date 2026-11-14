@@ -114,6 +114,13 @@ pub fn compute_fingerprint(public_key: &[u8; KEY_LEN]) -> String {
     format_fingerprint(&compute_member_id(public_key))
 }
 
+/// Computes the 8-byte SHA-256 checksum (16 lowercase hex characters) over an invite's
+/// base64url payload string (design 0051 D3).
+pub fn invite_payload_check_hex(payload_text: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, payload_text.as_bytes());
+    hex_encode(&digest.as_ref()[..8])
+}
+
 /// An X25519 public key (32 bytes). Safe to log, serialize, and display.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey([u8; KEY_LEN]);
@@ -469,6 +476,289 @@ pub fn master_noise_key_path(state_dir: Option<&Path>) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Redacted Wire Wrappers, Member Roles, Entries, Invites, and Enrollment Proofs (ENROLL-1b)
+// ---------------------------------------------------------------------------------------------
+
+/// A 32-byte secret, proof, or handshake hash whose [`fmt::Debug`] output is always `"<redacted>"`.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedBytes32(pub [u8; KEY_LEN]);
+
+impl RedactedBytes32 {
+    pub const fn as_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+
+    /// Lowercase 64-character hex representation.
+    pub fn to_hex(&self) -> String {
+        hex_encode(&self.0)
+    }
+
+    /// Parses a 64-character hex string (ignoring surrounding whitespace) into [`RedactedBytes32`].
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let bytes = hex_decode(text.trim())?;
+        let arr: [u8; KEY_LEN] = bytes.try_into().ok()?;
+        Some(Self(arr))
+    }
+}
+
+impl fmt::Debug for RedactedBytes32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+/// A sensitive string (such as a 6-digit pairing check) whose [`fmt::Debug`] output is always
+/// `"<redacted>"`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl RedactedString {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+/// Role granted to an enrolled machine in `members.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRole {
+    Worker,
+    Client,
+    Admin,
+}
+
+impl MemberRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Client => "client",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+impl fmt::Display for MemberRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MemberRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "worker" => Ok(Self::Worker),
+            "client" => Ok(Self::Client),
+            "admin" => Ok(Self::Admin),
+            other => Err(format!(
+                "invalid member role '{other}': expected worker, client, or admin"
+            )),
+        }
+    }
+}
+
+fn default_member_roles() -> Vec<MemberRole> {
+    vec![MemberRole::Worker]
+}
+
+/// A single enrolled machine entry in `members.json` and in `ClientResponse::MembersList`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub public_key: PublicKey,
+    #[serde(default = "default_member_roles")]
+    pub roles: Vec<MemberRole>,
+    #[serde(default)]
+    pub enrolled_at: Option<u64>,
+    #[serde(default)]
+    pub last_seen: Option<u64>,
+    #[serde(default, alias = "enrolled_via")]
+    pub via_invite: Option<String>,
+}
+
+impl MemberEntry {
+    /// Creates a new [`MemberEntry`] deriving `id` from `public_key.member_id()`.
+    pub fn new(
+        name: impl Into<String>,
+        public_key: PublicKey,
+        roles: impl IntoIterator<Item = MemberRole>,
+    ) -> Self {
+        Self {
+            id: public_key.member_id(),
+            name: name.into(),
+            public_key,
+            roles: roles.into_iter().collect(),
+            enrolled_at: None,
+            last_seen: None,
+            via_invite: None,
+        }
+    }
+
+    /// Canonical member ID derived from `self.public_key`.
+    pub fn effective_id(&self) -> String {
+        self.public_key.member_id()
+    }
+
+    /// Returns `true` if this member has any role at all.
+    pub fn has_any_role(&self) -> bool {
+        !self.roles.is_empty()
+    }
+
+    /// Returns `true` if this member is permitted to register as a worker.
+    ///
+    /// Per design 0051 D3, `admin` implies `client` but does **not** imply `worker`.
+    pub fn has_worker_role(&self) -> bool {
+        self.roles.contains(&MemberRole::Worker)
+    }
+
+    /// Returns `true` if this member may issue client task/blob commands (`client` or `admin`).
+    pub fn has_client_role(&self) -> bool {
+        self.roles
+            .iter()
+            .any(|r| matches!(r, MemberRole::Client | MemberRole::Admin))
+    }
+
+    /// Returns `true` if this member has the `admin` role.
+    pub fn has_admin_role(&self) -> bool {
+        self.roles.contains(&MemberRole::Admin)
+    }
+}
+
+/// Summary of an invite returned by `ListInvites` (never carries `invite_secret`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteSummary {
+    pub invite_id: String,
+    pub roles: Vec<MemberRole>,
+    pub uses_remaining: u32,
+    pub max_uses: u32,
+    pub expires_at: u64,
+    pub require_approval: bool,
+    pub revoked: bool,
+}
+
+/// Summary of a pending enrollment request returned by `ListPendingEnrollments`.
+///
+/// Intentionally omits `pairing_code` so the cluster administrator must obtain the 6-digit
+/// pairing code out-of-band from the joining machine before running `oxideswarm members approve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEnrollmentInfo {
+    pub pending_id: String,
+    pub member_id: String,
+    pub public_key: PublicKey,
+    pub name: String,
+    pub os: String,
+    pub arch: String,
+    pub roles: Vec<MemberRole>,
+    pub invite_id: String,
+    pub master_fingerprint: String,
+    pub remote_addr: String,
+    pub requested_at: u64,
+    pub expires_at: u64,
+}
+
+/// Domain-separation prefix for the OXS-AUTH v3 enrollment proof (`HMAC-SHA256`).
+pub const LABEL_ENROLL_PROOF: &[u8] = b"oxs3-enroll";
+
+/// Returns `true` if `c` is a Unicode control character (`Cc`) or a Unicode format character
+/// (`Cf`, including BiDi overrides `U+202A..=U+202E`, isolates `U+2066..=U+2069`, directional
+/// marks `U+200E..=U+200F`, `U+061C`, zero-width joiners/spaces, BOM, and tag characters).
+pub fn is_control_or_format_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c as u32,
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0001
+                | 0xE0020..=0xE007F
+        )
+}
+
+/// Domain-separation prefix for the 6-digit pairing check derived from `handshake_hash`.
+const LABEL_PAIRING_CODE: &[u8] = b"oxs3-pairing-check:";
+
+/// Computes `HMAC-SHA256(invite_secret, "oxs3-enroll" || handshake_hash)`.
+pub fn compute_enroll_proof(
+    invite_secret: &[u8; KEY_LEN],
+    handshake_hash: &[u8; KEY_LEN],
+) -> RedactedBytes32 {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, invite_secret);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(LABEL_ENROLL_PROOF);
+    ctx.update(handshake_hash);
+    let tag = ctx.sign();
+    let mut out = [0u8; KEY_LEN];
+    out.copy_from_slice(tag.as_ref());
+    RedactedBytes32(out)
+}
+
+/// Verifies `proof` in constant time against `HMAC-SHA256(invite_secret, "oxs3-enroll" || handshake_hash)`.
+pub fn verify_enroll_proof(
+    invite_secret: &[u8; KEY_LEN],
+    handshake_hash: &[u8; KEY_LEN],
+    proof: &RedactedBytes32,
+) -> bool {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, invite_secret);
+    let mut msg = Vec::with_capacity(LABEL_ENROLL_PROOF.len() + KEY_LEN);
+    msg.extend_from_slice(LABEL_ENROLL_PROOF);
+    msg.extend_from_slice(handshake_hash);
+    hmac::verify(&key, &msg, &proof.0).is_ok()
+}
+
+/// Derives a 6-digit decimal pairing check (`"000000"`..=`"999999"`) from `handshake_hash`.
+pub fn derive_pairing_code(handshake_hash: &[u8; KEY_LEN]) -> RedactedString {
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(LABEL_PAIRING_CODE);
+    ctx.update(handshake_hash);
+    let d = ctx.finish();
+    let b = d.as_ref();
+    let code = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) % 1_000_000;
+    RedactedString(format!("{code:06}"))
+}
+
+/// Verifies a 6-digit pairing check in constant time (ignoring surrounding whitespace and
+/// optional hyphens).
+pub fn verify_pairing_code(expected: &str, candidate: &str) -> bool {
+    let exp = expected.trim();
+    let cand: String = candidate.trim().chars().filter(|c| *c != '-').collect();
+    if exp.len() != 6 || cand.len() != 6 || !cand.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in exp.bytes().zip(cand.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------------------------
 // OXS-AUTH v3 Handshake (Noise_IK_25519_ChaChaPoly_BLAKE2s)
 // ---------------------------------------------------------------------------------------------
 
@@ -522,8 +812,11 @@ pub fn parse_v3_hello_body(body: &[u8]) -> Option<(u32, HandshakePurpose)> {
 }
 
 /// Derives the 32-byte record-layer `session_key` from snow's two raw `Split()` directional keys
-/// `(k_i2r, k_r2i)` using `HMAC-SHA256(key = "oxs3-split-session-key", k_i2r || k_r2i)`.
-fn derive_v3_session_key(hs: &mut snow::HandshakeState) -> [u8; MAC_LEN] {
+/// `(k_i2r, k_r2i)` using `HMAC-SHA256(key = "oxs3-split-session-key", k_i2r || k_r2i)`, along
+/// with the 32-byte Noise `IK` `handshake_hash` captured before `Split()`.
+fn derive_v3_session_key_and_hash(hs: &mut snow::HandshakeState) -> ([u8; MAC_LEN], [u8; KEY_LEN]) {
+    let mut handshake_hash = [0u8; KEY_LEN];
+    handshake_hash.copy_from_slice(hs.get_handshake_hash());
     let (mut k1, mut k2) = hs.dangerously_get_raw_split();
     let key = hmac::Key::new(hmac::HMAC_SHA256, LABEL_V3_SESSION_KEY);
     let mut ctx = hmac::Context::with_key(&key);
@@ -537,7 +830,7 @@ fn derive_v3_session_key(hs: &mut snow::HandshakeState) -> [u8; MAC_LEN] {
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    out
+    (out, handshake_hash)
 }
 
 /// Runs the client (initiator) side of the OXS-AUTH v3 handshake using
@@ -564,6 +857,28 @@ where
     .await
 }
 
+/// Runs the client (initiator) side of the OXS-AUTH v3 handshake and returns both
+/// `(session_key, handshake_hash)` (used by `oxideswarm join` with an invite to compute the
+/// enrollment proof and 6-digit pairing check).
+pub async fn v3_client_handshake_with_hash<T>(
+    t: &mut MessageTransport<T>,
+    node_key: &NodeKeypair,
+    pinned_master_key: &PublicKey,
+    purpose: HandshakePurpose,
+) -> GridResult<([u8; MAC_LEN], [u8; KEY_LEN])>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    v3_client_handshake_with_version_and_hash(
+        t,
+        node_key,
+        pinned_master_key,
+        purpose,
+        PROTOCOL_VERSION_CURRENT,
+    )
+    .await
+}
+
 /// Like [`v3_client_handshake`], with an explicit `protocol_version` (used by version-mismatch
 /// unit tests).
 pub async fn v3_client_handshake_with_version<T>(
@@ -573,6 +888,27 @@ pub async fn v3_client_handshake_with_version<T>(
     purpose: HandshakePurpose,
     protocol_version: u32,
 ) -> GridResult<[u8; MAC_LEN]>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let (sk, _) = v3_client_handshake_with_version_and_hash(
+        t,
+        node_key,
+        pinned_master_key,
+        purpose,
+        protocol_version,
+    )
+    .await?;
+    Ok(sk)
+}
+
+async fn v3_client_handshake_with_version_and_hash<T>(
+    t: &mut MessageTransport<T>,
+    node_key: &NodeKeypair,
+    pinned_master_key: &PublicKey,
+    purpose: HandshakePurpose,
+    protocol_version: u32,
+) -> GridResult<([u8; MAC_LEN], [u8; KEY_LEN])>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -637,7 +973,7 @@ where
         )
     })?;
 
-    Ok(derive_v3_session_key(&mut hs))
+    Ok(derive_v3_session_key_and_hash(&mut hs))
 }
 
 /// Server-side result after completing the two Noise `IK` handshake messages, **before** the
@@ -647,24 +983,32 @@ where
 /// record decrypts under `session_key` (because `IK` message 1 can be replayed).
 pub struct PendingV3Session {
     session_key: [u8; MAC_LEN],
+    handshake_hash: [u8; KEY_LEN],
     peer_public_key: PublicKey,
     purpose: HandshakePurpose,
+    master_fingerprint: String,
 }
 
 impl fmt::Debug for PendingV3Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingV3Session")
             .field("session_key", &"<redacted>")
+            .field("handshake_hash", &"<redacted>")
             .field("peer_public_key", &self.peer_public_key)
             .field("purpose", &self.purpose)
+            .field("master_fingerprint", &self.master_fingerprint)
             .finish()
     }
 }
 
 impl Drop for PendingV3Session {
     fn drop(&mut self) {
-        for b in &mut self.session_key {
-            // SAFETY: `b` is a valid mutable byte in `self.session_key`.
+        for b in self
+            .session_key
+            .iter_mut()
+            .chain(self.handshake_hash.iter_mut())
+        {
+            // SAFETY: `b` is a valid mutable byte in `self`.
             unsafe { std::ptr::write_volatile(b, 0) };
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -686,6 +1030,11 @@ impl PendingV3Session {
     pub fn session_key(&self) -> &[u8; MAC_LEN] {
         &self.session_key
     }
+
+    /// The 32-byte Noise `IK` handshake hash `h` captured before `Split()`.
+    pub fn handshake_hash(&self) -> &[u8; KEY_LEN] {
+        &self.handshake_hash
+    }
 }
 
 /// A v3 peer whose Noise `IK` handshake **and** first encrypted `0x04` transport record have both
@@ -695,6 +1044,9 @@ pub struct AuthenticatedV3Peer {
     pub public_key: PublicKey,
     pub member_id: String,
     pub purpose: HandshakePurpose,
+    pub handshake_hash: RedactedBytes32,
+    pub master_fingerprint: String,
+    pub remote_addr: String,
 }
 
 /// Runs the server (responder) side of the OXS-AUTH v3 handshake from the start of the stream.
@@ -727,10 +1079,13 @@ where
 /// `hello_frame`.
 ///
 /// 1. Validates the cleartext `HELLO` (`auth_version == 3`, protocol version compatibility via
-///    design 0040's [`is_protocol_version_compatible`], and `purpose == Member`).
+///    design 0040's [`is_protocol_version_compatible`], and `purpose` in `{Member, Enroll}`).
 /// 2. Reads Noise `IK` message 1 (capped at [`PRE_AUTH_MAX_FRAME`]) with `prologue = hello_frame`.
-/// 3. Checks the peer's static public key against `is_admitted_member`.
-/// 4. Sends Noise `IK` message 2 and derives the record-layer key from `Split()`.
+/// 3. For `HandshakePurpose::Member`, checks the peer's static public key against
+///    `is_admitted_member`. For `HandshakePurpose::Enroll`, admission is checked when the first
+///    encrypted `ENROLL` record arrives (D2 step 5 / D4).
+/// 4. Sends Noise `IK` message 2 and derives the record-layer key and `handshake_hash` from
+///    `Split()`.
 pub async fn v3_server_handshake_from_hello<T, F>(
     t: &mut MessageTransport<T>,
     hello_frame: &[u8],
@@ -769,18 +1124,6 @@ where
         let message = format_incompatible_version_error("peer", peer_protocol_version);
         let _ = send_reject(t, &message).await;
         return Err(GridError::IncompatibleVersion(message));
-    }
-
-    if purpose != HandshakePurpose::Member {
-        return Err(reject_peer(
-            t,
-            REJECT_AUTH_FAILED,
-            format!(
-                "unsupported v3 handshake purpose '{}' (only 'member' is supported in ENROLL-1a)",
-                purpose.as_str()
-            ),
-        )
-        .await);
     }
 
     let msg1_frame = match recv_auth_frame(t).await {
@@ -834,7 +1177,7 @@ where
     peer_pub_bytes.copy_from_slice(remote_static);
     let peer_public_key = PublicKey::from_bytes(peer_pub_bytes);
 
-    if !is_admitted_member(&peer_public_key) {
+    if purpose == HandshakePurpose::Member && !is_admitted_member(&peer_public_key) {
         return Err(reject_peer(
             t,
             REJECT_AUTH_FAILED,
@@ -854,11 +1197,13 @@ where
     t.send_raw_frame(auth_frame(KIND_NOISE_MSG2, &[&msg2_buf[..msg2_len]]))
         .await?;
 
-    let session_key = derive_v3_session_key(&mut hs);
+    let (session_key, handshake_hash) = derive_v3_session_key_and_hash(&mut hs);
     Ok(PendingV3Session {
         session_key,
+        handshake_hash,
         peer_public_key,
         purpose,
+        master_fingerprint: master_key.fingerprint(),
     })
 }
 
@@ -866,8 +1211,9 @@ where
 /// peer's first `0x04` transport record, and only then returns the confirmed
 /// [`AuthenticatedV3Peer`].
 ///
-/// This enforces D2 step 4: a replayed Noise `IK` message 1 cannot decrypt or authenticate any
-/// transport record after the responder's fresh ephemeral key in message 2 is mixed into `Split()`.
+/// This enforces D2 step 4 & step 5: a replayed Noise `IK` message 1 cannot decrypt or
+/// authenticate any transport record after the responder's fresh ephemeral key in message 2 is
+/// mixed into `Split()`, and an `enroll` connection is capped at [`PRE_AUTH_MAX_FRAME`] (1 KiB).
 pub async fn v3_server_confirm_first_record<T, M>(
     t: &mut MessageTransport<T>,
     pending: PendingV3Session,
@@ -877,15 +1223,19 @@ where
     M: DeserializeOwned + 'static,
 {
     t.enable_encryption(pending.session_key(), EndpointRole::Server);
-    match t
-        .recv_msg_with_codec_max::<M>(V3_FIRST_RECORD_MAX_FRAME)
-        .await
-    {
+    let max_frame = match pending.purpose {
+        HandshakePurpose::Member => V3_FIRST_RECORD_MAX_FRAME,
+        HandshakePurpose::Enroll => PRE_AUTH_MAX_FRAME,
+    };
+    match t.recv_msg_with_codec_max::<M>(max_frame).await {
         Ok(Some((msg, codec))) => {
             let auth_peer = AuthenticatedV3Peer {
                 member_id: pending.peer_public_key.member_id(),
                 public_key: pending.peer_public_key,
                 purpose: pending.purpose,
+                handshake_hash: RedactedBytes32(pending.handshake_hash),
+                master_fingerprint: pending.master_fingerprint.clone(),
+                remote_addr: String::new(),
             };
             Ok((auth_peer, msg, codec))
         }
@@ -1493,5 +1843,70 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn enroll_purpose_derives_matching_handshake_hash_proof_and_1kib_first_record_cap() {
+        let master_kp = keypair(70);
+        let candidate_kp = keypair(71);
+        let master_pub = *master_kp.public_key();
+        let invite_secret = [0x42u8; KEY_LEN];
+
+        let (mut client1, mut server1) = pair();
+        let (c1, s1) = tokio::join!(
+            v3_client_handshake_with_hash(
+                &mut client1,
+                &candidate_kp,
+                &master_pub,
+                HandshakePurpose::Enroll
+            ),
+            v3_server_handshake(&mut server1, &master_kp, |_pk| false)
+        );
+        let (c_key1, c_hash1) = c1.expect("enroll client handshake");
+        let pending1 = s1.expect("enroll server handshake");
+        assert_eq!(pending1.purpose(), HandshakePurpose::Enroll);
+        assert_eq!(pending1.handshake_hash(), &c_hash1);
+
+        let proof1 = compute_enroll_proof(&invite_secret, &c_hash1);
+        let pairing1 = derive_pairing_code(&c_hash1);
+        assert_eq!(format!("{proof1:?}"), "\"<redacted>\"");
+        assert_eq!(format!("{pairing1:?}"), "\"<redacted>\"");
+        assert_eq!(pairing1.as_str().len(), 6);
+        assert!(pairing1.as_str().chars().all(|c| c.is_ascii_digit()));
+        assert!(verify_enroll_proof(&invite_secret, &c_hash1, &proof1));
+        assert!(!verify_enroll_proof(&[0x99u8; KEY_LEN], &c_hash1, &proof1));
+
+        // A second enrollment handshake produces a fresh ephemeral handshake_hash, so proof1
+        // from handshake 1 does not verify against handshake 2.
+        let (mut client2, mut server2) = pair();
+        let (c2, s2) = tokio::join!(
+            v3_client_handshake_with_hash(
+                &mut client2,
+                &candidate_kp,
+                &master_pub,
+                HandshakePurpose::Enroll
+            ),
+            v3_server_handshake(&mut server2, &master_kp, |_pk| false)
+        );
+        let (c_key2, c_hash2) = c2.unwrap();
+        let pending2 = s2.unwrap();
+        assert_ne!(c_hash1, c_hash2);
+        assert!(!verify_enroll_proof(&invite_secret, &c_hash2, &proof1));
+
+        // First encrypted record on an Enroll session is capped at PRE_AUTH_MAX_FRAME (1 KiB).
+        let _ = (c_key1, pending1);
+        client2.enable_encryption(&c_key2, EndpointRole::Client);
+        let oversized_enroll = WorkerMessage::Disconnecting {
+            worker_id: Uuid::nil(),
+            reason: "x".repeat(PRE_AUTH_MAX_FRAME),
+        };
+        client2.send_msg(&oversized_enroll).await.unwrap();
+        let err = v3_server_confirm_first_record::<_, WorkerMessage>(&mut server2, pending2)
+            .await
+            .expect_err("enroll first record over 1 KiB must be refused");
+        assert!(
+            err.to_string().contains(&PRE_AUTH_MAX_FRAME.to_string()),
+            "expected 1 KiB cap error, got: {err}"
+        );
     }
 }
