@@ -19,11 +19,11 @@ use clap::{Args, Subcommand};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::digest::{Context as DigestContext, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
@@ -73,7 +73,8 @@ pub const MIN_USER_PASSPHRASE_CHARS: usize = 16;
 /// Maximum stdin passphrase length accepted in bytes.
 const MAX_PASSPHRASE_STDIN_BYTES: usize = 1024;
 /// Default GitHub release download base URL prefix.
-const DEFAULT_RELEASE_BASE_PREFIX: &str = "https://github.com/DuongNAD/OxideSwarm/releases/download";
+const DEFAULT_RELEASE_BASE_PREFIX: &str =
+    "https://github.com/DuongNAD/OxideSwarm/releases/download";
 /// Optional env var overriding the HTTPS base URL in tests (`--download` or online `SHA256SUMS`).
 const ONLINE_DOWNLOAD_BASE_ENV: &str = "OXIDESWARM_USB_DOWNLOAD_BASE_URL";
 /// Optional env var supplying an explicit HTTPS URL for online `SHA256SUMS` verification (`"off"` disables).
@@ -585,7 +586,11 @@ pub fn parse_user_passphrase<R: Read>(mut reader: R) -> GridResult<Zeroizing<Str
         .next()
         .unwrap_or("")
         .trim_end_matches(&['\r', '\n'][..]);
-    if text.lines().nth(1).is_some_and(|extra| !extra.trim().is_empty()) {
+    if text
+        .lines()
+        .nth(1)
+        .is_some_and(|extra| !extra.trim().is_empty())
+    {
         return Err(GridError::Config(
             "stdin passed extra non-empty lines alongside the passphrase".into(),
         ));
@@ -712,9 +717,9 @@ pub fn verify_archives_against_sums(
     let expected = parse_sha256sums(sums_text)?;
     let mut verified = Vec::with_capacity(required_files.len());
     for name in required_files {
-        let want = expected.get(name).ok_or_else(|| {
-            GridError::Config(format!("{name} is not listed in SHA256SUMS"))
-        })?;
+        let want = expected
+            .get(name)
+            .ok_or_else(|| GridError::Config(format!("{name} is not listed in SHA256SUMS")))?;
         let path = archives_dir.join(name);
         if !path.exists() {
             return Err(GridError::Config(format!(
@@ -742,9 +747,9 @@ pub fn verify_sums_against_online(
     let local = parse_sha256sums(local_sums)?;
     let online = parse_sha256sums(online_sums)?;
     for name in required_files {
-        let l = local.get(name).ok_or_else(|| {
-            GridError::Config(format!("{name} is missing from local SHA256SUMS"))
-        })?;
+        let l = local
+            .get(name)
+            .ok_or_else(|| GridError::Config(format!("{name} is missing from local SHA256SUMS")))?;
         let o = online.get(name).ok_or_else(|| {
             GridError::Config(format!("{name} is missing from online SHA256SUMS"))
         })?;
@@ -931,9 +936,7 @@ fn validate_https_url(raw: &str) -> GridResult<Url> {
         ));
     }
     if parsed.host_str().is_none() {
-        return Err(GridError::Config(format!(
-            "HTTPS URL '{raw}' has no host"
-        )));
+        return Err(GridError::Config(format!("HTTPS URL '{raw}' has no host")));
     }
     Ok(parsed)
 }
@@ -962,7 +965,11 @@ fn build_tls_connector() -> GridResult<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-async fn https_get_bytes(url_str: &str, max_bytes: usize, timeout: Duration) -> GridResult<Vec<u8>> {
+async fn https_get_bytes(
+    url_str: &str,
+    max_bytes: usize,
+    timeout: Duration,
+) -> GridResult<Vec<u8>> {
     let connector = build_tls_connector()?;
     let mut current = validate_https_url(url_str)?;
 
@@ -993,9 +1000,8 @@ async fn https_get_bytes(url_str: &str, max_bytes: usize, timeout: Duration) -> 
             path_query
         };
 
-        let server_name = ServerName::try_from(host.clone()).map_err(|_| {
-            GridError::Config(format!("invalid TLS server name '{host}'"))
-        })?;
+        let server_name = ServerName::try_from(host.clone())
+            .map_err(|_| GridError::Config(format!("invalid TLS server name '{host}'")))?;
 
         let response = tokio::time::timeout(timeout, async {
             let tcp = TcpStream::connect((host.as_str(), port))
@@ -1180,9 +1186,8 @@ async fn read_chunked_body<R: AsyncReadExt + Unpin>(
         let size_line = std::str::from_utf8(&raw[..line_end])
             .map_err(|_| GridError::Framing("invalid UTF-8 in chunk size line".into()))?;
         let hex_part = size_line.split(';').next().unwrap_or("").trim();
-        let chunk_size = usize::from_str_radix(hex_part, 16).map_err(|_| {
-            GridError::Framing(format!("malformed HTTP chunk size '{hex_part}'"))
-        })?;
+        let chunk_size = usize::from_str_radix(hex_part, 16)
+            .map_err(|_| GridError::Framing(format!("malformed HTTP chunk size '{hex_part}'")))?;
         raw.drain(..line_end + 2);
 
         if chunk_size == 0 {
@@ -1248,12 +1253,9 @@ async fn prepare_verified_archives(
         if let Ok(online_url) = std::env::var(ONLINE_SUMS_URL_ENV) {
             let trimmed = online_url.trim();
             if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("off") {
-                let bytes = https_get_bytes(
-                    trimmed,
-                    MAX_SUMS_DOWNLOAD_BYTES,
-                    Duration::from_secs(30),
-                )
-                .await?;
+                let bytes =
+                    https_get_bytes(trimmed, MAX_SUMS_DOWNLOAD_BYTES, Duration::from_secs(30))
+                        .await?;
                 let online_text = String::from_utf8(bytes).map_err(|_| {
                     GridError::Framing("online SHA256SUMS is not valid UTF-8".into())
                 })?;
@@ -1289,12 +1291,8 @@ async fn prepare_verified_archives(
     };
 
     eprintln!("Downloading release SHA256SUMS from {sums_url} ...");
-    let sums_bytes = https_get_bytes(
-        &sums_url,
-        MAX_SUMS_DOWNLOAD_BYTES,
-        Duration::from_secs(30),
-    )
-    .await?;
+    let sums_bytes =
+        https_get_bytes(&sums_url, MAX_SUMS_DOWNLOAD_BYTES, Duration::from_secs(30)).await?;
     let sums_text = String::from_utf8(sums_bytes)
         .map_err(|_| GridError::Framing("downloaded SHA256SUMS is not valid UTF-8".into()))?;
     let _ = parse_sha256sums(&sums_text)?;
@@ -1376,7 +1374,10 @@ fn write_kit_to_destination(spec: &KitWriteSpec<'_>) -> GridResult<()> {
         }
     }
 
-    fs::write(archives_dir.join("SHA256SUMS"), spec.archives.sums_text.as_bytes())?;
+    fs::write(
+        archives_dir.join("SHA256SUMS"),
+        spec.archives.sums_text.as_bytes(),
+    )?;
     for (name, src_path) in &spec.archives.files {
         copy_file_contents_only(src_path, &archives_dir.join(name))?;
     }
@@ -1418,9 +1419,7 @@ fn write_kit_to_destination(spec: &KitWriteSpec<'_>) -> GridResult<()> {
     Ok(())
 }
 
-fn validate_usb_policy(
-    args: &UsbCreateArgs,
-) -> GridResult<(Vec<MemberRole>, u64)> {
+fn validate_usb_policy(args: &UsbCreateArgs) -> GridResult<(Vec<MemberRole>, u64)> {
     let roles = parse_roles_csv(&args.roles).map_err(GridError::Config)?;
     if roles.contains(&MemberRole::Admin) {
         return Err(GridError::Config(
@@ -1428,9 +1427,7 @@ fn validate_usb_policy(
         ));
     }
     if args.machines == 0 {
-        return Err(GridError::Config(
-            "--machines must be at least 1".into(),
-        ));
+        return Err(GridError::Config("--machines must be at least 1".into()));
     }
     let default_exp = if args.no_approval { "48h" } else { "7d" };
     let exp_str = args.expires.as_deref().unwrap_or(default_exp);
@@ -1627,7 +1624,9 @@ async fn run_usb_create(
                 return ExitCode::FAILURE;
             }
             Err(e) => {
-                eprintln!("Failed to receive CreateInvite response from Master ({connect_addr}): {e}");
+                eprintln!(
+                    "Failed to receive CreateInvite response from Master ({connect_addr}): {e}"
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -1643,23 +1642,23 @@ async fn run_usb_create(
             master_ticket,
         ) = created;
 
-        let cleanup_revoke = |id: String, mut tr: rusty_grid_core::protocol::MessageTransport<_>| async move {
-            let _ = tr.send_msg(&ClientMessage::RevokeInvite { invite_id: id }).await;
-            let _ = tr.recv_msg::<ClientResponse>().await;
-        };
+        let cleanup_revoke =
+            |id: String, mut tr: rusty_grid_core::protocol::MessageTransport<_>| async move {
+                let _ = tr
+                    .send_msg(&ClientMessage::RevokeInvite { invite_id: id })
+                    .await;
+                let _ = tr.recv_msg::<ClientResponse>().await;
+            };
 
-        let (master, ticket) = match finalize_invite_targets(
-            local_master,
-            local_ticket,
-            master_ticket,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                cleanup_revoke(invite_id, transport).await;
-                return ExitCode::FAILURE;
-            }
-        };
+        let (master, ticket) =
+            match finalize_invite_targets(local_master, local_ticket, master_ticket) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    cleanup_revoke(invite_id, transport).await;
+                    return ExitCode::FAILURE;
+                }
+            };
 
         let token = InviteToken {
             master,
@@ -1715,7 +1714,10 @@ async fn run_usb_create(
             isolation: args.isolation.as_deref(),
         };
         if let Err(e) = write_kit_to_destination(&write_spec) {
-            eprintln!("Error writing USB kit to '{}': {e}", dest_plan.kit_dir.display());
+            eprintln!(
+                "Error writing USB kit to '{}': {e}",
+                dest_plan.kit_dir.display()
+            );
             cleanup_revoke(invite_id, transport).await;
             return ExitCode::FAILURE;
         }
@@ -1725,9 +1727,26 @@ async fn run_usb_create(
         println!("  invite id:  {invite_id}");
         println!("  machines:   {max_uses}");
         println!("  roles:      {}", format_roles(&granted_roles));
-        println!("  approval:   {}", if require_approval { "required per machine" } else { "disabled (--no-approval)" });
-        println!("  workspaces: {}", if args.workspaces { "enabled when Cargo is available" } else { "disabled" });
-        println!("  gpu:        {}", if args.gpu { "included" } else { "not included" });
+        println!(
+            "  approval:   {}",
+            if require_approval {
+                "required per machine"
+            } else {
+                "disabled (--no-approval)"
+            }
+        );
+        println!(
+            "  workspaces: {}",
+            if args.workspaces {
+                "enabled when Cargo is available"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "  gpu:        {}",
+            if args.gpu { "included" } else { "not included" }
+        );
         if generated_passphrase {
             println!();
             println!("Kit passphrase (write this down; NOT saved on the stick):");
@@ -1779,8 +1798,8 @@ mod tests {
     fn invite_oxs_rejects_wrong_passphrase_truncation_and_bit_flips() {
         let encrypted = fast_encrypt(SAMPLE_TOKEN, SAMPLE_PASS);
 
-        let wrong = decrypt_invite_oxs(&encrypted, "wrong-passphrase-words")
-            .expect_err("wrong passphrase");
+        let wrong =
+            decrypt_invite_oxs(&encrypted, "wrong-passphrase-words").expect_err("wrong passphrase");
         assert!(matches!(wrong, GridError::AuthFailed(_)), "{wrong:?}");
         assert!(!format!("{wrong:?}").contains(SAMPLE_PASS));
         assert!(!format!("{wrong:?}").contains(SAMPLE_TOKEN));

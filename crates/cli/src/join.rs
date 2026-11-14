@@ -2384,7 +2384,10 @@ mod tests {
 
         // `--invite-file` parses cleanly and conflicts with `--code` and `--pair-host`.
         let with_file = JoinArgs::try_parse_from(["join", "--invite-file", "invite.oxs"]).unwrap();
-        assert_eq!(with_file.invite_file.as_deref(), Some(Path::new("invite.oxs")));
+        assert_eq!(
+            with_file.invite_file.as_deref(),
+            Some(Path::new("invite.oxs"))
+        );
         assert!(JoinArgs::try_parse_from([
             "join",
             "--invite-file",

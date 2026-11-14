@@ -2580,3 +2580,10 @@ Add one dated line per finished item, newest last.
   folder containing an unmarked or foreign-used `workspaces` directory while naming the worker using
   it (`tests/test_launcher_scripts.py` + isolated live Windows cluster check). The Index counts are
   now 74 Implemented, 7 Partial and 41 Planned.
+- 2026-11-14: `USB-1a` and `USB-1b` completed locally (`win2`): added `oxideswarm usb create`
+  (`crates/cli/src/usb_kit.rs`), `oxideswarm join --invite-file` (`crates/cli/src/join.rs`),
+  `invite.oxs` + `kit.json`, v1 `packaging/usb/` installers and uninstallers, `tests/cli_usb_kit_e2e.rs`,
+  Windows/POSIX v1 launcher tests in `tests/test_launcher_scripts.py`, and docs updates across
+  [design 0053](design/0053-usb-setup-kit.md), [guides/add-a-machine.md](guides/add-a-machine.md),
+  and [README.md](../README.md). `USB-1` stays `Partial` until the cross-machine live stick test is
+  recorded; the Index counts remain 74 Implemented, 7 Partial and 41 Planned.

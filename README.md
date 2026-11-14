@@ -86,12 +86,14 @@ installed and does the work. Neither machine has to build OxideSwarm.
    The first run sends every file that `.gitignore` does not exclude and builds from scratch. Run it
    again: only changed files travel, and B reuses its `target/` directory.
 
-To set up several machines, a USB stick can carry the program for every system and the token:
-see [packaging/usb/README.md](packaging/usb/README.md). The stick installs, joins and starts the
-worker with one double-click on macOS and Windows, or `bash install.sh` on Linux. With a token that
-carries the master's P2P ticket, it also works on school or office Wi-Fi where the machines cannot
-reach each other. The kit scripts are in the repository and install release `0.1.1` or newer (`0.1.2` or newer for
-Windows workers that run workspace tasks under `-Isolation fs`).
+To set up several machines, build an encrypted USB setup kit with `oxideswarm usb create`
+(kit format v1: `invite.oxs` + `kit.json` with per-machine identity and `oxideswarm invite --revoke`):
+see [docs/guides/add-a-machine.md](docs/guides/add-a-machine.md) and [packaging/usb/README.md](packaging/usb/README.md).
+The stick installs, verifies `SHA256SUMS`, joins and starts the worker with one double-click on
+macOS and Windows, or `bash install.sh` on Linux. With the master's P2P ticket, it also works on
+school or office Wi-Fi where the machines cannot reach each other. The kit scripts are in the
+repository and install release `0.1.1` or newer (`0.1.2` or newer for Windows workers that run
+workspace tasks under `-Isolation fs`).
 
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
@@ -495,6 +497,10 @@ or `~/.oxideswarm/cluster.secret`.
 # Or pair on the same LAN with a short one-time code (design 0052, no copy-and-paste):
 ./target/release/oxideswarm invite --code [--master 192.168.1.100:8088] [--roles worker,client] [--expires 10m]
 ./target/release/oxideswarm join --code <N>-<word>-<word> [--pair-host <HOST:PORT>]
+# Or build and use an encrypted USB setup kit (design 0053):
+./target/release/oxideswarm usb create <DIR> --machines <N> [--expires 7d] [--roles worker] [--archives <DIR>|--download]
+./target/release/oxideswarm join --invite-file <INVITE_OXS>
+./target/release/oxideswarm invite --revoke <INVITE_ID>
 ./target/release/oxideswarm members pending
 ./target/release/oxideswarm members approve <PENDING_ID> --code <NNNNNN> [--fingerprint <XXXX-XXXX-XXXX-XXXX>]
 ./target/release/oxideswarm members list

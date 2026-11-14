@@ -1,9 +1,10 @@
-# OxideSwarm USB installer for Windows (kit format v0, design 0053 prototype).
+# OxideSwarm USB installer for Windows (kit format v0 / v1, design 0053).
 #
-# Installs the worker for the current user from this USB stick (no administrator rights), joins the
-# cluster with the kit's join token, starts the worker hidden, and starts it again at every logon
-# through an HKCU Run entry. The user's own %USERPROFILE%\.oxideswarm is never read or written:
-# the installed worker keeps its state in <install folder>\home.
+# Installs OxideSwarm for the current user from this USB stick (no administrator rights), joins
+# the cluster with invite.oxs (v1) or join.token (v0), starts the worker hidden (when the kit
+# includes the worker role), and registers an HKCU Run entry. The user's own
+# %USERPROFILE%\.oxideswarm is never read or written: the installed worker keeps its state in
+# <install folder>\home.
 #
 # The install folder is %LOCALAPPDATA%\OxideSwarm-USB unless -InstallRoot names another one or the
 # person at the keyboard picks another fixed NTFS or ReFS drive. Workspaces stay in
@@ -15,7 +16,7 @@
 # folder, name, GPU choice, isolation, cluster membership and start at logon, asks nothing, does
 # not join again, and only replaces the binaries and restarts the worker.
 #
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-NoWorkspaces] [-Isolation off|fs]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-Workspaces | -NoWorkspaces] [-Isolation off|fs]
 #                                                 [-Gpu | -NoGpu] [-Slots N] [-Update]
 #
 # -Slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
@@ -25,6 +26,7 @@ param(
     [string]$Name = "",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "OxideSwarm-USB"),
     [switch]$NoAutostart,
+    [switch]$Workspaces,
     [switch]$NoWorkspaces,
     [switch]$Gpu,
     [switch]$NoGpu,
@@ -35,7 +37,80 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Kit = $PSScriptRoot
-function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+$script:PendingLogLines = New-Object 'System.Collections.Generic.List[string]'
+$script:InstallLogPath = $null
+$script:RollbackArmed = $false
+$script:CreatedPointer = $false
+$script:CreatedRunEntry = $false
+$script:PreexistingRoot = $false
+function Write-LogRecord([string]$line) {
+    if ($script:InstallLogPath) {
+        try { Add-Content -LiteralPath $script:InstallLogPath -Value $line -Encoding UTF8 } catch {}
+    } else {
+        $script:PendingLogLines.Add($line)
+    }
+}
+function Say([string]$msg) {
+    Write-Host $msg
+    Write-LogRecord $msg
+}
+function Rollback-FreshInstall {
+    if (-not $script:RollbackArmed) { return }
+    $script:RollbackArmed = $false
+    try { Set-Location ([IO.Path]::GetTempPath()) } catch {}
+    try {
+        if ($script:CreatedRunEntry) {
+            Remove-ItemProperty -Path $RunKey -Name $runValueName -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    try {
+        if ($InstallRoot) {
+            $rbExe = Join-Path $InstallRoot 'bin\oxideswarm.exe'
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $rbExe } | ForEach-Object {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            $rbPidFile = Join-Path $InstallRoot 'run\worker.pid'
+            if (Test-Path -LiteralPath $rbPidFile) {
+                $rbPid = Get-Content -LiteralPath $rbPidFile -ErrorAction SilentlyContinue
+                if ($rbPid -match '^\d+$') {
+                    $rbProc = Get-Process -Id ([int]$rbPid) -ErrorAction SilentlyContinue
+                    if ($rbProc -and $rbProc.Path -eq $rbExe) {
+                        Stop-Process -Id ([int]$rbPid) -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    } catch {}
+    try {
+        if ($script:CreatedPointer) {
+            Remove-Item -Path $PointerKey -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    try {
+        if ($InstallRoot -and (Test-Path -LiteralPath $InstallRoot)) {
+            if (-not $script:PreexistingRoot) {
+                Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                foreach ($f in @('.oxideswarm-usb-install', 'kit-install.txt', 'start-worker.vbs', 'revoke-isolation-acls.ps1')) {
+                    $p = Join-Path $InstallRoot $f
+                    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+                }
+                foreach ($d in @('bin', 'home', 'run', 'logs', 'workspaces')) {
+                    $dp = Join-Path $InstallRoot $d
+                    if (Test-Path -LiteralPath $dp) { Remove-Item -LiteralPath $dp -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        }
+    } catch {}
+}
+function Fail($msg) {
+    Write-LogRecord "ERROR: $msg"
+    Rollback-FreshInstall
+    Write-Host "ERROR: $msg" -ForegroundColor Red
+    exit 1
+}
+if ($Workspaces -and $NoWorkspaces) { Fail "cannot specify both -Workspaces and -NoWorkspaces" }
 if ($PSBoundParameters.ContainsKey('Slots') -and ($Slots -lt 1 -or $Slots -gt 256)) { Fail "-Slots needs a number from 1 to 256 (got: $Slots)" }
 $slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
 # Full form of %LOCALAPPDATA%: GetFullPath on Windows PowerShell 5.1 expands 8.3 short names (a CI
@@ -57,6 +132,29 @@ function FailAfterStart($msg) {
 $Target = 'x86_64-pc-windows-msvc'
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "this kit needs 64-bit Windows" }
 $TokenFile = Join-Path $Kit 'join.token'
+$InviteFile = Join-Path $Kit 'invite.oxs'
+$KitJson = Join-Path $Kit 'kit.json'
+$IsV1Kit = Test-Path -LiteralPath $InviteFile
+$kitVersion = $null
+$KitHasWorker = $true
+$KitHasClient = $true
+$useWorkspaces = $true
+if ($IsV1Kit -and -not (Test-Path -LiteralPath $KitJson)) { Fail "kit.json is missing from this v1 kit" }
+if (Test-Path -LiteralPath $KitJson) {
+    try { $kitMeta = Get-Content -Raw -LiteralPath $KitJson | ConvertFrom-Json }
+    catch { Fail "invalid kit.json: $_" }
+    if ($kitMeta.kit_format -ne 1) { Fail "unsupported kit_format '$($kitMeta.kit_format)' in kit.json (expected 1)" }
+    $kitVersion = "$($kitMeta.version)"
+    if (-not $kitVersion -or $kitVersion.Contains('..') -or $kitVersion -notmatch '^[A-Za-z0-9.+_-]+$') {
+        Fail "invalid version '$kitVersion' in kit.json"
+    }
+    $kitRoles = @($kitMeta.roles | ForEach-Object { "$_".ToLowerInvariant() })
+    $KitHasWorker = $kitRoles -contains 'worker'
+    $KitHasClient = $kitRoles -contains 'client'
+    if (-not $KitHasWorker -and -not $KitHasClient) { Fail "kit.json roles lists neither 'worker' nor 'client'" }
+    if (-not $Update) { $useWorkspaces = [bool]$kitMeta.workspaces }
+}
+if (-not $KitHasWorker) { $NoGpu = $true }
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
 $IsolationFile = Join-Path $Kit 'isolation'
@@ -72,13 +170,29 @@ if (-not $Isolation) {
     $Isolation = $Isolation.ToLower()
 }
 $Sums = Join-Path $Kit 'archives\SHA256SUMS'
-if (-not $Update -and -not (Test-Path $TokenFile)) { Fail "join.token is missing from the kit" }
+if (-not $IsV1Kit) {
+    if (-not $Update -and -not (Test-Path $TokenFile)) { Fail "join.token (or invite.oxs) is missing from the kit" }
+}
 if (-not (Test-Path $Sums)) { Fail "archives\SHA256SUMS is missing from the kit" }
-$Archive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target.zip" | Select-Object -First 1
+$Archive = $null
+if ($IsV1Kit -and $kitVersion) {
+    $exactArch = Join-Path $Kit "archives\oxideswarm-$kitVersion-$Target.zip"
+    if (Test-Path -LiteralPath $exactArch) { $Archive = Get-Item -LiteralPath $exactArch }
+}
+if (-not $Archive) {
+    $Archive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target.zip" | Select-Object -First 1
+}
 if (-not $Archive) { Fail "no archive for $Target in the kit" }
 # A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
 # when it finds one. It is installed only when the person at the keyboard agrees (or -Gpu).
-$GpuArchive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target-gpu.zip" | Select-Object -First 1
+$GpuArchive = $null
+if ($IsV1Kit -and $kitVersion) {
+    $exactGpu = Join-Path $Kit "archives\oxideswarm-$kitVersion-$Target-gpu.zip"
+    if (Test-Path -LiteralPath $exactGpu) { $GpuArchive = Get-Item -LiteralPath $exactGpu }
+}
+if (-not $GpuArchive) {
+    $GpuArchive = Get-ChildItem (Join-Path $Kit 'archives') -Filter "oxideswarm-*-$Target-gpu.zip" | Select-Object -First 1
+}
 if ($Update) {
     # The install to update: -InstallRoot, else the one the installer recorded, else the default
     # (%LOCALAPPDATA%\OxideSwarm-USB), falling back to legacy %LOCALAPPDATA%\OxideSwarm.
@@ -106,7 +220,10 @@ if ($Update) {
         if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { $Name = "" }
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
-    if ($settings['workspaces'] -eq '0') { $NoWorkspaces = $true }
+    if ($settings['workspaces'] -eq '0') { $useWorkspaces = $false }
+    elseif ($settings['workspaces'] -eq '1') { $useWorkspaces = $true }
+    if (-not $IsV1Kit -and $settings.ContainsKey('worker')) { $KitHasWorker = ($settings['worker'] -eq '1') }
+    if (-not $IsV1Kit -and $settings.ContainsKey('client')) { $KitHasClient = ($settings['client'] -eq '1') }
     # Slots chosen with -Slots at install time are kept; an automatic choice is made again.
     if ($slotsSet -eq 0 -and $settings['slots'] -match '^\d+$' -and [int]$settings['slots'] -ge 1 -and [int]$settings['slots'] -le 256) { $slotsSet = [int]$settings['slots'] }
     # The isolation it runs with is kept: kit-install.txt, else the --isolation in its launcher (an
@@ -411,6 +528,10 @@ if (-not $Update -and (
 )) {
     Fail "cannot install in ${InstallRoot}: $DefaultWorkerWorkspaceRoot is the default worker workspace root; omit -InstallRoot to use $DefaultRoot, or pass -Update to update an older install"
 }
+if ($NoWorkspaces) { $useWorkspaces = $false }
+elseif ($Workspaces) { $useWorkspaces = $true }
+$script:PreexistingRoot = Test-Path -LiteralPath $InstallRoot
+$freshInstall = (-not $Update) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'home\node.key'))) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'home\cluster.secret')))
 $PrivateRoot = $InstallRoot.StartsWith($LocalAppDataFull + '\', [StringComparison]::OrdinalIgnoreCase)
 if (-not $PrivateRoot) {
     if ([IO.Path]::GetPathRoot($InstallRoot + '\').TrimEnd('\') -eq $InstallRoot) { Fail "choose a folder such as $InstallRoot\OxideSwarm-USB, not the root of a drive" }
@@ -448,16 +569,102 @@ if ($GpuArchive) {
     }
 }
 
-# 1. Check the archive against the kit's SHA256SUMS (catches a damaged copy, not a swapped stick).
-$expected = $null
-foreach ($line in Get-Content $Sums) {
-    $parts = $line -split '\s+', 2
-    if ($parts.Count -eq 2 -and $parts[1].Trim() -eq $Archive.Name) { $expected = $parts[0].ToLower() }
+# 1. Check the archive against the kit's SHA256SUMS (and online release SHA256SUMS when
+#    configured or reachable).
+function Lookup-SumEntry([string[]]$lines, [string]$fileName) {
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        $parts = $trimmed -split '\s+', 2
+        if ($parts.Count -eq 2) {
+            $hash = $parts[0].Trim()
+            $namePart = $parts[1].Trim().TrimStart('*')
+            if ($namePart -eq $fileName -and $hash -match '^[0-9a-fA-F]{64}$') {
+                return $hash.ToLowerInvariant()
+            }
+        }
+    }
+    return $null
 }
+
+function Verify-OnlineSums([string]$fileName, [string]$localExpected) {
+    $onlineUrl = $env:OXIDESWARM_USB_ONLINE_SUMS_URL
+    $strict = $false
+    if (-not $onlineUrl) {
+        if (-not ($IsV1Kit -and $kitVersion)) { return }
+        $onlineUrl = "https://github.com/DuongNAD/OxideSwarm/releases/download/v$kitVersion/SHA256SUMS"
+        $strict = $false
+    } elseif ($onlineUrl -match '^(?i)(off|0|none)$') {
+        Say "  online:  skipped (OXIDESWARM_USB_ONLINE_SUMS_URL=off)"
+        return
+    } else {
+        $strict = $true
+    }
+
+    $onlineUrl = $onlineUrl.Trim()
+    [uri]$parsed = $null
+    if (-not [uri]::TryCreate($onlineUrl, [UriKind]::Absolute, [ref]$parsed)) {
+        Fail "invalid online SHA256SUMS URL '$onlineUrl'"
+    }
+    $onlineText = $null
+    if ($parsed.Scheme -eq 'file') {
+        $localPath = $parsed.LocalPath
+        if (-not (Test-Path -LiteralPath $localPath)) {
+            Fail "cannot read online SHA256SUMS from '$onlineUrl'"
+        }
+        $item = Get-Item -LiteralPath $localPath -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) {
+            Fail "refusing symlink or directory at '$localPath'"
+        }
+        $onlineText = Get-Content -Raw -LiteralPath $localPath -Encoding UTF8
+    } elseif ($parsed.Scheme -eq 'https') {
+        if ($parsed.UserInfo) {
+            Fail "refusing online SHA256SUMS URL with embedded credentials"
+        }
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($parsed)
+            $req.Timeout = 10000
+            $req.ReadWriteTimeout = 10000
+            $req.UserAgent = 'OxideSwarm-USB-Installer'
+            $resp = $req.GetResponse()
+            try {
+                if ($resp.ResponseUri.Scheme -ne 'https') {
+                    Fail "refusing redirect to non-HTTPS URL '$($resp.ResponseUri)'"
+                }
+                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+                try { $onlineText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally {
+                $resp.Dispose()
+            }
+        } catch {
+            if ($strict) {
+                Fail "could not fetch online SHA256SUMS from '$onlineUrl': $_"
+            } else {
+                Say "  online:  unavailable (offline or unreleased v$kitVersion); relying on stick SHA256SUMS"
+                return
+            }
+        }
+    } else {
+        Fail "refusing online SHA256SUMS URL '$onlineUrl': only https:// or file:// is allowed"
+    }
+
+    $onlineExpected = Lookup-SumEntry ($onlineText -split "`r?`n") $fileName
+    if (-not $onlineExpected) {
+        Fail "$fileName is not listed in online SHA256SUMS"
+    }
+    if ($onlineExpected -ne $localExpected) {
+        Fail "online SHA256SUMS mismatch for $fileName (stick $localExpected vs online $onlineExpected); refusing tampered kit"
+    }
+    Say "  online:  $fileName matches online SHA256SUMS"
+}
+
+$expected = Lookup-SumEntry (Get-Content $Sums) $Archive.Name
 if (-not $expected) { Fail "$($Archive.Name) is not listed in SHA256SUMS" }
 $actual = (Get-FileHash $Archive.FullName -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { Fail "checksum mismatch for $($Archive.Name): the copy on the stick is damaged" }
-Write-Host "  archive: $($Archive.Name) (checksum OK)"
+Say "  archive: $($Archive.Name) (checksum OK)"
+Verify-OnlineSums $Archive.Name $expected
 
 # 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
 if (-not $PrivateRoot) {
@@ -504,18 +711,17 @@ if (-not $PrivateRoot) {
     Write-Host "  access:  this user, SYSTEM and Administrators only"
 }
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+$script:RollbackArmed = $freshInstall
 Set-Content -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install') -Value 'Installed from an OxideSwarm USB kit; remove with Uninstall OxideSwarm.cmd.' -Encoding ASCII
-$pointerParent = Split-Path -Parent $PointerKey
-$pointerFull = if ($pointer) { [IO.Path]::GetFullPath($pointer).TrimEnd('\') } else { $null }
-if (-not ($pointerFull -and -not [string]::Equals($pointerFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path (Join-Path $pointerFull 'bin\oxideswarm.exe')))) {
-    foreach ($k in @($pointerParent, $PointerKey)) { if ($k -and -not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
-    Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
-}
 $Bin = Join-Path $InstallRoot 'bin'
 $State = Join-Path $InstallRoot 'home'
 $RunDir = Join-Path $InstallRoot 'run'
 $LogDir = Join-Path $InstallRoot 'logs'
 foreach ($d in @($Bin, $State, $RunDir, $LogDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+$script:InstallLogPath = Join-Path $LogDir 'install.log'
+Write-LogRecord ("=== OxideSwarm USB installer run ({0}) ===" -f ([DateTime]::UtcNow.ToString('o')))
+foreach ($pendingLine in $script:PendingLogLines) { Write-LogRecord $pendingLine }
+$script:PendingLogLines.Clear()
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("oxideswarm-usb-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
@@ -558,6 +764,8 @@ try {
             break
         }
     }
+} catch {
+    Fail "failed while unpacking $($Archive.Name): $_"
 } finally {
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
 }
@@ -578,12 +786,21 @@ $env:RUSTY_GRID_ACL_GRANT_LOG = $GrantLog
 $env:RUSTY_GRID_SANDBOX_BASE_DIR = $SandboxBase
 Set-Location $InstallRoot
 
-# 4. Join: the token goes in on standard input only. An update keeps the existing membership.
+# 4. Join: the token (v0) or encrypted invite file (v1) is consumed directly. An update keeps
+#    the existing membership.
 if (-not $Update) {
     Write-Host ""
     Write-Host "Joining the cluster ..."
-    Get-Content -Raw $TokenFile | & $Exe join --no-doctor
+    if (-not $IsV1Kit) { Get-Content -Raw $TokenFile | & $Exe join --no-doctor }
+    else { & $Exe join --invite-file $InviteFile --no-doctor }
     if ($LASTEXITCODE -ne 0) { Fail "join failed (see the message above); nothing was started" }
+}
+$pointerParent = Split-Path -Parent $PointerKey
+$pointerFull = if ($pointer) { [IO.Path]::GetFullPath($pointer).TrimEnd('\') } else { $null }
+if (-not ($pointerFull -and -not [string]::Equals($pointerFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path (Join-Path $pointerFull 'bin\oxideswarm.exe')))) {
+    foreach ($k in @($pointerParent, $PointerKey)) { if ($k -and -not (Test-Path $k)) { New-Item -Path $k | Out-Null } }
+    Set-ItemProperty -Path $PointerKey -Name InstallRoot -Value $InstallRoot
+    $script:CreatedPointer = $freshInstall
 }
 
 # The worker prefers a P2P ticket that join saved in [worker] p2p_ticket. On networks where the
@@ -619,11 +836,12 @@ if ($ticket) {
 if (-not $Name) { $Name = ($env:COMPUTERNAME).ToLower() -replace '[^a-z0-9_-]', '-' }
 # The name goes into the worker's command line and the launcher, so only safe characters pass.
 if ($Name -notmatch '^[A-Za-z0-9_.-]{1,64}$') { Fail "the name '$Name' may only hold letters, digits, '.', '_' and '-' (at most 64)" }
+if ($KitHasWorker) {
 # A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
 # same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
-# machine's own id (MachineGuid), the name and the cluster secret: the machine id never leaves the
-# machine, and the same machine gets unrelated ids in different clusters. An existing id file is
-# kept. OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
+# machine's own id (MachineGuid), the name and the cluster secret (or master_key on v1 invite kits):
+# the machine id never leaves the machine, and the same machine gets unrelated ids in different
+# clusters. An existing id file is kept. OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
 $idFile = Join-Path $State "worker_id.$Name"
 if (-not (Test-Path $idFile) -or (Get-Item $idFile).Length -eq 0) {
     $machineId = $env:OXIDESWARM_USB_MACHINE_ID
@@ -631,7 +849,25 @@ if (-not (Test-Path $idFile) -or (Get-Item $idFile).Length -eq 0) {
     if (-not $machineId) { try { $machineId = (Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID } catch { $machineId = $null } }
     if ($machineId) {
         $secretFile = Join-Path $State 'cluster.secret'
-        $secretBytes = if (Test-Path $secretFile) { [IO.File]::ReadAllBytes($secretFile) } else { [byte[]]@() }
+        if ((Test-Path -LiteralPath $secretFile) -and (Get-Item -LiteralPath $secretFile).Length -gt 0) {
+            $secretBytes = [IO.File]::ReadAllBytes($secretFile)
+        } else {
+            $masterKeySeed = $null
+            $masterKeyFile = Join-Path $State 'master_key'
+            if ((Test-Path -LiteralPath $masterKeyFile) -and (Get-Item -LiteralPath $masterKeyFile).Length -gt 0) {
+                $masterKeySeed = (Get-Content -Raw -LiteralPath $masterKeyFile).Trim()
+            } elseif (Test-Path -LiteralPath $cfg) {
+                foreach ($line in Get-Content -LiteralPath $cfg) {
+                    if ($line -match '^\s*master_key\s*=\s*(.+?)\s*(?:#.*)?$') {
+                        $v = $Matches[1].Trim()
+                        if (($v.StartsWith("'") -and $v.EndsWith("'")) -or ($v.StartsWith('"') -and $v.EndsWith('"'))) { $v = $v.Substring(1, $v.Length - 2) }
+                        $masterKeySeed = $v
+                        break
+                    }
+                }
+            }
+            $secretBytes = if ($masterKeySeed) { [Text.Encoding]::UTF8.GetBytes($masterKeySeed + "`n") } else { [byte[]]@() }
+        }
         $seed = [Text.Encoding]::UTF8.GetBytes("oxideswarm-usb-worker-id-v1`n$machineId`n$Name`n") + $secretBytes
         $h = [Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$seed)
         $h[6] = ($h[6] -band 0x0f) -bor 0x80   # UUID version 8 (vendor-specific)
@@ -715,7 +951,7 @@ Write-Host "  slots:   $slots ($slotsWhy; change it with -Slots N)"
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
 # Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
 $supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
-if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+if ($useWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
     # Always pass an explicit workspace root inside the install folder so the USB worker never shares
     # %LOCALAPPDATA%\oxideswarm\workspaces (the default workspace root used by non-USB workers).
     $WorkspaceRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
@@ -785,33 +1021,68 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
 }
 if (-not $connected) { FailAfterStart "the worker runs but the master does not list it yet; see $log" }
-Write-Host "  connected (isolation: $Isolation)"
-# What an update keeps: the name, the build, the workspace choice and the isolation.
-$builtWithGpu = if ($GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
-$withWorkspaces = if ($NoWorkspaces) { '0' } else { '1' }
-$recordedSlots = if ($slotsSet -ge 1) { "$slotsSet" } else { '' }
-Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @("name=$Name", "gpu=$builtWithGpu", "workspaces=$withWorkspaces", "isolation=$Isolation", "slots=$recordedSlots")
+Say "  connected (isolation: $Isolation)"
+}
+# What an update keeps: the name, the build, the workspace choice, roles and isolation.
+$builtWithGpu = if ($KitHasWorker -and $GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
+$withWorkspaces = if ($useWorkspaces) { '1' } else { '0' }
+$withWorkerRole = if ($KitHasWorker) { '1' } else { '0' }
+$withClientRole = if ($KitHasClient) { '1' } else { '0' }
+$recordedSlots = if ($KitHasWorker -and $slotsSet -ge 1) { "$slotsSet" } else { '' }
+Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Value @(
+    "name=$Name",
+    "gpu=$builtWithGpu",
+    "workspaces=$withWorkspaces",
+    "isolation=$Isolation",
+    "slots=$recordedSlots",
+    "worker=$withWorkerRole",
+    "client=$withClientRole"
+)
 
 # 8. Start at logon (current user only, no administrator rights).
-if (-not $NoAutostart) {
-    Set-ItemProperty -Path $RunKey -Name $runValueName -Value ('wscript.exe "' + $vbs + '"')
-    Write-Host "  autostart: HKCU Run entry $runValueName"
-} else {
-    Write-Host "  autostart: skipped (-NoAutostart)"
+if ($KitHasWorker) {
+    if (-not $NoAutostart) {
+        Set-ItemProperty -Path $RunKey -Name $runValueName -Value ('wscript.exe "' + $vbs + '"')
+        $script:CreatedRunEntry = $freshInstall
+        Say "  autostart: HKCU Run entry $runValueName"
+    } else {
+        Say "  autostart: skipped (-NoAutostart)"
+    }
 }
+
+$script:RollbackArmed = $false
 
 if ($Update) {
     Write-Host ""
-    Write-Host "Updated. Worker '$Name' runs $(& $Exe --version) from $InstallRoot."
+    if ($KitHasWorker) {
+        Write-Host "Updated. Worker '$Name' runs $(& $Exe --version) from $InstallRoot."
+        Write-LogRecord "Updated. Worker '$Name' runs from $InstallRoot."
+    } else {
+        Write-Host "Updated. Worker '$Name' (client mode) runs $(& $Exe --version) from $InstallRoot."
+        Write-LogRecord "Updated. Client '$Name' runs from $InstallRoot."
+    }
     exit 0
 }
 
 # 9. Check the cluster.
-Write-Host ""
-Write-Host "Checking the cluster (oxideswarm doctor) ..."
-& $Exe doctor @checkArgs
-$doctor = if ($LASTEXITCODE -eq 0) { "passed" } else { "reported a problem (see above)" }
-Write-Host ""
-Write-Host "Done. Worker '$Name' is part of the cluster; the doctor check $doctor."
-Write-Host "Files: $InstallRoot   Log: $log"
-Write-Host "To remove it, run 'Uninstall OxideSwarm.cmd' from the stick."
+if ($KitHasClient) {
+    $env:RUST_LOG = 'off'
+    Write-Host ""
+    Write-Host "Checking the cluster (oxideswarm doctor) ..."
+    & $Exe doctor @checkArgs
+    $doctor = if ($LASTEXITCODE -eq 0) { "passed" } else { "reported a problem (see above)" }
+    Write-Host ""
+    if ($KitHasWorker) {
+        Say "Done. Worker '$Name' is part of the cluster; the doctor check $doctor."
+        Say "Files: $InstallRoot   Log: $log"
+    } else {
+        Say "Done. Machine '$Name' is enrolled as a client; the doctor check $doctor."
+        Say "Files: $InstallRoot   Log: $script:InstallLogPath"
+    }
+} else {
+    Write-Host ""
+    Say "Skipping doctor check (worker-only kit; roles do not include 'client')."
+    Say "Done. Worker '$Name' is part of the cluster (doctor skipped: worker-only kit)."
+    Say "Files: $InstallRoot   Log: $log"
+}
+Say "To remove it, run 'Uninstall OxideSwarm.cmd' from the stick."

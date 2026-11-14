@@ -25,7 +25,9 @@ Nothing here touches the real ~/.oxideswarm, needs a built binary, the network o
 import fnmatch
 import glob
 import hashlib
+import json
 import os
+import pathlib
 import re
 import shutil
 import signal
@@ -36,6 +38,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.environ.get("OX_SCRIPT_ROOT") or os.path.join(HERE, ".."))
@@ -549,6 +552,35 @@ case "$1" in workers|doctor) echo "$1 RUST_LOG=${RUST_LOG:-}" >> "$FAKE_ARGS_LOG
 case "$1" in
   --version) echo "rusty-grid 9.9.9"; exit 0 ;;
   join)
+    shift
+    invite_file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --invite-file) invite_file=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "$invite_file" ]; then
+      [ -f "$invite_file" ] || { echo "missing invite file: $invite_file" >&2; exit 3; }
+      IFS= read -r pass || true
+      pass=$(printf '%s' "$pass" | tr -d '\\r')
+      if [ -z "$pass" ] || [ "$pass" = "wrong-passphrase" ]; then
+        echo "Cannot unlock $invite_file: decryption failed" >&2
+        exit 3
+      fi
+      mkdir -p "$OXIDESWARM_HOME"
+      printf 'fake-node-key\\n' > "$OXIDESWARM_HOME/node.key"
+      chmod 600 "$OXIDESWARM_HOME/node.key"
+      mkey="${FAKE_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      {
+        printf "[worker]\\nmaster_key = '%s'\\n" "$mkey"
+        if [ -n "${FAKE_TICKET:-}" ]; then
+          printf "p2p_ticket = '%s'\\n" "$FAKE_TICKET"
+        fi
+      } > "$OXIDESWARM_HOME/rusty-grid.toml"
+      touch "$OXIDESWARM_HOME/joined"
+      exit 0
+    fi
     tok=$(cat)
     case "$tok" in
       oxs1-join:*)
@@ -635,7 +667,7 @@ class UsbKitTests(unittest.TestCase):
 
     def env(self):
         return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": self.home, "TMPDIR": self.tmp,
-                "FAKE_ARGS_LOG": self.args_log}
+                "FAKE_ARGS_LOG": self.args_log, "OXIDESWARM_USB_ONLINE_SUMS_URL": "off"}
 
     def make_kit(self, token=KIT_TOKEN, extra=()):
         return subprocess.run(
@@ -1199,6 +1231,159 @@ class UsbKitTests(unittest.TestCase):
         self.assertNotEqual(bad_inst.returncode, 0)
         self.assertIn("--isolation must be off or fs", bad_inst.stdout)
 
+    def _make_v1_kit(self, *, roles=("worker",), workspaces=False, require_approval=True, no_autostart=True):
+        extra = ["--no-autostart"] if no_autostart else []
+        res = self.make_kit(extra=extra)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        kit = os.path.join(self.out, "OxideSwarm")
+        tok_path = os.path.join(kit, "join.token")
+        if os.path.exists(tok_path):
+            os.remove(tok_path)
+        with open(os.path.join(kit, "invite.oxs"), "wb") as f:
+            f.write(b"OXSINV01fake-encrypted-payload")
+        meta = {
+            "kit_format": 1,
+            "version": "9.9.9",
+            "created_at": 1700000000,
+            "expires_at": 1900000000,
+            "machines": 2,
+            "roles": list(roles),
+            "workspaces": workspaces,
+            "gpu": False,
+            "require_approval": require_approval,
+            "invite_id": "0123456789abcdef0123456789abcdef",
+        }
+        with open(os.path.join(kit, "kit.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        return kit
+
+    def test_v1_kit_worker_roles_workspaces_logs_and_rollback(self):
+        kit = self._make_v1_kit(roles=("worker",), workspaces=False, no_autostart=True)
+
+        # Wrong passphrase triggers fresh-install rollback cleanly.
+        root_bad = os.path.join(self.tmp, "v1-bad-pass")
+        bad = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root_bad, "--name", "bad-w"],
+            env=self.env(), input="wrong-passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertNotEqual(bad.returncode, 0, bad.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root_bad, "bin", "oxideswarm")))
+        self.assertFalse(os.path.exists(os.path.join(root_bad, "home", "node.key")))
+
+        # Worker-only kit skips doctor, omits --workspaces when kit says false, writes install.log.
+        root = os.path.join(self.tmp, "v1-worker")
+        env1 = dict(self.env(), FAKE_MASTER_KEY="11" * 32)
+        res = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--name", "v1-worker"],
+            env=env1, input="valid kit passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(root, "home", "node.key")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "home", "rusty-grid.toml")))
+        id_path = os.path.join(root, "home", "worker_id.v1-worker")
+        self.assertTrue(os.path.isfile(id_path))
+        wid1 = read(id_path).strip()
+        self.assertTrue(wid1)
+        self.assertTrue(os.path.isfile(os.path.join(root, "logs", "install.log")))
+
+        log_lines = read(self.args_log).splitlines()
+        self.assertTrue(any(l.startswith("join --invite-file ") for l in log_lines), log_lines)
+        worker_lines = [l for l in log_lines if l.startswith("worker ")]
+        self.assertTrue(worker_lines and "--name v1-worker" in worker_lines[-1], worker_lines)
+        self.assertNotIn("--workspaces", worker_lines[-1])
+        self.assertFalse(any(l == "doctor" or l.startswith("doctor ") for l in log_lines), log_lines)
+
+        # --uninstall --yes --keep-key preserves home/node.key while removing bin/.
+        un = subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root, "--yes", "--keep-key"],
+            env=env1, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+        self.assertEqual(un.returncode, 0, un.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root, "bin")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "home", "node.key")))
+
+        # --workspaces flag + different FAKE_MASTER_KEY passes --workspaces (with cargo) & shifts worker_id.
+        fake_bin = os.path.join(self.tmp, "fake-cargo-bin")
+        os.makedirs(fake_bin, exist_ok=True)
+        cargo_exe = os.path.join(fake_bin, "cargo")
+        with open(cargo_exe, "w", encoding="utf-8") as cf:
+            cf.write("#!/bin/sh\necho cargo 1.90.0\n")
+        os.chmod(cargo_exe, 0o755)
+        root_ws = os.path.join(self.tmp, "v1-worker-ws")
+        env2 = dict(self.env(), FAKE_MASTER_KEY="22" * 32)
+        env2["PATH"] = fake_bin + os.pathsep + env2["PATH"]
+        res_ws = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root_ws, "--name", "v1-worker", "--workspaces"],
+            env=env2, input="valid kit passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res_ws.returncode, 0, res_ws.stdout)
+        worker_lines2 = [l for l in read(self.args_log).splitlines() if l.startswith("worker ")]
+        self.assertIn("--workspaces", worker_lines2[-1])
+        wid2 = read(os.path.join(root_ws, "home", "worker_id.v1-worker")).strip()
+        self.assertNotEqual(wid1, wid2)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root_ws, "--yes"],
+            env=env2, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        )
+
+    def test_v1_kit_client_roles_and_online_sums(self):
+        kit = self._make_v1_kit(roles=("client",), workspaces=False, no_autostart=True)
+        sums_text = read(os.path.join(kit, "archives", "SHA256SUMS"))
+        good_sums = os.path.join(self.tmp, "good_SHA256SUMS")
+        bad_sums = os.path.join(self.tmp, "bad_SHA256SUMS")
+        with open(good_sums, "w", encoding="utf-8") as f:
+            f.write(sums_text)
+        with open(bad_sums, "w", encoding="utf-8") as f:
+            for line in sums_text.splitlines():
+                if len(line) > 64:
+                    f.write("0" * 64 + line[64:] + "\n")
+
+        # Non-HTTPS URL must be refused.
+        root_http = os.path.join(self.tmp, "v1-http")
+        env_http = dict(self.env(), OXIDESWARM_USB_ONLINE_SUMS_URL="http://example.com/SHA256SUMS")
+        res_http = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root_http, "--name", "cli1"],
+            env=env_http, input="valid kit passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertNotEqual(res_http.returncode, 0, res_http.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root_http, "bin")))
+
+        # Mismatched file:// SHA256SUMS fails before unpacking.
+        root_bad_sum = os.path.join(self.tmp, "v1-bad-sum")
+        env_bad_sum = dict(self.env(), OXIDESWARM_USB_ONLINE_SUMS_URL=pathlib.Path(bad_sums).as_uri())
+        res_bad_sum = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root_bad_sum, "--name", "cli1"],
+            env=env_bad_sum, input="valid kit passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertNotEqual(res_bad_sum.returncode, 0, res_bad_sum.stdout)
+        self.assertFalse(os.path.exists(os.path.join(root_bad_sum, "bin")))
+
+        # Client-only kit with matching file:// SHA256SUMS runs doctor and skips worker start.
+        root_cli = os.path.join(self.tmp, "v1-client")
+        env_good = dict(self.env(), OXIDESWARM_USB_ONLINE_SUMS_URL=pathlib.Path(good_sums).as_uri())
+        res_cli = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", root_cli, "--name", "cli1"],
+            env=env_good, input="valid kit passphrase\n", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res_cli.returncode, 0, res_cli.stdout)
+        log_lines = read(self.args_log).splitlines()
+        self.assertTrue(any(l == "doctor" or l.startswith("doctor ") for l in log_lines), log_lines)
+        self.assertFalse(any(l.startswith("worker ") for l in log_lines), log_lines)
+        self.assertFalse(os.path.exists(os.path.join(root_cli, "start-worker.sh")))
+        un = subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", root_cli, "--yes"],
+            env=env_good, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        )
+        self.assertEqual(un.returncode, 0, un.stdout)
+        self.assertFalse(os.path.exists(root_cli))
+
 
 class StaticRepositoryChecks(unittest.TestCase):
     def test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation(self):
@@ -1304,6 +1489,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                 TMP=tmp_temp,
                 OXIDESWARM_USB_RUN_VALUE=test_run_val,
                 OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+                OXIDESWARM_USB_ONLINE_SUMS_URL="off",
             )
             pids_log = os.path.join(tmp, "spawned_workers.pids")
             ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
@@ -2185,7 +2371,7 @@ Write-Output 'USB_HELPERS_OK'
         self.assertIn("Join-Path $env:LOCALAPPDATA 'OxideSwarm-USB'", uninstall_ps1)
 
         # Always pass --workspace-root when --workspaces is enabled, even inside %LOCALAPPDATA%.
-        ws_block_start = install_ps1.index("if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces")
+        ws_block_start = install_ps1.index("if ($useWorkspaces -and $supportsIsolatedWorkspaces")
         ws_block_end = install_ps1.index("$log = Join-Path $LogDir 'worker.log'", ws_block_start)
         ws_block = install_ps1[ws_block_start:ws_block_end]
         self.assertNotIn("if (-not $PrivateRoot)", ws_block)
@@ -2253,6 +2439,7 @@ Write-Output 'USB_HELPERS_OK'
             TMP=tmp_temp,
             OXIDESWARM_USB_RUN_VALUE=test_run_val,
             OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
             FAKE_OXIDE_PIDS_LOG=pids_log,
         )
         if not shutil.which("cargo", path=ps_env.get("PATH")):
@@ -2451,6 +2638,307 @@ public class Program {
             for pid_candidate in (
                 pids_log,
                 os.path.join(tmp_localappdata, "OxideSwarm-USB", "run", "worker.pid"),
+            ):
+                if os.path.isfile(pid_candidate):
+                    try:
+                        for line in read(pid_candidate).splitlines():
+                            p_str = line.strip()
+                            if p_str.isdigit():
+                                subprocess.run(
+                                    ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {p_str} -Force -ErrorAction SilentlyContinue"],
+                                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                )
+                    except Exception:
+                        pass
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB v1 kit test")
+    def test_windows_usb_v1_kit_passphrase_roles_online_sums_and_rollback(self):
+        tmp = tempfile.mkdtemp(prefix="ox_usb1_ps_")
+        tmp_home = os.path.join(tmp, "home")
+        tmp_localappdata = os.path.join(tmp, "localappdata")
+        tmp_appdata = os.path.join(tmp, "appdata")
+        tmp_temp = os.path.join(tmp, "temp")
+        tmp_client_localappdata = os.path.join(tmp, "localappdata_client")
+        for d in (tmp_home, tmp_localappdata, tmp_client_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        test_run_val = f"OxideSwarmUsbWorkerV1Test_{os.getpid()}"
+        test_pointer_key = rf"HKCU:\Software\OxideSwarm\UsbKitV1Test_{os.getpid()}"
+        pids_log = os.path.join(tmp, "spawned_v1.pids")
+        args_log = os.path.join(tmp, "v1_args.log")
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME")
+        }
+        ps_env.update(
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+            FAKE_ARGS_LOG=args_log,
+            FAKE_WORKER_NAME="v1-win-worker",
+        )
+        if not shutil.which("cargo", path=ps_env.get("PATH")):
+            fake_cargo_dir = os.path.join(tmp, "fake_cargo_bin")
+            os.makedirs(fake_cargo_dir, exist_ok=True)
+            with open(os.path.join(fake_cargo_dir, "cargo.cmd"), "w", encoding="utf-8") as cf:
+                cf.write("@echo off\r\necho cargo 1.90.0\r\n")
+            ps_env["PATH"] = fake_cargo_dir + os.pathsep + ps_env.get("PATH", "")
+
+        root_worker = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+        root_client = os.path.join(tmp_client_localappdata, "OxideSwarm-USB")
+        try:
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(
+                os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"),
+                os.path.join(kit_dir, "revoke-isolation-acls.ps1"),
+            )
+            with open(os.path.join(kit_dir, "invite.oxs"), "wb") as f:
+                f.write(b"OXSINV01fake-encrypted-payload")
+            with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                f.write("off\n")
+
+            def write_kit_json(roles, workspaces=False):
+                meta = {
+                    "kit_format": 1,
+                    "version": "9.9.9",
+                    "created_at": 1700000000,
+                    "expires_at": 1900000000,
+                    "machines": 2,
+                    "roles": roles,
+                    "workspaces": workspaces,
+                    "gpu": False,
+                    "require_approval": True,
+                    "invite_id": "0123456789abcdef0123456789abcdef",
+                }
+                with open(os.path.join(kit_dir, "kit.json"), "w", encoding="utf-8") as mf:
+                    json.dump(meta, mf)
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string argsLog = Environment.GetEnvironmentVariable("FAKE_ARGS_LOG");
+        if (!string.IsNullOrEmpty(argsLog)) {
+            try { File.AppendAllText(argsLog, string.Join(" ", args) + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            string inviteFile = null;
+            for (int i = 1; i < args.Length - 1; i++) {
+                if (args[i] == "--invite-file") { inviteFile = args[i + 1]; break; }
+            }
+            if (string.IsNullOrEmpty(inviteFile) || !File.Exists(inviteFile)) {
+                Console.Error.WriteLine("missing invite file");
+                return 3;
+            }
+            string pass = Console.In.ReadLine() ?? "";
+            if (string.IsNullOrEmpty(pass) || pass == "wrong-passphrase") {
+                Console.Error.WriteLine("Cannot unlock invite.oxs: decryption failed");
+                return 3;
+            }
+            string oxHome = Environment.GetEnvironmentVariable("OXIDESWARM_HOME");
+            if (string.IsNullOrEmpty(oxHome)) {
+                oxHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".oxideswarm");
+            }
+            Directory.CreateDirectory(oxHome);
+            File.WriteAllText(Path.Combine(oxHome, "node.key"), "fake-node-key\n");
+            string mkey = Environment.GetEnvironmentVariable("FAKE_MASTER_KEY");
+            if (string.IsNullOrEmpty(mkey)) {
+                mkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            }
+            File.WriteAllText(Path.Combine(oxHome, "rusty-grid.toml"), "[worker]\nmaster_key = '" + mkey + "'\n");
+            File.WriteAllText(Path.Combine(oxHome, "joined"), "1\n");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            string wname = Environment.GetEnvironmentVariable("FAKE_WORKER_NAME") ?? "v1-win-worker";
+            Console.WriteLine("[{\"name\":\"" + wname + "\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            cs_file = os.path.join(tmp, "FakeOxideV1.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            compile_res = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+            good_sums_text = f"{zip_sha}  {zip_name}\n"
+            with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                f.write(good_sums_text)
+
+            good_online = os.path.join(tmp, "online_good_SHA256SUMS")
+            bad_online = os.path.join(tmp, "online_bad_SHA256SUMS")
+            with open(good_online, "w", encoding="utf-8") as f:
+                f.write(good_sums_text)
+            with open(bad_online, "w", encoding="utf-8") as f:
+                f.write(("0" * 64) + f"  {zip_name}\n")
+
+            write_kit_json(["worker"], workspaces=False)
+            install_ps1 = os.path.join(kit_dir, "install.ps1")
+            uninstall_ps1 = os.path.join(kit_dir, "uninstall.ps1")
+
+            # 1. Non-HTTPS URL must be refused cleanly.
+            env_http = dict(ps_env, OXIDESWARM_USB_ONLINE_SUMS_URL="http://example.com/SHA256SUMS")
+            res_http = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "v1-win-worker", "-InstallRoot", root_worker, "-NoAutostart"],
+                env=env_http, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertNotEqual(res_http.returncode, 0, res_http.stdout)
+            self.assertIn("only https:// or file:// is allowed", res_http.stdout)
+            self.assertFalse(os.path.exists(os.path.join(root_worker, "bin", "oxideswarm.exe")))
+
+            # 2. Mismatched file:/// online SHA256SUMS must fail before unpacking.
+            env_bad_sum = dict(ps_env, OXIDESWARM_USB_ONLINE_SUMS_URL=pathlib.Path(bad_online).as_uri())
+            res_bad_sum = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "v1-win-worker", "-InstallRoot", root_worker, "-NoAutostart"],
+                env=env_bad_sum, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertNotEqual(res_bad_sum.returncode, 0, res_bad_sum.stdout)
+            self.assertNotIn("on the drive this kit runs from", res_bad_sum.stdout)
+            self.assertFalse(os.path.exists(args_log))
+            self.assertFalse(os.path.exists(os.path.join(root_worker, "bin", "oxideswarm.exe")))
+
+            # 3. Wrong passphrase triggers fresh-install rollback: removes bin, node.key, InstallRoot, PointerKey.
+            env_good_online = dict(ps_env, OXIDESWARM_USB_ONLINE_SUMS_URL=pathlib.Path(good_online).as_uri())
+            res_bad_pass = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "v1-win-worker", "-InstallRoot", root_worker, "-NoAutostart"],
+                env=env_good_online, input="wrong-passphrase\r\n", stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            self.assertNotEqual(res_bad_pass.returncode, 0, res_bad_pass.stdout)
+            self.assertTrue(os.path.isfile(args_log), res_bad_pass.stdout)
+            self.assertTrue(any(l.startswith("join --invite-file ") for l in read(args_log).splitlines()), res_bad_pass.stdout)
+            self.assertFalse(os.path.exists(os.path.join(root_worker, "bin", "oxideswarm.exe")))
+            self.assertFalse(os.path.exists(os.path.join(root_worker, "home", "node.key")))
+            self.assertFalse(os.path.exists(root_worker))
+            ptr_chk = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"if (Test-Path -Path '{test_pointer_key}') {{ exit 1 }} else {{ exit 0 }}"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15,
+            )
+            self.assertEqual(ptr_chk.returncode, 0, f"Rollback left PointerKey behind: {ptr_chk.stdout}")
+
+            # 4. Valid passphrase on worker-only v1 kit: installs, skips doctor & --workspaces, writes install.log.
+            with open(args_log, "w", encoding="utf-8") as af:
+                af.write("")
+            res_ok = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "v1-win-worker", "-InstallRoot", root_worker, "-NoAutostart"],
+                env=env_good_online, input="correct horse battery staple\r\ny\r\n", stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_ok.returncode, 0, res_ok.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(root_worker, "home", "node.key")))
+            self.assertTrue(os.path.isfile(os.path.join(root_worker, "home", "rusty-grid.toml")))
+            self.assertTrue(os.path.isfile(os.path.join(root_worker, "home", "worker_id.v1-win-worker")))
+            self.assertTrue(os.path.isfile(os.path.join(root_worker, "logs", "install.log")))
+
+            arg_lines = read(args_log).splitlines()
+            self.assertTrue(any(l.startswith("join --invite-file ") for l in arg_lines), arg_lines)
+            worker_lines = [l for l in arg_lines if l.startswith("worker ")]
+            self.assertTrue(worker_lines and "--name v1-win-worker" in worker_lines[-1], worker_lines)
+            self.assertNotIn("--workspaces", worker_lines[-1])
+            self.assertFalse(any(l == "doctor" or l.startswith("doctor ") for l in arg_lines), arg_lines)
+
+            # uninstall.ps1 -Yes -KeepKey removes bin and PointerKey while keeping home\node.key.
+            res_un = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", uninstall_ps1,
+                 "-InstallRoot", root_worker, "-Yes", "-KeepKey"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(res_un.returncode, 0, res_un.stdout)
+            self.assertFalse(os.path.exists(os.path.join(root_worker, "bin", "oxideswarm.exe")))
+            self.assertTrue(os.path.isfile(os.path.join(root_worker, "home", "node.key")))
+            ptr_chk2 = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"if (Test-Path -Path '{test_pointer_key}') {{ exit 1 }} else {{ exit 0 }}"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15,
+            )
+            self.assertEqual(ptr_chk2.returncode, 0, f"uninstall.ps1 -KeepKey left PointerKey: {ptr_chk2.stdout}")
+
+            # 5. Client-only v1 kit runs doctor and skips starting a worker.
+            with open(args_log, "w", encoding="utf-8") as af:
+                af.write("")
+            write_kit_json(["client"], workspaces=False)
+            client_env = dict(ps_env, LOCALAPPDATA=tmp_client_localappdata)
+            res_cli = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "v1-win-client", "-InstallRoot", root_client, "-NoAutostart"],
+                env=client_env, input="correct horse battery staple\r\ny\r\n", stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_cli.returncode, 0, res_cli.stdout)
+            cli_args = read(args_log).splitlines()
+            self.assertTrue(any(l == "doctor" or l.startswith("doctor ") for l in cli_args), cli_args)
+            self.assertFalse(any(l.startswith("worker ") for l in cli_args), cli_args)
+            res_un_cli = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", uninstall_ps1,
+                 "-InstallRoot", root_client, "-Yes"],
+                env=client_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(res_un_cli.returncode, 0, res_un_cli.stdout)
+            self.assertFalse(os.path.exists(root_client))
+        finally:
+            for pid_candidate in (
+                pids_log,
+                os.path.join(root_worker, "run", "worker.pid"),
+                os.path.join(root_client, "run", "worker.pid"),
             ):
                 if os.path.isfile(pid_candidate):
                     try:
