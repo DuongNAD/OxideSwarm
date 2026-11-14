@@ -9,7 +9,9 @@ pub mod join;
 pub mod mcp;
 pub mod members_cmd;
 pub mod mode_cli;
+pub mod pair;
 pub mod secret_cmd;
+pub mod wordlist;
 
 pub use cli_app::run_cli;
 pub use connect::{connect_master, DEFAULT_MASTER_ADDR, DEFAULT_MASTER_PORT};

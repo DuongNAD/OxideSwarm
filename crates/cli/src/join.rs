@@ -842,6 +842,21 @@ pub struct JoinArgs {
 
     #[arg(
         long,
+        value_name = "CODE",
+        help = "Pair with an inviting machine on the LAN using its short code (<N>-<word1>-<word2>)"
+    )]
+    pub code: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        requires = "code",
+        help = "Connect directly to the inviter's pairing port instead of UDP broadcast discovery"
+    )]
+    pub pair_host: Option<String>,
+
+    #[arg(
+        long,
         help = "Save the secret and the address but do not run the doctor checks"
     )]
     pub no_doctor: bool,
@@ -861,6 +876,9 @@ pub async fn run_join(
     if !args.refused_argument.is_empty() {
         eprintln!("A join token must not be given as an argument: it would stay in your shell history and be visible in the process list. Pipe it in instead, for example `pbpaste | oxideswarm join`, or `ssh master oxideswarm secret join-token | oxideswarm join`.");
         return ExitCode::FAILURE;
+    }
+    if args.code.is_some() {
+        return crate::pair::run_join_code(args, secret_opts, config).await;
     }
     let stdin = std::io::stdin();
     let stdin_is_terminal = stdin.is_terminal();
@@ -1059,7 +1077,7 @@ async fn open_enroll_stream(
     ))
 }
 
-fn parse_yes_no_confirmation(line: &str) -> bool {
+pub(crate) fn parse_yes_no_confirmation(line: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
@@ -1274,10 +1292,21 @@ async fn run_worker_member_readonly_check(
 
 async fn run_join_invite(
     args: JoinArgs,
-    _secret_opts: &SecretOpts,
+    secret_opts: &SecretOpts,
     config: Option<&ConfigFile>,
     text: String,
     stdin_is_terminal: bool,
+) -> ExitCode {
+    run_join_invite_with_pair(args, secret_opts, config, text, stdin_is_terminal, None).await
+}
+
+pub(crate) async fn run_join_invite_with_pair(
+    args: JoinArgs,
+    _secret_opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+    text: String,
+    confirm_via_stdin: bool,
+    mut pair_pending_tx: Option<tokio::sync::oneshot::Sender<crate::pair::PairPendingNotice>>,
 ) -> ExitCode {
     use rusty_grid_core::noise_auth::{
         compute_enroll_proof, default_node_key_path, derive_pairing_code,
@@ -1391,7 +1420,7 @@ async fn run_join_invite(
 
     // Open the controlling terminal for `[y/N]` confirmation BEFORE connecting to the master so a
     // headless invocation without `/dev/tty` or `CONIN$` fails without touching the master.
-    let mut confirm_term = match open_confirmation_terminal(stdin_is_terminal) {
+    let mut confirm_term = match open_confirmation_terminal(confirm_via_stdin) {
         Ok(t) => Some(t),
         Err(e) => {
             eprintln!("{e}");
@@ -1535,6 +1564,13 @@ async fn run_join_invite(
                 return ExitCode::from(AUTH_EXIT_CODE);
             }
             ClientResponse::EnrollPending { pending_id } => {
+                if let Some(tx) = pair_pending_tx.take() {
+                    let _ = tx.send(crate::pair::PairPendingNotice {
+                        pending_id: pending_id.clone(),
+                        pairing_code: pairing_code.as_str().to_string(),
+                        master_fingerprint: fp.clone(),
+                    });
+                }
                 println!(
                     "Pairing code: {}  (Master key fingerprint: {fp})",
                     pairing_code.as_str()
@@ -2185,5 +2221,30 @@ mod tests {
             std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn join_args_code_pair_host_and_positional_secret_rules() {
+        let ok = JoinArgs::try_parse_from([
+            "join",
+            "--code",
+            "7-rocket-violin",
+            "--pair-host",
+            "192.168.1.5:51234",
+        ])
+        .unwrap();
+        assert_eq!(ok.code.as_deref(), Some("7-rocket-violin"));
+        assert_eq!(ok.pair_host.as_deref(), Some("192.168.1.5:51234"));
+        assert!(ok.refused_argument.is_empty());
+
+        // `--pair-host` without `--code` is rejected by clap.
+        assert!(JoinArgs::try_parse_from(["join", "--pair-host", "192.168.1.5:51234"]).is_err());
+
+        // A positional secret alongside `--code` is captured in `refused_argument` rather than
+        // being echoed back by clap.
+        let with_secret =
+            JoinArgs::try_parse_from(["join", "--code", "7-rocket-violin", "oxs1-secret-value"])
+                .unwrap();
+        assert_eq!(with_secret.refused_argument, vec!["oxs1-secret-value"]);
     }
 }

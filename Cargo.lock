@@ -790,6 +790,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "fiat-crypto 0.2.9",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
 ]
@@ -1480,6 +1481,24 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "http"
@@ -3430,11 +3449,13 @@ dependencies = [
  "futures",
  "ignore",
  "libc",
+ "ring",
  "rusty_grid_core",
  "rusty_grid_master",
  "rusty_grid_worker",
  "serde",
  "serde_json",
+ "spake2",
  "sysinfo",
  "tempfile",
  "tokio",
@@ -3848,6 +3869,18 @@ name = "sorted-index-buffer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea06cc588e43c632923a55450401b8f25e628131571d4e1baea1bdfdb2b5ed06"
+
+[[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "spez"
