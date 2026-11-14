@@ -61,6 +61,7 @@ jobs:
           cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --features 3d --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features otel --locked -- -D warnings
       - name: master compiles without default features (dashboard, p2p)
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p rusty_grid_master --no-default-features --locked
@@ -122,6 +123,12 @@ jobs:
           cargo test -p rusty_grid_worker --features 3d --locked --test test_3d1_honest_sdf --test test_autorig_adversarial_stress --test test_autorig_pipeline --test test_challenger_m3_blender_job_object --test test_gen3d_adversarial_stress --test test_gen3d_pipeline
           cargo test -p rusty_grid_cli --features 3d --locked --test test_cli_3d_submission --test test_3d_autorig_pipeline --test test_challenger_m5_3d_pipeline
           cargo test -p agent_mesh --features 3d --locked --test test_challenger_m4_mesh_tampering_and_burst --test test_ecosystem_convergence
+      - name: run otel feature unit and integration tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo test -p rusty_grid_master --lib --features otel --locked
+          cargo test -p rusty_grid_cli --lib --features otel --locked
+          cargo test -p rusty_grid_master --test observability_metrics_otel_test --features otel,test-hooks --locked
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
       - name: build agent mesh hub binary for Python interop suites

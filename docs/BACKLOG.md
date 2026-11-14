@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `e7bb4204` plus SCALE-1: 74 items Implemented, 7 Partial and 41 Planned. Five items
+On 2026-11-14, at `master` `a93f7082` plus SCALE-1: 75 items Implemented, 7 Partial and 40 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -244,7 +244,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ECO-1 | Remote Execution API compatibility | P3 | L | REAPI-1, ECO-2 |  | Planned |  |
 | ECO-2 | Action cache (is CACHE-1) | P2 | L | FEAT-1 |  | Planned |  |
 | ECO-3 | Multi-tenancy and quotas | P2 | L | SCALE-1 |  | Planned |  |
-| ECO-4 | Observability: metrics and traces | P2 | M |  |  | Planned |  |
+| ECO-4 | Observability: metrics and traces | P2 | M |  |  | Implemented | (design 0050), 225 |
 | ECO-5 | Packaging for package managers and containers | P2 | M | REL-4 | Yes | Planned |  |
 | ECO-6 | Client SDKs and a versioned public API | P3 | L | FEAT-8 |  | Planned |  |
 | ECO-7 | Integrations for coding agents and CI | P2 | M | DOC-7 |  | Planned |  |
@@ -2570,4 +2570,12 @@ Add one dated line per finished item, newest last.
   pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
 - 2026-11-14: Implemented JOIN-2 ([design 0052](design/0052-short-code-pairing.md), pull request 221, `5d05932`): BIP-0039 CC0-1.0 2048-word list (`crates/cli/src/wordlist.rs`), UDP port 8087 broadcast discovery, SPAKE2 over Ed25519 with joiner-first confirmation and single-guess burn rule, and HKDF/ChaCha20-Poly1305 invite and `PairPendingNotice` handoff (`crates/cli/src/pair.rs`), `invite --code`, `join --code [--pair-host]`, `tests/cli_pair_e2e.rs` green on Linux, macOS and Windows (CI run `43590921426`), and a live LAN run between macOS arm64 and Windows 11 x86_64 recorded in [guides/add-a-machine.md](guides/add-a-machine.md#recorded-two-machine-run) (UDP 8087 broadcast with `422-tool-humor`, matching pairing check `711 627`, member `269b134d8914e3de`, `submit --wait -- echo paired-ok` exit `0` in `348 ms`). The Index counts are now 72 Implemented, 7 Partial and 43 Planned.
 - 2026-11-14: Implemented FEAT-7 ([design 0066](design/0066-usable-rendezvous-discovery.md), pull request 224, `e7bb420`): standalone `oxideswarm rendezvous` HTTP registry on `:8090` with deterministic Ed25519 `lease_key` / `key_signature` multi-cluster slot isolation and `X-OxideSwarm-Lease-Auth` read authorization (`crates/master/src/rendezvous.rs`, `crates/core/src/discovery.rs`), MAC-covered `p2p_ticket` and P2P fallback when discovered TCP fails (`crates/worker/src/client.rs`, `crates/cli/src/connect.rs`), upfront `https://` rejection, `2 s` master registration retries (`crates/master/src/server.rs`), updated `README.md` / `CLAUDE.md` / `CHANGELOG.md`, and `tests/rendezvous_discovery_e2e.rs`. The Index counts are now 73 Implemented, 7 Partial and 42 Planned.
-- 2026-11-14: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 74 Implemented, 7 Partial and 41 Planned.
+- 2026-11-14: Implemented ECO-4 ([design 0050](design/0050-scale-out-architecture.md), pull request 225, `a93f708`): added
+  authenticated Prometheus `GET /metrics` (`AuthScope::Observer`, `crates/master/src/metrics.rs`,
+  `web_ui.rs`, `auth.rs`, `queue.rs`, `store.rs`) and opt-in zero-SDK `--features otel` OTLP/HTTP
+  JSON trace export (`crates/master/src/otel.rs`, `scheduler.rs`, `crates/cli/src/cli_app.rs`, `0`
+  new external packages in `Cargo.lock`) emitting deterministic `task_id`-seeded `submit`,
+  `place`, `assign`, `run`, and `result` spans without secret or task-input leakage
+  (`tests/observability_metrics_otel_test.rs`). The Index counts are now 74 Implemented, 7 Partial
+  and 41 Planned.
+- 2026-11-14: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 75 Implemented, 7 Partial and 40 Planned.

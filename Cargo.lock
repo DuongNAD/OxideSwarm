@@ -3506,6 +3506,7 @@ dependencies = [
  "libc",
  "reqwest 0.12.28",
  "ring",
+ "rustls-native-certs",
  "rusty_grid_core",
  "rusty_grid_worker",
  "serde",
@@ -3514,10 +3515,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tower-http 0.5.2",
  "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
