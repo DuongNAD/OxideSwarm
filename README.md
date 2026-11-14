@@ -188,6 +188,10 @@ flowchart LR
   ([design 0016](docs/design/0016-mapreduce-cli-script-shipping.md)).
 - **Web dashboard:** live workers, tasks and links over plain HTTP. It listens on loopback by
   default, and needs a token once the master has a secret.
+- **Observability:** Prometheus metrics at `GET /metrics` on the dashboard listener (`Observer`
+  scope when authentication is active) and opt-in OTLP/HTTP JSON task lifecycle traces when built
+  with `--features otel` (`OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+  `OTEL_SERVICE_NAME`; [design 0050](docs/design/0050-scale-out-architecture.md)).
 - **Discovery:** `--master auto` finds a master on the LAN through an authenticated UDP beacon. An
   HTTP probe and a rendezvous registry exist, with gaps that FEAT-7 tracks.
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker

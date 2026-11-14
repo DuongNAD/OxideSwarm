@@ -6,6 +6,9 @@ pub mod blob_store;
 pub mod dashboard;
 pub mod liveness;
 pub mod mapreduce;
+pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod queue;
 pub mod reaper;
 pub mod registry;

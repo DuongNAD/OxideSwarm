@@ -372,6 +372,7 @@ mod middleware {
     pub fn route_required_scope(method: &Method, path: &str) -> Option<AuthScope> {
         match (method, path) {
             (&Method::GET, "/") => None, // Public SPA HTML (static, contains no cluster data)
+            (&Method::GET, "/metrics") => Some(AuthScope::Observer),
             (&Method::GET, p) if p.starts_with("/api/discovery/probe") => None,
             (&Method::GET, p) if p.starts_with("/api/rendezvous/master") => None,
             (&Method::POST, p) if p.starts_with("/api/rendezvous/register") => None,
@@ -988,6 +989,7 @@ mod tests {
                 "/api/stream/sse",
                 "/api/modes",
                 "/api/modes/status",
+                "/metrics",
                 "/anything/else",
             ] {
                 assert_eq!(
@@ -996,6 +998,10 @@ mod tests {
                     "GET {path}"
                 );
             }
+            assert_eq!(
+                route_required_scope(&Method::POST, "/metrics"),
+                Some(AuthScope::Admin)
+            );
             assert_eq!(
                 route_required_scope(&Method::POST, "/api/tasks"),
                 Some(AuthScope::Submitter)

@@ -244,7 +244,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | ECO-1 | Remote Execution API compatibility | P3 | L | REAPI-1, ECO-2 |  | Planned |  |
 | ECO-2 | Action cache (is CACHE-1) | P2 | L | FEAT-1 |  | Planned |  |
 | ECO-3 | Multi-tenancy and quotas | P2 | L | SCALE-1 |  | Planned |  |
-| ECO-4 | Observability: metrics and traces | P2 | M |  |  | Planned |  |
+| ECO-4 | Observability: metrics and traces | P2 | M |  |  | Implemented | (design 0050) |
 | ECO-5 | Packaging for package managers and containers | P2 | M | REL-4 | Yes | Planned |  |
 | ECO-6 | Client SDKs and a versioned public API | P3 | L | FEAT-8 |  | Planned |  |
 | ECO-7 | Integrations for coding agents and CI | P2 | M | DOC-7 |  | Planned |  |
@@ -2568,3 +2568,11 @@ Add one dated line per finished item, newest last.
   `681012d`: `crates/worker/src/client.rs` unit tests moved to `crates/worker/src/client/tests.rs`,
   8,252 to 4,363 lines); USB-1 lists merged pull requests 185, 195 and 207; and ENROLL-1b merged in
   pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
+- 2026-11-14: Implemented ECO-4 ([design 0050](design/0050-scale-out-architecture.md)): added
+  authenticated Prometheus `GET /metrics` (`AuthScope::Observer`, `crates/master/src/metrics.rs`,
+  `web_ui.rs`, `auth.rs`, `queue.rs`, `store.rs`) and opt-in zero-SDK `--features otel` OTLP/HTTP
+  JSON trace export (`crates/master/src/otel.rs`, `scheduler.rs`, `crates/cli/src/cli_app.rs`, `0`
+  new external packages in `Cargo.lock`) emitting deterministic `task_id`-seeded `submit`,
+  `place`, `assign`, `run`, and `result` spans without secret or task-input leakage
+  (`tests/observability_metrics_otel_test.rs`). The Index counts are now 72 Implemented, 7 Partial
+  and 43 Planned.

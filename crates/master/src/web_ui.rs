@@ -316,6 +316,7 @@ pub fn create_web_ui_router_full(
         // HTML Cockpit Single Page Application
         .route("/", get(index_html))
         // Observability & Telemetry APIs
+        .route("/metrics", get(api_metrics))
         .route("/api/status", get(api_status))
         .route("/api/workers", get(api_get_workers))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
@@ -533,6 +534,67 @@ fn discovery_hosts(workers: &[WorkerInfo]) -> Vec<String> {
     hosts.dedup();
     hosts.truncate(MAX_DISCOVERY_HOSTS);
     hosts
+}
+
+/// Prometheus text exposition endpoint guarded by `AuthScope::Observer`.
+async fn api_metrics(State(state): State<WebUiState>) -> impl IntoResponse {
+    let (queue_stats, store_metrics, workers_info) = tokio::join!(
+        state.queue.stats(),
+        state.queue.store_metrics_snapshot(),
+        state.registry.list_all_workers(),
+    );
+    let queue_metrics = state.queue.metrics().snapshot();
+
+    #[cfg(feature = "p2p")]
+    let p2p_links: std::collections::HashMap<uuid::Uuid, crate::metrics::WorkerLinkKind> =
+        if let Some(conns) = state.master_handle.as_ref().map(|h| h.p2p_connection_map()) {
+            let guard = conns.read().await;
+            guard
+                .iter()
+                .map(|(&wid, conn)| {
+                    let kind = match rusty_grid_core::transport::inspect_connection_paths(conn) {
+                        Some(info) if info.is_relay => crate::metrics::WorkerLinkKind::QuicRelay,
+                        Some(_) | None => crate::metrics::WorkerLinkKind::QuicDirect,
+                    };
+                    (wid, kind)
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    let workers: Vec<crate::metrics::WorkerMetricSample> = workers_info
+        .iter()
+        .map(|w| {
+            #[cfg(feature = "p2p")]
+            let p2p_override = p2p_links.get(&w.worker_id).copied();
+            #[cfg(not(feature = "p2p"))]
+            let p2p_override = None;
+            crate::metrics::WorkerMetricSample::from_worker_info(w, p2p_override)
+        })
+        .collect();
+
+    let blob_stats = state
+        .master_handle
+        .as_ref()
+        .and_then(|h| h.blob_store())
+        .map(|b| b.stats());
+
+    let body = crate::metrics::render_prometheus_metrics(
+        &queue_stats,
+        &queue_metrics,
+        &workers,
+        blob_stats.as_ref(),
+        &store_metrics,
+    );
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            crate::metrics::PROMETHEUS_CONTENT_TYPE,
+        )],
+        body,
+    )
 }
 
 async fn api_status(
