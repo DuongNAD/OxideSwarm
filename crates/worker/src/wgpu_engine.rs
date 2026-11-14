@@ -109,9 +109,7 @@ impl GemmControl {
 fn new_instance() -> Instance {
     Instance::new(InstanceDescriptor {
         backends: Backends::all(),
-        flags: InstanceFlags::default(),
-        dx12_shader_compiler: Dx12Compiler::default(),
-        gles_minor_version: Gles3MinorVersion::default(),
+        ..InstanceDescriptor::new_without_display_handle()
     })
 }
 
@@ -134,7 +132,7 @@ fn rank_adapter(info: &AdapterInfo, can_run_gemm: bool) -> Option<i32> {
         Backend::Metal | Backend::Vulkan => 3,
         Backend::Dx12 => 2,
         Backend::BrowserWebGpu => 1,
-        Backend::Gl | Backend::Empty => 0,
+        Backend::Gl | Backend::Noop => 0,
     };
     Some(by_type + by_backend)
 }
@@ -149,7 +147,7 @@ fn adapter_can_run_gemm(adapter: &Adapter) -> bool {
         .contains(DownlevelFlags::COMPUTE_SHADERS)
         && limits.max_storage_buffers_per_shader_stage >= 3
         && limits.max_bind_groups >= 1
-        && limits.max_uniform_buffer_binding_size >= std::mem::size_of::<GpuDimensions>() as u32
+        && limits.max_uniform_buffer_binding_size >= std::mem::size_of::<GpuDimensions>() as u64
 }
 
 fn adapter_rank(adapter: &Adapter) -> Option<i32> {
@@ -163,17 +161,18 @@ fn select_adapter(instance: &Instance) -> Option<Adapter> {
         power_preference: PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
+        apply_limit_buckets: false,
     }));
-    if let Some(adapter) = preferred {
+    if let Ok(adapter) = preferred {
         if adapter_rank(&adapter).is_some() {
             return Some(adapter);
         }
     }
-    let mut ranked: Vec<(i32, Adapter)> = instance
-        .enumerate_adapters(Backends::all())
-        .into_iter()
-        .filter_map(|adapter| adapter_rank(&adapter).map(|rank| (rank, adapter)))
-        .collect();
+    let mut ranked: Vec<(i32, Adapter)> =
+        pollster::block_on(instance.enumerate_adapters(Backends::all()))
+            .into_iter()
+            .filter_map(|adapter| adapter_rank(&adapter).map(|rank| (rank, adapter)))
+            .collect();
     ranked.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
     ranked.into_iter().next().map(|(_, adapter)| adapter)
 }
@@ -209,13 +208,13 @@ fn describe_error(error: &Error) -> String {
 /// around it, so the errors those calls raise come back as `Err` instead of reaching wgpu's
 /// panicking default handler. `what` names the step in the message.
 fn with_error_scopes<T>(device: &Device, what: &str, f: impl FnOnce() -> T) -> Result<T, GpuError> {
-    device.push_error_scope(ErrorFilter::Internal);
-    device.push_error_scope(ErrorFilter::OutOfMemory);
-    device.push_error_scope(ErrorFilter::Validation);
+    let internal_guard = device.push_error_scope(ErrorFilter::Internal);
+    let oom_guard = device.push_error_scope(ErrorFilter::OutOfMemory);
+    let validation_guard = device.push_error_scope(ErrorFilter::Validation);
     let value = f();
-    let validation = pollster::block_on(device.pop_error_scope());
-    let out_of_memory = pollster::block_on(device.pop_error_scope());
-    let internal = pollster::block_on(device.pop_error_scope());
+    let validation = pollster::block_on(validation_guard.pop());
+    let out_of_memory = pollster::block_on(oom_guard.pop());
+    let internal = pollster::block_on(internal_guard.pop());
     match validation.or(out_of_memory).or(internal) {
         None => Ok(value),
         Some(error) => Err(GpuError::Device(format!(
@@ -228,7 +227,8 @@ fn with_error_scopes<T>(device: &Device, what: &str, f: impl FnOnce() -> T) -> R
 fn device_limits_from(limits: &Limits) -> DeviceLimits {
     DeviceLimits {
         max_dim: GPU_MAX_DIM,
-        max_matrix_bytes: (limits.max_storage_buffer_binding_size as u64)
+        max_matrix_bytes: limits
+            .max_storage_buffer_binding_size
             .min(limits.max_buffer_size),
         max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
         max_workgroup_edge: limits
@@ -305,15 +305,14 @@ impl WgpuEngine {
 
         // The adapter's own limits, not the WebGPU defaults: asking for more than a weaker GPU
         // has makes request_device fail, and asking for less caps the matrices at 128 MiB.
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &DeviceDescriptor {
-                label: Some("oxideswarm_wgpu_engine_device"),
-                required_features: Features::empty(),
-                required_limits: adapter_limits.clone(),
-                memory_hints: MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("oxideswarm_wgpu_engine_device"),
+            required_features: Features::empty(),
+            required_limits: adapter_limits.clone(),
+            experimental_features: ExperimentalFeatures::disabled(),
+            memory_hints: MemoryHints::Performance,
+            trace: Trace::Off,
+        }))
         .map_err(|e| format!("Failed to request WGPU device from adapter: {e}"))?;
 
         let lost = Arc::new(AtomicBool::new(false));
@@ -330,7 +329,7 @@ impl WgpuEngine {
         }
         {
             let reason = Arc::clone(&background_error);
-            device.on_uncaptured_error(Box::new(move |error| {
+            device.on_uncaptured_error(Arc::new(move |error| {
                 let text = describe_error(&error);
                 tracing::error!("WGPU error outside any error scope: {text}");
                 *lock(&reason) = Some(text);
@@ -430,15 +429,15 @@ impl WgpuEngine {
                 .device
                 .create_pipeline_layout(&PipelineLayoutDescriptor {
                     label: Some("gemm_pipeline_layout"),
-                    bind_group_layouts: &[&self.gemm_bind_group_layout],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(&self.gemm_bind_group_layout)],
+                    immediate_size: 0,
                 });
             self.device
                 .create_compute_pipeline(&ComputePipelineDescriptor {
                     label: Some("gemm_compute_pipeline"),
                     layout: Some(&layout),
                     module: &shader,
-                    entry_point: "main",
+                    entry_point: Some("main"),
                     compilation_options: PipelineCompilationOptions::default(),
                     cache: None,
                 })
@@ -630,7 +629,9 @@ impl WgpuEngine {
 
         let mut matrix_c = vec![0.0f32; num_elements];
         {
-            let view = staging_buf.slice(..).get_mapped_range();
+            let view = staging_buf.slice(..).get_mapped_range().map_err(|err| {
+                GpuError::Device(format!("reading mapped result buffer failed: {err}"))
+            })?;
             let target_bytes = bytemuck::cast_slice_mut(&mut matrix_c[..]);
             target_bytes.copy_from_slice(&view[..target_bytes.len()]);
         }
@@ -670,7 +671,7 @@ impl WgpuEngine {
     }
 
     /// Polls the device until the staging buffer is mapped, the device is lost, or `control`
-    /// asks to stop. (`Maintain::Wait` would block with no way out if the driver hangs.)
+    /// asks to stop. (`PollType::Wait` would block with no way out if the driver hangs.)
     fn wait_for_map(
         &self,
         mapped: &std::sync::mpsc::Receiver<Result<(), BufferAsyncError>>,
@@ -678,7 +679,9 @@ impl WgpuEngine {
     ) -> Result<(), GpuError> {
         let mut polls = 0u32;
         loop {
-            self.device.poll(Maintain::Poll);
+            if let Err(err) = self.device.poll(PollType::Poll) {
+                return Err(GpuError::Device(format!("wgpu poll failed: {err}")));
+            }
             match mapped.try_recv() {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => {
@@ -846,12 +849,7 @@ mod tests {
     fn info(device_type: DeviceType, backend: Backend) -> AdapterInfo {
         AdapterInfo {
             name: "test".into(),
-            vendor: 0,
-            device: 0,
-            device_type,
-            driver: String::new(),
-            driver_info: String::new(),
-            backend,
+            ..AdapterInfo::new(device_type, backend)
         }
     }
 
