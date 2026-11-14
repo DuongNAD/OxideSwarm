@@ -30,9 +30,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 7;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 8;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 7;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 8;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -2094,6 +2094,44 @@ pub enum ClientMessage {
     /// Requests the Master's workspace affinity map, answered by `ClientResponse::Workspaces`.
     /// Appended last so existing variant indices do not move.
     ListWorkspaces,
+    /// Requests enrolment of this node's static key on a v3 `enroll` connection (design 0051 D4).
+    Enroll {
+        invite_id: String,
+        proof: crate::noise_auth::RedactedBytes32,
+        name: String,
+        os: String,
+        arch: String,
+    },
+    /// Creates a new enrollment invite (design 0051 D3; requires `admin` role).
+    CreateInvite {
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_in_secs: u64,
+        require_approval: bool,
+    },
+    /// Lists invites on the Master (design 0051 D3; requires `admin` role).
+    ListInvites,
+    /// Revokes an invite by ID or prefix (design 0051 D3; requires `admin` role).
+    RevokeInvite { invite_id: String },
+    /// Lists enrolled members (design 0051 D5; requires `admin` role).
+    ListMembers,
+    /// Lists pending enrollment requests (design 0051 D5; requires `admin` role).
+    ListPendingEnrollments,
+    /// Approves a pending enrollment request after verifying the 6-digit pairing check
+    /// (design 0051 D4/D5; requires `admin` role).
+    ApproveEnrollment {
+        pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
+    },
+    /// Rejects a pending enrollment request (design 0051 D4/D5; requires `admin` role).
+    RejectEnrollment { pending_id: String },
+    /// Revokes an enrolled member by ID, prefix, or name (design 0051 D5; requires `admin` role).
+    RevokeMember { target: String },
+    /// Renames an enrolled member by ID, prefix, or name (design 0051 D5; requires `admin` role).
+    RenameMember { target: String, new_name: String },
+    /// Releases a non-live `worker_id` claim so an enrolled member can register with that ID
+    /// (design 0051 D5/D6; requires `admin` role).
+    ReleaseWorkerId { worker_id: Uuid },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2148,6 +2186,67 @@ enum HumanClientMessage {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    Enroll {
+        invite_id: String,
+        proof: crate::noise_auth::RedactedBytes32,
+        name: String,
+        os: String,
+        arch: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    CreateInvite {
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_in_secs: u64,
+        require_approval: bool,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ListInvites {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    RevokeInvite {
+        invite_id: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ListMembers {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ListPendingEnrollments {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ApproveEnrollment {
+        pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    RejectEnrollment {
+        pending_id: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    RevokeMember {
+        target: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    RenameMember {
+        target: String,
+        new_name: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ReleaseWorkerId {
+        worker_id: Uuid,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2188,6 +2287,56 @@ enum BinaryClientMessage {
         protocol_version: u32,
     },
     ListWorkspaces {
+        protocol_version: u32,
+    },
+    Enroll {
+        invite_id: String,
+        proof: crate::noise_auth::RedactedBytes32,
+        name: String,
+        os: String,
+        arch: String,
+        protocol_version: u32,
+    },
+    CreateInvite {
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_in_secs: u64,
+        require_approval: bool,
+        protocol_version: u32,
+    },
+    ListInvites {
+        protocol_version: u32,
+    },
+    RevokeInvite {
+        invite_id: String,
+        protocol_version: u32,
+    },
+    ListMembers {
+        protocol_version: u32,
+    },
+    ListPendingEnrollments {
+        protocol_version: u32,
+    },
+    ApproveEnrollment {
+        pending_id: String,
+        pairing_code: crate::noise_auth::RedactedString,
+        protocol_version: u32,
+    },
+    RejectEnrollment {
+        pending_id: String,
+        protocol_version: u32,
+    },
+    RevokeMember {
+        target: String,
+        protocol_version: u32,
+    },
+    RenameMember {
+        target: String,
+        new_name: String,
+        protocol_version: u32,
+    },
+    ReleaseWorkerId {
+        worker_id: Uuid,
         protocol_version: u32,
     },
 }
@@ -2287,6 +2436,68 @@ impl HumanClientMessage {
             ClientMessage::ListWorkspaces => {
                 HumanClientMessage::ListWorkspaces { protocol_version }
             }
+            ClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+            } => HumanClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+                protocol_version,
+            },
+            ClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+            } => HumanClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+                protocol_version,
+            },
+            ClientMessage::ListInvites => HumanClientMessage::ListInvites { protocol_version },
+            ClientMessage::RevokeInvite { invite_id } => HumanClientMessage::RevokeInvite {
+                invite_id,
+                protocol_version,
+            },
+            ClientMessage::ListMembers => HumanClientMessage::ListMembers { protocol_version },
+            ClientMessage::ListPendingEnrollments => {
+                HumanClientMessage::ListPendingEnrollments { protocol_version }
+            }
+            ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            } => HumanClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                protocol_version,
+            },
+            ClientMessage::RejectEnrollment { pending_id } => {
+                HumanClientMessage::RejectEnrollment {
+                    pending_id,
+                    protocol_version,
+                }
+            }
+            ClientMessage::RevokeMember { target } => HumanClientMessage::RevokeMember {
+                target,
+                protocol_version,
+            },
+            ClientMessage::RenameMember { target, new_name } => HumanClientMessage::RenameMember {
+                target,
+                new_name,
+                protocol_version,
+            },
+            ClientMessage::ReleaseWorkerId { worker_id } => HumanClientMessage::ReleaseWorkerId {
+                worker_id,
+                protocol_version,
+            },
         }
     }
 
@@ -2313,7 +2524,34 @@ impl HumanClientMessage {
                 protocol_version, ..
             }
             | Self::Hello { protocol_version }
-            | Self::ListWorkspaces { protocol_version } => *protocol_version,
+            | Self::ListWorkspaces { protocol_version }
+            | Self::Enroll {
+                protocol_version, ..
+            }
+            | Self::CreateInvite {
+                protocol_version, ..
+            }
+            | Self::ListInvites { protocol_version }
+            | Self::RevokeInvite {
+                protocol_version, ..
+            }
+            | Self::ListMembers { protocol_version }
+            | Self::ListPendingEnrollments { protocol_version }
+            | Self::ApproveEnrollment {
+                protocol_version, ..
+            }
+            | Self::RejectEnrollment {
+                protocol_version, ..
+            }
+            | Self::RevokeMember {
+                protocol_version, ..
+            }
+            | Self::RenameMember {
+                protocol_version, ..
+            }
+            | Self::ReleaseWorkerId {
+                protocol_version, ..
+            } => *protocol_version,
         }
     }
 }
@@ -2352,6 +2590,68 @@ impl BinaryClientMessage {
             ClientMessage::ListWorkspaces => {
                 BinaryClientMessage::ListWorkspaces { protocol_version }
             }
+            ClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+            } => BinaryClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+                protocol_version,
+            },
+            ClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+            } => BinaryClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+                protocol_version,
+            },
+            ClientMessage::ListInvites => BinaryClientMessage::ListInvites { protocol_version },
+            ClientMessage::RevokeInvite { invite_id } => BinaryClientMessage::RevokeInvite {
+                invite_id,
+                protocol_version,
+            },
+            ClientMessage::ListMembers => BinaryClientMessage::ListMembers { protocol_version },
+            ClientMessage::ListPendingEnrollments => {
+                BinaryClientMessage::ListPendingEnrollments { protocol_version }
+            }
+            ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            } => BinaryClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                protocol_version,
+            },
+            ClientMessage::RejectEnrollment { pending_id } => {
+                BinaryClientMessage::RejectEnrollment {
+                    pending_id,
+                    protocol_version,
+                }
+            }
+            ClientMessage::RevokeMember { target } => BinaryClientMessage::RevokeMember {
+                target,
+                protocol_version,
+            },
+            ClientMessage::RenameMember { target, new_name } => BinaryClientMessage::RenameMember {
+                target,
+                new_name,
+                protocol_version,
+            },
+            ClientMessage::ReleaseWorkerId { worker_id } => BinaryClientMessage::ReleaseWorkerId {
+                worker_id,
+                protocol_version,
+            },
         }
     }
 
@@ -2378,7 +2678,34 @@ impl BinaryClientMessage {
                 protocol_version, ..
             }
             | Self::Hello { protocol_version }
-            | Self::ListWorkspaces { protocol_version } => *protocol_version,
+            | Self::ListWorkspaces { protocol_version }
+            | Self::Enroll {
+                protocol_version, ..
+            }
+            | Self::CreateInvite {
+                protocol_version, ..
+            }
+            | Self::ListInvites { protocol_version }
+            | Self::RevokeInvite {
+                protocol_version, ..
+            }
+            | Self::ListMembers { protocol_version }
+            | Self::ListPendingEnrollments { protocol_version }
+            | Self::ApproveEnrollment {
+                protocol_version, ..
+            }
+            | Self::RejectEnrollment {
+                protocol_version, ..
+            }
+            | Self::RevokeMember {
+                protocol_version, ..
+            }
+            | Self::RenameMember {
+                protocol_version, ..
+            }
+            | Self::ReleaseWorkerId {
+                protocol_version, ..
+            } => *protocol_version,
         }
     }
 }
@@ -2412,6 +2739,60 @@ impl From<HumanClientMessage> for ClientMessage {
             }
             HumanClientMessage::Hello { .. } => ClientMessage::Hello,
             HumanClientMessage::ListWorkspaces { .. } => ClientMessage::ListWorkspaces,
+            HumanClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+                ..
+            } => ClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+            },
+            HumanClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+                ..
+            } => ClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+            },
+            HumanClientMessage::ListInvites { .. } => ClientMessage::ListInvites,
+            HumanClientMessage::RevokeInvite { invite_id, .. } => {
+                ClientMessage::RevokeInvite { invite_id }
+            }
+            HumanClientMessage::ListMembers { .. } => ClientMessage::ListMembers,
+            HumanClientMessage::ListPendingEnrollments { .. } => {
+                ClientMessage::ListPendingEnrollments
+            }
+            HumanClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                ..
+            } => ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            },
+            HumanClientMessage::RejectEnrollment { pending_id, .. } => {
+                ClientMessage::RejectEnrollment { pending_id }
+            }
+            HumanClientMessage::RevokeMember { target, .. } => {
+                ClientMessage::RevokeMember { target }
+            }
+            HumanClientMessage::RenameMember {
+                target, new_name, ..
+            } => ClientMessage::RenameMember { target, new_name },
+            HumanClientMessage::ReleaseWorkerId { worker_id, .. } => {
+                ClientMessage::ReleaseWorkerId { worker_id }
+            }
         }
     }
 }
@@ -2447,6 +2828,60 @@ impl From<BinaryClientMessage> for ClientMessage {
             }
             BinaryClientMessage::Hello { .. } => ClientMessage::Hello,
             BinaryClientMessage::ListWorkspaces { .. } => ClientMessage::ListWorkspaces,
+            BinaryClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+                ..
+            } => ClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+            },
+            BinaryClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+                ..
+            } => ClientMessage::CreateInvite {
+                roles,
+                max_uses,
+                expires_in_secs,
+                require_approval,
+            },
+            BinaryClientMessage::ListInvites { .. } => ClientMessage::ListInvites,
+            BinaryClientMessage::RevokeInvite { invite_id, .. } => {
+                ClientMessage::RevokeInvite { invite_id }
+            }
+            BinaryClientMessage::ListMembers { .. } => ClientMessage::ListMembers,
+            BinaryClientMessage::ListPendingEnrollments { .. } => {
+                ClientMessage::ListPendingEnrollments
+            }
+            BinaryClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+                ..
+            } => ClientMessage::ApproveEnrollment {
+                pending_id,
+                pairing_code,
+            },
+            BinaryClientMessage::RejectEnrollment { pending_id, .. } => {
+                ClientMessage::RejectEnrollment { pending_id }
+            }
+            BinaryClientMessage::RevokeMember { target, .. } => {
+                ClientMessage::RevokeMember { target }
+            }
+            BinaryClientMessage::RenameMember {
+                target, new_name, ..
+            } => ClientMessage::RenameMember { target, new_name },
+            BinaryClientMessage::ReleaseWorkerId { worker_id, .. } => {
+                ClientMessage::ReleaseWorkerId { worker_id }
+            }
         }
     }
 }
@@ -2530,6 +2965,73 @@ pub enum ClientResponse {
     /// do not move.
     Workspaces {
         workspaces: Vec<WorkspaceAffinity>,
+    },
+    /// Enrollment request queued for owner approval (`oxideswarm members approve <pending_id>`).
+    EnrollPending {
+        pending_id: String,
+    },
+    /// Keepalive sent on a pending enrollment connection while waiting for approval.
+    EnrollKeepalive,
+    /// Enrollment succeeded; the machine's `node.key` is now in `members.json`.
+    Enrolled {
+        member_id: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+    },
+    /// Enrollment was refused (invalid/expired/exhausted/revoked invite, bad proof, or rejected).
+    EnrollRejected {
+        message: String,
+    },
+    /// Answer to `ClientMessage::CreateInvite`.
+    InviteCreated {
+        invite_id: String,
+        invite_secret: crate::noise_auth::RedactedBytes32,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_at: u64,
+        require_approval: bool,
+        master_key: crate::noise_auth::PublicKey,
+        p2p_ticket: Option<String>,
+    },
+    /// Answer to `ClientMessage::ListInvites`.
+    InvitesList {
+        invites: Vec<crate::noise_auth::InviteSummary>,
+    },
+    /// Answer to `ClientMessage::RevokeInvite`.
+    InviteRevoked {
+        invite_id: String,
+    },
+    /// Answer to `ClientMessage::ListMembers`.
+    MembersList {
+        members: Vec<crate::noise_auth::MemberEntry>,
+    },
+    /// Answer to `ClientMessage::ListPendingEnrollments`.
+    PendingEnrollmentsList {
+        pending: Vec<crate::noise_auth::PendingEnrollmentInfo>,
+    },
+    /// Answer to `ClientMessage::ApproveEnrollment`.
+    EnrollmentApproved {
+        pending_id: String,
+        member_id: String,
+        name: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+    },
+    /// Answer to `ClientMessage::RejectEnrollment`.
+    EnrollmentRejected {
+        pending_id: String,
+    },
+    /// Answer to `ClientMessage::RevokeMember`.
+    MemberRevoked {
+        member_id: String,
+        disconnected_sessions: usize,
+    },
+    /// Answer to `ClientMessage::RenameMember`.
+    MemberRenamed {
+        member_id: String,
+        name: String,
+    },
+    /// Answer to `ClientMessage::ReleaseWorkerId`.
+    WorkerIdReleased {
+        worker_id: Uuid,
     },
 }
 
@@ -2615,6 +3117,88 @@ enum HumanClientResponse {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    EnrollPending {
+        pending_id: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    EnrollKeepalive {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    Enrolled {
+        member_id: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    EnrollRejected {
+        message: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    InviteCreated {
+        invite_id: String,
+        invite_secret: crate::noise_auth::RedactedBytes32,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_at: u64,
+        require_approval: bool,
+        master_key: crate::noise_auth::PublicKey,
+        p2p_ticket: Option<String>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    InvitesList {
+        invites: Vec<crate::noise_auth::InviteSummary>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    InviteRevoked {
+        invite_id: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MembersList {
+        members: Vec<crate::noise_auth::MemberEntry>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    PendingEnrollmentsList {
+        pending: Vec<crate::noise_auth::PendingEnrollmentInfo>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    EnrollmentApproved {
+        pending_id: String,
+        member_id: String,
+        name: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    EnrollmentRejected {
+        pending_id: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MemberRevoked {
+        member_id: String,
+        disconnected_sessions: usize,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MemberRenamed {
+        member_id: String,
+        name: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    WorkerIdReleased {
+        worker_id: Uuid,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2681,6 +3265,74 @@ enum BinaryClientResponse {
     },
     Workspaces {
         workspaces: Vec<WorkspaceAffinity>,
+        protocol_version: u32,
+    },
+    EnrollPending {
+        pending_id: String,
+        protocol_version: u32,
+    },
+    EnrollKeepalive {
+        protocol_version: u32,
+    },
+    Enrolled {
+        member_id: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        protocol_version: u32,
+    },
+    EnrollRejected {
+        message: String,
+        protocol_version: u32,
+    },
+    InviteCreated {
+        invite_id: String,
+        invite_secret: crate::noise_auth::RedactedBytes32,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        max_uses: u32,
+        expires_at: u64,
+        require_approval: bool,
+        master_key: crate::noise_auth::PublicKey,
+        p2p_ticket: Option<String>,
+        protocol_version: u32,
+    },
+    InvitesList {
+        invites: Vec<crate::noise_auth::InviteSummary>,
+        protocol_version: u32,
+    },
+    InviteRevoked {
+        invite_id: String,
+        protocol_version: u32,
+    },
+    MembersList {
+        members: Vec<crate::noise_auth::MemberEntry>,
+        protocol_version: u32,
+    },
+    PendingEnrollmentsList {
+        pending: Vec<crate::noise_auth::PendingEnrollmentInfo>,
+        protocol_version: u32,
+    },
+    EnrollmentApproved {
+        pending_id: String,
+        member_id: String,
+        name: String,
+        roles: Vec<crate::noise_auth::MemberRole>,
+        protocol_version: u32,
+    },
+    EnrollmentRejected {
+        pending_id: String,
+        protocol_version: u32,
+    },
+    MemberRevoked {
+        member_id: String,
+        disconnected_sessions: usize,
+        protocol_version: u32,
+    },
+    MemberRenamed {
+        member_id: String,
+        name: String,
+        protocol_version: u32,
+    },
+    WorkerIdReleased {
+        worker_id: Uuid,
         protocol_version: u32,
     },
 }
@@ -2867,6 +3519,99 @@ impl HumanClientResponse {
                 workspaces,
                 protocol_version,
             },
+            ClientResponse::EnrollPending { pending_id } => HumanClientResponse::EnrollPending {
+                pending_id,
+                protocol_version,
+            },
+            ClientResponse::EnrollKeepalive => {
+                HumanClientResponse::EnrollKeepalive { protocol_version }
+            }
+            ClientResponse::Enrolled { member_id, roles } => HumanClientResponse::Enrolled {
+                member_id,
+                roles,
+                protocol_version,
+            },
+            ClientResponse::EnrollRejected { message } => HumanClientResponse::EnrollRejected {
+                message,
+                protocol_version,
+            },
+            ClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+            } => HumanClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+                protocol_version,
+            },
+            ClientResponse::InvitesList { invites } => HumanClientResponse::InvitesList {
+                invites,
+                protocol_version,
+            },
+            ClientResponse::InviteRevoked { invite_id } => HumanClientResponse::InviteRevoked {
+                invite_id,
+                protocol_version,
+            },
+            ClientResponse::MembersList { members } => HumanClientResponse::MembersList {
+                members,
+                protocol_version,
+            },
+            ClientResponse::PendingEnrollmentsList { pending } => {
+                HumanClientResponse::PendingEnrollmentsList {
+                    pending,
+                    protocol_version,
+                }
+            }
+            ClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+            } => HumanClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+                protocol_version,
+            },
+            ClientResponse::EnrollmentRejected { pending_id } => {
+                HumanClientResponse::EnrollmentRejected {
+                    pending_id,
+                    protocol_version,
+                }
+            }
+            ClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+            } => HumanClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+                protocol_version,
+            },
+            ClientResponse::MemberRenamed { member_id, name } => {
+                HumanClientResponse::MemberRenamed {
+                    member_id,
+                    name,
+                    protocol_version,
+                }
+            }
+            ClientResponse::WorkerIdReleased { worker_id } => {
+                HumanClientResponse::WorkerIdReleased {
+                    worker_id,
+                    protocol_version,
+                }
+            }
         }
     }
 
@@ -2906,6 +3651,46 @@ impl HumanClientResponse {
                 protocol_version, ..
             }
             | Self::Workspaces {
+                protocol_version, ..
+            }
+            | Self::EnrollPending {
+                protocol_version, ..
+            }
+            | Self::EnrollKeepalive { protocol_version }
+            | Self::Enrolled {
+                protocol_version, ..
+            }
+            | Self::EnrollRejected {
+                protocol_version, ..
+            }
+            | Self::InviteCreated {
+                protocol_version, ..
+            }
+            | Self::InvitesList {
+                protocol_version, ..
+            }
+            | Self::InviteRevoked {
+                protocol_version, ..
+            }
+            | Self::MembersList {
+                protocol_version, ..
+            }
+            | Self::PendingEnrollmentsList {
+                protocol_version, ..
+            }
+            | Self::EnrollmentApproved {
+                protocol_version, ..
+            }
+            | Self::EnrollmentRejected {
+                protocol_version, ..
+            }
+            | Self::MemberRevoked {
+                protocol_version, ..
+            }
+            | Self::MemberRenamed {
+                protocol_version, ..
+            }
+            | Self::WorkerIdReleased {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -3007,6 +3792,99 @@ impl BinaryClientResponse {
                 workspaces,
                 protocol_version,
             },
+            ClientResponse::EnrollPending { pending_id } => BinaryClientResponse::EnrollPending {
+                pending_id,
+                protocol_version,
+            },
+            ClientResponse::EnrollKeepalive => {
+                BinaryClientResponse::EnrollKeepalive { protocol_version }
+            }
+            ClientResponse::Enrolled { member_id, roles } => BinaryClientResponse::Enrolled {
+                member_id,
+                roles,
+                protocol_version,
+            },
+            ClientResponse::EnrollRejected { message } => BinaryClientResponse::EnrollRejected {
+                message,
+                protocol_version,
+            },
+            ClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+            } => BinaryClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+                protocol_version,
+            },
+            ClientResponse::InvitesList { invites } => BinaryClientResponse::InvitesList {
+                invites,
+                protocol_version,
+            },
+            ClientResponse::InviteRevoked { invite_id } => BinaryClientResponse::InviteRevoked {
+                invite_id,
+                protocol_version,
+            },
+            ClientResponse::MembersList { members } => BinaryClientResponse::MembersList {
+                members,
+                protocol_version,
+            },
+            ClientResponse::PendingEnrollmentsList { pending } => {
+                BinaryClientResponse::PendingEnrollmentsList {
+                    pending,
+                    protocol_version,
+                }
+            }
+            ClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+            } => BinaryClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+                protocol_version,
+            },
+            ClientResponse::EnrollmentRejected { pending_id } => {
+                BinaryClientResponse::EnrollmentRejected {
+                    pending_id,
+                    protocol_version,
+                }
+            }
+            ClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+            } => BinaryClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+                protocol_version,
+            },
+            ClientResponse::MemberRenamed { member_id, name } => {
+                BinaryClientResponse::MemberRenamed {
+                    member_id,
+                    name,
+                    protocol_version,
+                }
+            }
+            ClientResponse::WorkerIdReleased { worker_id } => {
+                BinaryClientResponse::WorkerIdReleased {
+                    worker_id,
+                    protocol_version,
+                }
+            }
         }
     }
 
@@ -3046,6 +3924,46 @@ impl BinaryClientResponse {
                 protocol_version, ..
             }
             | Self::Workspaces {
+                protocol_version, ..
+            }
+            | Self::EnrollPending {
+                protocol_version, ..
+            }
+            | Self::EnrollKeepalive { protocol_version }
+            | Self::Enrolled {
+                protocol_version, ..
+            }
+            | Self::EnrollRejected {
+                protocol_version, ..
+            }
+            | Self::InviteCreated {
+                protocol_version, ..
+            }
+            | Self::InvitesList {
+                protocol_version, ..
+            }
+            | Self::InviteRevoked {
+                protocol_version, ..
+            }
+            | Self::MembersList {
+                protocol_version, ..
+            }
+            | Self::PendingEnrollmentsList {
+                protocol_version, ..
+            }
+            | Self::EnrollmentApproved {
+                protocol_version, ..
+            }
+            | Self::EnrollmentRejected {
+                protocol_version, ..
+            }
+            | Self::MemberRevoked {
+                protocol_version, ..
+            }
+            | Self::MemberRenamed {
+                protocol_version, ..
+            }
+            | Self::WorkerIdReleased {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -3130,6 +4048,77 @@ impl From<HumanClientResponse> for ClientResponse {
             HumanClientResponse::Workspaces { workspaces, .. } => {
                 ClientResponse::Workspaces { workspaces }
             }
+            HumanClientResponse::EnrollPending { pending_id, .. } => {
+                ClientResponse::EnrollPending { pending_id }
+            }
+            HumanClientResponse::EnrollKeepalive { .. } => ClientResponse::EnrollKeepalive,
+            HumanClientResponse::Enrolled {
+                member_id, roles, ..
+            } => ClientResponse::Enrolled { member_id, roles },
+            HumanClientResponse::EnrollRejected { message, .. } => {
+                ClientResponse::EnrollRejected { message }
+            }
+            HumanClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+                ..
+            } => ClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+            },
+            HumanClientResponse::InvitesList { invites, .. } => {
+                ClientResponse::InvitesList { invites }
+            }
+            HumanClientResponse::InviteRevoked { invite_id, .. } => {
+                ClientResponse::InviteRevoked { invite_id }
+            }
+            HumanClientResponse::MembersList { members, .. } => {
+                ClientResponse::MembersList { members }
+            }
+            HumanClientResponse::PendingEnrollmentsList { pending, .. } => {
+                ClientResponse::PendingEnrollmentsList { pending }
+            }
+            HumanClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+                ..
+            } => ClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+            },
+            HumanClientResponse::EnrollmentRejected { pending_id, .. } => {
+                ClientResponse::EnrollmentRejected { pending_id }
+            }
+            HumanClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+                ..
+            } => ClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+            },
+            HumanClientResponse::MemberRenamed {
+                member_id, name, ..
+            } => ClientResponse::MemberRenamed { member_id, name },
+            HumanClientResponse::WorkerIdReleased { worker_id, .. } => {
+                ClientResponse::WorkerIdReleased { worker_id }
+            }
         }
     }
 }
@@ -3207,6 +4196,77 @@ impl From<BinaryClientResponse> for ClientResponse {
             },
             BinaryClientResponse::Workspaces { workspaces, .. } => {
                 ClientResponse::Workspaces { workspaces }
+            }
+            BinaryClientResponse::EnrollPending { pending_id, .. } => {
+                ClientResponse::EnrollPending { pending_id }
+            }
+            BinaryClientResponse::EnrollKeepalive { .. } => ClientResponse::EnrollKeepalive,
+            BinaryClientResponse::Enrolled {
+                member_id, roles, ..
+            } => ClientResponse::Enrolled { member_id, roles },
+            BinaryClientResponse::EnrollRejected { message, .. } => {
+                ClientResponse::EnrollRejected { message }
+            }
+            BinaryClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+                ..
+            } => ClientResponse::InviteCreated {
+                invite_id,
+                invite_secret,
+                roles,
+                max_uses,
+                expires_at,
+                require_approval,
+                master_key,
+                p2p_ticket,
+            },
+            BinaryClientResponse::InvitesList { invites, .. } => {
+                ClientResponse::InvitesList { invites }
+            }
+            BinaryClientResponse::InviteRevoked { invite_id, .. } => {
+                ClientResponse::InviteRevoked { invite_id }
+            }
+            BinaryClientResponse::MembersList { members, .. } => {
+                ClientResponse::MembersList { members }
+            }
+            BinaryClientResponse::PendingEnrollmentsList { pending, .. } => {
+                ClientResponse::PendingEnrollmentsList { pending }
+            }
+            BinaryClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+                ..
+            } => ClientResponse::EnrollmentApproved {
+                pending_id,
+                member_id,
+                name,
+                roles,
+            },
+            BinaryClientResponse::EnrollmentRejected { pending_id, .. } => {
+                ClientResponse::EnrollmentRejected { pending_id }
+            }
+            BinaryClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+                ..
+            } => ClientResponse::MemberRevoked {
+                member_id,
+                disconnected_sessions,
+            },
+            BinaryClientResponse::MemberRenamed {
+                member_id, name, ..
+            } => ClientResponse::MemberRenamed { member_id, name },
+            BinaryClientResponse::WorkerIdReleased { worker_id, .. } => {
+                ClientResponse::WorkerIdReleased { worker_id }
             }
         }
     }
@@ -5810,8 +6870,8 @@ mod tests {
 
     #[test]
     fn test_protocol_6_hello_round_trips_in_both_codecs_and_is_appended_last() {
-        assert_eq!(PROTOCOL_VERSION_CURRENT, 7);
-        assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 7);
+        assert_eq!(PROTOCOL_VERSION_CURRENT, 8);
+        assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 8);
         for codec in [WireCodec::Bincode, WireCodec::Json] {
             let raw = serialize_message(&ClientMessage::Hello, codec).unwrap();
             let (msg, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();

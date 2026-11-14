@@ -197,3 +197,8 @@ path = "../../tests/agent_workspace_e2e.rs"
 name = "enroll_v3_e2e"
 path = "../../tests/enroll_v3_e2e.rs"
 
+[[test]]
+name = "cli_enroll_e2e"
+path = "../../tests/cli_enroll_e2e.rs"
+
+
