@@ -127,11 +127,13 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `f486885` plus ENROLL-1b: 70 items Implemented, 5 Partial and 44 Planned. Five items
+On 2026-11-14, at `master` `0de63fc4` plus ENROLL-1b: 70 items Implemented, 5 Partial and 47 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
 One item (TEST-23) was added on 2026-11-11 from a CI failure on Windows.
+Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
+[design 0065](design/0065-large-transfer-and-long-run-tests.md).
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -169,6 +171,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Planned |  |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
+| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -824,6 +829,61 @@ The full suite must pass on a clean machine before CI can require it.
      at fault, follow rule 4: add a test that fails without the fix, then fix the product.
 - **Done when:** The cause is written in the status log, and the test passes 50 times in a row
   on Windows under CPU load. If production code changed, a regression test covers the cause.
+
+### TEST-24: Test large transfers between machines
+
+- **Evidence:** Read, on 2026-11-14 at `master` `f486885`. The largest file in the end-to-end
+  blob tests is 5 MiB plus 123 bytes (`tests/blob_transfer_e2e.rs:183`). The largest tree is
+  10,000 small files (`tests/blob_upload_pipelining_e2e.rs`). The defaults allow far more: the
+  master's blob store holds 4 GiB (`DEFAULT_BLOB_STORE_MAX_BYTES`), the worker cache 2 GiB
+  (`DEFAULT_BLOB_CACHE_MAX_BYTES`) and a task's outputs 1 GiB (`DEFAULT_OUTPUT_LIMIT_BYTES`).
+  From the code, a dropped upload starts again at offset 0 (`blob_store.rs`: `write_chunk`), and
+  one blob moves at most 4 MiB per round trip (`blob_transfer.rs`: `upload_blob`,
+  `download_blob`).
+- **Problem:** Nobody knows whether memory stays flat as a file grows, how long a large input
+  takes over LAN or a relay, or whether a slow TCP link can delay a heartbeat past the 10 s
+  timeout during a transfer. Design 0062 plans to move model weights of several GB.
+- **Do:** Follow D1 and D2 of [design 0065](design/0065-large-transfer-and-long-run-tests.md).
+  1. Add `benchmarks/endurance/endurance.py` with the subcommands `transfer`, `throttle` and
+     `sample`, standard library only, under the rules of `benchmarks/grid/bench_grid.py`: own
+     processes, private homes, stop by handle, no host names in records.
+  2. Run scenarios T1 to T9 on loopback, then on two machines over LAN TCP, LAN QUIC and a relay.
+     Use a master started for the run with a temporary home and its own ports, never the trial
+     cluster or `~/.oxideswarm`.
+  3. Add `tests/test_endurance_harness.py` (helpers without a binary) and run it in the CI job
+     `agent-bridge`.
+  4. For every failed check, open an item or write a failing regression test (rule 4).
+- **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
+  `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
+
+### TEST-25: Run a cluster for 24 hours under load and faults
+
+- **Evidence:** Read, on 2026-11-14 at `master` `f486885`. Every CI job has a timeout of at most
+  90 minutes (`.github/workflows/ci.yml`). The longest script outside CI, `bench_grid.py`, takes
+  about 10 minutes. No committed record measures the memory, handles or disk of a cluster over
+  hours.
+- **Problem:** A slow leak of memory, handles or disk, or a task lost after many restarts, shows up
+  only after hours. The USB kit runs workers for days on other people's machines.
+- **Do:** Follow D3 of [design 0065](design/0065-large-transfer-and-long-run-tests.md).
+  1. Add the subcommand `soak` to `benchmarks/endurance/endurance.py`, with a seeded load, the
+     faults of D3 (worker kill, master restart on its state directory, link cuts, bursts to the
+     queue cap) and a ledger of every task submitted.
+  2. Run it for 24 hours on a Mac master and two Windows workers, with temporary homes and their
+     own ports (Q57).
+- **Done when:** The 24-hour record is committed. It passes the checks of D3, or every failed
+  check has its own item or regression test.
+
+### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
+
+- **Evidence:** `.github/workflows/ci.yml` already runs the jobs `audit` and `p2p-wan-relay` on a
+  weekly schedule and on `workflow_dispatch`.
+- **Problem:** Without a scheduled run, a change can bring back a defect that TEST-24 or TEST-25
+  found, and nothing notices until the next full run.
+- **Do:** Add a job `endurance` on `ubuntu-latest` for `workflow_dispatch` and the weekly
+  schedule, never for pull requests. It runs T1 at 1 GiB, T2 at 20,000 files, T4, T6, T7 and T8 on
+  loopback and a soak of 45 minutes, and uploads the JSON record as an artifact. It is not a
+  required check.
+- **Done when:** The job is green on two scheduled runs.
 
 ## Phase 3: make the documents true
 
@@ -2478,6 +2538,10 @@ Add one dated line per finished item, newest last.
 - 2026-11-11: Added MAINT-1 (Planned): the six largest source files hold 6,184 to 8,639 lines each,
   about 40 % of it tests, and `cli_app.rs` changed 101 times in a month. The Index counts are now
   70 Implemented, 4 Partial and 45 Planned.
+- 2026-11-14: Added TEST-24, TEST-25 and TEST-26 (Planned) at the owner's request, from
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md): the end-to-end blob tests move
+  at most about 5 MiB per file, and no record measures a cluster over hours. Nothing is built.
+  The Index counts are now 70 Implemented, 4 Partial and 48 Planned.
 - 2026-11-14: ENROLL-1 is Partial: `ENROLL-1a` merged in pull request 190 (per-machine X25519 keys,
   OXS-AUTH v3 Noise `IK` handshake and `Split()` record layer, `members.json` loaded at startup,
   `--master-key`, `master --auth secret|members|both`, `tests/enroll_v3_e2e.rs`), and `ENROLL-1b` is
@@ -2487,4 +2551,4 @@ Add one dated line per finished item, newest last.
   `node.key` as `admin`, worker-id ownership per member, protocol version 8,
   `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live revocation across all lanes and task
   cancellation/requeue) and `ENROLL-1d` (dashboard members page and docs/guide) are Planned. The
-  Index counts are now 70 Implemented, 5 Partial and 44 Planned.
+  Index counts are now 70 Implemented, 5 Partial and 47 Planned.
