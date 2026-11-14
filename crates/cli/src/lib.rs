@@ -7,6 +7,7 @@ pub mod connect;
 pub mod doctor;
 pub mod join;
 pub mod mcp;
+pub mod members_cmd;
 pub mod mode_cli;
 pub mod secret_cmd;
 

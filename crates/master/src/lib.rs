@@ -12,6 +12,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod server;
 mod session;
+pub mod speed;
 pub mod store;
 #[cfg(feature = "dashboard")]
 pub mod web_ui;
@@ -46,6 +47,7 @@ pub use server::{
     write_port_file, MasterHandle, MasterServer, ServerConfig, WaiterMap,
     DEFAULT_SESSION_RESUME_HOLD, DEFAULT_SESSION_RESUME_HOLD_SECS,
 };
+pub use speed::{SpeedBook, SpeedEntry, TaskKey, EMA_WEIGHT, MAX_SPEED_KEYS, MAX_WORKERS_PER_KEY};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -27,7 +27,8 @@ use rusty_grid_core::noise_auth::{default_node_key_path, NodeKeypair, PublicKey,
 
 use crate::config::{resolve_bool, ConfigFile, SecretSection, SecretText};
 use crate::connect::{
-    cli_master_key_flag, master_requires_secret, set_default_client_v3_auth, AUTH_EXIT_CODE,
+    cli_master_key_flag, master_requires_secret, set_default_client_local_v3_fallback,
+    set_default_client_v3_auth, AUTH_EXIT_CODE,
 };
 
 /// The secret-related command line flags, as given.
@@ -146,25 +147,104 @@ impl SecretOpts {
         Ok(None)
     }
 
-    /// Resolves the OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for `section`:
-    /// when a `master_key` is configured, loads (or generates on first run) the private key at
-    /// `~/.oxideswarm/node.key`.
+    /// Resolves the explicit OXS-AUTH v3 credential pair `(node_key, pinned_master_key)` for
+    /// `section` when `--master-key`, `RUSTY_GRID_MASTER_KEY`, or config `master_key` is set,
+    /// loading (or generating on first run) the private key at `~/.oxideswarm/node.key`.
     pub fn resolve_v3_auth(
         &self,
         config: Option<&ConfigFile>,
         section: SecretSection,
     ) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
-        let Some(master_pub) = self.resolve_master_key(config, section)? else {
-            return Ok(None);
-        };
-        let Some(node_key_path) = default_node_key_path() else {
-            return Err(GridError::Config(
-                "cannot determine the home directory for ~/.oxideswarm/node.key".into(),
-            ));
-        };
-        let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
-        Ok(Some((node_key, master_pub)))
+        if let Some(master_pub) = self.resolve_master_key(config, section)? {
+            let Some(node_key_path) = default_node_key_path() else {
+                return Err(GridError::Config(
+                    "cannot determine the home directory for ~/.oxideswarm/node.key".into(),
+                ));
+            };
+            let (node_key, _) = NodeKeypair::load_or_generate_file(&node_key_path)?;
+            return Ok(Some((node_key, master_pub)));
+        }
+        Ok(None)
     }
+
+    /// Returns `true` when an explicit shared secret flag, environment variable, or config key
+    /// (tiers 1..5, excluding the default `~/.oxideswarm/cluster.secret` file) is configured.
+    pub fn has_explicit_secret(&self, config: Option<&ConfigFile>, section: SecretSection) -> bool {
+        self.value.is_some()
+            || self.file.is_some()
+            || std::env::var_os(ENV_SECRET).is_some()
+            || std::env::var_os(ENV_SECRET_FILE).is_some()
+            || config.is_some_and(|c| {
+                let (val, file) = c.secret_keys(section);
+                val.is_some() || file.is_some()
+            })
+    }
+}
+
+fn resolve_local_host_v3_auth(
+    config: Option<&ConfigFile>,
+) -> GridResult<Option<(NodeKeypair, PublicKey)>> {
+    if cfg!(test) && std::env::var_os("OXIDESWARM_HOME").is_none() {
+        return Ok(None);
+    }
+    if std::env::var("RUSTY_GRID_AUTH")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("secret"))
+    {
+        return Ok(None);
+    }
+    if config
+        .and_then(|c| c.master.as_ref())
+        .and_then(|m| m.auth.as_deref())
+        .is_some_and(|a| a.trim().eq_ignore_ascii_case("secret"))
+    {
+        return Ok(None);
+    }
+
+    let state_dir = std::env::var("RUSTY_GRID_STATE_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .and_then(|c| c.master.as_ref())
+                .and_then(|m| m.state_dir.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        });
+
+    let Some(node_key_path) = default_node_key_path() else {
+        return Ok(None);
+    };
+    let Some(master_key_path) =
+        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(members_path) =
+        rusty_grid_master::server::MemberStore::resolve_path(state_dir.as_deref())
+    else {
+        return Ok(None);
+    };
+    if !node_key_path.is_file() || !master_key_path.is_file() || !members_path.is_file() {
+        return Ok(None);
+    }
+
+    let Ok(node_key) = NodeKeypair::load_file(&node_key_path) else {
+        return Ok(None);
+    };
+    let Ok(master_key) = NodeKeypair::load_file(&master_key_path) else {
+        return Ok(None);
+    };
+    let Ok(store) = rusty_grid_master::server::MemberStore::load_file(&members_path) else {
+        return Ok(None);
+    };
+    if !store.contains(node_key.public_key()) {
+        return Ok(None);
+    }
+    Ok(Some((node_key, *master_key.public_key())))
 }
 
 fn config_key_error(key: &str, err: &GridError) -> GridError {
@@ -705,8 +785,16 @@ pub fn client_secret(
         eprintln!("{e}");
         ExitCode::FAILURE
     })?;
+    let local_v3_fallback = if v3_auth.is_none()
+        && !master_requires_secret(master_addr, false)
+        && !secret_opts.has_explicit_secret(config_file, section)
+    {
+        resolve_local_host_v3_auth(config_file).ok().flatten()
+    } else {
+        None
+    };
     match decide_peer_credential(
-        secret.is_some() || v3_auth.is_some(),
+        secret.is_some() || v3_auth.is_some() || local_v3_fallback.is_some(),
         master_addr,
         false,
         insecure,
@@ -714,6 +802,7 @@ pub fn client_secret(
     ) {
         Ok(outcome) => {
             set_default_client_v3_auth(v3_auth);
+            set_default_client_local_v3_fallback(local_v3_fallback);
             announce_peer_secret(outcome, PeerRole::Client, master_addr);
             Ok(secret)
         }

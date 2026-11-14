@@ -173,6 +173,12 @@ fn clean_token(text: &str) -> GridResult<String> {
                 .into(),
         ));
     }
+    if text.contains(['\n', '\r']) {
+        return Err(GridError::Config(
+            "the input contains multiple lines; pipe only the single-line join token or invite on standard input (the [y/N] confirmation is read from the terminal)"
+                .into(),
+        ));
+    }
     Ok(text)
 }
 
@@ -413,6 +419,18 @@ pub fn read_token_hidden() -> GridResult<String> {
         .lock()
         .take(MAX_TOKEN_BYTES + 1)
         .read_line(&mut line);
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::tcflush(0, libc::TCIFLUSH);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+        };
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let _ = FlushConsoleInputBuffer(handle);
+    }
     drop(guard);
     eprintln!();
     read.map_err(|e| GridError::Config(format!("cannot read the join token: {e}")))?;
@@ -471,6 +489,18 @@ pub fn plan_target(
     ticket: Option<&str>,
     path: &Path,
 ) -> GridResult<ConfigPlan> {
+    plan_target_with_master_key(existing, master, ticket, None, path)
+}
+
+/// Like [`plan_target`], and also sets `master_key` in `[worker]`, `[submit]`, and `[status]` when
+/// `master_key` is `Some` (used when joining with an `oxs1-invite:` token).
+pub fn plan_target_with_master_key(
+    existing: Option<&str>,
+    master: Option<&str>,
+    ticket: Option<&str>,
+    master_key: Option<&str>,
+    path: &Path,
+) -> GridResult<ConfigPlan> {
     let mut doc: toml_edit::DocumentMut = existing.unwrap_or("").parse().map_err(|e| {
         GridError::Config(format!(
             "config file '{}' is not valid TOML ({e}); fix or move it, then join again",
@@ -490,6 +520,21 @@ pub fn plan_target(
                 plan.conflicts.push(format!("[{name}].master"));
             }
             table["master"] = toml_edit::value(master);
+            plan.changes.push(format!("[{name}].master"));
+        }
+    } else if let (Some(t), Some(_)) = (ticket, master_key) {
+        // When an invite carries only a P2P ticket (no TCP master address), set `[submit].master`
+        // and `[status].master` to the ticket so client commands also reach the master over P2P.
+        for name in ["submit", "status"] {
+            let table = table_of(&mut doc, name, path)?;
+            let current = table.get("master").and_then(|v| v.as_str());
+            if current == Some(t) {
+                continue;
+            }
+            if table.contains_key("master") {
+                plan.conflicts.push(format!("[{name}].master"));
+            }
+            table["master"] = toml_edit::value(t);
             plan.changes.push(format!("[{name}].master"));
         }
     }
@@ -514,6 +559,20 @@ pub fn plan_target(
             plan.changes.push("[worker].p2p_ticket (removed)".into());
         }
         (None, _) => {}
+    }
+    if let Some(mk) = master_key {
+        for name in ["worker", "submit", "status"] {
+            let table = table_of(&mut doc, name, path)?;
+            let current = table.get("master_key").and_then(|v| v.as_str());
+            if current.is_some_and(|c| c.trim().eq_ignore_ascii_case(mk)) {
+                continue;
+            }
+            if table.contains_key("master_key") {
+                plan.conflicts.push(format!("[{name}].master_key"));
+            }
+            table["master_key"] = toml_edit::value(mk);
+            plan.changes.push(format!("[{name}].master_key"));
+        }
     }
     // An empty table that only this function created is not worth writing.
     for name in ["worker", "submit", "status"] {
@@ -804,7 +863,8 @@ pub async fn run_join(
         return ExitCode::FAILURE;
     }
     let stdin = std::io::stdin();
-    let read = if stdin.is_terminal() {
+    let stdin_is_terminal = stdin.is_terminal();
+    let read = if stdin_is_terminal {
         read_token_hidden()
     } else {
         read_token(stdin.lock())
@@ -816,6 +876,9 @@ pub async fn run_join(
             return ExitCode::FAILURE;
         }
     };
+    if text.starts_with(crate::members_cmd::INVITE_PREFIX) || text.starts_with("oxs1-invite") {
+        return run_join_invite(args, secret_opts, config, text, stdin_is_terminal).await;
+    }
     let token = match JoinToken::decode(&text) {
         Ok(token) => token,
         Err(e) => {
@@ -949,6 +1012,799 @@ pub async fn run_join(
     }
 }
 
+fn sanitize_machine_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !rusty_grid_core::noise_auth::is_control_or_format_char(*c) || *c == ' ')
+        .take(64)
+        .collect();
+    cleaned.trim().to_string()
+}
+
+fn default_machine_name() -> String {
+    std::env::var("RUSTY_GRID_WORKER_NAME")
+        .or_else(|_| std::env::var("RUSTY_GRID_NAME"))
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|s| sanitize_machine_name(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("node-{}", std::env::consts::OS))
+}
+
+async fn open_enroll_stream(
+    master: Option<&str>,
+    ticket: Option<&str>,
+) -> GridResult<rusty_grid_core::transport::GridStream> {
+    let relay_url = crate::connect::active_client_relay_url();
+
+    if let Some(m) = master {
+        match crate::connect::open_raw_master_stream(m, None, relay_url.as_deref()).await {
+            Ok((_label, stream, _via_p2p)) => return Ok(stream),
+            Err(e) if ticket.is_none() => return Err(e),
+            Err(_) => {
+                // Fall back to P2P ticket below when TCP connect fails and a ticket is present.
+            }
+        }
+    }
+
+    if let Some(t) = ticket {
+        let (_label, stream, _via_p2p) =
+            crate::connect::open_raw_master_stream(t, None, relay_url.as_deref()).await?;
+        return Ok(stream);
+    }
+
+    Err(GridError::Config(
+        "the invite has neither a reachable master address nor a P2P ticket".into(),
+    ))
+}
+
+fn parse_yes_no_confirmation(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+enum ConfirmationTerminal {
+    Stdin,
+    #[cfg(any(unix, windows))]
+    File(std::fs::File),
+}
+
+/// Opens the controlling terminal handle used for the `[y/N]` confirmation check *before*
+/// opening a network connection to the master so a non-interactive environment without a
+/// controlling terminal fails immediately without sending an enrollment request.
+fn open_confirmation_terminal(stdin_is_terminal: bool) -> GridResult<ConfirmationTerminal> {
+    if stdin_is_terminal {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let dup_fd = unsafe { libc::dup(0) };
+            if dup_fd >= 0 {
+                let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+                return Ok(ConfirmationTerminal::File(file));
+            }
+        }
+        return Ok(ConfirmationTerminal::Stdin);
+    }
+    #[cfg(unix)]
+    {
+        let tty = std::fs::File::open("/dev/tty").map_err(|e| {
+            GridError::Config(format!(
+                "cannot open /dev/tty to confirm the pairing code ({e}); run `oxideswarm join` from an interactive terminal"
+            ))
+        })?;
+        Ok(ConfirmationTerminal::File(tty))
+    }
+    #[cfg(windows)]
+    {
+        let con = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .map_err(|e| {
+                GridError::Config(format!(
+                    "cannot open CONIN$ to confirm the pairing code ({e}); run `oxideswarm join` from an interactive console"
+                ))
+            })?;
+        Ok(ConfirmationTerminal::File(con))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(GridError::Config(
+            "cannot open controlling terminal to confirm the pairing code".into(),
+        ))
+    }
+}
+
+/// Discards any pending input bytes sitting in the terminal input queue before displaying the
+/// `[y/N]` confirmation prompt (`Item 4`), so a multi-line paste at the token prompt
+/// (`<invite>\ny\n`) cannot auto-answer `[y/N]`.
+fn flush_confirmation_terminal(term: &ConfirmationTerminal) {
+    match term {
+        ConfirmationTerminal::Stdin => {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::tcflush(0, libc::TCIFLUSH);
+            }
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::System::Console::{
+                    FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+                };
+                let handle = GetStdHandle(STD_INPUT_HANDLE);
+                let _ = FlushConsoleInputBuffer(handle);
+            }
+        }
+        #[cfg(any(unix, windows))]
+        ConfirmationTerminal::File(file) => {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                unsafe {
+                    let _ = libc::tcflush(file.as_raw_fd(), libc::TCIFLUSH);
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+                unsafe {
+                    let _ = FlushConsoleInputBuffer(file.as_raw_handle());
+                }
+            }
+        }
+    }
+}
+
+/// Reads the joiner's `[y/N]` confirmation from the previously opened controlling terminal
+/// after the pairing code and master fingerprint have been printed.
+fn read_confirmation_from_terminal(term: ConfirmationTerminal) -> GridResult<bool> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    match term {
+        ConfirmationTerminal::Stdin => {
+            let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| {
+                GridError::Config(format!("cannot read confirmation from terminal: {e}"))
+            })?;
+            Ok(n > 0 && parse_yes_no_confirmation(&line))
+        }
+        #[cfg(any(unix, windows))]
+        ConfirmationTerminal::File(file) => {
+            let mut reader = std::io::BufReader::new(file);
+            let n = reader.read_line(&mut line).map_err(|e| {
+                GridError::Config(format!("cannot read confirmation from terminal: {e}"))
+            })?;
+            Ok(n > 0 && parse_yes_no_confirmation(&line))
+        }
+    }
+}
+
+/// Spawns a detached OS thread (not a `tokio::task::spawn_blocking` pool thread) to read the
+/// `[y/N]` confirmation over a `oneshot` channel so that if the master rejects or closes the
+/// enrollment connection, the process can return and exit immediately without hanging on `Enter`.
+fn spawn_confirmation_prompt(
+    term: ConfirmationTerminal,
+) -> tokio::sync::oneshot::Receiver<GridResult<bool>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_confirmation_from_terminal(term));
+    });
+    rx
+}
+
+async fn run_worker_member_readonly_check(
+    target: &str,
+    node_key: rusty_grid_core::noise_auth::NodeKeypair,
+    master_key: rusty_grid_core::noise_auth::PublicKey,
+    expect_workers: usize,
+) -> ExitCode {
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
+    crate::connect::with_client_v3_auth(Some((node_key, master_key)), async move {
+        let mut transport = match crate::connect::connect_master(target, None).await {
+            Ok(t) => t,
+            Err(e) => {
+                return crate::connect::report_master_failure(
+                    target,
+                    true,
+                    "Cluster check failed",
+                    &e,
+                );
+            }
+        };
+        if let Err(e) = transport.send_msg(&ClientMessage::ClusterStatus).await {
+            eprintln!("Cluster check failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        match transport.recv_msg::<ClientResponse>().await {
+            Ok(Some(ClientResponse::ClusterStatus { .. })) => {}
+            Ok(Some(ClientResponse::Error { message })) => {
+                eprintln!("Cluster check failed: {message}");
+                return ExitCode::FAILURE;
+            }
+            Ok(other) => {
+                eprintln!("Cluster check failed: unexpected reply {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("Cluster check failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Err(e) = transport.send_msg(&ClientMessage::ListWorkers).await {
+                eprintln!("Cluster check failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            match transport.recv_msg::<ClientResponse>().await {
+                Ok(Some(ClientResponse::WorkerList { workers })) => {
+                    if workers.len() >= expect_workers {
+                        println!(
+                            "Cluster check passed (connected as enrolled member; {} worker(s) online).",
+                            workers.len()
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "Cluster check failed: expected at least {expect_workers} worker(s), found {}",
+                            workers.len()
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+                Ok(Some(ClientResponse::Error { message })) => {
+                    eprintln!("Cluster check failed: {message}");
+                    return ExitCode::FAILURE;
+                }
+                Ok(other) => {
+                    eprintln!("Cluster check failed: unexpected reply {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("Cluster check failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+}
+
+async fn run_join_invite(
+    args: JoinArgs,
+    _secret_opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+    text: String,
+    stdin_is_terminal: bool,
+) -> ExitCode {
+    use rusty_grid_core::noise_auth::{
+        compute_enroll_proof, default_node_key_path, derive_pairing_code,
+        v3_client_handshake_with_hash, HandshakePurpose, MemberRole, NodeKeypair, ENV_MASTER_KEY,
+    };
+    use rusty_grid_core::protocol::{
+        ClientMessage, ClientResponse, EndpointRole, MessageTransport,
+    };
+    use std::io::Write;
+
+    let token = match crate::members_cmd::InviteToken::decode(&text) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(text);
+
+    if token.is_expired() {
+        eprintln!(
+            "the invite has expired; ask the cluster admin for a new `oxideswarm invite` (nothing was written)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let master_key_hex = token.master_key.to_hex();
+    if let Some(flag_mk) = crate::connect::cli_master_key_flag() {
+        if !flag_mk.trim().eq_ignore_ascii_case(&master_key_hex) {
+            eprintln!(
+                "the --master-key flag sets a different master public key and outranks the config file; remove it, then join again; nothing was changed."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Ok(env_mk) = std::env::var(ENV_MASTER_KEY) {
+        if !env_mk.trim().is_empty() && !env_mk.trim().eq_ignore_ascii_case(&master_key_hex) {
+            eprintln!(
+                "the {ENV_MASTER_KEY} environment variable sets a different master public key and outranks the config file; unset it, then join again; nothing was changed."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let Some(node_key_path) = default_node_key_path() else {
+        eprintln!("cannot determine the home directory for ~/.oxideswarm/node.key");
+        return ExitCode::FAILURE;
+    };
+    let config_path = default_oxideswarm_dir()
+        .map(|d| d.join(CONFIG_FILE_NAME))
+        .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME));
+    let master = token.master.as_deref().map(normalize_master_addr);
+
+    // Plan the config edit before network or disk writes so a conflict leaves the machine untouched.
+    let existing = match read_config_for_plan(&config_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plan = match plan_target_with_master_key(
+        existing.as_deref(),
+        master.as_deref(),
+        token.ticket.as_deref(),
+        Some(&master_key_hex),
+        &config_path,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !plan.conflicts.is_empty() && !args.replace_master {
+        eprintln!(
+            "{} already names a different master, P2P ticket or master_key (keys: {}). Joining would point this machine at another cluster. If that is what you want, run `oxideswarm join --replace-master`; a backup of the file is kept.",
+            config_path.display(),
+            plan.conflicts.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Load an existing node.key if present, or generate one in memory (never written to disk
+    // until both master approval and user confirmation succeed).
+    let (node_key, node_key_is_new) = if node_key_path.exists() {
+        match NodeKeypair::load_file(&node_key_path) {
+            Ok(kp) => (kp, false),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match NodeKeypair::generate() {
+            Ok(kp) => (kp, true),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let codec = match crate::connect::resolve_client_wire_codec() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Open the controlling terminal for `[y/N]` confirmation BEFORE connecting to the master so a
+    // headless invocation without `/dev/tty` or `CONIN$` fails without touching the master.
+    let mut confirm_term = match open_confirmation_terminal(stdin_is_terminal) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let fp = token.master_key.fingerprint();
+
+    // `--no-approval` invite: prompt `[y/N]` on the pinned master key fingerprint BEFORE opening
+    // any connection to the master. The fingerprint comes from the `master_key` in the invite and
+    // the Noise IK handshake proves that exact static key, so prompting first needs nothing from
+    // the session, keeps the 5 s handshake watchdog intact without pre-auth waiter slots, and
+    // omits the pairing code nobody compares.
+    if !token.require_approval {
+        let term = confirm_term
+            .take()
+            .expect("confirm_term available for --no-approval invite");
+        flush_confirmation_terminal(&term);
+        println!("Master key fingerprint: {fp}");
+        println!(
+            "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
+        );
+        print!(
+            "Confirm that this master key fingerprint ({fp}) matches the cluster you intend to join [y/N]: "
+        );
+        let _ = std::io::stdout().flush();
+
+        let confirm_rx = spawn_confirmation_prompt(term);
+        match confirm_rx.await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) | Err(_) => {
+                eprintln!("Confirmation declined; nothing was written.");
+                return ExitCode::FAILURE;
+            }
+            Ok(Err(e)) => {
+                eprintln!("{e}; nothing was written.");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let stream = match open_enroll_stream(master.as_deref(), token.ticket.as_deref()).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut transport = MessageTransport::with_codec(stream, codec);
+    let hs_res = tokio::time::timeout(
+        crate::connect::AUTH_TIMEOUT,
+        v3_client_handshake_with_hash(
+            &mut transport,
+            &node_key,
+            &token.master_key,
+            HandshakePurpose::Enroll,
+        ),
+    )
+    .await;
+    let (session_key, handshake_hash) = match hs_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            eprintln!("Enrollment handshake failed: {e}");
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+        Err(_) => {
+            eprintln!(
+                "Enrollment handshake timed out after {}s",
+                crate::connect::AUTH_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    transport.enable_encryption(&session_key, EndpointRole::Client);
+
+    let proof = compute_enroll_proof(token.invite_secret.as_bytes(), &handshake_hash);
+    let machine_name = config
+        .and_then(|c| c.worker.as_ref())
+        .and_then(|w| w.name.as_deref())
+        .map(sanitize_machine_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_machine_name);
+
+    if let Err(e) = transport
+        .send_msg(&ClientMessage::Enroll {
+            invite_id: token.invite_id.clone(),
+            proof,
+            name: machine_name,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        })
+        .await
+    {
+        eprintln!("Failed to send enrollment request: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let first_reply = match tokio::time::timeout(
+        crate::connect::AUTH_TIMEOUT,
+        transport.recv_msg::<ClientResponse>(),
+    )
+    .await
+    {
+        Ok(Ok(Some(reply))) => reply,
+        Ok(Ok(None)) => {
+            eprintln!("Master closed connection during enrollment");
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+        Ok(Err(e)) => {
+            eprintln!("Failed to read enrollment reply: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_) => {
+            eprintln!("Timed out waiting for enrollment reply from Master");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (member_id, roles) = if !token.require_approval {
+        match first_reply {
+            ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {
+                eprintln!("Enrollment rejected: {message}");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            ClientResponse::Enrolled { member_id, roles } => (member_id, roles),
+            other => {
+                eprintln!("Unexpected enrollment reply from Master: {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let pairing_code = derive_pairing_code(&handshake_hash);
+        let confirm_term = confirm_term
+            .take()
+            .expect("confirm_term available for approval invite");
+
+        let mut approved: Option<(String, Vec<MemberRole>)> = match first_reply {
+            ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {
+                eprintln!("Enrollment rejected: {message}");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            ClientResponse::EnrollPending { pending_id } => {
+                println!(
+                    "Pairing code: {}  (Master key fingerprint: {fp})",
+                    pairing_code.as_str()
+                );
+                println!(
+                    "Pending enrollment ID: {pending_id} (waiting for admin approval: `oxideswarm members approve {pending_id} --code {} --fingerprint {fp}`)",
+                    pairing_code.as_str()
+                );
+                None
+            }
+            ClientResponse::Enrolled { member_id, roles } => {
+                println!(
+                    "Pairing code: {}  (Master key fingerprint: {fp})",
+                    pairing_code.as_str()
+                );
+                Some((member_id, roles))
+            }
+            other => {
+                eprintln!("Unexpected enrollment reply from Master: {other:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        flush_confirmation_terminal(&confirm_term);
+        println!(
+            "WARNING: Joining a cluster gives that cluster's master and clients code execution on this machine (use `oxideswarm worker --isolation fs` where supported)."
+        );
+        print!(
+            "Confirm that the cluster admin's master shows this pairing code and fingerprint [y/N]: "
+        );
+        let _ = std::io::stdout().flush();
+
+        let mut confirm_rx = spawn_confirmation_prompt(confirm_term);
+        let mut confirmed: Option<bool> = None;
+
+        while approved.is_none() || confirmed.is_none() {
+            if approved.is_none() && confirmed.is_none() {
+                tokio::select! {
+                    conf_res = &mut confirm_rx => {
+                        match conf_res {
+                            Ok(Ok(true)) => {
+                                confirmed = Some(true);
+                            }
+                            Ok(Ok(false)) | Err(_) => {
+                                drop(transport);
+                                eprintln!("Confirmation declined; nothing was written.");
+                                return ExitCode::FAILURE;
+                            }
+                            Ok(Err(e)) => {
+                                drop(transport);
+                                eprintln!("{e}; nothing was written.");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    msg_res = transport.recv_msg::<ClientResponse>() => {
+                        match msg_res {
+                            Ok(Some(ClientResponse::EnrollKeepalive)) => {}
+                            Ok(Some(ClientResponse::Enrolled { member_id, roles })) => {
+                                approved = Some((member_id, roles));
+                            }
+                            Ok(Some(ClientResponse::EnrollRejected { message }))
+                            | Ok(Some(ClientResponse::Error { message })) => {
+                                eprintln!("Enrollment rejected: {message}");
+                                return ExitCode::from(AUTH_EXIT_CODE);
+                            }
+                            Ok(Some(other)) => {
+                                eprintln!("Unexpected enrollment message from Master: {other:?}");
+                                return ExitCode::FAILURE;
+                            }
+                            Ok(None) => {
+                                eprintln!("Connection closed by Master before enrollment was approved");
+                                return ExitCode::FAILURE;
+                            }
+                            Err(e) => {
+                                eprintln!("Connection error while awaiting approval: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                }
+            } else if confirmed.is_none() {
+                match (&mut confirm_rx).await {
+                    Ok(Ok(true)) => {
+                        confirmed = Some(true);
+                    }
+                    Ok(Ok(false)) | Err(_) => {
+                        let _ = transport
+                            .send_msg(&ClientMessage::RejectEnrollment {
+                                pending_id: String::new(),
+                            })
+                            .await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            transport.recv_msg::<ClientResponse>(),
+                        )
+                        .await;
+                        drop(transport);
+                        eprintln!("Confirmation declined; nothing was written.");
+                        return ExitCode::FAILURE;
+                    }
+                    Ok(Err(e)) => {
+                        let _ = transport
+                            .send_msg(&ClientMessage::RejectEnrollment {
+                                pending_id: String::new(),
+                            })
+                            .await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            transport.recv_msg::<ClientResponse>(),
+                        )
+                        .await;
+                        drop(transport);
+                        eprintln!("{e}; nothing was written.");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match transport.recv_msg::<ClientResponse>().await {
+                    Ok(Some(ClientResponse::EnrollKeepalive)) => {}
+                    Ok(Some(ClientResponse::Enrolled { member_id, roles })) => {
+                        approved = Some((member_id, roles));
+                    }
+                    Ok(Some(ClientResponse::EnrollRejected { message }))
+                    | Ok(Some(ClientResponse::Error { message })) => {
+                        eprintln!("Enrollment rejected: {message}");
+                        return ExitCode::from(AUTH_EXIT_CODE);
+                    }
+                    Ok(Some(other)) => {
+                        eprintln!("Unexpected enrollment message from Master: {other:?}");
+                        return ExitCode::FAILURE;
+                    }
+                    Ok(None) => {
+                        eprintln!("Connection closed by Master before enrollment was approved");
+                        return ExitCode::FAILURE;
+                    }
+                    Err(e) => {
+                        eprintln!("Connection error while awaiting approval: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+
+        // Send post-approval confirmation (`ClientMessage::Hello`) so the master commits the
+        // approved enrollment instead of rolling it back on disconnect.
+        if let Err(e) = transport.send_msg(&ClientMessage::Hello).await {
+            eprintln!("Failed to send enrollment confirmation to Master: {e}");
+            return ExitCode::FAILURE;
+        }
+        match tokio::time::timeout(
+            crate::connect::AUTH_TIMEOUT,
+            transport.recv_msg::<ClientResponse>(),
+        )
+        .await
+        {
+            Ok(Ok(Some(ClientResponse::Hello { .. }))) => {}
+            Ok(Ok(Some(ClientResponse::EnrollRejected { message })))
+            | Ok(Ok(Some(ClientResponse::Error { message }))) => {
+                eprintln!("Enrollment rejected: {message}");
+                return ExitCode::from(AUTH_EXIT_CODE);
+            }
+            Ok(Ok(other)) => {
+                eprintln!("Unexpected enrollment confirmation reply from Master: {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Ok(Err(e)) => {
+                eprintln!("Failed to read enrollment confirmation reply: {e}");
+                return ExitCode::FAILURE;
+            }
+            Err(_) => {
+                eprintln!("Timed out waiting for enrollment confirmation reply from Master");
+                return ExitCode::FAILURE;
+            }
+        }
+
+        approved.expect("approved is Some after loop")
+    };
+
+    drop(transport);
+
+    if node_key_is_new {
+        if let Err(e) = node_key.save_file(&node_key_path, false) {
+            eprintln!(
+                "Failed to save node key to {}: {e}",
+                node_key_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        println!("Node key saved to {}", node_key_path.display());
+    } else {
+        println!("Using existing node key at {}", node_key_path.display());
+    }
+
+    if plan.changes.is_empty() {
+        println!(
+            "{} already names this master and key",
+            config_path.display()
+        );
+    } else {
+        match apply_plan(&config_path, existing.as_deref(), &plan) {
+            Ok(backup) => {
+                eprintln!(
+                    "Changed in {}: {}",
+                    config_path.display(),
+                    plan.changes.join(", ")
+                );
+                if let Some(backup) = backup {
+                    eprintln!("Previous file kept as {} (owner-only)", backup.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    println!(
+        "Enrolled as member {} (roles: {})",
+        member_id,
+        crate::members_cmd::format_roles(&roles)
+    );
+    if let Some(ref m) = master {
+        println!("Master: {m}");
+    }
+    if token.ticket.is_some() {
+        println!("The master's P2P ticket was saved as the worker's `p2p_ticket`.");
+    }
+    println!("Start a worker here with: oxideswarm worker");
+
+    if args.no_doctor {
+        return ExitCode::SUCCESS;
+    }
+    let Some(check_target) = master.as_deref().or(token.ticket.as_deref()) else {
+        return ExitCode::SUCCESS;
+    };
+
+    println!("Checking the cluster ...");
+    let has_client_role = roles.contains(&MemberRole::Client) || roles.contains(&MemberRole::Admin);
+    if has_client_role {
+        let options = DoctorOptions {
+            expect_workers: args.expect_workers,
+            probe_timeout: Duration::from_secs(60),
+            ..DoctorOptions::default()
+        };
+        let report = crate::connect::with_client_v3_auth(
+            Some((node_key, token.master_key)),
+            run_doctor(check_target, None, &options),
+        )
+        .await;
+        print!("{}", report.render());
+        if report.auth_failed {
+            ExitCode::from(AUTH_EXIT_CODE)
+        } else if report.failed() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    } else {
+        run_worker_member_readonly_check(
+            check_target,
+            node_key,
+            token.master_key,
+            args.expect_workers,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1900,13 @@ mod tests {
         assert!(read_token("  \n".as_bytes()).is_err());
         let long = "x".repeat(MAX_TOKEN_BYTES as usize + 1);
         assert!(read_token(long.as_bytes()).is_err());
+        let multiline_err = read_token("oxs1invite_example\ny\n".as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            multiline_err.contains("multiple lines"),
+            "expected multi-line input error, got: {multiline_err}"
+        );
     }
 
     #[test]

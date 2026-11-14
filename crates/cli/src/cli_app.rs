@@ -168,8 +168,14 @@ pub enum Commands {
     /// Generate or show the shared cluster secret, or create a join token for another machine
     Secret(SecretCliArgs),
 
-    /// Join this machine to a cluster with a join token read from standard input
+    /// Join this machine to a cluster with a join token or invite read from standard input
     Join(crate::join::JoinArgs),
+
+    /// Create, list, or revoke OXS-AUTH v3 machine enrollment invites
+    Invite(crate::members_cmd::InviteArgs),
+
+    /// List, approve, reject, revoke, or rename enrolled cluster members
+    Members(crate::members_cmd::MembersCliArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
@@ -239,6 +245,14 @@ pub struct MasterArgs {
         help = "Immediately fail tasks whose capabilities or placement constraints no registered worker can satisfy"
     )]
     pub fail_unfulfillable_tasks: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        allow_hyphen_values = true,
+        help = "Speed-aware placement hold-back factor (> 1.0, or 0 to disable; default: 1.5)"
+    )]
+    pub speed_hold_factor: Option<String>,
 
     #[arg(long, help = "Enable native P2P QUIC endpoint for NAT traversal")]
     pub p2p: bool,
@@ -1179,6 +1193,12 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Join(args) => {
             crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
         }
+        Commands::Invite(args) => {
+            crate::members_cmd::run_invite(args, config_file, secret_opts).await
+        }
+        Commands::Members(args) => {
+            crate::members_cmd::run_members(args, config_file, secret_opts).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -1281,8 +1301,38 @@ fn resolve_fail_unfulfillable_tasks(
     )
 }
 
+/// Resolve `speed_hold_factor` with precedence CLI `--speed-hold-factor`, then
+/// `RUSTY_GRID_SPEED_HOLD_FACTOR`, then `[master].speed_hold_factor`, then
+/// `SchedulerConfig::default().speed_hold_factor` (`1.5`), validating `0.0` (off) or finite `> 1.0`.
+fn resolve_speed_hold_factor(flag: Option<String>, cfg_val: Option<f64>) -> Result<f64, String> {
+    if let Some(raw) = flag {
+        let parsed: f64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("--speed-hold-factor: invalid factor '{raw}'"))?;
+        return SchedulerConfig::validate_speed_hold_factor(parsed)
+            .map_err(|e| format!("--speed-hold-factor: {e}"));
+    }
+    if let Ok(raw) = std::env::var("RUSTY_GRID_SPEED_HOLD_FACTOR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let parsed: f64 = trimmed
+                .parse()
+                .map_err(|_| format!("RUSTY_GRID_SPEED_HOLD_FACTOR: invalid factor '{trimmed}'"))?;
+            return SchedulerConfig::validate_speed_hold_factor(parsed)
+                .map_err(|e| format!("RUSTY_GRID_SPEED_HOLD_FACTOR: {e}"));
+        }
+    }
+    if let Some(cfg) = cfg_val {
+        return SchedulerConfig::validate_speed_hold_factor(cfg)
+            .map_err(|e| format!("speed_hold_factor: {e}"));
+    }
+    Ok(SchedulerConfig::default().speed_hold_factor)
+}
+
 /// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
-/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`,
+/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and `--speed-hold-factor` /
+/// `RUSTY_GRID_SPEED_HOLD_FACTOR` / `[master].speed_hold_factor`, and carrying `preserve_gpu`,
 /// `max_host_cpu`, and `fail_unfulfillable_tasks`.
 fn build_master_scheduler_config(
     flag: Option<String>,
@@ -1290,13 +1340,18 @@ fn build_master_scheduler_config(
     preserve_gpu: bool,
     max_host_cpu: f32,
     fail_unfulfillable_tasks: bool,
+    speed_hold_factor_flag: Option<String>,
+    speed_hold_factor_cfg: Option<f64>,
 ) -> Result<SchedulerConfig, String> {
     let scheduler_policy = resolve_scheduler_policy(flag, cfg_val)?;
+    let speed_hold_factor =
+        resolve_speed_hold_factor(speed_hold_factor_flag, speed_hold_factor_cfg)?;
     Ok(SchedulerConfig {
         policy: scheduler_policy,
         preserve_gpu_for_gpu_tasks: preserve_gpu,
         max_host_cpu_pct: max_host_cpu,
         fail_unfulfillable_tasks,
+        speed_hold_factor,
         ..Default::default()
     })
 }
@@ -1667,6 +1722,8 @@ async fn run_master_inner(
         preserve_gpu,
         max_host_cpu,
         fail_unfulfillable_tasks,
+        args.speed_hold_factor,
+        master_cfg.as_ref().and_then(|m| m.speed_hold_factor),
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1757,53 +1814,6 @@ async fn run_master_inner(
                 return ExitCode::FAILURE;
             }
         };
-    let members = match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref())
-    {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("Failed to load members.json: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // The v3 key is written to disk only when OXS-AUTH v3 can be used: a state directory was
-    // given, members exist, or the master admits members only. A loopback or `--insecure`
-    // master without members must not create `~/.oxideswarm`; an in-memory key costs nothing
-    // there, because no member has pinned it.
-    let persist_noise_key = state_dir.is_some()
-        || !members.is_empty()
-        || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members);
-    let master_noise_key = if (ephemeral_key && state_dir.is_none()) || !persist_noise_key {
-        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
-            Ok(kp) => kp,
-            Err(e) => {
-                eprintln!("Failed to generate master_noise.key: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else if let Some(key_path) =
-        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
-    {
-        match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(&key_path) {
-            Ok((kp, _)) => kp,
-            Err(e) => {
-                eprintln!("Failed to load or generate {}: {e}", key_path.display());
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
-            Ok(kp) => kp,
-            Err(e) => {
-                eprintln!("Failed to generate master_noise.key: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-    server_config = server_config
-        .with_auth_mode(auth_mode)
-        .with_members(members)
-        .with_master_noise_key(master_noise_key);
-
     let insecure = resolve_bool(
         if args.insecure { Some(true) } else { None },
         &["RUSTY_GRID_INSECURE"],
@@ -1823,6 +1833,121 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
+    let in_unisolated_unit_test =
+        cfg!(test) && state_dir.is_none() && std::env::var_os("OXIDESWARM_HOME").is_none();
+    let disable_v3_disk = in_unisolated_unit_test
+        || (ephemeral_key && state_dir.is_none())
+        || !auth_mode.allows_members();
+    let members = if disable_v3_disk {
+        rusty_grid_master::server::MemberStore::new()
+    } else {
+        match rusty_grid_master::server::MemberStore::load_from_dir(state_dir.as_deref()) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Failed to load members.json: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let key_path = if disable_v3_disk {
+        None
+    } else {
+        rusty_grid_core::noise_auth::master_noise_key_path(state_dir.as_deref())
+    };
+    let members_path = if disable_v3_disk {
+        None
+    } else {
+        rusty_grid_master::server::MemberStore::resolve_path(state_dir.as_deref())
+    };
+    let local_node_key_path = if disable_v3_disk {
+        None
+    } else if cfg!(test) && std::env::var_os("OXIDESWARM_HOME").is_none() {
+        state_dir.as_deref().map(|d| d.join("node.key"))
+    } else {
+        rusty_grid_core::noise_auth::default_node_key_path()
+    };
+    let existing_v3_files = key_path.as_ref().is_some_and(|p| p.is_file())
+        || members_path.as_ref().is_some_and(|p| p.is_file());
+    // OXS-AUTH v3 files (`master_noise.key`, `node.key`, `members.json`) are persisted at startup
+    // only when the master admits members (`--auth both` or `--auth members`) and one of: a state
+    // directory was given, `master_noise.key` or `members.json` already exists on disk, members
+    // are already present, `--auth members` is used, or the master uses the default
+    // `~/.oxideswarm/cluster.secret` under `--auth both`. With `--auth secret`, no v3 files are
+    // ever loaded or written; under `--auth both` with an explicit `--secret` / `--secret-file`,
+    // `--insecure`, or bare loopback without existing v3 files, `master_noise.key`, `members.json`,
+    // and `local-host` are persisted on demand only if `CreateInvite` is called.
+    let has_explicit_secret =
+        secret_opts.has_explicit_secret(config_file.as_ref(), SecretSection::Master);
+    let uses_default_secret = matches!(
+        secret_outcome,
+        crate::secret_cmd::MasterSecretOutcome::Generated { .. }
+    ) || (matches!(
+        secret_outcome,
+        crate::secret_cmd::MasterSecretOutcome::Configured(_)
+    ) && !has_explicit_secret);
+    let persist_noise_key = !disable_v3_disk
+        && (state_dir.is_some()
+            || existing_v3_files
+            || !members.is_empty()
+            || matches!(auth_mode, rusty_grid_master::server::AuthMode::Members)
+            || uses_default_secret);
+    if !persist_noise_key {
+        members.set_save_path(None);
+    }
+    let master_noise_key = if !persist_noise_key {
+        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
+            Ok(kp) => kp,
+            Err(e) => {
+                eprintln!("Failed to generate master_noise.key: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(ref kp_path) = key_path {
+        match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(kp_path) {
+            Ok((kp, _)) => kp,
+            Err(e) => {
+                eprintln!("Failed to load or generate {}: {e}", kp_path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match rusty_grid_core::noise_auth::NodeKeypair::generate() {
+            Ok(kp) => kp,
+            Err(e) => {
+                eprintln!("Failed to generate master_noise.key: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if persist_noise_key && auth_mode.allows_members() {
+        if let Some(ref node_key_path) = local_node_key_path {
+            match rusty_grid_core::noise_auth::NodeKeypair::load_or_generate_file(node_key_path) {
+                Ok((host_node_kp, _)) => {
+                    if let Err(e) = members.ensure_local_host_admin(
+                        *host_node_kp.public_key(),
+                        "local-host",
+                        true,
+                    ) {
+                        eprintln!("Failed to enrol local master host in members.json: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to load or generate {}: {e}",
+                        node_key_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    server_config = server_config
+        .with_auth_mode(auth_mode)
+        .with_members(members)
+        .with_master_noise_key(master_noise_key)
+        .with_master_noise_key_path(key_path)
+        .with_local_node_key_path(local_node_key_path);
     if auth_mode == rusty_grid_master::server::AuthMode::Members {
         println!("Cluster authentication: members only (enrolled machines via OXS-AUTH v3)");
     } else {
@@ -5858,11 +5983,15 @@ max_active_mb = 768
     async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes(
     ) {
         // 1. `--max-active-mb 0` is refused at startup with `ExitCode::FAILURE`.
+        let tmp_blob = tempfile::tempdir().unwrap();
+        let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
         let zero_cli = Cli::try_parse_from([
             "oxideswarm",
             "master",
             "--listen",
             "127.0.0.1:0",
+            "--state-dir",
+            &blob_dir_str,
             "--max-active-mb",
             "0",
         ])
@@ -5888,12 +6017,10 @@ max_active_mb = 768
         //    reports `active_bytes` and `max_active_bytes` in `ClusterStatus`, and refuses
         //    the second 600 KiB task with `task requires ... bytes`, `bytes in use`,
         //    `limit 1048576 bytes`, and `--max-active-mb`.
-        let tmp_blob = tempfile::tempdir().unwrap();
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let run_master_addr = probe_listener.local_addr().unwrap();
         drop(probe_listener);
         let run_master_addr_str = run_master_addr.to_string();
-        let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
         let cli = Cli::try_parse_from([
             "oxideswarm",
             "master",
@@ -5903,6 +6030,8 @@ max_active_mb = 768
             "127.0.0.1:0",
             "--max-active-mb",
             "1",
+            "--state-dir",
+            &blob_dir_str,
             "--blob-dir",
             &blob_dir_str,
         ])
@@ -6241,6 +6370,8 @@ max_active_mb = 768
             false,
             72.5,
             true,
+            Some("2.0".into()),
+            Some(1.8),
         )
         .unwrap();
         assert_eq!(
@@ -6251,12 +6382,25 @@ max_active_mb = 768
         assert!(!built_sched_cfg.preserve_gpu_for_gpu_tasks);
         assert_eq!(built_sched_cfg.max_host_cpu_pct, 72.5);
         assert!(built_sched_cfg.fail_unfulfillable_tasks);
+        assert_eq!(built_sched_cfg.speed_hold_factor, 2.0);
         assert!(build_master_scheduler_config(
             Some("bogus-policy".into()),
             None,
             true,
             85.0,
-            false
+            false,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(build_master_scheduler_config(
+            None,
+            None,
+            true,
+            85.0,
+            false,
+            Some("1.0".into()),
+            None,
         )
         .is_err());
 
@@ -6348,6 +6492,22 @@ max_active_mb = 768
                 "--wire-codec",
                 "xml",
             ],
+            vec![
+                "oxideswarm",
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--speed-hold-factor",
+                "1.0",
+            ],
+            vec![
+                "oxideswarm",
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--speed-hold-factor",
+                "-1",
+            ],
         ] {
             let cli = Cli::try_parse_from(&bad_master_argv).unwrap();
             let Commands::Master(m_args) = cli.command else {
@@ -6432,6 +6592,8 @@ max_active_mb = 768
             "2",
             "--scheduler-policy",
             "round-robin",
+            "--state-dir",
+            &blob_dir_str,
             "--blob-dir",
             &blob_dir_str,
         ])
@@ -6771,6 +6933,7 @@ max_active_mb = 768
         // Precedence for `fail_unfulfillable_tasks` via `resolve_fail_unfulfillable_tasks`:
         // CLI `--fail-unfulfillable-tasks` > `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` > `[master].fail_unfulfillable_tasks` > false
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+
         let parsed_fail_true_cfg: ConfigFile = toml::from_str(
             r#"
 [master]
@@ -6806,6 +6969,69 @@ fail_unfulfillable_tasks = false
         );
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
 
+        // Precedence & validation for `speed_hold_factor`:
+        // CLI `--speed-hold-factor` > `RUSTY_GRID_SPEED_HOLD_FACTOR` > `[master].speed_hold_factor` > 1.5
+        std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
+        let parsed_hold_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+speed_hold_factor = 2.25
+"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_speed_hold_factor(None, None).unwrap(), 1.5);
+        assert_eq!(
+            resolve_speed_hold_factor(
+                None,
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            2.25
+        );
+        std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", "0");
+        assert_eq!(
+            resolve_speed_hold_factor(
+                None,
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            0.0,
+            "RUSTY_GRID_SPEED_HOLD_FACTOR=0 must override config 2.25 and disable D2"
+        );
+        assert_eq!(
+            resolve_speed_hold_factor(
+                Some("1.75".into()),
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            1.75,
+            "--speed-hold-factor CLI flag must override env and config"
+        );
+        for bad in ["1.0", "0.5", "-1", "nan", "inf", "not-a-float"] {
+            assert!(
+                resolve_speed_hold_factor(Some(bad.into()), None)
+                    .unwrap_err()
+                    .starts_with("--speed-hold-factor: "),
+                "CLI error for '{bad}' must start with '--speed-hold-factor: '"
+            );
+            std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", bad);
+            assert!(
+                resolve_speed_hold_factor(None, None)
+                    .unwrap_err()
+                    .starts_with("RUSTY_GRID_SPEED_HOLD_FACTOR: "),
+                "Env error for '{bad}' must start with 'RUSTY_GRID_SPEED_HOLD_FACTOR: '"
+            );
+        }
+        std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
+        for bad_cfg in [1.0, 0.5, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                resolve_speed_hold_factor(None, Some(bad_cfg))
+                    .unwrap_err()
+                    .starts_with("speed_hold_factor: "),
+                "Config error for '{bad_cfg}' must start with 'speed_hold_factor: '"
+            );
+        }
+
         // 6. Live `run_master` verification of `sched_config`:
         //    - `--scheduler-policy round-robin` rotates two 1-core task submissions across two
         //      connected workers (`rr-w1` with 8 cores at 0% CPU and `rr-w2` with 2 cores at 50% CPU)
@@ -6831,6 +7057,8 @@ fail_unfulfillable_tasks = false
             "127.0.0.1:0",
             "--scheduler-policy",
             "round-robin",
+            "--state-dir",
+            &rr_blob_str,
             "--blob-dir",
             &rr_blob_str,
         ])
@@ -7911,6 +8139,8 @@ relay_url = "https://cfg-client.relay.example.com"
             file: None,
         };
 
+        let tmp_state = tempfile::tempdir().unwrap();
+        let state_dir_str = tmp_state.path().to_str().unwrap().to_string();
         for bad in [
             "http://relay.example.com",
             "https://user:secret@relay.example.com",
@@ -7921,6 +8151,8 @@ relay_url = "https://cfg-client.relay.example.com"
                 "master",
                 "--listen",
                 "127.0.0.1:0",
+                "--state-dir",
+                &state_dir_str,
                 "--relay-url",
                 bad,
             ])
