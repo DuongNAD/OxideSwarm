@@ -1,7 +1,7 @@
 # 0039: Persistent workspaces for coding agents
 
 Status: Implemented. W1 to W11 are built and W10 is recorded live
-Created: 2026-11-07    Updated: 2026-11-09
+Created: 2026-11-07    Updated: 2026-11-14
 
 ## Summary
 
@@ -533,7 +533,7 @@ off by default until FEAT-3 is Implemented.
   `DELETE` on the `tree` and `tmp` directory nodes themselves (restoring `owner_only_entries` on
   task cleanup), with Windows workspace confinement and tree-swap regression tests in
   `crates/worker/tests/test_feat3_os_isolation.rs`.
-- 2026-11-09: W11 done (`oxideswarm-tree/2`). `TreeManifest` (`crates/core/src/blob.rs`,
+- 2026-11-14: W11 done (`oxideswarm-tree/2`). `TreeManifest` (`crates/core/src/blob.rs`,
   `MANIFEST_MAGIC = b"oxideswarm-tree/2\n"` when symbolic links or empty directories are present and
   `MANIFEST_MAGIC_V1 = b"oxideswarm-tree/1\n"` otherwise, while `TreeManifest::decode` accepts both)
   adds `symlinks: Vec<BlobSymlink>` (`BlobSymlink { path, target }`) and `empty_dirs: Vec<String>`

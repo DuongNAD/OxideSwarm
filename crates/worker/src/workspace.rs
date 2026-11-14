@@ -1602,10 +1602,12 @@ fn create_in_tree_symlink(
 
 fn remove_symlink(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
-    let p = verbatim_dir_path(path);
+    let verbatim = verbatim_dir_path(path);
+    #[cfg(windows)]
+    let p: &Path = &verbatim;
     #[cfg(not(windows))]
-    let p = path;
-    fs::remove_file(&p).or_else(|_| fs::remove_dir(&p))
+    let p: &Path = path;
+    fs::remove_file(p).or_else(|_| fs::remove_dir(p))
 }
 
 /// `tree` joined with the manifest path `rel`, after the checks of design 0021 and the blob path
