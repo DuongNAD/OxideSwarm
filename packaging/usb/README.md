@@ -73,7 +73,8 @@ directly or through a relay. The master keeps the same ticket across restarts as
 Each installer does the following, without administrator rights:
 1. It checks the archive against `SHA256SUMS`.
 2. It installs into a per-user folder: `~/Library/Application Support/OxideSwarm`,
-   `%LOCALAPPDATA%\OxideSwarm` or `~/.local/share/oxideswarm`.
+   `%LOCALAPPDATA%\OxideSwarm-USB` (with `--workspace-root <folder>\workspaces` so it stays apart from
+   a non-USB Windows worker's default `%LOCALAPPDATA%\oxideswarm\workspaces` root) or `~/.local/share/oxideswarm`.
 3. It runs `oxideswarm join` with the token on standard input. The installed worker keeps its state
    in `<folder>/home` (through `OXIDESWARM_HOME`), so an existing `~/.oxideswarm` is never read or
    changed.
@@ -142,7 +143,7 @@ Double-click `Update OxideSwarm.command` (macOS) or `Update OxideSwarm.cmd` (Win
 `bash install.sh --update` on Linux, from a stick that carries the newer kit. The update:
 
 - finds the install (`--install-root`, else on Windows the folder recorded in
-  `HKCU\Software\OxideSwarm\UsbKit`, else the default folder) and stops if there is none;
+  `HKCU\Software\OxideSwarm\UsbKit`, else `%LOCALAPPDATA%\OxideSwarm-USB` falling back to legacy `%LOCALAPPDATA%\OxideSwarm`) and stops if there is none;
 - keeps its name, build (GPU or plain) and workspace choice from `kit-install.conf`
   (`kit-install.txt` on Windows), which the installer writes; for an older install the name comes
   from its `home/worker_id.<name>` file and, without a terminal, the plain build is kept;
@@ -157,9 +158,11 @@ An install that uses the GPU build is not updated from a kit without one, unless
 ### Another drive on Windows
 
 When the machine has another fixed NTFS or ReFS drive, `install.ps1` asks where to keep its files
-and lists `%LOCALAPPDATA%\OxideSwarm` (the default) and `<drive>:\OxideSwarm` for each such drive,
-with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
-the folder in advance. A folder outside `%LOCALAPPDATA%`:
+and lists `%LOCALAPPDATA%\OxideSwarm-USB` (the default) and `<drive>:\OxideSwarm-USB` for each such
+drive, with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
+the folder in advance (`-Update` still accepts legacy `%LOCALAPPDATA%\OxideSwarm` installs, while
+fresh installs refuse `%LOCALAPPDATA%\OxideSwarm` and `%LOCALAPPDATA%\oxideswarm\workspaces` so they
+never collide with a non-USB worker's default workspace root). A folder outside `%LOCALAPPDATA%`:
 
 - must be on a fixed NTFS or ReFS drive, not on the kit's drive, not the root of a drive, and new,
   empty or an earlier install of the kit. FAT and exFAT keep no permissions, and a removable drive
@@ -170,13 +173,18 @@ the folder in advance. A folder outside `%LOCALAPPDATA%`:
   on, and no folder on the way to it may be renamed, deleted or re-permissioned by another account.
   The result is checked before anything is written, for an update too. A new folder at the root of
   a data drive otherwise lets every local account change its content;
-- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`)
-  and the workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
-  user's cache folder on drive C.
+- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`),
+  while `%TEMP%\oxideswarm-usb\sandboxes` holds task folders for an install under `%LOCALAPPDATA%`.
+  In both locations, whenever `--workspaces` is enabled, `install.ps1` always passes
+  `--workspace-root <folder>\workspaces` (or `<folder>\usb-kit\workspaces` when updating a legacy
+  `%LOCALAPPDATA%\OxideSwarm` install) and marks it with `.oxideswarm-usb-workspaces`.
 
 The installer records the folder in `HKCU\Software\OxideSwarm\UsbKit`, and `uninstall.ps1` removes
-that install when it gets no `-InstallRoot`. While an install exists in one folder, the installer
-refuses another one unless `-InstallRoot` asks for it.
+that install when it gets no `-InstallRoot` (falling back to `%LOCALAPPDATA%\OxideSwarm-USB`, then
+legacy `%LOCALAPPDATA%\OxideSwarm`). Before stopping or deleting anything, `uninstall.ps1` refuses to
+remove `$InstallRoot` if `$InstallRoot\workspaces` lacks `.oxideswarm-usb-workspaces` or is used by
+another worker or service, naming which worker uses it. While an install exists in one folder, the
+installer refuses another one unless `-InstallRoot` asks for it.
 
 The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
 logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P

@@ -1293,6 +1293,7 @@ class StaticRepositoryChecks(unittest.TestCase):
             for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
                 os.makedirs(d, exist_ok=True)
             test_run_val = f"OxideSwarmUsbWorkerTest_{os.getpid()}"
+            test_pointer_key = f"HKCU:\\Software\\OxideSwarm\\UsbKitTest_{os.getpid()}"
             ps_env = dict(
                 ps_env,
                 USERPROFILE=tmp_home,
@@ -1302,6 +1303,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                 TEMP=tmp_temp,
                 TMP=tmp_temp,
                 OXIDESWARM_USB_RUN_VALUE=test_run_val,
+                OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
             )
             pids_log = os.path.join(tmp, "spawned_workers.pids")
             ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
@@ -1453,7 +1455,7 @@ public class Program {
                 }
                 File.WriteAllText(grantLog, dummyTarget + Environment.NewLine);
             }
-            Thread.Sleep(25000);
+            Thread.Sleep(60000);
             return 0;
         }
         if (args.Length > 0 && args[0] == "workers") {
@@ -1657,7 +1659,7 @@ public class Program {
                 subprocess.run(
                     [
                         "powershell", "-NoProfile", "-Command",
-                        f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue",
+                        f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
                     ],
                     env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
                 )
@@ -2162,6 +2164,313 @@ Write-Output 'USB_HELPERS_OK'
         chaos = read(os.path.join(ROOT, "run_chaos_test.sh"))
         self.assertIn('grep -q "^done:${SB_VICTIM}" "$LOG"', chaos)
         self.assertIn("kept running and wrote done:${SB_VICTIM} after the kill", chaos)
+
+    def test_windows_usb_install_and_workspace_roots_never_collide_with_default_workspace_root(self):
+        # USB-3: Windows NTFS is case-insensitive, so the USB kit's install folder and
+        # --workspace-root must never equal worker::workspace::default_root_with(Platform::Windows, ..)
+        # (<LOCALAPPDATA>\oxideswarm\workspaces) under any case spelling.
+        ws_rs = read(os.path.join(ROOT, "crates", "worker", "src", "workspace.rs"))
+        self.assertIn('Platform::Windows => PathBuf::from(get("LOCALAPPDATA")?)', ws_rs)
+        self.assertIn('.join("oxideswarm").join("workspaces")', ws_rs)
+
+        install_ps1 = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        uninstall_ps1 = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+
+        m_param = re.search(r'\[string\]\$InstallRoot\s*=\s*\(Join-Path \$env:LOCALAPPDATA "([^"]+)"\)', install_ps1)
+        self.assertIsNotNone(m_param, "missing default -InstallRoot in install.ps1")
+        m_def = re.search(r"\$DefaultRoot\s*=\s*Join-Path \$LocalAppDataFull '([^']+)'", install_ps1)
+        self.assertIsNotNone(m_def, "missing $DefaultRoot in install.ps1")
+        self.assertEqual(m_param.group(1), m_def.group(1))
+        self.assertIn("$candidate = Join-Path $d.Name 'OxideSwarm-USB'", install_ps1)
+        self.assertIn("Join-Path $env:LOCALAPPDATA 'OxideSwarm-USB'", uninstall_ps1)
+
+        # Always pass --workspace-root when --workspaces is enabled, even inside %LOCALAPPDATA%.
+        ws_block_start = install_ps1.index("if (-not $NoWorkspaces -and $supportsIsolatedWorkspaces")
+        ws_block_end = install_ps1.index("$log = Join-Path $LogDir 'worker.log'", ws_block_start)
+        ws_block = install_ps1[ws_block_start:ws_block_end]
+        self.assertNotIn("if (-not $PrivateRoot)", ws_block)
+        self.assertIn(".oxideswarm-usb-workspaces", ws_block)
+        self.assertIn("$workerArgs += ' --workspaces --workspace-root \"' + $WorkspaceRoot + '\"'", ws_block)
+        self.assertIn("$LegacyDefaultRoot", install_ps1)
+        self.assertIn("$DefaultWorkerWorkspaceRoot", install_ps1)
+
+        # Case-insensitive equivalence check across arbitrary LocalAppData and component spellings.
+        kit_dir_name = m_def.group(1)
+        for local_app in (
+            r"C:\Users\Alice\AppData\Local",
+            r"C:\USERS\ALICE\APPDATA\LOCAL",
+            r"c:\users\alice\appdata\local",
+        ):
+            worker_default_parent = f"{local_app}\\oxideswarm".lower()
+            worker_default_root = f"{local_app}\\oxideswarm\\workspaces".lower()
+            for ws_leaf in ("workspaces", "WORKSPACES", "Workspaces"):
+                for root_case in (kit_dir_name, kit_dir_name.lower(), kit_dir_name.upper()):
+                    kit_install = f"{local_app}\\{root_case}".lower()
+                    kit_ws_root = f"{local_app}\\{root_case}\\{ws_leaf}".lower()
+                    legacy_ws_root = f"{local_app}\\OxideSwarm\\usb-kit\\{ws_leaf}".lower()
+                    self.assertNotEqual(kit_install, worker_default_parent)
+                    self.assertNotEqual(kit_install, worker_default_root)
+                    self.assertNotEqual(kit_ws_root, worker_default_root)
+                    self.assertNotEqual(legacy_ws_root, worker_default_root)
+
+        # uninstall.ps1 must check .oxideswarm-usb-workspaces and foreign users before prompt/stop/delete.
+        check_idx = uninstall_ps1.index("function Get-WorkspaceDirUsers")
+        marker_idx = uninstall_ps1.index("'.oxideswarm-usb-workspaces'")
+        prompt_idx = uninstall_ps1.index("if (-not $Yes)")
+        stop_idx = uninstall_ps1.index("Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $Exe }")
+        delete_idx = uninstall_ps1.index("Remove-Item -Recurse -Force -LiteralPath $InstallRoot")
+        self.assertLess(check_idx, marker_idx)
+        self.assertLess(marker_idx, prompt_idx)
+        self.assertLess(prompt_idx, stop_idx)
+        self.assertLess(stop_idx, delete_idx)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell runtime test")
+    def test_windows_usb3_install_folder_and_uninstall_workspace_guard(self):
+        if not shutil.which("powershell"):
+            self.skipTest("powershell is not available")
+        import zipfile
+
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_usb3_"))
+        tmp_home = os.path.join(tmp, "userprofile")
+        tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
+        tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
+        tmp_temp = os.path.join(tmp_localappdata, "Temp")
+        for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        test_run_val = f"OxideSwarmUsb3Test_{os.getpid()}"
+        test_pointer_key = f"HKCU:\\Software\\OxideSwarm\\UsbKitUsb3Test_{os.getpid()}"
+        pids_log = os.path.join(tmp, "spawned_workers.pids")
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME")
+        }
+        ps_env.update(
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+        )
+        if not shutil.which("cargo", path=ps_env.get("PATH")):
+            fake_cargo_dir = os.path.join(tmp, "fake_cargo_bin")
+            os.makedirs(fake_cargo_dir, exist_ok=True)
+            with open(os.path.join(fake_cargo_dir, "cargo.cmd"), "w", encoding="utf-8") as cf:
+                cf.write("@echo off\r\necho cargo 1.90.0\r\n")
+            ps_env["PATH"] = fake_cargo_dir + os.pathsep + ps_env.get("PATH", "")
+
+        normal_proc = None
+        try:
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(
+                os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"),
+                os.path.join(kit_dir, "revoke-isolation-acls.ps1"),
+            )
+            with open(os.path.join(kit_dir, "join.token"), "w", encoding="utf-8") as f:
+                f.write(KIT_TOKEN + "\n")
+            with open(os.path.join(kit_dir, "no-autostart"), "w", encoding="utf-8") as f:
+                f.write("trial\n")
+            with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                f.write("off\n")
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            Console.In.ReadToEnd();
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            Console.WriteLine("[{\"name\":\"win-kit-test\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            cs_file = os.path.join(tmp, "FakeOxide.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            compile_res = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+            with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                f.write(f"{zip_sha}  {zip_name}\n")
+
+            normal_ws_root = os.path.join(tmp_localappdata, "oxideswarm", "workspaces")
+            proj_tree_hello = os.path.join(normal_ws_root, "proj-alpha", "tree", "hello.txt")
+            os.makedirs(os.path.dirname(proj_tree_hello), exist_ok=True)
+            with open(proj_tree_hello, "w", encoding="utf-8") as hf:
+                hf.write("normal worker state\n")
+
+            normal_worker_dir = os.path.join(tmp, "normal-worker")
+            os.makedirs(normal_worker_dir, exist_ok=True)
+            normal_exe = os.path.join(normal_worker_dir, "oxideswarm.exe")
+            shutil.copyfile(fake_exe, normal_exe)
+            normal_proc = subprocess.Popen(
+                [normal_exe, "worker", "--name", "dev-local-worker", "--workspaces"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            time.sleep(0.3)
+            self.assertIsNone(normal_proc.poll(), "normal worker should remain running")
+
+            for legacy_spell in ("OxideSwarm", "OXIDESWARM"):
+                refused_legacy = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(kit_dir, "install.ps1"),
+                        "-InstallRoot", os.path.join(tmp_localappdata, legacy_spell),
+                        "-Name", "win-kit-test", "-Isolation", "off",
+                    ],
+                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(refused_legacy.returncode, 0, refused_legacy.stdout)
+                self.assertIn("default worker workspace root", refused_legacy.stdout)
+
+            inst_default = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", os.path.join(kit_dir, "install.ps1"),
+                    "-Name", "win-kit-test", "-Isolation", "off",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(inst_default.returncode, 0, inst_default.stdout)
+            default_usb_root = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+            default_usb_ws = os.path.join(default_usb_root, "workspaces")
+            self.assertTrue(os.path.isdir(default_usb_root))
+            self.assertTrue(os.path.isfile(os.path.join(default_usb_ws, ".oxideswarm-usb-workspaces")))
+            vbs_default = read(os.path.join(default_usb_root, "start-worker.vbs"))
+            self.assertIn(f'--workspaces --workspace-root ""{default_usb_ws}""', vbs_default)
+
+            uninst_default = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                    "-Yes",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(uninst_default.returncode, 0, uninst_default.stdout)
+            self.assertFalse(os.path.exists(default_usb_root))
+            self.assertIsNone(normal_proc.poll(), "normal worker must keep running across USB uninstall")
+            self.assertEqual(read(proj_tree_hello), "normal worker state\n")
+
+            legacy_root = os.path.join(tmp_localappdata, "OxideSwarm")
+            os.makedirs(os.path.join(legacy_root, "bin"), exist_ok=True)
+            os.makedirs(os.path.join(legacy_root, "home"), exist_ok=True)
+            shutil.copyfile(fake_exe, os.path.join(legacy_root, "bin", "oxideswarm.exe"))
+            uninst_blocked = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                    "-Yes",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertNotEqual(uninst_blocked.returncode, 0, uninst_blocked.stdout)
+            self.assertIn("dev-local-worker", uninst_blocked.stdout)
+            self.assertIn(str(normal_proc.pid), uninst_blocked.stdout)
+            self.assertTrue(os.path.isdir(legacy_root))
+            self.assertEqual(read(proj_tree_hello), "normal worker state\n")
+
+            normal_proc.terminate()
+            normal_proc.wait(timeout=10)
+            if normal_proc.stdout is not None:
+                normal_proc.stdout.close()
+            normal_proc = None
+
+            uninst_unmarked = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                    "-Yes",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertNotEqual(uninst_unmarked.returncode, 0, uninst_unmarked.stdout)
+            self.assertIn("default workspace root", uninst_unmarked.stdout)
+            self.assertIn("missing .oxideswarm-usb-workspaces", uninst_unmarked.stdout)
+            self.assertTrue(os.path.isdir(legacy_root))
+            self.assertEqual(read(proj_tree_hello), "normal worker state\n")
+        finally:
+            if normal_proc is not None:
+                if normal_proc.poll() is None:
+                    normal_proc.terminate()
+                    try:
+                        normal_proc.wait(timeout=10)
+                    except Exception:
+                        normal_proc.kill()
+                        normal_proc.wait(timeout=5)
+                if normal_proc.stdout is not None:
+                    normal_proc.stdout.close()
+            for pid_candidate in (
+                pids_log,
+                os.path.join(tmp_localappdata, "OxideSwarm-USB", "run", "worker.pid"),
+            ):
+                if os.path.isfile(pid_candidate):
+                    try:
+                        for line in read(pid_candidate).splitlines():
+                            p_str = line.strip()
+                            if p_str.isdigit():
+                                subprocess.run(
+                                    ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {p_str} -Force -ErrorAction SilentlyContinue"],
+                                    env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                )
+                    except Exception:
+                        pass
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

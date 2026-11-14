@@ -3,7 +3,8 @@
 # manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its folder
 # (binaries, the cluster secret it received, logs, task folders and file cache), and
 # %TEMP%\oxideswarm-usb. Nothing else is touched. Without -InstallRoot it removes the install the
-# installer recorded in HKCU (another drive included), else %LOCALAPPDATA%\OxideSwarm.
+# installer recorded in HKCU (another drive included), else %LOCALAPPDATA%\OxideSwarm-USB (or
+# %LOCALAPPDATA%\OxideSwarm for an older install).
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-Yes]
 [CmdletBinding()]
 param(
@@ -11,26 +12,110 @@ param(
     [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
-$PointerKey = 'HKCU:\Software\OxideSwarm\UsbKit'
+$PointerKey = if ($env:OXIDESWARM_USB_POINTER_KEY) { $env:OXIDESWARM_USB_POINTER_KEY } else { 'HKCU:\Software\OxideSwarm\UsbKit' }
+$DefaultRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm-USB')).TrimEnd('\')
+$LegacyDefaultRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm')).TrimEnd('\')
+$DefaultWorkerWorkspaceRoot = Join-Path $LegacyDefaultRoot 'workspaces'
 $pointer = $null
 try { $pointer = (Get-ItemProperty -Path $PointerKey -Name InstallRoot -ErrorAction Stop).InstallRoot } catch { $pointer = $null }
-if (-not $InstallRoot) { $InstallRoot = if ($pointer) { $pointer } else { Join-Path $env:LOCALAPPDATA "OxideSwarm" } }
+if (-not $InstallRoot) {
+    if ($pointer) {
+        $InstallRoot = $pointer
+    } elseif (-not (Test-Path -LiteralPath (Join-Path $DefaultRoot 'bin\oxideswarm.exe')) -and (Test-Path -LiteralPath (Join-Path $LegacyDefaultRoot 'bin\oxideswarm.exe'))) {
+        $InstallRoot = $LegacyDefaultRoot
+    } else {
+        $InstallRoot = $DefaultRoot
+    }
+}
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $Exe = Join-Path $InstallRoot 'bin\oxideswarm.exe'
 if (-not (Test-Path -LiteralPath $InstallRoot)) { Write-Host "Nothing to remove: $InstallRoot does not exist."; exit 0 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "ERROR: $InstallRoot does not look like a USB-kit install; not touching it." -ForegroundColor Red; exit 1 }
 # Only a folder this kit made is deleted: it carries the installer's marker (installs from before the
-# marker existed only in the default folder), it is not a link, and nothing inside is one, because
-# Windows PowerShell 5.1 follows junctions while it deletes.
+# marker existed only in the legacy default folder), it is not a link, and nothing inside is one,
+# because Windows PowerShell 5.1 follows junctions while it deletes.
 $rootItem = Get-Item -LiteralPath $InstallRoot -Force
 if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-Host "ERROR: $InstallRoot is a link; not touching it." -ForegroundColor Red; exit 1 }
-$isDefault = [string]::Equals($InstallRoot, [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'OxideSwarm')).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+$isDefault = [string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)
 if (-not $isDefault -and -not (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install'))) {
     Write-Host "ERROR: $InstallRoot has no .oxideswarm-usb-install marker; not touching it." -ForegroundColor Red; exit 1
 }
 $links = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | Select-Object -First 3)
 if ($links.Count -gt 0) {
     Write-Host "ERROR: $InstallRoot contains links ($(($links | ForEach-Object { $_.FullName }) -join ', ')); remove them first, then run the uninstaller again." -ForegroundColor Red; exit 1
+}
+function Get-CommandLineOptionValue($cmdLine, [string]$optName) {
+    if (-not $cmdLine) { return $null }
+    $esc = [regex]::Escape($optName)
+    $pattern = '(?:^|\s)' + $esc + '(?:=|\s+)(?:"([^"]+)"|''([^'']+)''|(\S+))'
+    $m = [regex]::Match($cmdLine, $pattern)
+    if (-not $m.Success) { return $null }
+    for ($i = 1; $i -le 3; $i++) {
+        if ($m.Groups[$i].Success) { return $m.Groups[$i].Value }
+    }
+    return $null
+}
+function Get-CommandLineWorkspaceRoot($cmdLine, [string]$defaultWsRoot) {
+    $explicit = Get-CommandLineOptionValue $cmdLine '--workspace-root'
+    if ($explicit) {
+        try { return [IO.Path]::GetFullPath($explicit).TrimEnd('\') } catch { return $null }
+    }
+    if ($defaultWsRoot -and ($cmdLine -match '(?:^|\s)--workspaces(?:\s|$)')) {
+        return $defaultWsRoot
+    }
+    return $null
+}
+function Get-WorkspaceDirUsers([string]$targetDir, [string]$ownExe, [string]$defaultWsRoot) {
+    $users = New-Object 'System.Collections.Generic.List[string]'
+    $ownExeFull = [IO.Path]::GetFullPath($ownExe)
+    $procs = @()
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { $procs = @() }
+    foreach ($p in $procs) {
+        if ($p.ExecutablePath) {
+            try {
+                if ([string]::Equals([IO.Path]::GetFullPath($p.ExecutablePath), $ownExeFull, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            } catch { }
+        }
+        $cmd = $p.CommandLine
+        if (-not $cmd) { continue }
+        $isOxideBin = ($p.Name -in @('oxideswarm.exe', 'rusty-grid.exe')) -or ($p.ExecutablePath -match '(?:oxideswarm|rusty-grid)(?:\.exe)?$')
+        if (-not $isOxideBin -or $cmd -notmatch '(?:^|\s)worker(?:\s|$)') { continue }
+        $wsRoot = Get-CommandLineWorkspaceRoot $cmd $defaultWsRoot
+        if ($wsRoot -and [string]::Equals($wsRoot, $targetDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $wName = Get-CommandLineOptionValue $cmd '--name'
+            $label = if ($wName) { "worker '$wName' (PID $($p.ProcessId), $($p.ExecutablePath))" } else { "worker PID $($p.ProcessId) ($($p.ExecutablePath))" }
+            $users.Add($label)
+        }
+    }
+    $svcs = @()
+    try { $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop) } catch { $svcs = @() }
+    foreach ($s in $svcs) {
+        $pathName = $s.PathName
+        if (-not $pathName -or $pathName -notmatch '(?:oxideswarm|rusty-grid)(?:\.exe)?' -or $pathName -notmatch '(?:^|\s)worker(?:\s|$)') { continue }
+        if ($ownExe -and $pathName.IndexOf($ownExe, [StringComparison]::OrdinalIgnoreCase) -ge 0) { continue }
+        $wsRoot = Get-CommandLineWorkspaceRoot $pathName $null
+        if ($wsRoot -and [string]::Equals($wsRoot, $targetDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $users.Add("Windows service '$($s.Name)' ($pathName)")
+        }
+    }
+    return @($users)
+}
+# Refuse to delete $InstallRoot if $InstallRoot\workspaces was not created by the USB kit or is
+# currently used by another worker (for example a non-USB worker sharing %LOCALAPPDATA%\oxideswarm\workspaces).
+$WorkspacesDir = Join-Path $InstallRoot 'workspaces'
+if (Test-Path -LiteralPath $WorkspacesDir) {
+    $wsMarker = Join-Path $WorkspacesDir '.oxideswarm-usb-workspaces'
+    $foreignUsers = @(Get-WorkspaceDirUsers $WorkspacesDir $Exe $DefaultWorkerWorkspaceRoot)
+    if (-not (Test-Path -LiteralPath $wsMarker) -or $foreignUsers.Count -gt 0) {
+        if ($foreignUsers.Count -gt 0) {
+            Write-Host "ERROR: $WorkspacesDir is used by $($foreignUsers -join '; '); not touching $InstallRoot." -ForegroundColor Red
+        } elseif ([string]::Equals($WorkspacesDir, $DefaultWorkerWorkspaceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "ERROR: $WorkspacesDir is the default workspace root of a non-USB OxideSwarm worker (missing .oxideswarm-usb-workspaces marker); not touching $InstallRoot." -ForegroundColor Red
+        } else {
+            Write-Host "ERROR: $WorkspacesDir was not created by the USB kit (missing .oxideswarm-usb-workspaces marker; used by another OxideSwarm worker or tool); not touching $InstallRoot." -ForegroundColor Red
+        }
+        exit 1
+    }
 }
 if (-not $Yes) {
     $ans = Read-Host "Remove the OxideSwarm worker installed in $InstallRoot? [y/N]"
@@ -87,10 +172,12 @@ if (Test-Path -LiteralPath $Manifest) {
 }
 
 Remove-Item -Recurse -Force -LiteralPath $InstallRoot
-if ($pointer -and $pointer -eq $InstallRoot) {
+$pointerFull = if ($pointer) { [IO.Path]::GetFullPath($pointer).TrimEnd('\') } else { $null }
+if ($pointerFull -and [string]::Equals($pointerFull, $InstallRoot, [StringComparison]::OrdinalIgnoreCase)) {
     Remove-Item -Path $PointerKey -Force
-    $parent = Get-Item -Path 'HKCU:\Software\OxideSwarm' -ErrorAction SilentlyContinue
-    if ($parent -and $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0) { Remove-Item -Path 'HKCU:\Software\OxideSwarm' }
+    $pointerParent = Split-Path -Parent $PointerKey
+    $parent = if ($pointerParent) { Get-Item -Path $pointerParent -ErrorAction SilentlyContinue } else { $null }
+    if ($parent -and $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0) { Remove-Item -Path $pointerParent }
 }
 $UsbTempRoot = Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb'
 if (Test-Path -LiteralPath $UsbTempRoot) {
