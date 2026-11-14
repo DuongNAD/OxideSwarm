@@ -639,6 +639,11 @@ function Ensure-ServicePrivateDir {
         $sec = New-ServicePrivateSecurity -OwnerSid $OwnerSid -FullControlSids $fullSids
         foreach ($seg in $missing) {
             [void][IO.Directory]::CreateDirectory($seg, $sec)
+            $segWhy = Get-ServiceDirSafetyError -TargetPath $seg -AllowedOwners $AllowedOwners -AllowedAncestorOwners $AllowedAncestorOwners
+            if ($segWhy) {
+                Write-Error $segWhy
+                exit 1
+            }
             Write-Host "[OK] Created directory with protected ACL: $seg" -ForegroundColor Green
         }
     }
@@ -726,13 +731,13 @@ function Set-PrivateDirAcl {
             Write-Error "Refusing to reset ownership under '$Path': '$badChildLink' is a link or reparse point. Remove it before running the service installer."
             exit 1
         }
-        & icacls.exe $Path /setowner ("*" + $OwnerSid) /T /C | Out-Null
+        & icacls.exe $Path /setowner ("*" + $OwnerSid) /T /C /L | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Could not reset owner on children of $Path (icacls exit code $LASTEXITCODE)."
             exit 1
         }
         if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count -gt 0) {
-            & icacls.exe (Join-Path $Path '*') /reset /T /C | Out-Null
+            & icacls.exe (Join-Path $Path '*') /reset /T /C /L | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 Write-Error "Could not reset inherited ACLs on children of $Path (icacls exit code $LASTEXITCODE)."
                 exit 1
@@ -741,15 +746,40 @@ function Set-PrivateDirAcl {
     }
 }
 
-$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
-$LogDir = [IO.Path]::GetFullPath($LogDir).TrimEnd('\')
-$DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
-$ConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+function Resolve-LongPathPrefix {
+    param([string]$InputPath)
+    $full = [IO.Path]::GetFullPath($InputPath).TrimEnd('\')
+    $drive = [IO.Path]::GetPathRoot($full + '\').TrimEnd('\')
+    $tail = @()
+    $cur = $full
+    while ($cur -and $cur -ne $drive -and -not (Test-Path -LiteralPath $cur)) {
+        $tail += (Split-Path -Leaf $cur)
+        $cur = Split-Path -Parent $cur
+        if ($cur) { $cur = $cur.TrimEnd('\') }
+    }
+    if ($cur -and $cur -ne $drive -and (Test-Path -LiteralPath $cur)) {
+        $resolvedBase = (Get-Item -LiteralPath $cur -Force).FullName.TrimEnd('\')
+    } else {
+        $resolvedBase = $cur
+    }
+    if ($tail.Count -gt 0) {
+        [array]::Reverse($tail)
+        foreach ($leaf in $tail) {
+            $resolvedBase = Join-Path $resolvedBase $leaf
+        }
+    }
+    return $resolvedBase.TrimEnd('\')
+}
+
+$InstallDir = Resolve-LongPathPrefix -InputPath $InstallDir
+$LogDir = Resolve-LongPathPrefix -InputPath $LogDir
+$DataDir = Resolve-LongPathPrefix -InputPath $DataDir
+$ConfigPath = Resolve-LongPathPrefix -InputPath $ConfigPath
 $binDir = Join-Path $InstallDir "bin"
 $configParent = (Split-Path -Path $ConfigPath -Parent).TrimEnd('\')
 $dataParent = (Split-Path -Path $DataDir -Parent).TrimEnd('\')
 $logParent = (Split-Path -Path $LogDir -Parent).TrimEnd('\')
-$programDataRoot = if ($env:ProgramData) { [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\') } else { "C:\ProgramData" }
+$programDataRoot = if ($env:ProgramData) { Resolve-LongPathPrefix -InputPath $env:ProgramData } else { "C:\ProgramData" }
 
 $programDataParents = @()
 foreach ($candParent in @($dataParent, $configParent, $logParent)) {

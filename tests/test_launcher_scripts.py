@@ -1815,7 +1815,7 @@ public class Program {
             return
 
         ps_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
-        tmp = tempfile.mkdtemp(prefix="ox_win_ps_acl_")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_ps_acl_"))
         try:
             # 1. PowerShell AST parser check on every .ps1 script in the repository.
             ps1_files = tracked_or_present(["*.ps1"])
@@ -1858,7 +1858,8 @@ $wanted = @(
     'Test-ServicePrivateAcl',
     'Ensure-ServicePrivateDir',
     'Set-PrivateDirAcl',
-    'Set-PrivateFileAcl'
+    'Set-PrivateFileAcl',
+    'Resolve-LongPathPrefix'
 )
 foreach ($fnAst in $ast.FindAll({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }}, $true)) {{
     if ($fnAst.Name -in $wanted) {{
@@ -1870,6 +1871,7 @@ $allowed = @($me, 'S-1-5-18', 'S-1-5-32-544')
 $ancAllowed = @($me, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $base = Join-Path '{tmp_esc}' 'svc_case'
 New-Item -ItemType Directory -Path $base | Out-Null
+$base = (Get-Item -LiteralPath $base -Force).FullName
 & icacls.exe $base /grant '*S-1-1-0:(OI)(CI)R' | Out-Null
 
 # (a) Junction at ProgramData\\OxideSwarm or its child is refused before any change.
@@ -1941,6 +1943,19 @@ if ($foundLink -ne $evilJunc) {{ throw "expected Find-FirstReparsePointUnder to 
 $canaryAcl = Get-Acl -LiteralPath $canary
 if ($canaryAcl.AreAccessRulesProtected) {{ throw "canary target DACL was modified" }}
 & cmd.exe /c rmdir $evilJunc | Out-Null
+
+# (f) Resolve-LongPathPrefix preserves missing leaf segments and does not dereference junctions.
+$missingLeaf = Join-Path $cleanPd 'sub\leaf'
+if ((Resolve-LongPathPrefix -InputPath $missingLeaf) -ne $missingLeaf) {{ throw "Resolve-LongPathPrefix altered missing leaf path" }}
+$juncCheck = Join-Path $base 'junc_keep'
+& cmd.exe /c mklink /J $juncCheck $canary | Out-Null
+try {{
+    if ((Resolve-LongPathPrefix -InputPath (Join-Path $juncCheck 'child')) -ne (Join-Path $juncCheck 'child')) {{
+        throw "Resolve-LongPathPrefix dereferenced junction"
+    }}
+}} finally {{
+    if (Test-Path -LiteralPath $juncCheck) {{ & cmd.exe /c rmdir $juncCheck | Out-Null }}
+}}
 Write-Output 'SVC_HELPERS_OK'
 """
             with open(svc_driver, "w", encoding="utf-8", newline="\r\n") as f:
@@ -1983,6 +1998,7 @@ foreach ($fnAst in $ast.FindAll({{ param($n) $n -is [System.Management.Automatio
 }}
 $uBase = Join-Path '{tmp_esc}' 'usb_case'
 New-Item -ItemType Directory -Path $uBase | Out-Null
+$uBase = (Get-Item -LiteralPath $uBase -Force).FullName
 $sec = Get-PrivateSecurity
 $sec.SetOwner($UserSid)
 $sysDrive = [IO.Path]::GetPathRoot($env:SystemRoot)
