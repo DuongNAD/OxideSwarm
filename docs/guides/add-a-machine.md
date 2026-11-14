@@ -4,8 +4,6 @@
 
 Enrol a second machine on the same local network using a three-part spoken pairing code (`<nameplate>-<word>-<word>`) with zero copy-and-paste, and run a test task on it.
 
-Status note: automated tests (`tests/cli_pair_e2e.rs`) pass on loopback; the live two-machine LAN rehearsal between Windows and macOS (`JOIN-2b`) is pending.
-
 ## Prerequisites
 
 - An OxideSwarm master running on a LAN-reachable address (`--listen 0.0.0.0:8088`, and `--auth members` or `--auth both`).
@@ -102,6 +100,45 @@ On the master or an enrolled client machine, confirm the worker is online and ru
 ```
 
 Expected output: `<WORKER_NAME>` appears in `workers`, and `submit --wait` prints `paired-ok`.
+
+### Recorded two-machine run
+
+Run on 2026-11-14 between 12:06 and 12:14 UTC on one private LAN (`Link: TCP/LAN`) with isolated temporary home directories on both machines at commit `917c032` (on `master` `8596c5fd`):
+
+| Field | Value |
+|---|---|
+| Master and inviter | MacBook Air, Apple M5 (10 cores), 32 GiB, macOS (Darwin 27.2.0). Master started with `--listen <MASTER_IP>:18088 --auth both` (master key fingerprint `bb45-78c6-d1fd-23a5`). Inviter ran `oxideswarm invite --code --roles worker,client --master <MASTER_IP>:18088`. |
+| Joining worker | Laptop with an Intel Core i7-1355U (10 cores, 12 threads), 16 GB, Windows 11 (`x86_64`). Ran `oxideswarm.exe join --code 422-tool-humor` with no `--pair-host` flag. |
+
+1. On the inviting machine (`macOS`), `oxideswarm invite --code --roles worker,client --master <MASTER_IP>:18088` printed:
+
+```text
+Invite 885cc5ca9f2ce341d97e8f5dda6c7872 ready (roles: worker,client, expires in 600s).
+Pairing code: 422-tool-humor
+On the new machine run: oxideswarm join --code 422-tool-humor
+Fallback if broadcasts are blocked: oxideswarm join --code 422-tool-humor --pair-host <MASTER_IP>:56924
+```
+
+2. On the joining machine (`Windows 11`), `oxideswarm.exe join --code 422-tool-humor` found the inviter on the first UDP port `8087` broadcast query without `--pair-host`. Both terminals printed the matching 6-digit pairing check (`711 627`):
+   - Inviter terminal: `<WORKER_NAME> (windows/x86_64, <JOINER_IP>:55177) wants to join. Pairing check 711 627. Approve? [y/N]`
+   - Joiner terminal: `Pairing code: 711627  (Master key fingerprint: bb45-78c6-d1fd-23a5)` and `Pending enrollment ID: 5c41330f4b2572a9`
+3. Confirming `y` on both terminals enrolled member `269b134d8914e3de` (`roles: worker,client`), wrote `<TEMP_HOME>\.oxideswarm\node.key` and `<TEMP_HOME>\.oxideswarm\rusty-grid.toml` (with no `cluster.secret` on the Windows machine), and ran `doctor`:
+
+```text
+PASS  C1 Connect                                 connected without a cluster secret in 34 ms
+Summary: 3 passed, 0 warnings, 0 failed, 2 skipped
+```
+
+4. Starting `oxideswarm.exe worker --no-portal --no-gpu` on the Windows machine registered worker `592f86b2-51cf-4e1f-b338-d1539f2c8cf9` (`Cores: 12, RAM: 16068MB, GPU: false, Simulated: false`, `Link: TCP/LAN`). On the master machine (`macOS`), `oxideswarm submit --master <MASTER_IP>:18088 --worker <WORKER_NAME> --wait -- echo paired-ok` completed:
+
+```text
+Task 0518c0f0-c8ce-421d-82c5-585ff97ffbd0 completed successfully.
+Worker: <WORKER_NAME> (592f86b2-51cf-4e1f-b338-d1539f2c8cf9)
+Exit Code: 0
+Execution Time: 348ms
+Stdout:
+paired-ok
+```
 
 ## Troubleshooting
 

@@ -1,6 +1,6 @@
 # 0052: Join on a LAN with a short code
 
-Status: Accepted (Partial: JOIN-2a built; JOIN-2b guide written, live LAN run pending)
+Status: Implemented
 Created: 2026-11-09    Updated: 2026-11-14
 
 ## Summary
@@ -140,7 +140,7 @@ Each step has a 5-second timeout, and the session runs over one TCP connection.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | JOIN-2a | Word list and code grammar, SPAKE2 exchange with the burn rule, `invite --code`, `join --code`, discovery on UDP 8087 | `crates/cli/src/pair.rs`, `crates/cli/src/wordlist.rs`, `crates/cli/src/members_cmd.rs`, `crates/cli/src/join.rs`, `tests/cli_pair_e2e.rs`, `README.md`, `CLAUDE.md`, `docs/SECURITY.md` | `cli_pair_e2e` passes on Linux, macOS and Windows | Implemented |
-| JOIN-2b | Guide section and live record | `docs/guides/add-a-machine.md`, `docs/README.md` | The live LAN run is recorded | Partial |
+| JOIN-2b | Guide section and live record | `docs/guides/add-a-machine.md`, `docs/README.md` | The live LAN run is recorded | Implemented |
 
 ## Status log
 
@@ -156,3 +156,4 @@ Each step has a 5-second timeout, and the session runs over one TCP connection.
   Partial pending the live Windows/macOS LAN run): BIP-0039 `CC0-1.0` wordlist (`wordlist.rs`),
   SPAKE2 + burn rule + UDP 8087 discovery + HKDF/ChaCha20-Poly1305 invite & `PairPendingNotice`
   handoff (`pair.rs`), `invite --code`, `join --code [--pair-host]`, and `tests/cli_pair_e2e.rs`.
+- 2026-11-14: Completed `JOIN-2b` and verified `tests/cli_pair_e2e.rs` on Linux, macOS and Windows in CI (run `43590921426`). Recorded the live two-machine LAN run in `docs/guides/add-a-machine.md` (macOS `arm64` master + inviter and Windows 11 `x86_64` joiner at `917c032`: UDP `8087` broadcast discovery with `422-tool-humor`, matching pairing check `711 627`, enrolled member `269b134d8914e3de`, `doctor` `3 passed, 0 warnings, 0 failed, 2 skipped`, and `submit --wait -- echo paired-ok` returning `paired-ok` in `348 ms`).
