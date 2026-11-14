@@ -8,6 +8,9 @@ pub mod dashboard;
 pub mod fair_share;
 pub mod liveness;
 pub mod mapreduce;
+pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod queue;
 pub mod reaper;
 pub mod registry;

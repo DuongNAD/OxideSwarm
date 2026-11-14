@@ -1138,29 +1138,9 @@ pub struct DoctorArgs {
     pub insecure: bool,
 }
 
-pub async fn run_cli() -> ExitCode {
-    run_cli_with(Cli::parse()).await
-}
-
-pub async fn run_cli_with(cli: Cli) -> ExitCode {
-    // Initialize tracing subscriber if not already set
-    let log_level = if cli.verbose {
-        "debug"
-    } else if cli.quiet {
-        "error"
-    } else {
-        "info"
-    };
-    let builder = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
-    );
+fn init_default_fmt_subscriber(env_filter: tracing_subscriber::EnvFilter, info_to_stdout: bool) {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
-    let is_mcp = matches!(cli.command, Commands::Mcp(_));
-    let info_to_stdout = matches!(
-        cli.command,
-        Commands::Master(_) | Commands::Worker(_) | Commands::Rendezvous(_) | Commands::Mode(_)
-    );
+    let builder = tracing_subscriber::fmt().with_env_filter(env_filter);
     let _ = if !info_to_stdout {
         builder.with_writer(std::io::stderr).try_init()
     } else {
@@ -1172,6 +1152,83 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
             )
             .try_init()
     };
+}
+
+pub async fn run_cli() -> ExitCode {
+    run_cli_with(Cli::parse()).await
+}
+
+pub async fn run_cli_with(cli: Cli) -> ExitCode {
+    #[cfg(feature = "otel")]
+    let (otel_layer, otel_handle) = if matches!(cli.command, Commands::Master(_)) {
+        match rusty_grid_master::otel::OtlpConfig::from_env() {
+            Ok(Some(cfg)) => {
+                let (layer, handle) = rusty_grid_master::otel::start_otlp_exporter(cfg);
+                (Some(layer), Some(handle))
+            }
+            Ok(None) => (None, None),
+            Err(e) => {
+                eprintln!("Configuration error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    // Initialize tracing subscriber if not already set
+    let log_level = if cli.verbose {
+        "debug"
+    } else if cli.quiet {
+        "error"
+    } else {
+        "info"
+    };
+    #[allow(unused_mut)]
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level)));
+    #[cfg(feature = "otel")]
+    if otel_layer.is_some() {
+        env_filter = env_filter.add_directive(
+            "oxideswarm::otel=info"
+                .parse()
+                .expect("static tracing directive is valid"),
+        );
+    }
+    let is_mcp = matches!(cli.command, Commands::Mcp(_));
+    let info_to_stdout = matches!(
+        cli.command,
+        Commands::Master(_) | Commands::Worker(_) | Commands::Rendezvous(_) | Commands::Mode(_)
+    );
+    #[cfg(feature = "otel")]
+    if let Some(otel_layer) = otel_layer {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = if !info_to_stdout {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(otel_layer)
+                .try_init()
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    tracing_subscriber::fmt::layer().with_writer(
+                        std::io::stderr
+                            .with_max_level(tracing::Level::WARN)
+                            .or_else(std::io::stdout),
+                    ),
+                )
+                .with(otel_layer)
+                .try_init()
+        };
+    } else {
+        init_default_fmt_subscriber(env_filter, info_to_stdout);
+    }
+    #[cfg(not(feature = "otel"))]
+    init_default_fmt_subscriber(env_filter, info_to_stdout);
 
     let config_file = match if is_mcp {
         crate::config::load_mcp_config_file(cli.config.as_deref())
@@ -1189,6 +1246,11 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     crate::connect::set_cli_master_key_flag(cli.master_key.clone());
     rusty_grid_core::mode::set_mode_runner_hook(crate::mode_cli::execute_mode_action);
     let exit_code = match cli.command {
+        #[cfg(feature = "otel")]
+        Commands::Master(args) => {
+            run_master_with_otel(args, config_file, secret_opts, otel_handle).await
+        }
+        #[cfg(not(feature = "otel"))]
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
         Commands::Submit(args) => run_submit_with_secret(args, config_file, secret_opts).await,
@@ -1564,18 +1626,43 @@ fn resolve_worker_target(
 /// Runs the master. The body's future is large (the server, the auth context and the P2P
 /// endpoint), so it is boxed: a caller on a default 2 MiB thread stack, such as a
 /// `#[tokio::test]`, would otherwise overflow it in a debug build.
+#[cfg(any(not(feature = "otel"), test))]
 async fn run_master(
     args: MasterArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
-    Box::pin(run_master_inner(args, config_file, secret_opts)).await
+    Box::pin(run_master_inner(
+        args,
+        config_file,
+        secret_opts,
+        #[cfg(feature = "otel")]
+        None,
+    ))
+    .await
+}
+
+#[cfg(feature = "otel")]
+async fn run_master_with_otel(
+    args: MasterArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+    otel_handle: Option<rusty_grid_master::otel::OtlpExporterHandle>,
+) -> ExitCode {
+    Box::pin(run_master_inner(
+        args,
+        config_file,
+        secret_opts,
+        otel_handle,
+    ))
+    .await
 }
 
 async fn run_master_inner(
     args: MasterArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
+    #[cfg(feature = "otel")] otel_handle: Option<rusty_grid_master::otel::OtlpExporterHandle>,
 ) -> ExitCode {
     let master_cfg = config_file.as_ref().and_then(|c| c.master.clone());
 
@@ -2137,6 +2224,10 @@ async fn run_master_inner(
     wait_for_worker_shutdown_signal().await;
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
+    #[cfg(feature = "otel")]
+    if let Some(otel) = otel_handle {
+        otel.shutdown().await;
+    }
     ExitCode::SUCCESS
 }
 

@@ -9,8 +9,7 @@ Today one master runs the whole grid for one owner or one small team. This recor
 of that design with evidence, and a staged architecture that grows it to many workers and many
 submitters: a load harness first, then a faster scheduler, worker-to-worker blob distribution, a
 highly available master, autoscaling providers and, last, federation of sites. It also covers
-multi-tenancy and observability, which a shared grid needs. Stage D2 (`SCALE-2`) is implemented in code pending the post-`SCALE-1` harness comparison; the remaining stages list
-its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
+multi-tenancy and observability, which a shared grid needs. D7 (`ECO-4`) is built and stage D2 (`SCALE-2`) is implemented in code pending the post-`SCALE-1` harness comparison; the remaining stages are planned. Each open choice lists its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
 
 ## Context
 
@@ -210,12 +209,36 @@ guide says so. Fair share (D2 option B) uses the tenant as the submitter key.
 
 ### D7: Observability (`ECO-4`)
 
-A `/metrics` endpoint in Prometheus text format on the dashboard listener, behind the Observer
-scope: queue depth by state, tasks per second, scheduling latency histogram, workers by state and
-link, blob bytes in and out, journal size and fsync time, store health. OpenTelemetry traces
-(submit, place, assign, run, result) behind an opt-in Cargo feature, exported over OTLP, with the
-task id as the trace id seed. `tracing` already exists in the code base, so spans map to existing
-log points. Log lines never carry the secret or task inputs.
+`GET /metrics` on the dashboard router (`crates/master/src/web_ui.rs`, `metrics.rs`) exposes
+Prometheus text exposition (`text/plain; version=0.0.4; charset=utf-8`), guarded by
+`AuthScope::Observer` in `crates/master/src/auth.rs`:
+
+- Queue & throughput: `oxideswarm_queue_tasks{state}` (`queued`, `scheduled`, `running`,
+  `retrying`, `completed`, `failed`, `cancelled`), `oxideswarm_queue_active_bytes`,
+  `oxideswarm_queue_max_active_bytes`, `oxideswarm_tasks_submitted_total`,
+  `oxideswarm_tasks_terminal_total{state}` (`completed`, `failed`, `cancelled`),
+  `oxideswarm_tasks_per_second` (60-second sliding window anchored to creation `Instant`), and
+  `oxideswarm_scheduling_latency_seconds` histogram (`_bucket`, `_sum`, `_count`).
+- Workers (`state` × `link`): `oxideswarm_workers{state,link}` (`connected`, `busy`,
+  `disconnected` × `tcp_lan`, `quic_direct`, `quic_relay`, plus `other` when present; live
+  `iroh::endpoint::Connection` inspection overrides tags for P2P workers).
+- Blob store & durable journal (`--state-dir`): `oxideswarm_blob_bytes_in_total`,
+  `oxideswarm_blob_bytes_out_total`, `oxideswarm_blob_evictions_total`,
+  `oxideswarm_blob_store_bytes`, `oxideswarm_blob_store_max_bytes`,
+  `oxideswarm_blob_store_objects`, `oxideswarm_journal_bytes`, `oxideswarm_journal_records`,
+  `oxideswarm_journal_fsync_duration_seconds` histogram, `oxideswarm_store_configured` (`1`/`0`),
+  and `oxideswarm_store_healthy` (`1` healthy, `0` after any write failure).
+
+Opt-in OpenTelemetry tracing (`--features otel` on `rusty_grid_master` / `rusty_grid_cli`, zero
+new external packages in `Cargo.lock`) exports `oxideswarm::otel` lifecycle spans (`submit`,
+`place`, `assign`, `run`, `result`) over OTLP/HTTP JSON (`POST /v1/traces`, configured via
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` plus `OTEL_SERVICE_NAME`)
+in `crates/master/src/otel.rs` and `crates/cli/src/cli_app.rs`. `traceId` and `parentSpanId` are
+deterministically derived from `task_id` via keyed BLAKE3, and only a closed attribute allowlist
+(`task_id`, `worker_id`, `priority`, `requires_gpu`, `verdict`, `outcome`, `exit_code`, `attempt`)
+is captured. Endpoint parsing rejects embedded URL credentials without echoing secrets, and cluster
+secrets, bearer tokens, worker IPs, task commands/inputs, and store error strings never appear in
+Prometheus labels or OTLP attributes.
 
 ### D8: Federation of sites (`SCALE-6`, last, optional)
 
@@ -268,7 +291,7 @@ only if the owner's Q8 target needs more than one site.
 | SCALE-5 | Autoscaling providers (D5) | new `crates/` module or bin | A queue backlog starts workers and idle time drains them, recorded live | Planned |
 | SCALE-6 | Multi-site federation (D8) | to be designed | A task reaches a worker in another site | Planned |
 | ECO-3 | Multi-tenancy and quotas (D6) | `crates/core/src/task.rs`, `crates/master/src/auth.rs`, `queue.rs` | An over-quota submit is refused and the audit log shows it | Planned |
-| ECO-4 | Observability (D7) | `crates/master/src/web_ui.rs` | A Prometheus scrape returns the listed series | Planned |
+| ECO-4 | Observability (D7) | `crates/master/src/metrics.rs`, `otel.rs`, `web_ui.rs`, `auth.rs`, `queue.rs`, `scheduler.rs`, `store.rs`, `crates/cli/src/cli_app.rs` | A Prometheus scrape returns the listed series | Implemented |
 
 Order: SCALE-1 first, then SCALE-2 and SCALE-3 as the numbers direct, SCALE-4, SCALE-5, and
 SCALE-6 only on need. ECO-3 and ECO-4 can start after SCALE-1.
@@ -278,4 +301,10 @@ SCALE-6 only on need. ECO-3 and ECO-4 can start after SCALE-1.
 - 2026-11-09: Created as Draft at the owner's request to grow OxideSwarm into a large project.
   Nothing is built. The owner's decisions Q8, Q9 and Q12 in `ROADMAP.md` fix the target scale, the
   HA approach and the first providers.
+- 2026-11-14: Implemented ECO-4 (D7): added authenticated Prometheus `GET /metrics`
+  (`AuthScope::Observer`) in `crates/master/src/metrics.rs`, `web_ui.rs`, `auth.rs`, `queue.rs`,
+  and `store.rs`, plus opt-in zero-SDK `--features otel` OTLP/HTTP JSON trace export across
+  `submit`, `place`, `assign`, `run`, and `result` lifecycle spans seeded deterministically from
+  `task_id` in `crates/master/src/otel.rs`, `scheduler.rs`, and `crates/cli/src/cli_app.rs`
+  (`tests/observability_metrics_otel_test.rs`).
 - 2026-11-14: Implemented D2 (`SCALE-2`) scheduler bitset index (`WorkerIndex` and `RegisteredIndex`), `SCAN_PAGE = 512` and `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size`), adaptive micro-batch debounce and multi-batch drain, per-submitter `FairShareQueues`, dashboard receiver guards, and `ColdResultStore` disk spill. Marked Partial until the 500-worker / 20-submitter `SCALE-1` harness run is recorded after PR #222 lands.

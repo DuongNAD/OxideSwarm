@@ -305,6 +305,7 @@ struct Shared {
     pending_compactions: AtomicU64,
     compaction_due: AtomicBool,
     failed: Mutex<Option<String>>,
+    fsync_duration: crate::metrics::Histogram,
     /// Test-only fault injection: 1 = `sync_data` fails, 2 = the writer panics at the sync.
     #[cfg(test)]
     inject: std::sync::atomic::AtomicU8,
@@ -506,6 +507,11 @@ impl TaskStore {
         self.shared.journal_bytes.load(Ordering::Relaxed)
     }
 
+    /// Lock-free histogram of durable `sync_data` / `compact` fsync durations.
+    pub fn fsync_histogram(&self) -> &crate::metrics::Histogram {
+        &self.shared.fsync_duration
+    }
+
     /// Returns the error reason if the store writer has failed since [`TaskStore::open`], or
     /// `None` while durability is healthy. Once set, durability is gone until the master restarts.
     pub fn failure_reason(&self) -> Option<String> {
@@ -661,14 +667,22 @@ impl Writer {
             _ => {}
         }
         self.shared.sync_calls.fetch_add(1, Ordering::Relaxed);
-        sync_file_data(&self.journal, &self.dir, "journal_data")
-            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e))
+        let started = std::time::Instant::now();
+        let res = sync_file_data(&self.journal, &self.dir, "journal_data")
+            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e));
+        self.shared.fsync_duration.observe(started.elapsed());
+        res
     }
 
     fn compact(&mut self, image: &SnapshotImage) -> GridResult<()> {
         let next = self.generation + 1;
-        write_snapshot_file(&self.dir, next, image)?;
-        reset_journal(&mut self.journal, &self.dir, next, "journal_reset")?;
+        let started = std::time::Instant::now();
+        let res = (|| {
+            write_snapshot_file(&self.dir, next, image)?;
+            reset_journal(&mut self.journal, &self.dir, next, "journal_reset")
+        })();
+        self.shared.fsync_duration.observe(started.elapsed());
+        res?;
         self.generation = next;
         self.bytes = HEADER_LEN as u64;
         self.records = 0;

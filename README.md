@@ -188,6 +188,10 @@ flowchart LR
   ([design 0016](docs/design/0016-mapreduce-cli-script-shipping.md)).
 - **Web dashboard:** live workers, tasks and links over plain HTTP. It listens on loopback by
   default, and needs a token once the master has a secret.
+- **Observability:** Prometheus metrics at `GET /metrics` on the dashboard listener (`Observer`
+  scope when authentication is active) and opt-in OTLP/HTTP JSON task lifecycle traces when built
+  with `--features otel` (`OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+  `OTEL_SERVICE_NAME`; [design 0050](docs/design/0050-scale-out-architecture.md)).
 - **Discovery:** `--master auto` finds a master on the LAN through an authenticated UDP beacon,
   falls back to an HTTP `/api/discovery/probe` on `--web-ui-addr` / candidate hosts, and falls back
   across subnets to a standalone keyed HTTP rendezvous registry (`oxideswarm rendezvous` on `:8090`,
@@ -760,7 +764,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | :--- | :--- | :--- | :--- |
 | **8088** | TCP | Master Grid Coordinator | Primary cluster communication port for worker node registration, heartbeat exchanges, task distribution, and CLI client requests (`submit`, `status`, `workers`, `mapreduce`). Protected by mutual HMAC-SHA256 handshake (`cluster_auth`). |
 | **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--port 8090`) when co-locating services. |
-| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
+| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, Prometheus metrics (`/metrics`), live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
 | **8089** | UDP | Master Discovery Beacon | When the master listens on a non-loopback address, it binds `0.0.0.0:8089` and broadcasts its cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`); when the master listens on loopback, it binds that loopback address (`127.0.0.1:8089`), answers local unicast probes only, and does not broadcast. When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
 | **8087** | UDP | Short-Code Pairing Discovery | Bound only for the lifetime of an active `oxideswarm invite --code` session (at most 10 minutes), paired with an ephemeral TCP listener (`<= 4 KiB` frames). `join --code` queries nameplate matches on UDP `8087` and connects over TCP to run SPAKE2 (`oxs-pair-v1`), with a strict single-guess burn rule ([design 0052](docs/design/0052-short-code-pairing.md)). |
 | **8090** | TCP (HTTP) | Standalone Rendezvous Registry | Default listener for `oxideswarm rendezvous` (`127.0.0.1:8090`; override with `--listen` or `OXIDESWARM_RENDEZVOUS_LISTEN`). Accepts signed `POST /api/rendezvous/register` leases and serves `GET /api/rendezvous/master?key=<hex>` to requests with a valid `X-OxideSwarm-Lease-Auth` signature (`http://` only; terminate TLS in a local reverse proxy). **Port Note:** `README.md` `agent-mesh hub` examples also show `8090`; bind one to an alternate port when running both on the same host. |
@@ -829,6 +833,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `OXIDESWARM_RENDEZVOUS_LISTEN` | Rendezvous | Listen address for `oxideswarm rendezvous` (`--listen`; default `127.0.0.1:8090`) |
 | `RUSTY_GRID_RENDEZVOUS` | Master, Worker & Clients | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
 | `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces (`1` or `true`; equivalent to `--dev`) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Master (`--features otel`) | Full `http://` or `https://` OTLP/HTTP JSON trace endpoint URL (`POST` as given; takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`; URLs carrying embedded credentials are rejected, [design 0050](docs/design/0050-scale-out-architecture.md)) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Master (`--features otel`) | Base `http://` or `https://` OTLP collector URL (appends `/v1/traces` when path is empty or `/`; URLs carrying embedded credentials are rejected, [design 0050](docs/design/0050-scale-out-architecture.md)) |
+| `OTEL_SERVICE_NAME` | Master (`--features otel`) | `service.name` resource attribute exported on `oxideswarm::otel` task lifecycle spans (default `oxideswarm-master`, [design 0050](docs/design/0050-scale-out-architecture.md)) |
 
 #### Tier C: Worker Node Engine, GPU, CUDA, Blender & 3D Subsystem
 | Variable | Component | Purpose |
