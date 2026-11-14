@@ -100,7 +100,7 @@ name.
 1. It detects the system and the architecture, picks the archive, and checks it against
    `archives/SHA256SUMS`.
 2. It unpacks the archive into a per-user folder: `~/Library/Application Support/OxideSwarm/bin`,
-   `%LOCALAPPDATA%\OxideSwarm\bin` or `~/.local/share/oxideswarm/bin`.
+   `%LOCALAPPDATA%\OxideSwarm-USB\bin` or `~/.local/share/oxideswarm/bin`.
 3. It runs `oxideswarm join --invite-file <stick>/OxideSwarm/invite.oxs`. `join` asks for the
    passphrase with echo off, decrypts the invite in memory and enrols as in 0051 D4. It prints the
    master's fingerprint and the pairing check, waits for the approval, and asks the user to confirm

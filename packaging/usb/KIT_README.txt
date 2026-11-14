@@ -12,7 +12,7 @@ The installer:
   1. checks the program against archives/SHA256SUMS,
   2. copies it to a per-user folder
        macOS    ~/Library/Application Support/OxideSwarm
-       Windows  %LOCALAPPDATA%\OxideSwarm
+       Windows  %LOCALAPPDATA%\OxideSwarm-USB
        Linux    ~/.local/share/oxideswarm
   3. joins the cluster with join.token,
   4. starts the worker and starts it again at every login,

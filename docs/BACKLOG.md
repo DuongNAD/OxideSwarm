@@ -232,7 +232,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), 185, 195, 207 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
-| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
+| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented | (open) |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
@@ -2568,3 +2568,13 @@ Add one dated line per finished item, newest last.
   `681012d`: `crates/worker/src/client.rs` unit tests moved to `crates/worker/src/client/tests.rs`,
   8,252 to 4,363 lines); USB-1 lists merged pull requests 185, 195 and 207; and ENROLL-1b merged in
   pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
+- 2026-11-14: Implemented USB-3 (Keep the Windows USB install folder apart from the default
+  workspace root): `packaging/usb/install.ps1` defaults `-InstallRoot` to
+  `%LOCALAPPDATA%\OxideSwarm-USB` (and `<drive>:\OxideSwarm-USB`), refuses fresh installs in
+  `%LOCALAPPDATA%\OxideSwarm` or `%LOCALAPPDATA%\oxideswarm\workspaces` while continuing `-Update`
+  and `uninstall.ps1` fallback for legacy `%LOCALAPPDATA%\OxideSwarm` installs, always passes
+  `--workspace-root <folder>\workspaces` (or `<folder>\usb-kit\workspaces` on legacy updates)
+  marked with `.oxideswarm-usb-workspaces`, and `packaging/usb/uninstall.ps1` refuses to delete a
+  folder containing an unmarked or foreign-used `workspaces` directory while naming the worker using
+  it (`tests/test_launcher_scripts.py` + isolated live Windows cluster check). The Index counts are
+  now 72 Implemented, 7 Partial and 43 Planned.
