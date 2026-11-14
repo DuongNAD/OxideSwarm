@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`): adds `ClientMessage` and `ClientResponse` variants for OXS-AUTH v3 enrollment, invites, and member management ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 
+### Security
+- Windows workers now create and validate `<sandbox_base>\cache`, `cache\blobs`, `objects`, `tmp`, fanout subdirectories, and `.locks` through `ensure_private_dir` (refusing reparse points, untrusted owners, and foreign write-class grants); `packaging/windows/install_windows_service.ps1` checks reparse points and owners (`SYSTEM` or `Administrators`) before stopping a service or modifying any path, creates missing directories in one step with a protected DACL, grants Modify by SID (`*<serviceSid>:(OI)(CI)M`), checks every `icacls` exit code, verifies resulting DACLs, and resets child ownership and inherited ACLs under `$DataDir` (`/setowner *S-1-5-32-544 /T /C`, `/reset /T /C`); and `packaging/usb/install.ps1` sets the private DACL on an existing open install root via a single `FILE_FLAG_OPEN_REPARSE_POINT` handle while bounding `-Update`'s open-root scan to control directories ([design 0021](docs/design/0021-private-default-sandbox-base.md)).
+
 ## [0.1.2] - 2026-11-12
 
 A patch release for the USB setup kit and for Windows workers. The protocol is still version 7, so
