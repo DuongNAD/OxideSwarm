@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `fc33c9e7` plus ENROLL-1b: 70 items Implemented, 6 Partial and 46 Planned. Five items
+On 2026-11-14 (`mac/join-2-lan-code`, at `master` `8596c5fd`): 70 items Implemented, 7 Partial and 45 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -229,7 +229,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 (open) |
-| JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
+| JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Partial | (design 0052), (open) |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
@@ -1727,6 +1727,7 @@ then JOIN-2 and USB-1 in parallel.
   not confirm cancels the code. Approval stays.
 - **Done when:** `tests/cli_pair_e2e.rs` passes on Linux, macOS and Windows, and a live LAN run
   between Windows and macOS is recorded.
+- **Status (2026-11-14):** `JOIN-2a` (`pair.rs`, `wordlist.rs`, `invite --code`, `join --code [--pair-host]`, `tests/cli_pair_e2e.rs`) and `docs/guides/add-a-machine.md` are built (`Partial`: `JOIN-2b` live Windows/macOS LAN run pending).
 
 ### USB-1: Set up machines from a USB stick
 
@@ -2559,3 +2560,4 @@ Add one dated line per finished item, newest last.
   `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live revocation across all lanes and task
   cancellation/requeue) and `ENROLL-1d` (dashboard members page and docs/guide) are Planned. The
   Index counts are now 70 Implemented, 6 Partial and 46 Planned.
+- 2026-11-14: JOIN-2 is Partial (`mac/join-2-lan-code` on `master` `8596c5fd`): `JOIN-2a` implemented (`crates/cli/src/wordlist.rs` BIP-0039 `CC0-1.0` list, `crates/cli/src/pair.rs` UDP `8087` discovery + SPAKE2 + burn rule + encrypted invite / `PairPendingNotice` handoff, `invite --code`, `join --code [--pair-host]`, `tests/cli_pair_e2e.rs`) and `docs/guides/add-a-machine.md` added; `JOIN-2b` stays Partial pending the live two-machine Windows/macOS LAN run. The Index counts are now 70 Implemented, 7 Partial and 45 Planned.

@@ -1,7 +1,7 @@
 # 0052: Join on a LAN with a short code
 
-Status: Accepted (decision Q13, 2026-11-09); not built; needs ENROLL-1b
-Created: 2026-11-09    Updated: 2026-11-09
+Status: Accepted (Partial: JOIN-2a built; JOIN-2b guide written, live LAN run pending)
+Created: 2026-11-09    Updated: 2026-11-14
 
 ## Summary
 
@@ -45,9 +45,9 @@ guess per code, and every failed or abandoned exchange cancels the code. Item `J
 - The form is `<nameplate>-<word>-<word>`. The nameplate is a random number from 1 to 999. Each word
   comes from a 2048-entry English word list, which gives 22 bits.
 - The word list ships in the binary and must carry a licence compatible with `MIT OR Apache-2.0`,
-  such as a public-domain list. `JOIN-2a` names the list and its source in this record. USB-1
-  ([0053](0053-usb-setup-kit.md)) uses the same list for passphrases; whichever item lands first
-  adds it.
+  such as a public-domain list. `crates/cli/src/wordlist.rs` embeds the 2048-word Bitcoin BIP-0039
+  English wordlist copied verbatim from `rust-bitcoin/rust-bip39` v3.0.0 (`CC0-1.0` Public Domain
+  dedication). USB-1 ([0053](0053-usb-setup-kit.md)) shares `wordlist.rs`.
 - A word that is not in the list is caught before any network traffic, and `join` suggests the
   closest word.
 
@@ -78,12 +78,19 @@ Each step has a 5-second timeout, and the session runs over one TCP connection.
    someone who did not know it; nothing was shared; make a new code". An attacker thus never
    receives anything that tests a guess, and gets one guess per code. A connection that stalls
    before sending its SPAKE2 message holds the single slot for at most 5 seconds.
-4. The inviter sends the invite string, encrypted with ChaCha20-Poly1305 under a key derived from
-   `K`. The joiner then goes on as `join` does with an invite (0051 D4), including the pairing check
-   and its own confirmation.
-5. The inviting process watches the master's pending requests for its invite id, with the 0051
-   messages `members pending` and `members approve`. It shows
-   `<name> (<os>/<arch>, <address>) wants to join. Pairing check 418 302. Approve? [y/N]`.
+4. The inviter derives directional keys via HKDF-SHA256 (`salt = "oxs-pair-v1-aead-salt"`,
+   info `"oxs-pair-v1-key-i2j"` and `"oxs-pair-v1-key-j2i"`) and sends the invite string encrypted
+   with ChaCha20-Poly1305 (`seq = 0`, AAD `"oxs-pair-v1-invite"`). When `--master` was omitted (or
+   loopback/unspecified) while the pairing TCP socket used a non-loopback interface, the inviter
+   puts that interface's IP with the master port into the invite so the joiner reaches the LAN
+   master without extra flags. The joiner then goes on as `join` does with an invite (0051 D4),
+   including the pairing check and its own confirmation.
+5. Once the master answers `EnrollPending`, the joiner sends an encrypted `PairPendingNotice`
+   (`pending_id`, 6-digit `pairing_code`, `master_fingerprint`) back over `oxs-pair-v1-key-j2i`
+   (`seq = 1`, AAD `"oxs-pair-v1-pending"`). The inviting process verifies that `pending_id` on the
+   master via `ListPendingEnrollments` (0051), checks its `invite_id` and `master_fingerprint`,
+   shows `<name> (<os>/<arch>, <address>) wants to join. Pairing check 418 302. Approve? [y/N]`,
+   and sends `ApproveEnrollment` (or `RejectEnrollment` and `RevokeInvite`) on confirmation.
 
 ### D4 Limits and command line
 
@@ -132,8 +139,8 @@ Each step has a 5-second timeout, and the session runs over one TCP connection.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| JOIN-2a | Word list and code grammar, SPAKE2 exchange with the burn rule, `invite --code`, `join --code`, discovery on UDP 8087 | `crates/cli/src/pair.rs` (new), `crates/cli/src/wordlist.rs` (new), `crates/cli/src/join.rs`, `crates/cli/src/cli_app.rs`, `README.md` (ports) | `cli_pair_e2e` passes on Linux, macOS and Windows | Planned |
-| JOIN-2b | Guide section and live record | `docs/guides/add-a-machine.md` | The live LAN run is recorded | Planned |
+| JOIN-2a | Word list and code grammar, SPAKE2 exchange with the burn rule, `invite --code`, `join --code`, discovery on UDP 8087 | `crates/cli/src/pair.rs`, `crates/cli/src/wordlist.rs`, `crates/cli/src/members_cmd.rs`, `crates/cli/src/join.rs`, `tests/cli_pair_e2e.rs`, `README.md`, `CLAUDE.md`, `docs/SECURITY.md` | `cli_pair_e2e` passes on Linux, macOS and Windows | Implemented |
+| JOIN-2b | Guide section and live record | `docs/guides/add-a-machine.md`, `docs/README.md` | The live LAN run is recorded | Partial |
 
 ## Status log
 
@@ -145,3 +152,7 @@ Each step has a 5-second timeout, and the session runs over one TCP connection.
     port 8089;
   - `join --code`, which keeps the argument rule of 0048;
   - the 0051 pending messages are named.
+- 2026-11-14: Implemented `JOIN-2a` and wrote `docs/guides/add-a-machine.md` (`JOIN-2b` stays
+  Partial pending the live Windows/macOS LAN run): BIP-0039 `CC0-1.0` wordlist (`wordlist.rs`),
+  SPAKE2 + burn rule + UDP 8087 discovery + HKDF/ChaCha20-Poly1305 invite & `PairPendingNotice`
+  handoff (`pair.rs`), `invite --code`, `join --code [--pair-host]`, and `tests/cli_pair_e2e.rs`.
