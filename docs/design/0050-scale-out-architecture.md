@@ -117,6 +117,23 @@ Recommended order: A, then B with D6, then C only when the harness shows A and B
 Option A keeps the 8-state machine (`TaskQueue::can_transition_to`) and the `Engine::hold_back`
 rule that keeps wide tasks from starving.
 
+Implemented (`SCALE-2`): `WorkerIndex` and `RegisteredIndex` in `crates/master/src/worker_index.rs`
+maintain $O(W / 64)$ `u64` bitsets over OS, architecture, worker id/name, isolation level, tools,
+tags, GPU capability, protocol features (including `WORKSPACES`), free slots, and mobile
+thermal/battery buckets for fast candidate filtering and `fail_unfulfillable_tasks` checks.
+`WorkloadScheduler` (`crates/master/src/scheduler.rs`) scans `SCAN_PAGE = 512` ready tasks per step,
+`MasterServer::spawn` raises the default batch cap to `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024`
+(configurable via `master --max-batch-size`, `RUSTY_GRID_MAX_BATCH_SIZE`, and
+`[master].max_batch_size`), and both scheduler loops use adaptive micro-batch debounce plus a
+bounded multi-batch drain (`MAX_CONSECUTIVE_BATCHES = 16`). `FairShareQueue` in
+`crates/master/src/fair_share.rs` interleaves queued submissions per `SubmitterId` with weighted
+deficit round-robin while preserving priority ordering, wide-task hold-back, and `SpeedBook`
+hold-back. Dashboard broadcast sites guard on `b_tx.receiver_count() > 0` before calling
+`get_task`/`stats`, and `ColdResultStore` (`crates/master/src/cold_results.rs`, stored under
+`<state_dir>/cold_results/results.pack`) spills terminal `TaskResult` payloads past the hot
+limits (`DEFAULT_MAX_HOT_TERMINAL_TASKS` / `DEFAULT_MAX_HOT_TERMINAL_BYTES`) while keeping
+`GetTaskStatus` RAM-only via `TaskStatusDetail`.
+
 ### D3: Worker-to-worker blob distribution (`SCALE-3`)
 
 Workers already keep a bounded BLAKE3 cache (`crates/worker/src/blob_cache.rs`). The master becomes

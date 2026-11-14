@@ -21,6 +21,11 @@ use rusty_grid_core::task::{
     CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
 };
 
+use crate::cold_results::{
+    task_result_bytes, ColdResultStore, ColdResultSummary, DEFAULT_MAX_HOT_TERMINAL_BYTES,
+    DEFAULT_MAX_HOT_TERMINAL_TASKS,
+};
+use crate::fair_share::{FairShareQueues, FairWalkCursor, SubmitterId};
 use crate::store::{
     DurableAck, JournalRecord, PersistedTaskEntry, Recovered, SnapshotImage, TaskStore,
 };
@@ -365,6 +370,10 @@ pub struct TaskEntry {
     pub retry_history: Vec<RetryAttempt>,
     pub result: Option<TaskResult>,
     pub error_message: Option<String>,
+    /// Fair-share submitter identity (not persisted across restarts).
+    pub submitter: SubmitterId,
+    /// Compact metadata retained in RAM after the full `TaskResult` spills to `cold_results/`.
+    pub cold_result: Option<ColdResultSummary>,
 }
 
 impl TaskEntry {
@@ -379,8 +388,16 @@ impl TaskEntry {
             failover_count: self.failover_count,
             evacuation_count: self.evacuation_count,
             submitted_at_utc: self.submitted_at_utc,
-            execution_time_ms: self.result.as_ref().map(|r| r.execution_time_ms),
-            exit_code: self.result.as_ref().map(|r| r.exit_code),
+            execution_time_ms: self
+                .result
+                .as_ref()
+                .map(|r| r.execution_time_ms)
+                .or_else(|| self.cold_result.as_ref().map(|c| c.execution_time_ms)),
+            exit_code: self
+                .result
+                .as_ref()
+                .map(|r| r.exit_code)
+                .or_else(|| self.cold_result.as_ref().map(|c| c.exit_code)),
             error_message: self.error_message.clone(),
         }
     }
@@ -403,6 +420,14 @@ pub struct TaskInfo {
     pub execution_time_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub error_message: Option<String>,
+}
+
+/// RAM-only task status summary for `GetTaskStatus` without reading cold result files.
+#[derive(Debug, Clone)]
+pub struct TaskStatusDetail {
+    pub info: TaskInfo,
+    pub result_exit_code: Option<i32>,
+    pub result_error: Option<String>,
 }
 
 /// Aggregated statistics of tasks currently managed by `TaskQueue`.
@@ -688,6 +713,7 @@ fn is_schedulable_queued(entry: &TaskEntry, policy: &RetryPolicy, now: Instant) 
 struct TaskQueueInner {
     tasks: HashMap<TaskId, TaskEntry>,
     ready_queue: BTreeSet<QueueOrderKey>,
+    fair_queues: FairShareQueues,
     delayed_retries: BTreeSet<DelayedRetryKey>,
     worker_assignments: HashMap<Uuid, HashSet<TaskId>>,
     next_sequence: u64,
@@ -701,6 +727,20 @@ struct TaskQueueInner {
     terminal_sizes: HashMap<TaskId, usize>,
     /// Sum of `terminal_sizes`.
     terminal_bytes: usize,
+    /// FIFO order of terminal tasks whose full `TaskResult` is still hot in RAM.
+    hot_terminal_order: std::collections::VecDeque<TaskId>,
+    /// Result payload byte size per hot terminal task.
+    hot_terminal_sizes: HashMap<TaskId, usize>,
+    /// Sum of `hot_terminal_sizes`.
+    hot_terminal_bytes: usize,
+    /// Max hot terminal tasks kept in RAM when `cold_results` is active.
+    max_hot_terminal_tasks: usize,
+    /// Max hot terminal result bytes kept in RAM when `cold_results` is active.
+    max_hot_terminal_bytes: usize,
+    /// Cold result files queued for unlinking after eviction (flushed off the lock).
+    pending_cold_deletes: Vec<TaskId>,
+    /// Out-of-band cold result storage attached alongside `store`.
+    cold_results: Option<Arc<ColdResultStore>>,
     /// Bytes each active (non-terminal) task is currently charged (see `retained_bytes`).
     active_sizes: HashMap<TaskId, usize>,
     /// Sum of `active_sizes`.
@@ -832,21 +872,12 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
 /// Bytes of payload and output a task entry keeps alive: its spec (stdin, sources, input data),
 /// checkpoint, captured stdout/stderr and the strings of its history.
 fn retained_bytes(entry: &TaskEntry) -> usize {
-    let result = entry.result.as_ref().map_or(0, |r| {
-        r.stdout.0.len()
-            + r.stderr.0.len()
-            + r.error.as_ref().map_or(0, String::len)
-            + r.device_name.as_ref().map_or(0, String::len)
-            + r.asset_bytes.as_ref().map_or(0, |b| b.0.len())
-            + r.artifacts
-                .iter()
-                .map(|a| a.path.len() + a.data.len())
-                .sum::<usize>()
-            + r.outputs
-                .iter()
-                .map(|o| o.path.len() + BLOB_REF_BYTES)
-                .sum::<usize>()
-    });
+    let result = entry
+        .result
+        .as_ref()
+        .map(task_result_bytes)
+        .or_else(|| entry.cold_result.as_ref().map(|c| c.result_bytes))
+        .unwrap_or(0);
     let history: usize = entry
         .retry_history
         .iter()
@@ -876,16 +907,17 @@ impl TaskQueueInner {
 
     /// Drops a retained terminal task and its byte charge.
     fn remove_retained(&mut self, task_id: &TaskId) {
-        let (prev_hold_worker, ws_name) = self
+        let (prev_hold_worker, ws_name, had_cold) = self
             .tasks
             .get(task_id)
             .map(|e| {
                 (
                     e.adoptable_by.map(|(w, _)| w),
                     e.task.workspace.as_ref().map(|ws| ws.name.clone()),
+                    e.cold_result.is_some(),
                 )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, false));
         self.tasks.remove(task_id);
         self.untrack_active_task(task_id);
         self.track_adoption_hold(*task_id, false);
@@ -902,6 +934,18 @@ impl TaskQueueInner {
         }
         if let Some(size) = self.terminal_sizes.remove(task_id) {
             self.terminal_bytes = self.terminal_bytes.saturating_sub(size);
+        }
+        if let Some(hsize) = self.hot_terminal_sizes.remove(task_id) {
+            self.hot_terminal_bytes = self.hot_terminal_bytes.saturating_sub(hsize);
+            if self.hot_terminal_order.len()
+                > self.hot_terminal_sizes.len().saturating_mul(2).max(64)
+            {
+                self.hot_terminal_order
+                    .retain(|id| self.hot_terminal_sizes.contains_key(id));
+            }
+        }
+        if had_cold && self.cold_results.is_some() {
+            self.pending_cold_deletes.push(*task_id);
         }
     }
 
@@ -961,10 +1005,17 @@ impl TaskQueueInner {
         if self.terminal_sizes.contains_key(&task_id) {
             return;
         }
-        let size = self.tasks.get(&task_id).map_or(0, retained_bytes);
+        let (size, hot_size) = self.tasks.get(&task_id).map_or((0, None), |e| {
+            (retained_bytes(e), e.result.as_ref().map(task_result_bytes))
+        });
         self.terminal_sizes.insert(task_id, size);
         self.terminal_bytes += size;
         self.terminal_order.push_back(task_id);
+        if let Some(hsize) = hot_size {
+            self.hot_terminal_sizes.insert(task_id, hsize);
+            self.hot_terminal_bytes = self.hot_terminal_bytes.saturating_add(hsize);
+            self.hot_terminal_order.push_back(task_id);
+        }
         self.enforce_terminal_limits();
     }
 
@@ -989,10 +1040,25 @@ impl TaskQueueInner {
     fn insert_ready(&mut self, key: QueueOrderKey) {
         if self.ready_queue.insert(key) {
             self.ready_epoch = self.ready_epoch.wrapping_add(1);
+            let submitter = self
+                .tasks
+                .get(&key.task_id)
+                .map_or(SubmitterId::Default, |e| e.submitter);
+            self.fair_queues.insert(submitter, key);
             if let Some(entry) = self.tasks.get_mut(&key.task_id) {
                 entry.queued_instant = Instant::now();
             }
         }
+    }
+
+    fn remove_ready(&mut self, key: &QueueOrderKey) -> bool {
+        let removed = self.ready_queue.remove(key);
+        let submitter = self
+            .tasks
+            .get(&key.task_id)
+            .map_or(SubmitterId::Default, |e| e.submitter);
+        self.fair_queues.remove(submitter, key);
+        removed
     }
 
     fn snapshot_image(&self) -> SnapshotImage {
@@ -1016,6 +1082,7 @@ impl TaskQueueInner {
                 retry_history: entry.retry_history.clone(),
                 result: entry.result.clone(),
                 error_message: entry.error_message.clone(),
+                cold_result: entry.cold_result.clone(),
             })
             .collect();
         tasks.sort_unstable_by_key(|e| e.sequence);
@@ -1244,6 +1311,7 @@ impl TaskQueue {
             inner: Arc::new(RwLock::new(TaskQueueInner {
                 tasks: HashMap::new(),
                 ready_queue: BTreeSet::new(),
+                fair_queues: FairShareQueues::default(),
                 delayed_retries: BTreeSet::new(),
                 worker_assignments: HashMap::new(),
                 next_sequence: 1,
@@ -1255,6 +1323,13 @@ impl TaskQueue {
                 terminal_order: std::collections::VecDeque::new(),
                 terminal_sizes: HashMap::new(),
                 terminal_bytes: 0,
+                hot_terminal_order: std::collections::VecDeque::new(),
+                hot_terminal_sizes: HashMap::new(),
+                hot_terminal_bytes: 0,
+                max_hot_terminal_tasks: DEFAULT_MAX_HOT_TERMINAL_TASKS,
+                max_hot_terminal_bytes: DEFAULT_MAX_HOT_TERMINAL_BYTES,
+                pending_cold_deletes: Vec::new(),
+                cold_results: None,
                 active_sizes: HashMap::new(),
                 active_bytes: 0,
                 ready_epoch: 0,
@@ -1389,7 +1464,7 @@ impl TaskQueue {
             }
             (entry.priority, entry.sequence)
         };
-        inner.ready_queue.remove(&QueueOrderKey {
+        inner.remove_ready(&QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
             task_id,
@@ -1501,7 +1576,7 @@ impl TaskQueue {
                 inner.update_active_task(task_id);
                 return (Some(record), false, true);
             } else {
-                inner.ready_queue.remove(&QueueOrderKey {
+                inner.remove_ready(&QueueOrderKey {
                     priority_rev: Reverse(priority),
                     sequence,
                     task_id,
@@ -1641,6 +1716,7 @@ impl TaskQueue {
                             fail_if_not_adopted: false,
                             retry_history: Vec::new(),
                             result: None,
+                            cold_result: None,
                             error_message: None,
                         },
                     );
@@ -1756,6 +1832,7 @@ impl TaskQueue {
                             entry.retry_history.push(attempt);
                         }
                         entry.result = result;
+                        entry.cold_result = None;
                         entry.error_message = error_message;
                         if !terminal_order_vec.contains(&task_id) {
                             terminal_order_vec.push(task_id);
@@ -1793,19 +1870,25 @@ impl TaskQueue {
 
         let mut immediate_zero_retry_failures: Vec<(TaskId, Option<Uuid>)> = Vec::new();
         let mut acks: Vec<DurableAck> = Vec::new();
-
-        {
+        let cold_store = Arc::clone(store.cold_results());
+        let (live_cold_ids, recovered_cold_ids) = {
             let mut inner = self.inner.write().await;
             inner.session_resume_hold = clamped_hold;
             self.session_resume_hold_secs
                 .store(clamped_hold.as_secs(), std::sync::atomic::Ordering::Release);
             inner.tasks.clear();
             inner.ready_queue.clear();
+            inner.fair_queues.clear_entries_preserving_weights();
             inner.delayed_retries.clear();
             inner.worker_assignments.clear();
             inner.terminal_order.clear();
             inner.terminal_sizes.clear();
             inner.terminal_bytes = 0;
+            inner.hot_terminal_order.clear();
+            inner.hot_terminal_sizes.clear();
+            inner.hot_terminal_bytes = 0;
+            inner.pending_cold_deletes.clear();
+            inner.cold_results = Some(Arc::clone(&cold_store));
             inner.active_sizes.clear();
             inner.active_bytes = 0;
             inner.held_tasks.clear();
@@ -1893,6 +1976,8 @@ impl TaskQueue {
                     retry_history: p.retry_history,
                     result: p.result,
                     error_message: p.error_message,
+                    submitter: SubmitterId::Default,
+                    cold_result: p.cold_result,
                 };
 
                 let is_terminal = entry.state.is_terminal();
@@ -1957,14 +2042,60 @@ impl TaskQueue {
             }
             inner.sync_adoption_holds();
             inner.rebuild_all_resume_protection();
+
+            for &tid in &inner.terminal_order.clone() {
+                if let Some(hsize) = inner
+                    .tasks
+                    .get(&tid)
+                    .filter(|e| e.state.is_terminal())
+                    .and_then(|e| e.result.as_ref().map(task_result_bytes))
+                {
+                    inner.hot_terminal_sizes.insert(tid, hsize);
+                    inner.hot_terminal_bytes = inner.hot_terminal_bytes.saturating_add(hsize);
+                    inner.hot_terminal_order.push_back(tid);
+                }
+            }
+            let live_cold: HashSet<TaskId> = inner
+                .tasks
+                .iter()
+                .filter(|(_, e)| e.state.is_terminal() && e.cold_result.is_some())
+                .map(|(tid, _)| *tid)
+                .collect();
+            let recovered_cold: Vec<TaskId> = live_cold.iter().copied().collect();
+
             inner.maybe_trigger_compaction();
-        }
+            (live_cold, recovered_cold)
+        };
 
         for ack in acks {
             if let Err(err) = ack.await {
                 tracing::warn!(error = %err, "Failed to sync replay zero-retry failure record");
             }
         }
+        let cold_for_sync = Arc::clone(&cold_store);
+        let live_for_sync = live_cold_ids;
+        let missing_cold = tokio::task::spawn_blocking(move || {
+            cold_for_sync.retain_only(&live_for_sync);
+            recovered_cold_ids
+                .into_iter()
+                .filter(|tid| !cold_for_sync.contains(tid))
+                .collect::<Vec<TaskId>>()
+        })
+        .await
+        .unwrap_or_default();
+        if !missing_cold.is_empty() {
+            let mut inner = self.inner.write().await;
+            for tid in missing_cold {
+                tracing::warn!(
+                    task_id = %tid,
+                    "Cold result file missing on replay; clearing cold summary reference"
+                );
+                if let Some(entry) = inner.tasks.get_mut(&tid) {
+                    entry.cold_result = None;
+                }
+            }
+        }
+        self.flush_cold_maintenance().await;
         Ok(())
     }
 
@@ -1983,6 +2114,10 @@ impl TaskQueue {
                         let ids: Vec<BlobId> = res.outputs.iter().map(|o| o.id).collect();
                         if !ids.is_empty() {
                             terminal.push((entry.task.id, ids));
+                        }
+                    } else if let Some(ref cold) = entry.cold_result {
+                        if !cold.output_blob_ids.is_empty() {
+                            terminal.push((entry.task.id, cold.output_blob_ids.clone()));
                         }
                     }
                 } else {
@@ -2084,7 +2219,7 @@ impl TaskQueue {
                         let entry = inner.tasks.get(&task_id).expect("checked above");
                         (entry.priority, entry.sequence)
                     };
-                    inner.ready_queue.remove(&QueueOrderKey {
+                    inner.remove_ready(&QueueOrderKey {
                         priority_rev: Reverse(priority),
                         sequence,
                         task_id,
@@ -2297,6 +2432,9 @@ impl TaskQueue {
                 tracing::warn!(error = %err, "Failed to sync expired adoption failure record");
             }
         }
+        if !newly_failed.is_empty() {
+            self.flush_cold_maintenance().await;
+        }
         newly_failed
     }
 
@@ -2316,18 +2454,41 @@ impl TaskQueue {
     /// Compacts the task store (if attached), detaches it from the queue, and waits for the writer
     /// thread to flush and release `store.lock`.
     pub async fn close_and_compact_store(&self) {
-        let (store, ack) = {
+        let (store, ack, cold_store, deletes) = {
             let mut inner = self.inner.write().await;
             inner.store_closed = true;
+            let cold_store = inner.cold_results.take();
+            let deletes = std::mem::take(&mut inner.pending_cold_deletes);
             let Some(store) = inner.store.take() else {
+                drop(inner);
+                if let Some(cold) = cold_store {
+                    if !deletes.is_empty() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            for tid in &deletes {
+                                cold.remove(tid);
+                            }
+                        })
+                        .await;
+                    }
+                }
                 return;
             };
             let image = inner.snapshot_image();
             let ack = store.compact(image).ok();
-            (store, ack)
+            (store, ack, cold_store, deletes)
         };
         if let Some(ack) = ack {
             let _ = ack.await;
+        }
+        if let Some(cold) = cold_store {
+            if !deletes.is_empty() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for tid in &deletes {
+                        cold.remove(tid);
+                    }
+                })
+                .await;
+            }
         }
         drop(store);
     }
@@ -2337,11 +2498,23 @@ impl TaskQueue {
     pub fn close_and_compact_store_sync(&self) {
         if let Ok(mut inner) = self.inner.try_write() {
             inner.store_closed = true;
+            let cold_store = inner.cold_results.take();
+            let deletes = std::mem::take(&mut inner.pending_cold_deletes);
             if let Some(store) = inner.store.take() {
                 let image = inner.snapshot_image();
                 let _ = store.compact(image);
                 drop(inner);
+                if let Some(cold) = cold_store {
+                    for tid in &deletes {
+                        cold.remove(tid);
+                    }
+                }
                 drop(store);
+            } else if let Some(cold) = cold_store {
+                drop(inner);
+                for tid in &deletes {
+                    cold.remove(tid);
+                }
             }
             return;
         }
@@ -2349,11 +2522,23 @@ impl TaskQueue {
         let _ = std::thread::spawn(move || {
             let mut inner = queue.inner.blocking_write();
             inner.store_closed = true;
+            let cold_store = inner.cold_results.take();
+            let deletes = std::mem::take(&mut inner.pending_cold_deletes);
             if let Some(store) = inner.store.take() {
                 let image = inner.snapshot_image();
                 let _ = store.compact(image);
                 drop(inner);
+                if let Some(cold) = cold_store {
+                    for tid in &deletes {
+                        cold.remove(tid);
+                    }
+                }
                 drop(store);
+            } else if let Some(cold) = cold_store {
+                drop(inner);
+                for tid in &deletes {
+                    cold.remove(tid);
+                }
             }
         })
         .join();
@@ -2384,7 +2569,7 @@ impl TaskQueue {
 
     /// Submits a task with default priority (0).
     pub async fn submit(&self, task: Task) -> GridResult<TaskId> {
-        self.submit_with_priority(task, 0).await
+        self.submit_from(task, 0, SubmitterId::Default).await
     }
 
     /// Checks under the read lock whether a task of `task_bytes` bytes can currently fit in the
@@ -2417,6 +2602,17 @@ impl TaskQueue {
     /// When the queue is full (`QueueFull` or `QueueByteLimitExceeded`), `task_slot` is left
     /// untouched so the caller can retry after backoff without ever cloning the task payload.
     pub(crate) async fn try_submit_slot(&self, task_slot: &mut Option<Task>) -> GridResult<TaskId> {
+        self.try_submit_slot_from(task_slot, SubmitterId::Default)
+            .await
+    }
+
+    /// Like [`try_submit_slot`](Self::try_submit_slot), associating the task with `submitter` for
+    /// multi-client fair-share scheduling.
+    pub(crate) async fn try_submit_slot_from(
+        &self,
+        task_slot: &mut Option<Task>,
+        submitter: SubmitterId,
+    ) -> GridResult<TaskId> {
         let task_ref = task_slot
             .as_ref()
             .ok_or_else(|| GridError::Config("task_slot is empty".into()))?;
@@ -2487,6 +2683,7 @@ impl TaskQueue {
                 task_key,
                 priority: 0,
                 sequence,
+                submitter,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
@@ -2508,6 +2705,7 @@ impl TaskQueue {
                 pending_failover_reason: None,
                 retry_history: Vec::new(),
                 result: None,
+                cold_result: None,
                 error_message: None,
             };
 
@@ -2547,7 +2745,7 @@ impl TaskQueue {
                     }
                     Err(err) => {
                         let mut inner = inner_arc.write().await;
-                        inner.ready_queue.remove(&ready_key);
+                        inner.remove_ready(&ready_key);
                         inner.remove_retained(&task_id);
                         inner.terminal_order.retain(|id| *id != task_id);
                         Err(err)
@@ -2567,6 +2765,17 @@ impl TaskQueue {
     /// queued, running or finished is refused instead of replacing the entry (which would orphan
     /// its queue keys and run the work twice).
     pub async fn submit_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
+        self.submit_from(task, priority, SubmitterId::Default).await
+    }
+
+    /// Submits a task with explicit scheduling `priority` attributed to `submitter` for multi-client
+    /// fair-share scheduling.
+    pub async fn submit_from(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+    ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
 
         let (task_id, sequence, ack) = {
@@ -2630,6 +2839,7 @@ impl TaskQueue {
                 task_key,
                 priority,
                 sequence,
+                submitter,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
@@ -2651,6 +2861,7 @@ impl TaskQueue {
                 pending_failover_reason: None,
                 retry_history: Vec::new(),
                 result: None,
+                cold_result: None,
                 error_message: None,
             };
 
@@ -2690,7 +2901,7 @@ impl TaskQueue {
                     }
                     Err(err) => {
                         let mut inner = inner_arc.write().await;
-                        inner.ready_queue.remove(&ready_key);
+                        inner.remove_ready(&ready_key);
                         inner.remove_retained(&task_id);
                         inner.terminal_order.retain(|id| *id != task_id);
                         Err(err)
@@ -2775,6 +2986,60 @@ impl TaskQueue {
             })
         });
         (views, next)
+    }
+
+    /// Number of distinct submitters that currently have at least one ready task in the queue.
+    pub async fn active_submitter_count(&self) -> usize {
+        self.inner.read().await.fair_queues.active_submitter_count()
+    }
+
+    /// Sets the WRR scheduling weight (`>= 1`) assigned to `submitter`.
+    pub async fn set_submitter_weight(&self, submitter: SubmitterId, weight: u32) {
+        self.inner
+            .write()
+            .await
+            .fair_queues
+            .set_weight(submitter, weight);
+    }
+
+    /// Scheduling views of up to `limit` queued tasks walking across active submitters in
+    /// weighted round-robin order using `cursor`.
+    pub(crate) async fn ready_views_fair(
+        &self,
+        cursor: &mut FairWalkCursor,
+        limit: usize,
+    ) -> Vec<TaskView> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        self.ready_views_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let policy = &inner.retry_policy;
+        let mut views = Vec::with_capacity(limit.min(512));
+        while views.len() < limit {
+            let remaining = limit - views.len();
+            let batch = inner.fair_queues.walk(cursor, remaining);
+            if batch.is_empty() {
+                break;
+            }
+            for (key, _submitter) in batch {
+                let Some(entry) = inner
+                    .tasks
+                    .get(&key.task_id)
+                    .filter(|e| is_schedulable_queued(e, policy, now))
+                else {
+                    continue;
+                };
+                let mut view = TaskView::of_with_key(&entry.task, entry.task_key);
+                view.avoid = entry.avoid_workers.clone();
+                view.queued_for = now.saturating_duration_since(entry.queued_instant);
+                views.push(view);
+            }
+        }
+        views
     }
 
     /// Monotonic counter incremented whenever a task enters `ready_queue`.
@@ -3061,13 +3326,13 @@ impl TaskQueue {
                 .copied();
 
             if let Some(key) = found_key {
-                inner.ready_queue.remove(&key);
+                inner.remove_ready(&key);
                 Self::apply_pending_failover_charge_before_dispatch(
                     &mut inner,
                     key.task_id,
                     now_epoch,
                 );
-                let (task, zero_retries) = {
+                let (task, zero_retries, submitter) = {
                     let entry = inner.tasks.get_mut(&key.task_id)?;
                     let zr = policy.zero_retries_for(entry);
                     entry.state = TaskState::Scheduled;
@@ -3079,8 +3344,9 @@ impl TaskQueue {
                     entry.pending_failover_charge = false;
                     entry.pending_failover_reason = None;
                     entry.scheduled_instant = Some(now);
-                    (entry.task.clone(), zr)
+                    (entry.task.clone(), zr, entry.submitter)
                 };
+                inner.fair_queues.on_scheduled(submitter);
                 inner.track_adoption_hold(key.task_id, false);
 
                 inner
@@ -3142,14 +3408,14 @@ impl TaskQueue {
                 (entry.priority, entry.sequence)
             };
 
-            inner.ready_queue.remove(&QueueOrderKey {
+            inner.remove_ready(&QueueOrderKey {
                 priority_rev: Reverse(priority_info.0),
                 sequence: priority_info.1,
                 task_id: *task_id,
             });
             Self::apply_pending_failover_charge_before_dispatch(&mut inner, *task_id, now_epoch);
 
-            let (task, zero_retries) = {
+            let (task, zero_retries, submitter) = {
                 let entry = inner.tasks.get_mut(task_id)?;
                 let zr = policy.zero_retries_for(entry);
                 entry.state = TaskState::Scheduled;
@@ -3161,8 +3427,9 @@ impl TaskQueue {
                 entry.pending_failover_charge = false;
                 entry.pending_failover_reason = None;
                 entry.scheduled_instant = Some(now);
-                (entry.task.clone(), zr)
+                (entry.task.clone(), zr, entry.submitter)
             };
+            inner.fair_queues.on_scheduled(submitter);
             inner.track_adoption_hold(*task_id, false);
 
             inner
@@ -3260,19 +3527,20 @@ impl TaskQueue {
                             sequence: entry.sequence,
                             task_id,
                         };
-                        inner.ready_queue.remove(&stale);
+                        inner.remove_ready(&stale);
                         continue;
                     }
                     None => continue,
                 };
 
-                inner.ready_queue.remove(&QueueOrderKey {
+                inner.remove_ready(&QueueOrderKey {
                     priority_rev: Reverse(priority),
                     sequence,
                     task_id,
                 });
                 Self::apply_pending_failover_charge_before_dispatch(&mut inner, task_id, now_epoch);
 
+                let mut dispatched_submitter = None;
                 if let Some(entry) = inner.tasks.get_mut(&task_id) {
                     let zero_retries = policy.zero_retries_for(entry);
                     entry.state = TaskState::Scheduled;
@@ -3284,6 +3552,7 @@ impl TaskQueue {
                     entry.pending_failover_charge = false;
                     entry.pending_failover_reason = None;
                     entry.scheduled_instant = Some(now);
+                    dispatched_submitter = Some(entry.submitter);
                     let task = entry.task.clone();
                     inner.track_adoption_hold(task_id, false);
 
@@ -3308,6 +3577,9 @@ impl TaskQueue {
                     }
 
                     scheduled.push((task_id, worker_id, task));
+                }
+                if let Some(submitter) = dispatched_submitter {
+                    inner.fair_queues.on_scheduled(submitter);
                 }
             }
 
@@ -3765,6 +4037,9 @@ impl TaskQueue {
                 tracing::warn!(error = %err, "Failed to sync task result journal record");
             }
         }
+        if outcome.state.is_terminal() {
+            self.flush_cold_maintenance().await;
+        }
         Ok(outcome)
     }
 
@@ -3848,7 +4123,7 @@ impl TaskQueue {
         }
 
         if adoptable_by_sender {
-            inner.ready_queue.remove(&QueueOrderKey {
+            inner.remove_ready(&QueueOrderKey {
                 priority_rev: Reverse(priority),
                 sequence,
                 task_id,
@@ -3915,6 +4190,7 @@ impl TaskQueue {
                 }
                 entry.state = TaskState::Completed;
                 entry.result = Some(result.clone());
+                entry.cold_result = None;
                 let record = JournalRecord::TaskTerminal {
                     task_id,
                     state: TaskState::Completed,
@@ -3934,6 +4210,7 @@ impl TaskQueue {
                 entry.state = TaskState::Cancelled;
                 entry.error_message = result.error.clone().or_else(|| Some("Cancelled".into()));
                 entry.result = Some(result.clone());
+                entry.cold_result = None;
                 let record = JournalRecord::TaskTerminal {
                     task_id,
                     state: TaskState::Cancelled,
@@ -4035,6 +4312,7 @@ impl TaskQueue {
                 entry.state = TaskState::Failed;
                 entry.error_message = result.error.clone();
                 entry.result = Some(result.clone());
+                entry.cold_result = None;
                 let record = JournalRecord::TaskTerminal {
                     task_id,
                     state: TaskState::Failed,
@@ -4142,6 +4420,7 @@ impl TaskQueue {
                 entry.state = TaskState::Failed;
                 entry.error_message = result.error.clone();
                 entry.result = Some(result.clone());
+                entry.cold_result = None;
                 JournalRecord::TaskTerminal {
                     task_id,
                     state: TaskState::Failed,
@@ -4169,6 +4448,7 @@ impl TaskQueue {
                 tracing::warn!(error = %err, "Failed to sync unsendable assignment failure record");
             }
         }
+        self.flush_cold_maintenance().await;
         Ok(ResultDisposition::Terminal)
     }
 
@@ -4193,7 +4473,7 @@ impl TaskQueue {
                 (entry.priority, entry.sequence)
             };
 
-            inner.ready_queue.remove(&QueueOrderKey {
+            inner.remove_ready(&QueueOrderKey {
                 priority_rev: Reverse(priority),
                 sequence,
                 task_id: *task_id,
@@ -4214,6 +4494,7 @@ impl TaskQueue {
                 entry.pending_failover_reason = None;
                 entry.error_message = Some(reason.clone());
                 entry.result = Some(result.clone());
+                entry.cold_result = None;
                 record = Some(JournalRecord::TaskTerminal {
                     task_id: *task_id,
                     state: TaskState::Failed,
@@ -4241,6 +4522,7 @@ impl TaskQueue {
         if let Some(ack) = ack {
             let _ = ack.await;
         }
+        self.flush_cold_maintenance().await;
         Some(result)
     }
 
@@ -4269,7 +4551,7 @@ impl TaskQueue {
         session_id: Option<u64>,
         reason: &str,
     ) -> Vec<TaskId> {
-        let (affected, acks) = {
+        let (affected, had_terminal, acks) = {
             let mut guard = self.inner.write().await;
             let inner = &mut *guard;
             if inner.store_closed {
@@ -4430,6 +4712,7 @@ impl TaskQueue {
                             Some(err_msg.clone()),
                         );
                         entry.result = Some(fail_result.clone());
+                        entry.cold_result = None;
                         terminal_to_track.push(task_id);
                         records.push(JournalRecord::TaskTerminal {
                             task_id,
@@ -4462,6 +4745,7 @@ impl TaskQueue {
                 inner.update_active_task(tid);
                 inner.sync_workspace_active(tid);
             }
+            let had_terminal = !terminal_to_track.is_empty();
             for tid in terminal_to_track {
                 inner.sync_workspace_active(tid);
                 inner.track_terminal_task(tid);
@@ -4492,11 +4776,14 @@ impl TaskQueue {
             }
             inner.maybe_trigger_compaction();
 
-            (affected, acks)
+            (affected, had_terminal, acks)
         };
 
         for ack in acks {
             let _ = ack.await;
+        }
+        if had_terminal {
+            self.flush_cold_maintenance().await;
         }
 
         affected
@@ -4538,7 +4825,7 @@ impl TaskQueue {
         reason: &str,
         immediate_reschedule: bool,
     ) -> Vec<TaskId> {
-        let (affected, acks) = {
+        let (affected, had_terminal, acks) = {
             let mut guard = self.inner.write().await;
             let inner = &mut *guard;
             if inner.store_closed {
@@ -4701,6 +4988,7 @@ impl TaskQueue {
                         Some(err_msg.clone()),
                     );
                     entry.result = Some(fail_result.clone());
+                    entry.cold_result = None;
                     terminal_to_track.push(task_id);
                     records.push(JournalRecord::TaskTerminal {
                         task_id,
@@ -4741,6 +5029,7 @@ impl TaskQueue {
             for tid in holds_to_track {
                 inner.track_adoption_hold(tid, true);
             }
+            let had_terminal = !terminal_to_track.is_empty();
             for tid in terminal_to_track {
                 inner.sync_workspace_active(tid);
                 inner.track_terminal_task(tid);
@@ -4771,11 +5060,14 @@ impl TaskQueue {
             }
             inner.maybe_trigger_compaction();
 
-            (affected, acks)
+            (affected, had_terminal, acks)
         };
 
         for ack in acks {
             let _ = ack.await;
+        }
+        if had_terminal {
+            self.flush_cold_maintenance().await;
         }
 
         affected
@@ -4884,16 +5176,27 @@ impl TaskQueue {
             };
 
             if state.is_terminal() {
+                let needs_cold = inner
+                    .tasks
+                    .get(task_id)
+                    .is_some_and(|e| e.result.is_none() && e.cold_result.is_some());
+                let cached = inner.tasks.get(task_id).and_then(|e| e.result.clone());
+                drop(inner);
+                let result = if needs_cold {
+                    self.get_result(task_id).await
+                } else {
+                    cached
+                };
                 return Ok(CancelOutcome {
                     newly_cancelled: false,
                     worker_to_notify: None,
-                    result: inner.tasks.get(task_id).and_then(|e| e.result.clone()),
+                    result,
                 });
             }
 
             let worker_to_notify = match state {
                 TaskState::Queued => {
-                    inner.ready_queue.remove(&QueueOrderKey {
+                    inner.remove_ready(&QueueOrderKey {
                         priority_rev: Reverse(priority_info.0),
                         sequence: priority_info.1,
                         task_id: *task_id,
@@ -4947,6 +5250,7 @@ impl TaskQueue {
                 if entry.result.is_none() {
                     entry.result = Some(cancel_result);
                 }
+                entry.cold_result = None;
                 recorded = entry.result.clone();
                 record = Some(JournalRecord::TaskTerminal {
                     task_id: *task_id,
@@ -4996,6 +5300,7 @@ impl TaskQueue {
                 );
             }
         }
+        self.flush_cold_maintenance().await;
 
         Ok(outcome)
     }
@@ -5006,6 +5311,25 @@ impl TaskQueue {
     pub async fn get_task(&self, task_id: &TaskId) -> Option<TaskInfo> {
         let inner = self.inner.read().await;
         inner.tasks.get(task_id).map(|e| e.to_info())
+    }
+
+    /// Retrieves task metadata and terminal exit code/error purely from RAM without loading
+    /// spilled cold result files from disk.
+    pub async fn get_status_detail(&self, task_id: &TaskId) -> Option<TaskStatusDetail> {
+        let inner = self.inner.read().await;
+        let entry = inner.tasks.get(task_id)?;
+        let (result_exit_code, result_error) = if let Some(ref res) = entry.result {
+            (Some(res.exit_code), res.error.clone())
+        } else if let Some(ref cold) = entry.cold_result {
+            (Some(cold.exit_code), cold.error.clone())
+        } else {
+            (None, None)
+        };
+        Some(TaskStatusDetail {
+            info: entry.to_info(),
+            result_exit_code,
+            result_error,
+        })
     }
 
     /// Retrieves full task specification.
@@ -5020,10 +5344,32 @@ impl TaskQueue {
         inner.tasks.get(task_id).map(|e| e.state)
     }
 
-    /// Retrieves recorded task execution result, if finished.
+    /// Retrieves recorded task execution result, if finished, transparently reading from cold
+    /// out-of-band storage when the result was spilled out of RAM.
     pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
-        let inner = self.inner.read().await;
-        inner.tasks.get(task_id).and_then(|e| e.result.clone())
+        let cold_lookup = {
+            let inner = self.inner.read().await;
+            let entry = inner.tasks.get(task_id)?;
+            if let Some(ref res) = entry.result {
+                return Some(res.clone());
+            }
+            if !entry.state.is_terminal() || entry.cold_result.is_none() {
+                return None;
+            }
+            inner.cold_results.clone()
+        }?;
+        let tid = *task_id;
+        match tokio::task::spawn_blocking(move || cold_lookup.get(&tid)).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
+                tracing::warn!(task_id = %task_id.0, error = %err, "Failed to read cold task result");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(task_id = %task_id.0, error = %err, "Cold result reader task panicked");
+                None
+            }
+        }
     }
 
     /// Retrieves the recorded retry and evacuation history for a task.
@@ -5109,19 +5455,170 @@ impl TaskQueue {
 
     /// Dynamically adjusts the retention limit for terminal tasks and evicts oldest tasks exceeding this limit.
     pub async fn set_max_terminal_tasks(&self, limit: usize) {
-        let mut inner = self.inner.write().await;
-        inner.max_terminal_tasks = limit;
-        inner.enforce_terminal_limits();
-        inner.maybe_trigger_compaction();
+        {
+            let mut inner = self.inner.write().await;
+            inner.max_terminal_tasks = limit;
+            inner.enforce_terminal_limits();
+            inner.maybe_trigger_compaction();
+        }
+        self.flush_cold_maintenance().await;
     }
 
     /// Dynamically adjusts the byte budget of retained terminal tasks and evicts oldest tasks
     /// until it holds (see [`DEFAULT_MAX_TERMINAL_BYTES`]).
     pub async fn set_max_terminal_bytes(&self, limit: usize) {
-        let mut inner = self.inner.write().await;
-        inner.max_terminal_bytes = limit;
-        inner.enforce_terminal_limits();
-        inner.maybe_trigger_compaction();
+        {
+            let mut inner = self.inner.write().await;
+            inner.max_terminal_bytes = limit;
+            inner.enforce_terminal_limits();
+            inner.maybe_trigger_compaction();
+        }
+        self.flush_cold_maintenance().await;
+    }
+
+    /// Configures the hot in-RAM terminal result limits and spills excess results if a durable
+    /// store is attached.
+    pub async fn set_hot_terminal_limits(&self, max_tasks: usize, max_bytes: usize) {
+        {
+            let mut inner = self.inner.write().await;
+            inner.max_hot_terminal_tasks = max_tasks;
+            inner.max_hot_terminal_bytes = max_bytes;
+        }
+        self.flush_cold_maintenance().await;
+    }
+
+    /// Returns `(hot_terminal_tasks, hot_terminal_bytes)` currently held in RAM.
+    pub async fn hot_terminal_stats(&self) -> (usize, usize) {
+        let inner = self.inner.read().await;
+        (inner.hot_terminal_sizes.len(), inner.hot_terminal_bytes)
+    }
+
+    /// Flushes pending cold-result spills and unlinks cold files of evicted tasks outside the
+    /// queue lock. No-ops quickly when no `ColdResultStore` is attached or limits hold.
+    pub(crate) async fn flush_cold_maintenance(&self) {
+        {
+            let inner = self.inner.read().await;
+            if inner.cold_results.is_none() {
+                return;
+            }
+            let need_spill = inner.hot_terminal_sizes.len() > inner.max_hot_terminal_tasks
+                || inner.hot_terminal_bytes > inner.max_hot_terminal_bytes;
+            if inner.pending_cold_deletes.is_empty() && !need_spill {
+                return;
+            }
+        }
+
+        let (store, candidates, deletes) = {
+            let mut inner = self.inner.write().await;
+            let deletes = std::mem::take(&mut inner.pending_cold_deletes);
+            let Some(ref store) = inner.cold_results else {
+                return;
+            };
+            let mut candidates: Vec<(TaskId, TaskResult, ColdResultSummary)> = Vec::new();
+            let mut sim_tasks = inner.hot_terminal_sizes.len();
+            let mut sim_bytes = inner.hot_terminal_bytes;
+            for tid in &inner.hot_terminal_order {
+                if sim_tasks <= inner.max_hot_terminal_tasks
+                    && sim_bytes <= inner.max_hot_terminal_bytes
+                {
+                    break;
+                }
+                let Some(&hsize) = inner.hot_terminal_sizes.get(tid) else {
+                    continue;
+                };
+                let Some(entry) = inner.tasks.get(tid) else {
+                    sim_tasks = sim_tasks.saturating_sub(1);
+                    continue;
+                };
+                if !entry.state.is_terminal() {
+                    sim_tasks = sim_tasks.saturating_sub(1);
+                    continue;
+                }
+                let Some(ref res) = entry.result else {
+                    sim_tasks = sim_tasks.saturating_sub(1);
+                    continue;
+                };
+                let summary = ColdResultSummary::from_result(res, hsize);
+                candidates.push((*tid, res.clone(), summary));
+                sim_tasks = sim_tasks.saturating_sub(1);
+                sim_bytes = sim_bytes.saturating_sub(hsize);
+            }
+            (Arc::clone(store), candidates, deletes)
+        };
+
+        if candidates.is_empty() && deletes.is_empty() {
+            return;
+        }
+
+        let store_bg = Arc::clone(&store);
+        let written = tokio::task::spawn_blocking(move || {
+            for tid in &deletes {
+                store_bg.remove(tid);
+            }
+            let mut ok = Vec::with_capacity(candidates.len());
+            for (tid, res, summary) in candidates {
+                match store_bg.put(&tid, &res) {
+                    Ok(()) => ok.push((tid, summary)),
+                    Err(err) => {
+                        tracing::warn!(
+                            task_id = %tid.0,
+                            error = %err,
+                            "Failed to spill cold terminal result to disk"
+                        );
+                    }
+                }
+            }
+            ok
+        })
+        .await
+        .unwrap_or_default();
+
+        if written.is_empty() {
+            return;
+        }
+
+        let mut orphan_deletes = Vec::new();
+        {
+            let mut inner = self.inner.write().await;
+            let same_store = inner
+                .cold_results
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &store));
+            if !same_store {
+                return;
+            }
+            for (tid, summary) in written {
+                let committed = match inner.tasks.get_mut(&tid) {
+                    Some(entry) if entry.state.is_terminal() && entry.result.is_some() => {
+                        entry.result = None;
+                        entry.cold_result = Some(summary);
+                        true
+                    }
+                    Some(entry) if entry.state.is_terminal() && entry.cold_result.is_some() => true,
+                    _ => false,
+                };
+                if committed {
+                    if let Some(hsize) = inner.hot_terminal_sizes.remove(&tid) {
+                        inner.hot_terminal_bytes = inner.hot_terminal_bytes.saturating_sub(hsize);
+                    }
+                } else {
+                    orphan_deletes.push(tid);
+                }
+            }
+            let inner_ref = &mut *inner;
+            inner_ref
+                .hot_terminal_order
+                .retain(|id| inner_ref.hot_terminal_sizes.contains_key(id));
+        }
+
+        if !orphan_deletes.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for tid in &orphan_deletes {
+                    store.remove(tid);
+                }
+            })
+            .await;
+        }
     }
 
     /// Bytes currently charged for retained terminal tasks.
@@ -5138,10 +5635,16 @@ impl TaskQueue {
     ///
     /// Returns the number of evicted tasks.
     pub async fn evict_terminal_tasks(&self, max_retained: usize) -> usize {
-        let mut inner = self.inner.write().await;
-        let evicted = inner.evict_terminal_tasks(max_retained);
+        let evicted = {
+            let mut inner = self.inner.write().await;
+            let evicted = inner.evict_terminal_tasks(max_retained);
+            if evicted > 0 {
+                inner.maybe_trigger_compaction();
+            }
+            evicted
+        };
         if evicted > 0 {
-            inner.maybe_trigger_compaction();
+            self.flush_cold_maintenance().await;
         }
         evicted
     }
@@ -7129,6 +7632,7 @@ mod tests {
                         task: submitted_task,
                         task_key: submitted_key,
                         priority: 0,
+                        submitter: SubmitterId::Default,
                         sequence: seq,
                         state: TaskState::Submitted,
                         assigned_worker_id: None,
@@ -7151,6 +7655,7 @@ mod tests {
                         pending_failover_reason: None,
                         retry_history: Vec::new(),
                         result: None,
+                        cold_result: None,
                         error_message: None,
                     },
                 );
@@ -8800,5 +9305,198 @@ mod tests {
             .await
             .unwrap();
         assert!(pop_outcome.resumed_from_checkpoint);
+    }
+
+    fn count_cold_bin_files(root: &std::path::Path) -> usize {
+        let cold_root = root.join(crate::cold_results::COLD_RESULTS_DIR);
+        let Ok(shards) = std::fs::read_dir(cold_root) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for shard in shards.flatten() {
+            if let Ok(files) = std::fs::read_dir(shard.path()) {
+                for f in files.flatten() {
+                    if f.path().extension().and_then(|e| e.to_str()) == Some("bin") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn cold_terminal_results_spill_load_compact_reopen_and_evict() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = crate::blob_store::BlobStore::open(
+            &crate::blob_store::BlobStoreConfig::new(dir.path().join("blobs"), 200)
+                .with_output_pin_retention(Duration::from_secs(60)),
+        )
+        .unwrap();
+        let out_blob_id = blob_store.put(&[b'o'; 60]).await.unwrap();
+
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        let q = TaskQueue::new();
+        q.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+        q.set_hot_terminal_limits(2, 1024).await;
+
+        let w1 = Uuid::new_v4();
+        let mut tids = Vec::new();
+        for i in 0..6 {
+            let tid = q.submit(echo_task(&format!("cold-{i}"))).await.unwrap();
+            assert!(q.schedule_task(&tid, w1).await.is_some());
+            let mut res = TaskResult::success(w1, tid, "x".repeat(2048), 5 + i as u64, false);
+            res.outputs.push(rusty_grid_core::blob::BlobFile {
+                path: format!("out-{i}.bin"),
+                id: out_blob_id,
+                size: 60,
+                executable: false,
+            });
+            q.record_result_from(w1, None, res).await.unwrap();
+            tids.push(tid);
+        }
+
+        let (hot_tasks, _hot_bytes) = q.hot_terminal_stats().await;
+        assert!(hot_tasks <= 2, "expected <= 2 hot tasks, got {hot_tasks}");
+
+        {
+            let inner = q.inner.read().await;
+            let oldest = inner.tasks.get(&tids[0]).unwrap();
+            assert!(
+                oldest.result.is_none(),
+                "oldest result must spill out of RAM"
+            );
+            assert!(
+                oldest.cold_result.is_some(),
+                "cold summary must stay in RAM"
+            );
+        }
+
+        let detail = q.get_status_detail(&tids[0]).await.unwrap();
+        assert_eq!(detail.result_exit_code, Some(0));
+        assert_eq!(detail.result_error, None);
+
+        let loaded = q.get_result(&tids[0]).await.unwrap();
+        assert_eq!(loaded.stdout.len(), 2048);
+        assert_eq!(loaded.outputs.len(), 1);
+        assert_eq!(loaded.outputs[0].id, out_blob_id);
+
+        // Inject an orphan `.bin` file in a valid cold shard dir.
+        let orphan_dir = dir
+            .path()
+            .join(crate::cold_results::COLD_RESULTS_DIR)
+            .join("ff");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        let orphan_path = orphan_dir.join(format!("{}.bin", Uuid::new_v4()));
+        std::fs::write(&orphan_path, b"orphan-data").unwrap();
+        assert!(orphan_path.exists());
+
+        q.compact_store().await.unwrap();
+        q.close_and_compact_store().await;
+        drop(q);
+
+        let (store2, rec2) = TaskStore::open(dir.path()).unwrap();
+        let q2 = TaskQueue::new();
+        q2.attach_store_and_replay(store2, rec2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            !orphan_path.exists(),
+            "orphan cold file must be unlinked on reopen"
+        );
+        for tid in &tids {
+            let res = q2
+                .get_result(tid)
+                .await
+                .expect("cold result survives reopen");
+            assert_eq!(res.stdout.len(), 2048);
+        }
+
+        q2.repin_recovered_blobs(&blob_store).await;
+        let b1 = blob_store.put(&[b'a'; 70]).await.unwrap();
+        let _b2 = blob_store.put(&[b'b'; 80]).await.unwrap();
+        assert!(
+            blob_store.contains(&out_blob_id),
+            "repin_recovered_blobs must pin cold output blobs"
+        );
+        assert!(
+            !blob_store.contains(&b1),
+            "unpinned blob b1 should evict before pinned cold output blob"
+        );
+
+        let before_bins = count_cold_bin_files(dir.path());
+        assert_eq!(before_bins, 6);
+        let evicted = q2.evict_terminal_tasks(1).await;
+        assert_eq!(evicted, 5);
+        let after_bins = count_cold_bin_files(dir.path());
+        assert_eq!(
+            after_bins, 1,
+            "evicted cold result files must be unlinked from disk"
+        );
+        assert!(q2.get_result(&tids[0]).await.is_none());
+        assert!(q2.get_result(&tids[5]).await.is_some());
+        q2.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn fair_share_ready_views_interleaves_submitters_with_weights() {
+        let q = TaskQueue::new();
+        let sub_a = SubmitterId::Client(Uuid::new_v4());
+        let sub_b = SubmitterId::Client(Uuid::new_v4());
+
+        let mut set_a = HashSet::new();
+        let mut set_b = HashSet::new();
+        for i in 0..20 {
+            let tid = q
+                .submit_from(echo_task(&format!("a-{i}")), 0, sub_a)
+                .await
+                .unwrap();
+            set_a.insert(tid);
+        }
+        for i in 0..5 {
+            let tid = q
+                .submit_from(echo_task(&format!("b-{i}")), 0, sub_b)
+                .await
+                .unwrap();
+            set_b.insert(tid);
+        }
+        assert_eq!(q.active_submitter_count().await, 2);
+
+        let mut cursor = crate::fair_share::FairWalkCursor::default();
+        let views = q.ready_views_fair(&mut cursor, 10).await;
+        assert_eq!(views.len(), 10);
+        let a_count = views.iter().filter(|v| set_a.contains(&v.task_id)).count();
+        let b_count = views.iter().filter(|v| set_b.contains(&v.task_id)).count();
+        assert_eq!((a_count, b_count), (5, 5));
+
+        q.set_submitter_weight(sub_a, 3).await;
+        let mut weighted_cursor = crate::fair_share::FairWalkCursor::default();
+        let w_views = q.ready_views_fair(&mut weighted_cursor, 8).await;
+        assert_eq!(w_views.len(), 8);
+        let wa = w_views
+            .iter()
+            .filter(|v| set_a.contains(&v.task_id))
+            .count();
+        let wb = w_views
+            .iter()
+            .filter(|v| set_b.contains(&v.task_id))
+            .count();
+        assert_eq!((wa, wb), (6, 2));
+
+        // Priority preservation within each submitter's queue.
+        let a_high = q.submit_from(echo_task("a-high"), 50, sub_a).await.unwrap();
+        let mut prio_cursor = crate::fair_share::FairWalkCursor::default();
+        let p_views = q.ready_views_fair(&mut prio_cursor, 4).await;
+        assert!(
+            p_views.iter().any(|v| v.task_id == a_high),
+            "high-priority task within submitter a must surface immediately"
+        );
+        let first_a = p_views
+            .iter()
+            .find(|v| set_a.contains(&v.task_id) || v.task_id == a_high)
+            .unwrap();
+        assert_eq!(first_a.task_id, a_high);
     }
 }

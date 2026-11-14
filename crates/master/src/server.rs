@@ -79,6 +79,9 @@ pub const DEFAULT_SESSION_RESUME_HOLD_SECS: u64 = 30;
 pub const DEFAULT_SESSION_RESUME_HOLD: Duration =
     Duration::from_secs(DEFAULT_SESSION_RESUME_HOLD_SECS);
 
+/// Default maximum tasks assigned per scheduling pass (`master --max-batch-size`, default: 1024).
+pub const DEFAULT_MASTER_MAX_BATCH_SIZE: usize = 1024;
+
 /// Configuration options for initializing and running a `MasterServer`.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -918,7 +921,12 @@ impl MasterServer {
     /// Spawns full Master stack (TCP accept loop, background scheduler, and heartbeat reaper),
     /// returning an ergonomic, thread-safe `MasterHandle`.
     pub async fn spawn(config: ServerConfig) -> GridResult<MasterHandle> {
-        Self::spawn_with_config(config, SchedulerConfig::default(), ReaperConfig::default()).await
+        Self::spawn_with_config(
+            config,
+            SchedulerConfig::default().with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE),
+            ReaperConfig::default(),
+        )
+        .await
     }
 
     /// Spawns full Master stack with custom scheduler and reaper configurations.
@@ -1071,40 +1079,68 @@ impl MasterServer {
 
             let mut ticker = tokio::time::interval(sched.config().tick_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_pass: Option<std::time::Instant> = None;
+            const MAX_CONSECUTIVE_BATCHES: usize = 16;
 
             loop {
                 tokio::select! {
                     _ = sched_trigger.notified() => {
                         debug!("Scheduler loop woken by event notification");
-                        if sched.config().micro_batch_window > Duration::ZERO {
-                            tokio::time::sleep(sched.config().micro_batch_window).await;
+                        let delay = last_pass.map_or(Duration::ZERO, |t| {
+                            sched.config().micro_batch_window.saturating_sub(t.elapsed())
+                        });
+                        if delay > Duration::ZERO {
+                            tokio::time::sleep(delay).await;
                         }
-                        if let Ok(report) = sched.schedule_once().await {
-                            let _ = &report;
-                            #[cfg(feature = "dashboard")]
-                            if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
-                                    for assignment in &report.assignments {
-                                        if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
-                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                        for _ in 0..MAX_CONSECUTIVE_BATCHES {
+                            if *sched_shutdown_rx.borrow() {
+                                break;
+                            }
+                            let batch_cap = sched.config().max_batch_size.max(1);
+                            let res = sched.schedule_once().await;
+                            last_pass = Some(std::time::Instant::now());
+                            if let Ok(ref report) = res {
+                                let _ = &report;
+                                #[cfg(feature = "dashboard")]
+                                if let Some(ref b_tx) = sched_broadcast_tx {
+                                    if b_tx.receiver_count() > 0
+                                        && (!report.assignments.is_empty()
+                                            || !report.unfulfillable.is_empty())
+                                    {
+                                        for assignment in &report.assignments {
+                                            if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
+                                                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                            }
                                         }
-                                    }
-                                    for (task_id, _) in &report.unfulfillable {
-                                        if let Some(info) = sched_queue.get_task(task_id).await {
-                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                        for (task_id, _) in &report.unfulfillable {
+                                            if let Some(info) = sched_queue.get_task(task_id).await {
+                                                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                            }
                                         }
+                                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(sched_queue.stats().await));
                                     }
-                                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(sched_queue.stats().await));
                                 }
                             }
+                            let filled = res
+                                .as_ref()
+                                .is_ok_and(|r| r.assignments.len() >= batch_cap);
+                            if !filled {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
                         }
                     }
                     _ = ticker.tick() => {
-                        if let Ok(report) = sched.schedule_once().await {
+                        let res = sched.schedule_once().await;
+                        last_pass = Some(std::time::Instant::now());
+                        if let Ok(ref report) = res {
                             let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
+                                if b_tx.receiver_count() > 0
+                                    && (!report.assignments.is_empty()
+                                        || !report.unfulfillable.is_empty())
+                                {
                                     for assignment in &report.assignments {
                                         if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
                                             let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
@@ -2553,14 +2589,16 @@ async fn apply_task_result_inner(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        if let Some(info) = queue.get_task(&task_id).await {
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                info,
+        if b_tx.receiver_count() > 0 {
+            if let Some(info) = queue.get_task(&task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
             ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-            queue.stats().await,
-        ));
     }
 
     // 2. Release the worker's slot immediately and keep its circuit breaker current
@@ -2597,6 +2635,7 @@ async fn apply_task_result_inner(
             if let Some(ack) = durable_ack {
                 let waiters = Arc::clone(waiters);
                 let ack_registry = registry.clone();
+                let cold_queue = queue.clone();
                 tokio::spawn(async move {
                     if let Err(err) = ack.await {
                         warn!(
@@ -2610,12 +2649,15 @@ async fn apply_task_result_inner(
                             .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
                     }
-                    let mut lock = waiters.write().await;
-                    if let Some(senders) = lock.remove(&task_id) {
-                        for tx in senders {
-                            let _ = tx.send(result.clone());
+                    {
+                        let mut lock = waiters.write().await;
+                        if let Some(senders) = lock.remove(&task_id) {
+                            for tx in senders {
+                                let _ = tx.send(result.clone());
+                            }
                         }
                     }
+                    cold_queue.flush_cold_maintenance().await;
                 });
             } else {
                 if send_ack {
@@ -2623,12 +2665,15 @@ async fn apply_task_result_inner(
                         .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
                 }
-                let mut lock = waiters.write().await;
-                if let Some(senders) = lock.remove(&task_id) {
-                    for tx in senders {
-                        let _ = tx.send(result.clone());
+                {
+                    let mut lock = waiters.write().await;
+                    if let Some(senders) = lock.remove(&task_id) {
+                        for tx in senders {
+                            let _ = tx.send(result.clone());
+                        }
                     }
                 }
+                queue.flush_cold_maintenance().await;
             }
         } else {
             if let Some(ack) = durable_ack {
@@ -2645,12 +2690,15 @@ async fn apply_task_result_inner(
                     .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
             }
-            let mut lock = waiters.write().await;
-            if let Some(senders) = lock.remove(&task_id) {
-                for tx in senders {
-                    let _ = tx.send(result.clone());
+            {
+                let mut lock = waiters.write().await;
+                if let Some(senders) = lock.remove(&task_id) {
+                    for tx in senders {
+                        let _ = tx.send(result.clone());
+                    }
                 }
             }
+            queue.flush_cold_maintenance().await;
         }
     } else if send_ack {
         if let Some(ack) = durable_ack {
@@ -2742,14 +2790,16 @@ pub(crate) async fn handle_oversized_master_message(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        if let Some(info) = queue.get_task(&task_id).await {
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                info,
+        if b_tx.receiver_count() > 0 {
+            if let Some(info) = queue.get_task(&task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
             ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-            queue.stats().await,
-        ));
     }
 
     let _ = registry.decrement_active_tasks(&worker_id).await;
@@ -2758,12 +2808,15 @@ pub(crate) async fn handle_oversized_master_message(
         if let Some(store) = blob_store {
             store.unpin_task(&task_id).await;
         }
-        let mut lock = waiters.write().await;
-        if let Some(senders) = lock.remove(&task_id) {
-            for tx in senders {
-                let _ = tx.send(result.clone());
+        {
+            let mut lock = waiters.write().await;
+            if let Some(senders) = lock.remove(&task_id) {
+                for tx in senders {
+                    let _ = tx.send(result.clone());
+                }
             }
         }
+        queue.flush_cold_maintenance().await;
     }
 
     scheduler_notify.notify_one();
@@ -2853,14 +2906,16 @@ async fn apply_task_progress(
     }
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        if let Some(info) = queue.get_task(&task_id).await {
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                info,
+        if b_tx.receiver_count() > 0 {
+            if let Some(info) = queue.get_task(&task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
             ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-            queue.stats().await,
-        ));
     }
 }
 
@@ -3113,12 +3168,14 @@ pub async fn handle_worker_disconnect_with_broadcast(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        let _ = b_tx.send(
-            crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
-                worker_id: *worker_id,
-                reason: reason.to_string(),
-            },
-        );
+        if b_tx.receiver_count() > 0 {
+            let _ = b_tx.send(
+                crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                    worker_id: *worker_id,
+                    reason: reason.to_string(),
+                },
+            );
+        }
     }
 
     failover_session_tasks(
@@ -3174,12 +3231,14 @@ pub async fn handle_worker_evacuate_with_broadcast(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        let _ = b_tx.send(
-            crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
-                worker_id: *worker_id,
-                reason: reason.to_string(),
-            },
-        );
+        if b_tx.receiver_count() > 0 {
+            let _ = b_tx.send(
+                crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                    worker_id: *worker_id,
+                    reason: reason.to_string(),
+                },
+            );
+        }
     }
 
     let affected_tasks = queue
@@ -3198,16 +3257,18 @@ pub async fn handle_worker_evacuate_with_broadcast(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        for task_id in &affected_tasks {
-            if let Some(info) = queue.get_task(task_id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                    info,
-                ));
+        if b_tx.receiver_count() > 0 {
+            for task_id in &affected_tasks {
+                if let Some(info) = queue.get_task(task_id).await {
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
+                }
             }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
+            ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-            queue.stats().await,
-        ));
     }
 
     if let Some(waiters) = waiters {
@@ -3247,16 +3308,18 @@ async fn failover_session_tasks(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        for task_id in &affected_tasks {
-            if let Some(info) = queue.get_task(task_id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                    info,
-                ));
+        if b_tx.receiver_count() > 0 {
+            for task_id in &affected_tasks {
+                if let Some(info) = queue.get_task(task_id).await {
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
+                }
             }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
+            ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-            queue.stats().await,
-        ));
     }
 
     // Resolve waiters for any tasks that reached terminal state (e.g. retries exhausted)
@@ -3336,18 +3399,13 @@ async fn handle_worker_disconnect_internal(
 
 /// Answers `GetTaskStatus` (and the non-terminal half of `GetTaskResult`).
 async fn task_status_response(queue: &TaskQueue, task_id: TaskId) -> ClientResponse {
-    match queue.get_task(&task_id).await {
-        Some(info) => {
-            let (status, err) = match queue.get_result(&task_id).await {
-                Some(res) => {
-                    if res.exit_code == 0 {
-                        (TaskStatus::Completed, res.error)
-                    } else if res.exit_code == 130 {
-                        (TaskStatus::Cancelled, res.error)
-                    } else {
-                        (TaskStatus::Failed, res.error)
-                    }
-                }
+    match queue.get_status_detail(&task_id).await {
+        Some(detail) => {
+            let info = detail.info;
+            let (status, err) = match detail.result_exit_code {
+                Some(0) => (TaskStatus::Completed, detail.result_error),
+                Some(130) => (TaskStatus::Cancelled, detail.result_error),
+                Some(_) => (TaskStatus::Failed, detail.result_error),
                 None => match info.state {
                     TaskState::Submitted
                     | TaskState::Queued
@@ -3438,6 +3496,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
         Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     >,
 ) -> GridResult<()> {
+    let client_submitter = crate::fair_share::SubmitterId::Client(Uuid::new_v4());
     let mut next_msg = Some(first_msg);
     let mut first_iteration = true;
     // Uploads this connection leaves unfinished are dropped when it ends.
@@ -3557,7 +3616,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     None
                 };
 
-                if let Err(e) = queue.submit(task).await {
+                if let Err(e) = queue.submit_from(task, 0, client_submitter).await {
                     // Validation failure, queue full, or a task id that is already in use: tell the
                     // client why, keep the connection, and take back the waiter registered above
                     // (it must never be resolved by the result of another task with the same id).
@@ -3577,14 +3636,17 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
 
                 #[cfg(feature = "dashboard")]
                 if let Some(ref b_tx) = broadcast_tx {
-                    if let Some(info) = queue.get_task(&task_id).await {
-                        let _ = b_tx.send(
-                            crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
-                        );
+                    if b_tx.receiver_count() > 0 {
+                        if let Some(info) = queue.get_task(&task_id).await {
+                            let _ = b_tx.send(
+                                crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                            );
+                        }
+                        let _ =
+                            b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                                queue.stats().await,
+                            ));
                     }
-                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                        queue.stats().await,
-                    ));
                 }
 
                 if let Some(rx) = rx {
@@ -3631,15 +3693,20 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 #[cfg(feature = "dashboard")]
                 if success {
                     if let Some(ref b_tx) = broadcast_tx {
-                        if let Some(info) = queue.get_task(&task_id).await {
+                        if b_tx.receiver_count() > 0 {
+                            if let Some(info) = queue.get_task(&task_id).await {
+                                let _ = b_tx.send(
+                                    crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                                        info,
+                                    ),
+                                );
+                            }
                             let _ = b_tx.send(
-                                crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                                crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                                    queue.stats().await,
+                                ),
                             );
                         }
-                        let _ =
-                            b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                                queue.stats().await,
-                            ));
                     }
                 }
                 let resp = ClientResponse::TaskCancelled { task_id, success };
@@ -5794,14 +5861,16 @@ impl MasterHandle {
         self.scheduler_notify.notify_one();
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
-            if let Some(info) = self.queue.get_task(&id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                    info,
+            if b_tx.receiver_count() > 0 {
+                if let Some(info) = self.queue.get_task(&id).await {
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
+                }
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                    self.queue.stats().await,
                 ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                self.queue.stats().await,
-            ));
         }
         Ok(id)
     }
@@ -5820,14 +5889,16 @@ impl MasterHandle {
         self.scheduler_notify.notify_one();
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
-            if let Some(info) = self.queue.get_task(&id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                    info,
+            if b_tx.receiver_count() > 0 {
+                if let Some(info) = self.queue.get_task(&id).await {
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
+                }
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                    self.queue.stats().await,
                 ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                self.queue.stats().await,
-            ));
         }
         Ok(id)
     }
@@ -5875,14 +5946,16 @@ impl MasterHandle {
 
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
-            if let Some(info) = self.queue.get_task(&task_id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                    info,
+            if b_tx.receiver_count() > 0 {
+                if let Some(info) = self.queue.get_task(&task_id).await {
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
+                }
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                    self.queue.stats().await,
                 ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                self.queue.stats().await,
-            ));
         }
         Ok(())
     }
@@ -11077,6 +11150,144 @@ mod tests {
             guard.get(&worker_id, fresh_resume_key).is_none(),
             "resumed-only task key must not enter SpeedBook"
         );
+
+        let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_multi_client_fair_share_prevents_head_of_line_starvation() {
+        use rusty_grid_core::task::{Bytes, TaskRequirements, TaskSpec};
+        use std::collections::HashSet;
+
+        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let addr = master.server_addr();
+
+        let mut client_a = MessageTransport::new(TcpStream::connect(addr).await.unwrap());
+        let mut client_b = MessageTransport::new(TcpStream::connect(addr).await.unwrap());
+
+        let mut a_ids = HashSet::new();
+        for i in 0..10 {
+            let task = Task::new(
+                TaskSpec::command("echo", vec![format!("a-{i}")]),
+                TaskRequirements::generic(1, 60),
+            );
+            a_ids.insert(task.id);
+            client_a
+                .send_msg(&ClientMessage::SubmitTask { task, wait: false })
+                .await
+                .unwrap();
+            match client_a.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::TaskSubmitted { .. }) => {}
+                other => panic!("expected TaskSubmitted for client_a, got {other:?}"),
+            }
+        }
+
+        let mut b_ids = HashSet::new();
+        for i in 0..2 {
+            let task = Task::new(
+                TaskSpec::command("echo", vec![format!("b-{i}")]),
+                TaskRequirements::generic(1, 60),
+            );
+            b_ids.insert(task.id);
+            client_b
+                .send_msg(&ClientMessage::SubmitTask { task, wait: false })
+                .await
+                .unwrap();
+            match client_b.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::TaskSubmitted { .. }) => {}
+                other => panic!("expected TaskSubmitted for client_b, got {other:?}"),
+            }
+        }
+
+        let mut worker = MessageTransport::new(TcpStream::connect(addr).await.unwrap());
+        let worker_id = Uuid::new_v4();
+        worker
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new("fair-worker", 2, 8192, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match worker.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        let mut assigned_from_a = Vec::new();
+        let mut assigned_from_b = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+                .await
+                .expect("worker must receive initial 2 tasks")
+                .unwrap()
+            {
+                Some(MasterMessage::AssignTask { task }) => {
+                    if a_ids.contains(&task.id) {
+                        assigned_from_a.push(task.id);
+                    } else if b_ids.contains(&task.id) {
+                        assigned_from_b.push(task.id);
+                    } else {
+                        panic!("unexpected task assigned: {}", task.id);
+                    }
+                }
+                other => panic!("expected AssignTask, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            assigned_from_a.len(),
+            1,
+            "first 2 assignments must interleave client A"
+        );
+        assert_eq!(
+            assigned_from_b.len(),
+            1,
+            "first 2 assignments must interleave client B instead of starving behind A"
+        );
+
+        let b_done = assigned_from_b[0];
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: b_done,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+
+        let mut b_completed = false;
+        for _ in 0..100 {
+            client_b
+                .send_msg(&ClientMessage::GetTaskStatus { task_id: b_done })
+                .await
+                .unwrap();
+            match client_b.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::TaskStatusInfo {
+                    status: TaskStatus::Completed,
+                    ..
+                }) => {
+                    b_completed = true;
+                    break;
+                }
+                Some(ClientResponse::TaskStatusInfo { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("unexpected GetTaskStatus reply: {other:?}"),
+            }
+        }
+        assert!(b_completed, "client B task must complete cleanly");
 
         let _ = master.shutdown();
     }

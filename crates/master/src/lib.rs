@@ -2,8 +2,10 @@
 
 pub mod auth;
 pub mod blob_store;
+pub mod cold_results;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod fair_share;
 pub mod liveness;
 pub mod mapreduce;
 pub mod queue;
@@ -16,6 +18,7 @@ pub mod speed;
 pub mod store;
 #[cfg(feature = "dashboard")]
 pub mod web_ui;
+pub mod worker_index;
 
 pub use auth::{
     dashboard_admin_token, resolve_dashboard_auth, ApiToken, AuthConfig, AuthIdentity, AuthScope,
@@ -26,12 +29,17 @@ pub use blob_store::{
     BlobStore, BlobStoreConfig, BlobStoreStats, OutputPinGuard, DEFAULT_BLOB_STORE_MAX_BYTES,
     DEFAULT_OUTPUT_PIN_RETENTION,
 };
+pub use cold_results::{
+    ColdResultSummary, COLD_RESULTS_DIR, DEFAULT_MAX_HOT_TERMINAL_BYTES,
+    DEFAULT_MAX_HOT_TERMINAL_TASKS,
+};
+pub use fair_share::SubmitterId;
 pub use liveness::{RxClock, StampedStream};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{
     is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey, QueueOrderKey, QueueStats,
     ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo, TaskQueue,
-    TaskState, TaskView, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
+    TaskState, TaskStatusDetail, TaskView, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
     DEFAULT_MAX_TERMINAL_TASKS,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
@@ -45,7 +53,7 @@ pub use scheduler::{
 pub use server::{
     handle_task_progress, handle_task_result, handle_worker_disconnect, remove_port_file,
     write_port_file, MasterHandle, MasterServer, ServerConfig, WaiterMap,
-    DEFAULT_SESSION_RESUME_HOLD, DEFAULT_SESSION_RESUME_HOLD_SECS,
+    DEFAULT_MASTER_MAX_BATCH_SIZE, DEFAULT_SESSION_RESUME_HOLD, DEFAULT_SESSION_RESUME_HOLD_SECS,
 };
 pub use speed::{SpeedBook, SpeedEntry, TaskKey, EMA_WEIGHT, MAX_SPEED_KEYS, MAX_WORKERS_PER_KEY};
 
