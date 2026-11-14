@@ -45,6 +45,7 @@ test-hooks = []
 rusty_grid_worker = { path = "../worker" }
 futures = { workspace = true }
 reqwest = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
 [[test]]

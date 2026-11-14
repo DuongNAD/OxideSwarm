@@ -22,6 +22,14 @@ use tokio_tungstenite::connect_async;
 use rusty_grid_master::auth::{AuthConfig, AuthScope};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 
+fn http_client() -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+}
+
 /// Test 1: Loopback `--dev` mode bypass grants Admin scope to local unauthenticated requests.
 #[tokio::test]
 async fn test_rbac_loopback_dev_bypass() {
@@ -41,10 +49,7 @@ async fn test_rbac_loopback_dev_bypass() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // 1. GET / (public HTML) succeeds
     let resp = client.get(&base_url).send().await.expect("GET /");
@@ -96,10 +101,7 @@ async fn test_rbac_strict_mode_unauthorized() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // 1. GET / is always public
     let resp = client.get(&base_url).send().await.expect("GET /");
@@ -166,10 +168,7 @@ async fn test_rbac_invalid_token() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // Case A: Invalid Authorization Bearer
     let resp = client
@@ -225,10 +224,7 @@ async fn test_rbac_scope_enforcement() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // --- Observer Scope ---
     // Can read /api/status
@@ -363,10 +359,7 @@ async fn test_rbac_multi_channel_credential_extraction() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // Channel 1: Authorization: Bearer <token>
     let resp = client
@@ -425,10 +418,7 @@ async fn test_adversarial_malformed_tokens_and_empty_prefixes() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // 1. Authorization: Bearer (no space, empty)
     let resp = client
@@ -571,10 +561,7 @@ async fn test_adversarial_non_uuid_task_routes_strict_404() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // 1. Completely non-UUID string
     let resp = client
@@ -686,10 +673,7 @@ async fn test_adversarial_scope_escalation_matrix() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // Matrix check: POST /api/tasks requires Submitter or Admin
     // Observer -> 403
@@ -797,10 +781,7 @@ async fn test_adversarial_scope_escalation_matrix() {
 /// Adversarial Test 4: Loopback bypass dev toggle permutations and credential priority.
 #[tokio::test]
 async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     // Permutation A: dev_mode=false, loopback_bypass=true -> Loopback MUST be rejected (401)
     {
@@ -977,6 +958,7 @@ async fn test_adversarial_high_concurrency_stream_burst() {
     for _ in 0..CONCURRENT_CLIENTS {
         let sse_url = format!("{}/api/stream/sse?token=stream-token", base_url);
         let handle = tokio::spawn(async move {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
             let client = reqwest::Client::builder().build().unwrap();
             let mut res = client.get(&sse_url).send().await.expect("connect sse");
             assert_eq!(res.status(), StatusCode::OK);
@@ -992,6 +974,7 @@ async fn test_adversarial_high_concurrency_stream_burst() {
     }
 
     // Submit 5 tasks while clients are connected
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
     for i in 0..5 {
         let resp = client
