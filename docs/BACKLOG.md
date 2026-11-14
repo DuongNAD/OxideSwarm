@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `fc33c9e7` plus ENROLL-1b: 70 items Implemented, 6 Partial and 46 Planned. Five items
+On 2026-11-14, at `master` `8596c5fd`: 71 items Implemented, 7 Partial and 44 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -220,7 +220,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Planned |  |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -228,12 +228,12 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented | 162, 175, 187, 189 |
-| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 (open) |
+| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | (design 0051), 190, 201 |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Planned | (design 0052) |
-| USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), (open) |
+| USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), 185, 195, 207 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
-| USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Planned |  |
+| USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | 214, (design 0060) |
@@ -2552,15 +2552,24 @@ Add one dated line per finished item, newest last.
 - 2026-11-14: ENROLL-1 is Partial: `ENROLL-1a` merged in pull request 190 (per-machine X25519 keys,
   OXS-AUTH v3 Noise `IK` handshake and `Split()` record layer, `members.json` loaded at startup,
   `--master-key`, `master --auth secret|members|both`, `tests/enroll_v3_e2e.rs`), and `ENROLL-1b` is
-  implemented in pull request 201 (`oxs1-invite:` invites, `oxideswarm invite`, `oxideswarm members`
+  merged in pull request 201 (`oxs1-invite:` invites, `oxideswarm invite`, `oxideswarm members`
   including `release-worker`, `oxideswarm join` with invites and 6-digit pairing check confirmation,
   pending enrollment requests with use deducted at approval, auto-enrolment of the master's host
   `node.key` as `admin`, worker-id ownership per member, protocol version 8,
   `tests/cli_enroll_e2e.rs`). `ENROLL-1c` (live revocation across all lanes and task
   cancellation/requeue) and `ENROLL-1d` (dashboard members page and docs/guide) are Planned. The
   Index counts are now 70 Implemented, 6 Partial and 46 Planned.
+- 2026-11-14: Synced BACKLOG with `master` `8596c5fd`: USB-4 is Implemented (pull requests 207 and
+  210, `29ccd3e`: default worker slots sized to performance cores via Windows
+  `GetSystemCpuSetInformation`, macOS `hw.perflevel0.logicalcpu`, and Linux
+  `/sys/devices/cpu_core/cpus` with battery fallback, `--slots` / `-Slots` override preserved across
+  `--update`, `tests/test_launcher_scripts.py` and live probe picking 4 slots on the Core i7-1355U
+  laptop and 10 on the Core i5-14600KF desktop); MAINT-1 is Partial (pull requests 211 and 212,
+  `681012d`: `crates/worker/src/client.rs` unit tests moved to `crates/worker/src/client/tests.rs`,
+  8,252 to 4,363 lines); USB-1 lists merged pull requests 185, 195 and 207; and ENROLL-1b merged in
+  pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
 - 2026-11-14: Completed design 0039 W11 under FEAT-4 (pull request 186): symbolic links and empty
   directories in `TreeManifest` (`oxideswarm-tree/2`, `ProtocolCapabilities::TREE_V2`), with
   case- and Unicode-folded `FoldedSymlinkTrie` / `FoldedPathTrie` validation, manifest complexity
   budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
-  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 6 Partial and 46 Planned.
+  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 71 Implemented, 7 Partial and 44 Planned.
