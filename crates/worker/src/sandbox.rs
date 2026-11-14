@@ -817,7 +817,7 @@ fn check_windows_ancestor(
     }
     if !snap.is_dir {
         return Err(SandboxError::BaseDirUnusable {
-            path: root.to_path_buf(),
+            path: anc.to_path_buf(),
             source: std::io::Error::from_raw_os_error(267), // ERROR_DIRECTORY
         });
     }
@@ -928,7 +928,7 @@ fn check_windows_ancestor(
 }
 
 #[cfg(windows)]
-fn ensure_private_dir_windows_with(
+pub(crate) fn ensure_private_dir_windows_with(
     root: &Path,
     emit_warnings: bool,
     current_sid: impl FnOnce() -> std::io::Result<String>,
@@ -1193,7 +1193,7 @@ fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
     true
 }
 
-fn is_real_owned_file(path: &Path, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_real_owned_file(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
@@ -1268,6 +1268,11 @@ fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
     }
 
     let locks_dir = base_dir.join(".locks");
+    #[cfg(windows)]
+    ensure_private_dir_recheck(&locks_dir).map_err(|e| match e {
+        SandboxError::BaseDirUnusable { source, .. } => source,
+        other => std::io::Error::new(std::io::ErrorKind::PermissionDenied, other.to_string()),
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1277,7 +1282,7 @@ fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
             Err(e) => return Err(e),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         match std::fs::create_dir(&locks_dir) {
             Ok(()) => {}
@@ -2969,6 +2974,19 @@ mod windows_private_dir_tests {
                 dir.display()
             );
         }
+
+        // 4. A non-directory file on the ancestor chain is reported with that ancestor's path, not
+        //    the target root's path.
+        let file_anc = tmp.path().join("file_anc");
+        std::fs::write(&file_anc, b"not a directory").unwrap();
+        let under_file_anc = file_anc.join("sandboxes");
+        let err_file_anc =
+            ensure_private_dir(&under_file_anc).expect_err("file ancestor must be refused");
+        assert!(
+            matches!(&err_file_anc, SandboxError::BaseDirUnusable { path, .. }
+                if path == &file_anc),
+            "{err_file_anc:?}"
+        );
     }
 
     #[tokio::test]

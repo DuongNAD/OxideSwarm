@@ -51,9 +51,14 @@ cleanup of `<base>/cache` must not follow such links. That check covers the clea
   refuses non-admin rename rights on every ancestor up to the drive root. An ancestor such as
   `C:\ProgramData` that grants `BUILTIN\Users` `FILE_ADD_SUBDIRECTORY` without `DELETE` or
   `FILE_DELETE_CHILD` cannot rename an existing child, though another local user could pre-create a
-  missing child first (refused by the owner check) or place sibling files in an unprotected shared
-  parent (for example `.cargo\config.toml`, which `cargo` reads upward). `install_windows_service.ps1`
-  therefore locks `C:\ProgramData\OxideSwarm` as well as `C:\ProgramData\OxideSwarm\data`.
+  missing child first (refused by the owner check). `install_windows_service.ps1` therefore checks
+  reparse points and owners (`SYSTEM` or `Administrators`) before making any change and creates
+  `C:\ProgramData\OxideSwarm` as well as `C:\ProgramData\OxideSwarm\data` in one step with a
+  protected DACL.
+- Preventing upward `.cargo\config.toml` discovery across shared Windows system roots. `C:\` grants
+  `Authenticated Users` `(AD)` and `C:\ProgramData` grants `BUILTIN\Users` `(WD,AD)`, so any local
+  user can plant `C:\.cargo\config.toml` or `C:\ProgramData\.cargo\config.toml`, which `cargo` reads
+  for tasks run below them; a follow-up will look at `CARGO_HOME` / `--config` isolation.
 - Isolating a task from the worker's own account. A task still runs as that account (see
   `docs/SECURITY.md`, section 7).
 
@@ -114,14 +119,16 @@ directory) therefore skips it.
 ### D4 Windows sandbox base and workspace root
 
 Windows has no per-user root directory above `base_dir`. Instead `SandboxConfig::checked_private_root`
-returns `Some(&self.base_dir)`, `ensure_locks_dir` recreates a missing base only through
-`ensure_private_dir_recheck`, `TaskRunner::ensure_blob_cache` runs `ensure_private_root_recheck_blocking`
-on `spawn_blocking` before opening `<base_dir>/cache/blobs` (retrying on a later task if an earlier
-open failed), and `WorkspaceStore` runs `ensure_private_dir` in `open` and `ensure_private_dir_recheck`
-in `acquire`. Every start-up and per-task check from D3 therefore runs on Windows as well, and
-`is_real_owned_dir`, `is_real_owned_file`, and `is_real_owned_open_file` verify both absence of
-`FILE_ATTRIBUTE_REPARSE_POINT` and trusted ownership (`is_path_trusted_owner_no_follow` and
-`is_handle_trusted_owner`).
+returns `Some(&self.base_dir)`, `ensure_locks_dir` creates and re-checks both `base_dir` and
+`<base_dir>/.locks` through `ensure_private_dir_recheck`, `TaskRunner::ensure_blob_cache` runs
+`ensure_private_root_recheck_blocking` on `spawn_blocking` before `BlobCache::open`
+(`crates/worker/src/blob_cache.rs`), which checks `<base_dir>/cache`, `<base_dir>/cache/blobs`,
+`objects`, `tmp`, and every fanout directory through `ensure_private_dir` (retrying on a later task
+if an earlier open failed), and `WorkspaceStore` runs `ensure_private_dir` in `open` and
+`ensure_private_dir_recheck` in `acquire`. Every start-up and per-task check from D3 therefore runs
+on Windows as well, and `is_real_owned_dir`, `is_real_owned_file`, and `is_real_owned_open_file`
+verify both absence of `FILE_ATTRIBUTE_REPARSE_POINT` and trusted ownership
+(`is_path_trusted_owner_no_follow` and `is_handle_trusted_owner`).
 
 `ensure_private_dir` (`crates/worker/src/sandbox.rs`) calls `check_windows_ancestor`,
 `create_or_open_private_dir_all`, and `inspect_dir_security_no_follow`
@@ -172,9 +179,13 @@ back to desired access `0` on `PermissionDenied`):
    `RX` entries without write rights), so refusing foreign write grants in step 2 breaks neither
    `0.1.x` default bases, USB kit work folders, nor `tempfile` tests, while rejecting open shared
    folders such as an unhardened `C:\ProgramData\OxideSwarm\data` (`install_windows_service.ps1`
-   locks `$DataDir` with `/inheritance:r` to `SYSTEM`, `Administrators`, and the service SID). When
-   an existing trusted-owner directory has no foreign write grant, `dir_read_grants`
-   (`DIR_READ_MASK`: `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | GENERIC_READ`)
+   verifies reparse points and owners before making any change, creates missing directories in one
+   step with a protected DACL, locks `$DataDir` and `$LogDir` with `/inheritance:r` to `SYSTEM`,
+   `Administrators`, and Modify `*<serviceSid>:(OI)(CI)M`, verifies the resulting DACLs, and resets
+   child ownership and inherited ACLs under `$DataDir` via `/setowner *S-1-5-32-544 /T /C` and
+   `/reset /T /C` so `.locks` and `cache` also remain usable if `-ServiceAccount` changes on
+   reinstall). When an existing trusted-owner directory has no foreign write grant, `dir_read_grants`
+   (`DIR_READ_MASK`: `FILE_LIST_DIRECTORY | GENERIC_READ`, `0x0000_0001 | 0x8000_0000`)
    checks all five Windows allow ACE types (`ACCESS_ALLOWED`, `ACCESS_ALLOWED_CALLBACK`,
    `ACCESS_ALLOWED_COMPOUND`, `ACCESS_ALLOWED_OBJECT`, and `ACCESS_ALLOWED_CALLBACK_OBJECT`,
    bounds-checked via unaligned reads against both `AclSize` and `AclBytesInUse`). Any foreign
@@ -251,8 +262,9 @@ Unit tests in `crates/worker/src/sandbox.rs`, `crates/core/src/private_file.rs`,
     `client::tests::test_assign_refuses_a_task_before_touching_a_replaced_sandbox_root`, and
     `android_bridge::tests::test_bridge_check_creates_the_default_private_root_with_mode_700`.
 - Cross-platform and Windows tests (`crates/core/src/private_file.rs`,
-  `crates/worker/src/sandbox.rs`, `crates/worker/src/runner.rs`, `tests/test_launcher_scripts.py`):
-  - `dir_open_grants_catches_untrusted_sids_while_allowing_trusted_and_toolchain_traverse`,
+  `crates/worker/src/sandbox.rs`, `crates/worker/src/blob_cache.rs`, `crates/worker/src/runner.rs`,
+  `tests/test_launcher_scripts.py`):
+  - `dir_write_and_read_grants_separate_write_class_from_read_only`,
     `entries_without_data_access_including_generic_execute_and_read_ea_are_ignored`, and
     `ancestor_unsafe_grants_skips_inherit_only_and_catches_rename_rights`: verify write vs read
     masks (`dir_write_grants`, `dir_read_grants`), `GENERIC_EXECUTE`/`FILE_READ_EA`/traverse
@@ -270,8 +282,9 @@ Unit tests in `crates/worker/src/sandbox.rs`, `crates/core/src/private_file.rs`,
     `s2_parent_chain_refuses_mutable_or_reparse_ancestors_and_creates_missing_ancestors_privately`,
     `s2_per_task_recheck_runs_and_deleted_base_is_recreated_privately`,
     `s3_creation_race_runs_the_existing_directory_checks`,
-    `s4_non_acl_volume_and_dropped_security_descriptor_are_refused`, and
-    `runner::tests::test_runner_blob_cache_retries_after_initial_base_failure`.
+    `s4_non_acl_volume_and_dropped_security_descriptor_are_refused`,
+    `blob_cache::tests::windows_blob_cache_creates_private_dirs_and_refuses_junctions_untrusted_owners_and_foreign_write_grants`,
+    and `runner::workspace_runner_tests::test_runner_blob_cache_retries_after_initial_base_failure`.
 
 Disabling any refusal fails at least one of these tests. Disabling any call of the check fails one too,
 with one exception: the second check in `handle_assign_task`'s task, before the input fetch, has no
@@ -281,7 +294,7 @@ test. A test for it would have to replace the root while the task waits for a sl
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| SEC-8 | Private task directories on Unix and Windows | `crates/core/src/private_file.rs`, `crates/worker/src/sandbox.rs`, `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/android_bridge/src/lib.rs`, `packaging/usb/install.ps1`, `packaging/windows/install_windows_service.ps1` | The Unix, Windows, isolation (`FEAT-3d`), and launcher tests above pass | Implemented |
+| SEC-8 | Private task directories on Unix and Windows | `crates/core/src/private_file.rs`, `crates/worker/src/sandbox.rs`, `crates/worker/src/blob_cache.rs`, `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/android_bridge/src/lib.rs`, `packaging/usb/install.ps1`, `packaging/windows/install_windows_service.ps1` | The Unix, Windows, isolation (`FEAT-3d`), and launcher tests above pass | Implemented |
 
 ## Status log
 
@@ -341,3 +354,22 @@ test. A test for it would have to replace the root while the task waits for a sl
     inspection onto a single `CreateFileW` handle with cached `current_user_sid()`, made
     `TaskRunner::ensure_blob_cache` retryable via `spawn_blocking`, excluded `GENERIC_EXECUTE` and
     `FILE_READ_EA` from sensitive masks, and updated `README.md` and `docs/SECURITY.md`.
+- 2026-11-14 (USB-kit follow-up):
+  - `BlobCache::open` (`crates/worker/src/blob_cache.rs`) and `ensure_locks_dir` now create and
+    check `<base>\cache`, `cache\blobs`, `objects`, `tmp`, fanout directories, and `.locks` through
+    `ensure_private_dir` on Windows, refusing reparse points, untrusted owners, and foreign
+    write-class grants with the same checks and messages as the base.
+  - `packaging/windows/install_windows_service.ps1` checks reparse points and owners (`SYSTEM` or
+    `Administrators`) before stopping a service or touching any path, creates missing directories in
+    one step with a protected DACL (`[IO.Directory]::CreateDirectory($seg, $sec)`), grants Modify by
+    SID (`*<serviceSid>:(OI)(CI)M`) on `$DataDir` and `$LogDir`, checks every `icacls` exit code,
+    verifies resulting DACLs, and resets ownership and inherited ACLs on `$DataDir`'s children
+    (`/setowner *S-1-5-32-544 /T /C` and `/reset /T /C` after refusing reparse points), keeping
+    `.locks` and `cache` usable if `-ServiceAccount` changes on reinstall.
+  - `packaging/usb/install.ps1` applies the protected DACL on an existing open `$InstallRoot`
+    through a single `FILE_FLAG_OPEN_REPARSE_POINT` handle (`Set-PrivateDaclNoFollow`) and bounds
+    `-Update`'s open-root walk to installer/control folders so cargo `target` trees and task-created
+    junctions inside sandboxes or workspaces do not slow or block updates; recorded upward
+    `.cargo\config.toml` discovery across `C:\` / `C:\ProgramData` under Non-goals, marked raw
+    pointer helpers in `private_file.rs` `unsafe fn`, and fixed non-directory ancestor path reporting
+    in `sandbox.rs`.
