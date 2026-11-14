@@ -237,6 +237,7 @@ jobs:
       - run: python tests/test_launcher_scripts.py
       - run: python tests/test_m1_challenger_hygiene.py
       - run: python tests/test_bench_grid.py
+      - run: python tests/test_scale_harness.py
       - name: run agent mesh test suite
         run: python tests/run_mesh_simulation_tests.py
 
