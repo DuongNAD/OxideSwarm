@@ -1655,14 +1655,63 @@ pub async fn api_rendezvous_register(
             })),
         ));
     }
+    if !crate::rendezvous::is_routable_or_loopback_cluster_addr(&lease.cluster_addr) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid cluster_addr",
+                "message": "Lease cluster_addr must be a valid host:port and cannot be unspecified, multicast, or broadcast"
+            })),
+        ));
+    }
+    if !lease.web_ui_url.is_empty()
+        && (!(lease.web_ui_url.starts_with("http://") || lease.web_ui_url.starts_with("https://"))
+            || lease
+                .web_ui_url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace()))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid web_ui_url",
+                "message": "Lease web_ui_url must be a valid http(s) URL without whitespace or control characters"
+            })),
+        ));
+    }
+    if lease.ttl_secs == 0 || lease.ttl_secs > crate::rendezvous::DEFAULT_MAX_TTL_SECS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid TTL",
+                "message": format!(
+                    "Lease ttl_secs must be between 1 and {} seconds",
+                    crate::rendezvous::DEFAULT_MAX_TTL_SECS
+                )
+            })),
+        ));
+    }
 
     if let Some(ref secret) = state.cluster_secret {
-        if !lease.verify(secret, 30) {
+        if !lease.verify(secret, crate::rendezvous::LEASE_CLOCK_SKEW_SECS) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "error": "Invalid signature",
                     "message": "Rendezvous lease signature verification failed"
+                })),
+            ));
+        }
+    } else {
+        let now = chrono::Utc::now().timestamp() as u64;
+        if now + crate::rendezvous::LEASE_CLOCK_SKEW_SECS < lease.timestamp
+            || crate::rendezvous::is_lease_expired(&lease, now)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Expired lease",
+                    "message": "Rendezvous lease timestamp is expired or too far in the future"
                 })),
             ));
         }
@@ -1681,14 +1730,9 @@ pub async fn api_rendezvous_master(
     let guard = state.rendezvous_registry.read().await;
     if let Some(ref lease) = *guard {
         let now = chrono::Utc::now().timestamp() as u64;
-        if now
-            <= lease
-                .timestamp
-                .saturating_add(lease.ttl_secs)
-                .saturating_add(30)
-        {
+        if !crate::rendezvous::is_lease_expired(lease, now) {
             let mut lease = lease.clone();
-            let is_authenticated = crate::auth::extract_credential(&headers, uri.query())
+            let has_bearer_observer = crate::auth::extract_credential(&headers, uri.query())
                 .and_then(|token| crate::auth::find_token(&state.auth_config, &token))
                 .is_some_and(|registered| {
                     registered
@@ -1696,8 +1740,31 @@ pub async fn api_rendezvous_master(
                         .iter()
                         .any(|s| s.allows(crate::auth::AuthScope::Observer))
                 });
-            if !is_authenticated {
-                lease.p2p_ticket = None;
+            let expected_key = lease.lease_key.clone().or_else(|| {
+                state
+                    .cluster_secret
+                    .as_ref()
+                    .map(rusty_grid_core::discovery::derive_rendezvous_key)
+            });
+            let has_lease_read_auth = expected_key.as_deref().is_some_and(|key_hex| {
+                headers
+                    .get(rusty_grid_core::discovery::RENDEZVOUS_READ_AUTH_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|hdr| {
+                        rusty_grid_core::discovery::verify_rendezvous_read_auth(
+                            key_hex,
+                            hdr,
+                            crate::rendezvous::LEASE_CLOCK_SKEW_SECS,
+                        )
+                    })
+            });
+            if !(has_bearer_observer || has_lease_read_auth)
+                && lease.p2p_ticket.take().is_some()
+                && lease.signature.is_some()
+            {
+                if let Some(ref secret) = state.cluster_secret {
+                    lease.sign(secret);
+                }
             }
             return Ok(Json(lease));
         }

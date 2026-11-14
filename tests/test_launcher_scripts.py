@@ -2419,6 +2419,8 @@ public class Program {
 
             normal_proc.terminate()
             normal_proc.wait(timeout=10)
+            if normal_proc.stdout is not None:
+                normal_proc.stdout.close()
             normal_proc = None
 
             uninst_unmarked = subprocess.run(
@@ -2436,12 +2438,16 @@ public class Program {
             self.assertTrue(os.path.isdir(legacy_root))
             self.assertEqual(read(proj_tree_hello), "normal worker state\n")
         finally:
-            if normal_proc is not None and normal_proc.poll() is None:
-                normal_proc.terminate()
-                try:
-                    normal_proc.wait(timeout=10)
-                except Exception:
-                    normal_proc.kill()
+            if normal_proc is not None:
+                if normal_proc.poll() is None:
+                    normal_proc.terminate()
+                    try:
+                        normal_proc.wait(timeout=10)
+                    except Exception:
+                        normal_proc.kill()
+                        normal_proc.wait(timeout=5)
+                if normal_proc.stdout is not None:
+                    normal_proc.stdout.close()
             for pid_candidate in (
                 pids_log,
                 os.path.join(tmp_localappdata, "OxideSwarm-USB", "run", "worker.pid"),
