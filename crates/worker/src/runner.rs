@@ -161,6 +161,9 @@ pub struct RunnerConfig {
     /// Multiplier applied to `BuiltinTest` sleep durations in integration tests (`1` in production).
     #[doc(hidden)]
     pub test_sleep_multiplier: u32,
+    /// Additive offset (ms) applied to `BuiltinTest` sleep durations in integration tests (`0` in production).
+    #[doc(hidden)]
+    pub test_sleep_offset_ms: u64,
 }
 
 impl Default for RunnerConfig {
@@ -189,6 +192,7 @@ impl RunnerConfig {
             workspace_store: None,
             workspace_lock_wait: DEFAULT_WORKSPACE_LOCK_WAIT,
             test_sleep_multiplier: 1,
+            test_sleep_offset_ms: 0,
         }
     }
 
@@ -197,6 +201,14 @@ impl RunnerConfig {
     #[doc(hidden)]
     pub fn with_test_sleep_multiplier(mut self, multiplier: u32) -> Self {
         self.test_sleep_multiplier = multiplier.max(1);
+        self
+    }
+
+    /// Adds `offset_ms` to `BuiltinTest` sleep durations (test hook for speed-aware scheduling
+    /// integration tests). Exists for integration tests only.
+    #[doc(hidden)]
+    pub fn with_test_sleep_offset_ms(mut self, offset_ms: u64) -> Self {
+        self.test_sleep_offset_ms = offset_ms;
         self
     }
 
@@ -1325,13 +1337,13 @@ impl TaskRunner {
         }
 
         let sleep_mult = u64::from(self.config.test_sleep_multiplier.max(1));
+        let effective_sleep_ms = duration_ms
+            .saturating_mul(sleep_mult)
+            .saturating_add(self.config.test_sleep_offset_ms);
         let compute_fut = async {
             if cfg!(test) && test_name == "oversized_asset" {
                 if duration_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(
-                        duration_ms.saturating_mul(sleep_mult),
-                    ))
-                    .await;
+                    tokio::time::sleep(Duration::from_millis(effective_sleep_ms)).await;
                 }
                 "engine stdout line\n".to_string()
             } else if test_name == "sleep"
@@ -1341,8 +1353,7 @@ impl TaskRunner {
                     && test_name != "checkpoint_iterative"
                     && test_name != "hash_compute")
             {
-                let effective_ms = duration_ms.saturating_mul(sleep_mult);
-                tokio::time::sleep(Duration::from_millis(effective_ms)).await;
+                tokio::time::sleep(Duration::from_millis(effective_sleep_ms)).await;
                 format!("BuiltinTest sleep complete: {duration_ms} ms\n")
             } else if test_name == "arithmetic_stress" || test_name == "arithmetic" {
                 let iters = if iterations == 0 { 100_000 } else { iterations };

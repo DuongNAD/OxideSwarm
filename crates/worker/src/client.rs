@@ -1839,6 +1839,24 @@ impl WorkerClient {
         self
     }
 
+    /// Test hook adding `offset_ms` to `BuiltinTest` sleep durations on this worker's
+    /// [`TaskRunner`] (`docs/design/0060-speed-aware-placement.md` integration test). Exists for
+    /// integration tests only and is not exposed via CLI, environment variables, or wire messages.
+    #[doc(hidden)]
+    pub fn with_test_sleep_offset_ms(mut self, offset_ms: u64) -> Self {
+        let runner_cfg = self
+            .runner
+            .config()
+            .clone()
+            .with_test_sleep_offset_ms(offset_ms);
+        self.runner = Arc::new(TaskRunner::new(
+            self.worker_id,
+            self.capabilities.clone(),
+            runner_cfg,
+        ));
+        self
+    }
+
     /// What start-up decided about the GPU and why: the real adapter in use, or, if the owner
     /// asked for a GPU that cannot be used, a warning saying how to get one. The CLI prints these.
     pub fn gpu_notices(&self) -> &[GpuNotice] {

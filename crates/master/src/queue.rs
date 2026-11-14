@@ -3073,6 +3073,7 @@ impl TaskQueue {
                     entry.state = TaskState::Scheduled;
                     entry.assigned_worker_id = Some(worker_id);
                     entry.assigned_session = None;
+                    entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
                     entry.adoptable_by = None;
                     entry.fail_if_not_adopted = false;
                     entry.pending_failover_charge = false;
@@ -3154,6 +3155,7 @@ impl TaskQueue {
                 entry.state = TaskState::Scheduled;
                 entry.assigned_worker_id = Some(worker_id);
                 entry.assigned_session = None;
+                entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
                 entry.adoptable_by = None;
                 entry.fail_if_not_adopted = false;
                 entry.pending_failover_charge = false;
@@ -8751,5 +8753,52 @@ mod tests {
             "replay must record workspace affinity with the TaskTerminal finish timestamp"
         );
         q.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn test_single_task_schedulers_track_resumed_from_checkpoint() {
+        let q = TaskQueue::new();
+        let w1 = Uuid::new_v4();
+        let w2 = Uuid::new_v4();
+
+        // Fresh task scheduled with `schedule_task` has `resumed_from_checkpoint == false`.
+        let fresh_id = q.submit(echo_task("fresh-single")).await.unwrap();
+        assert!(q.schedule_task(&fresh_id, w1).await.is_some());
+        let fresh_outcome = q
+            .record_result_from(w1, None, TaskResult::success(w1, fresh_id, "ok", 20, false))
+            .await
+            .unwrap();
+        assert!(!fresh_outcome.resumed_from_checkpoint);
+
+        // Task with a recorded checkpoint scheduled via `schedule_task` marks
+        // `resumed_from_checkpoint == true`.
+        let t_sched = q.submit(echo_task("resumed-schedule-task")).await.unwrap();
+        assert!(q.schedule_task(&t_sched, w1).await.is_some());
+        q.record_checkpoint_from(w1, None, t_sched, CheckpointData::new(1, b"cp1".to_vec()))
+            .await
+            .unwrap();
+        q.requeue_task(&t_sched).await.unwrap();
+        assert!(q.schedule_task(&t_sched, w2).await.is_some());
+        let sched_outcome = q
+            .record_result_from(w2, None, TaskResult::success(w2, t_sched, "ok", 10, false))
+            .await
+            .unwrap();
+        assert!(sched_outcome.resumed_from_checkpoint);
+
+        // Same check for `pop_and_schedule`.
+        let t_pop = q.submit(echo_task("resumed-pop-schedule")).await.unwrap();
+        let popped_first = q.pop_and_schedule(w1, |_| true).await.unwrap();
+        assert_eq!(popped_first.id, t_pop);
+        q.record_checkpoint_from(w1, None, t_pop, CheckpointData::new(1, b"cp2".to_vec()))
+            .await
+            .unwrap();
+        q.requeue_task(&t_pop).await.unwrap();
+        let popped_second = q.pop_and_schedule(w2, |_| true).await.unwrap();
+        assert_eq!(popped_second.id, t_pop);
+        let pop_outcome = q
+            .record_result_from(w2, None, TaskResult::success(w2, t_pop, "ok", 10, false))
+            .await
+            .unwrap();
+        assert!(pop_outcome.resumed_from_checkpoint);
     }
 }

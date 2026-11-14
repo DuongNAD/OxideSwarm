@@ -92,7 +92,8 @@ In `Engine::place`, after `candidates` and before `rank`, for a task whose key h
    only when the task waits for `best`'s slots (`full`), not when `best` still has free slots and
    was excluded for another reason such as `ram_short`, `host_busy`, or GPU preservation. The hold
    decision and `min_expected` are cached per `(Shape, TaskKey)` within the pass when `avoid` and
-   `workspace` are empty. Otherwise only candidates that are clearly slower
+   `workspace` are empty, and that cache is cleared whenever the pass places a task, newly
+   reserves a worker in `hold_back`, or flips `gpu_waiting`. Otherwise only candidates that are clearly slower
    (`expected(c) >= speed_hold_factor * min_expected`, where `min_expected` is the minimum over
    `candidates`) are excluded, and the remaining candidates keep today's `rank` order with no
    re-ordering by expected finish time.
@@ -172,3 +173,4 @@ worker table.
 - 2026-11-10: Created from the two-machine trial measurements in Context. Planned.
 - 2026-11-11: Implemented `SCHED-4a` (`SpeedBook` in `crates/master/src/speed.rs`, updated on terminal results in `crates/master/src/server.rs` and cleared on worker removal/pruning in `crates/master/src/registry.rs`) and `SCHED-4b` (D2 speed-aware placement and `ScheduleSkipReason::WaitingForFasterWorker` in `crates/master/src/scheduler.rs`, verified by `tests/sched4_speed_aware.rs`). `SCHED-4c` and `SCHED-4d` remain Planned.
 - 2026-11-14: Amended D1 and D2 for review round 1: excluded only candidates with `expected(c) >= speed_hold_factor * min_expected` while preserving `rank` order among near-equal workers, added `Engine::dead_speed` per-pass cache and `Arc<SpeedBook>` copy-on-write snapshots, restricted `hold_back` reservation of `best` to `full` slot waits, added `speed_hold_factor` validation (`0` or finite `> 1.0`) plus `--speed-hold-factor` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`), treated `< speed_min_samples` candidates as unknown (`best_avg`), skipped recording checkpoint-resumed attempts (`AssignTaskWithCheckpoint`), and documented least-recently-recorded D1 eviction.
+- 2026-11-14: Amended D2 for review round 2b: cleared `Engine::dead_speed` whenever the pass places a task, newly reserves a worker in `hold_back`, or flips `gpu_waiting`.

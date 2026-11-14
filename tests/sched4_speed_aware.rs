@@ -222,7 +222,8 @@ async fn sched4_batch_finishes_within_1_5x_fast_worker_and_zero_factor_restores_
 #[tokio::test]
 async fn sched4_near_equal_workers_spread_after_warmup() {
     const BASE_SLEEP_MS: u64 = 180;
-    const TASKS: usize = 8;
+    const WARMUP_TASKS: usize = 16;
+    const MEASURED_TASKS: usize = 8;
 
     let sandbox_dir = TempDir::new().expect("tempdir for worker sandboxes");
     let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
@@ -237,15 +238,19 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
 
     let mut ids = Vec::new();
     let mut shutdowns = Vec::new();
-    for name in ["worker-a", "worker-b"] {
+    // Both workers expose 8 concurrent slots (16 total) so an 8-task measured batch never
+    // overflows onto the second worker due to slot saturation alone. `worker-b` sleeps 25 ms
+    // longer (~1.14x vs 1.0x): well inside `speed_hold_factor = 1.5`, so D2 must spread tasks
+    // across both whereas packing onto the lowest-EWMA worker sends all 8 tasks to `worker-a`.
+    for (name, offset_ms) in [("worker-a", 0u64), ("worker-b", 25u64)] {
         let cfg = WorkerConfig::new(master_addr.clone())
             .with_name(name)
-            .with_cores(4)
+            .with_cores(8)
             .with_ram_mb(16_384)
             .with_no_gpu(true)
-            .with_max_concurrency(4)
+            .with_max_concurrency(8)
             .with_sandbox_base_dir(sandbox_dir.path().join(name));
-        let mut client = WorkerClient::new(cfg);
+        let mut client = WorkerClient::new(cfg).with_test_sleep_offset_ms(offset_ms);
         ids.push(client.worker_id());
         let (tx, rx) = watch::channel(false);
         shutdowns.push(tx);
@@ -266,9 +271,9 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
     assert!(ready, "both near-equal workers failed to connect");
 
     let spec = sleep_spec(BASE_SLEEP_MS);
-    // Warmup of 8 tasks so both workers record >= 2 samples in SpeedBook.
-    let mut warm_ids = Vec::with_capacity(TASKS);
-    for _ in 0..TASKS {
+    // Warmup of 16 tasks so both 8-slot workers record >= 2 samples in SpeedBook.
+    let mut warm_ids = Vec::with_capacity(WARMUP_TASKS);
+    for _ in 0..WARMUP_TASKS {
         warm_ids.push(
             master
                 .submit_task(Task::new(spec.clone(), TaskRequirements::generic(1, 30)))
@@ -286,10 +291,23 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
     .map(|r| r.unwrap())
     .collect();
     assert!(warm_results.iter().all(TaskResult::is_success));
+    let warm_a = warm_results
+        .iter()
+        .filter(|r| r.worker_id == ids[0])
+        .count();
+    let warm_b = warm_results
+        .iter()
+        .filter(|r| r.worker_id == ids[1])
+        .count();
+    assert!(
+        warm_a >= 2 && warm_b >= 2,
+        "warmup must give both near-equal workers >= 2 samples (a={warm_a}, b={warm_b})"
+    );
 
-    // Measured batch with SpeedBook populated: both 1x workers still share the 8-task batch.
-    let mut batch_ids = Vec::with_capacity(TASKS);
-    for _ in 0..TASKS {
+    // Measured 8-task batch with SpeedBook populated on 16 total slots: both 1.0x/1.14x workers
+    // still share work instead of packing all 8 onto `worker-a`.
+    let mut batch_ids = Vec::with_capacity(MEASURED_TASKS);
+    for _ in 0..MEASURED_TASKS {
         batch_ids.push(
             master
                 .submit_task(Task::new(spec.clone(), TaskRequirements::generic(1, 30)))
