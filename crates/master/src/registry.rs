@@ -295,6 +295,7 @@ struct WorkerRegistryInner {
 #[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<RwLock<WorkerRegistryInner>>,
+    speed_book: Arc<std::sync::Mutex<Option<crate::speed::SharedSpeedBook>>>,
 }
 
 impl Default for WorkerRegistry {
@@ -314,7 +315,23 @@ impl WorkerRegistry {
                 next_session_id: 1,
                 registration_epoch: 0,
             })),
+            speed_book: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Attaches the scheduler's [`crate::speed::SpeedBook`] so terminal task results and worker
+    /// pruning update it under the scheduler's own lock (`0060` D1).
+    pub(crate) fn set_speed_book(&self, speed_book: crate::speed::SharedSpeedBook) {
+        *self.speed_book.lock().unwrap_or_else(|e| e.into_inner()) = Some(speed_book);
+    }
+
+    /// Returns the attached [`crate::speed::SpeedBook`], if a [`crate::scheduler::WorkloadScheduler`]
+    /// has been bound to this registry.
+    pub fn speed_book(&self) -> Option<crate::speed::SharedSpeedBook> {
+        self.speed_book
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Registers a new worker or reconnects an existing worker.
@@ -770,44 +787,62 @@ impl WorkerRegistry {
 
     /// Unconditionally removes a worker from the registry (closing any active abort handle).
     pub async fn remove_worker(&self, worker_id: &Uuid) -> Option<WorkerInfo> {
-        let mut inner = self.inner.write().await;
-        inner.network_types.remove(worker_id);
-        inner.owner_member_ids.remove(worker_id);
-        if let Some(entry) = inner.workers.remove(worker_id) {
-            inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
-            if let Some(abort) = entry.abort_handle.clone() {
-                abort_unless_current(abort);
+        let removed = {
+            let mut inner = self.inner.write().await;
+            inner.network_types.remove(worker_id);
+            inner.owner_member_ids.remove(worker_id);
+            if let Some(entry) = inner.workers.remove(worker_id) {
+                inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
+                if let Some(abort) = entry.abort_handle.clone() {
+                    abort_unless_current(abort);
+                }
+                Some(entry.to_info())
+            } else {
+                None
             }
-            Some(entry.to_info())
-        } else {
-            None
+        };
+        if removed.is_some() {
+            if let Some(sb) = self.speed_book() {
+                crate::speed::mutate_shared_speed_book(&sb, |book| book.remove_worker(worker_id));
+            }
         }
+        removed
     }
 
     /// Evicts disconnected workers whose last heartbeat or registration occurred longer ago than `stale_timeout`.
     pub async fn prune_stale_workers(&self, stale_timeout: Duration) -> usize {
-        let mut inner = self.inner.write().await;
-        let now = Instant::now();
-        let mut to_remove = Vec::new();
-        for (id, entry) in &inner.workers {
-            if entry.status == WorkerStatus::Disconnected
-                && now.duration_since(entry.last_heartbeat_instant) >= stale_timeout
-            {
-                to_remove.push(*id);
-            }
-        }
-        let count = to_remove.len();
-        for id in to_remove {
-            inner.network_types.remove(&id);
-            inner.owner_member_ids.remove(&id);
-            if let Some(entry) = inner.workers.remove(&id) {
-                if let Some(abort) = entry.abort_handle {
-                    abort_unless_current(abort);
+        let to_remove = {
+            let mut inner = self.inner.write().await;
+            let now = Instant::now();
+            let mut to_remove = Vec::new();
+            for (id, entry) in &inner.workers {
+                if entry.status == WorkerStatus::Disconnected
+                    && now.duration_since(entry.last_heartbeat_instant) >= stale_timeout
+                {
+                    to_remove.push(*id);
                 }
             }
-        }
+            for id in &to_remove {
+                inner.network_types.remove(id);
+                inner.owner_member_ids.remove(id);
+                if let Some(entry) = inner.workers.remove(id) {
+                    if let Some(abort) = entry.abort_handle {
+                        abort_unless_current(abort);
+                    }
+                }
+            }
+            if !to_remove.is_empty() {
+                inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
+            }
+            to_remove
+        };
+        let count = to_remove.len();
         if count > 0 {
-            inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
+            if let Some(sb) = self.speed_book() {
+                crate::speed::mutate_shared_speed_book(&sb, |book| {
+                    book.remove_workers(&to_remove);
+                });
+            }
         }
         count
     }
