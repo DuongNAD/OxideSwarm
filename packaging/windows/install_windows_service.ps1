@@ -415,9 +415,424 @@ if (-not $resolvedWorkerBin -or -not (Test-Path $resolvedWorkerBin)) {
 }
 
 # ==============================================================================
-# 4. Stop and Remove an Existing Service BEFORE touching any file
-#    (a running service locks rusty-grid.exe, so copying over it first would abort the script
-#    halfway and leave a new config next to an old service)
+# 4. Pre-flight Filesystem Safety Checks & Directory Helpers
+#    (checked BEFORE stopping an existing service or changing any file/ACL)
+# ==============================================================================
+$ServiceTrustedOwners = @("S-1-5-18", "S-1-5-32-544")
+$ServiceTrustedAncestorOwners = @(
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+
+function Get-ExtraAllowSids {
+    param (
+        [string]$Path,
+        [string[]]$KeepSids
+    )
+    $extra = @()
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            $sid = $rule.IdentityReference.Value
+            if ($sid -notin $KeepSids -and ("*" + $sid) -notin $extra) {
+                $extra += ("*" + $sid)
+            }
+        }
+    } catch {}
+    return $extra
+}
+
+function Resolve-PrincipalSid {
+    param ([string]$Principal)
+    if (-not $Principal) { return "" }
+    if ($Principal.StartsWith("*")) { return $Principal.Substring(1) }
+    try {
+        return (New-Object Security.Principal.NTAccount($Principal)).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        if ($Principal -match '^NT SERVICE\\(.+)$') {
+            try {
+                $sidOut = & sc.exe showsid $Matches[1] 2>$null | Out-String
+                if ($sidOut -match 'SERVICE SID:\s*(S-1-5-80-[0-9-]+)') {
+                    return $Matches[1]
+                }
+            } catch {}
+        }
+        return ""
+    }
+}
+
+function Get-ServiceDirSafetyError {
+    param (
+        [string]$TargetPath,
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544"),
+        [string[]]$AllowedAncestorOwners = @(
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        )
+    )
+    $full = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+    $drive = [IO.Path]::GetPathRoot($full + '\').TrimEnd('\')
+    if ($full -eq $drive) {
+        return "Refusing to use drive root '$full' as a service directory."
+    }
+    $ancestors = @()
+    $cur = Split-Path -Parent $full
+    while ($cur) {
+        $curTrim = $cur.TrimEnd('\')
+        $ancestors += $curTrim
+        if ($curTrim -eq $drive) { break }
+        $cur = Split-Path -Parent $curTrim
+    }
+    [array]::Reverse($ancestors)
+    foreach ($anc in $ancestors) {
+        $ancPath = if ($anc -eq $drive) { $drive + '\' } else { $anc }
+        if (-not (Test-Path -LiteralPath $ancPath)) { break }
+        $ancItem = Get-Item -LiteralPath $ancPath -Force -ErrorAction Stop
+        if (-not $ancItem.PSIsContainer) {
+            return "Refusing to use '$full': ancestor '$ancPath' is not a directory."
+        }
+        if (($anc -ne $drive) -and ($ancItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return "Refusing to use '$full': ancestor '$ancPath' is a link or reparse point. Remove it before running the service installer."
+        }
+        $ancOwner = (Get-Acl -LiteralPath $ancPath).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($ancOwner -notin $AllowedAncestorOwners) {
+            return "Refusing to use '$full': ancestor '$ancPath' belongs to $ancOwner (expected SYSTEM, Administrators or TrustedInstaller). Remove it or choose another directory."
+        }
+    }
+    if (Test-Path -LiteralPath $full) {
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            return "Refusing to use '$full': it is a link or reparse point. Remove it before running the service installer."
+        }
+        if (-not $item.PSIsContainer) {
+            return "Refusing to use '$full': it is not a directory."
+        }
+        $owner = (Get-Acl -LiteralPath $full).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $AllowedOwners) {
+            return "Refusing to use '$full': it already exists with owner $owner (expected SYSTEM or Administrators). Remove it before running the service installer."
+        }
+    }
+    return $null
+}
+
+function Get-ServiceFileSafetyError {
+    param (
+        [string]$FilePath,
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544")
+    )
+    if (-not (Test-Path -LiteralPath $FilePath)) { return $null }
+    $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        return "Refusing to write '$FilePath': it is a link or reparse point."
+    }
+    if ($item.PSIsContainer) {
+        return "Refusing to write '$FilePath': a directory exists at that path."
+    }
+    $owner = (Get-Acl -LiteralPath $FilePath).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $AllowedOwners) {
+        return "Refusing to overwrite '$FilePath': it belongs to $owner (expected SYSTEM or Administrators)."
+    }
+    return $null
+}
+
+function Find-FirstReparsePointUnder {
+    param ([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return $null }
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $rootItem.FullName }
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $queue.Enqueue($rootItem.FullName)
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                return $entry.FullName
+            }
+            if ($entry.PSIsContainer) {
+                $queue.Enqueue($entry.FullName)
+            }
+        }
+    }
+    return $null
+}
+
+function New-ServicePrivateSecurity {
+    param (
+        [string]$OwnerSid = "S-1-5-32-544",
+        [string[]]$FullControlSids = @("S-1-5-18", "S-1-5-32-544")
+    )
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    $sec.SetOwner((New-Object Security.Principal.SecurityIdentifier $OwnerSid))
+    foreach ($sid in $FullControlSids) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier $sid),
+            'FullControl',
+            'ContainerInherit, ObjectInherit',
+            'None',
+            'Allow'
+        )))
+    }
+    return $sec
+}
+
+function Test-ServicePrivateAcl {
+    param (
+        $Acl,
+        [string[]]$AllowedSids,
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544")
+    )
+    if (-not $Acl.AreAccessRulesProtected) { return $false }
+    $owner = $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $AllowedOwners) { return $false }
+    $seenAllow = @()
+    foreach ($rule in $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -eq 'Allow') {
+            if ($sid -notin $AllowedSids -and $sid -notlike 'S-1-15-*') {
+                return $false
+            }
+            if ($sid -notin $seenAllow) {
+                $seenAllow += $sid
+            }
+        }
+    }
+    foreach ($expectedSid in $AllowedSids) {
+        if ($expectedSid -notin $seenAllow) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Ensure-ServicePrivateDir {
+    param (
+        [string]$Path,
+        [string]$OwnerSid = "S-1-5-32-544",
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544"),
+        [string[]]$AllowedAncestorOwners = @(
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        )
+    )
+    $why = Get-ServiceDirSafetyError -TargetPath $Path -AllowedOwners $AllowedOwners -AllowedAncestorOwners $AllowedAncestorOwners
+    if ($why) {
+        Write-Error $why
+        exit 1
+    }
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $drive = [IO.Path]::GetPathRoot($full + '\').TrimEnd('\')
+    $missing = @()
+    $cur = $full
+    while ($cur -and $cur -ne $drive -and -not (Test-Path -LiteralPath $cur)) {
+        $missing += $cur
+        $cur = Split-Path -Parent $cur
+        if ($cur) { $cur = $cur.TrimEnd('\') }
+    }
+    if ($missing.Count -gt 0) {
+        [array]::Reverse($missing)
+        $fullSids = @("S-1-5-18", "S-1-5-32-544")
+        if ($OwnerSid -notin $fullSids) { $fullSids += $OwnerSid }
+        $sec = New-ServicePrivateSecurity -OwnerSid $OwnerSid -FullControlSids $fullSids
+        foreach ($seg in $missing) {
+            [void][IO.Directory]::CreateDirectory($seg, $sec)
+            $segWhy = Get-ServiceDirSafetyError -TargetPath $seg -AllowedOwners $AllowedOwners -AllowedAncestorOwners $AllowedAncestorOwners
+            if ($segWhy) {
+                Write-Error $segWhy
+                exit 1
+            }
+            Write-Host "[OK] Created directory with protected ACL: $seg" -ForegroundColor Green
+        }
+    }
+    # Re-verify after creation in case another account raced to create a segment right before us.
+    $afterWhy = Get-ServiceDirSafetyError -TargetPath $full -AllowedOwners $AllowedOwners -AllowedAncestorOwners $AllowedAncestorOwners
+    if ($afterWhy) {
+        Write-Error $afterWhy
+        exit 1
+    }
+}
+
+# Sandbox base directory ($DataDir) and ProgramData parent: protected DACL (/inheritance:r) owned
+# by Administrators, granting full control to SYSTEM and Administrators and Modify (*<serviceSid>)
+# to the service account (design 0021).
+function Set-PrivateDirAcl {
+    param (
+        [string]$Path,
+        [string]$Principal = "",
+        [string]$PrincipalRights = "(OI)(CI)M",
+        [switch]$ResetChildren,
+        [string]$OwnerSid = "S-1-5-32-544",
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544"),
+        [string[]]$AllowedAncestorOwners = @(
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        )
+    )
+    $why = Get-ServiceDirSafetyError -TargetPath $Path -AllowedOwners $AllowedOwners -AllowedAncestorOwners $AllowedAncestorOwners
+    if ($why) {
+        Write-Error $why
+        exit 1
+    }
+    $keepSids = @("S-1-5-18", "S-1-5-32-544")
+    if ($OwnerSid -notin $keepSids) { $keepSids += $OwnerSid }
+    $principalSid = Resolve-PrincipalSid -Principal $Principal
+    if ($Principal -and -not $principalSid) {
+        Write-Error "Could not resolve SID for service principal '$Principal'."
+        exit 1
+    }
+    if ($principalSid -and $principalSid -notin $keepSids) {
+        $keepSids += $principalSid
+    }
+    $grants = @("*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)")
+    if ($OwnerSid -notin @("S-1-5-18", "S-1-5-32-544")) {
+        $grants += ("*" + $OwnerSid + ":(OI)(CI)(F)")
+    }
+    if ($principalSid -and $principalSid -notin @("S-1-5-18", "S-1-5-32-544")) {
+        $grants += ("*" + $principalSid + ":" + $PrincipalRights)
+    }
+    if ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Error "Refusing to modify '$Path': it is a link or reparse point."
+        exit 1
+    }
+    & icacls.exe $Path /setowner ("*" + $OwnerSid) /L | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not set owner on private directory $Path (icacls exit code $LASTEXITCODE)."
+        exit 1
+    }
+    $removeArgs = @(Get-ExtraAllowSids -Path $Path -KeepSids $keepSids)
+    $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $grants
+    if ($removeArgs.Count -gt 0) {
+        $icaclsArgs += "/remove:g"
+        $icaclsArgs += $removeArgs
+    }
+    $icaclsArgs += "/L"
+    if ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Error "Refusing to modify '$Path': it became a link or reparse point."
+        exit 1
+    }
+    & icacls.exe @icaclsArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not restrict the ACL of private task directory $Path (icacls exit code $LASTEXITCODE)."
+        exit 1
+    }
+    $postItem = Get-Item -LiteralPath $Path -Force
+    $postAcl = Get-Acl -LiteralPath $Path
+    if (($postItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (Test-ServicePrivateAcl -Acl $postAcl -AllowedSids $keepSids -AllowedOwners $AllowedOwners)) {
+        Write-Error "Could not verify the protected ACL or owner of private directory $Path; remove it and re-run the installer."
+        exit 1
+    }
+    if ($ResetChildren) {
+        $badChildLink = Find-FirstReparsePointUnder -Root $Path
+        if ($badChildLink) {
+            Write-Error "Refusing to reset ownership under '$Path': '$badChildLink' is a link or reparse point. Remove it before running the service installer."
+            exit 1
+        }
+        & icacls.exe $Path /setowner ("*" + $OwnerSid) /T /C /L | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Could not reset owner on children of $Path (icacls exit code $LASTEXITCODE)."
+            exit 1
+        }
+        if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count -gt 0) {
+            & icacls.exe (Join-Path $Path '*') /reset /T /C /L | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "Could not reset inherited ACLs on children of $Path (icacls exit code $LASTEXITCODE)."
+                exit 1
+            }
+        }
+    }
+}
+
+function Resolve-LongPathPrefix {
+    param([string]$InputPath)
+    $full = [IO.Path]::GetFullPath($InputPath).TrimEnd('\')
+    $drive = [IO.Path]::GetPathRoot($full + '\').TrimEnd('\')
+    $tail = @()
+    $cur = $full
+    while ($cur -and $cur -ne $drive -and -not (Test-Path -LiteralPath $cur)) {
+        $tail += (Split-Path -Leaf $cur)
+        $cur = Split-Path -Parent $cur
+        if ($cur) { $cur = $cur.TrimEnd('\') }
+    }
+    if ($cur -and $cur -ne $drive -and (Test-Path -LiteralPath $cur)) {
+        $resolvedBase = (Get-Item -LiteralPath $cur -Force).FullName.TrimEnd('\')
+    } else {
+        $resolvedBase = $cur
+    }
+    if ($tail.Count -gt 0) {
+        [array]::Reverse($tail)
+        foreach ($leaf in $tail) {
+            $resolvedBase = Join-Path $resolvedBase $leaf
+        }
+    }
+    return $resolvedBase.TrimEnd('\')
+}
+
+$InstallDir = Resolve-LongPathPrefix -InputPath $InstallDir
+$LogDir = Resolve-LongPathPrefix -InputPath $LogDir
+$DataDir = Resolve-LongPathPrefix -InputPath $DataDir
+$ConfigPath = Resolve-LongPathPrefix -InputPath $ConfigPath
+$binDir = Join-Path $InstallDir "bin"
+$configParent = (Split-Path -Path $ConfigPath -Parent).TrimEnd('\')
+$dataParent = (Split-Path -Path $DataDir -Parent).TrimEnd('\')
+$logParent = (Split-Path -Path $LogDir -Parent).TrimEnd('\')
+$programDataRoot = if ($env:ProgramData) { Resolve-LongPathPrefix -InputPath $env:ProgramData } else { "C:\ProgramData" }
+
+$programDataParents = @()
+foreach ($candParent in @($dataParent, $configParent, $logParent)) {
+    if (-not $candParent) { continue }
+    $candFull = [IO.Path]::GetFullPath($candParent).TrimEnd('\')
+    $candDrive = [IO.Path]::GetPathRoot($candFull + '\').TrimEnd('\')
+    if ($candFull -ne $candDrive -and $candFull -ne $programDataRoot -and $candFull.StartsWith($programDataRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        if ($candFull -notin $programDataParents) {
+            $programDataParents += $candFull
+        }
+    }
+}
+
+$sourceEnginesDir = Join-Path $PSScriptRoot "..\..\engines"
+$destEnginesDir   = Join-Path $InstallDir "engines"
+$gen3dScriptPath  = Join-Path $destEnginesDir "generative_3d\entrypoint.py"
+
+$requiredDirs = @($programDataParents + @($InstallDir, $binDir, $LogDir, $DataDir, $configParent)) | Select-Object -Unique
+if (Test-Path -LiteralPath $sourceEnginesDir) {
+    $requiredDirs = @($requiredDirs + @($destEnginesDir)) | Select-Object -Unique
+}
+
+function Assert-ServicePathsSafe {
+    foreach ($dir in $requiredDirs) {
+        $why = Get-ServiceDirSafetyError -TargetPath $dir -AllowedOwners $ServiceTrustedOwners -AllowedAncestorOwners $ServiceTrustedAncestorOwners
+        if ($why) {
+            Write-Error $why
+            exit 1
+        }
+    }
+    foreach ($existingFile in @($ConfigPath, (Join-Path $configParent "cluster.secret"))) {
+        $fileWhy = Get-ServiceFileSafetyError -FilePath $existingFile -AllowedOwners $ServiceTrustedOwners
+        if ($fileWhy) {
+            Write-Error $fileWhy
+            exit 1
+        }
+    }
+    if (Test-Path -LiteralPath $DataDir) {
+        $badDataLink = Find-FirstReparsePointUnder -Root $DataDir
+        if ($badDataLink) {
+            Write-Error "Refusing to use '$DataDir': '$badDataLink' is a link or reparse point. Remove it before running the service installer."
+            exit 1
+        }
+    }
+}
+
+# Check every target directory, parent, and existing config/secret file BEFORE stopping an existing service or touching any path.
+Assert-ServicePathsSafe
+
+# ==============================================================================
+# 4b. Stop and Remove an Existing Service BEFORE touching any file
+#     (a running service locks rusty-grid.exe, so copying over it first would abort the script
+#     halfway and leave a new config next to an old service)
 # ==============================================================================
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existingService) {
@@ -447,95 +862,21 @@ if ($existingService) {
 }
 
 # ==============================================================================
-# 5. Create Filesystem Directory Hierarchy
+# 5. Create and Lock Filesystem Directory Hierarchy
 # ==============================================================================
-function Get-ExtraAllowSids {
-    param (
-        [string]$Path,
-        [string[]]$KeepSids
-    )
-    $extra = @()
-    try {
-        $acl = Get-Acl -LiteralPath $Path
-        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-            $sid = $rule.IdentityReference.Value
-            if ($sid -notin $KeepSids -and ("*" + $sid) -notin $extra) {
-                $extra += ("*" + $sid)
-            }
-        }
-    } catch {}
-    return $extra
-}
-
-function Resolve-PrincipalSid {
-    param ([string]$Principal)
-    if (-not $Principal) { return "" }
-    if ($Principal.StartsWith("*")) { return $Principal.Substring(1) }
-    try {
-        return (New-Object Security.Principal.NTAccount($Principal)).Translate([Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return ""
-    }
-}
-
-# Sandbox base directory ($DataDir): protected DACL (/inheritance:r) owned by Administrators and
-# granting full control only to SYSTEM, Administrators and the service SID (design 0021).
-function Set-PrivateDirAcl {
-    param (
-        [string]$Path,
-        [string]$Principal,
-        [string]$PrincipalRights = "(OI)(CI)(F)"
-    )
-    $keepSids = @("S-1-5-18", "S-1-5-32-544")
-    $principalSid = Resolve-PrincipalSid -Principal $Principal
-    if ($principalSid -and $principalSid -notin $keepSids) {
-        $keepSids += $principalSid
-    }
-    $grants = @("*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)")
-    if ($Principal -and $Principal -ne "*S-1-5-18") {
-        $grants += ($Principal + ":" + $PrincipalRights)
-    }
-    & icacls.exe $Path /setowner "*S-1-5-32-544" | Out-Null
-    $removeArgs = @(Get-ExtraAllowSids -Path $Path -KeepSids $keepSids)
-    $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $grants
-    if ($removeArgs.Count -gt 0) {
-        $icaclsArgs += "/remove:g"
-        $icaclsArgs += $removeArgs
-    }
-    & icacls.exe @icaclsArgs | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Could not restrict the ACL of private task directory $Path (icacls exit code $LASTEXITCODE)."
-        exit 1
-    }
-}
-
-$binDir = Join-Path $InstallDir "bin"
-$configParent = Split-Path -Path $ConfigPath -Parent
-$dataParent = Split-Path -Path $DataDir -Parent
-$programDataRoot = if ($env:ProgramData) { [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\') } else { "C:\ProgramData" }
-$lockDataParent = $false
-if ($dataParent) {
-    $dataParentFull = [IO.Path]::GetFullPath($dataParent).TrimEnd('\')
-    $dataDriveRoot = [IO.Path]::GetPathRoot($dataParentFull + '\').TrimEnd('\')
-    if ($dataParentFull -ne $dataDriveRoot -and $dataParentFull -ne $programDataRoot -and $dataParentFull.StartsWith($programDataRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        $lockDataParent = $true
-    }
-}
-
-$requiredDirs = @($InstallDir, $binDir, $LogDir, $DataDir, $configParent) | Select-Object -Unique
+Assert-ServicePathsSafe
 
 foreach ($dir in $requiredDirs) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        Write-Host "[OK] Created directory: $dir" -ForegroundColor Green
-    }
+    Ensure-ServicePrivateDir -Path $dir -OwnerSid "S-1-5-32-544" -AllowedOwners $ServiceTrustedOwners -AllowedAncestorOwners $ServiceTrustedAncestorOwners
 }
-if ($lockDataParent) {
-    Set-PrivateDirAcl -Path $dataParent -Principal ""
+foreach ($pdParent in $programDataParents) {
+    Set-PrivateDirAcl -Path $pdParent -Principal ""
 }
-# Lock $DataDir to SYSTEM and Administrators immediately on creation (before the service exists)
-# so it never inherits BUILTIN\Users access from ProgramData; section 9 adds the service SID.
-Set-PrivateDirAcl -Path $DataDir -Principal ""
+Set-PrivateDirAcl -Path $configParent -Principal ""
+Set-PrivateDirAcl -Path $LogDir -Principal ""
+# Lock $DataDir (and reset ownership/ACLs of any existing children) to SYSTEM and Administrators
+# immediately before the service exists; section 9 adds the service SID with Modify access.
+Set-PrivateDirAcl -Path $DataDir -Principal "" -ResetChildren
 
 # ==============================================================================
 # 6. Deploy Executable Binaries
@@ -578,11 +919,8 @@ if (Test-Path $destWorkerBin) {
 }
 
 # Deploy 3D subsystem driver scripts (engines/) into $InstallDir\engines so the service can locate them outside a repo checkout
-$sourceEnginesDir = Join-Path $PSScriptRoot "..\..\engines"
-$destEnginesDir   = Join-Path $InstallDir "engines"
-$gen3dScriptPath  = Join-Path $destEnginesDir "generative_3d\entrypoint.py"
-if (Test-Path $sourceEnginesDir) {
-    New-Item -ItemType Directory -Path $destEnginesDir -Force | Out-Null
+if (Test-Path -LiteralPath $sourceEnginesDir) {
+    Ensure-ServicePrivateDir -Path $destEnginesDir -OwnerSid "S-1-5-32-544" -AllowedOwners $ServiceTrustedOwners -AllowedAncestorOwners $ServiceTrustedAncestorOwners
     Copy-Item -Path (Join-Path $sourceEnginesDir "*") -Destination $destEnginesDir -Recurse -Force
     Write-Host "[OK] Deployed 3D engine scripts to: $destEnginesDir" -ForegroundColor Green
 }
@@ -868,20 +1206,40 @@ if ($serviceStartName) {
     Write-Host "[OK] Service runs as $serviceStartName (tasks inherit this low-privilege identity)." -ForegroundColor Green
 }
 
-# Config and secret: readable by SYSTEM, Administrators and the service account only.
+# Config and secret: readable by SYSTEM, Administrators and the service account (*<serviceSid>) only.
 function Set-PrivateFileAcl {
     param (
         [string]$Path,
-        [string]$Principal
+        [string]$Principal,
+        [string]$OwnerSid = "S-1-5-32-544",
+        [string[]]$AllowedOwners = @("S-1-5-18", "S-1-5-32-544")
     )
+    $fileWhy = Get-ServiceFileSafetyError -FilePath $Path -AllowedOwners $AllowedOwners
+    if ($fileWhy) {
+        Write-Error $fileWhy
+        exit 1
+    }
     $keepSids = @("S-1-5-18", "S-1-5-32-544")
+    if ($OwnerSid -notin $keepSids) { $keepSids += $OwnerSid }
     $principalSid = Resolve-PrincipalSid -Principal $Principal
+    if ($Principal -and -not $principalSid) {
+        Write-Error "Could not resolve SID for service principal '$Principal'."
+        exit 1
+    }
     if ($principalSid -and $principalSid -notin $keepSids) {
         $keepSids += $principalSid
     }
     $grants = @("*S-1-5-18:(F)", "*S-1-5-32-544:(F)")
-    if ($Principal -and $Principal -ne "*S-1-5-18") {
-        $grants += ($Principal + ":(R)")
+    if ($OwnerSid -notin @("S-1-5-18", "S-1-5-32-544")) {
+        $grants += ("*" + $OwnerSid + ":(F)")
+    }
+    if ($principalSid -and $principalSid -notin @("S-1-5-18", "S-1-5-32-544")) {
+        $grants += ("*" + $principalSid + ":(R)")
+    }
+    & icacls.exe $Path /setowner ("*" + $OwnerSid) /L | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not set owner on private configuration file $Path (icacls exit code $LASTEXITCODE)."
+        exit 1
     }
     $removeArgs = @(Get-ExtraAllowSids -Path $Path -KeepSids $keepSids)
     $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $grants
@@ -889,35 +1247,32 @@ function Set-PrivateFileAcl {
         $icaclsArgs += "/remove:g"
         $icaclsArgs += $removeArgs
     }
+    $icaclsArgs += "/L"
     & icacls.exe @icaclsArgs | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Could not restrict the ACL of $Path (icacls exit code $LASTEXITCODE). Restrict it manually: it holds the cluster secret / P2P ticket."
+        Write-Error "Could not restrict the ACL of $Path (icacls exit code $LASTEXITCODE)."
+        exit 1
+    }
+    $postAcl = Get-Acl -LiteralPath $Path
+    if (-not (Test-ServicePrivateAcl -Acl $postAcl -AllowedSids $keepSids -AllowedOwners $AllowedOwners)) {
+        Write-Error "Could not verify the protected ACL or owner of $Path; remove it and re-run the installer."
+        exit 1
     }
 }
 
-# Log directory: the service account must be able to write there.
-function Grant-ServiceModify {
-    param (
-        [string]$Path,
-        [string]$Principal
-    )
-    if (-not $Principal -or $Principal -eq "*S-1-5-18") { return }
-    & icacls.exe $Path /grant ($Principal + ":(OI)(CI)M") | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Could not grant the service account write access to $Path (icacls exit code $LASTEXITCODE)."
-    }
+foreach ($pdParent in $programDataParents) {
+    Set-PrivateDirAcl -Path $pdParent -Principal $aclPrincipal -PrincipalRights "(RX)"
 }
-
-if ($lockDataParent) {
-    Set-PrivateDirAcl -Path $dataParent -Principal $aclPrincipal -PrincipalRights "(RX)"
+if ($configParent -notin $programDataParents) {
+    Set-PrivateDirAcl -Path $configParent -Principal $aclPrincipal -PrincipalRights "(RX)"
 }
 Set-PrivateFileAcl -Path $ConfigPath -Principal $aclPrincipal
 if ($secretTarget) {
     Set-PrivateFileAcl -Path $secretTarget -Principal $aclPrincipal
 }
-Grant-ServiceModify -Path $LogDir -Principal $aclPrincipal
-Set-PrivateDirAcl -Path $DataDir -Principal $aclPrincipal
-Write-Host "[OK] Applied ACLs (config/secret and sandbox data directory private to SYSTEM, Administrators and the service account; log directory writable by the service account)." -ForegroundColor Green
+Set-PrivateDirAcl -Path $LogDir -Principal $aclPrincipal -PrincipalRights "(OI)(CI)M"
+Set-PrivateDirAcl -Path $DataDir -Principal $aclPrincipal -PrincipalRights "(OI)(CI)M" -ResetChildren
+Write-Host "[OK] Applied and verified ACLs (config/secret readable by service SID; log and sandbox data directories granted Modify to service SID; child ownership reset)." -ForegroundColor Green
 
 # ==============================================================================
 # 10. Configure SCM Recovery Actions & Auto-Start
