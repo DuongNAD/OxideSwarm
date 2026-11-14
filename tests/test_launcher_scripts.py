@@ -1775,13 +1775,286 @@ public class Program {
         self.assertRegex(ps1, r"obj=\s*\$serviceStartName")
         self.assertIn("AcceptSystemRisk", ps1)
         self.assertIn("Set-PrivateDirAcl -Path $DataDir", ps1)
+        self.assertIn('Set-PrivateDirAcl -Path $DataDir -Principal $aclPrincipal -PrincipalRights "(OI)(CI)M" -ResetChildren', ps1)
         self.assertIn("/inheritance:r", ps1)
+        self.assertIn("function Get-ServiceDirSafetyError", ps1)
+        self.assertIn("function Find-FirstReparsePointUnder", ps1)
+        self.assertIn("function Ensure-ServicePrivateDir", ps1)
+        self.assertIn("function Test-ServicePrivateAcl", ps1)
+        self.assertIn("[IO.Directory]::CreateDirectory($seg, $sec)", ps1)
+        self.assertNotIn("New-Item -ItemType Directory", ps1)
+        self.assertLess(
+            re.search(r"(?m)^Assert-ServicePathsSafe\r?$", ps1).start(),
+            ps1.index("Stop-Service -Name $ServiceName"),
+            "safety checks must run before stopping or removing an existing service",
+        )
+        self.assertIn('/setowner ("*" + $OwnerSid) /T /C', ps1)
+        self.assertIn("/reset /T /C", ps1)
         self.assertNotIn("Grant-ServiceModify -Path $DataDir", ps1)
         # the P2P ticket must not travel on the service command line or in the registry any more
         wrapper = read(os.path.join(ROOT, "packaging", "windows", "ServiceWrapper.cs"))
         self.assertNotIn("--p2p-ticket", wrapper)
         self.assertNotRegex(ps1, r"SetEnvironmentVariable\(\"OXIDESWARM_P2P_TICKET\",\s*\$P2pTicket")
         self.assertNotRegex(ps1, r"SetEnvironmentVariable\(\"OXIDESWARM_GEN3D_SCRIPT\"")
+
+    def test_windows_powershell_parse_and_non_elevated_acl_helpers(self):
+        usb_ps1 = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in (
+            "function Set-PrivateDaclNoFollow",
+            "FILE_FLAG_OPEN_REPARSE_POINT",
+            "SetKernelObjectSecurity",
+            "function Get-CheckedRootEntries",
+            "function Format-RootLinkRefusal",
+            "preserve cluster membership",
+            "$applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $UserSid.Value",
+        ):
+            self.assertIn(needle, usb_ps1)
+        self.assertNotIn("SetAccessControl(", usb_ps1)
+
+        if not (IS_WINDOWS and shutil.which("powershell")):
+            return
+
+        ps_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        tmp = tempfile.mkdtemp(prefix="ox_win_ps_acl_")
+        try:
+            # 1. PowerShell AST parser check on every .ps1 script in the repository.
+            ps1_files = tracked_or_present(["*.ps1"])
+            self.assertTrue(ps1_files, "expected tracked .ps1 files")
+            parse_driver = os.path.join(tmp, "parse_check.ps1")
+            with open(parse_driver, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write("$ErrorActionPreference = 'Stop'\r\n")
+                for p in ps1_files:
+                    esc = p.replace("'", "''")
+                    f.write(
+                        f"$tokens = $null; $errs = $null\r\n"
+                        f"[void][System.Management.Automation.Language.Parser]::ParseFile('{esc}', [ref]$tokens, [ref]$errs)\r\n"
+                        f"if ($errs -and $errs.Count -gt 0) {{ Write-Error \"Parse error in '{esc}': $($errs | Out-String)\"; exit 1 }}\r\n"
+                    )
+                f.write("Write-Output 'PARSE_OK'\r\n")
+            parse_res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", parse_driver],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertEqual(parse_res.returncode, 0, parse_res.stdout)
+            self.assertIn("PARSE_OK", parse_res.stdout)
+
+            # 2. Non-elevated unit tests of install_windows_service.ps1's safety/ACL helpers.
+            svc_ps1 = os.path.join(ROOT, "packaging", "windows", "install_windows_service.ps1").replace("'", "''")
+            svc_driver = os.path.join(tmp, "svc_helpers_test.ps1")
+            tmp_esc = tmp.replace("'", "''")
+            svc_script = f"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{svc_ps1}', [ref]$tokens, [ref]$errs)
+if ($errs.Count -gt 0) {{ throw "parse failed" }}
+$wanted = @(
+    'Get-ExtraAllowSids',
+    'Resolve-PrincipalSid',
+    'Get-ServiceDirSafetyError',
+    'Get-ServiceFileSafetyError',
+    'Find-FirstReparsePointUnder',
+    'New-ServicePrivateSecurity',
+    'Test-ServicePrivateAcl',
+    'Ensure-ServicePrivateDir',
+    'Set-PrivateDirAcl',
+    'Set-PrivateFileAcl'
+)
+foreach ($fnAst in $ast.FindAll({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }}, $true)) {{
+    if ($fnAst.Name -in $wanted) {{
+        . ([scriptblock]::Create($fnAst.Extent.Text))
+    }}
+}}
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$allowed = @($me, 'S-1-5-18', 'S-1-5-32-544')
+$ancAllowed = @($me, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$base = Join-Path '{tmp_esc}' 'svc_case'
+New-Item -ItemType Directory -Path $base | Out-Null
+& icacls.exe $base /grant '*S-1-1-0:(OI)(CI)R' | Out-Null
+
+# (a) Junction at ProgramData\\OxideSwarm or its child is refused before any change.
+$canary = Join-Path $base 'canary_target'
+New-Item -ItemType Directory -Path $canary | Out-Null
+$juncPd = Join-Path $base 'OxideSwarmJunc'
+& cmd.exe /c mklink /J $juncPd $canary | Out-Null
+$errJunc = Get-ServiceDirSafetyError -TargetPath $juncPd -AllowedOwners $allowed -AllowedAncestorOwners $ancAllowed
+if (-not $errJunc -or $errJunc -notmatch 'link or reparse point') {{ throw "expected link refusal on root: $errJunc" }}
+$errAncJunc = Get-ServiceDirSafetyError -TargetPath (Join-Path $juncPd 'data') -AllowedOwners $allowed -AllowedAncestorOwners $ancAllowed
+if (-not $errAncJunc -or $errAncJunc -notmatch 'ancestor .* is a link or reparse point') {{ throw "expected ancestor link refusal: $errAncJunc" }}
+& cmd.exe /c rmdir $juncPd | Out-Null
+
+# (b) Existing directory owned by an untrusted SID is refused.
+$foreignSim = Join-Path $base 'PreCreatedByUser'
+New-Item -ItemType Directory -Path $foreignSim | Out-Null
+$errOwner = Get-ServiceDirSafetyError -TargetPath $foreignSim -AllowedOwners @('S-1-5-18') -AllowedAncestorOwners $ancAllowed
+if (-not $errOwner -or $errOwner -notmatch 'already exists with owner') {{ throw "expected owner refusal: $errOwner" }}
+
+# (c) Ensure-ServicePrivateDir creates missing directories in one step with a protected DACL.
+$cleanPd = Join-Path $base 'OxideSwarmClean'
+$dataDir = Join-Path $cleanPd 'data'
+Ensure-ServicePrivateDir -Path $dataDir -OwnerSid $me -AllowedOwners $allowed -AllowedAncestorOwners $ancAllowed
+foreach ($created in @($cleanPd, $dataDir)) {{
+    $acl = Get-Acl -LiteralPath $created
+    if (-not (Test-ServicePrivateAcl -Acl $acl -AllowedSids $allowed -AllowedOwners $allowed)) {{
+        throw "created dir not private: $created"
+    }}
+}}
+
+# (d) Grant Modify by SID (*S-1-5-19:(OI)(CI)M), simulate worker-created D:P children (.locks, cache),
+#     then switch -ServiceAccount to *S-1-5-20 with -ResetChildren and verify old SID is removed and
+#     children inherit the new Modify grant without D:P.
+Set-PrivateDirAcl -Path $dataDir -Principal '*S-1-5-19' -PrincipalRights '(OI)(CI)M' -OwnerSid $me -AllowedOwners $allowed -AllowedAncestorOwners $ancAllowed
+$acl19 = Get-Acl -LiteralPath $dataDir
+$rules19 = @($acl19.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq 'S-1-5-19' }})
+if ($rules19.Count -ne 1) {{ throw "expected 1 rule for S-1-5-19, got $($rules19.Count)" }}
+if (($rules19[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) {{
+    throw "service principal must get Modify, not FullControl: $($rules19[0].FileSystemRights)"
+}}
+if (-not ($rules19[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify)) {{
+    throw "service principal missing Modify: $($rules19[0].FileSystemRights)"
+}}
+foreach ($childName in @('.locks', 'cache')) {{
+    $cPath = Join-Path $dataDir $childName
+    New-Item -ItemType Directory -Path $cPath | Out-Null
+    & icacls.exe $cPath /inheritance:r /grant:r "*$($me):(OI)(CI)(F)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(F)' | Out-Null
+}}
+Set-PrivateDirAcl -Path $dataDir -Principal '*S-1-5-20' -PrincipalRights '(OI)(CI)M' -ResetChildren -OwnerSid $me -AllowedOwners $allowed -AllowedAncestorOwners $ancAllowed
+$acl20 = Get-Acl -LiteralPath $dataDir
+$sids20 = @($acl20.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }})
+if ('S-1-5-19' -in $sids20 -or 'S-1-5-20' -notin $sids20) {{
+    throw "expected S-1-5-19 removed and S-1-5-20 added on dataDir: $($sids20 -join ',')"
+}}
+foreach ($childName in @('.locks', 'cache')) {{
+    $cAcl = Get-Acl -LiteralPath (Join-Path $dataDir $childName)
+    if ($cAcl.AreAccessRulesProtected) {{ throw "child $childName kept protected DACL after -ResetChildren" }}
+    $cSids = @($cAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }})
+    if ('S-1-5-19' -in $cSids -or 'S-1-5-20' -notin $cSids) {{
+        throw "child $childName did not inherit switched service account: $($cSids -join ',')"
+    }}
+}}
+
+# (e) A junction planted inside $DataDir is caught by Find-FirstReparsePointUnder before icacls /T runs.
+$evilJunc = Join-Path $dataDir 'evil_junc'
+& cmd.exe /c mklink /J $evilJunc $canary | Out-Null
+$foundLink = Find-FirstReparsePointUnder -Root $dataDir
+if ($foundLink -ne $evilJunc) {{ throw "expected Find-FirstReparsePointUnder to find $evilJunc, got $foundLink" }}
+$canaryAcl = Get-Acl -LiteralPath $canary
+if ($canaryAcl.AreAccessRulesProtected) {{ throw "canary target DACL was modified" }}
+& cmd.exe /c rmdir $evilJunc | Out-Null
+Write-Output 'SVC_HELPERS_OK'
+"""
+            with open(svc_driver, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(svc_script.replace("\r\n", "\n").replace("\n", "\r\n"))
+            svc_res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", svc_driver],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=45,
+            )
+            self.assertEqual(svc_res.returncode, 0, svc_res.stdout)
+            self.assertIn("SVC_HELPERS_OK", svc_res.stdout)
+
+            # 3. Non-elevated unit tests of packaging/usb/install.ps1's Set-PrivateDaclNoFollow
+            #    and open-root -Update walk (skips cargo target trees and task junctions).
+            usb_ps1_path = os.path.join(ROOT, "packaging", "usb", "install.ps1").replace("'", "''")
+            usb_driver = os.path.join(tmp, "usb_helpers_test.ps1")
+            usb_script = f"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{usb_ps1_path}', [ref]$tokens, [ref]$errs)
+if ($errs.Count -gt 0) {{ throw "parse failed" }}
+$UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$TrustedSids = @($UserSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+$TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+$RenameRights = 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40
+$wantedUsb = @(
+    'Get-PrivateSecurity',
+    'Get-AccountName',
+    'Get-ForeignGrant',
+    'Test-PrivateAcl',
+    'Set-PrivateDaclNoFollow',
+    'Get-CheckedRootEntries',
+    'Format-RootLinkRefusal',
+    'Test-RootSafety'
+)
+foreach ($fnAst in $ast.FindAll({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }}, $true)) {{
+    if ($fnAst.Name -in $wantedUsb) {{
+        . ([scriptblock]::Create($fnAst.Extent.Text))
+    }}
+}}
+$uBase = Join-Path '{tmp_esc}' 'usb_case'
+New-Item -ItemType Directory -Path $uBase | Out-Null
+$sec = Get-PrivateSecurity
+$sec.SetOwner($UserSid)
+$sysDrive = [IO.Path]::GetPathRoot($env:SystemRoot)
+$cleanTop = if ((Test-RootSafety $uBase) -eq $null) {{
+    Join-Path $uBase 'clean_top'
+}} else {{
+    Join-Path $sysDrive ("OxsUsbAclTest_" + $PID + "_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+}}
+[void][IO.Directory]::CreateDirectory($cleanTop, $sec)
+try {{
+    # (a) Set-PrivateDaclNoFollow refuses a junction without touching the junction target's DACL.
+    $targetOpen = Join-Path $uBase 'open_target'
+    New-Item -ItemType Directory -Path $targetOpen | Out-Null
+    & icacls.exe $targetOpen /grant '*S-1-1-0:(OI)(CI)R' | Out-Null
+    $juncRoot = Join-Path $cleanTop 'junc_root'
+    & cmd.exe /c mklink /J $juncRoot $targetOpen | Out-Null
+    $resLink = Set-PrivateDaclNoFollow $juncRoot $sec $UserSid.Value
+    if ($resLink -ne 'link') {{ throw "expected 'link', got $resLink" }}
+    if ((Get-Acl -LiteralPath $targetOpen).AreAccessRulesProtected) {{ throw "Set-PrivateDaclNoFollow modified junction target!" }}
+    & cmd.exe /c rmdir $juncRoot | Out-Null
+
+    # (b) Real open USB install root with task-created junctions inside work\\task-1 and workspaces\\ws1\\tree
+    #     plus a target directory: Get-CheckedRootEntries skips them and Set-PrivateDaclNoFollow locks the root.
+    $openRoot = Join-Path $cleanTop 'open_install'
+    New-Item -ItemType Directory -Path $openRoot | Out-Null
+    & icacls.exe $openRoot /grant '*S-1-5-11:(OI)(CI)R' | Out-Null
+    if ((Get-Acl -LiteralPath $openRoot).AreAccessRulesProtected) {{ throw "expected openRoot to start with inherited/unprotected DACL" }}
+    Set-Content -LiteralPath (Join-Path $openRoot '.oxideswarm-usb-install') -Value 'marker' -Encoding ASCII
+    foreach ($sub in @('bin', 'home', 'run', 'logs', 'work\\.locks', 'work\\cache\\blobs\\objects', 'work\\task-99\\target\\debug', 'workspaces\\ws1\\tree\\target')) {{
+        New-Item -ItemType Directory -Force -Path (Join-Path $openRoot $sub) | Out-Null
+    }}
+    $taskJunc = Join-Path $openRoot 'workspaces\\ws1\\tree\\dep_link'
+    & cmd.exe /c mklink /J $taskJunc $targetOpen | Out-Null
+    $whyOpen = Test-RootSafety $openRoot
+    if ($whyOpen) {{ throw "task junction inside workspace should not block -Update: $whyOpen" }}
+    $checkedPaths = @(Get-CheckedRootEntries $openRoot $true | ForEach-Object {{ $_.FullName }})
+    if ($checkedPaths | Where-Object {{ $_ -like '*\\target*' -or $_ -like '*\\dep_link*' }}) {{
+        throw "Get-CheckedRootEntries walked into task target/junction: $($checkedPaths -join '; ')"
+    }}
+    $applyReal = Set-PrivateDaclNoFollow $openRoot $sec $UserSid.Value
+    if ($applyReal -ne $null) {{ throw "expected null on real root, got $applyReal" }}
+    if (-not (Test-PrivateAcl (Get-Acl -LiteralPath $openRoot))) {{ throw "openRoot was not made private" }}
+
+    # (c) A link at a checked control path (work\\cache) IS refused with guidance keeping <root>\\home.
+    & icacls.exe $openRoot /grant '*S-1-5-11:(OI)(CI)R' | Out-Null
+    Remove-Item -Recurse -Force -LiteralPath (Join-Path $openRoot 'work\\cache')
+    & cmd.exe /c mklink /J (Join-Path $openRoot 'work\\cache') $targetOpen | Out-Null
+    $whyCtrlLink = Test-RootSafety $openRoot
+    if (-not $whyCtrlLink -or $whyCtrlLink -notmatch 'preserve cluster membership') {{
+        throw "expected control-folder link refusal naming home preservation, got: $whyCtrlLink"
+    }}
+    & cmd.exe /c rmdir (Join-Path $openRoot 'work\\cache') | Out-Null
+    & cmd.exe /c rmdir $taskJunc | Out-Null
+}} finally {{
+    if (Test-Path -LiteralPath (Join-Path $cleanTop 'junc_root')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'junc_root') 2>$null | Out-Null }}
+    if (Test-Path -LiteralPath (Join-Path $cleanTop 'open_install\\work\\cache')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'open_install\\work\\cache') 2>$null | Out-Null }}
+    if (Test-Path -LiteralPath (Join-Path $cleanTop 'open_install\\workspaces\\ws1\\tree\\dep_link')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'open_install\\workspaces\\ws1\\tree\\dep_link') 2>$null | Out-Null }}
+    Remove-Item -Recurse -Force -LiteralPath $cleanTop -ErrorAction SilentlyContinue
+}}
+Write-Output 'USB_HELPERS_OK'
+"""
+            with open(usb_driver, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(usb_script.replace("\r\n", "\n").replace("\n", "\r\n"))
+            usb_res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", usb_driver],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=45,
+            )
+            self.assertEqual(usb_res.returncode, 0, usb_res.stdout)
+            self.assertIn("USB_HELPERS_OK", usb_res.stdout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_cmd_pairing_script_does_not_strip_quotes_from_the_ticket(self):
         text = read(os.path.join(ROOT, "connect_remote.cmd"))

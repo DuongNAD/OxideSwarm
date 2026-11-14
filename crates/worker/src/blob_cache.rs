@@ -116,16 +116,56 @@ impl BlobCache {
     /// Opens (creating it if needed) the cache in `dir` (`<sandbox base>/cache/blobs`), indexing
     /// the blobs already there and removing stale temporary files.
     pub fn open(dir: &Path, max_bytes: u64) -> io::Result<Arc<Self>> {
+        Self::open_with_dir_check(dir, max_bytes, ensure_private_cache_dir)
+    }
+
+    fn open_with_dir_check(
+        dir: &Path,
+        max_bytes: u64,
+        mut check_dir: impl FnMut(&Path, bool) -> io::Result<()>,
+    ) -> io::Result<Arc<Self>> {
+        #[cfg(windows)]
+        if let Some(cache_parent) = dir.parent().filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("cache"))
+        }) {
+            check_dir(cache_parent, true)?;
+        }
+        check_dir(dir, true)?;
+
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
-        create_private_dir_all(&objects)?;
-        create_private_dir_all(&tmp)?;
+        check_dir(&objects, true)?;
+        check_dir(&tmp, true)?;
 
         // Another worker process may be writing into `tmp/` right now: only old files go.
         for entry in std::fs::read_dir(&tmp)?.flatten() {
-            let stale = entry
-                .metadata()
-                .and_then(|m| m.modified())
+            let entry_path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
+                continue;
+            };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    || !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(&entry_path)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Task sandboxes cannot use '{}' safely: cache entry is a link or \
+                             belongs to an untrusted account",
+                            entry_path.display()
+                        ),
+                    ));
+                }
+            }
+            if !crate::sandbox::is_real_owned_file(&entry_path, &meta) {
+                continue;
+            }
+            let stale = meta
+                .modified()
                 .map(|t| {
                     SystemTime::now()
                         .duration_since(t)
@@ -133,24 +173,60 @@ impl BlobCache {
                 })
                 .unwrap_or(false);
             if stale {
-                let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_file(&entry_path);
             }
         }
 
         let mut found = Vec::new();
         for fanout in std::fs::read_dir(&objects)?.flatten() {
-            if !fanout.file_type().is_ok_and(|t| t.is_dir()) {
+            let fanout_path = fanout.path();
+            let Ok(fanout_meta) = std::fs::symlink_metadata(&fanout_path) else {
+                continue;
+            };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if (fanout_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    || fanout_meta.is_dir()
+                {
+                    check_dir(&fanout_path, false)?;
+                }
+            }
+            if fanout_meta.file_type().is_symlink() || !fanout_meta.is_dir() {
                 continue;
             }
-            for object in std::fs::read_dir(fanout.path())?.flatten() {
-                let Ok(meta) = object.metadata() else {
+            for object in std::fs::read_dir(&fanout_path)?.flatten() {
+                let object_path = object.path();
+                let Ok(meta) = std::fs::symlink_metadata(&object_path) else {
                     continue;
                 };
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                        || !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(
+                            &object_path,
+                        )
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Task sandboxes cannot use '{}' safely: cached blob entry is a \
+                                 link or belongs to an untrusted account",
+                                object_path.display()
+                            ),
+                        ));
+                    }
+                }
                 let id = object
                     .file_name()
                     .to_str()
                     .and_then(|name| BlobId::from_hex(name).ok());
-                if let (Some(id), true) = (id, meta.is_file()) {
+                if let (Some(id), true) =
+                    (id, crate::sandbox::is_real_owned_file(&object_path, &meta))
+                {
                     found.push((
                         meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                         id,
@@ -481,17 +557,41 @@ impl Drop for CachePin {
     }
 }
 
-/// Creates `dir` and its missing parents readable by the owner only (Unix): the cache holds the
-/// files of every task, and the sandbox base directory may be a shared temporary directory.
-fn create_private_dir_all(dir: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
+/// Creates or validates `dir` (and any missing ancestors) as a private cache directory:
+/// - on Unix, creates missing directories with mode `0700`;
+/// - on Windows, delegates to [`crate::sandbox::ensure_private_dir`] /
+///   [`crate::sandbox::ensure_private_dir_recheck`] so missing directories get the protected
+///   owner-only DACL and existing directories are refused if they are reparse points, have an
+///   untrusted owner, or carry foreign write-class grants.
+fn ensure_private_cache_dir(dir: &Path, emit_warnings: bool) -> io::Result<()> {
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        let res = if emit_warnings {
+            crate::sandbox::ensure_private_dir(dir)
+        } else {
+            crate::sandbox::ensure_private_dir_recheck(dir)
+        };
+        res.map_err(|e| match e {
+            crate::sandbox::SandboxError::BaseDirUnusable { source, .. } => source,
+            other => io::Error::new(io::ErrorKind::PermissionDenied, other.to_string()),
+        })
     }
-    builder.create(dir)
+    #[cfg(not(windows))]
+    {
+        let _ = emit_warnings;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)
+    }
+}
+
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    ensure_private_cache_dir(dir, false)
 }
 
 fn corrupt(id: &BlobId) -> io::Error {
@@ -669,5 +769,179 @@ mod tests {
         assert_eq!(cache.usage(), (150, 15_000));
         assert_eq!(cache.evict_to_fit(), 145);
         assert_eq!(cache.usage(), (5, 500));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blob_cache_creates_private_dirs_and_refuses_junctions_untrusted_owners_and_foreign_write_grants(
+    ) {
+        use rusty_grid_core::private_file::{
+            create_or_open_private_dir_all, current_user_sid, dir_open_grants,
+            inspect_dir_security_no_follow, read_dacl, DirSecuritySnapshot,
+        };
+        use std::process::Command;
+
+        fn make_junction(link: &Path, target: &Path) {
+            let status = Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("cmd mklink /J");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        let user = current_user_sid().unwrap();
+
+        // 1. Missing `<base>\cache\blobs\{objects,tmp}` (plus fanout dirs) are created with a
+        //    protected owner-only DACL, even when `<base>` had no protected inheritance.
+        let root_tmp = tempfile::tempdir().unwrap();
+        let base = root_tmp.path().join("base");
+        crate::sandbox::ensure_private_dir(&base).unwrap();
+        let blobs_dir = base.join("cache").join("blobs");
+        let cache = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        let id = put(&cache, root_tmp.path(), b"private-cache-blob");
+        let fanout_dir = cache.object_path(&id).parent().unwrap().to_path_buf();
+        for d in [
+            base.join("cache"),
+            blobs_dir.clone(),
+            blobs_dir.join("objects"),
+            blobs_dir.join("tmp"),
+            fanout_dir,
+        ] {
+            let (aces, protected) = read_dacl(&d).unwrap();
+            assert!(protected, "{} must have a protected DACL", d.display());
+            assert!(
+                dir_open_grants(&aces, &user).is_empty(),
+                "{} must grant no foreign access: {aces:?}",
+                d.display()
+            );
+        }
+        drop(cache);
+
+        // 2. A junction at `<base>\cache` is refused without writing into the junction target.
+        let junc_base = root_tmp.path().join("base_junc_cache");
+        crate::sandbox::ensure_private_dir(&junc_base).unwrap();
+        let canary_target = root_tmp.path().join("canary_target");
+        std::fs::create_dir(&canary_target).unwrap();
+        let cache_junc = junc_base.join("cache");
+        make_junction(&cache_junc, &canary_target);
+        let err_junc_cache = match BlobCache::open(&cache_junc.join("blobs"), 1 << 20) {
+            Ok(_) => panic!("junction at <base>\\cache must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err_junc_cache.kind(), io::ErrorKind::PermissionDenied);
+        let msg_junc = err_junc_cache.to_string();
+        assert!(
+            msg_junc.contains(&cache_junc.display().to_string())
+                && msg_junc.contains("reparse point"),
+            "unexpected error: {msg_junc}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&canary_target).unwrap().count(),
+            0,
+            "junction target must stay untouched"
+        );
+
+        // 3. A junction at a fanout subdirectory (`objects\ab`) is also refused on open.
+        let junc_fanout_base = root_tmp.path().join("base_junc_fanout");
+        let fanout_blobs = junc_fanout_base.join("cache").join("blobs");
+        drop(BlobCache::open(&fanout_blobs, 1 << 20).unwrap());
+        make_junction(&fanout_blobs.join("objects").join("ab"), &canary_target);
+        let err_fanout = match BlobCache::open(&fanout_blobs, 1 << 20) {
+            Ok(_) => panic!("junction at objects\\ab must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err_fanout.to_string().contains("reparse point"),
+            "{err_fanout}"
+        );
+
+        // 4. Existing `<base>\cache` or `<base>\cache\blobs\objects` with a foreign write grant
+        //    (such as `BUILTIN\Users:(OI)(CI)(W)`) is refused with the base's `icacls` remedy.
+        let write_base = root_tmp.path().join("base_foreign_write");
+        let write_blobs = write_base.join("cache").join("blobs");
+        drop(BlobCache::open(&write_blobs, 1 << 20).unwrap());
+        let status = Command::new("icacls")
+            .arg(write_base.join("cache"))
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(OI)(CI)(W)")
+            .output()
+            .expect("icacls /grant");
+        assert!(status.status.success());
+        let err_write = match BlobCache::open(&write_blobs, 1 << 20) {
+            Ok(_) => panic!("foreign write grant on <base>\\cache must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err_write
+                .to_string()
+                .contains("grants write access to other accounts")
+                && err_write.to_string().contains("icacls"),
+            "{err_write}"
+        );
+
+        // 5a. Real read-only check on `%SystemRoot%` (`TrustedInstaller` owner) is refused.
+        if let Some(sys_root) = std::env::var_os("SystemRoot") {
+            let sys_path = PathBuf::from(sys_root);
+            if let Ok(snap) = inspect_dir_security_no_follow(&sys_path) {
+                if let Ok(owner) = snap.owner_sid {
+                    if !rusty_grid_core::private_file::is_trusted_owner_sid(&owner, &user) {
+                        let err_sys = match BlobCache::open(&sys_path, 1 << 20) {
+                            Ok(_) => panic!("TrustedInstaller-owned cache dir must be refused"),
+                            Err(e) => e,
+                        };
+                        assert!(err_sys.to_string().contains(&owner), "{err_sys}");
+                    }
+                }
+            }
+        }
+
+        // 5b. Deterministic non-elevated check: `<base>` is owned by the worker account while
+        //     `<base>\cache` (left over from an old open base) belongs to another local user SID
+        //     (`S-1-5-21-1-2-3-1002`).
+        let foreign_owner_base = root_tmp.path().join("base_foreign_owner");
+        let foreign_cache = foreign_owner_base.join("cache");
+        let foreign_blobs = foreign_cache.join("blobs");
+        drop(BlobCache::open(&foreign_blobs, 1 << 20).unwrap());
+        let worker_sid = "S-1-5-21-1-2-3-1001";
+        let attacker_sid = "S-1-5-21-1-2-3-1002";
+        let err_owner = match BlobCache::open_with_dir_check(&foreign_blobs, 1 << 20, |p, warn| {
+            crate::sandbox::ensure_private_dir_windows_with(
+                p,
+                warn,
+                || Ok(worker_sid.to_string()),
+                create_or_open_private_dir_all,
+                |inspected| {
+                    let owner = if inspected == foreign_cache {
+                        attacker_sid
+                    } else {
+                        worker_sid
+                    };
+                    Ok(DirSecuritySnapshot {
+                        is_reparse_point: false,
+                        is_dir: true,
+                        persistent_acls: Ok(true),
+                        owner_sid: Ok(owner.to_string()),
+                        dacl: Ok((Vec::new(), true)),
+                    })
+                },
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))
+        }) {
+            Ok(_) => panic!("foreign-owned <base>\\cache must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err_owner.to_string().contains(attacker_sid)
+                && err_owner
+                    .to_string()
+                    .contains(&foreign_cache.display().to_string()),
+            "{err_owner}"
+        );
     }
 }

@@ -193,6 +193,132 @@ function Test-PrivateAcl($acl) {
     }
     return $true
 }
+# Sets $sec's DACL on an existing directory via a single handle opened with
+# FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, refusing links and foreign owners on
+# that handle before touching any ACL.
+function Set-PrivateDaclNoFollow($path, $sec, [string]$expectedOwnerSid) {
+    if (-not ('OxideSwarmDirAcl' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+
+public static class OxideSwarmDirAcl {
+    const uint READ_CONTROL = 0x00020000;
+    const uint WRITE_DAC = 0x00040000;
+    const uint FILE_SHARE_ALL = 0x00000007;
+    const uint OPEN_EXISTING = 3;
+    const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    const uint DACL_SECURITY_INFORMATION = 0x00000004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        public uint dwFileAttributes;
+        public FILETIME ftCreationTime;
+        public FILETIME ftLastAccessTime;
+        public FILETIME ftLastWriteTime;
+        public uint dwVolumeSerialNumber;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint nNumberOfLinks;
+        public uint nFileIndexHigh;
+        public uint nFileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetKernelObjectSecurity(IntPtr Handle, uint RequestedInformation, byte[] pSecurityDescriptor, uint nLength, out uint lpnLengthNeeded);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool SetKernelObjectSecurity(IntPtr Handle, uint SecurityInformation, byte[] SecurityDescriptor);
+
+    public static string Apply(string path, byte[] sdBytes, string expectedOwnerSid) {
+        IntPtr h = CreateFileW(path, READ_CONTROL | WRITE_DAC, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (h == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            BY_HANDLE_FILE_INFORMATION info;
+            if (!GetFileInformationByHandle(h, out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return "link";
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return "file";
+            uint needed = 0;
+            GetKernelObjectSecurity(h, OWNER_SECURITY_INFORMATION, null, 0, out needed);
+            if (needed == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            byte[] ownerBuf = new byte[needed];
+            if (!GetKernelObjectSecurity(h, OWNER_SECURITY_INFORMATION, ownerBuf, needed, out needed)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            RawSecurityDescriptor ownerSd = new RawSecurityDescriptor(ownerBuf, 0);
+            string ownerSid = ownerSd.Owner != null ? ownerSd.Owner.Value : "";
+            if (!string.Equals(ownerSid, expectedOwnerSid, StringComparison.OrdinalIgnoreCase)) {
+                return "owner:" + ownerSid;
+            }
+            if (!SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sdBytes)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return null;
+        } finally {
+            CloseHandle(h);
+        }
+    }
+}
+'@
+    }
+    return [OxideSwarmDirAcl]::Apply($path, $sec.GetSecurityDescriptorBinaryForm(), $expectedOwnerSid)
+}
+# Entries under an existing open $root to inspect: direct children of $root, the installer's own
+# small control folders (bin, home, run, logs), and the worker's cache/lock directories under work.
+# Skips task sandboxes, workspace trees and cargo target trees so -Update stays fast and junctions
+# created by tasks inside sandboxes or workspaces do not block an update.
+function Get-CheckedRootEntries($root, [bool]$ours) {
+    $direct = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)
+    if (-not $ours) { return $direct }
+    $entries = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
+    foreach ($d in $direct) {
+        $entries.Add($d)
+        if (-not $d.PSIsContainer -or ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+        $leaf = $d.Name.ToLowerInvariant()
+        if ($leaf -in @('bin', 'home', 'run', 'logs')) {
+            foreach ($sub in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop)) {
+                $entries.Add($sub)
+            }
+        } elseif ($leaf -eq 'work') {
+            foreach ($rel in @('.locks', 'cache', 'cache\blobs', 'cache\blobs\objects', 'cache\blobs\tmp')) {
+                $p = Join-Path $d.FullName $rel
+                if (Test-Path -LiteralPath $p) {
+                    $entries.Add((Get-Item -LiteralPath $p -Force -ErrorAction Stop))
+                }
+            }
+        } elseif ($leaf -eq 'workspaces') {
+            foreach ($ws in @(Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction Stop)) {
+                $entries.Add($ws)
+            }
+        } else {
+            foreach ($sub in @(Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction Stop)) {
+                $entries.Add($sub)
+            }
+        }
+    }
+    return @($entries)
+}
+function Format-RootLinkRefusal($root, $linkPath) {
+    return "$linkPath is a link; remove that link (keep $(Join-Path $root 'home') in place to preserve cluster membership) and run the installer again"
+}
 # DELETE 0x10000, WRITE_DAC 0x40000, WRITE_OWNER 0x80000, FILE_DELETE_CHILD 0x40.
 $RenameRights = 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40
 # Why $root may not be used: nobody else may rename, delete or re-permission a folder on the way to
@@ -220,12 +346,12 @@ function Test-RootSafety($root) {
         return "$root belongs to another account ($(Get-AccountName $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value)); remove it or choose another folder"
     }
     if (Test-PrivateAcl $acl) { return $null }
-    # Not made by this installer, or by an older one: every entry must be ours.
+    # Not made by this installer, or by an older one: every installer/control entry must be ours.
     $ours = (Test-Path -LiteralPath (Join-Path $root '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $root 'bin\oxideswarm.exe'))
-    $children = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)
+    $children = @(Get-CheckedRootEntries $root $ours)
     if (-not $ours -and $children.Count -gt 0) { return "$root already holds other files; choose a new or empty folder with -InstallRoot" }
     foreach ($c in $children) {
-        if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$($c.FullName) is a link" }
+        if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { return (Format-RootLinkRefusal $root $c.FullName) }
         $who = Get-ForeignGrant $c.FullName -1 $false
         if ($who) { return "another account ($who) has rights on $($c.FullName); remove $root or choose another folder" }
     }
@@ -313,7 +439,13 @@ if (-not $PrivateRoot) {
     } elseif (-not (Test-PrivateAcl (Get-Acl -LiteralPath $InstallRoot))) {
         $recheckExisting = $true
         $hadOurs = (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
-        (Get-Item -LiteralPath $InstallRoot -Force).SetAccessControl($sec)
+        $applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $UserSid.Value
+        if ($applyErr -eq 'link') { Fail "$InstallRoot is a link; remove it and run the installer again" }
+        if ($applyErr -eq 'file') { Fail "$InstallRoot is a file" }
+        if ($applyErr -like 'owner:*') {
+            $badOwner = $applyErr.Substring('owner:'.Length)
+            Fail "$InstallRoot belongs to another account ($(Get-AccountName $badOwner)); remove it or choose another folder"
+        }
     }
     # CreateDirectory returns an existing folder as it is (one made in between by someone else), so
     # check what is there now.
@@ -325,13 +457,13 @@ if (-not $PrivateRoot) {
         Fail "could not make $InstallRoot private to this user; remove it and run the installer again"
     }
     if ($recheckExisting) {
-        # Close the Test-RootSafety -> SetAccessControl window on an existing folder that was open to others.
-        $afterChildren = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction Stop)
+        # Close the Test-RootSafety -> Set-PrivateDaclNoFollow window on an existing folder that was open to others.
+        $afterChildren = @(Get-CheckedRootEntries $InstallRoot $hadOurs)
         if (-not $hadOurs -and $afterChildren.Count -gt 0) {
             Fail "files appeared in $InstallRoot before it could be made private; remove it or choose another folder"
         }
         foreach ($c in $afterChildren) {
-            if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$($c.FullName) is a link" }
+            if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail (Format-RootLinkRefusal $InstallRoot $c.FullName) }
             $who = Get-ForeignGrant $c.FullName -1 $false
             if ($who) { Fail "another account ($who) has rights on $($c.FullName); remove $InstallRoot or choose another folder" }
         }
