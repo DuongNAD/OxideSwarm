@@ -10,6 +10,12 @@ python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm --quick  #
 python3 benchmarks/grid/bench_grid.py --bin target/release/oxideswarm \
     --offload-master <HOST:PORT_OR_TICKET> --secret-file ~/.oxideswarm/cluster.secret  # (c) two-machine offload
 python3 tests/test_bench_grid.py                                               # helper checks, no binary
+cargo build --release --locked --bin oxideswarm --example scale_load_driver
+python3 benchmarks/grid/scale_harness.py --workers 100 --submitters 10 --tasks 1000 --runs 3
+python3 benchmarks/grid/scale_harness.py --workers 500 --submitters 20 --tasks 2000 --runs 3
+python3 benchmarks/grid/scale_harness.py --workers 1000 --submitters 20 --tasks 2000 --runs 3
+python3 benchmarks/grid/scale_harness.py --quick --no-write                     # smoke run, 64 simulated workers
+python3 tests/test_scale_harness.py                                             # helper checks, no binary
 ```
 
 Every run starts its own master and workers on `127.0.0.1` with ephemeral ports, gives each process a
@@ -143,6 +149,52 @@ figure is the worker writing a fresh tree from its blob cache and compiling the 
 scratch; the warm figure is a sync that changes nothing plus an incremental `cargo test`. Each warm run
 took about 3.6 % of its cold run.
 
+**(d) Simulated worker fleet load (`scale_harness.py`, `SCALE-1`).** Spawns one real `oxideswarm master`
+subprocess (`--secret-file`, `--state-dir`, `--blob-dir`, ephemeral loopback ports, private `HOME` and
+`USERPROFILE`) and drives `N` in-process `WorkerClient::simulated` sessions (`crates/worker/src/sim.rs`)
+from `crates/cli/examples/scale_load_driver.rs`. Each simulated worker runs the full OXS-AUTH v2
+handshake, ChaCha20-Poly1305 encrypted record layer, and protocol v8 state machine, while `FakeRunnerConfig`
+sleeps `5 ms` per compute task instead of spawning a child OS process. Optional `SimulatedLinkStream`
+impairment adds one-way base latency, uniform FIFO jitter, and per-chunk `RetransmitStall` delays.
+
+Per fresh cluster, `scale_load_driver` measures seven phases:
+
+1. Concurrent registration convergence across `N` workers.
+2. 32 sequential unloaded `submit` probes for submit-to-assign and submit-to-complete p50/p99 latency.
+3. A concurrent multi-submitter burst (`10` or `20` persistent TCP client connections submitting and
+   polling every `15 ms`).
+4. A `6 s` quiet heartbeat window (`3 s` heartbeat interval) with `sysinfo` master RSS and CPU sampling.
+5. Simultaneous `10 MiB` input-blob fan-out from the master to `100` workers (`1000 MiB` total).
+6. Simultaneous `disconnect_all()` mass reconnect storm (`500 ms` initial backoff) followed by verification tasks.
+7. `journal.bin` byte size, in-process `TaskStore::open` plus `TaskQueue::attach_store_and_replay` replay
+   latency, and full `oxideswarm master` subprocess restart readiness.
+
+**(d) Recorded runs.** `2026-11-14` (UTC), `Intel(R) Core(TM) i5-14600KF`, 20 logical CPUs, `47.79` GiB RAM,
+Windows `amd64`, AC power, release build of `3d6b35eb`, 3 fresh clusters per scenario:
+
+- 100w loopback: [`results/2026-11-14-scale1-windows-amd64-100w.json`](results/2026-11-14-scale1-windows-amd64-100w.json)
+- 500w loopback: [`results/2026-11-14-scale1-windows-amd64-500w.json`](results/2026-11-14-scale1-windows-amd64-500w.json)
+- 1000w loopback: [`results/2026-11-14-scale1-windows-amd64-1000w.json`](results/2026-11-14-scale1-windows-amd64-1000w.json)
+- 100w impaired (`25+10 ms`, `1 %` loss): [`results/2026-11-14-scale1-windows-amd64-100w-imp-25ms-10ms.json`](results/2026-11-14-scale1-windows-amd64-100w-imp-25ms-10ms.json)
+
+| Scenario | Registration, ms | Unloaded assign p50 / p99, ms | Burst throughput, tasks/s | Burst assign p50 / p99, ms | Reconnect storm, ms |
+|---|---|---|---|---|---|
+| 100w loopback (10 sub, 1000 tasks) | 153.7 (124.5 to 156.5) | 30.89 (30.89 to 31.06) / 32.27 (32.00 to 32.43) | 160.2 (159.0 to 160.4) | 31.11 (30.98 to 31.12) / 32.60 (32.32 to 46.54) | 635.5 (629.5 to 657.1) |
+| 500w loopback (20 sub, 2000 tasks) | 233.8 (219.8 to 246.4) | 31.01 (30.89 to 31.22) / 32.64 (32.43 to 47.17) | 375.2 (369.2 to 382.8) | 17.07 (16.97 to 17.26) / 33.31 (33.19 to 46.24) | 639.6 (629.9 to 655.8) |
+| 1000w loopback (20 sub, 2000 tasks) | 340.7 (311.7 to 344.3) | 16.46 (16.45 to 16.57) / 32.65 (17.67 to 32.89) | 419.7 (418.6 to 420.2) | 17.44 (17.42 to 17.47) / 33.45 (33.10 to 33.62) | 641.5 (636.7 to 654.5) |
+| 100w impaired (`25+10 ms`, `1 %` loss, 10 sub, 500 tasks) | 466.6 (465.3 to 483.3) | 62.71 (62.61 to 63.20) / 78.88 (78.33 to 125.35) | 60.6 (60.1 to 60.6) | 62.75 (62.73 to 62.91) / 108.33 (91.05 to 123.36) | 900.4 (876.1 to 936.5) |
+
+| Scenario | Steady / Peak RSS, MiB | Peak master CPU, % | Quiet heartbeats (acks/s, rx / tx B/s) | `100 x 10 MiB` fan-out (ms, MiB/s) | Journal bytes / replay / restart, ms |
+|---|---|---|---|---|---|
+| 100w loopback | 25.7 (25.7 to 26.5) / 507.4 (467.9 to 658.7) | 917.7 (884.0 to 1341.7) | 33.2, 1396 / 2859 | 1592.8 (1539.8 to 1700.0), 627.84 (588.22 to 649.43) | 753548 / 10.71 (10.48 to 12.49) / 29.86 (27.51 to 35.28) |
+| 500w loopback | 55.7 (55.0 to 57.7) / 676.7 (650.1 to 843.1) | 1192.9 (869.6 to 1367.2) | 166.5, 6995 / 14323 | 1539.9 (1517.1 to 1554.3), 649.41 (643.39 to 659.14) | 1372548 / 16.73 (16.58 to 18.79) / 33.52 (32.86 to 37.10) |
+| 1000w loopback | 87.6 (86.5 to 87.8) / 537.3 (512.8 to 845.3) | 1032.1 (1009.1 to 1266.3) | 336.8, 14145 / 28577 | 1524.9 (1517.9 to 1584.5), 655.80 (631.12 to 658.82) | 1372548 / 19.53 (16.47 to 20.11) / 34.32 (27.21 to 36.89) |
+| 100w impaired | 25.6 (24.8 to 26.2) / 592.7 (583.2 to 593.8) | 1537.5 (1296.6 to 1550.4) | 33.3, 1397 / 2861 | 25492.6 (25456.8 to 25561.4), 39.23 (39.12 to 39.28) | 444048 / 8.62 (8.46 to 8.68) / 31.10 (29.77 to 34.28) |
+
+All 12 runs finished with `0` failed burst tasks and `0` failed post-reconnect tasks (`646` median
+simulated packet-loss stalls in the impaired run, range `643` to `654`). Peak master RSS (`507` to
+`845 MiB` vs `25.6` to `87.6 MiB` steady) occurs during simultaneous `100 x 10 MiB` `GetBlob` fan-out.
+
 ## Limits
 
 - (a) and (b) run on one machine over loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
@@ -157,3 +209,4 @@ took about 3.6 % of its cold run.
 - No other scheduler was run, so these figures are not a comparison with any other system.
 - (c) is one pair of machines on one LAN, a single worker and one crate: it shows what a reused `target/` saves, not how the grid scales, and a
   relayed or Internet link would add transfer time to a first run.
+- (d) isolates the master's control plane, blob store and journal by running simulated workers in one driver process on the same host over loopback (or user-space stream delays): it skips per-task OS process spawn, sandbox setup, and real multi-host NIC/router queues, and submit-to-assign timestamps include the client's 15 ms status-polling quantum.
