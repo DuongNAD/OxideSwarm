@@ -1,7 +1,7 @@
 # 0050: Scale-out architecture (`SCALE-1` to `SCALE-6`, `ECO-3`, `ECO-4`)
 
-Status: Draft
-Created: 2026-11-09    Updated: 2026-11-09
+Status: Partial
+Created: 2026-11-09    Updated: 2026-11-14
 
 ## Summary
 
@@ -9,7 +9,7 @@ Today one master runs the whole grid for one owner or one small team. This recor
 of that design with evidence, and a staged architecture that grows it to many workers and many
 submitters: a load harness first, then a faster scheduler, worker-to-worker blob distribution, a
 highly available master, autoscaling providers and, last, federation of sites. It also covers
-multi-tenancy and observability, which a shared grid needs. Nothing is built. Each open choice lists
+multi-tenancy and observability, which a shared grid needs. `SCALE-1` (D1) is implemented with baseline records at 100, 500 and 1000 simulated workers; the remaining stages are Planned. Each open choice lists
 its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
 
 ## Context
@@ -43,10 +43,7 @@ grid grows.
    admin of the grid. `AuthScope` (`crates/master/src/auth.rs`) covers the dashboard only.
 7. **No metrics or traces for operators.** No Prometheus or OpenTelemetry code exists in `crates/`.
    The dashboard (`crates/master/src/web_ui.rs`) shows live state and `doctor` checks one grid.
-8. **The numbers come from one machine.** `benchmarks/grid/` (BENCH-1) runs one to four workers on
-   loopback on one Mac under load. No run has more than four workers, many submitters, or a network
-   between master and workers, so the real ceiling is unknown. The load harness (D1) is the first
-   work item for that reason: later choices need its numbers.
+8. **Single-machine baseline extended to simulated fleets.** `benchmarks/grid/bench_grid.py` (BENCH-1) runs one to four workers on loopback. `SCALE-1` (`benchmarks/grid/scale_harness.py`, `crates/cli/examples/scale_load_driver.rs`) now measures 100, 500 and 1000 simulated workers plus an impaired-link scenario (summarized under D1).
 
 ## Goals
 
@@ -90,18 +87,31 @@ Every stage below keeps these. A stage that cannot keep one is not accepted.
 
 ## Design
 
-### D1: Load harness (`SCALE-1`)
+### D1: Load harness (`SCALE-1`, Implemented)
 
-A simulated worker is a `WorkerClient` with a fake runner, so 1000 of them fit in one process
-group. It registers, heartbeats, receives tasks, and answers after a configurable delay, with an
-optional link delay and loss. The harness lives under `benchmarks/grid/` and follows BENCH-1: one
-JSON record per run, with date, commit, hardware, operating system, network and raw runs.
+A simulated worker is `WorkerClient::simulated` (`crates/worker/src/client.rs`, `crates/worker/src/sim.rs`)
+paired with `FakeRunnerConfig` (`crates/worker/src/runner.rs`) and `SimulatedLinkStream`, so 1000 of
+them run in `crates/cli/examples/scale_load_driver.rs` against one real `oxideswarm master`
+subprocess (`OXS-AUTH` v2 handshake, ChaCha20-Poly1305 record layer, protocol v8). Each worker
+registers, heartbeats, receives tasks, and answers after a configurable delay with optional link
+base latency, FIFO jitter, packet-loss stalls, and `disconnect_all()` mass reconnect injection.
+`benchmarks/grid/scale_harness.py` drives the scenarios under BENCH-1 rules and writes sanitized JSON
+records with date, commit, hardware, OS, network, and 3 raw runs.
 
-Measured: scheduling throughput and p50/p99 submit-to-assign latency by worker count; master CPU,
-memory and journal bytes; time to replay the journal at start; heartbeat load; blob bytes through
-the master; time to reach the stated state after a mass reconnect (every worker drops at once).
+The `2026-11-14` baseline (`3d6b35eb`, Core i5-14600KF, 20 logical CPUs, `47.79` GiB RAM, Windows
+`amd64`, [benchmarks/grid/README.md](../../benchmarks/grid/README.md)) decides which of D2 and D3
+matter first:
 
-The first record is the baseline. It decides which of D2 and D3 matter first.
+- Control plane, heartbeats (`336.8 acks/s`, `42.7 KB/s` at 1000 workers), mass reconnect (`641.5 ms`
+  for 1000 workers), steady master RSS (`25.7` / `55.7` / `87.6 MiB` at 100 / 500 / 1000 workers),
+  and journal replay (`19.5 ms` in-process for `1.37 MB`) stay well within single-master bounds up
+  to 1000 workers.
+- Simultaneous `100 x 10 MiB` input-blob fan-out spikes master RSS from `25.7–87.6 MiB` to
+  `507.4–676.7 MiB` median (up to `845.3 MiB` max) and drops to `39.23 MiB/s` (`25.5 s`,
+  `1537.5 %` peak master CPU) over a `25 ms + 10 ms`, `1 %`-loss simulated WAN link, pointing
+  directly to `SCALE-3` (D3 worker-to-worker blob distribution and bounded master transfer buffers)
+  as the primary data-plane bottleneck, alongside `SCALE-2` (D2 scheduler indexing, cold terminal
+  result eviction, and fair share) for multi-submitter queues.
 
 ### D2: Scheduler and queue at scale (`SCALE-2`)
 
@@ -244,7 +254,7 @@ only if the owner's Q8 target needs more than one site.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| SCALE-1 | Load harness with simulated workers (D1) | `benchmarks/grid/`, `crates/worker/src/` (fake runner) | Dated records at 100, 500 and 1000 workers are committed | Planned |
+| SCALE-1 | Load harness with simulated workers (D1) | `benchmarks/grid/scale_harness.py`, `crates/cli/examples/scale_load_driver.rs`, `crates/worker/src/sim.rs` | Dated records at 100, 500 and 1000 workers are committed | Implemented |
 | SCALE-2 | Scheduler and queue at scale (D2) | `crates/master/src/scheduler.rs`, `queue.rs` | The SCALE-1 numbers improve by the Q8 target, with no change in placement results | Planned |
 | SCALE-3 | Worker-to-worker blob distribution (D3) | `crates/core/src/blob_transfer.rs`, `crates/worker/src/blob_client.rs`, `crates/master/src/blob_store.rs` | A test shows the master sends one blob once to N workers | Planned |
 | SCALE-4 | Master high availability (D4) | `crates/master/src/store.rs`, `server.rs`, `crates/worker/src/client.rs` | Killing the leader loses no accepted task | Planned |
@@ -261,3 +271,4 @@ SCALE-6 only on need. ECO-3 and ECO-4 can start after SCALE-1.
 - 2026-11-09: Created as Draft at the owner's request to grow OxideSwarm into a large project.
   Nothing is built. The owner's decisions Q8, Q9 and Q12 in `ROADMAP.md` fix the target scale, the
   HA approach and the first providers.
+- 2026-11-14: Implemented SCALE-1 (D1) in pull request 222: WorkerClient::simulated, FakeRunnerConfig, SimulatedLinkStream (crates/worker/src/sim.rs, crates/worker/tests/scale1_simulated_worker.rs), scale_load_driver (crates/cli/examples/scale_load_driver.rs), benchmarks/grid/scale_harness.py (tests/test_scale_harness.py), and 3-run baseline records at 100, 500 and 1000 loopback workers plus 100 workers on a 25 ms + 10 ms, 1 % loss simulated link (benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json). Status changed from Draft to Partial.

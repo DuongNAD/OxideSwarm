@@ -576,6 +576,10 @@ pub struct WorkerConfig {
     /// Maximum number of workspaces kept on disk before LRU eviction (CLI `--max-workspaces`,
     /// default: [`DEFAULT_MAX_WORKSPACES`]).
     pub max_workspaces: usize,
+    /// Optional in-process synthetic task runner (`SCALE-1`).
+    pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
+    /// Optional simulated link shaping and byte/disconnect instrumentation (`SCALE-1`).
+    pub simulated_link: Option<crate::sim::SimulatedLinkConfig>,
 }
 
 impl WorkerConfig {
@@ -630,6 +634,8 @@ impl WorkerConfig {
             enable_redirection_portal: true,
             redirection_portal_port: 8080,
             wire_codec: WireCodec::default(),
+            fake_runner: None,
+            simulated_link: None,
         }
     }
 
@@ -903,6 +909,42 @@ impl WorkerConfig {
     pub fn with_max_workspaces(mut self, max: usize) -> Self {
         self.max_workspaces = max;
         self
+    }
+
+    /// Configures an in-process synthetic runner for simulated worker fleets (`SCALE-1`).
+    pub fn with_fake_runner(mut self, fake: crate::sim::FakeRunnerConfig) -> Self {
+        self.fake_runner = Some(fake);
+        self
+    }
+
+    /// Configures simulated link shaping and instrumentation for the worker connection (`SCALE-1`).
+    pub fn with_simulated_link(mut self, link: crate::sim::SimulatedLinkConfig) -> Self {
+        self.simulated_link = Some(link);
+        self
+    }
+
+    /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
+    pub fn simulated(
+        master_addr: impl Into<String>,
+        name: Option<String>,
+        cores: Option<usize>,
+        fake_runner: crate::sim::FakeRunnerConfig,
+        simulated_link: Option<crate::sim::SimulatedLinkConfig>,
+    ) -> Self {
+        let mut config = Self::new(master_addr)
+            .with_name(name.unwrap_or_else(|| "sim-worker".to_string()))
+            .with_cores(cores.unwrap_or(4))
+            .with_ram_mb(4096)
+            .with_no_battery(true)
+            .with_no_gpu(true)
+            .with_no_blender(true)
+            .with_no_cuda(true)
+            .with_fake_runner(fake_runner);
+        config.enable_redirection_portal = false;
+        if let Some(link) = simulated_link {
+            config = config.with_simulated_link(link);
+        }
+        config
     }
 }
 
@@ -1617,7 +1659,8 @@ impl WorkerClient {
                 limit_mb: config.workspace_limit_mb,
                 max_workspaces: config.max_workspaces,
                 ..WorkspaceLimits::default()
-            });
+            })
+            .with_fake_runner(config.fake_runner.clone());
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
@@ -1792,6 +1835,24 @@ impl WorkerClient {
         }
         config = config.with_simulate_gpu(simulate_gpu);
         Self::new(config)
+    }
+
+    /// Constructs an in-process simulated `WorkerClient` with host probes and sandboxes bypassed
+    /// for high-fanout load testing (`SCALE-1`).
+    pub fn simulated(
+        master_addr: impl Into<String>,
+        name: Option<String>,
+        cores: Option<usize>,
+        fake_runner: crate::sim::FakeRunnerConfig,
+        simulated_link: Option<crate::sim::SimulatedLinkConfig>,
+    ) -> Self {
+        Self::new(WorkerConfig::simulated(
+            master_addr,
+            name,
+            cores,
+            fake_runner,
+            simulated_link,
+        ))
     }
 
     /// Alias for `from_options`.
@@ -2041,10 +2102,12 @@ impl WorkerClient {
 
         // A sandbox directory nobody can write to would fail every process task one by one, far
         // from its cause; refuse to start instead, with the fix in the message.
-        if let Err(e) = self.runner.config().sandbox_config.ensure_usable().await {
-            let err = GridError::Config(e.to_string());
-            error!(worker_id = %self.worker_id, error = %err, "Task sandboxes cannot be created");
-            return Err(err);
+        if self.runner.config().fake_runner.is_none() || self.config.sandbox_base_dir.is_some() {
+            if let Err(e) = self.runner.config().sandbox_config.ensure_usable().await {
+                let err = GridError::Config(e.to_string());
+                error!(worker_id = %self.worker_id, error = %err, "Task sandboxes cannot be created");
+                return Err(err);
+            }
         }
 
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
@@ -2428,31 +2491,38 @@ impl WorkerClient {
         // delivery). Replacing the table entry would drop the old run's cancel handle and make it
         // look like a Master cancellation, so stop it explicitly first, silently.
         self.retire_previous_run(task_id).await;
-        // Nothing may touch the sandbox base (the reclaim below, the blob cache, the sandbox
-        // itself) while another local user could have replaced its private root (design 0021).
-        if let Err(e) = self
-            .runner
-            .config()
-            .sandbox_config
-            .ensure_private_root_recheck()
-            .await
-        {
-            warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not safe");
-            let result = TaskResult::failure(
-                worker_id,
-                task_id,
-                EXIT_CODE_GENERAL_ERROR,
-                "",
-                e.to_string(),
-                0,
-                Some(format!("Sandbox base: {e}")),
-            );
-            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
-            return;
+        let skip_sandbox_touch = self.runner.config().fake_runner.is_some()
+            && task.inputs.is_empty()
+            && task.output_globs.is_empty()
+            && !has_workspace_tree;
+        if !skip_sandbox_touch {
+            // Nothing may touch the sandbox base (the reclaim below, the blob cache, the sandbox
+            // itself) while another local user could have replaced its private root (design 0021).
+            if let Err(e) = self
+                .runner
+                .config()
+                .sandbox_config
+                .ensure_private_root_recheck()
+                .await
+            {
+                warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not safe");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    e.to_string(),
+                    0,
+                    Some(format!("Sandbox base: {e}")),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                return;
+            }
+            // A sandbox directory left behind by a killed worker process (or kept for debugging)
+            // would make `Sandbox::create` fail with "already exists", and that failure is
+            // terminal.
+            self.reclaim_stale_sandbox(task_id).await;
         }
-        // A sandbox directory left behind by a killed worker process (or kept for debugging) would
-        // make `Sandbox::create` fail with "already exists", and that failure is terminal.
-        self.reclaim_stale_sandbox(task_id).await;
 
         let attempt = self.next_attempt.fetch_add(1, Ordering::Relaxed) + 1;
         let (cancel_tx, cancel_rx) = oneshot::channel::<String>();
@@ -3255,49 +3325,14 @@ impl WorkerClient {
         let clock = IoClock::new();
         match stream_mode {
             WorkerStreamMode::Single(stream) => {
-                let mut transport = MessageTransport::with_codec(
-                    StampedStream::new(stream, Arc::clone(&clock)),
-                    self.config.wire_codec,
-                );
-
-                // Cluster authentication (when a secret is configured) + atomic registration handshake
-                let mut deadline = self.resume_deadline;
-                let handshake = {
-                    let hs_fut = self.perform_handshake(&mut transport);
-                    tokio::pin!(hs_fut);
-                    loop {
-                        let resume_wait = async {
-                            match deadline {
-                                Some(d) => tokio::time::sleep_until(d).await,
-                                None => std::future::pending::<()>().await,
-                            }
-                        };
-                        tokio::select! {
-                            biased;
-                            _ = shutdown_requested(shutdown_rx) => break None,
-                            _ = resume_wait => {
-                                deadline = None;
-                                self.expire_resume_window("session-resume grace window expired").await;
-                            }
-                            res = &mut hs_fut => break Some(res),
-                        }
-                    }
-                };
-                self.resume_deadline = deadline;
-                let Some(handshake) = handshake else {
-                    info!(worker_id = %self.worker_id, "Shutdown requested during handshake");
-                    return Ok(());
-                };
-                let heartbeat_interval = handshake?;
-                backoff.reset();
-                info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
-
-                // Split transport into independent reader and writer; one stream serves both queues.
-                let (writer, reader) = transport.split();
-                let mut session = Session::new(clock);
-                session.attach_lane(writer, reader, "master", true, true);
-                self.run_session(session, heartbeat_interval, shutdown_rx)
-                    .await
+                if let Some(link_cfg) = self.config.simulated_link.clone() {
+                    let wrapped = crate::sim::SimulatedLinkStream::wrap(stream, link_cfg);
+                    self.run_single_stream_session(wrapped, clock, backoff, shutdown_rx)
+                        .await
+                } else {
+                    self.run_single_stream_session(stream, clock, backoff, shutdown_rx)
+                        .await
+                }
             }
             #[cfg(feature = "p2p")]
             WorkerStreamMode::Multiplexed { control, data } => {
@@ -3362,6 +3397,64 @@ impl WorkerClient {
                     .await
             }
         }
+    }
+
+    async fn run_single_stream_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        &mut self,
+        stream: S,
+        clock: Arc<IoClock>,
+        backoff: &mut ExponentialBackoff,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> GridResult<()> {
+        let mut transport = MessageTransport::with_codec(
+            StampedStream::new(stream, Arc::clone(&clock)),
+            self.config.wire_codec,
+        );
+
+        // Cluster authentication (when a secret is configured) + atomic registration handshake
+        let mut deadline = self.resume_deadline;
+        let handshake = {
+            let hs_fut = self.perform_handshake(&mut transport);
+            tokio::pin!(hs_fut);
+            loop {
+                let resume_wait = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = shutdown_requested(shutdown_rx) => break None,
+                    _ = resume_wait => {
+                        deadline = None;
+                        self.expire_resume_window("session-resume grace window expired").await;
+                    }
+                    res = &mut hs_fut => break Some(res),
+                }
+            }
+        };
+        self.resume_deadline = deadline;
+        let Some(handshake) = handshake else {
+            info!(worker_id = %self.worker_id, "Shutdown requested during handshake");
+            return Ok(());
+        };
+        let heartbeat_interval = handshake?;
+        let _sim_session = self
+            .config
+            .simulated_link
+            .as_ref()
+            .and_then(|cfg| cfg.control.as_ref())
+            .map(crate::sim::SimulatedNetworkControl::enter_session);
+        backoff.reset();
+        info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
+
+        // Split transport into independent reader and writer; one stream serves both queues.
+        let (writer, reader) = transport.split();
+        let mut session = Session::new(clock);
+        session.attach_lane(writer, reader, "master", true, true);
+        self.run_session(session, heartbeat_interval, shutdown_rx)
+            .await
     }
 
     /// Returns the intersection of `ProtocolCapabilities` supported by this worker and
