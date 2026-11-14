@@ -576,6 +576,9 @@ pub struct WorkerConfig {
     /// Maximum number of workspaces kept on disk before LRU eviction (CLI `--max-workspaces`,
     /// default: [`DEFAULT_MAX_WORKSPACES`]).
     pub max_workspaces: usize,
+    /// Optional URL of rendezvous registry for cross-subnet discovery (`--rendezvous` /
+    /// `OXIDESWARM_RENDEZVOUS`).
+    pub rendezvous_url: Option<String>,
 }
 
 impl WorkerConfig {
@@ -630,6 +633,7 @@ impl WorkerConfig {
             enable_redirection_portal: true,
             redirection_portal_port: 8080,
             wire_codec: WireCodec::default(),
+            rendezvous_url: None,
         }
     }
 
@@ -666,6 +670,12 @@ impl WorkerConfig {
     /// Sets or clears the optional custom iroh relay URL (`https://...`).
     pub fn with_relay_url(mut self, url: Option<String>) -> Self {
         self.p2p_relay_url = url;
+        self
+    }
+
+    /// Sets or clears the optional HTTP rendezvous registry URL (`http://...`).
+    pub fn with_rendezvous_url(mut self, url: Option<String>) -> Self {
+        self.rendezvous_url = url;
         self
     }
 
@@ -3031,6 +3041,15 @@ impl WorkerClient {
     #[cfg(feature = "p2p")]
     async fn establish_p2p(&self) -> GridResult<(WorkerStreamMode, String)> {
         let ticket_str = self.config.p2p_ticket.as_deref().unwrap_or_default();
+        self.establish_p2p_with_ticket(ticket_str).await
+    }
+
+    /// Dials the Master over iroh QUIC using an explicit P2P ticket string.
+    #[cfg(feature = "p2p")]
+    async fn establish_p2p_with_ticket(
+        &self,
+        ticket_str: &str,
+    ) -> GridResult<(WorkerStreamMode, String)> {
         let node_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket_str)
             .map_err(|e| GridError::Config(format!("Invalid P2P ticket: {e}")))?;
         info!("Connecting to Master via P2P NAT Traversal (iroh QUIC)...");
@@ -3127,6 +3146,8 @@ impl WorkerClient {
     /// Connects over plain TCP, discovering the Master first when the address is `auto`.
     async fn establish_tcp(&self) -> GridResult<(WorkerStreamMode, String)> {
         let mut target_addr = self.config.master_addr.clone();
+        #[cfg(feature = "p2p")]
+        let mut discovered_p2p_ticket: Option<String> = None;
         if target_addr.is_empty()
             || target_addr.eq_ignore_ascii_case("auto")
             || target_addr.starts_with("auto:")
@@ -3145,10 +3166,11 @@ impl WorkerClient {
             );
             // With a cluster secret only beacons signed for this probe are accepted, so a LAN
             // host that does not know the secret cannot steer the worker to itself.
-            match rusty_grid_core::discovery::discover_master_with_secret(
+            match rusty_grid_core::discovery::discover_master_with_secret_and_rendezvous(
                 Duration::from_secs(3),
                 disc_port,
                 self.config.cluster_secret.as_ref(),
+                self.config.rendezvous_url.as_deref(),
             )
             .await
             {
@@ -3156,8 +3178,12 @@ impl WorkerClient {
                     info!(
                         master = %beacon.cluster_addr,
                         hostname = %beacon.hostname,
-                        "Discovered active Master via UDP LAN beacon"
+                        "Discovered active Master via discovery"
                     );
+                    #[cfg(feature = "p2p")]
+                    {
+                        discovered_p2p_ticket = beacon.p2p_ticket.clone();
+                    }
                     *self.master_beacon.write().await = Some(beacon.clone());
                     target_addr = beacon.cluster_addr;
                 }
@@ -3177,13 +3203,38 @@ impl WorkerClient {
         }
 
         let connect_timeout = self.config.connect_timeout;
-        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&target_addr))
+        let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&target_addr))
             .await
-            .map_err(|_| GridError::Timeout {
-                operation: format!("tcp_connect {target_addr}"),
-                duration_secs: connect_timeout.as_secs(),
-            })?
-            .map_err(GridError::Io)?;
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(tcp_err)) => {
+                #[cfg(feature = "p2p")]
+                if let Some(ticket) = discovered_p2p_ticket.as_deref().filter(|t| !t.is_empty()) {
+                    info!(
+                        tcp_addr = %target_addr,
+                        error = %tcp_err,
+                        "TCP connect to discovered Master failed; falling back to discovered P2P ticket"
+                    );
+                    return self.establish_p2p_with_ticket(ticket).await;
+                }
+                return Err(GridError::Io(tcp_err));
+            }
+            Err(_) => {
+                #[cfg(feature = "p2p")]
+                if let Some(ticket) = discovered_p2p_ticket.as_deref().filter(|t| !t.is_empty()) {
+                    info!(
+                        tcp_addr = %target_addr,
+                        timeout_secs = connect_timeout.as_secs(),
+                        "TCP connect to discovered Master timed out; falling back to discovered P2P ticket"
+                    );
+                    return self.establish_p2p_with_ticket(ticket).await;
+                }
+                return Err(GridError::Timeout {
+                    operation: format!("tcp_connect {target_addr}"),
+                    duration_secs: connect_timeout.as_secs(),
+                });
+            }
+        };
         // TCP_NODELAY + keepalive: a Master that vanishes without a FIN (Wi-Fi drop, suspended
         // laptop) is noticed in about a minute instead of the OS default of hours.
         if let Err(e) = rusty_grid_core::transport::configure_tcp_stream(&stream) {

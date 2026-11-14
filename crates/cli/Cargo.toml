@@ -201,4 +201,8 @@ path = "../../tests/enroll_v3_e2e.rs"
 name = "cli_enroll_e2e"
 path = "../../tests/cli_enroll_e2e.rs"
 
+[[test]]
+name = "rendezvous_discovery_e2e"
+path = "../../tests/rendezvous_discovery_e2e.rs"
+
 

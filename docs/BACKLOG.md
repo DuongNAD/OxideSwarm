@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `8596c5fd`: 71 items Implemented, 7 Partial and 44 Planned. Five items
+On 2026-11-14, at `master` `321fe9b` plus FEAT-7: 72 items Implemented, 7 Partial and 43 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -215,7 +215,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
-| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
+| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented | (design 0066), (open) |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
@@ -2568,3 +2568,4 @@ Add one dated line per finished item, newest last.
   `681012d`: `crates/worker/src/client.rs` unit tests moved to `crates/worker/src/client/tests.rs`,
   8,252 to 4,363 lines); USB-1 lists merged pull requests 185, 195 and 207; and ENROLL-1b merged in
   pull request 201 (`8596c5fd`). The Index counts are now 71 Implemented, 7 Partial and 44 Planned.
+- 2026-11-14: Implemented FEAT-7 ([design 0066](design/0066-usable-rendezvous-discovery.md), open): standalone `oxideswarm rendezvous` HTTP registry on `:8090` with deterministic Ed25519 `lease_key` / `key_signature` multi-cluster slot isolation and `X-OxideSwarm-Lease-Auth` read authorization (`crates/master/src/rendezvous.rs`, `crates/core/src/discovery.rs`), MAC-covered `p2p_ticket` and P2P fallback when discovered TCP fails (`crates/worker/src/client.rs`, `crates/cli/src/connect.rs`), upfront `https://` rejection, `2 s` master registration retries (`crates/master/src/server.rs`), updated `README.md` / `CLAUDE.md` / `CHANGELOG.md`, and `tests/rendezvous_discovery_e2e.rs`. The Index counts are now 72 Implemented, 7 Partial and 43 Planned.
