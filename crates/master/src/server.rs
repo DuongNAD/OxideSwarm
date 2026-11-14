@@ -24,12 +24,12 @@ use rusty_grid_core::cluster_auth::{
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
 use rusty_grid_core::noise_auth::{
     master_noise_key_path, v3_server_confirm_first_record, v3_server_handshake_from_hello,
-    NodeKeypair, PublicKey,
+    AuthenticatedV3Peer, HandshakePurpose, NodeKeypair, PublicKey,
 };
 use rusty_grid_core::protocol::{
-    deserialize_message, format_incompatible_version_error, ClientMessage, ClientResponse,
-    EndpointRole, InboundMessage, ProtocolCapabilities, ProtocolError, PROTOCOL_VERSION_CURRENT,
-    WIRE_FORMAT_JSON,
+    deserialize_message, format_incompatible_version_error, is_protocol_version_compatible,
+    ClientMessage, ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities,
+    ProtocolError, PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
@@ -188,6 +188,12 @@ pub struct ServerConfig {
     pub auth_mode: AuthMode,
     /// Static X25519 key pair for OXS-AUTH v3 (`master_noise.key`).
     pub master_noise_key: Option<NodeKeypair>,
+    /// Optional path where `master_noise.key` is persisted before `CreateInvite` hands out the
+    /// master's v3 public key (when not already saved at startup).
+    pub master_noise_key_path: Option<PathBuf>,
+    /// Optional path to the local host's `node.key` to auto-enrol as `local-host` (`admin`) when
+    /// `CreateInvite` first persists `master_noise.key`.
+    pub local_node_key_path: Option<PathBuf>,
     /// Enrolled member list (`members.json`).
     pub members: Arc<MemberStore>,
     /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
@@ -245,6 +251,8 @@ impl Default for ServerConfig {
             session_resume_hold_explicit: false,
             auth_mode: AuthMode::default(),
             master_noise_key: None,
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::new(MemberStore::new()),
             members_explicit: false,
         }
@@ -533,6 +541,7 @@ impl ServerConfig {
     /// Sets the master authentication mode (`secret`, `members`, or `both`).
     pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
         self.auth_mode = mode;
+        self.members.set_auth_mode(mode);
         self
     }
 
@@ -542,8 +551,22 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the path where `master_noise.key` is persisted on demand (e.g. before `CreateInvite`).
+    pub fn with_master_noise_key_path(mut self, path: Option<PathBuf>) -> Self {
+        self.master_noise_key_path = path;
+        self
+    }
+
+    /// Sets the local host's `node.key` path to auto-enrol as `local-host` (`admin`) when OXS-AUTH
+    /// v3 persistence is triggered on demand.
+    pub fn with_local_node_key_path(mut self, path: Option<PathBuf>) -> Self {
+        self.local_node_key_path = path;
+        self
+    }
+
     /// Sets the enrolled member store for OXS-AUTH v3 handshakes.
     pub fn with_members(mut self, members: MemberStore) -> Self {
+        members.set_auth_mode(self.auth_mode);
         self.members = Arc::new(members);
         self.members_explicit = true;
         self
@@ -639,17 +662,28 @@ impl MasterServer {
             config.p2p_relay_url.as_deref(),
         )?;
 
-        if !config.members_explicit {
+        if !config.members_explicit && config.auth_mode.allows_members() {
             if let Some(ref state_dir) = config.state_dir {
                 config.members = Arc::new(MemberStore::load_from_dir(Some(state_dir))?);
             }
         }
-        if config.master_noise_key.is_none() {
+        config.members.set_auth_mode(config.auth_mode);
+        if config.master_noise_key_path.is_none()
+            && !config.ephemeral_key
+            && config.auth_mode.allows_members()
+        {
             if let Some(ref state_dir) = config.state_dir {
-                if !config.ephemeral_key {
-                    if let Some(key_path) = master_noise_key_path(Some(state_dir)) {
-                        let (kp, _) = NodeKeypair::load_or_generate_file(&key_path)?;
-                        config.master_noise_key = Some(kp);
+                config.master_noise_key_path = master_noise_key_path(Some(state_dir));
+            }
+        }
+        if config.master_noise_key.is_none() {
+            if config.auth_mode.allows_members() {
+                if let Some(ref state_dir) = config.state_dir {
+                    if !config.ephemeral_key {
+                        if let Some(key_path) = master_noise_key_path(Some(state_dir)) {
+                            let (kp, _) = NodeKeypair::load_or_generate_file(&key_path)?;
+                            config.master_noise_key = Some(kp);
+                        }
                     }
                 }
             }
@@ -893,6 +927,7 @@ impl MasterServer {
         sched_config: SchedulerConfig,
         reaper_config: ReaperConfig,
     ) -> GridResult<MasterHandle> {
+        sched_config.validate().map_err(GridError::Config)?;
         let registry = WorkerRegistry::new();
         let retry_policy = crate::queue::RetryPolicy {
             max_retries: config.max_retries,
@@ -999,15 +1034,8 @@ impl MasterServer {
             server.broadcast_tx = Some(b_tx.clone());
         }
 
-        // 1. Spawn TCP server accept loop
-        let srv_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = server.run(srv_shutdown_rx).await {
-                error!(error = %e, "Master server accept loop terminated with error");
-            }
-        });
-
-        // 2. Spawn Background Scheduler loop
+        // Build scheduler before starting accept loop so its SpeedBook is attached to `registry`
+        // before any worker connection is handled.
         let sched = Arc::new(
             WorkloadScheduler::new(
                 sched_config,
@@ -1017,6 +1045,16 @@ impl MasterServer {
             )
             .with_waiters(Arc::clone(&waiters)),
         );
+
+        // 1. Spawn TCP server accept loop
+        let srv_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.run(srv_shutdown_rx).await {
+                error!(error = %e, "Master server accept loop terminated with error");
+            }
+        });
+
+        // 2. Spawn Background Scheduler loop
         let mut sched_shutdown_rx = shutdown_rx.clone();
         #[cfg(feature = "dashboard")]
         let sched_broadcast_tx = broadcast_tx.clone();
@@ -1597,8 +1635,17 @@ impl MasterServer {
         let auth_ctx = MasterAuthContext {
             auth_mode: self.config.auth_mode,
             master_noise_key: self.config.master_noise_key.clone(),
+            master_noise_key_path: self.config.master_noise_key_path.clone(),
+            local_node_key_path: self.config.local_node_key_path.clone(),
+            ephemeral_without_state_dir: self.config.ephemeral_key
+                && self.config.state_dir.is_none(),
             members: Arc::clone(&self.config.members),
+            p2p_ticket: self.p2p_ticket.clone(),
+            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         };
+        if auth_ctx.auth_mode.allows_members() {
+            spawn_member_store_resync(Arc::clone(&auth_ctx.members), shutdown_rx.clone());
+        }
 
         #[cfg(feature = "p2p")]
         if let Some(endpoint) = self.p2p_endpoint {
@@ -1929,6 +1976,17 @@ impl MasterServer {
         }
 
         self.queue.close_and_compact_store().await;
+        if auth_ctx.auth_mode.allows_members() && auth_ctx.members.is_dirty() {
+            let members_for_shutdown = Arc::clone(&auth_ctx.members);
+            if let Err(e) =
+                run_member_store_blocking(move || members_for_shutdown.flush_dirty()).await
+            {
+                warn!(
+                    error = %e,
+                    "Failed to flush dirty members.json during master server shutdown"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -2522,6 +2580,13 @@ async fn apply_task_result_inner(
     //    input pins. When terminal, input pins are released and output pins stay held for
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
+        if !outcome.resumed_from_checkpoint {
+            if let Some(sb) = registry.speed_book() {
+                crate::speed::mutate_shared_speed_book(&sb, |book| {
+                    book.record_result(worker_id, outcome.task_key, outcome.timeout_secs, &result);
+                });
+            }
+        }
         if let Some(store) = blob_store {
             store.unpin_task(&task_id).await;
         }
@@ -3026,14 +3091,14 @@ pub async fn handle_worker_disconnect_with_broadcast(
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
-) {
+) -> bool {
     let unregistered = registry
         .unregister(worker_id, session_id)
         .await
         .unwrap_or(false);
     if !unregistered {
         debug!(worker_id = %worker_id, "Worker unregister skipped (stale session or already handled)");
-        return;
+        return false;
     }
     if let Some(sid) = session_id {
         queue.set_worker_session_resume_connected(*worker_id, sid, false);
@@ -3068,6 +3133,7 @@ pub async fn handle_worker_disconnect_with_broadcast(
         broadcast_tx,
     )
     .await;
+    true
 }
 
 /// Unregisters a worker session that announced a graceful drain (`WorkerMessage::Disconnecting`),
@@ -3363,6 +3429,8 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     waiters: WaiterMap,
     mapreduce_parallelism: usize,
     blob_store: Option<Arc<BlobStore>>,
+    auth_ctx: MasterAuthContext,
+    v3_peer: Option<AuthenticatedV3Peer>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -3371,6 +3439,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     >,
 ) -> GridResult<()> {
     let mut next_msg = Some(first_msg);
+    let mut first_iteration = true;
     // Uploads this connection leaves unfinished are dropped when it ends.
     let uploads = blob_store
         .as_ref()
@@ -3431,6 +3500,37 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
             while !blob_pipeline.is_empty() {
                 let reply = blob_pipeline.next_reply().await;
                 send_client_response(&mut transport, &ClientResponse::BlobReply { reply }).await?;
+            }
+        }
+
+        let is_first = std::mem::replace(&mut first_iteration, false);
+        if let Some(ref peer) = v3_peer {
+            match peer.purpose {
+                HandshakePurpose::Enroll => {
+                    if !is_first || !matches!(msg, ClientMessage::Enroll { .. }) {
+                        warn!(
+                            member_id = %peer.member_id,
+                            "Refusing non-Enroll message on OXS-AUTH v3 enroll connection"
+                        );
+                        break;
+                    }
+                }
+                HandshakePurpose::Member => {
+                    auth_ctx.members.touch_last_seen(&peer.public_key);
+                    if let Err((log_msg, wire_reason)) =
+                        check_v3_client_message_role(&auth_ctx, &peer.public_key, &msg)
+                    {
+                        warn!(member_id = %peer.member_id, "{log_msg}");
+                        send_client_response(
+                            &mut transport,
+                            &ClientResponse::Error {
+                                message: format!("Authentication failed: {wire_reason}"),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -3663,17 +3763,1068 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     blob_pipeline.push_ready(reply);
                 }
             },
+            ClientMessage::Enroll {
+                invite_id,
+                proof,
+                name,
+                os,
+                arch,
+            } => {
+                handle_enroll_connection(
+                    &mut transport,
+                    v3_peer.as_ref(),
+                    &auth_ctx,
+                    &registry,
+                    &queue,
+                    &scheduler_notify,
+                    &waiters,
+                    #[cfg(feature = "dashboard")]
+                    broadcast_tx.as_ref(),
+                    &invite_id,
+                    &proof,
+                    name,
+                    os,
+                    arch,
+                )
+                .await;
+                break;
+            }
+            msg @ (ClientMessage::CreateInvite { .. }
+            | ClientMessage::ListInvites
+            | ClientMessage::RevokeInvite { .. }
+            | ClientMessage::ListMembers
+            | ClientMessage::ListPendingEnrollments
+            | ClientMessage::ApproveEnrollment { .. }
+            | ClientMessage::RejectEnrollment { .. }
+            | ClientMessage::RevokeMember { .. }
+            | ClientMessage::RenameMember { .. }
+            | ClientMessage::ReleaseWorkerId { .. }) => {
+                handle_member_admin_message(
+                    &mut transport,
+                    msg,
+                    &auth_ctx,
+                    v3_peer.as_ref(),
+                    &registry,
+                    &queue,
+                    &scheduler_notify,
+                    &waiters,
+                    #[cfg(feature = "dashboard")]
+                    broadcast_tx.as_ref(),
+                )
+                .await?;
+            }
         }
     }
 
     Ok(())
 }
 
-#[derive(Clone, Default)]
+const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
+
+/// How often the master retries flushing `members.json` when an earlier rollback, resync, or
+/// bookkeeping write failed (`S1`, `NIT 2`).
+const MEMBER_STORE_RESYNC_INTERVAL: Duration = Duration::from_secs(2);
+
+async fn run_member_store_blocking<T, F>(f: F) -> GridResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> GridResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| GridError::Config(format!("member store task panicked: {e}")))?
+}
+
+fn spawn_member_store_resync(members: Arc<MemberStore>, mut shutdown_rx: watch::Receiver<bool>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MEMBER_STORE_RESYNC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if members.is_dirty() {
+                        let m = Arc::clone(&members);
+                        match run_member_store_blocking(move || m.flush_dirty()).await {
+                            Ok(()) => {
+                                info!("Flushed previously failed members.json update to disk");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Periodic retry failed to flush dirty members.json"
+                                );
+                            }
+                        }
+                    }
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rollback_enrollment_and_disconnect_workers(
+    auth_ctx: &MasterAuthContext,
+    rollback: members::ApprovedEnrollmentRollback,
+    disconnect_reason: &str,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) {
+    let member_id = rollback.member_id.clone();
+    let pubkey = rollback.public_key;
+    let members_store = auth_ctx.members.clone();
+    let released_claims = match run_member_store_blocking(move || {
+        members_store.rollback_approved_enrollment(rollback)
+    })
+    .await
+    {
+        Ok(claims) => claims,
+        Err(e) => {
+            warn!(
+                member_id = %member_id,
+                error = %e,
+                "Failed to persist rollback of unconfirmed OXS-AUTH v3 enrollment"
+            );
+            Vec::new()
+        }
+    };
+    let still_has_worker_role = auth_ctx
+        .members
+        .get(&pubkey)
+        .is_some_and(|m| m.has_worker_role());
+    if !still_has_worker_role {
+        let mut wids = released_claims;
+        for wid in registry.release_workers_owned_by(&member_id).await {
+            if !wids.contains(&wid) {
+                wids.push(wid);
+            }
+        }
+        for wid in &wids {
+            registry.release_worker_owner(wid).await;
+            let _ = handle_worker_disconnect_with_broadcast(
+                registry,
+                queue,
+                scheduler_notify,
+                Some(waiters),
+                wid,
+                None,
+                disconnect_reason,
+                true,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_enroll_connection<S>(
+    transport: &mut MessageTransport<S>,
+    v3_peer: Option<&AuthenticatedV3Peer>,
+    auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+    invite_id: &str,
+    proof: &rusty_grid_core::noise_auth::RedactedBytes32,
+    name: String,
+    os: String,
+    arch: String,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Some(peer) = v3_peer else {
+        let _ = send_client_response(
+            transport,
+            &ClientResponse::EnrollRejected {
+                message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
+            },
+        )
+        .await;
+        return;
+    };
+    if peer.purpose != HandshakePurpose::Enroll {
+        let _ = send_client_response(
+            transport,
+            &ClientResponse::EnrollRejected {
+                message: "ENROLL requires an OXS-AUTH v3 enroll handshake".into(),
+            },
+        )
+        .await;
+        return;
+    }
+    let members_store = auth_ctx.members.clone();
+    let peer_pk = peer.public_key;
+    let hh_bytes = *peer.handshake_hash.as_bytes();
+    let master_fp = peer.master_fingerprint.clone();
+    let remote_addr = peer.remote_addr.clone();
+    let invite_id_owned = invite_id.to_string();
+    let proof_owned = *proof;
+    match run_member_store_blocking(move || {
+        members_store.handle_enroll_request(
+            peer_pk,
+            &hh_bytes,
+            &master_fp,
+            &remote_addr,
+            &invite_id_owned,
+            &proof_owned,
+            name,
+            os,
+            arch,
+        )
+    })
+    .await
+    {
+        Ok(members::EnrollOutcome::Rejected {
+            log_reason,
+            wire_message,
+        }) => {
+            warn!(
+                member_id = %peer.member_id,
+                reason = %log_reason,
+                "Refusing v3 enrollment request"
+            );
+            let _ = send_client_response(
+                transport,
+                &ClientResponse::EnrollRejected {
+                    message: wire_message,
+                },
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+        Ok(members::EnrollOutcome::ImmediateApproved { member_id, roles }) => {
+            info!(
+                member_id = %member_id,
+                ?roles,
+                "Enrolled v3 member (--no-approval)"
+            );
+            let _ = send_client_response(transport, &ClientResponse::Enrolled { member_id, roles })
+                .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+        Ok(members::EnrollOutcome::Pending {
+            pending_id,
+            decision_rx,
+        }) => {
+            wait_for_pending_enrollment(
+                transport,
+                auth_ctx,
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+                &peer.member_id,
+                pending_id,
+                decision_rx,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                member_id = %peer.member_id,
+                error = %e,
+                "Failed to process v3 enrollment request"
+            );
+            let _ = send_client_response(
+                transport,
+                &ClientResponse::EnrollRejected {
+                    message: members::GENERIC_ENROLL_REJECT_MESSAGE.to_string(),
+                },
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                REFUSAL_DRAIN_TIMEOUT,
+                transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME),
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_pending_enrollment<S>(
+    transport: &mut MessageTransport<S>,
+    auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+    member_id: &str,
+    pending_id: String,
+    mut decision_rx: tokio::sync::oneshot::Receiver<members::PendingDecision>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    info!(
+        pending_id = %pending_id,
+        member_id = %member_id,
+        "Queued v3 enrollment request for admin approval"
+    );
+    let mut decision_consumed = false;
+    if send_client_response(
+        transport,
+        &ClientResponse::EnrollPending {
+            pending_id: pending_id.clone(),
+        },
+    )
+    .await
+    .is_ok()
+    {
+        let enroll_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(members::PENDING_ENROLLMENT_TTL_SECS);
+        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive_interval.tick().await;
+        loop {
+            tokio::select! {
+                dec = &mut decision_rx => {
+                    decision_consumed = true;
+                    match dec {
+                        Ok(members::PendingDecision::Approved {
+                            member_id,
+                            roles,
+                            rollback,
+                        }) => {
+                            info!(
+                                pending_id = %pending_id,
+                                member_id = %member_id,
+                                ?roles,
+                                "Admin approved pending v3 enrollment; waiting for joining machine confirmation"
+                            );
+                            if send_client_response(
+                                transport,
+                                &ClientResponse::Enrolled {
+                                    member_id: member_id.clone(),
+                                    roles,
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                info!(
+                                    pending_id = %pending_id,
+                                    member_id = %member_id,
+                                    "Joining machine disconnected while sending Enrolled; rolling back enrollment"
+                                );
+                                rollback_enrollment_and_disconnect_workers(
+                                    auth_ctx,
+                                    *rollback,
+                                    "Enrollment confirmation declined by joining machine",
+                                    registry,
+                                    queue,
+                                    scheduler_notify,
+                                    waiters,
+                                    #[cfg(feature = "dashboard")]
+                                    broadcast_tx,
+                                )
+                                .await;
+                                break;
+                            }
+                            let confirm_deadline =
+                                tokio::time::Instant::now() + auth_ctx.enroll_confirm_timeout;
+                            let confirm_res = tokio::time::timeout_at(
+                                confirm_deadline,
+                                transport.recv_msg::<ClientMessage>(),
+                            )
+                            .await;
+                            match confirm_res {
+                                Ok(Ok(Some(ClientMessage::Hello))) => {
+                                    let members_store = auth_ctx.members.clone();
+                                    let rollback_to_confirm = *rollback;
+                                    let _ = run_member_store_blocking(move || {
+                                        members_store
+                                            .confirm_approved_enrollment(&rollback_to_confirm);
+                                        Ok(())
+                                    })
+                                    .await;
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        "Joining machine confirmed v3 enrollment"
+                                    );
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::Hello {
+                                            min_compatible_version:
+                                                rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        timeout_secs = auth_ctx.enroll_confirm_timeout.as_secs(),
+                                        "Enrollment confirmation timed out after approval; rolling back enrollment"
+                                    );
+                                    rollback_enrollment_and_disconnect_workers(
+                                        auth_ctx,
+                                        *rollback,
+                                        "Enrollment confirmation timed out",
+                                        registry,
+                                        queue,
+                                        scheduler_notify,
+                                        waiters,
+                                        #[cfg(feature = "dashboard")]
+                                        broadcast_tx,
+                                    )
+                                    .await;
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::EnrollRejected {
+                                            message: "enrollment confirmation timed out".into(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Ok(_) => {
+                                    info!(
+                                        pending_id = %pending_id,
+                                        member_id = %member_id,
+                                        "Joining machine declined confirmation or disconnected after approval; rolling back enrollment"
+                                    );
+                                    rollback_enrollment_and_disconnect_workers(
+                                        auth_ctx,
+                                        *rollback,
+                                        "Enrollment confirmation declined by joining machine",
+                                        registry,
+                                        queue,
+                                        scheduler_notify,
+                                        waiters,
+                                        #[cfg(feature = "dashboard")]
+                                        broadcast_tx,
+                                    )
+                                    .await;
+                                    let _ = send_client_response(
+                                        transport,
+                                        &ClientResponse::EnrollRejected {
+                                            message: "enrollment cancelled by joining machine".into(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Ok(members::PendingDecision::Rejected { message }) => {
+                            info!(
+                                pending_id = %pending_id,
+                                "Admin rejected pending v3 enrollment"
+                            );
+                            let _ = send_client_response(
+                                transport,
+                                &ClientResponse::EnrollRejected { message },
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            let _ = send_client_response(
+                                transport,
+                                &ClientResponse::EnrollRejected {
+                                    message: "enrollment request was closed".into(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    let _ = tokio::time::timeout(
+                        REFUSAL_DRAIN_TIMEOUT,
+                        transport.recv_raw_frame_max(
+                            rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
+                        ),
+                    )
+                    .await;
+                    break;
+                }
+                _ = keepalive_interval.tick() => {
+                    if send_client_response(
+                        transport,
+                        &ClientResponse::EnrollKeepalive,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        debug!(
+                            pending_id = %pending_id,
+                            "Pending enrollment peer disconnected during keepalive"
+                        );
+                        break;
+                    }
+                }
+                peer_frame = transport.recv_raw_frame_max(rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME) => {
+                    match peer_frame {
+                        Ok(None) | Err(_) => {
+                            debug!(
+                                pending_id = %pending_id,
+                                "Pending enrollment peer closed connection before approval; dropping pending entry"
+                            );
+                        }
+                        Ok(Some(_)) => {
+                            warn!(
+                                pending_id = %pending_id,
+                                "Pending enrollment peer sent unexpected frame while waiting for approval; dropping pending entry"
+                            );
+                        }
+                    }
+                    break;
+                }
+                _ = tokio::time::sleep_until(enroll_deadline) => {
+                    info!(
+                        pending_id = %pending_id,
+                        "Pending enrollment timed out waiting for admin approval"
+                    );
+                    decision_rx.close();
+                    auth_ctx.members.remove_pending(&pending_id);
+                    if let Ok(members::PendingDecision::Approved { rollback, .. }) =
+                        decision_rx.try_recv()
+                    {
+                        decision_consumed = true;
+                        rollback_enrollment_and_disconnect_workers(
+                            auth_ctx,
+                            *rollback,
+                            "Enrollment request timed out before confirmation",
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            waiters,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                        )
+                        .await;
+                    }
+                    let _ = send_client_response(
+                        transport,
+                        &ClientResponse::EnrollRejected {
+                            message: "enrollment request timed out waiting for approval".into(),
+                        },
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        REFUSAL_DRAIN_TIMEOUT,
+                        transport.recv_raw_frame_max(
+                            rusty_grid_core::cluster_auth::PRE_AUTH_MAX_FRAME,
+                        ),
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    }
+    if !decision_consumed {
+        decision_rx.close();
+    }
+    auth_ctx.members.remove_pending(&pending_id);
+    if !decision_consumed {
+        if let Ok(members::PendingDecision::Approved { rollback, .. }) = decision_rx.try_recv() {
+            info!(
+                pending_id = %pending_id,
+                member_id = %member_id,
+                "Pending enrollment disconnected concurrently with admin approval; rolling back unconfirmed enrollment"
+            );
+            rollback_enrollment_and_disconnect_workers(
+                auth_ctx,
+                *rollback,
+                "Enrollment confirmation declined by joining machine",
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_member_admin_message<S>(
+    transport: &mut MessageTransport<S>,
+    msg: ClientMessage,
+    auth_ctx: &MasterAuthContext,
+    v3_peer: Option<&AuthenticatedV3Peer>,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &Arc<tokio::sync::Notify>,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) -> GridResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let is_v3_admin = v3_peer.is_some_and(|peer| {
+        peer.purpose == HandshakePurpose::Member
+            && auth_ctx
+                .members
+                .get(&peer.public_key)
+                .is_some_and(|m| m.has_admin_role())
+    });
+    let is_v2_authenticated = v3_peer.is_none() && transport.is_encrypted();
+    if !is_v3_admin && !is_v2_authenticated {
+        send_client_response(
+            transport,
+            &ClientResponse::Error {
+                message: "Authentication failed: member and invite administration requires cluster secret (v2) or admin member (v3) authentication (run `oxideswarm secret generate` or start the master with `--auth members`)".into(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    match msg {
+        ClientMessage::CreateInvite {
+            roles,
+            max_uses,
+            expires_in_secs,
+            require_approval,
+        } => {
+            if !auth_ctx.auth_mode.allows_members() {
+                send_client_response(
+                    transport,
+                    &ClientResponse::Error {
+                        message:
+                            "cannot create an invite when the master is configured with --auth secret"
+                                .into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            let auth_ctx_cloned = auth_ctx.clone();
+            let create_res = run_member_store_blocking(move || {
+                let pk = auth_ctx_cloned.ensure_v3_key_persisted()?;
+                let rec = auth_ctx_cloned.members.create_invite(
+                    roles,
+                    max_uses,
+                    expires_in_secs,
+                    require_approval,
+                )?;
+                Ok((pk, rec))
+            })
+            .await;
+            match create_res {
+                Ok((master_key_pub, rec)) => {
+                    info!(
+                        invite_id = %rec.invite_id,
+                        roles = ?rec.roles,
+                        max_uses = rec.max_uses,
+                        expires_at = rec.expires_at,
+                        require_approval = rec.require_approval,
+                        "Created cluster invite"
+                    );
+                    let resp = ClientResponse::InviteCreated {
+                        invite_id: rec.invite_id,
+                        invite_secret: rec.invite_secret,
+                        roles: rec.roles,
+                        max_uses: rec.max_uses,
+                        expires_at: rec.expires_at,
+                        require_approval: rec.require_approval,
+                        master_key: master_key_pub,
+                        p2p_ticket: auth_ctx.p2p_ticket.clone(),
+                    };
+                    send_client_response(transport, &resp).await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ListInvites => {
+            let invites = auth_ctx.members.list_invites();
+            send_client_response(transport, &ClientResponse::InvitesList { invites }).await?;
+        }
+        ClientMessage::RevokeInvite { invite_id } => {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.revoke_invite(&invite_id)).await {
+                Ok(resolved_id) => {
+                    info!(invite_id = %resolved_id, "Revoked cluster invite");
+                    send_client_response(
+                        transport,
+                        &ClientResponse::InviteRevoked {
+                            invite_id: resolved_id,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ListMembers => {
+            let members = auth_ctx.members.list_members();
+            send_client_response(transport, &ClientResponse::MembersList { members }).await?;
+        }
+        ClientMessage::ListPendingEnrollments => {
+            let pending = auth_ctx.members.list_pending();
+            send_client_response(
+                transport,
+                &ClientResponse::PendingEnrollmentsList { pending },
+            )
+            .await?;
+        }
+        ClientMessage::ApproveEnrollment {
+            pending_id,
+            pairing_code,
+        } => {
+            let members_store = auth_ctx.members.clone();
+            let pid_clone = pending_id.clone();
+            match run_member_store_blocking(move || {
+                members_store.approve_pending(&pid_clone, pairing_code.as_str())
+            })
+            .await
+            {
+                Ok(entry) => {
+                    info!(
+                        pending_id = %pending_id,
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        roles = ?entry.roles,
+                        "Approved pending member enrollment"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::EnrollmentApproved {
+                            pending_id,
+                            member_id: entry.id,
+                            name: entry.name,
+                            roles: entry.roles,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RejectEnrollment { pending_id } => {
+            match auth_ctx.members.reject_pending(&pending_id) {
+                Ok(resolved_id) => {
+                    info!(pending_id = %resolved_id, "Rejected pending member enrollment");
+                    send_client_response(
+                        transport,
+                        &ClientResponse::EnrollmentRejected {
+                            pending_id: resolved_id,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RevokeMember { target } => {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.revoke_member(&target)).await {
+                Ok((entry, owned_workers)) => {
+                    let mut disconnected_sessions = 0usize;
+                    for wid in &owned_workers {
+                        registry.release_worker_owner(wid).await;
+                        if handle_worker_disconnect_with_broadcast(
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            Some(waiters),
+                            wid,
+                            None,
+                            "Member revoked by admin",
+                            true,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                        )
+                        .await
+                        {
+                            disconnected_sessions += 1;
+                        }
+                    }
+                    info!(
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        disconnected_sessions,
+                        "Revoked cluster member"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::MemberRevoked {
+                            member_id: entry.id,
+                            disconnected_sessions,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::RenameMember { target, new_name } => {
+            let members_store = auth_ctx.members.clone();
+            match run_member_store_blocking(move || members_store.rename_member(&target, &new_name))
+                .await
+            {
+                Ok(entry) => {
+                    info!(
+                        member_id = %entry.id,
+                        name = %entry.name,
+                        "Renamed cluster member"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::MemberRenamed {
+                            member_id: entry.id,
+                            name: entry.name,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ReleaseWorkerId { worker_id } => {
+            match registry
+                .release_non_live_worker_id(worker_id, &auth_ctx.members)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        worker_id = %worker_id,
+                        "Released non-live worker_id claim"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::WorkerIdReleased { worker_id },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    warn!(
+                        worker_id = %worker_id,
+                        error = %e,
+                        "Failed to release non-live worker_id claim"
+                    );
+                    send_client_response(
+                        transport,
+                        &ClientResponse::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => unreachable!("non-admin ClientMessage passed to handle_member_admin_message"),
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
 pub(crate) struct MasterAuthContext {
     pub auth_mode: AuthMode,
     pub master_noise_key: Option<NodeKeypair>,
+    pub master_noise_key_path: Option<PathBuf>,
+    pub local_node_key_path: Option<PathBuf>,
+    pub ephemeral_without_state_dir: bool,
     pub members: Arc<MemberStore>,
+    pub p2p_ticket: Option<String>,
+    pub enroll_confirm_timeout: Duration,
+}
+
+impl Default for MasterAuthContext {
+    fn default() -> Self {
+        Self {
+            auth_mode: AuthMode::default(),
+            master_noise_key: None,
+            master_noise_key_path: None,
+            local_node_key_path: None,
+            ephemeral_without_state_dir: false,
+            members: Arc::default(),
+            p2p_ticket: None,
+            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl MasterAuthContext {
+    /// Ensures `master_noise.key` is persisted on disk and the local host `node.key` is enrolled as
+    /// `local-host` (`admin`) before `CreateInvite` hands out the master's v3 public key.
+    pub fn ensure_v3_key_persisted(&self) -> GridResult<PublicKey> {
+        let Some(ref master_key) = self.master_noise_key else {
+            return Err(GridError::Config(
+                "Master has no OXS-AUTH v3 key (master_noise.key) configured".into(),
+            ));
+        };
+        if self.ephemeral_without_state_dir
+            || (self.members.has_save_path() && self.master_noise_key_path.is_none())
+        {
+            return Err(GridError::Config(
+                "cannot create an invite when the master is running with --ephemeral-key and no --state-dir".into(),
+            ));
+        }
+        if let Some(ref key_path) = self.master_noise_key_path {
+            if key_path.is_file() {
+                let existing = NodeKeypair::load_file(key_path)?;
+                if existing.public_key() != master_key.public_key() {
+                    return Err(GridError::Config(format!(
+                        "existing master_noise.key at '{}' has a different public key ({}) than the running master ({}); restart the master so it uses the key on disk",
+                        key_path.display(),
+                        existing.public_key().fingerprint(),
+                        master_key.public_key().fingerprint(),
+                    )));
+                }
+            } else {
+                master_key.save_file(key_path, false)?;
+            }
+            if !self.members.has_save_path() {
+                if let Some(dir) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    self.members
+                        .set_save_path(Some(dir.join(members::MEMBERS_FILE_NAME)));
+                }
+            }
+        }
+        if let Some(ref node_key_path) = self.local_node_key_path {
+            let (host_node_kp, _) = NodeKeypair::load_or_generate_file(node_key_path)?;
+            self.members
+                .ensure_local_host_admin(*host_node_kp.public_key(), "local-host", true)?;
+        }
+        Ok(*master_key.public_key())
+    }
+}
+
+fn check_v3_client_message_role(
+    auth_ctx: &MasterAuthContext,
+    public_key: &PublicKey,
+    msg: &ClientMessage,
+) -> Result<(), (&'static str, String)> {
+    let Some(member) = auth_ctx.members.get(public_key) else {
+        return Err((
+            "Refusing client message from un-enrolled or revoked v3 member",
+            "member is no longer enrolled".to_string(),
+        ));
+    };
+    match msg {
+        ClientMessage::Hello
+        | ClientMessage::ClusterStatus
+        | ClientMessage::ListWorkers
+        | ClientMessage::ListWorkspaces => {
+            if member.has_any_role() {
+                Ok(())
+            } else {
+                Err((
+                    "Refusing client connection from v3 member with no roles",
+                    "member has no roles".to_string(),
+                ))
+            }
+        }
+        ClientMessage::SubmitTask { .. }
+        | ClientMessage::GetTaskStatus { .. }
+        | ClientMessage::CancelTask { .. }
+        | ClientMessage::SubmitMapReduce { .. }
+        | ClientMessage::GetTaskResult { .. }
+        | ClientMessage::BlobRequest { .. } => {
+            if member.has_client_role() {
+                Ok(())
+            } else {
+                Err((
+                    "Refusing client connection from v3 member without the client role",
+                    "member does not have the client role".to_string(),
+                ))
+            }
+        }
+        ClientMessage::CreateInvite { .. }
+        | ClientMessage::ListInvites
+        | ClientMessage::RevokeInvite { .. }
+        | ClientMessage::ListMembers
+        | ClientMessage::ListPendingEnrollments
+        | ClientMessage::ApproveEnrollment { .. }
+        | ClientMessage::RejectEnrollment { .. }
+        | ClientMessage::RevokeMember { .. }
+        | ClientMessage::RenameMember { .. }
+        | ClientMessage::ReleaseWorkerId { .. } => {
+            if member.has_admin_role() {
+                Ok(())
+            } else {
+                Err((
+                    "Refusing admin command from v3 member without the admin role",
+                    "member does not have the admin role".to_string(),
+                ))
+            }
+        }
+        ClientMessage::Enroll { .. } => Err((
+            "Refusing ClientMessage::Enroll on a member session",
+            "ClientMessage::Enroll requires an enroll handshake".to_string(),
+        )),
+    }
 }
 
 async fn run_v3_auth_from_hello<S>(
@@ -3684,7 +4835,7 @@ async fn run_v3_auth_from_hello<S>(
     auth_ctx: &MasterAuthContext,
     deadline: tokio::time::Instant,
     handshake_timeout: Duration,
-) -> GridResult<(InboundMessage, WireCodec)>
+) -> GridResult<(InboundMessage, WireCodec, Option<AuthenticatedV3Peer>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -3744,7 +4895,7 @@ where
         }
     };
 
-    let (auth_peer, first_msg, codec) = match tokio::time::timeout_at(
+    let (mut auth_peer, first_msg, codec) = match tokio::time::timeout_at(
         deadline,
         v3_server_confirm_first_record::<_, InboundMessage>(transport, pending),
     )
@@ -3782,15 +4933,42 @@ where
         }
     };
 
+    auth_peer.remote_addr = peer.to_string();
+
     debug!(
         remote = %peer,
         lane,
         member_id = %auth_peer.member_id,
+        purpose = ?auth_peer.purpose,
         "Peer authenticated with OXS-AUTH v3 (Noise IK)"
     );
 
+    if auth_peer.purpose == HandshakePurpose::Enroll {
+        if !matches!(
+            first_msg,
+            InboundMessage::Client(ClientMessage::Enroll { .. })
+        ) {
+            let reason = "enroll handshake may only send ClientMessage::Enroll".to_string();
+            warn!(
+                remote = %peer,
+                lane,
+                member_id = %auth_peer.member_id,
+                "Refusing non-Enroll first message on OXS-AUTH v3 enroll handshake"
+            );
+            return Err(GridError::AuthFailed(reason));
+        }
+        return Ok((first_msg, codec, Some(auth_peer)));
+    }
+
+    auth_ctx.members.touch_last_seen(&auth_peer.public_key);
+
     match &first_msg {
-        InboundMessage::Worker(WorkerMessage::Register { worker_id, .. }) => {
+        InboundMessage::Worker(WorkerMessage::Register {
+            worker_id,
+            capabilities,
+            protocol_version,
+            ..
+        }) => {
             let has_worker_role = auth_ctx
                 .members
                 .get(&auth_peer.public_key)
@@ -3820,6 +4998,39 @@ where
                         .await;
                 return Err(GridError::AuthFailed(reason));
             }
+            if is_protocol_version_compatible(*protocol_version) && capabilities.cpu_cores > 0 {
+                if let Err(err) = auth_ctx
+                    .members
+                    .check_worker_id_owner(*worker_id, Some(&auth_peer.member_id))
+                {
+                    let reason = err.to_string();
+                    warn!(
+                        remote = %peer,
+                        lane,
+                        member_id = %auth_peer.member_id,
+                        worker_id = %worker_id,
+                        error = %reason,
+                        "Refusing Register from v3 member for worker_id owned by another member"
+                    );
+                    if codec == WireCodec::Json {
+                        transport.set_outbound_codec(WireCodec::Json);
+                    }
+                    let reject_ack = MasterMessage::RegisterAck {
+                        accepted: false,
+                        worker_id: *worker_id,
+                        heartbeat_interval_secs: 0,
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features: ProtocolCapabilities::empty(),
+                        message: Some(reason),
+                    };
+                    let _ = tokio::time::timeout(
+                        REFUSAL_DRAIN_TIMEOUT,
+                        transport.send_msg(&reject_ack),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         }
         InboundMessage::Worker(_) => {
             let has_worker_role = auth_ctx
@@ -3837,33 +5048,30 @@ where
                 return Err(GridError::AuthFailed(reason));
             }
         }
-        InboundMessage::Client(_) => {
-            let has_client_role = auth_ctx
-                .members
-                .get(&auth_peer.public_key)
-                .is_some_and(|m| m.has_client_role());
-            if !has_client_role {
-                let reason = "member does not have the client role".to_string();
+        InboundMessage::Client(client_msg) => {
+            if let Err((log_msg, wire_reason)) =
+                check_v3_client_message_role(auth_ctx, &auth_peer.public_key, client_msg)
+            {
                 warn!(
                     remote = %peer,
                     lane,
                     member_id = %auth_peer.member_id,
-                    "Refusing client connection from v3 member without the client role"
+                    "{log_msg}"
                 );
                 if codec == WireCodec::Json {
                     transport.set_outbound_codec(WireCodec::Json);
                 }
                 let err_resp = ClientResponse::Error {
-                    message: format!("Authentication failed: {reason}"),
+                    message: format!("Authentication failed: {wire_reason}"),
                 };
                 let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp))
                     .await;
-                return Err(GridError::AuthFailed(reason));
+                return Err(GridError::AuthFailed(wire_reason));
             }
         }
     }
 
-    Ok((first_msg, codec))
+    Ok((first_msg, codec, Some(auth_peer)))
 }
 
 /// Authenticates a freshly accepted peer and reads its first protocol message, all inside one
@@ -3886,7 +5094,7 @@ pub(crate) async fn authenticate_and_read_first_message<S>(
     auth_ctx: &MasterAuthContext,
     handshake_timeout: Duration,
     lane: &str,
-) -> GridResult<(InboundMessage, WireCodec)>
+) -> GridResult<(InboundMessage, WireCodec, Option<AuthenticatedV3Peer>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -3902,7 +5110,7 @@ where
     };
     let requires_auth = effective_secret.is_some()
         || auth_ctx.auth_mode == AuthMode::Members
-        || (auth_ctx.auth_mode.allows_members() && !auth_ctx.members.is_empty());
+        || (auth_ctx.auth_mode.allows_members() && auth_ctx.members.has_non_host_members());
 
     if requires_auth {
         let hello_frame = match tokio::time::timeout_at(deadline, recv_auth_frame(transport)).await
@@ -4025,7 +5233,7 @@ where
         match tokio::time::timeout_at(deadline, transport.recv_msg_with_codec::<InboundMessage>())
             .await
         {
-            Ok(Ok(Some(first))) => Ok(first),
+            Ok(Ok(Some((first, codec)))) => Ok((first, codec, None)),
             Ok(Ok(None)) => {
                 debug!(remote = %peer, lane, "Peer closed connection before handshake");
                 Err(GridError::ConnectionClosed)
@@ -4101,7 +5309,7 @@ where
         }
 
         match deserialize_message::<InboundMessage>(&raw_frame) {
-            Ok(first) => Ok(first),
+            Ok((first, codec)) => Ok((first, codec, None)),
             Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
                 let message = format_incompatible_version_error("client", peer_version);
                 warn!(
@@ -4762,6 +5970,14 @@ impl MasterHandle {
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
         self.queue.close_and_compact_store_sync();
+        if self.auth_mode.allows_members() && self.members.is_dirty() {
+            if let Err(e) = self.members.flush_dirty() {
+                warn!(
+                    error = %e,
+                    "Failed to flush dirty members.json on shutdown"
+                );
+            }
+        }
         self.shutdown_tx
             .send(true)
             .map_err(|_| GridError::ConnectionClosed)
@@ -8477,7 +9693,11 @@ mod tests {
         let ctx_both = MasterAuthContext {
             auth_mode: AuthMode::Both,
             master_noise_key: Some(master_kp.clone()),
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::clone(&members),
+            p2p_ticket: None,
+            ..Default::default()
         };
         let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
         let client_pub = *master_kp.public_key();
@@ -8523,7 +9743,39 @@ mod tests {
             other => panic!("expected rejected RegisterAck, got: {other:?}"),
         }
 
-        // 1b. v3 peer without the `client` (or `admin`) role cannot open a client session.
+        // 1b. v3 peer with `worker` role is allowed read-only `ListWorkers`, but refused on
+        //     `CancelTask` (requires `client`), while `client`-only is refused on `ListMembers`
+        //     (requires `admin`).
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let client_pub = *master_kp.public_key();
+        let worker_only = worker_kp.clone();
+        let worker_ro_task = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            let sk =
+                v3_client_handshake(&mut t, &worker_only, &client_pub, HandshakePurpose::Member)
+                    .await
+                    .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::ListWorkers).await.unwrap();
+        });
+        let mut st = MessageTransport::new(s_stream);
+        let (first_msg, _, v3_peer) = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50002",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
+        .await
+        .expect("worker-only member must be allowed read-only ListWorkers");
+        assert!(matches!(
+            first_msg,
+            InboundMessage::Client(ClientMessage::ListWorkers)
+        ));
+        assert!(v3_peer.is_some());
+        worker_ro_task.await.unwrap();
+
         let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
         let client_pub = *master_kp.public_key();
         let worker_only = worker_kp.clone();
@@ -8534,14 +9786,18 @@ mod tests {
                     .await
                     .unwrap();
             t.enable_encryption(&sk, EndpointRole::Client);
-            t.send_msg(&ClientMessage::Hello).await.unwrap();
+            t.send_msg(&ClientMessage::CancelTask {
+                task_id: TaskId::new(),
+            })
+            .await
+            .unwrap();
             t.recv_msg::<ClientResponse>().await.unwrap()
         });
 
         let mut st = MessageTransport::new(s_stream);
         let server_res = authenticate_and_read_first_message(
             &mut st,
-            "127.0.0.1:50002",
+            "127.0.0.1:50003",
             Some(&secret),
             &ctx_both,
             Duration::from_secs(5),
@@ -8561,11 +9817,52 @@ mod tests {
             other => panic!("expected ClientResponse::Error, got: {other:?}"),
         }
 
+        let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
+        let client_pub = *master_kp.public_key();
+        let client_only = client_only_kp.clone();
+        let client_as_admin_task = tokio::spawn(async move {
+            let mut t = MessageTransport::new(c_stream);
+            let sk =
+                v3_client_handshake(&mut t, &client_only, &client_pub, HandshakePurpose::Member)
+                    .await
+                    .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::ListMembers).await.unwrap();
+            t.recv_msg::<ClientResponse>().await.unwrap()
+        });
+
+        let mut st = MessageTransport::new(s_stream);
+        let server_res = authenticate_and_read_first_message(
+            &mut st,
+            "127.0.0.1:50004",
+            Some(&secret),
+            &ctx_both,
+            Duration::from_secs(5),
+            "connection",
+        )
+        .await;
+        let err = server_res.unwrap_err().to_string();
+        assert!(
+            err.contains("member does not have the admin role"),
+            "expected missing admin role error, got: {err}"
+        );
+        let resp = client_as_admin_task.await.unwrap();
+        match resp {
+            Some(ClientResponse::Error { message }) => {
+                assert!(message.contains("admin role"), "got: {message}");
+            }
+            other => panic!("expected ClientResponse::Error, got: {other:?}"),
+        }
+
         // 2. With `--auth members`, a v2 secret peer is refused with REJECT_MEMBERS_ONLY.
         let ctx_members = MasterAuthContext {
             auth_mode: AuthMode::Members,
             master_noise_key: Some(master_kp.clone()),
+            master_noise_key_path: None,
+            local_node_key_path: None,
             members: Arc::clone(&members),
+            p2p_ticket: None,
+            ..Default::default()
         };
         let (c_stream, s_stream) = tokio::io::duplex(16 * 1024);
         let secret_c = secret.clone();
@@ -8590,5 +9887,1198 @@ mod tests {
                 .contains("this master admits enrolled machines only; join with an invite"),
             "expected members-only rejection reason, got: {v2_client_err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_v3_member_70_unnamed_worker_restarts_and_v2_offline_worker_ownership() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose};
+        use rusty_grid_core::WorkerCapabilities;
+
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let member_kp = NodeKeypair::generate().unwrap();
+        let members = MemberStore::from_entries(vec![super::members::MemberEntry::new(
+            "worker-box",
+            *member_kp.public_key(),
+            vec![super::members::MemberRole::Worker],
+        )]);
+        let caps = WorkerCapabilities {
+            cpu_cores: 2,
+            ram_mb: 2048,
+            ..Default::default()
+        };
+        let mut config = ServerConfig::default()
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(true)
+            .with_master_noise_key(master_kp.clone())
+            .with_members(members);
+        config.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            config.enable_p2p = false;
+        }
+        config.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            config.enable_web_ui = false;
+        }
+        let handle = MasterServer::spawn(config).await.unwrap();
+        let addr = handle.server_addr;
+        let master_pub = *master_kp.public_key();
+
+        // N1: 70 sequential worker registrations with a fresh UUID each time (simulating 70
+        // unnamed worker restarts) must all succeed; non-live worker_id claims are LRU-evicted.
+        for run in 0..70 {
+            let wid = Uuid::new_v4();
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            let ack = t.recv_msg::<MasterMessage>().await.unwrap().unwrap();
+            match ack {
+                MasterMessage::RegisterAck {
+                    accepted, message, ..
+                } => {
+                    assert!(accepted, "run {run} must be accepted: {message:?}");
+                }
+                other => panic!("expected RegisterAck on run {run}, got: {other:?}"),
+            }
+            drop(t);
+            // Wait until the server marks the session Disconnected before the next restart.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while handle.registry().live_worker_ids().await.contains(&wid) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "session for run {run} did not disconnect in time"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            handle
+                .members()
+                .workers_owned_by(&member_kp.member_id())
+                .len(),
+            64
+        );
+
+        // N7: A v2 worker registers and then disconnects (temporarily offline); the v3 member
+        // must NOT be able to claim the offline v2 worker's ID and lock the v2 worker out.
+        let v2_wid = Uuid::new_v4();
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck { accepted, .. } => assert!(accepted),
+                other => panic!("expected RegisterAck, got: {other:?}"),
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.registry().live_worker_ids().await.contains(&v2_wid) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // v3 member attempts to register `v2_wid` while the v2 worker is Disconnected -> refused!
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck {
+                    accepted, message, ..
+                } => {
+                    assert!(
+                        !accepted,
+                        "v3 member must not take over an offline v2 worker's ID"
+                    );
+                    assert!(
+                        message.unwrap_or_default().contains("owned by another"),
+                        "expected ownership refusal"
+                    );
+                }
+                other => panic!("expected RegisterAck refusal, got: {other:?}"),
+            }
+        }
+        // The v2 worker reconnects with `v2_wid` -> accepted!
+        {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            match t.recv_msg::<MasterMessage>().await.unwrap().unwrap() {
+                MasterMessage::RegisterAck { accepted, .. } => {
+                    assert!(accepted, "v2 worker must be able to reconnect with its ID");
+                }
+                other => panic!("expected RegisterAck, got: {other:?}"),
+            }
+        }
+
+        let _ = handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_n2_unauthenticated_member_admin_refused_and_restart_with_secret_and_n6_key_mismatch(
+    ) {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::MemberRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        // Phase 1: Start a loopback master with NO secret and no non-host members (`requires_auth` is false).
+        let mut cfg1 = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_ephemeral_key(false);
+        cfg1.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg1.enable_p2p = false;
+        }
+        cfg1.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg1.enable_web_ui = false;
+        }
+        let handle1 = MasterServer::spawn(cfg1).await.unwrap();
+        let addr1 = handle1.server_addr;
+
+        // `mallory` connects without v2 or v3 authentication and attempts `CreateInvite` and `ListMembers`.
+        for msg in [
+            ClientMessage::CreateInvite {
+                roles: vec![MemberRole::Admin],
+                max_uses: 1,
+                expires_in_secs: 3600,
+                require_approval: false,
+            },
+            ClientMessage::ListMembers,
+        ] {
+            let stream = TcpStream::connect(addr1).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            t.send_msg(&msg).await.unwrap();
+            let resp = t.recv_msg::<ClientResponse>().await.unwrap().unwrap();
+            match resp {
+                ClientResponse::Error { message } => {
+                    assert!(
+                        message.contains("Authentication failed"),
+                        "expected Authentication failed for unauthenticated member-admin, got: {message}"
+                    );
+                }
+                other => panic!("expected ClientResponse::Error for {msg:?}, got: {other:?}"),
+            }
+        }
+        assert!(
+            handle1.members().is_empty(),
+            "no members or invites may be created by an unauthenticated peer"
+        );
+        let _ = handle1.shutdown();
+
+        // Phase 2: Restart the master WITH a cluster secret on the same state_dir.
+        let secret = ClusterSecret::generate().unwrap();
+        let mut cfg2 = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_ephemeral_key(false);
+        cfg2.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg2.enable_p2p = false;
+        }
+        cfg2.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg2.enable_web_ui = false;
+        }
+        let handle2 = MasterServer::spawn(cfg2).await.unwrap();
+        let addr2 = handle2.server_addr;
+
+        // Unauthenticated peer is rejected at the handshake gate.
+        {
+            let stream = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let _ = t.send_msg(&ClientMessage::ListMembers).await;
+            let res = t.recv_msg::<ClientResponse>().await;
+            assert!(
+                !matches!(res, Ok(Some(ClientResponse::MembersList { .. }))),
+                "unauthenticated peer must not list members after restart with secret"
+            );
+        }
+        // v2-authenticated admin can list members and create an invite.
+        {
+            let stream = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(stream);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&ClientMessage::ListMembers).await.unwrap();
+            match t.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+                ClientResponse::MembersList { members } => assert!(members.is_empty()),
+                other => panic!("expected MembersList, got: {other:?}"),
+            }
+        }
+        let _ = handle2.shutdown();
+
+        // N6: ensure_v3_key_persisted detects a mismatch when master_noise.key on disk differs
+        // from the in-memory master_noise_key.
+        let disk_kp = NodeKeypair::generate().unwrap();
+        let mem_kp = NodeKeypair::generate().unwrap();
+        let key_path = dir.path().join("mismatch_master_noise.key");
+        disk_kp.save_file(&key_path, false).unwrap();
+        let mismatch_ctx = MasterAuthContext {
+            auth_mode: AuthMode::Both,
+            master_noise_key: Some(mem_kp),
+            master_noise_key_path: Some(key_path),
+            local_node_key_path: None,
+            ephemeral_without_state_dir: false,
+            members: Arc::new(MemberStore::new()),
+            p2p_ticket: None,
+            ..Default::default()
+        };
+        let err = mismatch_ctx
+            .ensure_v3_key_persisted()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("different public key"),
+            "expected key mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_and_item7_prune()
+    {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, v3_client_handshake, HandshakePurpose, MemberRole,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let member_kp = NodeKeypair::generate().unwrap();
+        let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+            .unwrap();
+        let h = [0x22u8; 32];
+        let proof = compute_enroll_proof(&inv.invite_secret.0, &h);
+        members
+            .handle_enroll_request(
+                *member_kp.public_key(),
+                &h,
+                "1111-2222-3333-4444",
+                "127.0.0.1:44000",
+                &inv.invite_id,
+                &proof,
+                "w-member".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap();
+
+        let make_cfg = |members: MemberStore| {
+            let mut cfg = ServerConfig::default()
+                .with_state_dir(dir.path().to_path_buf())
+                .with_cluster_secret(secret.clone())
+                .with_auth_mode(AuthMode::Both)
+                .with_ephemeral_key(false)
+                .with_master_noise_key(master_kp.clone())
+                .with_members(members);
+            cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+            #[cfg(feature = "p2p")]
+            {
+                cfg.enable_p2p = false;
+            }
+            cfg.enable_discovery = false;
+            #[cfg(feature = "dashboard")]
+            {
+                cfg.enable_web_ui = false;
+            }
+            cfg
+        };
+
+        let handle = MasterServer::spawn(make_cfg(members)).await.unwrap();
+        let addr = handle.server_addr;
+        let v2_wid = Uuid::new_v4();
+        let caps = WorkerCapabilities::new("node", 2, 1024, false, false, None);
+
+        // 1. v3 member registers `v2_wid` first (squatting) and then disconnects.
+        {
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                t.recv_msg::<MasterMessage>().await.unwrap(),
+                Some(MasterMessage::RegisterAck { accepted: true, .. })
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.registry().live_worker_ids().await.contains(&v2_wid) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 2. While v3 member is still live on another session, v2 cannot hijack a live v3 session;
+        // once the squatted v3 session has disconnected, the v2 cluster-secret worker reclaims `v2_wid`.
+        {
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck { accepted: true, .. })
+                ),
+                "v2 cluster-secret worker must reclaim a non-live squatted worker_id"
+            );
+        }
+        let _ = handle.shutdown();
+
+        // 3. Master restarts from disk; v2 worker's ownership of `v2_wid` was persisted in
+        // `v2_worker_seq`, so v3 member is refused BEFORE v2 reconnects, and v2 reconnects cleanly.
+        let reloaded_members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let handle2 = MasterServer::spawn(make_cfg(reloaded_members))
+            .await
+            .unwrap();
+        let addr2 = handle2.server_addr;
+
+        // v3 member tries to re-squat `v2_wid` right after master restart -> refused!
+        {
+            let s = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = v3_client_handshake(&mut t, &member_kp, &master_pub, HandshakePurpose::Member)
+                .await
+                .unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck {
+                        accepted: false,
+                        ..
+                    })
+                ),
+                "v3 member must not reclaim a persisted v2 worker_id after master restart"
+            );
+        }
+
+        // v2 worker reconnects after master restart -> accepted!
+        {
+            let s = TcpStream::connect(addr2).await.unwrap();
+            let mut t = MessageTransport::new(s);
+            let sk = client_handshake(&mut t, &secret).await.unwrap();
+            t.enable_encryption(&sk, EndpointRole::Client);
+            t.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: caps.clone(),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    t.recv_msg::<MasterMessage>().await.unwrap(),
+                    Some(MasterMessage::RegisterAck { accepted: true, .. })
+                ),
+                "v2 worker must reconnect after master restart"
+            );
+        }
+
+        // Item 7: remove_worker removes from owner_member_ids as well.
+        assert!(handle2
+            .registry()
+            .check_worker_owner(&v2_wid, None)
+            .await
+            .is_ok());
+        handle2.registry().remove_worker(&v2_wid).await;
+        assert!(
+            handle2
+                .registry()
+                .check_worker_owner(&v2_wid, Some("any-member"))
+                .await
+                .is_ok(),
+            "remove_worker must also remove the worker_id from in-memory owner_member_ids"
+        );
+
+        let _ = handle2.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_round4_n3_server_disconnect_race_and_nit3_confirm_timeout_message() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, derive_pairing_code, v3_client_handshake_with_hash,
+            HandshakePurpose, MemberRole, RedactedString,
+        };
+        use rusty_grid_core::protocol::EndpointRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+
+        let mut cfg = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(false)
+            .with_master_noise_key(master_kp.clone())
+            .with_members(members.clone());
+        cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg.enable_p2p = false;
+        }
+        cfg.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg.enable_web_ui = false;
+        }
+
+        let handle = MasterServer::spawn(cfg).await.unwrap();
+        let addr = handle.server_addr;
+
+        // 1. N3 TCP race: joiner connects, sends Enroll, receives EnrollPending, and drops its
+        //    TCP stream concurrently with admin sending ApproveEnrollment over TCP.
+        for i in 0..15u32 {
+            let joiner_kp = NodeKeypair::generate().unwrap();
+            let s = TcpStream::connect(addr).await.unwrap();
+            let mut jt = MessageTransport::new(s);
+            let (sk, hh) = v3_client_handshake_with_hash(
+                &mut jt,
+                &joiner_kp,
+                &master_pub,
+                HandshakePurpose::Enroll,
+            )
+            .await
+            .unwrap();
+            jt.enable_encryption(&sk, EndpointRole::Client);
+            let code = derive_pairing_code(&hh).as_str().to_string();
+            let proof = compute_enroll_proof(&inv.invite_secret.0, &hh);
+            jt.send_msg(&ClientMessage::Enroll {
+                invite_id: inv.invite_id.clone(),
+                proof,
+                name: format!("tcp-race-{i}"),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            })
+            .await
+            .unwrap();
+            let pid = match jt.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+                ClientResponse::EnrollPending { pending_id } => pending_id,
+                other => panic!("expected EnrollPending, got: {other:?}"),
+            };
+
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+
+            let approve_fut = async move {
+                admin_t
+                    .send_msg(&ClientMessage::ApproveEnrollment {
+                        pending_id: pid,
+                        pairing_code: RedactedString(code),
+                    })
+                    .await
+                    .unwrap();
+                let _ = admin_t.recv_msg::<ClientResponse>().await;
+            };
+            let drop_fut = async move {
+                tokio::task::yield_now().await;
+                drop(jt);
+            };
+            tokio::join!(approve_fut, drop_fut);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if !members.contains(joiner_kp.public_key())
+                    && members.unconfirmed_tracking_counts() == (0, 0)
+                    && members.list_invites().first().map(|x| x.uses_remaining) == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !members.contains(joiner_kp.public_key()),
+                "iteration {i}: disconnected joiner stayed enrolled"
+            );
+            assert_eq!(members.list_invites()[0].uses_remaining, 1, "iteration {i}");
+            assert_eq!(
+                members.unconfirmed_tracking_counts(),
+                (0, 0),
+                "iteration {i}"
+            );
+        }
+
+        let _ = handle.shutdown();
+
+        // 2. NIT 3: verify distinct timeout message ("enrollment confirmation timed out") vs
+        //    client-cancelled message ("enrollment cancelled by joining machine").
+        let mem_nit3 = MemberStore::new();
+        let inv_nit3 = mem_nit3
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+        let j_nit3 = NodeKeypair::generate().unwrap();
+        let h_nit3 = [0x99u8; 32];
+        let p_nit3 = compute_enroll_proof(&inv_nit3.invite_secret.0, &h_nit3);
+        let (pid_nit3, rx_nit3) = match mem_nit3
+            .handle_enroll_request(
+                *j_nit3.public_key(),
+                &h_nit3,
+                "1111-2222-3333-4444",
+                "127.0.0.1:50099",
+                &inv_nit3.invite_id,
+                &p_nit3,
+                "nit3-box".into(),
+                "linux".into(),
+                "x86_64".into(),
+            )
+            .unwrap()
+        {
+            members::EnrollOutcome::Pending {
+                pending_id,
+                decision_rx,
+            } => (pending_id, decision_rx),
+            _ => panic!("expected Pending"),
+        };
+        let auth_ctx_nit3 = MasterAuthContext {
+            members: Arc::new(mem_nit3.clone()),
+            enroll_confirm_timeout: Duration::from_millis(80),
+            ..Default::default()
+        };
+        let reg_nit3 = WorkerRegistry::new();
+        let q_nit3 = TaskQueue::new();
+        let sched_nit3 = tokio::sync::Notify::new();
+        let waiters_nit3: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (c_dup, s_dup) = tokio::io::duplex(16 * 1024);
+        let mut c_trans = MessageTransport::new(c_dup);
+        let mut s_trans = MessageTransport::new(s_dup);
+
+        let j_nit3_mid = j_nit3.member_id();
+        let srv_fut = wait_for_pending_enrollment(
+            &mut s_trans,
+            &auth_ctx_nit3,
+            &reg_nit3,
+            &q_nit3,
+            &sched_nit3,
+            &waiters_nit3,
+            #[cfg(feature = "dashboard")]
+            None,
+            &j_nit3_mid,
+            pid_nit3.clone(),
+            rx_nit3,
+        );
+        let cli_fut = async {
+            assert!(matches!(
+                c_trans.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollPending { .. })
+            ));
+            mem_nit3
+                .approve_pending(&pid_nit3, derive_pairing_code(&h_nit3).as_str())
+                .unwrap();
+            assert!(matches!(
+                c_trans.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::Enrolled { .. })
+            ));
+            // Do not send Hello; wait for the 80 ms confirmation timeout to fire!
+            match c_trans.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::EnrollRejected { message }) => {
+                    assert_eq!(message, "enrollment confirmation timed out");
+                }
+                other => panic!("expected EnrollRejected timeout message, got: {other:?}"),
+            }
+        };
+        tokio::join!(srv_fut, cli_fut);
+        assert!(!mem_nit3.contains(j_nit3.public_key()));
+        assert_eq!(mem_nit3.list_invites()[0].uses_remaining, 1);
+        assert_eq!(mem_nit3.unconfirmed_tracking_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::noise_auth::{
+            compute_enroll_proof, derive_pairing_code, v3_client_handshake_with_hash,
+            HandshakePurpose, MemberRole, RedactedString,
+        };
+        use rusty_grid_core::protocol::{
+            EndpointRole, ProtocolCapabilities, PROTOCOL_VERSION_CURRENT,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = ClusterSecret::generate().unwrap();
+        let master_kp = NodeKeypair::generate().unwrap();
+        let master_pub = *master_kp.public_key();
+        let members = MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .with_auth_mode(AuthMode::Both);
+        let inv = members
+            .create_invite(vec![MemberRole::Worker], 1, 3600, true)
+            .unwrap();
+
+        let mut cfg = ServerConfig::default()
+            .with_state_dir(dir.path().to_path_buf())
+            .with_cluster_secret(secret.clone())
+            .with_auth_mode(AuthMode::Both)
+            .with_ephemeral_key(false)
+            .with_master_noise_key(master_kp)
+            .with_members(members.clone());
+        cfg.bind_addr = "127.0.0.1:0".parse().unwrap();
+        #[cfg(feature = "p2p")]
+        {
+            cfg.enable_p2p = false;
+        }
+        cfg.enable_discovery = false;
+        #[cfg(feature = "dashboard")]
+        {
+            cfg.enable_web_ui = false;
+        }
+
+        let handle = MasterServer::spawn(cfg).await.unwrap();
+        let addr = handle.server_addr;
+
+        // 1. Register a v2 worker, then disconnect it cleanly so its `worker_id` is non-live.
+        let v2_wid = Uuid::new_v4();
+        {
+            let ws = TcpStream::connect(addr).await.unwrap();
+            let mut wt = MessageTransport::new(ws);
+            let wsk = client_handshake(&mut wt, &secret).await.unwrap();
+            wt.enable_encryption(&wsk, EndpointRole::Client);
+            wt.send_msg(&WorkerMessage::Register {
+                worker_id: v2_wid,
+                capabilities: WorkerCapabilities::new("v2-m1-box", 2, 4096, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                wt.recv_msg::<MasterMessage>().await.unwrap(),
+                Some(MasterMessage::RegisterAck { accepted: true, .. })
+            ));
+            wt.send_msg(&WorkerMessage::Disconnecting {
+                worker_id: v2_wid,
+                reason: "stop before release-worker test".into(),
+            })
+            .await
+            .unwrap();
+        }
+        let wait_disc = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_disc {
+            if handle.registry().list_all_workers().await.iter().all(|w| {
+                w.worker_id != v2_wid || w.status == crate::registry::WorkerStatus::Disconnected
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Point `save_path` under a regular file so the `members.json` write fails (`M1`).
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        members.set_save_path(Some(blocker.join("members.json")));
+
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ReleaseWorkerId { worker_id: v2_wid })
+                .await
+                .unwrap();
+            match admin_t.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::Error { .. }) => {}
+                other => panic!(
+                    "M1: ReleaseWorkerId must return ClientResponse::Error on failed write, got: {other:?}"
+                ),
+            }
+        }
+        assert!(
+            handle
+                .registry()
+                .check_worker_owner(&v2_wid, Some("0123456789abcdef"))
+                .await
+                .is_err(),
+            "M1: failed ReleaseWorkerId must retain v2 claim in WorkerRegistry"
+        );
+        assert!(
+            members.claim_worker_id(v2_wid, "0123456789abcdef").is_err(),
+            "M1: failed ReleaseWorkerId must retain v2_worker_seq claim in MemberStore"
+        );
+
+        // Restore valid `save_path` for `S1` enrollment + approval, then break `save_path` for
+        // the post-approval rollback write and verify `handle.shutdown()` flushes the rollback.
+        let valid_members_path = dir.path().join("members.json");
+        members.set_save_path(Some(valid_members_path.clone()));
+
+        let joiner_kp = NodeKeypair::generate().unwrap();
+        let js = TcpStream::connect(addr).await.unwrap();
+        let mut jt = MessageTransport::new(js);
+        let (jsk, jhh) = v3_client_handshake_with_hash(
+            &mut jt,
+            &joiner_kp,
+            &master_pub,
+            HandshakePurpose::Enroll,
+        )
+        .await
+        .unwrap();
+        jt.enable_encryption(&jsk, EndpointRole::Client);
+        let code = derive_pairing_code(&jhh).as_str().to_string();
+        let proof = compute_enroll_proof(&inv.invite_secret.0, &jhh);
+        jt.send_msg(&ClientMessage::Enroll {
+            invite_id: inv.invite_id.clone(),
+            proof,
+            name: "s1-shutdown-box".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        })
+        .await
+        .unwrap();
+        let pid = match jt.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+            ClientResponse::EnrollPending { pending_id } => pending_id,
+            other => panic!("expected EnrollPending, got: {other:?}"),
+        };
+
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ApproveEnrollment {
+                    pending_id: pid,
+                    pairing_code: RedactedString(code),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                admin_t.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollmentApproved { .. })
+            ));
+        }
+        assert!(matches!(
+            jt.recv_msg::<ClientResponse>().await.unwrap(),
+            Some(ClientResponse::Enrolled { .. })
+        ));
+
+        // Break `save_path` before dropping `jt` (simulating joiner declining `[y/N]` while disk
+        // cannot be written).
+        members.set_save_path(Some(blocker.join("members.json")));
+        drop(jt);
+
+        let wait_rb = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_rb {
+            if !members.contains(joiner_kp.public_key()) && members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!members.contains(joiner_kp.public_key()));
+        assert!(members.is_dirty());
+        // Disk still has `joiner_kp` before retry/shutdown flush.
+        assert!(MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .contains(joiner_kp.public_key()));
+
+        // Restore valid path while the server is still running -> `spawn_member_store_resync`
+        // periodically flushes the dirty rollback without waiting for shutdown.
+        members.set_save_path(Some(valid_members_path.clone()));
+        let wait_resync = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < wait_resync {
+            if !members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !members.is_dirty(),
+            "S1: periodic resync task must clear dirty flag once save_path recovers"
+        );
+        let reloaded_periodic = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert!(
+            !reloaded_periodic.contains(joiner_kp.public_key()),
+            "S1: periodic resync must remove declined unconfirmed member from members.json"
+        );
+
+        // Now repeat with a second declined enrollment and verify `handle.shutdown()` flushes
+        // synchronously before any periodic tick needs to run.
+        let joiner_kp2 = NodeKeypair::generate().unwrap();
+        let js2 = TcpStream::connect(addr).await.unwrap();
+        let mut jt2 = MessageTransport::new(js2);
+        let (jsk2, jhh2) = v3_client_handshake_with_hash(
+            &mut jt2,
+            &joiner_kp2,
+            &master_pub,
+            HandshakePurpose::Enroll,
+        )
+        .await
+        .unwrap();
+        jt2.enable_encryption(&jsk2, EndpointRole::Client);
+        let code2 = derive_pairing_code(&jhh2).as_str().to_string();
+        let proof2 = compute_enroll_proof(&inv.invite_secret.0, &jhh2);
+        jt2.send_msg(&ClientMessage::Enroll {
+            invite_id: inv.invite_id.clone(),
+            proof: proof2,
+            name: "s1-shutdown-box-2".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        })
+        .await
+        .unwrap();
+        let pid2 = match jt2.recv_msg::<ClientResponse>().await.unwrap().unwrap() {
+            ClientResponse::EnrollPending { pending_id } => pending_id,
+            other => panic!("expected EnrollPending, got: {other:?}"),
+        };
+        {
+            let admin_s = TcpStream::connect(addr).await.unwrap();
+            let mut admin_t = MessageTransport::new(admin_s);
+            let ask = client_handshake(&mut admin_t, &secret).await.unwrap();
+            admin_t.enable_encryption(&ask, EndpointRole::Client);
+            admin_t
+                .send_msg(&ClientMessage::ApproveEnrollment {
+                    pending_id: pid2,
+                    pairing_code: RedactedString(code2),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                admin_t.recv_msg::<ClientResponse>().await.unwrap(),
+                Some(ClientResponse::EnrollmentApproved { .. })
+            ));
+        }
+        assert!(matches!(
+            jt2.recv_msg::<ClientResponse>().await.unwrap(),
+            Some(ClientResponse::Enrolled { .. })
+        ));
+        members.set_save_path(Some(blocker.join("members.json")));
+        drop(jt2);
+        let wait_rb2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < wait_rb2 {
+            if !members.contains(joiner_kp2.public_key()) && members.is_dirty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(members.is_dirty());
+        assert!(MemberStore::load_from_dir(Some(dir.path()))
+            .unwrap()
+            .contains(joiner_kp2.public_key()));
+
+        members.set_save_path(Some(valid_members_path));
+        handle.shutdown().unwrap();
+        assert!(!members.is_dirty());
+
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert!(
+            !reloaded.contains(joiner_kp2.public_key()),
+            "S1: shutdown flush must remove declined unconfirmed member from members.json"
+        );
+        assert_eq!(
+            reloaded
+                .list_invites()
+                .into_iter()
+                .find(|i| i.invite_id == inv.invite_id)
+                .expect("1-use invite must not be pruned after retried rollback")
+                .uses_remaining,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn server_speed_book_skips_checkpoint_resumed_attempts_but_records_checkpoint_emitters() {
+        use rusty_grid_core::task::{Bytes, TaskRequirements, TaskSpec};
+
+        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let addr = master.server_addr();
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut worker = MessageTransport::new(stream);
+        let worker_id = Uuid::new_v4();
+        worker
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "cp-speed-worker",
+                    2,
+                    8192,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match worker.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        // 1. A normal attempt that emits a mid-run checkpoint and completes MUST still record in SpeedBook.
+        let spec = TaskSpec::command("echo", vec!["cp-emit-and-resume".into()]);
+        let task_key = crate::speed::TaskKey::of(&spec);
+        let emit_task = Task::new(spec.clone(), TaskRequirements::generic(1, 60));
+        let emit_id = emit_task.id;
+        master.submit_task(emit_task).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive AssignTask")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTask { task }) => assert_eq!(task.id, emit_id),
+            other => panic!("expected AssignTask for fresh task, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::Checkpoint {
+                task_id: emit_id,
+                sequence: 1,
+                delta_state: Bytes::from_static(b"mid-run-cp"),
+            })
+            .await
+            .unwrap();
+        let mut got_cp = false;
+        for _ in 0..100 {
+            if master.get_checkpoint(&emit_id).await.is_some() {
+                got_cp = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(got_cp, "master must record mid-run checkpoint");
+
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: emit_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 120,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+        let mut emit_done = false;
+        for _ in 0..100 {
+            if master.get_task_info(emit_id).await.unwrap().state == TaskState::Completed {
+                emit_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(emit_done, "emit task must complete");
+
+        let sb = master
+            .registry
+            .speed_book()
+            .expect("scheduler must attach SpeedBook to registry");
+        {
+            let guard = sb.lock().unwrap_or_else(|e| e.into_inner());
+            let after_emit = guard
+                .get(&worker_id, task_key)
+                .expect("checkpoint-emitting normal task must be recorded in SpeedBook");
+            assert_eq!(after_emit.samples, 1);
+            assert!((after_emit.avg_ms - 120.0).abs() < 1e-9);
+        }
+
+        // 2. A checkpoint-resumed attempt (`AssignTaskWithCheckpoint`) MUST NOT record into SpeedBook,
+        //    neither polluting `task_key`'s existing average nor creating a new entry for `resume_key`.
+        let mut resumed_same_key = Task::new(spec, TaskRequirements::generic(1, 60));
+        resumed_same_key.latest_checkpoint = Some(CheckpointData::new(2, b"prev".to_vec()));
+        let resumed_same_id = resumed_same_key.id;
+        master.submit_task(resumed_same_key).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive AssignTaskWithCheckpoint")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTaskWithCheckpoint { task, .. }) => {
+                assert_eq!(task.id, resumed_same_id)
+            }
+            other => panic!("expected AssignTaskWithCheckpoint, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: resumed_same_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+
+        let fresh_resume_spec = TaskSpec::command("echo", vec!["resume-only".into()]);
+        let fresh_resume_key = crate::speed::TaskKey::of(&fresh_resume_spec);
+        let mut fresh_resume = Task::new(fresh_resume_spec, TaskRequirements::generic(1, 60));
+        fresh_resume.latest_checkpoint = Some(CheckpointData::new(1, b"cp".to_vec()));
+        let fresh_resume_id = fresh_resume.id;
+        master.submit_task(fresh_resume).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive second AssignTaskWithCheckpoint")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTaskWithCheckpoint { task, .. }) => {
+                assert_eq!(task.id, fresh_resume_id)
+            }
+            other => panic!("expected AssignTaskWithCheckpoint, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: fresh_resume_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+
+        let mut both_done = false;
+        for _ in 0..100 {
+            if master.get_task_info(resumed_same_id).await.unwrap().state == TaskState::Completed
+                && master.get_task_info(fresh_resume_id).await.unwrap().state
+                    == TaskState::Completed
+            {
+                both_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(both_done, "resumed tasks must complete");
+
+        let guard = sb.lock().unwrap_or_else(|e| e.into_inner());
+        let after_resume = guard
+            .get(&worker_id, task_key)
+            .expect("prior sample must still exist");
+        assert_eq!(after_resume.samples, 1);
+        assert!((after_resume.avg_ms - 120.0).abs() < 1e-9);
+        assert!(
+            guard.get(&worker_id, fresh_resume_key).is_none(),
+            "resumed-only task key must not enter SpeedBook"
+        );
+
+        let _ = master.shutdown();
     }
 }

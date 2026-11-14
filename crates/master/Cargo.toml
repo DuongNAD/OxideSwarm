@@ -175,5 +175,10 @@ path = "../../tests/test_challenger_m4_scheduler_runner.rs"
 name = "master_restart_recovery"
 path = "../../tests/master_restart_recovery.rs"
 
+[[test]]
+name = "sched4_speed_aware"
+path = "../../tests/sched4_speed_aware.rs"
+
+
 
 
