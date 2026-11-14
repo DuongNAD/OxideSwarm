@@ -240,6 +240,14 @@ pub struct MasterArgs {
     )]
     pub fail_unfulfillable_tasks: Option<bool>,
 
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        allow_hyphen_values = true,
+        help = "Speed-aware placement hold-back factor (> 1.0, or 0 to disable; default: 1.5)"
+    )]
+    pub speed_hold_factor: Option<String>,
+
     #[arg(long, help = "Enable native P2P QUIC endpoint for NAT traversal")]
     pub p2p: bool,
 
@@ -1281,8 +1289,38 @@ fn resolve_fail_unfulfillable_tasks(
     )
 }
 
+/// Resolve `speed_hold_factor` with precedence CLI `--speed-hold-factor`, then
+/// `RUSTY_GRID_SPEED_HOLD_FACTOR`, then `[master].speed_hold_factor`, then
+/// `SchedulerConfig::default().speed_hold_factor` (`1.5`), validating `0.0` (off) or finite `> 1.0`.
+fn resolve_speed_hold_factor(flag: Option<String>, cfg_val: Option<f64>) -> Result<f64, String> {
+    if let Some(raw) = flag {
+        let parsed: f64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("--speed-hold-factor: invalid factor '{raw}'"))?;
+        return SchedulerConfig::validate_speed_hold_factor(parsed)
+            .map_err(|e| format!("--speed-hold-factor: {e}"));
+    }
+    if let Ok(raw) = std::env::var("RUSTY_GRID_SPEED_HOLD_FACTOR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let parsed: f64 = trimmed
+                .parse()
+                .map_err(|_| format!("RUSTY_GRID_SPEED_HOLD_FACTOR: invalid factor '{trimmed}'"))?;
+            return SchedulerConfig::validate_speed_hold_factor(parsed)
+                .map_err(|e| format!("RUSTY_GRID_SPEED_HOLD_FACTOR: {e}"));
+        }
+    }
+    if let Some(cfg) = cfg_val {
+        return SchedulerConfig::validate_speed_hold_factor(cfg)
+            .map_err(|e| format!("speed_hold_factor: {e}"));
+    }
+    Ok(SchedulerConfig::default().speed_hold_factor)
+}
+
 /// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
-/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`,
+/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and `--speed-hold-factor` /
+/// `RUSTY_GRID_SPEED_HOLD_FACTOR` / `[master].speed_hold_factor`, and carrying `preserve_gpu`,
 /// `max_host_cpu`, and `fail_unfulfillable_tasks`.
 fn build_master_scheduler_config(
     flag: Option<String>,
@@ -1290,13 +1328,18 @@ fn build_master_scheduler_config(
     preserve_gpu: bool,
     max_host_cpu: f32,
     fail_unfulfillable_tasks: bool,
+    speed_hold_factor_flag: Option<String>,
+    speed_hold_factor_cfg: Option<f64>,
 ) -> Result<SchedulerConfig, String> {
     let scheduler_policy = resolve_scheduler_policy(flag, cfg_val)?;
+    let speed_hold_factor =
+        resolve_speed_hold_factor(speed_hold_factor_flag, speed_hold_factor_cfg)?;
     Ok(SchedulerConfig {
         policy: scheduler_policy,
         preserve_gpu_for_gpu_tasks: preserve_gpu,
         max_host_cpu_pct: max_host_cpu,
         fail_unfulfillable_tasks,
+        speed_hold_factor,
         ..Default::default()
     })
 }
@@ -1667,6 +1710,8 @@ async fn run_master_inner(
         preserve_gpu,
         max_host_cpu,
         fail_unfulfillable_tasks,
+        args.speed_hold_factor,
+        master_cfg.as_ref().and_then(|m| m.speed_hold_factor),
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -6256,6 +6301,8 @@ max_active_mb = 768
             false,
             72.5,
             true,
+            Some("2.0".into()),
+            Some(1.8),
         )
         .unwrap();
         assert_eq!(
@@ -6266,12 +6313,25 @@ max_active_mb = 768
         assert!(!built_sched_cfg.preserve_gpu_for_gpu_tasks);
         assert_eq!(built_sched_cfg.max_host_cpu_pct, 72.5);
         assert!(built_sched_cfg.fail_unfulfillable_tasks);
+        assert_eq!(built_sched_cfg.speed_hold_factor, 2.0);
         assert!(build_master_scheduler_config(
             Some("bogus-policy".into()),
             None,
             true,
             85.0,
-            false
+            false,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(build_master_scheduler_config(
+            None,
+            None,
+            true,
+            85.0,
+            false,
+            Some("1.0".into()),
+            None,
         )
         .is_err());
 
@@ -6362,6 +6422,22 @@ max_active_mb = 768
                 "127.0.0.1:0",
                 "--wire-codec",
                 "xml",
+            ],
+            vec![
+                "oxideswarm",
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--speed-hold-factor",
+                "1.0",
+            ],
+            vec![
+                "oxideswarm",
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--speed-hold-factor",
+                "-1",
             ],
         ] {
             let cli = Cli::try_parse_from(&bad_master_argv).unwrap();
@@ -6786,6 +6862,7 @@ max_active_mb = 768
         // Precedence for `fail_unfulfillable_tasks` via `resolve_fail_unfulfillable_tasks`:
         // CLI `--fail-unfulfillable-tasks` > `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` > `[master].fail_unfulfillable_tasks` > false
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+
         let parsed_fail_true_cfg: ConfigFile = toml::from_str(
             r#"
 [master]
@@ -6820,6 +6897,69 @@ fail_unfulfillable_tasks = false
             "--fail-unfulfillable-tasks CLI flag must override env 0"
         );
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+
+        // Precedence & validation for `speed_hold_factor`:
+        // CLI `--speed-hold-factor` > `RUSTY_GRID_SPEED_HOLD_FACTOR` > `[master].speed_hold_factor` > 1.5
+        std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
+        let parsed_hold_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+speed_hold_factor = 2.25
+"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_speed_hold_factor(None, None).unwrap(), 1.5);
+        assert_eq!(
+            resolve_speed_hold_factor(
+                None,
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            2.25
+        );
+        std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", "0");
+        assert_eq!(
+            resolve_speed_hold_factor(
+                None,
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            0.0,
+            "RUSTY_GRID_SPEED_HOLD_FACTOR=0 must override config 2.25 and disable D2"
+        );
+        assert_eq!(
+            resolve_speed_hold_factor(
+                Some("1.75".into()),
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            1.75,
+            "--speed-hold-factor CLI flag must override env and config"
+        );
+        for bad in ["1.0", "0.5", "-1", "nan", "inf", "not-a-float"] {
+            assert!(
+                resolve_speed_hold_factor(Some(bad.into()), None)
+                    .unwrap_err()
+                    .starts_with("--speed-hold-factor: "),
+                "CLI error for '{bad}' must start with '--speed-hold-factor: '"
+            );
+            std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", bad);
+            assert!(
+                resolve_speed_hold_factor(None, None)
+                    .unwrap_err()
+                    .starts_with("RUSTY_GRID_SPEED_HOLD_FACTOR: "),
+                "Env error for '{bad}' must start with 'RUSTY_GRID_SPEED_HOLD_FACTOR: '"
+            );
+        }
+        std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
+        for bad_cfg in [1.0, 0.5, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                resolve_speed_hold_factor(None, Some(bad_cfg))
+                    .unwrap_err()
+                    .starts_with("speed_hold_factor: "),
+                "Config error for '{bad_cfg}' must start with 'speed_hold_factor: '"
+            );
+        }
 
         // 6. Live `run_master` verification of `sched_config`:
         //    - `--scheduler-policy round-robin` rotates two 1-core task submissions across two

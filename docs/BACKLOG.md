@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `f486885`: 70 items Implemented, 4 Partial and 48 Planned. Five items
+On 2026-11-14, at `master` `0de63fc` with SCHED-4 Partial in pull request 214: 70 items Implemented, 5 Partial and 47 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -236,7 +236,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Planned |  |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
-| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Planned | (design 0060) |
+| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | 214 (open), (design 0060) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned |  |
@@ -2542,8 +2542,15 @@ Add one dated line per finished item, newest last.
   [design 0065](design/0065-large-transfer-and-long-run-tests.md): the end-to-end blob tests move
   at most about 5 MiB per file, and no record measures a cluster over hours. Nothing is built.
   The Index counts are now 70 Implemented, 4 Partial and 48 Planned.
+- 2026-11-14: Implemented SCHED-4a and SCHED-4b ([design 0060](design/0060-speed-aware-placement.md), pull request 214):
+  `SpeedBook` (`crates/master/src/speed.rs`, 4,096 keys, 64 workers per key, EMA weight 0.3, skipping checkpoint-resumed attempts) records
+  successful task durations on terminal completion (`crates/master/src/server.rs`), drops entries of
+  removed or pruned workers (`crates/master/src/registry.rs`), and drives D2 speed-aware placement (`--speed-hold-factor`, `RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`)
+  and `ScheduleSkipReason::WaitingForFasterWorker` hold-back in `crates/master/src/scheduler.rs`
+  (`tests/sched4_speed_aware.rs`). SCHED-4c and SCHED-4d remain Planned. The Index counts are now
+  70 Implemented, 5 Partial and 47 Planned.
 - 2026-11-14: Completed design 0039 W11 under FEAT-4 (pull request 186): symbolic links and empty
   directories in `TreeManifest` (`oxideswarm-tree/2`, `ProtocolCapabilities::TREE_V2`), with
   case- and Unicode-folded `FoldedSymlinkTrie` / `FoldedPathTrie` validation, manifest complexity
   budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
-  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 4 Partial and 48 Planned.
+  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 70 Implemented, 5 Partial and 47 Planned.
