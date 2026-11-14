@@ -40,6 +40,8 @@ sysinfo = { workspace = true }
 ignore = "0.4"
 base64 = "0.23"
 toml_edit = "0.25"
+ring = "0.17"
+spake2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -54,6 +56,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 gpu-wgpu = ["rusty_grid_worker/gpu-wgpu"]
 # Opt-in Generative 3D (`gen3d`) and skeletal auto-rigging (`autorig`) worker execution support.
 3d = ["rusty_grid_worker/3d"]
+# Opt-in OpenTelemetry OTLP/HTTP trace export (`OTEL_EXPORTER_OTLP_*`).
+otel = ["rusty_grid_master/otel"]
 
 [dev-dependencies]
 rusty_grid_master = { workspace = true, features = ["test-hooks"] }
@@ -200,5 +204,13 @@ path = "../../tests/enroll_v3_e2e.rs"
 [[test]]
 name = "cli_enroll_e2e"
 path = "../../tests/cli_enroll_e2e.rs"
+
+[[test]]
+name = "cli_pair_e2e"
+path = "../../tests/cli_pair_e2e.rs"
+
+[[test]]
+name = "rendezvous_discovery_e2e"
+path = "../../tests/rendezvous_discovery_e2e.rs"
 
 
