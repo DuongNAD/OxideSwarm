@@ -893,6 +893,7 @@ impl MasterServer {
         sched_config: SchedulerConfig,
         reaper_config: ReaperConfig,
     ) -> GridResult<MasterHandle> {
+        sched_config.validate().map_err(GridError::Config)?;
         let registry = WorkerRegistry::new();
         let retry_policy = crate::queue::RetryPolicy {
             max_retries: config.max_retries,
@@ -999,15 +1000,8 @@ impl MasterServer {
             server.broadcast_tx = Some(b_tx.clone());
         }
 
-        // 1. Spawn TCP server accept loop
-        let srv_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = server.run(srv_shutdown_rx).await {
-                error!(error = %e, "Master server accept loop terminated with error");
-            }
-        });
-
-        // 2. Spawn Background Scheduler loop
+        // Build scheduler before starting accept loop so its SpeedBook is attached to `registry`
+        // before any worker connection is handled.
         let sched = Arc::new(
             WorkloadScheduler::new(
                 sched_config,
@@ -1017,6 +1011,16 @@ impl MasterServer {
             )
             .with_waiters(Arc::clone(&waiters)),
         );
+
+        // 1. Spawn TCP server accept loop
+        let srv_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.run(srv_shutdown_rx).await {
+                error!(error = %e, "Master server accept loop terminated with error");
+            }
+        });
+
+        // 2. Spawn Background Scheduler loop
         let mut sched_shutdown_rx = shutdown_rx.clone();
         #[cfg(feature = "dashboard")]
         let sched_broadcast_tx = broadcast_tx.clone();
@@ -2522,6 +2526,13 @@ async fn apply_task_result_inner(
     //    input pins. When terminal, input pins are released and output pins stay held for
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
+        if !outcome.resumed_from_checkpoint {
+            if let Some(sb) = registry.speed_book() {
+                crate::speed::mutate_shared_speed_book(&sb, |book| {
+                    book.record_result(worker_id, outcome.task_key, outcome.timeout_secs, &result);
+                });
+            }
+        }
         if let Some(store) = blob_store {
             store.unpin_task(&task_id).await;
         }
@@ -8589,5 +8600,208 @@ mod tests {
                 .contains("this master admits enrolled machines only; join with an invite"),
             "expected members-only rejection reason, got: {v2_client_err}"
         );
+    }
+
+    #[tokio::test]
+    async fn server_speed_book_skips_checkpoint_resumed_attempts_but_records_checkpoint_emitters() {
+        use rusty_grid_core::task::{Bytes, TaskRequirements, TaskSpec};
+
+        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let addr = master.server_addr();
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut worker = MessageTransport::new(stream);
+        let worker_id = Uuid::new_v4();
+        worker
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "cp-speed-worker",
+                    2,
+                    8192,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match worker.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        // 1. A normal attempt that emits a mid-run checkpoint and completes MUST still record in SpeedBook.
+        let spec = TaskSpec::command("echo", vec!["cp-emit-and-resume".into()]);
+        let task_key = crate::speed::TaskKey::of(&spec);
+        let emit_task = Task::new(spec.clone(), TaskRequirements::generic(1, 60));
+        let emit_id = emit_task.id;
+        master.submit_task(emit_task).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive AssignTask")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTask { task }) => assert_eq!(task.id, emit_id),
+            other => panic!("expected AssignTask for fresh task, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::Checkpoint {
+                task_id: emit_id,
+                sequence: 1,
+                delta_state: Bytes::from_static(b"mid-run-cp"),
+            })
+            .await
+            .unwrap();
+        let mut got_cp = false;
+        for _ in 0..100 {
+            if master.get_checkpoint(&emit_id).await.is_some() {
+                got_cp = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(got_cp, "master must record mid-run checkpoint");
+
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: emit_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 120,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+        let mut emit_done = false;
+        for _ in 0..100 {
+            if master.get_task_info(emit_id).await.unwrap().state == TaskState::Completed {
+                emit_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(emit_done, "emit task must complete");
+
+        let sb = master
+            .registry
+            .speed_book()
+            .expect("scheduler must attach SpeedBook to registry");
+        {
+            let guard = sb.lock().unwrap_or_else(|e| e.into_inner());
+            let after_emit = guard
+                .get(&worker_id, task_key)
+                .expect("checkpoint-emitting normal task must be recorded in SpeedBook");
+            assert_eq!(after_emit.samples, 1);
+            assert!((after_emit.avg_ms - 120.0).abs() < 1e-9);
+        }
+
+        // 2. A checkpoint-resumed attempt (`AssignTaskWithCheckpoint`) MUST NOT record into SpeedBook,
+        //    neither polluting `task_key`'s existing average nor creating a new entry for `resume_key`.
+        let mut resumed_same_key = Task::new(spec, TaskRequirements::generic(1, 60));
+        resumed_same_key.latest_checkpoint = Some(CheckpointData::new(2, b"prev".to_vec()));
+        let resumed_same_id = resumed_same_key.id;
+        master.submit_task(resumed_same_key).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive AssignTaskWithCheckpoint")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTaskWithCheckpoint { task, .. }) => {
+                assert_eq!(task.id, resumed_same_id)
+            }
+            other => panic!("expected AssignTaskWithCheckpoint, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: resumed_same_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+
+        let fresh_resume_spec = TaskSpec::command("echo", vec!["resume-only".into()]);
+        let fresh_resume_key = crate::speed::TaskKey::of(&fresh_resume_spec);
+        let mut fresh_resume = Task::new(fresh_resume_spec, TaskRequirements::generic(1, 60));
+        fresh_resume.latest_checkpoint = Some(CheckpointData::new(1, b"cp".to_vec()));
+        let fresh_resume_id = fresh_resume.id;
+        master.submit_task(fresh_resume).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+            .await
+            .expect("worker must receive second AssignTaskWithCheckpoint")
+            .unwrap()
+        {
+            Some(MasterMessage::AssignTaskWithCheckpoint { task, .. }) => {
+                assert_eq!(task.id, fresh_resume_id)
+            }
+            other => panic!("expected AssignTaskWithCheckpoint, got {other:?}"),
+        }
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id: fresh_resume_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"ok"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+
+        let mut both_done = false;
+        for _ in 0..100 {
+            if master.get_task_info(resumed_same_id).await.unwrap().state == TaskState::Completed
+                && master.get_task_info(fresh_resume_id).await.unwrap().state
+                    == TaskState::Completed
+            {
+                both_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(both_done, "resumed tasks must complete");
+
+        let guard = sb.lock().unwrap_or_else(|e| e.into_inner());
+        let after_resume = guard
+            .get(&worker_id, task_key)
+            .expect("prior sample must still exist");
+        assert_eq!(after_resume.samples, 1);
+        assert!((after_resume.avg_ms - 120.0).abs() < 1e-9);
+        assert!(
+            guard.get(&worker_id, fresh_resume_key).is_none(),
+            "resumed-only task key must not enter SpeedBook"
+        );
+
+        let _ = master.shutdown();
     }
 }
