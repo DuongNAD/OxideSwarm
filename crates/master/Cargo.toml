@@ -24,6 +24,11 @@ iroh = { workspace = true, optional = true }
 futures = { workspace = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+# Optional OTLP/HTTP trace exporter (`--features otel`, already in Cargo.lock).
+tracing-subscriber = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+url = { version = "2.5", optional = true }
 # Constant-time dashboard token comparison (already in Cargo.lock via rusty_grid_core).
 ring = "0.17"
 # Task store (design 0046 D2): bincode journal records, BLAKE3 frame checksums.
@@ -39,6 +44,7 @@ default = ["p2p", "dashboard"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
 dashboard = ["dep:axum", "dep:tower-http"]
 3d = ["rusty_grid_worker/3d"]
+otel = ["dep:tracing-subscriber", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:url"]
 test-hooks = []
 
 [dev-dependencies]
@@ -178,6 +184,8 @@ path = "../../tests/master_restart_recovery.rs"
 name = "sched4_speed_aware"
 path = "../../tests/sched4_speed_aware.rs"
 
-
-
+[[test]]
+name = "observability_metrics_otel_test"
+path = "../../tests/observability_metrics_otel_test.rs"
+required-features = ["dashboard"]
 

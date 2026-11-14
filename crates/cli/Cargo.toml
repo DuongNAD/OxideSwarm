@@ -61,6 +61,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 gpu-wgpu = ["rusty_grid_worker/gpu-wgpu"]
 # Opt-in Generative 3D (`gen3d`) and skeletal auto-rigging (`autorig`) worker execution support.
 3d = ["rusty_grid_worker/3d"]
+# Opt-in OpenTelemetry OTLP/HTTP trace export (`OTEL_EXPORTER_OTLP_*`).
+otel = ["rusty_grid_master/otel"]
 
 [dev-dependencies]
 rusty_grid_master = { workspace = true, features = ["test-hooks"] }
