@@ -1,7 +1,7 @@
 # 0050: Scale-out architecture (`SCALE-1` to `SCALE-6`, `ECO-3`, `ECO-4`)
 
-Status: Draft
-Created: 2026-11-09    Updated: 2026-11-09
+Status: Partial
+Created: 2026-11-09    Updated: 2026-11-14
 
 ## Summary
 
@@ -9,7 +9,7 @@ Today one master runs the whole grid for one owner or one small team. This recor
 of that design with evidence, and a staged architecture that grows it to many workers and many
 submitters: a load harness first, then a faster scheduler, worker-to-worker blob distribution, a
 highly available master, autoscaling providers and, last, federation of sites. It also covers
-multi-tenancy and observability, which a shared grid needs. Nothing is built. Each open choice lists
+multi-tenancy and observability, which a shared grid needs. Stage D2 (`SCALE-2`) is implemented in code pending the post-`SCALE-1` harness comparison; the remaining stages list
 its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
 
 ## Context
@@ -118,19 +118,19 @@ Option A keeps the 8-state machine (`TaskQueue::can_transition_to`) and the `Eng
 rule that keeps wide tasks from starving.
 
 Implemented (`SCALE-2`): `WorkerIndex` and `RegisteredIndex` in `crates/master/src/worker_index.rs`
-maintain $O(W / 64)$ `u64` bitsets over OS, architecture, worker id/name, isolation level, tools,
+maintain `O(W / 64)` `u64` bitsets over OS, architecture, worker id/name, isolation level, tools,
 tags, GPU capability, protocol features (including `WORKSPACES`), free slots, and mobile
 thermal/battery buckets for fast candidate filtering and `fail_unfulfillable_tasks` checks.
 `WorkloadScheduler` (`crates/master/src/scheduler.rs`) scans `SCAN_PAGE = 512` ready tasks per step,
 `MasterServer::spawn` raises the default batch cap to `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024`
 (configurable via `master --max-batch-size`, `RUSTY_GRID_MAX_BATCH_SIZE`, and
 `[master].max_batch_size`), and both scheduler loops use adaptive micro-batch debounce plus a
-bounded multi-batch drain (`MAX_CONSECUTIVE_BATCHES = 16`). `FairShareQueue` in
+bounded multi-batch drain (`MAX_CONSECUTIVE_BATCHES = 16`). `FairShareQueues` in
 `crates/master/src/fair_share.rs` interleaves queued submissions per `SubmitterId` with weighted
-deficit round-robin while preserving priority ordering, wide-task hold-back, and `SpeedBook`
+round-robin while preserving priority ordering, wide-task hold-back, and `SpeedBook`
 hold-back. Dashboard broadcast sites guard on `b_tx.receiver_count() > 0` before calling
 `get_task`/`stats`, and `ColdResultStore` (`crates/master/src/cold_results.rs`, stored under
-`<state_dir>/cold_results/results.pack`) spills terminal `TaskResult` payloads past the hot
+`<state_dir>/cold_results/<xx>/<task_id>.bin` in `OXSWCLD1` format) spills terminal `TaskResult` payloads past the hot
 limits (`DEFAULT_MAX_HOT_TERMINAL_TASKS` / `DEFAULT_MAX_HOT_TERMINAL_BYTES`) while keeping
 `GetTaskStatus` RAM-only via `TaskStatusDetail`.
 
@@ -262,7 +262,7 @@ only if the owner's Q8 target needs more than one site.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | SCALE-1 | Load harness with simulated workers (D1) | `benchmarks/grid/`, `crates/worker/src/` (fake runner) | Dated records at 100, 500 and 1000 workers are committed | Planned |
-| SCALE-2 | Scheduler and queue at scale (D2) | `crates/master/src/scheduler.rs`, `queue.rs` | The SCALE-1 numbers improve by the Q8 target, with no change in placement results | Planned |
+| SCALE-2 | Scheduler and queue at scale (D2) | `crates/master/src/{worker_index,fair_share,cold_results,scheduler,queue,server,store}.rs` | The SCALE-1 numbers improve by the Q8 target, with no change in placement results | Partial |
 | SCALE-3 | Worker-to-worker blob distribution (D3) | `crates/core/src/blob_transfer.rs`, `crates/worker/src/blob_client.rs`, `crates/master/src/blob_store.rs` | A test shows the master sends one blob once to N workers | Planned |
 | SCALE-4 | Master high availability (D4) | `crates/master/src/store.rs`, `server.rs`, `crates/worker/src/client.rs` | Killing the leader loses no accepted task | Planned |
 | SCALE-5 | Autoscaling providers (D5) | new `crates/` module or bin | A queue backlog starts workers and idle time drains them, recorded live | Planned |
@@ -278,3 +278,4 @@ SCALE-6 only on need. ECO-3 and ECO-4 can start after SCALE-1.
 - 2026-11-09: Created as Draft at the owner's request to grow OxideSwarm into a large project.
   Nothing is built. The owner's decisions Q8, Q9 and Q12 in `ROADMAP.md` fix the target scale, the
   HA approach and the first providers.
+- 2026-11-14: Implemented D2 (`SCALE-2`) scheduler bitset index (`WorkerIndex` and `RegisteredIndex`), `SCAN_PAGE = 512` and `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size`), adaptive micro-batch debounce and multi-batch drain, per-submitter `FairShareQueues`, dashboard receiver guards, and `ColdResultStore` disk spill. Marked Partial until the 500-worker / 20-submitter `SCALE-1` harness run is recorded after PR #222 lands.

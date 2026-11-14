@@ -1,8 +1,8 @@
 //! Bitset index over worker capabilities, placement constraints, and free slots.
 //!
-//! `WorkerIndex` replaces repeated $O(W)$ linear scans over worker metadata inside a scheduling
-//! pass (`scheduler::Engine::place`) with $O(W / 64)$ bitwise intersections over bitsets, plus
-//! $O(W)$ initial construction once per pass. `RegisteredIndex` builds the same attribute index
+//! `WorkerIndex` replaces repeated `O(W)` linear scans over worker metadata inside a scheduling
+//! pass (`scheduler::Engine::place`) with `O(W / 64)` bitwise intersections over bitsets, plus
+//! `O(W)` initial construction once per pass. `RegisteredIndex` builds the same attribute index
 //! over all registered workers (including `Disconnected` / cooling-down workers) for
 //! `fail_unfulfillable_tasks` checks.
 
