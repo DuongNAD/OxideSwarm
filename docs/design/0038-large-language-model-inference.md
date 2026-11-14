@@ -1,7 +1,7 @@
 # 0038: Large language model inference on the grid
 
 Status: Planned
-Created: 2026-11-07    Updated: 2026-11-07
+Created: 2026-11-07    Updated: 2026-11-12
 
 ## Summary
 
@@ -39,6 +39,12 @@ this code base.
   (pipeline parallelism) lets a model larger than one machine's memory run. The stages still run one
   after another for each token, and every stage boundary adds a network round trip. One request is
   not faster than on one machine with the same bandwidth.
+- **The prompt crosses every boundary before the first token.** While the prompt is read, the
+  hidden state of each prompt token passes each stage boundary once. The size is prompt tokens
+  times hidden size times bytes per value. For 4096 tokens, a hidden size of 8192 and 16-bit
+  values that is 64 MiB per boundary, about half a second on a 1 Gbit/s link before any compute,
+  and twice that with 32-bit values. This is arithmetic, not a measurement. A record of a split
+  run (LLM-5) states the time to the first token beside tokens per second.
 - **Mixture-of-experts sparsity does not remove the network.** A sparse model reads fewer weights
   per token, which helps on every machine. Placing the experts of every layer on different machines
   (expert parallelism) needs a round trip per layer per token. That works over data-centre
@@ -189,3 +195,23 @@ Order: LLM-1 can start at any time. LLM-2 to LLM-5 wait until the grid itself is
 
 - 2026-11-07: Created as Planned at the owner's request, from a discussion of mixture-of-experts
   and mixture-of-agents designs. Nothing is built.
+- 2026-11-10: The research in [design 0056](0056-frontier-program.md) found the split of one model
+  slow on ordinary networks: about 1.5 tokens per second for a 70B model over Wi-Fi in the
+  prima.cpp paper. Design 0056 adds LLM-6 to LLM-8 on the request path of D1. LLM-2 to LLM-5 keep
+  their order. Nothing is built.
+- 2026-11-11: The owner asked whether a mixture-of-experts model can run over several machines
+  with the answer arriving on a weaker one. The physical limits in Context stand: placing the
+  experts of one model on different machines needs a round trip per layer per token. The case that
+  fits the question is D1, whole models on separate machines and one request per answer.
+  [Design 0059](0059-first-users.md) names LIVA as a first application for it. Nothing is built.
+- 2026-11-11: Context gained the cost of the prompt at a stage boundary (arithmetic, not
+  measured), from an outside reading of the plans. No item changed.
+- 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes a client tunnel
+  to a loopback model server (LLM-9) that uses the connection types of D4, and that LLM-4
+  reuses it. Q41 decides, after a trial. D4 is unchanged.
+- 2026-11-12: [Design 0062](0062-model-weights-into-remote-memory.md) records a reading of
+  llama.cpp's RPC backend of 2026-11-11. It proposes that the head of a split model runs on a
+  worker and not on the machine that asks (its D5). It also records an upstream report that
+  the RPC server ends when a connection reaches it through a relay, which the tunnel of D4
+  is: its spike R16 tests that before LLM-4 is sized. The texts of LLM-4 and LLM-5 are
+  unchanged.
