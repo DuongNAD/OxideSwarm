@@ -281,3 +281,5 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   `kit-install.txt` keep an override across updates. Reason: on an i7-1355U laptop, 6 concurrent
   tasks took 39.6 s each against 2.9 s for 2, and a 32-task batch waited 52 s on the laptop's 6
   tasks (see `SCHED-4`, design 0060).
+- 2026-11-10: A bootable image stays a non-goal of the kit. [Design 0056](0056-frontier-program.md)
+  plans one as a separate item (IMG-1), which reuses the kit's invite.
