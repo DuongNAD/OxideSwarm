@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-14, at `master` `a93f7082` plus W11 (PR 186): 74 items Implemented, 7 Partial and 41 Planned. Five items
+On 2026-11-14, at `master` `016e6cf6` plus W11 (PR 186): 75 items Implemented, 7 Partial and 40 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -232,7 +232,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | (design 0053), 185, 195, 207 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented | 204 (design 0055) |
-| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Planned |  |
+| USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented | 226 |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Planned |  |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
@@ -2578,8 +2578,18 @@ Add one dated line per finished item, newest last.
   `place`, `assign`, `run`, and `result` spans without secret or task-input leakage
   (`tests/observability_metrics_otel_test.rs`). The Index counts are now 74 Implemented, 7 Partial
   and 41 Planned.
+- 2026-11-14: Implemented USB-3 (Keep the Windows USB install folder apart from the default
+  workspace root, pull request 226): `packaging/usb/install.ps1` defaults `-InstallRoot` to
+  `%LOCALAPPDATA%\OxideSwarm-USB` (and `<drive>:\OxideSwarm-USB`), refuses fresh installs in
+  `%LOCALAPPDATA%\OxideSwarm` or `%LOCALAPPDATA%\oxideswarm\workspaces` while continuing `-Update`
+  and `uninstall.ps1` fallback for legacy `%LOCALAPPDATA%\OxideSwarm` installs, always passes
+  `--workspace-root <folder>\workspaces` (or `<folder>\usb-kit\workspaces` on legacy updates)
+  marked with `.oxideswarm-usb-workspaces`, and `packaging/usb/uninstall.ps1` refuses to delete a
+  folder containing an unmarked or foreign-used `workspaces` directory while naming the worker using
+  it (`tests/test_launcher_scripts.py` + isolated live Windows cluster check). The Index counts are
+  now 75 Implemented, 7 Partial and 40 Planned.
 - 2026-11-14: Completed design 0039 W11 under FEAT-4 (pull request 186, open): symbolic links and empty
   directories in `TreeManifest` (`oxideswarm-tree/2`, `ProtocolCapabilities::TREE_V2`), with
   case- and Unicode-folded `FoldedSymlinkTrie` / `FoldedPathTrie` validation, manifest complexity
   budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
-  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 74 Implemented, 7 Partial and 41 Planned.
+  `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 75 Implemented, 7 Partial and 40 Planned.
