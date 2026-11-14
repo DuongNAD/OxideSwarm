@@ -161,8 +161,8 @@ Per fresh cluster, `scale_load_driver` measures seven phases:
 
 1. Concurrent registration convergence across `N` workers.
 2. 32 sequential unloaded `submit` probes for submit-to-assign and submit-to-complete p50/p99 latency.
-3. A concurrent multi-submitter burst (`10` or `20` persistent TCP client connections submitting and
-   polling every `15 ms`).
+3. A concurrent multi-submitter burst (`10` or `20` persistent TCP client connections sending
+   `SubmitTask { wait: true }` and awaiting push `TaskCompleted` frames).
 4. A `6 s` quiet heartbeat window (`3 s` heartbeat interval) with `sysinfo` master RSS and CPU sampling.
 5. Simultaneous `10 MiB` input-blob fan-out from the master to `100` workers (`1000 MiB` total).
 6. Simultaneous `disconnect_all()` mass reconnect storm (`500 ms` initial backoff) followed by verification tasks.
@@ -209,4 +209,4 @@ simulated packet-loss stalls in the impaired run, range `643` to `654`). Peak ma
 - No other scheduler was run, so these figures are not a comparison with any other system.
 - (c) is one pair of machines on one LAN, a single worker and one crate: it shows what a reused `target/` saves, not how the grid scales, and a
   relayed or Internet link would add transfer time to a first run.
-- (d) isolates the master's control plane, blob store and journal by running simulated workers in one driver process on the same host over loopback (or user-space stream delays): it skips per-task OS process spawn, sandbox setup, and real multi-host NIC/router queues, and submit-to-assign timestamps include the client's 15 ms status-polling quantum.
+- (d) isolates the master's control plane, blob store and journal by running simulated workers in one driver process on the same host over loopback (or user-space stream delays): it skips per-task OS process spawn, sandbox setup, and real multi-host NIC/router queues, and submit-to-assign timestamps include the Windows timer and scheduler quantum (~15.6 ms).

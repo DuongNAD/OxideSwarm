@@ -106,8 +106,8 @@ matter first:
   for 1000 workers), steady master RSS (`25.7` / `55.7` / `87.6 MiB` at 100 / 500 / 1000 workers),
   and journal replay (`19.5 ms` in-process for `1.37 MB`) stay well within single-master bounds up
   to 1000 workers.
-- Simultaneous `100 x 10 MiB` input-blob fan-out spikes master RSS from `25.7–87.6 MiB` to
-  `507.4–676.7 MiB` median (up to `845.3 MiB` max) and drops to `39.23 MiB/s` (`25.5 s`,
+- Simultaneous `100 x 10 MiB` input-blob fan-out spikes master RSS from `25.7 to 87.6 MiB` to
+  `507.4 to 676.7 MiB` median (up to `845.3 MiB` max) and drops to `39.23 MiB/s` (`25.5 s`,
   `1537.5 %` peak master CPU) over a `25 ms + 10 ms`, `1 %`-loss simulated WAN link, pointing
   directly to `SCALE-3` (D3 worker-to-worker blob distribution and bounded master transfer buffers)
   as the primary data-plane bottleneck, alongside `SCALE-2` (D2 scheduler indexing, cold terminal
