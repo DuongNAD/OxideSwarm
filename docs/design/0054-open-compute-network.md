@@ -1,7 +1,7 @@
 # 0054: An open compute network (long-term vision)
 
 Status: Draft (vision; the owner's long-term goal of 2026-11-10; decisions Q14 to Q18 are open)
-Created: 2026-11-10    Updated: 2026-11-10
+Created: 2026-11-10    Updated: 2026-11-11
 
 ## Summary
 
@@ -91,6 +91,16 @@ the host. They are optional and come later, for users who need confidentiality.
 
 - **Redundancy.** Run a task on k independent contributors and accept the result when they agree.
   Deterministic WebAssembly gives byte-identical outputs, so comparing hashes is enough.
+  - Hash agreement does not cover floating-point results from GPUs of different vendors or
+    drivers: a GPU may fuse multiply-adds or reorder a sum, so correct results differ in their
+    last bits. The worker's own check of a matrix product is tolerance based for this reason
+    (`verify_gemm` in `crates/worker/src/cpu_simd.rs`). Such a task class needs a comparison
+    that the task type declares (a domain check, below) or replicas on the same architecture
+    and adapter. NET-3 does not design a tolerance rule yet.
+  - A contributor that sees another replica's result before it reports can copy it. Results go
+    only to the cluster that asked. A public record of a redundant task is published after
+    every replica has reported, or each replica first sends a commitment: a hash of its result
+    with a random value that it reveals later. NET-3 chooses between the two.
 - **Spot checks.** Send tasks whose answers are known, unannounced. A wrong answer costs
   reputation.
 - **Reputation.** A per-key history of agreement and spot-check results lowers k for reliable
@@ -112,6 +122,9 @@ the host. They are optional and come later, for users who need confidentiality.
 - **Credits.** A contributor earns credits for verified work and spends them to run work, and a
   cluster can grant credits to its own users. Both sides sign each record of work, so the
   accounting can be checked.
+  - A credit is entered for a contributor only together with an equal debit of the account that
+    asked for the work, or of a grant that a cluster made. Keys that sign work for each other
+    then move credits between themselves and create none. NET-2 carries this rule.
 - **Payments later.** Money or tokens would bring payments, fraud and law in with them. Q14
   decides; the default is credits only.
 
@@ -122,6 +135,8 @@ the host. They are optional and come later, for users who need confidentiality.
 - **Task classes and policy.** Tasks are allowed by class. Mining, scanning and denial of service
   are refused, and repeat offenders are blocked by key.
 - **Transparency.** Reports say what ran, how much and for whom.
+- **Open results.** A project that receives donated compute publishes its outputs and its task
+  code. The draft charter is [design 0057](0057-open-results-charter.md).
 - **Governance.** An open specification, a public security process and, when the network has
   outside users, a neutral steward (Q17).
 
@@ -184,3 +199,21 @@ Fuzzing covers every parser of network input.
 
 - 2026-11-10: Draft. The owner set the long-term goal of an open, worldwide compute network on top
   of OxideSwarm. Phase H in `docs/ROADMAP.md`; decisions Q14 to Q18 are open.
+- 2026-11-10: [Design 0056](0056-frontier-program.md) proposes to build NET-1 earlier, inside
+  trusted clusters (Q21), and names independent rebuilds (PROOF-5) as a first public workload for
+  Q16. Its research found Wasmtime at tier 3 on Android, and no measurement of bit-identical
+  results across CPU architectures. The exit check of H0 therefore waits for spike R1. Nothing in
+  this record changed.
+- 2026-11-10: D7 gained "Open results", from the owner's proposal of the same day. The draft
+  charter is [design 0057](0057-open-results-charter.md). The owner accepted its principle the
+  same day (Q27 to Q29).
+- 2026-11-10: The owner asked whether OxideSwarm should replace installed operating systems. The
+  first non-goal of this record stands until Q30 is decided. Design 0056 adds a worker image that
+  starts a whole machine without touching its installed system (IMG-1 to IMG-4).
+- 2026-11-11: D4 and D6 gained three notes from an outside reading of the plans: hash agreement
+  does not cover GPU results from different vendors, a replica must not be able to copy another
+  replica's result, and a credit needs an equal debit. They are notes for NET-2 and NET-3.
+  The same reading proposed staking and a protocol fee; Q14 stands, and neither is adopted.
+- 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes usage records
+  and a balance per member inside one cluster (LLM-10, LLM-11), under the rule of D6. It keeps
+  model traffic inside clusters of people who trust each other. Q14 and Q16 stay open.

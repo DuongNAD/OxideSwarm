@@ -1,0 +1,648 @@
+{
+  "schema": 1,
+  "study": "model bring-up, session 1 (design 0056, spike R11)",
+  "backend": "laya",
+  "started_utc": "2026-11-11T13:33:00Z",
+  "git": {
+    "commit": "29bed8d",
+    "other_changes": true
+  },
+  "machine": {
+    "os": "Darwin",
+    "os_release": "27.2.0",
+    "arch": "arm64",
+    "cpu": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368,
+    "power": "ac"
+  },
+  "load_averages": {
+    "before": [
+      4.56,
+      7.74,
+      8.3
+    ],
+    "after": [
+      4.45,
+      7.31,
+      8.12
+    ]
+  },
+  "python": "3.11.8",
+  "packages": {
+    "laya": "0.4.31",
+    "torch": "2.15.0",
+    "transformers": "5.22.2",
+    "tokenizers": "0.23.3",
+    "huggingface_hub": "2.4.0",
+    "numpy": "2.4.6"
+  },
+  "model": {
+    "repo": "convaiinnovations/laya",
+    "subfolder": "multilingual",
+    "device_requested": "library default",
+    "device_reported": "mps"
+  },
+  "parameters": {
+    "warm_loads": 5,
+    "repeats": 5,
+    "warm_phases_offline": true,
+    "sentences_file": "vi_sentences.jsonl",
+    "sentences_sha256": "283b1e45b2f19edf484e6b10d12a8bfd9313e86bfee02a826b5690e94f98f6c7",
+    "questions": {
+      "kind": {
+        "type": "choice",
+        "instructions": "Is the sentence a command that asks the assistant to carry out an action on the computer, or a question that asks for an answer in words?",
+        "criteria": {
+          "command": "an action to carry out on the computer: open, play, close, set, turn on or off, send, save, create",
+          "question": "a request for information, an explanation, a summary, advice or a calculation, answered in words"
+        }
+      }
+    }
+  },
+  "cache": {
+    "empty_at_start": true,
+    "bytes_after_cold_load": 678281590
+  },
+  "cold_load": {
+    "import_s": 0.179,
+    "load_s": 18.974,
+    "first_predict_s": 1.105,
+    "device_reported": "mps",
+    "process_wall_s": 20.629,
+    "fetch_measured": true
+  },
+  "warm_loads": {
+    "runs": [
+      {
+        "import_s": 0.061,
+        "load_s": 2.222,
+        "first_predict_s": 0.083,
+        "device_reported": "mps",
+        "process_wall_s": 2.661
+      },
+      {
+        "import_s": 0.041,
+        "load_s": 2.091,
+        "first_predict_s": 0.08,
+        "device_reported": "mps",
+        "process_wall_s": 2.49
+      },
+      {
+        "import_s": 0.041,
+        "load_s": 2.069,
+        "first_predict_s": 0.082,
+        "device_reported": "mps",
+        "process_wall_s": 2.466
+      },
+      {
+        "import_s": 0.042,
+        "load_s": 2.127,
+        "first_predict_s": 0.081,
+        "device_reported": "mps",
+        "process_wall_s": 2.518
+      },
+      {
+        "import_s": 0.041,
+        "load_s": 2.087,
+        "first_predict_s": 0.082,
+        "device_reported": "mps",
+        "process_wall_s": 2.492
+      }
+    ],
+    "load_s": {
+      "median": 2.091,
+      "min": 2.069,
+      "max": 2.222,
+      "n": 5
+    },
+    "process_wall_s": {
+      "median": 2.492,
+      "min": 2.466,
+      "max": 2.661,
+      "n": 5
+    }
+  },
+  "fetch_estimate": {
+    "seconds": 16.883,
+    "note": "cold load_s minus the median warm load_s; an estimate, not a timed download"
+  },
+  "decisions": {
+    "first_call_ms": 97.875,
+    "first_pass_ms": {
+      "median": 21.016,
+      "min": 18.797,
+      "max": 262.072,
+      "n": 20
+    },
+    "repeat_ms": {
+      "median": 17.664,
+      "min": 15.319,
+      "max": 24.109,
+      "n": 100
+    },
+    "accuracy": {
+      "correct": 18,
+      "total": 20,
+      "per_label": {
+        "command": {
+          "correct": 10,
+          "total": 10
+        },
+        "question": {
+          "correct": 8,
+          "total": 10
+        }
+      }
+    },
+    "misses": [
+      {
+        "id": 13,
+        "text": "Giải thích giúp tôi thuật toán sắp xếp nhanh.",
+        "expected": "question",
+        "got": "command"
+      },
+      {
+        "id": 19,
+        "text": "Khóa chính trong cơ sở dữ liệu dùng để làm gì?",
+        "expected": "question",
+        "got": "command"
+      }
+    ],
+    "labels_changed_between_passes": [],
+    "first_pass": [
+      {
+        "id": 1,
+        "ms": 97.875,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9994,
+            "question": 0.0006
+          },
+          "confidence": 0.9923,
+          "answer_confidence": 0.9994,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 2,
+        "ms": 20.803,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.5899,
+            "question": 0.4101
+          },
+          "confidence": 0.0234,
+          "answer_confidence": 0.5899,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 3,
+        "ms": 178.346,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.5544,
+            "question": 0.4456
+          },
+          "confidence": 0.0086,
+          "answer_confidence": 0.5544,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 4,
+        "ms": 21.122,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9943,
+            "question": 0.0057
+          },
+          "confidence": 0.9494,
+          "answer_confidence": 0.9943,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 5,
+        "ms": 262.072,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.5614,
+            "question": 0.4386
+          },
+          "confidence": 0.0109,
+          "answer_confidence": 0.5614,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 6,
+        "ms": 22.044,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.7032,
+            "question": 0.2968
+          },
+          "confidence": 0.1226,
+          "answer_confidence": 0.7032,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 7,
+        "ms": 20.91,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9787,
+            "question": 0.0213
+          },
+          "confidence": 0.8512,
+          "answer_confidence": 0.9787,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 8,
+        "ms": 25.179,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9826,
+            "question": 0.0174
+          },
+          "confidence": 0.8736,
+          "answer_confidence": 0.9826,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 9,
+        "ms": 23.478,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9534,
+            "question": 0.0466
+          },
+          "confidence": 0.7283,
+          "answer_confidence": 0.9534,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 10,
+        "ms": 18.797,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.9732,
+            "question": 0.0268
+          },
+          "confidence": 0.8218,
+          "answer_confidence": 0.9732,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 11,
+        "ms": 19.004,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0602,
+            "question": 0.9398
+          },
+          "confidence": 0.6716,
+          "answer_confidence": 0.9398,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 12,
+        "ms": 22.809,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0029,
+            "question": 0.9971
+          },
+          "confidence": 0.9717,
+          "answer_confidence": 0.9971,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 13,
+        "ms": 20.333,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.5128,
+            "question": 0.4872
+          },
+          "confidence": 0.0005,
+          "answer_confidence": 0.5128,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 14,
+        "ms": 18.954,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0081,
+            "question": 0.9919
+          },
+          "confidence": 0.9323,
+          "answer_confidence": 0.9919,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 15,
+        "ms": 19.137,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0321,
+            "question": 0.9679
+          },
+          "confidence": 0.7952,
+          "answer_confidence": 0.9679,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 16,
+        "ms": 24.014,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0164,
+            "question": 0.9836
+          },
+          "confidence": 0.8796,
+          "answer_confidence": 0.9836,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 17,
+        "ms": 20.265,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0457,
+            "question": 0.9543
+          },
+          "confidence": 0.7322,
+          "answer_confidence": 0.9543,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 18,
+        "ms": 19.176,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.0072,
+            "question": 0.9928
+          },
+          "confidence": 0.9381,
+          "answer_confidence": 0.9928,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 19,
+        "ms": 20.26,
+        "label": "command",
+        "answer": {
+          "type": "choice",
+          "choice": "command",
+          "probabilities": {
+            "command": 0.5721,
+            "question": 0.4279
+          },
+          "confidence": 0.015,
+          "answer_confidence": 0.5721,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      {
+        "id": 20,
+        "ms": 21.418,
+        "label": "question",
+        "answer": {
+          "type": "choice",
+          "choice": "question",
+          "probabilities": {
+            "command": 0.4476,
+            "question": 0.5524
+          },
+          "confidence": 0.008,
+          "answer_confidence": 0.5524,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      }
+    ],
+    "repeat_passes_ms": [
+      [
+        20.028,
+        19.003,
+        17.808,
+        17.392,
+        18.235,
+        24.109,
+        20.156,
+        21.195,
+        19.681,
+        21.509,
+        21.403,
+        17.574,
+        18.688,
+        18.213,
+        16.827,
+        16.659,
+        16.61,
+        16.446,
+        16.496,
+        17.014
+      ],
+      [
+        15.819,
+        15.666,
+        18.356,
+        15.897,
+        17.75,
+        17.732,
+        17.488,
+        21.241,
+        19.531,
+        18.878,
+        20.394,
+        17.354,
+        17.4,
+        17.791,
+        21.395,
+        20.646,
+        20.162,
+        18.838,
+        19.066,
+        21.138
+      ],
+      [
+        19.156,
+        18.622,
+        19.36,
+        20.535,
+        17.147,
+        20.04,
+        19.534,
+        18.891,
+        18.845,
+        17.671,
+        19.262,
+        16.927,
+        17.726,
+        16.434,
+        16.604,
+        16.493,
+        16.933,
+        16.636,
+        16.694,
+        16.61
+      ],
+      [
+        15.381,
+        17.012,
+        16.676,
+        16.539,
+        17.751,
+        16.401,
+        16.775,
+        16.691,
+        16.806,
+        15.387,
+        17.979,
+        15.319,
+        18.097,
+        16.453,
+        16.751,
+        17.744,
+        16.825,
+        18.112,
+        16.772,
+        19.877
+      ],
+      [
+        17.787,
+        16.889,
+        16.512,
+        16.425,
+        17.687,
+        18.313,
+        18.788,
+        18.168,
+        18.471,
+        16.403,
+        17.846,
+        15.545,
+        16.379,
+        16.641,
+        16.749,
+        16.491,
+        17.657,
+        16.684,
+        16.596,
+        16.837
+      ]
+    ]
+  }
+}

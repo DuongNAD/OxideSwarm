@@ -1,0 +1,20 @@
+{"id": 1, "text": "Mở nhạc lên giúp tôi.", "expected": "command"}
+{"id": 2, "text": "Hẹn giờ mười phút.", "expected": "command"}
+{"id": 3, "text": "Tăng âm lượng lên một chút.", "expected": "command"}
+{"id": 4, "text": "Mở trình duyệt Chrome.", "expected": "command"}
+{"id": 5, "text": "Tắt máy sau ba mươi phút nữa.", "expected": "command"}
+{"id": 6, "text": "Chụp màn hình rồi lưu vào thư mục Tải về.", "expected": "command"}
+{"id": 7, "text": "Đặt báo thức lúc sáu giờ sáng mai.", "expected": "command"}
+{"id": 8, "text": "Mở thư mục dự án của tôi.", "expected": "command"}
+{"id": 9, "text": "Gửi tin nhắn cho nhóm lớp rằng tôi sẽ đến muộn.", "expected": "command"}
+{"id": 10, "text": "Bật chế độ tối.", "expected": "command"}
+{"id": 11, "text": "Con trỏ trong ngôn ngữ C là gì?", "expected": "question"}
+{"id": 12, "text": "Vì sao bầu trời có màu xanh?", "expected": "question"}
+{"id": 13, "text": "Giải thích giúp tôi thuật toán sắp xếp nhanh.", "expected": "question"}
+{"id": 14, "text": "Thủ đô của Nhật Bản là thành phố nào?", "expected": "question"}
+{"id": 15, "text": "Sự khác nhau giữa RAM và ổ cứng là gì?", "expected": "question"}
+{"id": 16, "text": "Làm thế nào để học tiếng Anh hiệu quả hơn?", "expected": "question"}
+{"id": 17, "text": "Một năm ánh sáng dài bao nhiêu ki-lô-mét?", "expected": "question"}
+{"id": 18, "text": "Tại sao máy tính của tôi chạy chậm khi mở nhiều tab?", "expected": "question"}
+{"id": 19, "text": "Khóa chính trong cơ sở dữ liệu dùng để làm gì?", "expected": "question"}
+{"id": 20, "text": "Tóm tắt ý chính của định luật thứ hai của Newton.", "expected": "question"}

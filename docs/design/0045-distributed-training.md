@@ -1,7 +1,7 @@
 # 0045: Distributed training across workers
 
 Status: Planned
-Created: 2026-11-08    Updated: 2026-11-08
+Created: 2026-11-08    Updated: 2026-11-12
 
 ## Summary
 
@@ -12,6 +12,8 @@ OxideSwarm trains no model today. This record fixes the direction for when that 
   weights as blobs, and collects results.
 - **Independent runs first** (D1), then **low-communication rounds** in the style of DiLoCo (D2),
   with **adapter-only rounds** for fine-tuning (D3).
+- **A first workload for independent runs** is named in D6: grading edits that another model
+  wrote into the weights of a small model (spike R19).
 - Work starts after the core of the roadmap: the Phase D exit check of `ROADMAP.md` (decision Q6).
   Nothing in this record is built.
 
@@ -156,6 +158,59 @@ resubmits the round from its own state. Until FEAT-5 lands, a lost task restarts
 from zero. Short rounds keep that loss small. After both land, a round resumes from the journal and
 from the last checkpoint of each task.
 
+### D6 A workload for independent runs: grading edits to the weights of a small model
+
+**What was reported.** A blog post of 2026-11-02 by researchers at MIT CSAIL describes a large
+hosted model that reads the weights of a small open model and writes new values for a small
+share of them, with no gradient step
+([post](https://rikiyat.github.io/blog/weight-space-programming/),
+[logs](https://github.com/RikiyaT/lm_understand-logs)). It was read on 2026-11-12 through one
+news article about the post, on VentureBeat. The post itself was not read. By that article:
+
+- The patch to a model of 0.8 billion parameters touched about 0.016 % of its weights.
+- The scores on three tests rose. The authors put the gain down to less repetition in the
+  answers, and not to new skill.
+- A second small model, which did not repeat itself, did not improve.
+- No cycle of self-improvement was shown, and the patch still needed practice problems and
+  tests to be found.
+
+**What the owner proposed** on 2026-11-12: to use many machines for work of this kind.
+
+**Reading.** The writer of an edit is the hosted model. A grid of personal machines cannot take
+its place. The writing does not split over machines either, because edits act on each other.
+What does split is the test of each candidate. Every candidate needs a full pass over a test
+set, the passes do not depend on each other, and each returns one number. That is D1.
+
+**One task.**
+
+- **On the worker,** installed by its owner as in D1: the framework and the base model, each
+  advertised with a user tag.
+- **Inputs:** one patch file, which holds the changed values and where they go, one shard of
+  the test set, and the grading script. The base model is not an input. A model of that class
+  is larger than the 256 MiB that one submission may carry.
+- **Output:** one small file with the score of the shard and the answers.
+- **The client** submits one task for each pair of patch and shard, and adds up the scores.
+
+**Limits.**
+
+- A hosted model that writes patches costs money for each attempt. The first step uses only
+  patches that others have published (Q51 in [ROADMAP.md](../ROADMAP.md)).
+- The test has to grade itself.
+- The report is early and rests on one model. This record claims nothing about
+  self-improvement.
+- The grid checks no result here. A worker that returns a wrong score is not caught. Until the
+  receipts of [design 0056](0056-frontier-program.md) exist, the only check is a second run of
+  the same task on another worker.
+
+**Spike R19**, sized S, before TRAIN-1 is sized. The question: do two workers together grade
+as many items per hour as the two do alone, added up? The method: a small open model on each of
+the owner's two machines, and one public test set cut into shards, with one task for each
+shard. It runs on the first worker, on the second, and on both. If a published patch can be
+applied, the run is repeated with the patched model, and the record holds both scores. The
+record holds the date, both machines, the model, the test set, every command and the items
+graded per hour. The stop rule: if the two together grade less than 90 % of the sum, the cause
+is found before TRAIN-1 is sized.
+
 ## Compatibility
 
 - D1, D2, D3 and D5 need no change to the wire format. They use `Command` tasks, user tags, blob
@@ -199,6 +254,7 @@ from the last checkpoint of each task.
 | TRAIN-3 | Adapter rounds (D3). Size S. Needs TRAIN-2. | `scripts/`, `docs/guides/` | The D3 test passes | Planned |
 | TRAIN-4 | Outputs as inputs and input limits (D4). Size M. | `crates/cli/src/blobs.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The D4 tests pass | Planned |
 | TRAIN-5 | Rounds that survive the master (D5). Size S. Needs FEAT-1 and FEAT-5. | `scripts/` | A test restarts the master during a round, and the round completes | Planned |
+| R19 | Spike: two workers grade one test set (D6). Size S. | `benchmarks/` | A dated record holds the items graded per hour on each worker alone and on both, from a committed script | Planned |
 
 Order: every item waits for the Phase D exit check of `ROADMAP.md` (decision Q6). TRAIN-1 comes
 first. TRAIN-4 comes before TRAIN-2 when θ is larger than 256 MiB.
@@ -208,3 +264,7 @@ first. TRAIN-4 comes before TRAIN-2 when θ is larger than 256 MiB.
 - 2026-11-08: Created as Planned at the owner's request, from a discussion of training one model on
   several machines. The owner decided that it waits until the core of the roadmap is done. Nothing
   is built.
+- 2026-11-12: Added D6 and spike R19 at the owner's word, after a report that a large model
+  wrote edits into the weights of a small one. The owner proposed to use many machines for such
+  work. D6 reads that as grading candidates in parallel, which is D1. The report was read through
+  one news article, and the post itself was not read. Nothing is built or measured.
