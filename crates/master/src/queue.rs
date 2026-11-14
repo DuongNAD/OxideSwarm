@@ -753,6 +753,12 @@ struct TaskQueueInner {
     /// Index of tasks currently occupying each workspace (`Scheduled`, `Running`, or held in
     /// `held_tasks` via `adoptable_by` / `fail_if_not_adopted`).
     workspace_active_tasks: HashMap<String, HashSet<TaskId>>,
+    /// Lock-free Prometheus queue counters and latency histogram shared with [`TaskQueue`].
+    metrics: Arc<crate::metrics::QueueMetrics>,
+    /// Active `"run"` OpenTelemetry spans kept open from [`TaskQueue::mark_running_from`] until
+    /// execution completes, retries, or cancels.
+    #[cfg(feature = "otel")]
+    run_spans: HashMap<TaskId, tracing::Span>,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -880,7 +886,38 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
         + entry.error_message.as_ref().map_or(0, String::len)
 }
 
+fn mark_entry_scheduled(
+    entry: &mut TaskEntry,
+    worker_id: Uuid,
+    session_id: Option<u64>,
+    now: Instant,
+    policy: &RetryPolicy,
+    metrics: &crate::metrics::QueueMetrics,
+) -> (Task, bool) {
+    let zr = policy.zero_retries_for(entry);
+    metrics.observe_scheduling_latency(now.saturating_duration_since(entry.queued_instant));
+    entry.state = TaskState::Scheduled;
+    entry.assigned_worker_id = Some(worker_id);
+    entry.assigned_session = session_id;
+    entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
+    entry.adoptable_by = None;
+    entry.fail_if_not_adopted = false;
+    entry.pending_failover_charge = false;
+    entry.pending_failover_reason = None;
+    entry.scheduled_instant = Some(now);
+    (entry.task.clone(), zr)
+}
+
 impl TaskQueueInner {
+    fn close_run_span(&mut self, task_id: &TaskId) {
+        #[cfg(feature = "otel")]
+        {
+            self.run_spans.remove(task_id);
+        }
+        #[cfg(not(feature = "otel"))]
+        let _ = task_id;
+    }
+
     fn untrack_active_task(&mut self, task_id: &TaskId) {
         if let Some(size) = self.active_sizes.remove(task_id) {
             self.active_bytes = self.active_bytes.saturating_sub(size);
@@ -889,6 +926,13 @@ impl TaskQueueInner {
 
     fn update_active_task(&mut self, task_id: TaskId) {
         self.untrack_active_task(&task_id);
+        if !self
+            .tasks
+            .get(&task_id)
+            .is_some_and(|e| e.state == TaskState::Running)
+        {
+            self.close_run_span(&task_id);
+        }
         if let Some(entry) = self.tasks.get(&task_id).filter(|e| !e.state.is_terminal()) {
             let size = retained_bytes(entry);
             self.active_sizes.insert(task_id, size);
@@ -910,6 +954,7 @@ impl TaskQueueInner {
             .unwrap_or((None, None));
         self.tasks.remove(task_id);
         self.untrack_active_task(task_id);
+        self.close_run_span(task_id);
         self.track_adoption_hold(*task_id, false);
         if let Some(ws) = ws_name {
             if let Some(set) = self.workspace_active_tasks.get_mut(&ws) {
@@ -980,8 +1025,12 @@ impl TaskQueueInner {
 
     fn track_terminal_task(&mut self, task_id: TaskId) {
         self.untrack_active_task(&task_id);
+        self.close_run_span(&task_id);
         if self.terminal_sizes.contains_key(&task_id) {
             return;
+        }
+        if let Some(state) = self.tasks.get(&task_id).map(|e| e.state) {
+            self.metrics.record_terminal(state);
         }
         let size = self.tasks.get(&task_id).map_or(0, retained_bytes);
         self.terminal_sizes.insert(task_id, size);
@@ -1201,6 +1250,7 @@ const UNRESUMED_ZERO_RETRY_ERROR: &str =
 #[derive(Clone)]
 pub struct TaskQueue {
     inner: Arc<RwLock<TaskQueueInner>>,
+    metrics: Arc<crate::metrics::QueueMetrics>,
     adoption_holds: Arc<std::sync::atomic::AtomicUsize>,
     session_resume_hold_secs: Arc<std::sync::atomic::AtomicU64>,
     session_resume_workers: Arc<std::sync::Mutex<HashSet<Uuid>>>,
@@ -1262,6 +1312,7 @@ impl TaskQueue {
         let session_resume_workers = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let session_resume_tracker =
             Arc::new(std::sync::Mutex::new(SessionResumeTracker::default()));
+        let metrics = Arc::new(crate::metrics::QueueMetrics::new());
         Self {
             inner: Arc::new(RwLock::new(TaskQueueInner {
                 tasks: HashMap::new(),
@@ -1289,7 +1340,11 @@ impl TaskQueue {
                 session_resume_tracker: Arc::clone(&session_resume_tracker),
                 workspace_affinity: HashMap::new(),
                 workspace_active_tasks: HashMap::new(),
+                metrics: Arc::clone(&metrics),
+                #[cfg(feature = "otel")]
+                run_spans: HashMap::new(),
             })),
+            metrics,
             adoption_holds,
             session_resume_hold_secs,
             session_resume_workers,
@@ -2610,6 +2665,8 @@ impl TaskQueue {
         requires_tree_v2: bool,
     ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
+        #[cfg(feature = "otel")]
+        let requires_gpu = task.requirements.gpu_required;
 
         let (task_id, sequence, ack) = {
             let mut inner = self.inner.write().await;
@@ -2711,6 +2768,16 @@ impl TaskQueue {
             (task_id, sequence, ack)
         };
 
+        #[cfg(feature = "otel")]
+        let submit_span = tracing::info_span!(
+            target: crate::otel::OTEL_SPAN_TARGET,
+            "submit",
+            task_id = %task_id,
+            priority = i64::from(priority),
+            requires_gpu = requires_gpu,
+            outcome = tracing::field::Empty,
+        );
+
         if let Some(durable_ack) = ack {
             let ready_key = QueueOrderKey {
                 priority_rev: Reverse(priority),
@@ -2718,7 +2785,7 @@ impl TaskQueue {
                 task_id,
             };
             let inner_arc = Arc::clone(&self.inner);
-            tokio::spawn(async move {
+            let wait_res = tokio::spawn(async move {
                 match durable_ack.await {
                     Ok(()) => {
                         let mut inner = inner_arc.write().await;
@@ -2741,9 +2808,20 @@ impl TaskQueue {
                 }
             })
             .await
-            .map_err(|e| GridError::Storage(format!("submit ack worker cancelled: {e}")))??;
+            .map_err(|e| GridError::Storage(format!("submit ack worker cancelled: {e}")));
+            match wait_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) | Err(err) => {
+                    #[cfg(feature = "otel")]
+                    submit_span.record("outcome", "error");
+                    return Err(err);
+                }
+            }
         }
 
+        #[cfg(feature = "otel")]
+        submit_span.record("outcome", "accepted");
+        self.metrics.record_submitted();
         Ok(task_id)
     }
 
@@ -3122,19 +3200,10 @@ impl TaskQueue {
                     key.task_id,
                     now_epoch,
                 );
+                let metrics = Arc::clone(&inner.metrics);
                 let (task, zero_retries) = {
                     let entry = inner.tasks.get_mut(&key.task_id)?;
-                    let zr = policy.zero_retries_for(entry);
-                    entry.state = TaskState::Scheduled;
-                    entry.assigned_worker_id = Some(worker_id);
-                    entry.assigned_session = None;
-                    entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
-                    entry.adoptable_by = None;
-                    entry.fail_if_not_adopted = false;
-                    entry.pending_failover_charge = false;
-                    entry.pending_failover_reason = None;
-                    entry.scheduled_instant = Some(now);
-                    (entry.task.clone(), zr)
+                    mark_entry_scheduled(entry, worker_id, None, now, &policy, &metrics)
                 };
                 inner.track_adoption_hold(key.task_id, false);
 
@@ -3204,19 +3273,10 @@ impl TaskQueue {
             });
             Self::apply_pending_failover_charge_before_dispatch(&mut inner, *task_id, now_epoch);
 
+            let metrics = Arc::clone(&inner.metrics);
             let (task, zero_retries) = {
                 let entry = inner.tasks.get_mut(task_id)?;
-                let zr = policy.zero_retries_for(entry);
-                entry.state = TaskState::Scheduled;
-                entry.assigned_worker_id = Some(worker_id);
-                entry.assigned_session = None;
-                entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
-                entry.adoptable_by = None;
-                entry.fail_if_not_adopted = false;
-                entry.pending_failover_charge = false;
-                entry.pending_failover_reason = None;
-                entry.scheduled_instant = Some(now);
-                (entry.task.clone(), zr)
+                mark_entry_scheduled(entry, worker_id, None, now, &policy, &metrics)
             };
             inner.track_adoption_hold(*task_id, false);
 
@@ -3328,18 +3388,10 @@ impl TaskQueue {
                 });
                 Self::apply_pending_failover_charge_before_dispatch(&mut inner, task_id, now_epoch);
 
-                if let Some(entry) = inner.tasks.get_mut(&task_id) {
-                    let zero_retries = policy.zero_retries_for(entry);
-                    entry.state = TaskState::Scheduled;
-                    entry.assigned_worker_id = Some(worker_id);
-                    entry.assigned_session = session_id;
-                    entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
-                    entry.adoptable_by = None;
-                    entry.fail_if_not_adopted = false;
-                    entry.pending_failover_charge = false;
-                    entry.pending_failover_reason = None;
-                    entry.scheduled_instant = Some(now);
-                    let task = entry.task.clone();
+                let metrics = Arc::clone(&inner.metrics);
+                if let Some((task, zero_retries)) = inner.tasks.get_mut(&task_id).map(|entry| {
+                    mark_entry_scheduled(entry, worker_id, session_id, now, &policy, &metrics)
+                }) {
                     inner.track_adoption_hold(task_id, false);
 
                     inner
@@ -3429,6 +3481,7 @@ impl TaskQueue {
             };
 
             inner.sync_workspace_active(*task_id);
+            inner.close_run_span(task_id);
             inner.insert_ready(QueueOrderKey {
                 priority_rev: Reverse(priority),
                 sequence,
@@ -3513,6 +3566,7 @@ impl TaskQueue {
             tasks.remove(task_id);
         }
         inner.sync_workspace_active(*task_id);
+        inner.close_run_span(task_id);
         inner.refresh_worker_resume_protection(*worker_id);
         inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
@@ -3569,11 +3623,27 @@ impl TaskQueue {
                 inner.retry_policy.zero_retries_for(entry)
             };
 
+            let mut run_attempt = None;
             if let Some(entry) = inner.tasks.get_mut(task_id) {
                 entry.state = TaskState::Running;
                 entry.started_instant = Some(Instant::now());
+                run_attempt = Some(i64::from(entry.retry_count));
             }
             inner.sync_workspace_active(*task_id);
+            #[cfg(feature = "otel")]
+            if let Some(attempt) = run_attempt {
+                inner.close_run_span(task_id);
+                let run_span = tracing::info_span!(
+                    target: crate::otel::OTEL_SPAN_TARGET,
+                    "run",
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    attempt = attempt,
+                );
+                inner.run_spans.insert(*task_id, run_span);
+            }
+            #[cfg(not(feature = "otel"))]
+            let _ = run_attempt;
 
             let record = JournalRecord::TaskRunning {
                 task_id: *task_id,
@@ -3837,6 +3907,8 @@ impl TaskQueue {
         result: TaskResult,
     ) -> GridResult<(ResultOutcome, Option<DurableAck>)> {
         let task_id = result.task_id;
+        #[cfg(feature = "otel")]
+        let exit_code = i64::from(result.exit_code);
 
         let mut inner = self.inner.write().await;
         if inner.store_closed {
@@ -4128,6 +4200,30 @@ impl TaskQueue {
             inner.track_terminal_task(task_id);
         } else {
             inner.update_active_task(task_id);
+        }
+
+        #[cfg(feature = "otel")]
+        {
+            let attempt = inner
+                .tasks
+                .get(&task_id)
+                .map_or(0, |e| i64::from(e.retry_count));
+            let outcome = match res_state {
+                TaskState::Completed => "completed",
+                TaskState::Failed => "failed",
+                TaskState::Cancelled => "cancelled",
+                TaskState::Queued | TaskState::Retrying => "requeued",
+                _ => "other",
+            };
+            let _result_span = tracing::info_span!(
+                target: crate::otel::OTEL_SPAN_TARGET,
+                "result",
+                task_id = %task_id,
+                worker_id = %worker_id,
+                exit_code = exit_code,
+                attempt = attempt,
+                outcome = outcome,
+            );
         }
 
         let ack = inner.append_durable_warn(&journal_record);
@@ -5151,6 +5247,26 @@ impl TaskQueue {
     pub async fn store_error(&self) -> Option<String> {
         let inner = self.inner.read().await;
         inner.store.as_ref().and_then(|s| s.failure_reason())
+    }
+
+    /// Returns the lock-free queue counters and scheduling latency histogram handle.
+    pub fn metrics(&self) -> &Arc<crate::metrics::QueueMetrics> {
+        &self.metrics
+    }
+
+    /// Captures durable store health, journal counters, and fsync duration histogram for `/metrics`.
+    pub async fn store_metrics_snapshot(&self) -> crate::metrics::StoreMetricsSnapshot {
+        let inner = self.inner.read().await;
+        match inner.store.as_ref() {
+            Some(store) => crate::metrics::StoreMetricsSnapshot {
+                configured: true,
+                healthy: store.failure_reason().is_none(),
+                journal_bytes: store.journal_bytes(),
+                journal_records: store.journal_records(),
+                fsync_duration: store.fsync_histogram().snapshot(),
+            },
+            None => crate::metrics::StoreMetricsSnapshot::default(),
+        }
     }
 
     #[cfg(feature = "test-hooks")]

@@ -1648,8 +1648,25 @@ impl WorkloadScheduler {
                     self.note_gpu_demand();
                 }
                 for view in &views {
+                    #[cfg(feature = "otel")]
+                    let place_span = tracing::info_span!(
+                        target: crate::otel::OTEL_SPAN_TARGET,
+                        "place",
+                        task_id = %view.task_id,
+                        requires_gpu = view.requires_gpu,
+                        worker_id = tracing::field::Empty,
+                        verdict = tracing::field::Empty,
+                    );
                     match engine.place(view) {
                         Verdict::Placed(idx) => {
+                            #[cfg(feature = "otel")]
+                            {
+                                place_span.record("verdict", "placed");
+                                place_span.record(
+                                    "worker_id",
+                                    tracing::field::display(engine.seats[idx].worker.worker_id),
+                                );
+                            }
                             placements.push((view.task_id, idx));
                             if view.requires_gpu {
                                 self.note_gpu_demand();
@@ -1658,22 +1675,32 @@ impl WorkloadScheduler {
                                 engine.free_slots = 0;
                             }
                             if engine.free_slots == 0 && !need_unfulfillable_sweep {
+                                #[cfg(feature = "otel")]
+                                drop(place_span);
                                 break 'scan;
                             }
                         }
                         Verdict::Skip(reason) => {
+                            #[cfg(feature = "otel")]
+                            place_span.record("verdict", "skipped");
                             if report.skipped.len() < max_batch_size {
                                 report.skipped.push((view.task_id, reason));
                             }
                             // A worker held back for this task may have been the last one with room.
                             if engine.free_slots == 0 && !need_unfulfillable_sweep {
+                                #[cfg(feature = "otel")]
+                                drop(place_span);
                                 break 'scan;
                             }
                         }
                         Verdict::Unfulfillable(reason) => {
+                            #[cfg(feature = "otel")]
+                            place_span.record("verdict", "unfulfillable");
                             report.unfulfillable.push((view.task_id, reason));
                         }
                     }
+                    #[cfg(feature = "otel")]
+                    drop(place_span);
                 }
                 match next {
                     Some(key) => {
@@ -1794,10 +1821,20 @@ impl WorkloadScheduler {
             session_id,
             ..
         } = assignment;
+        #[cfg(feature = "otel")]
+        let assign_span = tracing::info_span!(
+            target: crate::otel::OTEL_SPAN_TARGET,
+            "assign",
+            task_id = %task_id,
+            worker_id = %worker_id,
+            outcome = tracing::field::Empty,
+        );
 
         let sender = match self.registry.reserve_dispatch(worker_id, *session_id).await {
             Ok(sender) => sender,
             Err(e) => {
+                #[cfg(feature = "otel")]
+                assign_span.record("outcome", "session_gone");
                 warn!(
                     task_id = %task_id,
                     worker_id = %worker_id,
@@ -1825,6 +1862,8 @@ impl WorkloadScheduler {
         };
         match delivered {
             Ok(Some(())) => {
+                #[cfg(feature = "otel")]
+                assign_span.record("outcome", "dispatched");
                 debug!(
                     task_id = %task_id,
                     worker_id = %worker_id,
@@ -1833,6 +1872,8 @@ impl WorkloadScheduler {
                 return;
             }
             Ok(None) => {
+                #[cfg(feature = "otel")]
+                assign_span.record("outcome", "stale");
                 // Cancelled, failed over or reassigned between the placement and now: the worker
                 // never hears of it, so it must not run it (and its slot is free again).
                 debug!(
@@ -1844,7 +1885,10 @@ impl WorkloadScheduler {
                 self.registry.release_dispatch(worker_id, *session_id).await;
                 return;
             }
-            Err(()) => {}
+            Err(()) => {
+                #[cfg(feature = "otel")]
+                assign_span.record("outcome", "dispatch_failed");
+            }
         }
 
         warn!(

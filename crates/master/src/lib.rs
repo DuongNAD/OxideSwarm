@@ -6,9 +6,13 @@ pub mod blob_store;
 pub mod dashboard;
 pub mod liveness;
 pub mod mapreduce;
+pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod queue;
 pub mod reaper;
 pub mod registry;
+pub mod rendezvous;
 pub mod scheduler;
 pub mod server;
 mod session;
@@ -37,6 +41,12 @@ pub use queue::{
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
 pub use registry::{
     HeartbeatOutcome, Registration, WorkerEntry, WorkerInfo, WorkerRegistry, WorkerStatus,
+};
+#[cfg(feature = "dashboard")]
+pub use rendezvous::{build_rendezvous_router, spawn_rendezvous_server, RendezvousServerHandle};
+pub use rendezvous::{
+    KeyedRendezvousConfig, KeyedRendezvousStore, DEFAULT_MAX_LEASES, DEFAULT_MAX_TTL_SECS,
+    LEASE_CLOCK_SKEW_SECS, MAX_LEASE_REQUEST_BYTES,
 };
 pub use scheduler::{
     ScheduleAssignment, ScheduleReport, ScheduleSkipReason, SchedulerConfig, SchedulingPolicy,
