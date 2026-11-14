@@ -20,7 +20,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_grid_core::blob::{
-    open_regular_file_nofollow, validate_blob_path, BlobFile, BlobHasher, BlobId, TreeManifest,
+    fold_blob_path, open_regular_file_nofollow, validate_blob_path, validate_symlink_target,
+    BlobFile, BlobHasher, BlobId, BlobSymlink, FoldedPathTrie, TreeManifest,
 };
 use rusty_grid_core::task::validate_workspace_name;
 use serde::{Deserialize, Serialize};
@@ -171,13 +172,21 @@ struct FileRecord {
     mtime_ns: u64,
 }
 
-/// The content of `state.json` (D2, D3).
+/// The content of `state.json` (D2, D3, W11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     version: u32,
     pub state: SyncState,
     records: BTreeMap<String, FileRecord>,
     pending: BTreeSet<String>,
+    #[serde(default)]
+    symlinks: BTreeMap<String, String>,
+    #[serde(default)]
+    pending_symlinks: BTreeSet<String>,
+    #[serde(default)]
+    empty_dirs: BTreeSet<String>,
+    #[serde(default)]
+    pending_dirs: BTreeSet<String>,
     /// Milliseconds since the Unix epoch.
     pub last_used_ms: u64,
     pub size_bytes: u64,
@@ -190,6 +199,10 @@ impl WorkspaceState {
             state: SyncState::Syncing,
             records: BTreeMap::new(),
             pending: BTreeSet::new(),
+            symlinks: BTreeMap::new(),
+            pending_symlinks: BTreeSet::new(),
+            empty_dirs: BTreeSet::new(),
+            pending_dirs: BTreeSet::new(),
             last_used_ms: 0,
             size_bytes: 0,
         }
@@ -206,6 +219,11 @@ pub struct SyncReport {
     /// Files hashed (not skipped by the size and time fast path).
     pub hashed: usize,
     pub deleted: usize,
+    /// Symbolic links skipped when the Windows worker lacks `SeCreateSymbolicLinkPrivilege`
+    /// (OS error `1314`) and Developer Mode is off.
+    pub skipped_symlinks: usize,
+    /// Warning for the task's stderr when symbolic links were skipped due to error `1314`.
+    pub warning: Option<String>,
 }
 
 /// One row of [`WorkspaceStore::list`].
@@ -819,17 +837,71 @@ impl WorkspaceGuard {
         let mut st = read_state(&self.dir).unwrap_or_else(WorkspaceState::fresh);
         let force_hash = st.state != SyncState::Ready;
 
-        check_case_collisions(manifest)?;
+        let folded_manifest_dirs = check_case_collisions(manifest)?;
         // Check every path before any change, so a bad manifest touches nothing.
         let mut targets: Vec<(&BlobFile, PathBuf)> = Vec::with_capacity(manifest.files().len());
         for f in manifest.files() {
             targets.push((f, checked_path(&tree, &f.path)?));
         }
-        let new_paths: BTreeSet<&str> = manifest.files().iter().map(|f| f.path.as_str()).collect();
+        let mut link_targets: Vec<(&BlobSymlink, PathBuf, String)> =
+            Vec::with_capacity(manifest.symlinks().len());
+        for s in manifest.symlinks() {
+            let link_path = checked_path(&tree, &s.path)?;
+            let resolved = validate_symlink_target(&s.path, &s.target).map_err(|reason| {
+                WorkspaceError::Path {
+                    path: s.path.clone(),
+                    reason,
+                }
+            })?;
+            checked_path(&tree, &resolved).map_err(|e| WorkspaceError::Path {
+                path: s.path.clone(),
+                reason: format!("symbolic link target '{resolved}': {e}"),
+            })?;
+            link_targets.push((s, link_path, resolved));
+        }
+        let mut empty_dir_targets: Vec<(&str, PathBuf)> =
+            Vec::with_capacity(manifest.empty_dirs().len());
+        for d in manifest.empty_dirs() {
+            empty_dir_targets.push((d.as_str(), checked_path(&tree, d)?));
+        }
+
+        let new_file_paths: BTreeSet<&str> =
+            manifest.files().iter().map(|f| f.path.as_str()).collect();
+        let new_symlink_paths: BTreeSet<&str> = manifest
+            .symlinks()
+            .iter()
+            .map(|s| s.path.as_str())
+            .collect();
+        let new_empty_dirs: BTreeSet<&str> =
+            manifest.empty_dirs().iter().map(|d| d.as_str()).collect();
+        let was_tracked_symlink: HashSet<String> = st
+            .symlinks
+            .keys()
+            .chain(st.pending_symlinks.iter())
+            .cloned()
+            .collect();
+        let folded_tracked_symlinks: HashSet<String> = was_tracked_symlink
+            .iter()
+            .map(|p| fold_blob_path(p))
+            .collect();
+        for (s, _, _) in &link_targets {
+            ensure_target_walks_no_on_disk_symlink(
+                &tree,
+                &s.path,
+                &s.target,
+                &folded_tracked_symlinks,
+            )?;
+        }
 
         // 1. pending paths, Syncing, flush.
-        for p in &new_paths {
+        for p in &new_file_paths {
             st.pending.insert((*p).to_string());
+        }
+        for p in &new_symlink_paths {
+            st.pending_symlinks.insert((*p).to_string());
+        }
+        for p in &new_empty_dirs {
+            st.pending_dirs.insert((*p).to_string());
         }
         st.state = SyncState::Syncing;
         st.last_used_ms = (self.store.clock)();
@@ -852,18 +924,37 @@ impl WorkspaceGuard {
 
         let mut report = SyncReport::default();
 
-        // 4. delete tracked paths the manifest dropped (regular files only), then empty dirs.
-        let stale: Vec<String> = st
+        // 4. delete tracked paths the manifest dropped (regular files, tracked symlinks, and
+        //    tracked empty directories), then remove directories left empty.
+        let stale_files: Vec<String> = st
             .records
             .keys()
             .chain(st.pending.iter())
-            .filter(|p| !new_paths.contains(p.as_str()))
+            .filter(|p| !new_file_paths.contains(p.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stale_symlinks: Vec<String> = st
+            .symlinks
+            .keys()
+            .chain(st.pending_symlinks.iter())
+            .filter(|p| !new_symlink_paths.contains(p.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stale_dirs: Vec<String> = st
+            .empty_dirs
+            .iter()
+            .chain(st.pending_dirs.iter())
+            .filter(|p| !manifest.has_dir(p.as_str()))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for p in &stale {
+        for p in &stale_files {
             let Ok(path) = checked_path(&tree, p) else {
                 continue;
             };
@@ -886,12 +977,60 @@ impl WorkspaceGuard {
                 cur = d.parent();
             }
         }
+        for p in &stale_symlinks {
+            let Ok(path) = checked_path(&tree, p) else {
+                continue;
+            };
+            if !parents_are_real_dirs(&tree, &path) {
+                continue;
+            }
+            if let Ok(m) = fs::symlink_metadata(&path) {
+                if is_link_like(&m) {
+                    remove_symlink(&path).map_err(io_err(format!("deleting symbolic link {p}")))?;
+                    report.deleted += 1;
+                }
+            }
+            let mut cur = path.parent();
+            while let Some(d) = cur {
+                if d == tree {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
+        for p in &stale_dirs {
+            let Ok(path) = checked_path(&tree, p) else {
+                continue;
+            };
+            if !parents_are_real_dirs(&tree, &path) {
+                continue;
+            }
+            let mut cur = Some(path.as_path());
+            while let Some(d) = cur {
+                if d == tree {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
         // Deepest first; remove_dir fails on a non-empty directory, which is the point.
         for d in dirs.iter().rev() {
-            let _ = fs::remove_dir(d);
+            if let Ok(m) = fs::symlink_metadata(d) {
+                if m.is_dir()
+                    && !is_link_like(&m)
+                    && fs::remove_dir(d).is_ok()
+                    && stale_dirs
+                        .iter()
+                        .any(|sd| d.strip_prefix(&tree).ok() == Some(Path::new(sd)))
+                {
+                    report.deleted += 1;
+                }
+            }
         }
 
-        // 2 and 3. add or replace.
+        // 2 and 3. add or replace regular files, empty directories, and in-tree symbolic links.
         let mut records = BTreeMap::new();
         for (file, path) in &targets {
             ensure_parents(&tree, path, &file.path)?;
@@ -958,9 +1097,46 @@ impl WorkspaceGuard {
             );
         }
 
+        let mut empty_dirs_out = BTreeSet::new();
+        for (dir_rel, dir_path) in &empty_dir_targets {
+            ensure_parents(&tree, dir_path, dir_rel)?;
+            match fs::symlink_metadata(dir_path) {
+                Ok(m) if m.is_dir() && !is_link_like(&m) => {}
+                Ok(m) => {
+                    let what = if is_link_like(&m) {
+                        "a symbolic link"
+                    } else {
+                        "a file"
+                    };
+                    return Err(WorkspaceError::Path {
+                        path: (*dir_rel).to_string(),
+                        reason: format!("the tree has {what} here"),
+                    });
+                }
+                Err(_) => {
+                    fs::create_dir(dir_path)
+                        .map_err(io_err(format!("creating empty directory {dir_rel}")))?;
+                }
+            }
+            empty_dirs_out.insert((*dir_rel).to_string());
+        }
+
+        let symlinks_out = materialize_symlinks(
+            &tree,
+            &self.name,
+            &link_targets,
+            &folded_manifest_dirs,
+            &was_tracked_symlink,
+            &mut report,
+        )?;
+
         // 5. records := new manifest, clear pending, Ready, flush.
         st.records = records;
         st.pending.clear();
+        st.symlinks = symlinks_out;
+        st.pending_symlinks.clear();
+        st.empty_dirs = empty_dirs_out;
+        st.pending_dirs.clear();
         st.state = SyncState::Ready;
         self.write_state(&st)?;
         Ok(report)
@@ -1006,35 +1182,432 @@ impl WorkspaceGuard {
     }
 }
 
-/// Refuses a manifest whose paths differ only by case (`A.rs` and `a.rs`, or a file `A` next to
-/// `a/x`): on the case-insensitive default file systems of macOS and Windows they are one file,
-/// so the sync would leave one of the contents in place and rewrite it every time. Uses Unicode
-/// lowercasing on every host. Residual: names that differ only by NFC/NFD normalisation (macOS
-/// APFS treats them as equal) are not detected.
-fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> {
-    let mut files: HashSet<String> = HashSet::new();
-    let mut dirs: HashSet<String> = HashSet::new();
-    let clash = |path: &str, other: &str| WorkspaceError::Path {
-        path: path.to_string(),
+/// Refuses a manifest whose paths differ only by case or Unicode NFC/NFD normalisation (`A.rs`
+/// and `a.rs`, `caf\u{00e9}.rs` and `cafe\u{0301}.rs`, or a file `A` next to `a/x`): on the
+/// case- and normalisation-insensitive default file systems of macOS and Windows they are one
+/// file, so the sync would leave one of the contents in place and rewrite it every time. Uses
+/// [`FoldedPathTrie`] (node-ID trie over [`fold_blob_path`]) on every host.
+fn check_case_collisions(manifest: &TreeManifest) -> Result<FoldedPathTrie, WorkspaceError> {
+    FoldedPathTrie::from_manifest(manifest).map_err(|(path, other)| WorkspaceError::Path {
+        path,
         reason: format!(
-            "it differs from '{other}' only by case, which one file system entry cannot hold \
-             on macOS and Windows"
+            "it differs from '{other}' only by case or Unicode normalisation, which one file \
+             system entry cannot hold on macOS and Windows"
         ),
-    };
-    for f in manifest.files() {
-        let folded = f.path.to_lowercase();
-        if dirs.contains(&folded) || !files.insert(folded.clone()) {
-            return Err(clash(&f.path, &folded));
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_SYMLINK_1314: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+fn verbatim_dir_path(p: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        || wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        return p.to_path_buf();
+    }
+    if p.is_absolute() {
+        let mut out: Vec<u16> = Vec::with_capacity(wide.len() + 4);
+        out.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        for &ch in &wide {
+            out.push(if ch == b'/' as u16 { b'\\' as u16 } else { ch });
         }
-        for (pos, _) in folded.match_indices('/') {
-            let d = &folded[..pos];
-            if files.contains(d) {
-                return Err(clash(&f.path, d));
+        return PathBuf::from(std::ffi::OsString::from_wide(&out));
+    }
+    p.to_path_buf()
+}
+
+#[cfg(unix)]
+const MAX_OPEN_WALK_FDS: usize = 32;
+
+#[cfg(unix)]
+enum UnixWalkState {
+    Dir(Option<std::os::fd::OwnedFd>),
+    NonTraversable,
+}
+
+#[cfg(unix)]
+fn openat_dir_nofollow(
+    parent_fd: std::os::fd::RawFd,
+    seg: &str,
+    link_path: &str,
+    target: &str,
+    rel: &str,
+) -> Result<std::os::fd::OwnedFd, WorkspaceError> {
+    use std::os::fd::FromRawFd;
+    let c_seg = std::ffi::CString::new(seg).map_err(|_| WorkspaceError::Path {
+        path: link_path.to_string(),
+        reason: format!("symbolic link target '{target}' contains a NUL byte"),
+    })?;
+    let raw = unsafe {
+        libc::openat(
+            parent_fd,
+            c_seg.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(WorkspaceError::Path {
+            path: link_path.to_string(),
+            reason: format!(
+                "cannot open directory '{rel}' while checking symbolic link target '{target}': {err}"
+            ),
+        });
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+#[cfg(unix)]
+fn ensure_unix_parent_fd(
+    root_fd: std::os::fd::RawFd,
+    cur: &[&str],
+    stack: &mut [UnixWalkState],
+    idx: usize,
+    link_path: &str,
+    target: &str,
+) -> Result<std::os::fd::RawFd, WorkspaceError> {
+    use std::os::fd::AsRawFd;
+    if let UnixWalkState::Dir(Some(fd)) = &stack[idx] {
+        return Ok(fd.as_raw_fd());
+    }
+    let mut start = idx;
+    while start > 0 {
+        if matches!(stack[start - 1], UnixWalkState::Dir(Some(_))) {
+            break;
+        }
+        start -= 1;
+    }
+    let mut cur_fd = if start == 0 {
+        root_fd
+    } else if let UnixWalkState::Dir(Some(fd)) = &stack[start - 1] {
+        fd.as_raw_fd()
+    } else {
+        unreachable!()
+    };
+    for step in start..=idx {
+        let rel = cur[..=step].join("/");
+        let opened = openat_dir_nofollow(cur_fd, cur[step], link_path, target, &rel)?;
+        cur_fd = opened.as_raw_fd();
+        let open_count = stack
+            .iter()
+            .filter(|s| matches!(s, UnixWalkState::Dir(Some(_))))
+            .count();
+        if open_count >= MAX_OPEN_WALK_FDS {
+            if let Some(slot) = stack
+                .iter_mut()
+                .find(|s| matches!(s, UnixWalkState::Dir(Some(_))))
+            {
+                *slot = UnixWalkState::Dir(None);
             }
-            dirs.insert(d.to_string());
+        }
+        stack[step] = UnixWalkState::Dir(Some(opened));
+    }
+    Ok(cur_fd)
+}
+
+fn ensure_target_walks_no_on_disk_symlink<'a>(
+    tree: &Path,
+    link_path: &'a str,
+    target: &'a str,
+    ignored_folded_symlinks: &HashSet<String>,
+) -> Result<(), WorkspaceError> {
+    match fs::symlink_metadata(tree) {
+        Ok(m) if m.is_dir() && !is_link_like(&m) => {}
+        Ok(_) => {
+            return Err(WorkspaceError::Path {
+                path: "tree".to_string(),
+                reason: "the tree is not a real directory".to_string(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(WorkspaceError::Path {
+                path: link_path.to_string(),
+                reason: format!(
+                "cannot inspect workspace tree while checking symbolic link target '{target}': {e}"
+            ),
+            })
         }
     }
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_tree = std::ffi::CString::new(tree.as_os_str().as_bytes()).map_err(|_| {
+            WorkspaceError::Path {
+                path: link_path.to_string(),
+                reason: "workspace tree path contains a NUL byte".to_string(),
+            }
+        })?;
+        let raw_root = unsafe {
+            libc::open(
+                c_tree.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_root < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(WorkspaceError::Path {
+                path: link_path.to_string(),
+                reason: format!(
+                    "cannot open workspace tree while checking symbolic link target '{target}': {err}"
+                ),
+            });
+        }
+        let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+        let mut cur: Vec<&str> = Vec::new();
+        let mut stack: Vec<UnixWalkState> = Vec::new();
+
+        let push_seg = |seg: &'a str,
+                        cur: &mut Vec<&'a str>,
+                        stack: &mut Vec<UnixWalkState>|
+         -> Result<(), WorkspaceError> {
+            let parent_idx = cur.len();
+            cur.push(seg);
+            if parent_idx > 0 && matches!(stack[parent_idx - 1], UnixWalkState::NonTraversable) {
+                stack.push(UnixWalkState::NonTraversable);
+                return Ok(());
+            }
+            let parent_fd = if parent_idx == 0 {
+                root_fd.as_raw_fd()
+            } else {
+                ensure_unix_parent_fd(
+                    root_fd.as_raw_fd(),
+                    &cur[..parent_idx],
+                    stack,
+                    parent_idx - 1,
+                    link_path,
+                    target,
+                )?
+            };
+            let c_seg = std::ffi::CString::new(seg).map_err(|_| WorkspaceError::Path {
+                path: link_path.to_string(),
+                reason: format!("symbolic link target '{target}' contains a NUL byte"),
+            })?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let rc = unsafe {
+                libc::fstatat(
+                    parent_fd,
+                    c_seg.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    stack.push(UnixWalkState::NonTraversable);
+                    return Ok(());
+                }
+                let rel = cur.join("/");
+                return Err(WorkspaceError::Path {
+                    path: link_path.to_string(),
+                    reason: format!(
+                        "cannot inspect '{rel}' while checking symbolic link target '{target}': {err}"
+                    ),
+                });
+            }
+            let st = unsafe { st.assume_init() };
+            let mode = st.st_mode & libc::S_IFMT;
+            if mode == libc::S_IFLNK {
+                let rel = cur.join("/");
+                if ignored_folded_symlinks.contains(&fold_blob_path(&rel)) {
+                    stack.push(UnixWalkState::NonTraversable);
+                    return Ok(());
+                }
+                return Err(WorkspaceError::Path {
+                    path: link_path.to_string(),
+                    reason: format!(
+                        "symbolic link target '{target}' traverses through symbolic link '{rel}'"
+                    ),
+                });
+            }
+            if mode == libc::S_IFDIR {
+                let rel = cur.join("/");
+                let child_fd = openat_dir_nofollow(parent_fd, seg, link_path, target, &rel)?;
+                let open_count = stack
+                    .iter()
+                    .filter(|s| matches!(s, UnixWalkState::Dir(Some(_))))
+                    .count();
+                if open_count >= MAX_OPEN_WALK_FDS {
+                    if let Some(slot) = stack
+                        .iter_mut()
+                        .find(|s| matches!(s, UnixWalkState::Dir(Some(_))))
+                    {
+                        *slot = UnixWalkState::Dir(None);
+                    }
+                }
+                stack.push(UnixWalkState::Dir(Some(child_fd)));
+            } else {
+                stack.push(UnixWalkState::NonTraversable);
+            }
+            Ok(())
+        };
+
+        let mut init_segs: Vec<&str> = link_path.split('/').collect();
+        init_segs.pop();
+        for seg in init_segs {
+            push_seg(seg, &mut cur, &mut stack)?;
+        }
+        for segment in target.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if cur.pop().is_some() {
+                        stack.pop();
+                    }
+                }
+                s => push_seg(s, &mut cur, &mut stack)?,
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let mut disk_path = verbatim_dir_path(tree);
+        let mut cur: Vec<&str> = Vec::new();
+        // `true` when the prefix is a confirmed real directory on disk; `false` when it is absent,
+        // a non-directory file, or an ignored tracked symlink.
+        let mut stack: Vec<bool> = Vec::new();
+
+        let push_seg = |seg: &'a str,
+                        cur: &mut Vec<&'a str>,
+                        disk_path: &mut PathBuf,
+                        stack: &mut Vec<bool>|
+         -> Result<(), WorkspaceError> {
+            let parent_is_dir = stack.last().copied().unwrap_or(true);
+            cur.push(seg);
+            disk_path.push(seg);
+            if !parent_is_dir {
+                stack.push(false);
+                return Ok(());
+            }
+            let meta_res = OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&*disk_path)
+                .and_then(|f| f.metadata());
+            match meta_res {
+                Ok(m) => {
+                    if is_link_like(&m) {
+                        let rel = cur.join("/");
+                        if ignored_folded_symlinks.contains(&fold_blob_path(&rel)) {
+                            stack.push(false);
+                            return Ok(());
+                        }
+                        return Err(WorkspaceError::Path {
+                            path: link_path.to_string(),
+                            reason: format!(
+                                "symbolic link target '{target}' traverses through symbolic link '{rel}'"
+                            ),
+                        });
+                    }
+                    stack.push(m.is_dir());
+                    Ok(())
+                }
+                Err(e) if e.raw_os_error() == Some(2) => {
+                    stack.push(false);
+                    Ok(())
+                }
+                Err(e) => {
+                    let rel = cur.join("/");
+                    Err(WorkspaceError::Path {
+                        path: link_path.to_string(),
+                        reason: format!(
+                            "cannot inspect '{rel}' while checking symbolic link target '{target}': {e}"
+                        ),
+                    })
+                }
+            }
+        };
+
+        let mut init_segs: Vec<&str> = link_path.split('/').collect();
+        init_segs.pop();
+        for seg in init_segs {
+            push_seg(seg, &mut cur, &mut disk_path, &mut stack)?;
+        }
+        for segment in target.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if cur.pop().is_some() {
+                        disk_path.pop();
+                        stack.pop();
+                    }
+                }
+                s => push_seg(s, &mut cur, &mut disk_path, &mut stack)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn symlink_kind_matches(meta: &fs::Metadata, target_is_dir: bool) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        let ft = meta.file_type();
+        if target_is_dir {
+            ft.is_symlink_dir()
+        } else {
+            ft.is_symlink_file()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (meta, target_is_dir);
+        true
+    }
+}
+
+fn create_in_tree_symlink(
+    target: &str,
+    link_path: &Path,
+    target_is_dir: bool,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_SYMLINK_1314.with(|c| c.get()) {
+        return Err(std::io::Error::from_raw_os_error(1314));
+    }
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::os::unix::fs::symlink(target, link_path)
+    }
+    #[cfg(windows)]
+    {
+        let win_target = target.replace('/', "\\");
+        let verbatim_link = verbatim_dir_path(link_path);
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(&win_target, &verbatim_link)
+        } else {
+            std::os::windows::fs::symlink_file(&win_target, &verbatim_link)
+        }
+    }
+}
+
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let verbatim = verbatim_dir_path(path);
+    #[cfg(windows)]
+    let p: &Path = &verbatim;
+    #[cfg(not(windows))]
+    let p: &Path = path;
+    fs::remove_file(p).or_else(|_| fs::remove_dir(p))
 }
 
 /// `tree` joined with the manifest path `rel`, after the checks of design 0021 and the blob path
@@ -1187,6 +1760,126 @@ fn set_exec(path: &Path, executable: bool) {
 
 #[cfg(not(unix))]
 fn set_exec(_path: &Path, _executable: bool) {}
+
+fn materialize_symlinks(
+    tree: &Path,
+    workspace_name: &str,
+    link_targets: &[(&BlobSymlink, PathBuf, String)],
+    folded_manifest_dirs: &FoldedPathTrie,
+    was_tracked_symlink: &HashSet<String>,
+    report: &mut SyncReport,
+) -> Result<BTreeMap<String, String>, WorkspaceError> {
+    let mut symlinks_out = BTreeMap::new();
+    let mut active_symlinks: Vec<&Path> = Vec::new();
+    let empty_set: HashSet<String> = HashSet::new();
+    let rollback_symlinks = |paths: &[&Path]| {
+        for p in paths {
+            let _ = remove_symlink(p);
+        }
+    };
+    for (link, path, resolved) in link_targets {
+        if let Err(e) = ensure_parents(tree, path, &link.path).and_then(|()| {
+            ensure_target_walks_no_on_disk_symlink(tree, &link.path, &link.target, &empty_set)
+        }) {
+            rollback_symlinks(&active_symlinks);
+            return Err(e);
+        }
+        let target_is_dir =
+            folded_manifest_dirs.contains_dir(resolved) || is_real_dir(&tree.join(resolved));
+        let tracked = was_tracked_symlink.contains(&link.path);
+        let kept = match fs::symlink_metadata(path) {
+            Ok(m) if is_link_like(&m) => {
+                let existing = fs::read_link(path)
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.replace('\\', "/")));
+                let same_target = existing.as_deref() == Some(link.target.as_str());
+                if same_target && symlink_kind_matches(&m, target_is_dir) {
+                    true
+                } else if same_target || tracked {
+                    if let Err(e) = remove_symlink(path)
+                        .map_err(io_err(format!("replacing symbolic link {}", link.path)))
+                    {
+                        rollback_symlinks(&active_symlinks);
+                        return Err(e);
+                    }
+                    false
+                } else {
+                    rollback_symlinks(&active_symlinks);
+                    return Err(WorkspaceError::Path {
+                        path: link.path.clone(),
+                        reason: "the tree already has a different symbolic link here".to_string(),
+                    });
+                }
+            }
+            Ok(m) if m.is_dir() => {
+                rollback_symlinks(&active_symlinks);
+                return Err(WorkspaceError::Path {
+                    path: link.path.clone(),
+                    reason: "the tree has a directory here".to_string(),
+                });
+            }
+            Ok(_) => {
+                if tracked {
+                    if let Err(e) =
+                        fs::remove_file(path).map_err(io_err(format!("replacing {}", link.path)))
+                    {
+                        rollback_symlinks(&active_symlinks);
+                        return Err(e);
+                    }
+                    false
+                } else {
+                    rollback_symlinks(&active_symlinks);
+                    return Err(WorkspaceError::Path {
+                        path: link.path.clone(),
+                        reason: "the tree has a file here".to_string(),
+                    });
+                }
+            }
+            Err(_) => false,
+        };
+        if kept {
+            active_symlinks.push(path.as_path());
+            report.unchanged += 1;
+            symlinks_out.insert(link.path.clone(), link.target.clone());
+        } else {
+            match create_in_tree_symlink(&link.target, path, target_is_dir) {
+                Ok(()) => {
+                    active_symlinks.push(path.as_path());
+                    report.written += 1;
+                    symlinks_out.insert(link.path.clone(), link.target.clone());
+                }
+                Err(e) if (cfg!(windows) || cfg!(test)) && e.raw_os_error() == Some(1314) => {
+                    report.skipped_symlinks += 1;
+                }
+                Err(e) => {
+                    rollback_symlinks(&active_symlinks);
+                    return Err(io_err(format!("creating symbolic link {}", link.path))(e));
+                }
+            }
+        }
+    }
+    // Re-verify every link's target walk on disk after all links of this sync exist, so the
+    // check uses the host filesystem's own case/Unicode folding and does not depend on the
+    // order in which links were created.
+    for (link, _, _) in link_targets {
+        if let Err(e) =
+            ensure_target_walks_no_on_disk_symlink(tree, &link.path, &link.target, &empty_set)
+        {
+            rollback_symlinks(&active_symlinks);
+            return Err(e);
+        }
+    }
+    if report.skipped_symlinks > 0 {
+        report.warning = Some(format!(
+            "workspace '{workspace_name}': skipped {} symbolic link(s) because Windows returned \
+             ERROR_PRIVILEGE_NOT_HELD (1314); enable Developer Mode in Settings -> System -> \
+             For developers -> Developer Mode (or grant SeCreateSymbolicLinkPrivilege) to \
+             materialize symbolic links",
+            report.skipped_symlinks
+        ));
+    }
+    Ok(symlinks_out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2140,5 +2833,743 @@ mod tests {
         assert!(g.tree_dir().join("sub").is_symlink());
         assert!(g.sync(&manifest(v1), &Mem::new(v1)).is_err());
         assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn w11_empty_directories_are_materialized_and_cleaned_up_when_dropped() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("src/main.rs", "fn main() {}", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["empty/nested".to_string(), "fixtures".to_string()],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert!(g.tree_dir().join("empty/nested").is_dir());
+        assert!(g.tree_dir().join("fixtures").is_dir());
+
+        // Dropping "empty/nested" removes both "empty/nested" and "empty".
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["fixtures".to_string()],
+        )
+        .unwrap();
+        let r = g.sync(&m2, &Mem::new(v1_files)).unwrap();
+        assert!(r.deleted >= 1);
+        assert!(!g.tree_dir().join("empty").exists());
+        assert!(g.tree_dir().join("fixtures").is_dir());
+    }
+
+    #[test]
+    fn w11_in_tree_symlinks_arrive_as_links_and_update_or_delete_cleanly() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[
+            ("scripts/mode.sh", "#!/bin/sh\necho ok\n", true),
+            ("scripts/alt.sh", "#!/bin/sh\necho alt\n", true),
+        ];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "ox-mode".to_string(),
+                target: "scripts/mode.sh".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let r1 = g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r1.written, 3);
+        let link_meta = fs::symlink_metadata(g.tree_dir().join("ox-mode")).unwrap();
+        assert!(is_link_like(&link_meta), "ox-mode must arrive as a symlink");
+        let link_target = fs::read_link(g.tree_dir().join("ox-mode"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        assert_eq!(link_target, "scripts/mode.sh");
+        assert_eq!(read(&g, "ox-mode"), "#!/bin/sh\necho ok\n");
+
+        // Second sync with unchanged symlink keeps it without rewriting.
+        let r2 = g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!((r2.written, r2.unchanged), (0, 3));
+
+        // Updating the symlink target replaces the link.
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "ox-mode".to_string(),
+                target: "scripts/alt.sh".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let r3 = g.sync(&m2, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r3.written, 1);
+        assert_eq!(read(&g, "ox-mode"), "#!/bin/sh\necho alt\n");
+
+        // Dropping the symlink removes it from the tree.
+        let m3 = manifest(v1_files);
+        let r4 = g.sync(&m3, &Mem::new(v1_files)).unwrap();
+        assert_eq!(r4.deleted, 1);
+        assert!(fs::symlink_metadata(g.tree_dir().join("ox-mode")).is_err());
+    }
+
+    #[test]
+    fn w11_windows_error_1314_skips_symlinks_with_developer_mode_warning() {
+        struct Force1314Guard;
+        impl Drop for Force1314Guard {
+            fn drop(&mut self) {
+                FORCE_SYMLINK_1314.with(|c| c.set(false));
+            }
+        }
+        FORCE_SYMLINK_1314.with(|c| c.set(true));
+        let _guard = Force1314Guard;
+
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("src/main.rs", "fn main() {}", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![
+                BlobSymlink {
+                    path: "alias1".to_string(),
+                    target: "src/main.rs".to_string(),
+                },
+                BlobSymlink {
+                    path: "alias2".to_string(),
+                    target: "src".to_string(),
+                },
+            ],
+            vec!["empty_dir".to_string()],
+        )
+        .unwrap();
+        let r = g
+            .sync(&m1, &Mem::new(v1_files))
+            .expect("sync must succeed with a warning when error 1314 occurs");
+        assert_eq!(r.written, 1);
+        assert_eq!(r.skipped_symlinks, 2);
+        let warning = r.warning.expect("expected warning on skipped symlinks");
+        assert!(
+            warning.contains("1314") && warning.contains("Developer Mode"),
+            "unexpected warning text: {warning}"
+        );
+        assert_eq!(read(&g, "src/main.rs"), "fn main() {}");
+        assert!(g.tree_dir().join("empty_dir").is_dir());
+        assert!(!g.tree_dir().join("alias1").exists());
+        assert!(!g.tree_dir().join("alias2").exists());
+        let st = g.state().unwrap();
+        assert_eq!(st.state, SyncState::Ready);
+        assert!(st.symlinks.is_empty());
+    }
+
+    #[test]
+    fn w11_untracked_file_at_new_symlink_path_is_refused_and_preserved() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("a.rs", "aaa", false)];
+        g.sync(&manifest(v1_files), &Mem::new(v1_files)).unwrap();
+
+        // A build writes an untracked file `out.bin` in `tree/`.
+        fs::write(g.tree_dir().join("out.bin"), "build-artifact").unwrap();
+
+        // Next sync introduces a symlink at `out.bin -> a.rs`. Because `out.bin` was not a tracked
+        // symlink, `sync` must refuse with `WorkspaceError::Path` and leave `out.bin` untouched.
+        let m2 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "out.bin".to_string(),
+                target: "a.rs".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let err = g.sync(&m2, &Mem::new(v1_files)).unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Path { ref path, .. } if path == "out.bin"),
+            "expected WorkspaceError::Path for untracked file at symlink path, got: {err}"
+        );
+        assert_eq!(read(&g, "out.bin"), "build-artifact");
+    }
+
+    #[test]
+    fn w11_unicode_nfc_nfd_colliding_paths_are_refused_before_any_change() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        // `caf\u{00e9}.rs` (NFC) vs `cafe\u{0301}.rs` (NFD)
+        let nfc_nfd: Files = &[
+            ("caf\u{00e9}.rs", "nfc", false),
+            ("cafe\u{0301}.rs", "nfd", false),
+        ];
+        let err = g.sync(&manifest(nfc_nfd), &Mem::new(nfc_nfd)).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Path { .. }), "{err}");
+        assert!(!g.tree_dir().exists(), "nothing was created");
+    }
+
+    #[test]
+    fn w11_symlink_target_changing_between_file_and_dir_recreates_link() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        // Sync 1: `item` is a regular file, `alias -> item`.
+        let v1_files: Files = &[("item", "file-body", false)];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert_eq!(read(&g, "alias"), "file-body");
+
+        // Sync 2: `item/sub.txt` is a file inside directory `item`, and `alias -> item` changes
+        // target kind from regular file to directory without changing its target string.
+        let v2_files: Files = &[("item/sub.txt", "inside-dir", false)];
+        let m2 = TreeManifest::with_entries(
+            manifest(v2_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m2, &Mem::new(v2_files)).unwrap();
+        let meta = fs::symlink_metadata(g.tree_dir().join("alias")).unwrap();
+        assert!(symlink_kind_matches(&meta, true));
+        assert_eq!(read(&g, "alias/sub.txt"), "inside-dir");
+
+        // Sync 3: `ITEM/sub.txt` differs in case from `alias_folded -> item`; `target_is_dir`
+        // folds case when choosing the symlink kind on Windows, and resolves through
+        // `alias_folded/sub.txt` on case-insensitive filesystems.
+        let v3_files: Files = &[("ITEM/sub.txt", "inside-dir-folded", false)];
+        let m3 = TreeManifest::with_entries(
+            manifest(v3_files).into_files(),
+            vec![BlobSymlink {
+                path: "alias_folded".to_string(),
+                target: "item".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m3, &Mem::new(v3_files)).unwrap();
+        let meta = fs::symlink_metadata(g.tree_dir().join("alias_folded")).unwrap();
+        assert!(symlink_kind_matches(&meta, true));
+        if g.tree_dir().join("item").exists() {
+            assert_eq!(read(&g, "alias_folded/sub.txt"), "inside-dir-folded");
+        }
+    }
+
+    #[test]
+    fn w11_symlinked_parent_left_by_task_refuses_links_and_empty_dirs_and_skips_deletes() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::create_dir(&probe_orig).unwrap();
+        if !crate::sandbox::try_create_test_symlink_dir(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("k", "keep", false)];
+        let m_with_link = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "sub/alias".to_string(),
+                target: "../k".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let m_with_empty = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["sub/empty".to_string()],
+        )
+        .unwrap();
+        let m_both = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "sub/alias".to_string(),
+                target: "../k".to_string(),
+            }],
+            vec!["sub/empty".to_string()],
+        )
+        .unwrap();
+        g.sync(&m_both, &Mem::new(v1_files)).unwrap();
+
+        // A task replaces `tree/sub` with a symlink to `victim` outside `tree/`.
+        let victim = td.path().join("victim");
+        fs::create_dir_all(victim.join("empty")).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_file(
+            Path::new("../k"),
+            &victim.join("alias")
+        ));
+        fs::remove_dir_all(g.tree_dir().join("sub")).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_dir(
+            &victim,
+            &g.tree_dir().join("sub")
+        ));
+
+        // Dropping `sub/alias` and `sub/empty` must NOT delete inside `victim` through `tree/sub`.
+        let m_only_k = manifest(v1_files);
+        g.sync(&m_only_k, &Mem::new(v1_files)).unwrap();
+        assert!(fs::symlink_metadata(victim.join("alias")).is_ok());
+        assert!(victim.join("empty").is_dir());
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("sub")).unwrap()
+        ));
+
+        // Placing a symlink or empty directory under `tree/sub` must fail without touching `victim`.
+        let _ = remove_symlink(&victim.join("alias"));
+        fs::remove_dir(victim.join("empty")).unwrap();
+        assert!(g.sync(&m_with_link, &Mem::new(v1_files)).is_err());
+        assert!(fs::symlink_metadata(victim.join("alias")).is_err());
+        assert!(g.sync(&m_with_empty, &Mem::new(v1_files)).is_err());
+        assert!(!victim.join("empty").exists());
+    }
+
+    #[test]
+    fn w11_switching_entry_between_directory_symlink_and_file_across_syncs() {
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::write(&probe_orig, "probe").unwrap();
+        if !crate::sandbox::try_create_test_symlink_file(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        // Sync 1: `d` is a non-empty directory (`d/inside.txt`), `empty_d` is an empty directory,
+        // and `target.txt` is a regular file.
+        let v1_files: Files = &[
+            ("d/inside.txt", "in-d", false),
+            ("target.txt", "target-body", false),
+        ];
+        let m1 = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![],
+            vec!["empty_d".to_string()],
+        )
+        .unwrap();
+        g.sync(&m1, &Mem::new(v1_files)).unwrap();
+        assert!(g.tree_dir().join("d").is_dir());
+        assert!(g.tree_dir().join("empty_d").is_dir());
+
+        // Sync 2: `d` and `empty_d` both switch from directories to symlinks pointing to `target.txt`.
+        let v2_files: Files = &[("target.txt", "target-body", false)];
+        let m2 = TreeManifest::with_entries(
+            manifest(v2_files).into_files(),
+            vec![
+                BlobSymlink {
+                    path: "d".to_string(),
+                    target: "target.txt".to_string(),
+                },
+                BlobSymlink {
+                    path: "empty_d".to_string(),
+                    target: "target.txt".to_string(),
+                },
+            ],
+            vec![],
+        )
+        .unwrap();
+        g.sync(&m2, &Mem::new(v2_files)).unwrap();
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("d")).unwrap()
+        ));
+        assert!(is_link_like(
+            &fs::symlink_metadata(g.tree_dir().join("empty_d")).unwrap()
+        ));
+        assert_eq!(read(&g, "d"), "target-body");
+        assert_eq!(read(&g, "empty_d"), "target-body");
+
+        // Sync 3: `d` switches from a symlink to a regular file, and `empty_d` switches from a
+        // symlink back to an empty directory.
+        let v3_files: Files = &[
+            ("d", "regular-d", false),
+            ("target.txt", "target-body", false),
+        ];
+        let m3 = TreeManifest::with_entries(
+            manifest(v3_files).into_files(),
+            vec![],
+            vec!["empty_d".to_string()],
+        )
+        .unwrap();
+        g.sync(&m3, &Mem::new(v3_files)).unwrap();
+        let d_meta = fs::symlink_metadata(g.tree_dir().join("d")).unwrap();
+        assert!(d_meta.is_file() && !is_link_like(&d_meta));
+        assert_eq!(read(&g, "d"), "regular-d");
+        let empty_meta = fs::symlink_metadata(g.tree_dir().join("empty_d")).unwrap();
+        assert!(empty_meta.is_dir() && !is_link_like(&empty_meta));
+    }
+
+    #[test]
+    fn w11_case_folded_symlink_chain_and_task_leftover_link_traversal_are_refused() {
+        // 1. In-manifest case-folded chains (`a/b/up -> ..` + `hop -> A/B/UP/../..`,
+        //    `s/b/up -> ..` + `hop -> ſ/b/up/../..`, and deeper `s/b/c/up -> ../..` +
+        //    `hop -> ſ/b/c/up/../../..`) are refused.
+        for (up_path, up_target, hop_target) in [
+            ("a/b/up", "..", "A/B/UP/../.."),
+            ("s/b/up", "..", "\u{017f}/b/up/../.."),
+            ("s/b/c/up", "../..", "\u{017f}/b/c/up/../../.."),
+            ("ss/k/up", "..", "ẞ/\u{212a}/up/../.."),
+        ] {
+            let res = TreeManifest::with_entries(
+                vec![],
+                vec![
+                    BlobSymlink {
+                        path: up_path.to_string(),
+                        target: up_target.to_string(),
+                    },
+                    BlobSymlink {
+                        path: "hop".to_string(),
+                        target: hop_target.to_string(),
+                    },
+                ],
+                vec![],
+            );
+            assert!(
+                res.is_err(),
+                "case-folded chain ({up_path}, {hop_target}) in manifest must be refused"
+            );
+        }
+
+        // 2. If a task leaves an untracked symlink `a/b/up -> ..` on disk in `tree/`, a later sync
+        //    introducing `hop -> a/b/up/../..` (and `hop -> A/B/UP/../..` on case-insensitive
+        //    filesystems) is refused before creating `hop`.
+        let td = tempfile::tempdir().unwrap();
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::create_dir(&probe_orig).unwrap();
+        if !crate::sandbox::try_create_test_symlink_dir(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        let (_s, g) = ready(&td);
+        let v1_files: Files = &[("a/b/keep.txt", "ok", false)];
+        g.sync(&manifest(v1_files), &Mem::new(v1_files)).unwrap();
+        assert!(crate::sandbox::try_create_test_symlink_dir(
+            Path::new(".."),
+            &g.tree_dir().join("a/b/up")
+        ));
+
+        let m_exact = TreeManifest::with_entries(
+            manifest(v1_files).into_files(),
+            vec![BlobSymlink {
+                path: "hop".to_string(),
+                target: "a/b/up/../..".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let err_exact = g.sync(&m_exact, &Mem::new(v1_files)).unwrap_err();
+        assert!(
+            matches!(err_exact, WorkspaceError::Path { ref path, .. } if path == "hop"),
+            "expected WorkspaceError::Path for hop traversing on-disk link, got: {err_exact}"
+        );
+        assert!(fs::symlink_metadata(g.tree_dir().join("hop")).is_err());
+
+        if g.tree_dir().join("A/B/UP").exists() {
+            let m_folded = TreeManifest::with_entries(
+                manifest(v1_files).into_files(),
+                vec![BlobSymlink {
+                    path: "hop".to_string(),
+                    target: "A/B/UP/../..".to_string(),
+                }],
+                vec![],
+            )
+            .unwrap();
+            let err_folded = g.sync(&m_folded, &Mem::new(v1_files)).unwrap_err();
+            assert!(
+                matches!(err_folded, WorkspaceError::Path { ref path, .. } if path == "hop"),
+                "expected WorkspaceError::Path for case-folded hop traversing on-disk link, got: {err_folded}"
+            );
+            assert!(fs::symlink_metadata(g.tree_dir().join("hop")).is_err());
+        }
+
+        // 3. Order-independent post-creation verification & rollback in `materialize_symlinks`:
+        //    even when `hop` is created BEFORE `s/b/up` (or deeper `s/b/c/up`), the post-creation
+        //    walk catches `hop`, rolls back all links created in the pass, and fails the sync.
+        let _ = remove_symlink(&g.tree_dir().join("a/b/up"));
+        for (up_rel, up_target, hop_target, hop_resolved) in [
+            ("s/b/up", "..", "s/b/up/../..", "s"),
+            ("s/b/c/up", "../..", "s/b/c/up/../../..", "s"),
+        ] {
+            let l_hop = BlobSymlink {
+                path: "hop".to_string(),
+                target: hop_target.to_string(),
+            };
+            let l_up = BlobSymlink {
+                path: up_rel.to_string(),
+                target: up_target.to_string(),
+            };
+            let targets = vec![
+                (&l_hop, g.tree_dir().join("hop"), hop_resolved.to_string()),
+                (&l_up, g.tree_dir().join(up_rel), "s".to_string()),
+            ];
+            let mut report = SyncReport::default();
+            let s_trie = FoldedPathTrie::from_manifest(
+                &TreeManifest::with_entries(vec![], vec![], vec!["s".to_string()]).unwrap(),
+            )
+            .unwrap();
+            let err = materialize_symlinks(
+                &g.tree_dir(),
+                "proj",
+                &targets,
+                &s_trie,
+                &HashSet::new(),
+                &mut report,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::Path { ref path, .. } if path == "hop"),
+                "expected post-creation failure on 'hop', got: {err}"
+            );
+            assert!(
+                fs::symlink_metadata(g.tree_dir().join("hop")).is_err(),
+                "created 'hop' link must be rolled back on failure"
+            );
+            assert!(
+                fs::symlink_metadata(g.tree_dir().join(up_rel)).is_err(),
+                "created '{up_rel}' link must be rolled back on failure"
+            );
+        }
+    }
+
+    #[test]
+    fn w11_long_target_segment_walk_enametoolong_and_kept_symlink_rollback() {
+        // 1. In-manifest 230-level deep pair with 'ẞ' (U+1E9E) and 'K' (U+212A) whose target
+        //    exceeds 1,024 bytes (`PATH_MAX` on macOS) is refused by `TreeManifest` on every OS.
+        let depth = 230usize;
+        let k_chain = vec!["k"; depth].join("/");
+        let kelvin_chain = vec!["\u{212a}"; depth].join("/");
+        let up_path = format!("ss/{k_chain}/up");
+        let up_target = vec![".."; depth].join("/");
+        let hop_dots = vec![".."; depth + 1].join("/");
+        let hop_target_unicode = format!("ẞ/{kelvin_chain}/up/{hop_dots}");
+        assert!(
+            hop_target_unicode.len() > 1024,
+            "target byte length ({}) must exceed macOS PATH_MAX (1024)",
+            hop_target_unicode.len()
+        );
+        let manifest_err = TreeManifest::with_entries(
+            vec![],
+            vec![
+                BlobSymlink {
+                    path: up_path.clone(),
+                    target: up_target.clone(),
+                },
+                BlobSymlink {
+                    path: "hop".to_string(),
+                    target: hop_target_unicode.clone(),
+                },
+            ],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(
+            manifest_err.contains("traverses through symbolic link"),
+            "{manifest_err}"
+        );
+
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let base_files: Files = &[("s/b/keep.txt", "ok", false)];
+        g.sync(&manifest(base_files), &Mem::new(base_files))
+            .unwrap();
+
+        // 2. Non-ENOENT metadata error (overlong 300-byte component -> ENAMETOOLONG /
+        //    ERROR_FILENAME_EXCED_RANGE) must fail closed instead of being ignored as "not a link".
+        let overlong_target = format!("{}/../s/b/keep.txt", "a".repeat(300));
+        let err_overlong = ensure_target_walks_no_on_disk_symlink(
+            &g.tree_dir(),
+            "hop",
+            &overlong_target,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_overlong, WorkspaceError::Path { ref path, .. } if path == "hop"),
+            "overlong component error must fail closed on 'hop', got: {err_overlong}"
+        );
+
+        // 3. Segment-by-segment on-disk walk at depth 230 with target > 1,024 bytes:
+        //    create `ss/k/k/.../k/up -> ../..` on disk and verify a > 1,024-byte target walking
+        //    through `up` is caught even when the walked path exceeds `PATH_MAX` (1024).
+        let deep_parent = g.tree_dir().join("ss").join(&k_chain);
+        #[cfg(windows)]
+        let deep_parent_create = verbatim_dir_path(&deep_parent);
+        #[cfg(not(windows))]
+        let deep_parent_create = deep_parent.clone();
+        fs::create_dir_all(&deep_parent_create).unwrap();
+        let deep_up = deep_parent.join("up");
+        let deep_link_created = match create_in_tree_symlink("../..", &deep_up, true) {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(1314) => std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(verbatim_dir_path(&deep_up))
+                .arg(g.tree_dir().join("ss"))
+                .output()
+                .is_ok_and(|o| o.status.success()),
+            Err(_) => false,
+        };
+        assert!(
+            deep_link_created,
+            "must create deep symlink or junction for 230-level walk test"
+        );
+        {
+            let hop_target_ascii_long = format!("{}ss/{k_chain}/up/{hop_dots}", "./".repeat(300));
+            assert!(hop_target_ascii_long.len() > 1024);
+            let err_deep_ascii = ensure_target_walks_no_on_disk_symlink(
+                &g.tree_dir(),
+                "hop",
+                &hop_target_ascii_long,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err_deep_ascii, WorkspaceError::Path { ref path, ref reason }
+                    if path == "hop" && reason.contains("traverses through symbolic link")),
+                "expected deep on-disk symlink traversal error, got: {err_deep_ascii}"
+            );
+
+            // On macOS (APFS) or any filesystem that folds 'ẞ'/'ss' or 'K'/'k', verify the 3-byte
+            // UTF-8 target (`> 1024` bytes without `./` padding) is also caught on disk.
+            #[cfg(windows)]
+            let kelvin_probe = verbatim_dir_path(&g.tree_dir().join("ss").join(&kelvin_chain));
+            #[cfg(not(windows))]
+            let kelvin_probe = g.tree_dir().join("ss").join(&kelvin_chain);
+            if kelvin_probe.exists() {
+                let hop_kelvin = format!("ss/{kelvin_chain}/up/{hop_dots}");
+                assert!(hop_kelvin.len() > 1024);
+                let err_kelvin = ensure_target_walks_no_on_disk_symlink(
+                    &g.tree_dir(),
+                    "hop",
+                    &hop_kelvin,
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err_kelvin, WorkspaceError::Path { ref path, ref reason }
+                        if path == "hop" && reason.contains("traverses through symbolic link")),
+                    "expected Kelvin-folded deep symlink traversal error, got: {err_kelvin}"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            if g.tree_dir().join("ẞ").exists() {
+                let err_macos = ensure_target_walks_no_on_disk_symlink(
+                    &g.tree_dir(),
+                    "hop",
+                    &hop_target_unicode,
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err_macos, WorkspaceError::Path { ref path, ref reason }
+                        if path == "hop" && reason.contains("traverses through symbolic link")),
+                    "expected macOS APFS sharp-S + Kelvin symlink traversal error, got: {err_macos}"
+                );
+            }
+            let _ = remove_symlink(&deep_up);
+        }
+
+        let probe_orig = td.path().join("probe_orig");
+        let probe_link = td.path().join("probe_link");
+        fs::create_dir(&probe_orig).unwrap();
+        if !crate::sandbox::try_create_test_symlink_dir(&probe_orig, &probe_link) {
+            return;
+        }
+        let _ = remove_symlink(&probe_link);
+
+        // 4. Item 7: if `hop` was kept from an earlier sync (`kept == true` in pass 1) and then
+        //    fails the second on-disk pass in `materialize_symlinks` after `s/b/up` is created,
+        //    `hop` must be removed from disk along with `s/b/up`.
+        let hop_disk = g.tree_dir().join("hop");
+        create_in_tree_symlink("s/b/up/../..", &hop_disk, true).unwrap();
+        assert!(fs::symlink_metadata(&hop_disk).is_ok());
+
+        let l_hop = BlobSymlink {
+            path: "hop".to_string(),
+            target: "s/b/up/../..".to_string(),
+        };
+        let l_up = BlobSymlink {
+            path: "s/b/up".to_string(),
+            target: "..".to_string(),
+        };
+        let targets = vec![
+            (&l_hop, hop_disk.clone(), "s".to_string()),
+            (&l_up, g.tree_dir().join("s/b/up"), "s".to_string()),
+        ];
+        let mut report = SyncReport::default();
+        let s_trie = FoldedPathTrie::from_manifest(
+            &TreeManifest::with_entries(vec![], vec![], vec!["s".to_string()]).unwrap(),
+        )
+        .unwrap();
+        let err_kept = materialize_symlinks(
+            &g.tree_dir(),
+            "proj",
+            &targets,
+            &s_trie,
+            &HashSet::from(["hop".to_string()]),
+            &mut report,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_kept, WorkspaceError::Path { ref path, .. } if path == "hop"),
+            "expected second-pass failure on kept 'hop', got: {err_kept}"
+        );
+        assert!(
+            fs::symlink_metadata(&hop_disk).is_err(),
+            "kept 'hop' link that failed the second pass must be removed from disk"
+        );
+        assert!(
+            fs::symlink_metadata(g.tree_dir().join("s/b/up")).is_err(),
+            "created 's/b/up' link must be rolled back on failure"
+        );
+    }
+
+    #[test]
+    fn w11_folded_path_trie_handles_deep_unshared_paths_and_case_folded_dirs() {
+        let tail_2040 = vec!["a"; 2_040].join("/");
+        let dummy_id = BlobId::of(b"x");
+        let deep_files: Vec<BlobFile> = (0..200)
+            .map(|i| BlobFile {
+                path: format!("f{i:03}/{tail_2040}"),
+                id: dummy_id,
+                size: 1,
+                executable: false,
+            })
+            .collect();
+        let m = TreeManifest::with_entries(deep_files, vec![], vec!["EmptyDir/ẞ_Sub".to_string()])
+            .unwrap();
+        let trie = check_case_collisions(&m).unwrap();
+        assert!(trie.contains_dir("f000/a/a"));
+        assert!(trie.contains_dir("F000/A/A"));
+        assert!(trie.contains_dir("emptydir/ss_sub"));
+        assert!(!trie.contains_dir(&format!("f000/{tail_2040}")));
     }
 }

@@ -344,6 +344,9 @@ fn feature_names(features: ProtocolCapabilities) -> String {
     if features.contains(ProtocolCapabilities::WORKSPACES) {
         names.push("WORKSPACES");
     }
+    if features.contains(ProtocolCapabilities::TREE_V2) {
+        names.push("TREE_V2");
+    }
     names.join(" and ")
 }
 
@@ -4612,6 +4615,409 @@ mod tests {
         // Fail t2 on w1 (non-rejection execution failure, max_retries = 0); affinity stays on w1.
         let _ = w2_sess;
         let _ = w2_id;
+    }
+
+    #[tokio::test]
+    async fn test_tree_v1_and_v2_version_negotiation_in_scheduler() {
+        use crate::blob_store::{BlobStore, BlobStoreConfig};
+        use crate::server::admit_blob_task;
+        use rusty_grid_core::blob::{BlobFile, BlobId, BlobSymlink, TaskInput, TreeManifest};
+        use rusty_grid_core::blob_transfer::BlobRequest;
+        use rusty_grid_core::task::{Bytes, WorkspaceRef, WorkspaceSource};
+
+        async fn store_blob(store: &Arc<BlobStore>, bytes: &[u8]) -> BlobId {
+            let id = BlobId::of(bytes);
+            let owner = store.new_owner();
+            store
+                .handle(
+                    owner,
+                    BlobRequest::Write {
+                        id,
+                        total_size: bytes.len() as u64,
+                        offset: 0,
+                        data: Bytes::from(bytes.to_vec()),
+                    },
+                )
+                .await;
+            id
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store =
+            BlobStore::open(&BlobStoreConfig::new(dir.path(), 64 * 1024 * 1024)).unwrap();
+        let main_id = store_blob(&blob_store, b"fn main() {}").await;
+
+        let v1_manifest = TreeManifest::new(vec![BlobFile {
+            path: "src/main.rs".to_string(),
+            id: main_id,
+            size: 12,
+            executable: false,
+        }])
+        .unwrap();
+        let v1_bytes = v1_manifest.encode();
+        assert!(v1_bytes.starts_with(b"oxideswarm-tree/1\n"));
+        let v1_id = store_blob(&blob_store, &v1_bytes).await;
+
+        let v2_manifest = TreeManifest::with_entries(
+            vec![BlobFile {
+                path: "src/main.rs".to_string(),
+                id: main_id,
+                size: 12,
+                executable: false,
+            }],
+            vec![BlobSymlink {
+                path: "src/alias.rs".to_string(),
+                target: "main.rs".to_string(),
+            }],
+            vec!["empty".to_string()],
+        )
+        .unwrap();
+        let v2_bytes = v2_manifest.encode();
+        assert!(v2_bytes.starts_with(b"oxideswarm-tree/2\n"));
+        let v2_id = store_blob(&blob_store, &v2_bytes).await;
+
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let w_v1_id = Uuid::new_v4();
+        let (w_v1_tx, _w_v1_rx) = tokio::sync::mpsc::channel(1024);
+        registry
+            .register_session(
+                w_v1_id,
+                WorkerCapabilities::new("worker-v1", 4, 8192, false, false, None),
+                ProtocolCapabilities::BLOB_TRANSFER | ProtocolCapabilities::WORKSPACES,
+                "127.0.0.1:9320".parse().unwrap(),
+                w_v1_tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig {
+                fail_unfulfillable_tasks: true,
+                ..SchedulerConfig::default()
+            },
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters);
+
+        // 1. A v1 manifest (no symlinks, no empty dirs) does NOT require TREE_V2 and schedules
+        //    onto a worker without TREE_V2 (`w_v1`).
+        let mut t_v1_input = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_v1_input.inputs = vec![TaskInput::tree(".", v1_id, v1_bytes.len() as u64)];
+        let v1_input_needs_v2 = admit_blob_task(Some(&blob_store), &t_v1_input)
+            .await
+            .unwrap();
+        assert!(!v1_input_needs_v2);
+        queue
+            .submit_with_priority_and_tree_v2(t_v1_input.clone(), 0, v1_input_needs_v2)
+            .await
+            .unwrap();
+
+        let t_v1_ws = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef {
+            name: "ws-v1".to_string(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: v1_id,
+                manifest_size: v1_bytes.len() as u64,
+            }),
+        });
+        let v1_ws_needs_v2 = admit_blob_task(Some(&blob_store), &t_v1_ws).await.unwrap();
+        assert!(!v1_ws_needs_v2);
+        queue
+            .submit_with_priority_and_tree_v2(t_v1_ws.clone(), 0, v1_ws_needs_v2)
+            .await
+            .unwrap();
+
+        let (v1_views, _) = queue.ready_views(None, 10).await;
+        assert_eq!(v1_views.len(), 2);
+        assert!(v1_views
+            .iter()
+            .all(|v| !v.required_features.contains(ProtocolCapabilities::TREE_V2)));
+
+        let r_v1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r_v1.assignments.len(), 2);
+        assert!(r_v1.assignments.iter().all(|a| a.worker_id == w_v1_id));
+
+        // 2. A v2 manifest (with symlinks/empty dirs) requires TREE_V2 via admit_blob_task ->
+        //    submit_with_priority_and_tree_v2 -> ready_views: it is refused on `w_v1` alone.
+        let mut t_v2_input = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_v2_input.inputs = vec![TaskInput::tree(".", v2_id, v2_bytes.len() as u64)];
+        let v2_input_needs_v2 = admit_blob_task(Some(&blob_store), &t_v2_input)
+            .await
+            .unwrap();
+        assert!(v2_input_needs_v2);
+        queue
+            .submit_with_priority_and_tree_v2(t_v2_input, 0, v2_input_needs_v2)
+            .await
+            .unwrap();
+
+        let (views_v2_in, _) = queue.ready_views(None, 10).await;
+        assert_eq!(views_v2_in.len(), 1);
+        assert!(views_v2_in[0]
+            .required_features
+            .contains(ProtocolCapabilities::TREE_V2));
+
+        let r_v2_on_v1 = sched.schedule_once().await.unwrap();
+        assert!(r_v2_on_v1.assignments.is_empty());
+        assert_eq!(r_v2_on_v1.unfulfillable.len(), 1);
+        assert!(
+            r_v2_on_v1.unfulfillable[0].1.contains("TREE_V2"),
+            "expected TREE_V2 in unfulfillable reason: {}",
+            r_v2_on_v1.unfulfillable[0].1
+        );
+
+        let t_v2_ws = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef {
+            name: "ws-v2".to_string(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: v2_id,
+                manifest_size: v2_bytes.len() as u64,
+            }),
+        });
+        let v2_ws_needs_v2 = admit_blob_task(Some(&blob_store), &t_v2_ws).await.unwrap();
+        assert!(v2_ws_needs_v2);
+        queue
+            .submit_with_priority_and_tree_v2(t_v2_ws, 0, v2_ws_needs_v2)
+            .await
+            .unwrap();
+
+        let r_v2_ws_on_v1 = sched.schedule_once().await.unwrap();
+        assert!(r_v2_ws_on_v1.assignments.is_empty());
+        assert_eq!(r_v2_ws_on_v1.unfulfillable.len(), 1);
+        assert!(r_v2_ws_on_v1.unfulfillable[0].1.contains("TREE_V2"));
+
+        // 3. When a `w_v2` worker (advertising TREE_V2) registers alongside `w_v1`, both v2
+        //    tasks are placed onto `w_v2` and never onto `w_v1`.
+        let w_v2_id = Uuid::new_v4();
+        let (w_v2_tx, _w_v2_rx) = tokio::sync::mpsc::channel(1024);
+        registry
+            .register_session(
+                w_v2_id,
+                WorkerCapabilities::new("worker-v2", 4, 8192, false, false, None),
+                ProtocolCapabilities::BLOB_TRANSFER
+                    | ProtocolCapabilities::WORKSPACES
+                    | ProtocolCapabilities::TREE_V2,
+                "127.0.0.1:9321".parse().unwrap(),
+                w_v2_tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut t_v2_input_ok = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_v2_input_ok.inputs = vec![TaskInput::tree(".", v2_id, v2_bytes.len() as u64)];
+        let needs_v2_a = admit_blob_task(Some(&blob_store), &t_v2_input_ok)
+            .await
+            .unwrap();
+        queue
+            .submit_with_priority_and_tree_v2(t_v2_input_ok, 0, needs_v2_a)
+            .await
+            .unwrap();
+
+        let t_v2_ws_ok = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef {
+            name: "ws-v2-ok".to_string(),
+            source: Some(WorkspaceSource::Tree {
+                manifest: v2_id,
+                manifest_size: v2_bytes.len() as u64,
+            }),
+        });
+        let needs_v2_b = admit_blob_task(Some(&blob_store), &t_v2_ws_ok)
+            .await
+            .unwrap();
+        queue
+            .submit_with_priority_and_tree_v2(t_v2_ws_ok, 0, needs_v2_b)
+            .await
+            .unwrap();
+
+        let r_v2_both = sched.schedule_once().await.unwrap();
+        assert_eq!(r_v2_both.assignments.len(), 2);
+        assert!(r_v2_both.assignments.iter().all(|a| a.worker_id == w_v2_id));
+
+        // 4. Direct `TaskQueue::submit` (bypassing `admit_blob_task`) fails closed: any task
+        //    with a tree input or workspace source tree defaults to `requires_tree_v2 = true`.
+        let mut t_direct = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        t_direct.inputs = vec![TaskInput::tree(".", v1_id, v1_bytes.len() as u64)];
+        let direct_id = t_direct.id;
+        queue.submit(t_direct).await.unwrap();
+        let (direct_views, _) = queue.ready_views(None, 10).await;
+        let direct_view = direct_views
+            .iter()
+            .find(|v| v.task_id == direct_id)
+            .expect("direct task in ready_views");
+        assert!(
+            direct_view
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "uninspected tree task submitted directly to TaskQueue must fail closed with TREE_V2"
+        );
+
+        // 5. Store recovery (`attach_store_and_replay` + `repin_recovered_blobs`):
+        //    - Before `repin_recovered_blobs`, all recovered tree tasks default to fail-closed
+        //      (`TREE_V2` required).
+        //    - After `repin_recovered_blobs`, a valid v1 tree task has `TREE_V2` cleared, a valid
+        //      v2 tree task keeps `TREE_V2`, and a task whose manifest blob is missing from the
+        //      blob store stays fail-closed (`TREE_V2` required).
+        let store_dir = dir.path().join("recovery-store");
+        let mut rec_v1 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        rec_v1.inputs = vec![TaskInput::tree(".", v1_id, v1_bytes.len() as u64)];
+        let rec_v1_id = rec_v1.id;
+
+        let mut rec_v2 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        rec_v2.inputs = vec![TaskInput::tree(".", v2_id, v2_bytes.len() as u64)];
+        let rec_v2_id = rec_v2.id;
+
+        let missing_manifest_id = BlobId::of(b"missing-manifest");
+        let mut rec_missing = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        rec_missing.inputs = vec![TaskInput::tree(".", missing_manifest_id, 64)];
+        let rec_missing_id = rec_missing.id;
+
+        {
+            let (store1, recovered1) = crate::store::TaskStore::open(&store_dir).unwrap();
+            let q1 = TaskQueue::new();
+            q1.attach_store_and_replay(store1, recovered1, Duration::ZERO)
+                .await
+                .unwrap();
+            q1.submit_with_priority_and_tree_v2(rec_v1, 0, false)
+                .await
+                .unwrap();
+            q1.submit_with_priority_and_tree_v2(rec_v2, 0, true)
+                .await
+                .unwrap();
+            q1.submit_with_priority_and_tree_v2(rec_missing, 0, false)
+                .await
+                .unwrap();
+            q1.close_and_compact_store().await;
+        }
+
+        let (store2, recovered2) = crate::store::TaskStore::open(&store_dir).unwrap();
+        let q2 = TaskQueue::new();
+        q2.attach_store_and_replay(store2, recovered2, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let (pre_repin_views, _) = q2.ready_views(None, 10).await;
+        assert_eq!(pre_repin_views.len(), 3);
+        assert!(
+            pre_repin_views
+                .iter()
+                .all(|v| v.required_features.contains(ProtocolCapabilities::TREE_V2)),
+            "all recovered tree tasks must start fail-closed before repin_recovered_blobs"
+        );
+
+        q2.repin_recovered_blobs(&blob_store).await;
+        let (post_repin_views, _) = q2.ready_views(None, 10).await;
+        let view_for = |id: TaskId| {
+            post_repin_views
+                .iter()
+                .find(|v| v.task_id == id)
+                .expect("recovered task view")
+        };
+        assert!(
+            !view_for(rec_v1_id)
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "verified v1 manifest must clear TREE_V2 after repin_recovered_blobs"
+        );
+        assert!(
+            view_for(rec_v2_id)
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "v2 manifest must keep TREE_V2 after repin_recovered_blobs"
+        );
+        assert!(
+            view_for(rec_missing_id)
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "missing manifest blob must stay fail-closed (TREE_V2) after repin_recovered_blobs"
+        );
+        q2.close_and_compact_store().await;
+
+        // 6. End-to-end `MasterHandle::submit_task` path (without passing `requires_tree_v2` by hand).
+        let handle_blob_dir = dir.path().join("handle-blobs");
+        let srv_cfg = crate::server::ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_blob_store(&handle_blob_dir, 64 * 1024 * 1024)
+            .with_ephemeral_key(true);
+        let sched_cfg = SchedulerConfig {
+            tick_interval: Duration::from_secs(3600),
+            micro_batch_window: Duration::from_secs(3600),
+            fail_unfulfillable_tasks: true,
+            ..SchedulerConfig::default()
+        };
+        let handle =
+            crate::server::MasterServer::spawn_with_config(srv_cfg, sched_cfg, Default::default())
+                .await
+                .unwrap();
+        let h_store = handle.blob_store().expect("blob store configured").clone();
+        let h_main_id = store_blob(&h_store, b"fn main() {}").await;
+        assert_eq!(h_main_id, main_id);
+        let h_v1_id = store_blob(&h_store, &v1_bytes).await;
+        assert_eq!(h_v1_id, v1_id);
+        let h_v2_id = store_blob(&h_store, &v2_bytes).await;
+        assert_eq!(h_v2_id, v2_id);
+
+        let mut h_t_v1 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        h_t_v1.inputs = vec![TaskInput::tree(".", h_v1_id, v1_bytes.len() as u64)];
+        let h_t_v1_id = handle.submit_task(h_t_v1).await.unwrap();
+
+        let mut h_t_v2 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        h_t_v2.inputs = vec![TaskInput::tree(".", h_v2_id, v2_bytes.len() as u64)];
+        let h_t_v2_id = handle.submit_task(h_t_v2).await.unwrap();
+
+        let (h_views, _) = handle.queue().ready_views(None, 10).await;
+        let h_v1_view = h_views.iter().find(|v| v.task_id == h_t_v1_id).unwrap();
+        let h_v2_view = h_views.iter().find(|v| v.task_id == h_t_v2_id).unwrap();
+        assert!(
+            !h_v1_view
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "MasterHandle::submit_task with v1 manifest must not require TREE_V2"
+        );
+        assert!(
+            h_v2_view
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "MasterHandle::submit_task with v2 manifest must require TREE_V2"
+        );
+        let _ = handle.shutdown();
     }
 
     /// Simulates wave-by-wave execution of `tasks` on `(fast, slow)` with deterministic per-task

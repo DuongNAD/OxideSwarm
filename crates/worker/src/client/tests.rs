@@ -3394,6 +3394,7 @@ fn test_pending_resume_outbox_enforces_byte_budget() {
 async fn test_workspaces_capability_advertised_only_when_enabled() {
     assert!(!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::WORKSPACES));
     assert!(!advertised_protocol_capabilities().contains(ProtocolCapabilities::WORKSPACES));
+    assert!(advertised_protocol_capabilities().contains(ProtocolCapabilities::TREE_V2));
 
     let default_client = WorkerClient::for_testing("127.0.0.1:9999", None, Some(1), false);
     assert!(!default_client

@@ -862,7 +862,20 @@ impl BlobStore {
         self: &Arc<Self>,
         inputs: &[TaskInput],
     ) -> Result<Vec<BlobId>, String> {
+        self.resolve_inputs_with_features(inputs)
+            .await
+            .map(|(ids, _)| ids)
+    }
+
+    /// Like [`BlobStore::resolve_inputs`], also returning whether any decoded [`TreeManifest`]
+    /// uses `oxideswarm-tree/2` features (`symlinks` or `empty_dirs`) so the queue entry can
+    /// require [`rusty_grid_core::protocol::ProtocolCapabilities::TREE_V2`].
+    pub async fn resolve_inputs_with_features(
+        self: &Arc<Self>,
+        inputs: &[TaskInput],
+    ) -> Result<(Vec<BlobId>, bool), String> {
         let mut ids = Vec::new();
+        let mut needs_tree_v2 = false;
         for input in inputs {
             match &input.source {
                 InputSource::File { id, size, .. } => {
@@ -875,8 +888,16 @@ impl BlobStore {
                 } => {
                     self.check_present(*manifest, *manifest_size, &input.path)?;
                     let bytes = self.read_all(*manifest, MAX_MANIFEST_BYTES).await?;
-                    let tree = TreeManifest::decode(&bytes)
-                        .map_err(|e| format!("input '{}': {e}", input.path))?;
+                    let input_path = input.path.clone();
+                    let tree = tokio::task::spawn_blocking(move || {
+                        TreeManifest::decode(&bytes)
+                            .map_err(|e| format!("input '{input_path}': {e}"))
+                    })
+                    .await
+                    .map_err(|e| format!("input '{}': {e}", input.path))??;
+                    if tree.is_v2() {
+                        needs_tree_v2 = true;
+                    }
                     ids.push(*manifest);
                     for file in tree.files() {
                         self.check_present(
@@ -891,7 +912,7 @@ impl BlobStore {
         }
         ids.sort();
         ids.dedup();
-        Ok(ids)
+        Ok((ids, needs_tree_v2))
     }
 
     fn check_present(&self, id: BlobId, size: u64, path: &str) -> Result<(), String> {
@@ -1679,5 +1700,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_inputs_with_features_detects_v2_manifest_even_after_reopen() {
+        use rusty_grid_core::blob::{BlobFile, BlobSymlink, InputSource, TaskInput, TreeManifest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 64 * 1024);
+        let file_bytes = b"hello";
+        let file_id = store.put(file_bytes).await.unwrap();
+
+        let v1_manifest = TreeManifest::new(vec![BlobFile {
+            path: "a.txt".into(),
+            id: file_id,
+            size: file_bytes.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let v1_bytes = v1_manifest.encode();
+        let v1_id = store.put(&v1_bytes).await.unwrap();
+
+        let v2_manifest = TreeManifest::with_entries(
+            vec![BlobFile {
+                path: "a.txt".into(),
+                id: file_id,
+                size: file_bytes.len() as u64,
+                executable: false,
+            }],
+            vec![BlobSymlink {
+                path: "link".into(),
+                target: "a.txt".into(),
+            }],
+            vec!["empty_dir".into()],
+        )
+        .unwrap();
+        let v2_bytes = v2_manifest.encode();
+        let v2_id = store.put(&v2_bytes).await.unwrap();
+
+        let v1_input = [TaskInput {
+            path: "src".into(),
+            source: InputSource::Tree {
+                manifest: v1_id,
+                manifest_size: v1_bytes.len() as u64,
+            },
+        }];
+        let v2_input = [TaskInput {
+            path: "src".into(),
+            source: InputSource::Tree {
+                manifest: v2_id,
+                manifest_size: v2_bytes.len() as u64,
+            },
+        }];
+
+        let (_, v1_needs_v2) = store.resolve_inputs_with_features(&v1_input).await.unwrap();
+        assert!(!v1_needs_v2);
+        let (_, v2_needs_v2) = store.resolve_inputs_with_features(&v2_input).await.unwrap();
+        assert!(v2_needs_v2);
+        drop(store);
+
+        let reopened = open(dir.path(), 64 * 1024);
+        let (_, reopened_v1_needs_v2) = reopened
+            .resolve_inputs_with_features(&v1_input)
+            .await
+            .unwrap();
+        assert!(!reopened_v1_needs_v2);
+        let (_, reopened_v2_needs_v2) = reopened
+            .resolve_inputs_with_features(&v2_input)
+            .await
+            .unwrap();
+        assert!(reopened_v2_needs_v2);
     }
 }

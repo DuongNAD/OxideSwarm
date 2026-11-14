@@ -356,7 +356,7 @@ OxideSwarm `0.1.2` covers the user story above. What it does not do yet:
 | One master, no automatic failover | The master is a single point of failure; `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 ([design 0050](docs/design/0050-scale-out-architecture.md)) |
 | Every machine shares one cluster secret | Removing one machine means a new secret for all | ENROLL-1 ([design 0051](docs/design/0051-machine-identity-and-invites.md)): a key per machine and the OXS-AUTH v3 handshake ship in `0.1.2` as an opt-in (`master --auth members|both`, ENROLL-1a); invites and removing one machine are ENROLL-1b |
 | On Windows, `cargo` under isolation needs a worker that is not elevated | Since release `0.1.2` (FEAT-3d) a Windows workspace worker runs with `--isolation fs`; an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
-| Workspace trees skip symbolic links and empty directories | A project that relies on a link inside its tree may not build remotely | W11 ([design 0039](docs/design/0039-agent-workspaces.md)) |
+| Workspace trees skip symbolic links that leave the tree or traverse another link, and creating links on Windows needs Developer Mode | Out-of-tree or chained links are skipped with a notice; a Windows worker without Developer Mode skips symbolic links during sync and prints a warning to the task's `stderr` | By design ([design 0039](docs/design/0039-agent-workspaces.md) W11) |
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | GPU support is a verified matrix-multiply benchmark | No user workload runs on the GPU yet | FEAT-9 |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
@@ -858,6 +858,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_ENABLE_PHYSICAL_GPU` | Worker | Force-enables hardware wgpu engine initialization when set to `1` |
 | `RUSTY_GRID_REQUIRE_GPU` | Worker (Tests) | In tests (`1`), asserts that failure to initialize a physical GPU is fatal instead of skipping |
 | `RUSTY_GRID_REQUIRE_BLENDER` | Worker (Tests) | In tests (`1` or `true`), asserts that a missing host Blender binary is fatal instead of skipping |
+| `RUSTY_GRID_REQUIRE_SYMLINKS` | Worker / CLI (Tests) | In tests (`1`), asserts that Windows `ERROR_PRIVILEGE_NOT_HELD` (`1314`) on symbolic link creation is fatal instead of skipping |
 | `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed (`--max-concurrency`) |
 | `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks (`--max-concurrent-tasks`) |
 | `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes (`--sandbox-base-dir` outranks it; used as given on Unix, checked and created with a protected owner-only DACL on Windows). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |

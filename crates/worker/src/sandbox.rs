@@ -1583,6 +1583,79 @@ impl Drop for Sandbox {
     }
 }
 
+/// Environment variable that forces tests creating Windows symbolic links to
+/// fail rather than skip when the process lacks `SeCreateSymbolicLinkPrivilege`
+/// (`ERROR_PRIVILEGE_NOT_HELD`, OS error `1314`) and Developer Mode is off.
+#[cfg(test)]
+pub(crate) const REQUIRE_SYMLINKS_ENV: &str = "RUSTY_GRID_REQUIRE_SYMLINKS";
+
+#[cfg(test)]
+const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+#[cfg(test)]
+fn require_symlinks_from_env() -> bool {
+    std::env::var_os(REQUIRE_SYMLINKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+fn handle_test_symlink_result(
+    res: std::io::Result<()>,
+    original: &Path,
+    link: &Path,
+    require_symlinks: bool,
+) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(err)
+            if cfg!(windows)
+                && err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+                && !require_symlinks =>
+        {
+            eprintln!(
+                "skipping symlink test ({} -> {}): Windows symlink creation returned ERROR_PRIVILEGE_NOT_HELD (1314); set {REQUIRE_SYMLINKS_ENV}=1 to fail instead",
+                link.display(),
+                original.display(),
+            );
+            false
+        }
+        Err(err) => panic!(
+            "failed to create test symlink {} -> {}: {err}",
+            link.display(),
+            original.display()
+        ),
+    }
+}
+
+/// Creates a directory symbolic link (`link` -> `original`) for a test.
+///
+/// Returns `true` when the link was created. On Windows, if symlink creation
+/// returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`) and `RUSTY_GRID_REQUIRE_SYMLINKS=1`
+/// is not set, prints why to stderr and returns `false` so the caller can skip
+/// cleanly. Panics on any other error or when `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
+#[cfg(test)]
+pub(crate) fn try_create_test_symlink_dir(original: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let res = std::os::unix::fs::symlink(original, link);
+    #[cfg(windows)]
+    let res = std::os::windows::fs::symlink_dir(original, link);
+    handle_test_symlink_result(res, original, link, require_symlinks_from_env())
+}
+
+/// Creates a file symbolic link (`link` -> `original`) for a test.
+///
+/// Returns `true` when the link was created. On Windows, if symlink creation
+/// returns `ERROR_PRIVILEGE_NOT_HELD` (`1314`) and `RUSTY_GRID_REQUIRE_SYMLINKS=1`
+/// is not set, prints why to stderr and returns `false` so the caller can skip
+/// cleanly. Panics on any other error or when `RUSTY_GRID_REQUIRE_SYMLINKS=1` is set.
+#[cfg(test)]
+pub(crate) fn try_create_test_symlink_file(original: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let res = std::os::unix::fs::symlink(original, link);
+    #[cfg(windows)]
+    let res = std::os::windows::fs::symlink_file(original, link);
+    handle_test_symlink_result(res, original, link, require_symlinks_from_env())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
