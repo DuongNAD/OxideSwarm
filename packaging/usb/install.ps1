@@ -152,6 +152,8 @@ function Test-InstallDrive($root) {
 # Another local account must not be able to read the cluster secret in it, or replace the worker
 # that the start-at-logon entry runs as this user.
 $UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+# Non-elevated tokens own new objects as $UserSid; elevated admin tokens default to TokenOwner (S-1-5-32-544).
+$OwnerSids = @($UserSid.Value, [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value) | Select-Object -Unique
 $TrustedSids = @($UserSid.Value, 'S-1-5-18', 'S-1-5-32-544')
 $TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 function Get-PrivateSecurity {
@@ -196,7 +198,7 @@ function Test-PrivateAcl($acl) {
 # Sets $sec's DACL on an existing directory via a single handle opened with
 # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, refusing links and foreign owners on
 # that handle before touching any ACL.
-function Set-PrivateDaclNoFollow($path, $sec, [string]$expectedOwnerSid) {
+function Set-PrivateDaclNoFollow($path, $sec, [string[]]$expectedOwnerSids) {
     if (-not ('OxideSwarmDirAcl' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -248,7 +250,7 @@ public static class OxideSwarmDirAcl {
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool SetKernelObjectSecurity(IntPtr Handle, uint SecurityInformation, byte[] SecurityDescriptor);
 
-    public static string Apply(string path, byte[] sdBytes, string expectedOwnerSid) {
+    public static string Apply(string path, byte[] sdBytes, string[] expectedOwnerSids) {
         IntPtr h = CreateFileW(path, READ_CONTROL | WRITE_DAC, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
         if (h == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
         try {
@@ -265,7 +267,16 @@ public static class OxideSwarmDirAcl {
             }
             RawSecurityDescriptor ownerSd = new RawSecurityDescriptor(ownerBuf, 0);
             string ownerSid = ownerSd.Owner != null ? ownerSd.Owner.Value : "";
-            if (!string.Equals(ownerSid, expectedOwnerSid, StringComparison.OrdinalIgnoreCase)) {
+            bool ownerOk = false;
+            if (expectedOwnerSids != null) {
+                foreach (string allowed in expectedOwnerSids) {
+                    if (string.Equals(ownerSid, allowed, StringComparison.OrdinalIgnoreCase)) {
+                        ownerOk = true;
+                        break;
+                    }
+                }
+            }
+            if (!ownerOk) {
                 return "owner:" + ownerSid;
             }
             if (!SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sdBytes)) {
@@ -279,7 +290,7 @@ public static class OxideSwarmDirAcl {
 }
 '@
     }
-    return [OxideSwarmDirAcl]::Apply($path, $sec.GetSecurityDescriptorBinaryForm(), $expectedOwnerSid)
+    return [OxideSwarmDirAcl]::Apply($path, $sec.GetSecurityDescriptorBinaryForm(), $expectedOwnerSids)
 }
 # Entries under an existing open $root to inspect: direct children of $root, the installer's own
 # small control folders (bin, home, run, logs), and the worker's cache/lock directories under work.
@@ -342,8 +353,9 @@ function Test-RootSafety($root) {
     if (-not $item.PSIsContainer) { return "$root is a file" }
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$root is a link" }
     $acl = Get-Acl -LiteralPath $root
-    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value) {
-        return "$root belongs to another account ($(Get-AccountName $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value)); remove it or choose another folder"
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($ownerSid -notin $OwnerSids) {
+        return "$root belongs to another account ($(Get-AccountName $ownerSid)); remove it or choose another folder"
     }
     if (Test-PrivateAcl $acl) { return $null }
     # Not made by this installer, or by an older one: every installer/control entry must be ours.
@@ -439,7 +451,7 @@ if (-not $PrivateRoot) {
     } elseif (-not (Test-PrivateAcl (Get-Acl -LiteralPath $InstallRoot))) {
         $recheckExisting = $true
         $hadOurs = (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install')) -or (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))
-        $applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $UserSid.Value
+        $applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $OwnerSids
         if ($applyErr -eq 'link') { Fail "$InstallRoot is a link; remove it and run the installer again" }
         if ($applyErr -eq 'file') { Fail "$InstallRoot is a file" }
         if ($applyErr -like 'owner:*') {
@@ -453,7 +465,7 @@ if (-not $PrivateRoot) {
         Fail "$InstallRoot is a link; remove it and run the installer again"
     }
     $acl = Get-Acl -LiteralPath $InstallRoot
-    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $UserSid.Value -or -not (Test-PrivateAcl $acl)) {
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $OwnerSids -or -not (Test-PrivateAcl $acl)) {
         Fail "could not make $InstallRoot private to this user; remove it and run the installer again"
     }
     if ($recheckExisting) {

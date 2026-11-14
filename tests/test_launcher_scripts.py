@@ -1806,7 +1806,7 @@ public class Program {
             "function Get-CheckedRootEntries",
             "function Format-RootLinkRefusal",
             "preserve cluster membership",
-            "$applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $UserSid.Value",
+            "$applyErr = Set-PrivateDaclNoFollow $InstallRoot $sec $OwnerSids",
         ):
             self.assertIn(needle, usb_ps1)
         self.assertNotIn("SetAccessControl(", usb_ps1)
@@ -1978,6 +1978,7 @@ $tokens = $null; $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{usb_ps1_path}', [ref]$tokens, [ref]$errs)
 if ($errs.Count -gt 0) {{ throw "parse failed" }}
 $UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$OwnerSids = @($UserSid.Value, [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value) | Select-Object -Unique
 $TrustedSids = @($UserSid.Value, 'S-1-5-18', 'S-1-5-32-544')
 $TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 $RenameRights = 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40
@@ -2015,7 +2016,7 @@ try {{
     & icacls.exe $targetOpen /grant '*S-1-1-0:(OI)(CI)R' | Out-Null
     $juncRoot = Join-Path $cleanTop 'junc_root'
     & cmd.exe /c mklink /J $juncRoot $targetOpen | Out-Null
-    $resLink = Set-PrivateDaclNoFollow $juncRoot $sec $UserSid.Value
+    $resLink = Set-PrivateDaclNoFollow $juncRoot $sec $OwnerSids
     if ($resLink -ne 'link') {{ throw "expected 'link', got $resLink" }}
     if ((Get-Acl -LiteralPath $targetOpen).AreAccessRulesProtected) {{ throw "Set-PrivateDaclNoFollow modified junction target!" }}
     & cmd.exe /c rmdir $juncRoot | Out-Null
@@ -2038,7 +2039,9 @@ try {{
     if ($checkedPaths | Where-Object {{ $_ -like '*\\target*' -or $_ -like '*\\dep_link*' }}) {{
         throw "Get-CheckedRootEntries walked into task target/junction: $($checkedPaths -join '; ')"
     }}
-    $applyReal = Set-PrivateDaclNoFollow $openRoot $sec $UserSid.Value
+    $resForeignOwner = Set-PrivateDaclNoFollow $openRoot $sec @('S-1-5-19')
+    if ($resForeignOwner -notlike 'owner:*') {{ throw "expected owner:* refusal, got $resForeignOwner" }}
+    $applyReal = Set-PrivateDaclNoFollow $openRoot $sec $OwnerSids
     if ($applyReal -ne $null) {{ throw "expected null on real root, got $applyReal" }}
     if (-not (Test-PrivateAcl (Get-Acl -LiteralPath $openRoot))) {{ throw "openRoot was not made private" }}
 
@@ -2053,9 +2056,19 @@ try {{
     & cmd.exe /c rmdir (Join-Path $openRoot 'work\\cache') | Out-Null
     & cmd.exe /c rmdir $taskJunc | Out-Null
 }} finally {{
-    if (Test-Path -LiteralPath (Join-Path $cleanTop 'junc_root')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'junc_root') 2>$null | Out-Null }}
-    if (Test-Path -LiteralPath (Join-Path $cleanTop 'open_install\\work\\cache')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'open_install\\work\\cache') 2>$null | Out-Null }}
-    if (Test-Path -LiteralPath (Join-Path $cleanTop 'open_install\\workspaces\\ws1\\tree\\dep_link')) {{ & cmd.exe /c rmdir (Join-Path $cleanTop 'open_install\\workspaces\\ws1\\tree\\dep_link') 2>$null | Out-Null }}
+    $ErrorActionPreference = 'Continue'
+    foreach ($maybeLink in @(
+        (Join-Path $cleanTop 'junc_root'),
+        (Join-Path $cleanTop 'open_install\\work\\cache'),
+        (Join-Path $cleanTop 'open_install\\workspaces\\ws1\\tree\\dep_link')
+    )) {{
+        if (Test-Path -LiteralPath $maybeLink) {{
+            $it = Get-Item -LiteralPath $maybeLink -Force -ErrorAction SilentlyContinue
+            if ($it -and ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)) {{
+                & cmd.exe /c rmdir $maybeLink | Out-Null
+            }}
+        }}
+    }}
     Remove-Item -Recurse -Force -LiteralPath $cleanTop -ErrorAction SilentlyContinue
 }}
 Write-Output 'USB_HELPERS_OK'
