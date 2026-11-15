@@ -1,4 +1,4 @@
-# 0067: Task video memory requirements and scheduler accounting
+# 0068: Task video memory requirements and scheduler accounting
 
 Status: Implemented
 Created: 2026-11-15    Updated: 2026-11-15

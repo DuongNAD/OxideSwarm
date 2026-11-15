@@ -217,7 +217,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented | (design 0066), 224 |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
-| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
+| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
 | MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212 |
@@ -1166,10 +1166,7 @@ The standard in `docs/README.md` requires "only what the code does". These items
 ### 3D-2: Wire VRAM and Blender routing
 
 - **Evidence:** Read. Confirmed by grep.
-- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs:138`) has no caller. `crates/master`
-  reads neither `has_blender` nor `vram_mb`. `--blender-path` reaches only the capability probe, and
-  `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can
-  advertise Blender and then fall back silently.
+- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs`) still returns preset defaults for `Generative3D` that are not automatically applied when `--vram-mb` is omitted, and `crates/master` does not read `has_blender` (explicit `TaskRequirements::vram_mb` via `--vram-mb` / MCP `vram_mb` is now enforced under `FEAT-9a` / [design 0068](design/0068-task-vram-accounting.md)). `--blender-path` reaches only the capability probe, and `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can advertise Blender and then fall back silently.
 - **Do:** Wire both into `view_fits`. Share one Blender resolver.
 - **Done when:** A `--preferred-provider blender` task lands only on a Blender worker. A `high` task
   skips a 2 GB worker.
@@ -1464,9 +1461,8 @@ Each item below needs a design record before code.
 ### FEAT-9: GPU workloads beyond the benchmark
 
 - **Evidence:** Read.
-- **Problem:** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity`
-  is never read, the CLI hard-codes `input_data`, and the product is dropped. `wgpu` is 22.1.0.
-  Real-GPU preference applies only to a fully idle GPU (`crates/master/src/scheduler.rs:679`).
+- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
+- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
 - **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
   puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
 - **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
@@ -2610,3 +2606,4 @@ Add one dated line per finished item, newest last.
   `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 75 Implemented, 7 Partial and 40 Planned.
 - 2026-11-15: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 76 Implemented, 7 Partial and 39 Planned.
 - 2026-11-15: Implemented SCALE-2 ([design 0050](design/0050-scale-out-architecture.md), pull request 227): added `WorkerIndex` / `RegisteredIndex` capability and attribute bitsets (`WORKSPACES`, `TREE_V2`, free slots, mobile buckets), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size` / `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`), adaptive micro-batch debounce and 16-batch drain, per-submitter `FairShareQueues` weighted round-robin, dashboard `receiver_count() > 0` guards, single-flight batched `ColdResultStore` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`) with uncompacted replay reuse, and committed 3-run post-`SCALE-2` records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`, `500w` `409.1` vs `375.2 tasks/s` and `16.69` vs `31.01 ms` unloaded assign p50, `1000w` `414.4 tasks/s` and `91.8 MiB` steady RSS, `0` failed tasks). The Index counts are now 77 Implemented, 7 Partial and 38 Planned.
+- 2026-11-15: Implemented FEAT-9a / Q56 ([design 0068](design/0068-task-vram-accounting.md), pull request 232): added optional `TaskRequirements.vram_mb` (`--vram-mb` / `--vram`, MCP `vram_mb`, web `vram_mb`) with `effective_vram_mb()` and `requires_gpu_or_vram()`, bumped wire `PROTOCOL_VERSION_CURRENT` to `9` (`VramMb` capability, `HelloAck.vram_mb` / `WorkerListed.vram_mb` mirrors) and `STORE_FORMAT_VERSION` to `3`, updated `WorkerIndex`, `TaskQueue::assigned_loads`, `WorkloadScheduler` VRAM packing, VRAM `hold_back`, `--fail-unfulfillable-tasks` diagnostics, and `gpu_demand` preservation; `FEAT-9b` (runtime `nvidia-smi` / `rocm-smi` / Metal VRAM polling) remains open. The Index counts are now 77 Implemented, 8 Partial and 37 Planned.

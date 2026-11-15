@@ -206,6 +206,10 @@ impl SchedulerConfig {
 
     /// Determines the required VRAM in MB for a given task.
     pub fn required_vram_mb(&self, task: &Task) -> u64 {
+        let explicit = task.requirements.effective_vram_mb();
+        if explicit > 0 {
+            return explicit;
+        }
         match &task.spec {
             TaskSpec::Generative3D(spec) => {
                 if spec.engine().is_cpu_capable() {
@@ -313,6 +317,7 @@ struct Shape {
     required_features: ProtocolCapabilities,
     cpu_cores: usize,
     ram_mb: u64,
+    vram_mb: u64,
     placement: Placement,
     workspace: Option<String>,
 }
@@ -325,6 +330,7 @@ impl Shape {
             required_features: view.required_features,
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
+            vram_mb: view.requirements.effective_vram_mb(),
             placement: placement.clone(),
             workspace: view.workspace.clone(),
         }
@@ -354,8 +360,10 @@ fn feature_names(features: ProtocolCapabilities) -> String {
 
 /// True if `worker` could run a task with `requirements` when idle (static capability check).
 fn statically_fits(requirements: &TaskRequirements, worker: &WorkerInfo) -> bool {
+    let req_vram = requirements.effective_vram_mb();
     (requirements.cpu_cores == 0 || worker.capabilities.cpu_cores >= requirements.cpu_cores)
         && (requirements.ram_mb == 0 || worker.capabilities.ram_mb >= requirements.ram_mb)
+        && (req_vram == 0 || worker.capabilities.vram_mb.is_some_and(|v| v >= req_vram))
 }
 
 /// True if `worker` satisfies a task's placement constraints (`require:` tags: os, arch, worker,
@@ -388,6 +396,10 @@ struct Seat<'a> {
 impl Seat<'_> {
     fn used_slots(&self) -> usize {
         self.base.slots + self.placed.slots
+    }
+
+    fn used_vram_mb(&self) -> u64 {
+        self.base.vram_mb.saturating_add(self.placed.vram_mb)
     }
 
     fn load(&self) -> usize {
@@ -608,6 +620,7 @@ impl<'a> Engine<'a> {
                         tasks: worker.active_tasks,
                         slots: worker.active_tasks,
                         unstarted_ram_mb: 0,
+                        vram_mb: 0,
                     },
                 };
                 let mut max_slots = config.effective_max_concurrency(worker);
@@ -788,10 +801,22 @@ impl<'a> Engine<'a> {
                 view.required_features,
             );
             if nobody_fits {
-                let verdict = Verdict::Unfulfillable(format!(
-                    "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})",
-                    view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu
-                ));
+                let req_vram = view.requirements.effective_vram_mb();
+                let reason = if req_vram > 0 {
+                    format!(
+                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, vram_mb={}, gpu={})",
+                        view.requirements.cpu_cores,
+                        view.requirements.ram_mb,
+                        req_vram,
+                        view.requires_gpu
+                    )
+                } else {
+                    format!(
+                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})",
+                        view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu
+                    )
+                };
+                let verdict = Verdict::Unfulfillable(reason);
                 self.dead.insert(shape, verdict.clone());
                 return verdict;
             }
@@ -836,7 +861,7 @@ impl<'a> Engine<'a> {
             candidates = self.candidates_and_matching(view, &[], &mut full, &mut matching);
         }
         if candidates.is_empty() {
-            self.hold_back(&full, weight);
+            self.hold_back(&full, weight, view.requirements.effective_vram_mb());
             let verdict = Verdict::Skip(self.skip_reason(view, placement));
             self.dead.insert(shape, verdict.clone());
             return verdict;
@@ -923,7 +948,11 @@ impl<'a> Engine<'a> {
                             let threshold = self.config.speed_hold_factor * (ready_ms + best_avg);
                             if min_expected >= threshold {
                                 if full.contains(&best_idx) {
-                                    self.hold_back(&[best_idx], weight);
+                                    self.hold_back(
+                                        &[best_idx],
+                                        weight,
+                                        view.requirements.effective_vram_mb(),
+                                    );
                                 }
                                 if view.avoid.is_empty() && view.workspace.is_none() {
                                     self.dead_speed
@@ -954,6 +983,10 @@ impl<'a> Engine<'a> {
         seat.placed.tasks += 1;
         seat.placed.slots += weight;
         seat.placed.unstarted_ram_mb += view.requirements.ram_mb;
+        seat.placed.vram_mb = seat
+            .placed
+            .vram_mb
+            .saturating_add(view.requirements.effective_vram_mb());
         seat.running.push((view.task_key, Duration::ZERO));
         let free_after = seat.remaining_slots();
         self.free_slots = self
@@ -973,7 +1006,7 @@ impl<'a> Engine<'a> {
     /// worker that needs the fewest slots to free up for it is held back for the rest of the
     /// pass: it takes nothing more, drains, and the task is placed on it in a later pass. Later
     /// tasks only lose a worker that could not have run the waiting task either way.
-    fn hold_back(&mut self, full: &[usize], weight: usize) {
+    fn hold_back(&mut self, full: &[usize], weight: usize, req_vram_mb: u64) {
         let slots_to_free = |seat: &Seat<'_>| {
             let used = seat.used_slots();
             if weight > seat.max_slots {
@@ -983,10 +1016,21 @@ impl<'a> Engine<'a> {
                 (used + weight).saturating_sub(seat.max_slots)
             }
         };
-        let Some(&idx) = full
-            .iter()
-            .min_by_key(|&&idx| (slots_to_free(&self.seats[idx]), idx))
-        else {
+        let vram_to_free = |seat: &Seat<'_>| {
+            if req_vram_mb == 0 {
+                return 0;
+            }
+            let Some(cap) = seat.worker.capabilities.vram_mb else {
+                return u64::MAX;
+            };
+            seat.used_vram_mb()
+                .saturating_add(req_vram_mb)
+                .saturating_sub(cap)
+        };
+        let Some(&idx) = full.iter().min_by_key(|&&idx| {
+            let seat = &self.seats[idx];
+            (slots_to_free(seat), vram_to_free(seat), idx)
+        }) else {
             return;
         };
         if !self.reserved[idx] {
@@ -1004,6 +1048,15 @@ impl<'a> Engine<'a> {
             let reserved = seat.base.unstarted_ram_mb + seat.placed.unstarted_ram_mb;
             seat.worker.ram_available_mb.saturating_sub(reserved) < req_ram_mb
         }
+    }
+
+    fn is_seat_vram_short(&self, seat: &Seat<'_>, req_vram_mb: u64) -> bool {
+        req_vram_mb > 0
+            && seat
+                .worker
+                .capabilities
+                .vram_mb
+                .is_some_and(|cap| cap.saturating_sub(seat.used_vram_mb()) < req_vram_mb)
     }
 
     fn apply_stage6_and_7(
@@ -1079,6 +1132,7 @@ impl<'a> Engine<'a> {
     ) -> Vec<usize> {
         let config = self.config;
         let req = &view.requirements;
+        let req_vram = req.effective_vram_mb();
         let weight = req.cpu_cores.max(1);
         let mut found: Vec<usize> = Vec::new();
         full.clear();
@@ -1105,6 +1159,7 @@ impl<'a> Engine<'a> {
                     let seat = &self.seats[idx];
                     if !statically_fits(req, seat.worker)
                         || self.is_seat_ram_short(seat, req.ram_mb)
+                        || self.is_seat_vram_short(seat, req_vram)
                         || !seat.worker.features.contains(view.required_features)
                     {
                         continue;
@@ -1139,7 +1194,10 @@ impl<'a> Engine<'a> {
                     }
                     let used = seat.used_slots();
                     let tasks = seat.load();
-                    if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
+                    if tasks >= seat.max_tasks
+                        || (used > 0 && used + weight > seat.max_slots)
+                        || self.is_seat_vram_short(seat, req_vram)
+                    {
                         full.push(idx);
                     }
                 }
@@ -1167,13 +1225,17 @@ impl<'a> Engine<'a> {
                 if (host_busy || ram_short) && seat.load() == 0 {
                     continue;
                 }
+                let vram_short = self.is_seat_vram_short(seat, req_vram);
                 matching.push(idx);
                 if self.reserved[idx] || host_busy || ram_short {
                     continue;
                 }
                 let used = seat.used_slots();
                 let tasks = seat.load();
-                if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
+                if tasks >= seat.max_tasks
+                    || (used > 0 && used + weight > seat.max_slots)
+                    || vram_short
+                {
                     full.push(idx);
                     continue;
                 }
@@ -1536,7 +1598,7 @@ impl WorkloadScheduler {
             let found = self
                 .queue
                 .any_queued(|task| {
-                    (task.requirements.gpu_required || task.spec.requires_gpu())
+                    (task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu())
                         && task.placement().is_ok_and(|placement| {
                             gpu_workers.iter().any(|w| {
                                 statically_fits(&task.requirements, w)
@@ -6649,5 +6711,351 @@ mod tests {
         assert!(r_held.skipped.iter().any(|(id, reason)| *id == wide_id
             && *reason == ScheduleSkipReason::AllEligibleWorkersSaturated));
         drop(rxs);
+    }
+
+    #[test]
+    fn test_vram_packing_multiple_tasks_share_worker_until_budget_exhausted() {
+        let config = SchedulerConfig::default();
+        let mut gpu_worker = make_worker("gpu-24g", 4, 32_768, true, false);
+        gpu_worker.capabilities.vram_mb = Some(24_576);
+        let workers = vec![gpu_worker.clone()];
+
+        let make_vram_task = |vram_mb: u64| {
+            Task::new(
+                TaskSpec::new_gpu_compute("vram-pack", 64),
+                TaskRequirements {
+                    gpu_required: true,
+                    ..TaskRequirements::generic(1, 512)
+                }
+                .with_vram_mb(vram_mb),
+            )
+        };
+        let t1 = make_vram_task(10_240);
+        let t2 = make_vram_task(10_240);
+        let t3 = make_vram_task(10_240);
+        let t_unsized = Task::new(
+            TaskSpec::new_gpu_compute("vram-unsized", 64),
+            TaskRequirements {
+                gpu_required: true,
+                ..TaskRequirements::generic(1, 512)
+            },
+        );
+
+        let packed_with_unsized = WorkloadScheduler::matchmake(
+            &config,
+            &[t1.clone(), t2.clone(), t_unsized.clone()],
+            &workers,
+        );
+        let unsized_assigned: Vec<TaskId> = packed_with_unsized
+            .assignments
+            .iter()
+            .map(|a| a.task_id)
+            .collect();
+        assert_eq!(unsized_assigned, vec![t1.id, t2.id, t_unsized.id]);
+
+        let report =
+            WorkloadScheduler::matchmake(&config, &[t1.clone(), t2.clone(), t3.clone()], &workers);
+        let assigned: Vec<TaskId> = report.assignments.iter().map(|a| a.task_id).collect();
+        assert_eq!(assigned, vec![t1.id, t2.id]);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(id, reason)| *id == t3.id
+                    && *reason == ScheduleSkipReason::NoGpuWorkersAvailable),
+            "third 10240 MB task must skip once 20480 of 24576 MB VRAM is committed, got {:?}",
+            report.skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vram_accounting_tracks_running_reservation_and_releases_on_finish() {
+        let (registry, queue, _waiters, notify) = scheduler_fixture().await;
+        let wid = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let session = registry
+            .register(
+                wid,
+                WorkerCapabilities::new("gpu-16g", 4, 32_768, true, false, None)
+                    .with_vram_mb(Some(16_384)),
+                "127.0.0.1:9410".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let make_vram_task = || {
+            Task::new(
+                TaskSpec::new_gpu_compute("vram-job", 64),
+                TaskRequirements {
+                    gpu_required: true,
+                    ..TaskRequirements::generic(1, 256)
+                }
+                .with_vram_mb(10_240),
+            )
+        };
+        let t1 = queue.submit(make_vram_task()).await.unwrap();
+        let t2 = queue.submit(make_vram_task()).await.unwrap();
+
+        let sched =
+            WorkloadScheduler::new(SchedulerConfig::default(), registry, queue.clone(), notify);
+
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, t1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+
+        // Transition t1 to Running: cross-pass `assigned_loads` must still reserve its 10240 MB VRAM.
+        queue
+            .mark_running_from(wid, Some(session), &t1)
+            .await
+            .unwrap();
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(
+            r2.assignments.is_empty(),
+            "running 10240 MB task on 16384 MB worker must block second 10240 MB task"
+        );
+
+        // Once t1 finishes cleanly, its VRAM reservation drops and t2 is placed.
+        queue
+            .record_result_from(
+                wid,
+                Some(session),
+                rusty_grid_core::task::TaskResult::success(wid, t1, "", 1, false),
+            )
+            .await
+            .unwrap();
+        let r3 = sched.schedule_once().await.unwrap();
+        assert_eq!(r3.assignments.len(), 1);
+        assert_eq!(r3.assignments[0].task_id, t2);
+        assert!(matches!(
+            rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_vram_hold_back_prevents_small_vram_stream_from_starving_large_vram_task() {
+        let (registry, queue, _waiters, notify) = scheduler_fixture().await;
+        let wid = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let session = registry
+            .register(
+                wid,
+                WorkerCapabilities::new("gpu-24g", 4, 32_768, true, false, None)
+                    .with_vram_mb(Some(24_576)),
+                "127.0.0.1:9411".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let vram_task = |vram_mb: u64| {
+            Task::new(
+                TaskSpec::new_gpu_compute("vram-stream", 64),
+                TaskRequirements {
+                    gpu_required: true,
+                    ..TaskRequirements::generic(1, 256)
+                }
+                .with_vram_mb(vram_mb),
+            )
+        };
+
+        let t_running = queue.submit(vram_task(16_384)).await.unwrap();
+        let sched =
+            WorkloadScheduler::new(SchedulerConfig::default(), registry, queue.clone(), notify);
+
+        let r0 = sched.schedule_once().await.unwrap();
+        assert_eq!(r0.assignments.len(), 1);
+        assert_eq!(r0.assignments[0].task_id, t_running);
+        assert!(matches!(
+            rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+        queue
+            .mark_running_from(wid, Some(session), &t_running)
+            .await
+            .unwrap();
+
+        // 8192 MB VRAM remain free. Submit a high-priority 20480 MB task and a 4096 MB trailing task.
+        let t_big = queue
+            .submit_with_priority(vram_task(20_480), 10)
+            .await
+            .unwrap();
+        let t_small = queue.submit(vram_task(4_096)).await.unwrap();
+
+        let r_held = sched.schedule_batch(16).await.unwrap();
+        assert!(
+            r_held.assignments.is_empty(),
+            "VRAM hold_back must prevent small VRAM task from starving waiting 20480 MB task, got {:?}",
+            r_held.assignments
+        );
+
+        queue
+            .record_result_from(
+                wid,
+                Some(session),
+                rusty_grid_core::task::TaskResult::success(wid, t_running, "", 1, false),
+            )
+            .await
+            .unwrap();
+        let r_after = sched.schedule_batch(16).await.unwrap();
+        let after_ids: Vec<TaskId> = r_after.assignments.iter().map(|a| a.task_id).collect();
+        assert_eq!(after_ids, vec![t_big, t_small]);
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_handles_unknown_vram_worker_and_includes_vram_mb_in_reason(
+    ) {
+        let (registry, queue, _waiters, notify) = scheduler_fixture().await;
+        let wid = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let _session = registry
+            .register(
+                wid,
+                WorkerCapabilities::new("gpu-unknown-vram", 4, 16_384, true, false, None),
+                "127.0.0.1:9412".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t_unknown_vram = queue
+            .submit(Task::new(
+                TaskSpec::new_gpu_compute("unsized-gpu", 64),
+                TaskRequirements {
+                    gpu_required: true,
+                    ..TaskRequirements::generic(1, 256)
+                },
+            ))
+            .await
+            .unwrap();
+        let t_explicit_vram = queue
+            .submit(Task::new(
+                TaskSpec::new_command("needs-24g", vec![]),
+                TaskRequirements::generic(1, 256).with_vram_mb(24_576),
+            ))
+            .await
+            .unwrap();
+        let t_huge_cpu = queue
+            .submit(Task::new(
+                TaskSpec::new_command("too-many-cores", vec![]),
+                TaskRequirements::generic(16, 32),
+            ))
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_fail_unfulfillable_tasks(true),
+            registry,
+            queue.clone(),
+            notify,
+        );
+        let report = sched.schedule_batch(16).await.unwrap();
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, t_unknown_vram);
+        assert!(matches!(
+            rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+
+        let failed: HashMap<TaskId, String> = report.unfulfillable.into_iter().collect();
+        assert_eq!(failed.len(), 2);
+        let vram_reason = failed.get(&t_explicit_vram).expect("vram task fails");
+        assert!(
+            vram_reason.contains("vram_mb=24576"),
+            "expected vram_mb=24576 in unfulfillable reason, got {vram_reason:?}"
+        );
+        assert_eq!(
+            failed.get(&t_huge_cpu).map(String::as_str),
+            Some("No registered worker satisfies task requirements (cpu_cores=16, ram_mb=512, gpu=false)"),
+            "zero-VRAM tasks must keep the original resource-reason format without vram_mb"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preserve_gpu_for_gpu_tasks_reacts_to_command_task_with_explicit_vram_mb() {
+        let (registry, queue, _waiters, notify) = scheduler_fixture().await;
+        let wid = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let session = registry
+            .register(
+                wid,
+                WorkerCapabilities::new("gpu-16g", 2, 16_384, true, false, None)
+                    .with_vram_mb(Some(16_384)),
+                "127.0.0.1:9413".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Occupy 1 slot and 12288 MB VRAM so only 1 slot (`<= gpu_reserved_slots=1`) and 4096 MB remain.
+        let t_running = queue
+            .submit(Task::new(
+                TaskSpec::new_gpu_compute("holder", 64),
+                TaskRequirements {
+                    gpu_required: true,
+                    ..TaskRequirements::generic(1, 256)
+                }
+                .with_vram_mb(12_288),
+            ))
+            .await
+            .unwrap();
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig {
+                preserve_gpu_for_gpu_tasks: true,
+                gpu_reserved_slots: 1,
+                ..SchedulerConfig::default()
+            },
+            registry.clone(),
+            queue.clone(),
+            notify,
+        );
+        let r0 = sched.schedule_once().await.unwrap();
+        assert_eq!(r0.assignments.len(), 1);
+        assert_eq!(r0.assignments[0].task_id, t_running);
+        assert!(matches!(
+            rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+        queue
+            .mark_running_from(wid, Some(session), &t_running)
+            .await
+            .unwrap();
+
+        // Queue a Command task specifying `with_vram_mb(8192)` (with `gpu_required == false` at struct level)
+        // plus a trailing generic CPU task.
+        let _t_vram_cmd = queue
+            .submit_with_priority(
+                Task::new(
+                    TaskSpec::new_command("cuda-cli", vec!["--infer".into()]),
+                    TaskRequirements::generic(1, 256).with_vram_mb(8_192),
+                ),
+                0,
+            )
+            .await
+            .unwrap();
+        let _t_generic = queue.submit(cmd_task("plain-cpu")).await.unwrap();
+
+        let workers = registry.list_workers().await;
+        let (gpu_waiting, gpu_recent) = sched.gpu_demand(&workers).await;
+        assert!(
+            gpu_waiting && gpu_recent,
+            "Command task with with_vram_mb(8192) must trigger gpu_demand"
+        );
+
+        let r_pass = sched.schedule_batch(16).await.unwrap();
+        assert!(
+            r_pass.assignments.is_empty(),
+            "GPU preservation must hold the final GPU slot while a VRAM-requiring Command task waits, got {:?}",
+            r_pass.assignments
+        );
     }
 }
