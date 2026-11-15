@@ -43,6 +43,15 @@ const SCAN_PAGE: usize = 512;
 /// How long an idle probe of the queue for GPU work is trusted (see `GpuDemand`).
 const GPU_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Maximum time a deferred dispatch waiter waits for capacity in a worker's outbound channel
+/// before giving up and returning the assignment to the queue (`BUG-20`, design `0075`).
+pub const DISPATCH_RESERVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of deferred dispatch waiters allowed in flight for a single worker at once
+/// (`BUG-20`, design `0075`). Assignments beyond this bound are requeued immediately so slow
+/// workers cannot accumulate unbounded background tasks.
+pub const MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER: usize = 16;
+
 /// Scheduling policies for load balancing across workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SchedulingPolicy {
@@ -1361,6 +1370,47 @@ struct UnfulfillableSweep {
     completed: bool,
 }
 
+/// RAII guard tracking one deferred dispatch waiter in flight for `worker_id` (`BUG-20`).
+struct InFlightDispatchGuard {
+    counts: Arc<std::sync::Mutex<HashMap<Uuid, usize>>>,
+    worker_id: Uuid,
+}
+
+impl InFlightDispatchGuard {
+    fn try_acquire(
+        counts: &Arc<std::sync::Mutex<HashMap<Uuid, usize>>>,
+        worker_id: Uuid,
+        max_per_worker: usize,
+    ) -> Option<Self> {
+        if max_per_worker == 0 {
+            return None;
+        }
+        let mut guard = counts.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.entry(worker_id).or_insert(0);
+        if *entry >= max_per_worker {
+            return None;
+        }
+        *entry += 1;
+        drop(guard);
+        Some(Self {
+            counts: Arc::clone(counts),
+            worker_id,
+        })
+    }
+}
+
+impl Drop for InFlightDispatchGuard {
+    fn drop(&mut self) {
+        let mut guard = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = guard.get_mut(&self.worker_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                guard.remove(&self.worker_id);
+            }
+        }
+    }
+}
+
 /// Autonomous workload-specific scheduling engine.
 pub struct WorkloadScheduler {
     config: SchedulerConfig,
@@ -1380,6 +1430,12 @@ pub struct WorkloadScheduler {
     unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>,
     /// Measured per-(worker, task-key) run-time history (`0060` D1/D2).
     speed_book: SharedSpeedBook,
+    /// Deadline for waiting on a full worker channel before requeuing an assignment (`BUG-20`).
+    dispatch_reserve_timeout: Duration,
+    /// Per-worker cap on concurrent deferred dispatch waiters (`BUG-20`).
+    max_in_flight_dispatches_per_worker: usize,
+    /// Active deferred dispatch waiter count per worker (`BUG-20`).
+    in_flight_dispatches: Arc<std::sync::Mutex<HashMap<Uuid, usize>>>,
 }
 
 impl WorkloadScheduler {
@@ -1402,12 +1458,29 @@ impl WorkloadScheduler {
             rr_cursor: std::sync::atomic::AtomicUsize::new(0),
             unfulfillable_sweep: std::sync::Mutex::new(UnfulfillableSweep::default()),
             speed_book,
+            dispatch_reserve_timeout: DISPATCH_RESERVE_TIMEOUT,
+            max_in_flight_dispatches_per_worker: MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER,
+            in_flight_dispatches: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     /// Hands the scheduler the client waiter map (see the `waiters` field).
     pub fn with_waiters(mut self, waiters: WaiterMap) -> Self {
         self.waiters = Some(waiters);
+        self
+    }
+
+    /// Overrides the deadline a deferred dispatch waiter waits on a full worker channel before
+    /// returning the assignment to the queue (`BUG-20`, default: [`DISPATCH_RESERVE_TIMEOUT`]).
+    pub fn with_dispatch_reserve_timeout(mut self, timeout: Duration) -> Self {
+        self.dispatch_reserve_timeout = timeout;
+        self
+    }
+
+    /// Overrides the maximum number of deferred dispatch waiters allowed in flight per worker
+    /// (`BUG-20`, default: [`MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER`]).
+    pub fn with_max_in_flight_dispatches_per_worker(mut self, cap: usize) -> Self {
+        self.max_in_flight_dispatches_per_worker = cap;
         self
     }
 
@@ -2036,9 +2109,13 @@ impl WorkloadScheduler {
     ///
     /// The slot is reserved on the assignment's *session*: if the worker disconnected or
     /// re-registered since the snapshot, nothing was sent and only this task is put back. If the
-    /// session's channel is dead the whole session is torn down and failed over (waking any
-    /// `wait = true` client whose task runs out of failovers), instead of the former sweep that
-    /// requeued, and charged a retry to, every unrelated healthy task of the worker.
+    /// session's channel has immediate room (`sender.try_reserve()`), the message is delivered
+    /// synchronously under the queue read lock via [`TaskQueue::deliver_if_scheduled`]. When the
+    /// channel is `Full`, delivery is handed off to a per-assignment spawned waiter bounded by
+    /// [`DISPATCH_RESERVE_TIMEOUT`] and [`MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER`] (`BUG-20`,
+    /// design `0075`), so one slow worker never stalls the rest of the scheduling pass. If the
+    /// session's channel is dead (`Closed`), the whole session is torn down and failed over (waking
+    /// any `wait = true` client whose task runs out of failovers).
     async fn dispatch(&self, assignment: &ScheduleAssignment, msg: MasterMessage) {
         let ScheduleAssignment {
             task_id,
@@ -2046,6 +2123,9 @@ impl WorkloadScheduler {
             session_id,
             ..
         } = assignment;
+        let task_id = *task_id;
+        let worker_id = *worker_id;
+        let session_id = *session_id;
         #[cfg(feature = "otel")]
         let assign_span = tracing::info_span!(
             target: crate::otel::OTEL_SPAN_TARGET,
@@ -2055,7 +2135,7 @@ impl WorkloadScheduler {
             outcome = tracing::field::Empty,
         );
 
-        let sender = match self.registry.reserve_dispatch(worker_id, *session_id).await {
+        let sender = match self.registry.reserve_dispatch(&worker_id, session_id).await {
             Ok(sender) => sender,
             Err(e) => {
                 #[cfg(feature = "otel")]
@@ -2069,73 +2149,255 @@ impl WorkloadScheduler {
                 );
                 let _ = self
                     .queue
-                    .requeue_dispatch_failure(task_id, worker_id, *session_id)
+                    .requeue_dispatch_failure(&task_id, &worker_id, session_id)
                     .await;
                 return;
             }
         };
 
-        // Wait for room in the worker's channel first (a slow worker can keep us here for a long
-        // time, and a client may cancel the task meanwhile), and only then confirm, with nothing
-        // in between, that the task is still ours to deliver.
-        let delivered = match sender.reserve().await {
-            Ok(permit) => Ok(self
-                .queue
-                .deliver_if_scheduled(task_id, worker_id, *session_id, move || permit.send(msg))
-                .await),
-            Err(_) => Err(()),
-        };
-        match delivered {
-            Ok(Some(())) => {
-                #[cfg(feature = "otel")]
-                assign_span.record("outcome", "dispatched");
-                debug!(
-                    task_id = %task_id,
-                    worker_id = %worker_id,
-                    "Successfully dispatched AssignTask to worker"
-                );
+        // Fast path: try to reserve a permit without blocking the pass. Only when the worker's
+        // outbound channel is full do we defer to a bounded background waiter (`BUG-20`).
+        match sender.try_reserve() {
+            Ok(permit) => {
+                match self
+                    .queue
+                    .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
+                        permit.send(msg)
+                    })
+                    .await
+                {
+                    Some(()) => {
+                        #[cfg(feature = "otel")]
+                        assign_span.record("outcome", "dispatched");
+                        debug!(
+                            task_id = %task_id,
+                            worker_id = %worker_id,
+                            "Successfully dispatched AssignTask to worker"
+                        );
+                    }
+                    None => {
+                        #[cfg(feature = "otel")]
+                        assign_span.record("outcome", "stale");
+                        debug!(
+                            task_id = %task_id,
+                            worker_id = %worker_id,
+                            session_id = session_id,
+                            "Task is no longer scheduled on this session; not delivering AssignTask"
+                        );
+                        self.registry.release_dispatch(&worker_id, session_id).await;
+                    }
+                }
                 return;
             }
-            Ok(None) => {
-                #[cfg(feature = "otel")]
-                assign_span.record("outcome", "stale");
-                // Cancelled, failed over or reassigned between the placement and now: the worker
-                // never hears of it, so it must not run it (and its slot is free again).
-                debug!(
-                    task_id = %task_id,
-                    worker_id = %worker_id,
-                    session_id = session_id,
-                    "Task is no longer scheduled on this session; not delivering AssignTask"
-                );
-                self.registry.release_dispatch(worker_id, *session_id).await;
-                return;
-            }
-            Err(()) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
                 #[cfg(feature = "otel")]
                 assign_span.record("outcome", "dispatch_failed");
+                Self::rollback_closed_dispatch(
+                    &self.registry,
+                    &self.queue,
+                    &self.trigger,
+                    self.waiters.as_ref(),
+                    task_id,
+                    worker_id,
+                    session_id,
+                )
+                .await;
+                return;
             }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {}
         }
 
+        let Some(in_flight_guard) = InFlightDispatchGuard::try_acquire(
+            &self.in_flight_dispatches,
+            worker_id,
+            self.max_in_flight_dispatches_per_worker,
+        ) else {
+            #[cfg(feature = "otel")]
+            assign_span.record("outcome", "dispatch_failed");
+            warn!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                session_id = session_id,
+                cap = self.max_in_flight_dispatches_per_worker,
+                "Worker channel is full and deferred dispatch waiter cap is reached; returning assignment to the queue"
+            );
+            self.registry.release_dispatch(&worker_id, session_id).await;
+            if self
+                .queue
+                .requeue_dispatch_failure(&task_id, &worker_id, session_id)
+                .await
+                .unwrap_or(false)
+            {
+                self.trigger.notify_one();
+            }
+            return;
+        };
+
+        // Poll `reserve_owned` once before spawning so the waiter node is registered in the
+        // channel's FIFO semaphore waitlist in exact pass order (before any later assignment or
+        // control frame on the same worker).
+        let mut reserve_fut = Box::pin(sender.reserve_owned());
+        let initial_poll = {
+            let mut noop_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            std::future::Future::poll(reserve_fut.as_mut(), &mut noop_cx)
+        };
+        match initial_poll {
+            std::task::Poll::Ready(Ok(permit)) => {
+                drop(in_flight_guard);
+                match self
+                    .queue
+                    .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
+                        let _ = permit.send(msg);
+                    })
+                    .await
+                {
+                    Some(()) => {
+                        #[cfg(feature = "otel")]
+                        assign_span.record("outcome", "dispatched");
+                        debug!(
+                            task_id = %task_id,
+                            worker_id = %worker_id,
+                            "Successfully dispatched AssignTask to worker"
+                        );
+                    }
+                    None => {
+                        #[cfg(feature = "otel")]
+                        assign_span.record("outcome", "stale");
+                        debug!(
+                            task_id = %task_id,
+                            worker_id = %worker_id,
+                            session_id = session_id,
+                            "Task is no longer scheduled on this session; not delivering AssignTask"
+                        );
+                        self.registry.release_dispatch(&worker_id, session_id).await;
+                    }
+                }
+                return;
+            }
+            std::task::Poll::Ready(Err(_)) => {
+                drop(in_flight_guard);
+                #[cfg(feature = "otel")]
+                assign_span.record("outcome", "dispatch_failed");
+                Self::rollback_closed_dispatch(
+                    &self.registry,
+                    &self.queue,
+                    &self.trigger,
+                    self.waiters.as_ref(),
+                    task_id,
+                    worker_id,
+                    session_id,
+                )
+                .await;
+                return;
+            }
+            std::task::Poll::Pending => {}
+        }
+
+        let registry = self.registry.clone();
+        let queue = self.queue.clone();
+        let trigger = Arc::clone(&self.trigger);
+        let waiters = self.waiters.clone();
+        let timeout = self.dispatch_reserve_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::spawn(async move {
+            let _guard = in_flight_guard;
+            match tokio::time::timeout_at(deadline, reserve_fut).await {
+                Ok(Ok(permit)) => {
+                    match queue
+                        .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
+                            let _ = permit.send(msg);
+                        })
+                        .await
+                    {
+                        Some(()) => {
+                            #[cfg(feature = "otel")]
+                            assign_span.record("outcome", "dispatched");
+                            debug!(
+                                task_id = %task_id,
+                                worker_id = %worker_id,
+                                "Successfully dispatched deferred AssignTask to worker"
+                            );
+                        }
+                        None => {
+                            #[cfg(feature = "otel")]
+                            assign_span.record("outcome", "stale");
+                            // Cancelled, failed over or reassigned between the placement and now:
+                            // the worker never hears of it, so it must not run it (and its slot is free again).
+                            debug!(
+                                task_id = %task_id,
+                                worker_id = %worker_id,
+                                session_id = session_id,
+                                "Task is no longer scheduled on this session; not delivering deferred AssignTask"
+                            );
+                            registry.release_dispatch(&worker_id, session_id).await;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    #[cfg(feature = "otel")]
+                    assign_span.record("outcome", "dispatch_failed");
+                    Self::rollback_closed_dispatch(
+                        &registry,
+                        &queue,
+                        &trigger,
+                        waiters.as_ref(),
+                        task_id,
+                        worker_id,
+                        session_id,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    #[cfg(feature = "otel")]
+                    assign_span.record("outcome", "dispatch_failed");
+                    warn!(
+                        task_id = %task_id,
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        timeout_ms = timeout.as_millis() as u64,
+                        "Timed out waiting for room in worker channel; returning assignment to the queue"
+                    );
+                    registry.release_dispatch(&worker_id, session_id).await;
+                    if queue
+                        .requeue_dispatch_failure(&task_id, &worker_id, session_id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        trigger.notify_one();
+                    }
+                }
+            }
+        });
+    }
+
+    async fn rollback_closed_dispatch(
+        registry: &WorkerRegistry,
+        queue: &TaskQueue,
+        trigger: &Arc<Notify>,
+        waiters: Option<&WaiterMap>,
+        task_id: TaskId,
+        worker_id: Uuid,
+        session_id: u64,
+    ) {
         warn!(
             task_id = %task_id,
             worker_id = %worker_id,
             session_id = session_id,
             "Failed to dispatch AssignTask to worker; rolling back assignment"
         );
-        let _ = self.registry.decrement_active_tasks(worker_id).await;
+        registry.release_dispatch(&worker_id, session_id).await;
         // Requeue this task first, uncharged: it never left the master, and the sweep below
         // would otherwise count it as a failover.
-        let _ = self
-            .queue
-            .requeue_dispatch_failure(task_id, worker_id, *session_id)
+        let _ = queue
+            .requeue_dispatch_failure(&task_id, &worker_id, session_id)
             .await;
         crate::server::handle_worker_disconnect_with_broadcast(
-            &self.registry,
-            &self.queue,
-            &self.trigger,
-            self.waiters.as_ref(),
-            worker_id,
-            Some(*session_id),
+            registry,
+            queue,
+            trigger,
+            waiters,
+            &worker_id,
+            Some(session_id),
             "Failed to deliver AssignTask message",
             false,
             #[cfg(feature = "dashboard")]
@@ -7057,5 +7319,307 @@ mod tests {
             "GPU preservation must hold the final GPU slot while a VRAM-requiring Command task waits, got {:?}",
             r_pass.assignments
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_worker_full_channel_does_not_block_healthy_worker_and_requeues_after_deadline(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // Give `stalled` a lower UUID so `schedule_batch` sorts it ahead of `healthy` and
+        // dispatches to the stalled worker first in the pass.
+        let stalled = Uuid::from_u128(1);
+        let healthy = Uuid::from_u128(2);
+
+        let (stalled_tx, _stalled_rx) = tokio::sync::mpsc::channel(1);
+        stalled_tx
+            .try_send(MasterMessage::HeartbeatAck { timestamp: 1 })
+            .expect("fill stalled worker channel");
+        let (healthy_tx, mut healthy_rx) = tokio::sync::mpsc::channel(8);
+
+        registry
+            .register(
+                stalled,
+                WorkerCapabilities::new("stalled", 1, 8192, true, false, None)
+                    .with_vram_mb(Some(16_384)),
+                "127.0.0.1:9420".parse().unwrap(),
+                stalled_tx,
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .register(
+                healthy,
+                WorkerCapabilities::new("healthy", 4, 8192, false, false, None),
+                "127.0.0.1:9421".parse().unwrap(),
+                healthy_tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t_stalled = queue
+            .submit(
+                Task::new(
+                    TaskSpec::new_command("on-stalled", vec![]),
+                    TaskRequirements::generic(1, 1024).with_vram_mb(4096),
+                )
+                .with_tags(vec![format!("require:worker={stalled}")]),
+            )
+            .await
+            .unwrap();
+        let t_healthy_1 = queue
+            .submit(
+                Task::new(
+                    TaskSpec::new_command("on-healthy-1", vec![]),
+                    TaskRequirements::generic(1, 512),
+                )
+                .with_tags(vec![format!("require:worker={healthy}")]),
+            )
+            .await
+            .unwrap();
+        let t_healthy_2 = queue
+            .submit(
+                Task::new(
+                    TaskSpec::new_command("on-healthy-2", vec![]),
+                    TaskRequirements::generic(1, 512),
+                )
+                .with_tags(vec![format!("require:worker={healthy}")]),
+            )
+            .await
+            .unwrap();
+
+        let config = SchedulerConfig::default();
+        let tick = config.tick_interval;
+        let sched = Arc::new(
+            WorkloadScheduler::new(config, registry.clone(), queue.clone(), notify)
+                .with_waiters(waiters),
+        );
+
+        let report = tokio::time::timeout(tick, sched.schedule_once())
+            .await
+            .expect("pass must not block on stalled worker channel")
+            .unwrap();
+        assert_eq!(report.assignments.len(), 3);
+        assert_eq!(report.assignments[0].worker_id, stalled);
+        assert_eq!(report.assignments[0].task_id, t_stalled);
+
+        // Within the same scheduling pass, the healthy worker receives all of its assignments.
+        let mut healthy_assigned = Vec::new();
+        while let Ok(msg) = healthy_rx.try_recv() {
+            if let MasterMessage::AssignTask { task } = msg {
+                healthy_assigned.push(task.id);
+            }
+        }
+        assert_eq!(healthy_assigned, vec![t_healthy_1, t_healthy_2]);
+
+        // Before the reserve deadline expires, the stalled worker's task is still waiting for room.
+        tokio::time::advance(DISPATCH_RESERVE_TIMEOUT - Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            queue.get_state(&t_stalled).await,
+            Some(crate::queue::TaskState::Scheduled)
+        );
+        assert_eq!(registry.get_worker(stalled).await.unwrap().active_tasks, 1);
+        let load_before = queue
+            .assigned_loads()
+            .await
+            .get(&stalled)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(load_before.tasks, 1);
+        assert_eq!(load_before.slots, 1);
+        assert_eq!(load_before.unstarted_ram_mb, 512);
+        assert_eq!(load_before.vram_mb, 4096);
+
+        // Once DISPATCH_RESERVE_TIMEOUT elapses, the stalled worker's task is requeued uncharged
+        // and all slot/RAM/VRAM reservations on `stalled` are released.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        for _ in 0..10 {
+            if queue.get_state(&t_stalled).await == Some(crate::queue::TaskState::Queued) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let stalled_info = queue.get_task(&t_stalled).await.unwrap();
+        assert_eq!(stalled_info.state, crate::queue::TaskState::Queued);
+        assert_eq!(stalled_info.retry_count, 0);
+        assert_eq!(stalled_info.failover_count, 0);
+        assert_eq!(registry.get_worker(stalled).await.unwrap().active_tasks, 0);
+        assert_eq!(
+            registry.get_worker(stalled).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+        assert!(
+            !queue.assigned_loads().await.contains_key(&stalled),
+            "requeued dispatch must release tasks, slots, unstarted_ram_mb, and vram_mb"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_task_cancelled_while_deferred_delivery_waits_is_never_sent() {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let w = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        registry
+            .register(
+                w,
+                WorkerCapabilities::new("w-cancel", 4, 8192, false, false, None),
+                "127.0.0.1:9422".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        tx.try_send(MasterMessage::HeartbeatAck { timestamp: 1 })
+            .expect("fill channel");
+
+        let t_cancel = queue
+            .submit(cmd_task("cancel-while-waiting"))
+            .await
+            .unwrap();
+        let t_keep = queue.submit(cmd_task("keep-while-waiting")).await.unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+        )
+        .with_waiters(waiters.clone());
+
+        let report = sched.schedule_once().await.unwrap();
+        assert_eq!(report.assignments.len(), 2);
+        assert_eq!(
+            queue.get_state(&t_cancel).await,
+            Some(crate::queue::TaskState::Scheduled)
+        );
+        assert_eq!(registry.get_worker(w).await.unwrap().active_tasks, 2);
+
+        // Cancel `t_cancel` while both deferred delivery waiters are parked on the full channel.
+        let cancel_handle = {
+            let (registry, queue, notify, waiters) = (
+                registry.clone(),
+                queue.clone(),
+                notify.clone(),
+                waiters.clone(),
+            );
+            tokio::spawn(async move {
+                crate::server::cancel_task_and_notify(
+                    &registry,
+                    &queue,
+                    &notify,
+                    &waiters,
+                    t_cancel,
+                    "user cancelled",
+                )
+                .await
+            })
+        };
+        for _ in 0..10 {
+            if queue.get_state(&t_cancel).await == Some(crate::queue::TaskState::Cancelled) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            queue.get_state(&t_cancel).await,
+            Some(crate::queue::TaskState::Cancelled)
+        );
+
+        // Drain the channel: `t_cancel` must not be sent, `t_keep` must be sent, and `t_cancel`'s
+        // reserved dispatch slot must be released.
+        let mut assigned = Vec::new();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            while let Ok(msg) = rx.try_recv() {
+                if let MasterMessage::AssignTask { task } = msg {
+                    assigned.push(task.id);
+                }
+            }
+        }
+        assert!(cancel_handle.await.unwrap().unwrap());
+        assert_eq!(assigned, vec![t_keep]);
+        assert_eq!(registry.get_worker(w).await.unwrap().active_tasks, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deferred_dispatch_waiter_cap_requeues_excess_and_releases_reservations() {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let w = Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(MasterMessage::HeartbeatAck { timestamp: 1 })
+            .expect("fill channel");
+        registry
+            .register(
+                w,
+                WorkerCapabilities::new("w-cap", 4, 8192, true, false, None)
+                    .with_vram_mb(Some(16_384)),
+                "127.0.0.1:9423".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t1 = queue
+            .submit(Task::new(
+                TaskSpec::new_command("cap-1", vec![]),
+                TaskRequirements::generic(1, 512).with_vram_mb(4096),
+            ))
+            .await
+            .unwrap();
+        let t2 = queue
+            .submit(Task::new(
+                TaskSpec::new_command("cap-2", vec![]),
+                TaskRequirements::generic(1, 512).with_vram_mb(4096),
+            ))
+            .await
+            .unwrap();
+
+        // Cap deferred dispatch waiters at 1 per worker: `t1` gets a waiter, `t2` is requeued at once.
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters)
+        .with_max_in_flight_dispatches_per_worker(1);
+
+        let report = sched.schedule_once().await.unwrap();
+        assert_eq!(report.assignments.len(), 2);
+        assert_eq!(
+            queue.get_state(&t1).await,
+            Some(crate::queue::TaskState::Scheduled)
+        );
+        assert_eq!(
+            queue.get_state(&t2).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+        assert_eq!(registry.get_worker(w).await.unwrap().active_tasks, 1);
+        let load = queue
+            .assigned_loads()
+            .await
+            .get(&w)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(load.tasks, 1);
+        assert_eq!(load.vram_mb, 4096);
+
+        // After the deadline expires, `t1` also returns to Queued and releases its reservation.
+        tokio::time::advance(DISPATCH_RESERVE_TIMEOUT + Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            if queue.get_state(&t1).await == Some(crate::queue::TaskState::Queued) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            queue.get_state(&t1).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+        assert_eq!(registry.get_worker(w).await.unwrap().active_tasks, 0);
+        assert!(!queue.assigned_loads().await.contains_key(&w));
     }
 }
