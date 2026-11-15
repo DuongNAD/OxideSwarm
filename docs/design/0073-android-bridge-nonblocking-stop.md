@@ -46,26 +46,44 @@ Previously (at `c2462e3`, `AND-5` in `docs/BACKLOG.md`):
 
 ## Design
 
-### D1 Non-blocking stop and draining state (`crates/android_bridge/src/lib.rs`)
+### D1 Non-blocking stop, draining state, and lifecycle serialization (`crates/android_bridge/src/lib.rs`)
 
-- `WorkerState` tracks `stopping: AtomicBool` alongside `running: AtomicBool`.
-- `stop_worker_impl` atomically transitions `running` from `true` to `false`, sets
-  `stopping = true` and `status = "STOPPING"`, sends `true` on `shutdown_tx`, takes `thread_handle`,
-  and spawns a background join thread (`std::thread::spawn`).
-- The join thread waits on `h.join()`, then sets `status = "STOPPED"` and clears
-  `stopping = false`.
-- If `start_worker_impl` is called while `stopping` is `true`, it polls `stopping` for up to `30 ms`
-  so an already-idle worker runtime can finish shutting down, and if `stopping` is still `true`
-  (because the previous worker is draining tasks), sets `status = "STOPPING"`, releases its
-  `running` claim, and returns `false` without blocking the caller.
+- `WorkerState` tracks `lifecycle: Mutex<()>`, `running: AtomicBool`, `stopping: AtomicBool`, and
+  `generation: AtomicU64`. Both `start_worker_impl` and `stop_worker_impl` hold `lifecycle` across
+  their state transitions so Start and Stop cannot interleave or clobber one another's fields.
+- `stop_worker_impl` acquires `lifecycle`, sets `stopping = true` (`swap(true)`), takes
+  `thread_handle` and `shutdown_tx`, sends `true` on `shutdown_tx`, sets `status = "STOPPING"` when
+  a worker thread handle was present, and only then transitions `running` from `true` to `false`. If
+  a handle was taken, it spawns a detached join thread (`std::thread::spawn`) that waits on
+  `h.join()` and then, under `lifecycle`, sets `status = "STOPPED"` and `stopping = false`. If no
+  handle was present, it sets `status = "STOPPED"` and clears `stopping` only when no earlier stop
+  is still draining (`!was_stopping`).
+- Before acquiring `lifecycle`, if `stopping` is `true`, `start_worker_impl` polls `stopping` for up
+  to `30 ms` so an already-idle worker runtime can finish shutting down. After acquiring `lifecycle`
+  and claiming `running`, it re-checks `stopping`: if the previous worker is still draining tasks,
+  it sets `status = "STOPPING"`, releases its `running` claim, and returns `false` without blocking
+  the caller.
+- `start_worker_impl` configures the in-process mobile worker with `.with_no_gpu(!simulate_gpu)`,
+  `.with_no_blender(true)`, and `.with_no_cuda(true)` to skip host subprocess hardware probes, and
+  constructs `WorkerClient::new(config)` inside `tokio::task::spawn_blocking` raced against
+  `shutdown_rx.changed()` so stop requests during client initialization take effect immediately.
 
-### D2 Atomic start claim (`crates/android_bridge/src/lib.rs`)
+### D2 Atomic start claim and generation-guarded self-exit (`crates/android_bridge/src/lib.rs`)
 
-- `start_worker_impl` claims `state.running` at entry with
-  `compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)`. If `running` is already
-  `true`, it returns `true` immediately without spawning a second worker thread.
-- Every early-return error path (`stopping` check, `check_sandbox_usable` failure, thread spawn
-  failure, and runtime build failure inside the worker thread) resets `running` to `false`.
+- Under `lifecycle`, `start_worker_impl` claims `state.running` with
+  `compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)` and holds `lifecycle` through
+  checking the sandbox directory, storing `worker_id`, `p2p_ticket`, `shutdown_tx`, and
+  `status = "STARTING"`, incrementing `generation`, spawning the worker thread, and storing
+  `thread_handle`. If `running` is already `true`, it returns `true` immediately without spawning a
+  second worker thread.
+- Every early-return error path (`stopping` re-check, `check_sandbox_usable` failure, and thread
+  spawn failure) resets `running` to `false` before releasing `lifecycle`.
+- Each spawned worker thread captures its `my_generation` and scopes both `WorkerThreadGuard`
+  (`debug_assert!(live <= 1)`) and the Tokio runtime inside an inner block so `rt.shutdown_background()`
+  (which consumes `rt`) and `drop(_worker_guard)` complete before any self-exit state update. On
+  self-exit (runtime build failure, uncancelled `WorkerClient::new` failure, or `client.run`
+  returning when not stopped), the thread locks `lifecycle` and updates `status` and
+  `running = false` only if `state.generation == my_generation && !state.stopping`.
 
 ### D3 Poison-tolerant mutex locking (`crates/android_bridge/src/lib.rs`)
 
@@ -109,6 +127,16 @@ Previously (at `c2462e3`, `AND-5` in `docs/BACKLOG.md`):
     listener.
   - `test_stop_then_start_again_works`: verifies stopping a worker and starting a fresh worker
     succeeds and assigns a new worker UUID.
+  - `test_interleaved_stop_start_at_most_one_worker_thread`: runs 200 barrier-synchronized
+    iterations of interleaved `start_worker_impl` and `stop_worker_impl` across two threads and
+    verifies that at most one worker thread is ever live simultaneously.
+  - `test_cancelled_start_does_not_clobber_stop_status`: drives `Start1 -> Stop -> Start2` using a
+    test hook after Start1's running claim and verifies that exactly one worker thread is live,
+    Start2's `worker_id` and `p2p_ticket` are preserved, and the status is not left stuck at
+    `STARTING`.
+  - `test_self_exiting_worker_then_immediate_start_does_not_panic`: starts a worker that self-exits
+    immediately (invalid P2P ticket) and immediately restarts in a 50-iteration loop, verifying no
+    panic and at most one live worker thread at any time.
 - CI step `cargo check -p rusty_grid_android_bridge --target aarch64-linux-android --locked`:
   checked on GitHub Actions (`ubuntu-latest` with `$ANDROID_NDK_LATEST_HOME`), not locally on hosts
   without the Android NDK installed.

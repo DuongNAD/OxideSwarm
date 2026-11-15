@@ -75,6 +75,7 @@ jobs:
           export CC_aarch64_linux_android="${CLANG_BIN}"
           export AR_aarch64_linux_android="${AR_BIN}"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CLANG_BIN}"
+          test -x "${CLANG_BIN}" && test -x "${AR_BIN}" || { echo "NDK toolchain not found under ${TOOLCHAIN}"; exit 1; }
           cargo check -p rusty_grid_android_bridge --target aarch64-linux-android --locked
 
   gpu-wgpu:
