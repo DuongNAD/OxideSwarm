@@ -1644,19 +1644,19 @@ mod tests {
         assert!(h_start1.join().unwrap());
         let start2_worker_id = h_stop_and_start2.join().unwrap();
 
-        // Wait for Start2's worker thread to enter its runtime so status advances past `STARTING`
-        // and its `WorkerThreadGuard` is active.
+        // Wait for Start2's worker thread to enter its runtime so status advances past `STARTING`.
         for _ in 0..100 {
-            if status_text() != "STARTING" && live_worker_threads_for_testing() == 1 {
+            if status_text() != "STARTING" {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        assert_eq!(
-            live_worker_threads_for_testing(),
-            1,
-            "Exactly one worker thread must be live after Start1 -> Stop -> Start2"
+        // Start2's worker may already have exited because its ticket is not parsable,
+        // so check "never two" rather than "exactly one".
+        assert!(
+            live_worker_threads_for_testing() <= 1,
+            "At most one worker thread may be live after Start1 -> Stop -> Start2"
         );
         assert!(
             max_live_worker_threads_for_testing() <= 1,
@@ -1675,10 +1675,14 @@ mod tests {
             "ticket-start2",
             "Start2's p2p_ticket must not be overwritten by Start1"
         );
+        let status = final_json["status"].as_str().unwrap();
         assert_ne!(
-            final_json["status"].as_str().unwrap(),
-            "STARTING",
+            status, "STARTING",
             "Status must not remain stuck at STARTING"
+        );
+        assert!(
+            status == "RUNNING" || status.starts_with("ERROR: "),
+            "Final status must be Start2's outcome (RUNNING or ERROR: ...), got: {status}"
         );
 
         assert!(stop_worker_impl());
