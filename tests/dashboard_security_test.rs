@@ -180,7 +180,6 @@ async fn test_every_route_is_denied_without_a_token_and_nothing_runs() {
         (Method::GET, "/api/stream".into()),
         (Method::HEAD, "/api/status".into()),
         (Method::POST, "/api/tasks".into()),
-        (Method::POST, "/api/chat".into()),
         (Method::POST, "/api/modes/run".into()),
         (Method::PUT, "/api/tasks".into()),
         (Method::PATCH, "/api/tasks".into()),
@@ -193,7 +192,7 @@ async fn test_every_route_is_denied_without_a_token_and_nothing_runs() {
         let resp = client
             .request(method.clone(), format!("{base}{path}"))
             .header("content-type", "application/json")
-            .body(r#"{"command":"touch /tmp/oxs-should-never-run","message":"hi","mode":"doc"}"#)
+            .body(r#"{"command":"touch /tmp/oxs-should-never-run","mode":"doc"}"#)
             .send()
             .await
             .unwrap_or_else(|e| panic!("{method} {path}: {e}"));
@@ -280,6 +279,20 @@ async fn test_registered_token_reaches_every_route_class() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(task_count(&master).await, 1);
+
+    // Removed POST /api/chat route returns 404 Not Found even with an Admin token (SEC-14).
+    let resp = client
+        .post(format!("{base}/api/chat"))
+        .header("authorization", bearer)
+        .json(&serde_json::json!({ "message": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "POST /api/chat with Admin token must return 404"
+    );
 
     // Browsers cannot set headers on WebSocket/SSE requests, so those take ?token=.
     let (mut ws, resp) = connect_async(format!("ws://{addr}/ws?token=admin-token-for-test"))
@@ -725,6 +738,19 @@ async fn test_a_bare_loopback_master_has_a_usable_local_dashboard() {
     }
     assert_eq!(post_task(addr, &[]).await, 200);
     assert_eq!(task_count(&master).await, 1);
+
+    // Removed POST /api/chat route returns 404 Not Found without a token on a local dashboard (SEC-14).
+    let resp = client
+        .post(format!("{base}/api/chat"))
+        .json(&serde_json::json!({ "message": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "POST /api/chat without token must return 404"
+    );
 
     // The implicit bypass is the dev bypass: every browser-origin check still applies.
     assert_eq!(
