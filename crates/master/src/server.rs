@@ -2661,7 +2661,7 @@ async fn apply_task_result_inner(
                             }
                         }
                     }
-                    cold_queue.flush_cold_maintenance().await;
+                    cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
                 if send_ack {
@@ -2677,7 +2677,7 @@ async fn apply_task_result_inner(
                         }
                     }
                 }
-                queue.flush_cold_maintenance().await;
+                queue.spawn_cold_maintenance().await;
             }
         } else {
             if let Some(ack) = durable_ack {
@@ -2702,7 +2702,7 @@ async fn apply_task_result_inner(
                     }
                 }
             }
-            queue.flush_cold_maintenance().await;
+            queue.spawn_cold_maintenance().await;
         }
     } else if send_ack {
         if let Some(ack) = durable_ack {
@@ -2820,7 +2820,7 @@ pub(crate) async fn handle_oversized_master_message(
                 }
             }
         }
-        queue.flush_cold_maintenance().await;
+        queue.spawn_cold_maintenance().await;
     }
 
     scheduler_notify.notify_one();

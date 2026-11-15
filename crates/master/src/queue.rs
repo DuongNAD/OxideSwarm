@@ -1108,6 +1108,33 @@ impl TaskQueueInner {
         evicted
     }
 
+    fn collect_cold_spill_ids(&self) -> Vec<TaskId> {
+        let mut candidates = Vec::new();
+        let mut sim_tasks = self.hot_terminal_sizes.len();
+        let mut sim_bytes = self.hot_terminal_bytes;
+        for tid in &self.hot_terminal_order {
+            if sim_tasks <= self.max_hot_terminal_tasks && sim_bytes <= self.max_hot_terminal_bytes
+            {
+                break;
+            }
+            let Some(&hsize) = self.hot_terminal_sizes.get(tid) else {
+                continue;
+            };
+            let Some(entry) = self.tasks.get(tid) else {
+                sim_tasks = sim_tasks.saturating_sub(1);
+                continue;
+            };
+            if !entry.state.is_terminal() || entry.result.is_none() {
+                sim_tasks = sim_tasks.saturating_sub(1);
+                continue;
+            }
+            candidates.push(*tid);
+            sim_tasks = sim_tasks.saturating_sub(1);
+            sim_bytes = sim_bytes.saturating_sub(hsize);
+        }
+        candidates
+    }
+
     fn insert_ready(&mut self, key: QueueOrderKey) {
         if self.ready_queue.insert(key) {
             self.ready_epoch = self.ready_epoch.wrapping_add(1);
@@ -1322,6 +1349,8 @@ pub struct TaskQueue {
     session_resume_hold_secs: Arc<std::sync::atomic::AtomicU64>,
     session_resume_workers: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     session_resume_tracker: Arc<std::sync::Mutex<SessionResumeTracker>>,
+    cold_flush_lock: Arc<tokio::sync::Mutex<()>>,
+    cold_maintenance_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     ready_views_calls: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -1424,6 +1453,8 @@ impl TaskQueue {
             session_resume_hold_secs,
             session_resume_workers,
             session_resume_tracker,
+            cold_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cold_maintenance_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -2141,9 +2172,11 @@ impl TaskQueue {
                 .map(|(tid, _)| *tid)
                 .collect();
             let recovered_cold: Vec<TaskId> = live_cold.iter().copied().collect();
+            let mut keep_cold = live_cold;
+            keep_cold.extend(inner.collect_cold_spill_ids());
 
             inner.maybe_trigger_compaction();
-            (live_cold, recovered_cold)
+            (keep_cold, recovered_cold)
         };
 
         for ack in acks {
@@ -2536,6 +2569,7 @@ impl TaskQueue {
     /// Compacts the task store (if attached), detaches it from the queue, and waits for the writer
     /// thread to flush and release `store.lock`.
     pub async fn close_and_compact_store(&self) {
+        let _cold_guard = self.cold_flush_lock.lock().await;
         let (store, ack, cold_store, deletes) = {
             let mut inner = self.inner.write().await;
             inner.store_closed = true;
@@ -5684,61 +5718,42 @@ impl TaskQueue {
         (inner.hot_terminal_sizes.len(), inner.hot_terminal_bytes)
     }
 
-    /// Flushes pending cold-result spills and unlinks cold files of evicted tasks outside the
-    /// queue lock. No-ops quickly when no `ColdResultStore` is attached or limits hold.
-    pub(crate) async fn flush_cold_maintenance(&self) {
-        {
-            let inner = self.inner.read().await;
-            if inner.cold_results.is_none() {
-                return;
-            }
-            let need_spill = inner.hot_terminal_sizes.len() > inner.max_hot_terminal_tasks
-                || inner.hot_terminal_bytes > inner.max_hot_terminal_bytes;
-            if inner.pending_cold_deletes.is_empty() && !need_spill {
-                return;
-            }
+    async fn needs_cold_maintenance(&self) -> bool {
+        let inner = self.inner.read().await;
+        if inner.cold_results.is_none() {
+            return false;
         }
+        let need_spill = inner.hot_terminal_sizes.len() > inner.max_hot_terminal_tasks
+            || inner.hot_terminal_bytes > inner.max_hot_terminal_bytes;
+        !inner.pending_cold_deletes.is_empty() || need_spill
+    }
 
+    async fn flush_cold_maintenance_step(&self) -> bool {
         let (store, candidates, deletes) = {
             let mut inner = self.inner.write().await;
             let deletes = std::mem::take(&mut inner.pending_cold_deletes);
             let Some(ref store) = inner.cold_results else {
-                return;
+                return false;
             };
-            let mut candidates: Vec<(TaskId, TaskResult, ColdResultSummary)> = Vec::new();
-            let mut sim_tasks = inner.hot_terminal_sizes.len();
-            let mut sim_bytes = inner.hot_terminal_bytes;
-            for tid in &inner.hot_terminal_order {
-                if sim_tasks <= inner.max_hot_terminal_tasks
-                    && sim_bytes <= inner.max_hot_terminal_bytes
-                {
-                    break;
+            let store = Arc::clone(store);
+            let spill_ids = inner.collect_cold_spill_ids();
+            let mut candidates: Vec<(TaskId, TaskResult, ColdResultSummary)> =
+                Vec::with_capacity(spill_ids.len());
+            for tid in spill_ids {
+                if let (Some(&hsize), Some(res)) = (
+                    inner.hot_terminal_sizes.get(&tid),
+                    inner.tasks.get(&tid).and_then(|e| e.result.as_ref()),
+                ) {
+                    let summary = ColdResultSummary::from_result(res, hsize);
+                    candidates.push((tid, res.clone(), summary));
                 }
-                let Some(&hsize) = inner.hot_terminal_sizes.get(tid) else {
-                    continue;
-                };
-                let Some(entry) = inner.tasks.get(tid) else {
-                    sim_tasks = sim_tasks.saturating_sub(1);
-                    continue;
-                };
-                if !entry.state.is_terminal() {
-                    sim_tasks = sim_tasks.saturating_sub(1);
-                    continue;
-                }
-                let Some(ref res) = entry.result else {
-                    sim_tasks = sim_tasks.saturating_sub(1);
-                    continue;
-                };
-                let summary = ColdResultSummary::from_result(res, hsize);
-                candidates.push((*tid, res.clone(), summary));
-                sim_tasks = sim_tasks.saturating_sub(1);
-                sim_bytes = sim_bytes.saturating_sub(hsize);
             }
-            (Arc::clone(store), candidates, deletes)
+            (store, candidates, deletes)
         };
 
-        if candidates.is_empty() && deletes.is_empty() {
-            return;
+        let had_deletes = !deletes.is_empty();
+        if candidates.is_empty() && !had_deletes {
+            return false;
         }
 
         let store_bg = Arc::clone(&store);
@@ -5746,26 +5761,13 @@ impl TaskQueue {
             for tid in &deletes {
                 store_bg.remove(tid);
             }
-            let mut ok = Vec::with_capacity(candidates.len());
-            for (tid, res, summary) in candidates {
-                match store_bg.put(&tid, &res) {
-                    Ok(()) => ok.push((tid, summary)),
-                    Err(err) => {
-                        tracing::warn!(
-                            task_id = %tid.0,
-                            error = %err,
-                            "Failed to spill cold terminal result to disk"
-                        );
-                    }
-                }
-            }
-            ok
+            store_bg.put_batch(candidates)
         })
         .await
         .unwrap_or_default();
 
         if written.is_empty() {
-            return;
+            return had_deletes;
         }
 
         let mut orphan_deletes = Vec::new();
@@ -5776,24 +5778,24 @@ impl TaskQueue {
                 .as_ref()
                 .is_some_and(|s| Arc::ptr_eq(s, &store));
             if !same_store {
-                return;
+                return false;
             }
-            for (tid, summary) in written {
-                let committed = match inner.tasks.get_mut(&tid) {
+            for (tid, summary) in &written {
+                let committed = match inner.tasks.get_mut(tid) {
                     Some(entry) if entry.state.is_terminal() && entry.result.is_some() => {
                         entry.result = None;
-                        entry.cold_result = Some(summary);
+                        entry.cold_result = Some(summary.clone());
                         true
                     }
                     Some(entry) if entry.state.is_terminal() && entry.cold_result.is_some() => true,
                     _ => false,
                 };
                 if committed {
-                    if let Some(hsize) = inner.hot_terminal_sizes.remove(&tid) {
+                    if let Some(hsize) = inner.hot_terminal_sizes.remove(tid) {
                         inner.hot_terminal_bytes = inner.hot_terminal_bytes.saturating_sub(hsize);
                     }
                 } else {
-                    orphan_deletes.push(tid);
+                    orphan_deletes.push(*tid);
                 }
             }
             let inner_ref = &mut *inner;
@@ -5809,6 +5811,68 @@ impl TaskQueue {
                 }
             })
             .await;
+        }
+        true
+    }
+
+    async fn run_cold_maintenance_locked(&self, mut guard: tokio::sync::OwnedMutexGuard<()>) {
+        loop {
+            loop {
+                self.cold_maintenance_requested
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if !self.needs_cold_maintenance().await {
+                    break;
+                }
+                if !self.flush_cold_maintenance_step().await {
+                    break;
+                }
+                if !self
+                    .cold_maintenance_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && !self.needs_cold_maintenance().await
+                {
+                    break;
+                }
+            }
+            drop(guard);
+            if self
+                .cold_maintenance_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Ok(next_guard) = Arc::clone(&self.cold_flush_lock).try_lock_owned() {
+                    guard = next_guard;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    /// Flushes pending cold-result spills and unlinks cold files of evicted tasks outside the
+    /// queue lock. No-ops quickly when no `ColdResultStore` is attached or limits hold.
+    pub(crate) async fn flush_cold_maintenance(&self) {
+        if !self.needs_cold_maintenance().await {
+            return;
+        }
+        self.cold_maintenance_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = Arc::clone(&self.cold_flush_lock).lock_owned().await;
+        self.run_cold_maintenance_locked(guard).await;
+    }
+
+    /// Triggers single-flight asynchronous cold-result maintenance without stalling task result
+    /// delivery or spawning overlapping workers under burst load.
+    pub(crate) async fn spawn_cold_maintenance(&self) {
+        if !self.needs_cold_maintenance().await {
+            return;
+        }
+        self.cold_maintenance_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(guard) = Arc::clone(&self.cold_flush_lock).try_lock_owned() {
+            let queue = self.clone();
+            tokio::spawn(async move {
+                queue.run_cold_maintenance_locked(guard).await;
+            });
         }
     }
 
@@ -9656,6 +9720,122 @@ mod tests {
         assert!(q2.get_result(&tids[0]).await.is_none());
         assert!(q2.get_result(&tids[5]).await.is_some());
         q2.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_maintenance_and_uncompacted_journal_replay_reuse() {
+        // Part 1: concurrent spawn_cold_maintenance bursts under a tight hot limit.
+        let dir1 = tempfile::tempdir().unwrap();
+        let (store1, rec1) = TaskStore::open(dir1.path()).unwrap();
+        let q1 = TaskQueue::new();
+        q1.attach_store_and_replay(store1, rec1, Duration::ZERO)
+            .await
+            .unwrap();
+        q1.set_hot_terminal_limits(4, 4096).await;
+
+        let w1 = Uuid::new_v4();
+        let mut tids1 = Vec::with_capacity(200);
+        let mut tasks = Vec::with_capacity(200);
+        for i in 0..200 {
+            let tid = q1.submit(echo_task(&format!("burst-{i}"))).await.unwrap();
+            assert!(q1.schedule_task(&tid, w1).await.is_some());
+            tids1.push(tid);
+        }
+        for (i, tid) in tids1.iter().copied().enumerate() {
+            let q_ref = q1.clone();
+            tasks.push(tokio::spawn(async move {
+                let res = TaskResult::success(
+                    w1,
+                    tid,
+                    format!("payload-{i:04}-{}", "y".repeat(64)),
+                    i as u64,
+                    false,
+                );
+                let (_outcome, ack) = q_ref
+                    .record_result_from_enqueued(w1, None, res)
+                    .await
+                    .unwrap();
+                if let Some(ack) = ack {
+                    ack.await.unwrap();
+                }
+                q_ref.spawn_cold_maintenance().await;
+            }));
+        }
+        for h in tasks {
+            h.await.unwrap();
+        }
+        q1.flush_cold_maintenance().await;
+        let (hot1, _) = q1.hot_terminal_stats().await;
+        assert!(hot1 <= 4, "expected <= 4 hot tasks, got {hot1}");
+        assert_eq!(count_cold_bin_files(dir1.path()), 196);
+        for tid in &tids1 {
+            assert!(q1.get_result(tid).await.is_some());
+        }
+        q1.close_and_compact_store().await;
+
+        // Part 2: uncompacted journal replay above DEFAULT_MAX_HOT_TERMINAL_TASKS reuses existing
+        // cold files with zero re-writes and still unlinks orphans.
+        let total = crate::cold_results::DEFAULT_MAX_HOT_TERMINAL_TASKS + 16;
+        let dir2 = tempfile::tempdir().unwrap();
+        let (store2, rec2) = TaskStore::open(dir2.path()).unwrap();
+        let q2 = TaskQueue::new();
+        q2.attach_store_and_replay(store2, rec2, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let w2 = Uuid::new_v4();
+        let mut tids2 = Vec::with_capacity(total);
+        let mut acks = Vec::with_capacity(total);
+        for i in 0..total {
+            let tid = q2.submit(echo_task(&format!("replay-{i}"))).await.unwrap();
+            assert!(q2.schedule_task(&tid, w2).await.is_some());
+            let res = TaskResult::success(w2, tid, format!("out-{i}").into_bytes(), 1, false);
+            let (_outcome, ack) = q2.record_result_from_enqueued(w2, None, res).await.unwrap();
+            if let Some(a) = ack {
+                acks.push(a);
+            }
+            tids2.push(tid);
+        }
+        for ack in acks {
+            ack.await.unwrap();
+        }
+        q2.flush_cold_maintenance().await;
+        assert_eq!(count_cold_bin_files(dir2.path()), 16);
+
+        let orphan_dir = dir2
+            .path()
+            .join(crate::cold_results::COLD_RESULTS_DIR)
+            .join("ff");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        let orphan_path = orphan_dir.join(format!("{}.bin", Uuid::new_v4()));
+        std::fs::write(&orphan_path, b"orphan-uncompacted").unwrap();
+
+        // Drop without compact_store so TaskStore reopens from an uncompacted journal.bin.
+        drop(q2);
+        assert!(!dir2.path().join("snapshot.bin").exists());
+
+        let (store3, rec3) = TaskStore::open(dir2.path()).unwrap();
+        let q3 = TaskQueue::new();
+        q3.attach_store_and_replay(store3, rec3, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            !orphan_path.exists(),
+            "orphan must still be removed on replay"
+        );
+        assert_eq!(count_cold_bin_files(dir2.path()), 16);
+        {
+            let inner = q3.inner.read().await;
+            let cold = inner.cold_results.as_ref().unwrap();
+            assert_eq!(
+                cold.temp_write_count(),
+                0,
+                "existing valid cold files must be reused without rewriting"
+            );
+        }
+        assert!(q3.get_result(&tids2[0]).await.is_some());
+        assert!(q3.get_result(&tids2[total - 1]).await.is_some());
+        q3.close_and_compact_store().await;
     }
 
     #[tokio::test]
