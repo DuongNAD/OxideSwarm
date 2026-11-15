@@ -141,8 +141,9 @@ One item (TEST-23) was added on 2026-11-11 from a CI failure on Windows.
 Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
 [design 0065](design/0065-large-transfer-and-long-run-tests.md).
 Eleven items (BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10) were added on 2026-11-15
-from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Index now holds 77
-items Implemented, 8 Partial and 48 Planned.
+from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Index then held 77
+items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
+and DOC-10, it holds 82 Implemented, 8 Partial and 43 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -161,11 +162,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 |  | Implemented | 25 |
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
-| SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Planned |  |
+| SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Planned | 238 (open) |
 | SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
 | SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
-| SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Planned |  |
-| SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Planned |  |
+| SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Planned | 239 (open) |
+| SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
 | SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
@@ -173,8 +174,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
 | BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
-| BUG-19 | Bound the data-lane backlog of a QUIC worker session | P1 | S |  |  | Planned |  |
-| BUG-20 | Keep one slow worker from stalling every dispatch | P1 | M |  |  | Planned |  |
+| BUG-19 | Bound the data-lane backlog of a QUIC worker session | P1 | S |  |  | Implemented | 236 (design 0069) |
+| BUG-20 | Keep one slow worker from stalling every dispatch | P1 | M |  |  | Implemented | 241 (design 0075) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -227,7 +228,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
-| AND-5 | Stop the Android worker without blocking the calling thread, and build the bridge in CI | P2 | S | SEC-3 |  | Planned |  |
+| AND-5 | Stop the Android worker without blocking the calling thread, and build the bridge in CI | P2 | S | SEC-3 |  | Planned | 240 (open) |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
@@ -240,7 +241,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230 (open), 231 (open), 242 (open) |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -2319,6 +2320,9 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** A test with a QUIC worker that heartbeats but never reads its data lane shows the
   master's buffered bytes for that session stay under the cap. The session ends within the
   timeout, and its tasks are requeued.
+- **Implemented (2026-11-15, pull request 236, [design 0069](design/0069-bounded-quic-data-lane.md)):**
+  the data-lane backlog of a QUIC session is capped by count and bytes, and the data lane has a
+  write timeout (`crates/master/src/session.rs`).
 
 ### BUG-20: Keep one slow worker from stalling every dispatch
 
@@ -2336,6 +2340,9 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** A test with one worker whose channel stays full and one healthy worker shows the
   healthy worker receives its assignments within one scheduling interval. The existing scheduler
   tests and the `Engine::hold_back` tests pass unchanged.
+- **Implemented (2026-11-15, pull request 241, [design 0075](design/0075-non-blocking-dispatch.md)):**
+  `WorkloadScheduler::dispatch` tries `try_reserve` first and defers a full channel instead of
+  holding the pass (`crates/master/src/scheduler.rs`).
 
 ### SEC-10: Stop a working-directory config file from configuring `worker` and `submit`
 
@@ -2418,6 +2425,9 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   `docs/SECURITY.md`.
 - **Done when:** `POST /api/chat` answers 404 on a default master, or 403 to a Submitter token and
   404 without the opt-in flag, with a test for each case.
+- **Implemented (2026-11-15, pull request 237, [design 0071](design/0071-remove-dashboard-chat.md)):**
+  the route, `run_agy` and the dashboard panel were removed from the master
+  (`crates/master/src/web_ui.rs`, `tests/dashboard_security_test.rs`).
 
 ### SEC-15: Make the Agent Mesh launchers safe by default
 
@@ -2539,9 +2549,9 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** One roadmap document exists, `PROJECT.md` links to it, and no committed document
   calls a plan "Approved for Implementation" without a decision in `docs/ROADMAP.md`.
 - **Implemented (2026-11-15, pull request 235):**
-  - "Where the project stands" in `docs/ROADMAP.md` now describes `c2462e3`.
+  - "Where the project stands" in `docs/ROADMAP.md` now describes `96ce571` (2026-11-16).
   - Section 5 of `PROJECT.md` is a link to `docs/ROADMAP.md`.
-  - The owner left the choice to Claude ("làm tốt nhất"). Claude moved the untracked
+  - The owner left the choice to Claude. Claude moved the untracked
     `docs/ROADMAP_AND_VISION.md` out of the repository into an archive folder of the owner's, with
     a note, instead of deleting it. Its six sound points had already landed through pull request
     206.
@@ -2897,4 +2907,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-15: Implemented FEAT-9a / Q56 ([design 0068](design/0068-task-vram-accounting.md), pull request 232): added optional `TaskRequirements.vram_mb` (`--vram-mb` / `--vram`, MCP `vram_mb`, web `vram_mb`) with `effective_vram_mb()`, `requires_gpu_or_vram()`, and `WorkerCapabilities::satisfies()` VRAM checks, bumped wire `PROTOCOL_VERSION_CURRENT` to `9` (`LegacyPreV9TaskRequirements`, `LegacyV6ToV8Task`, and `LegacyV6ToV8BinaryClientMessage` version-error decoders) and `STORE_FORMAT_VERSION` to `3`, updated `statically_fits_caps()`, `TaskQueue::assigned_loads`, `WorkloadScheduler` VRAM packing, VRAM `hold_back`, `--fail-unfulfillable-tasks` diagnostics, and `gpu_demand` preservation; `FEAT-9b` (runtime `nvidia-smi` / `rocm-smi` / Metal VRAM polling) remains open. The Index counts are now 77 Implemented, 8 Partial and 37 Planned.
 - 2026-11-15: Audit of `c2462e3` (read-only, with clippy, fmt and `cargo test --workspace --lib` run on macOS): added BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10 (Phase 11), decisions D8 to D10, and a size note on MAINT-1. Statuses of existing items are unchanged; DOC-9 lists the ones to correct. The Index counts are now 77 Implemented, 8 Partial and 48 Planned (FEAT-9 became Partial with FEAT-9a, pull request 232).
 - 2026-11-15: DOC-9 implemented (pull request 234): statuses and statements corrected across `docs/BACKLOG.md`, `docs/ROADMAP.md`, `docs/README.md`, `CLAUDE.md`, `PROJECT.md`, `README.md`, designs 0031 and 0033, and two help texts in `crates/cli`. The Index counts are now 78 Implemented, 8 Partial and 47 Planned.
-- 2026-11-15: DOC-10 implemented (pull request 235): `docs/ROADMAP.md` is the only roadmap and describes `c2462e3`, `PROJECT.md` section 5 links to it, and the untracked `docs/ROADMAP_AND_VISION.md` left the repository. The Index counts are now 79 Implemented, 8 Partial and 46 Planned.
+- 2026-11-15: DOC-10 implemented (pull request 235): `docs/ROADMAP.md` is the only roadmap and describes `f4a4a74`, `PROJECT.md` section 5 links to it, and the untracked `docs/ROADMAP_AND_VISION.md` left the repository. The Index counts are now 79 Implemented, 8 Partial and 46 Planned.
+- 2026-11-16: Phase 11 brought up to date before merge: BUG-19 (pull request 236, design 0069), BUG-20 (pull request 241, design 0075) and SEC-14 (pull request 237, design 0071) were merged before this phase reached `master` and are Implemented; SEC-10, SEC-13, AND-5 and MAINT-1 name their open pull requests (238, 239, 240, 230, 231, 242); "Where the project stands" in `docs/ROADMAP.md` describes `96ce571`. The Index counts are now 82 Implemented, 8 Partial and 43 Planned.

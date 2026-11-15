@@ -6,7 +6,7 @@ design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of de
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
-Created: 2026-11-07    Updated: 2026-11-15
+Created: 2026-11-07    Updated: 2026-11-16
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -76,10 +76,11 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `f4a4a74` on 2026-11-15: release 0.2.0 plus SCALE-2 and FEAT-9a (task VRAM, protocol 9). The
-previous version of this section described `3ce2a65` of 2026-11-09. This is the only roadmap of
-the project (DOC-10). [BACKLOG.md](BACKLOG.md) holds the items and their status, and section 5 of
-`PROJECT.md` links here.
+The state at `master` `96ce571` on 2026-11-16: release 0.2.0 plus SCALE-2, FEAT-9a (task VRAM,
+protocol 9) and the fixes BUG-19, BUG-20 and SEC-14 from the audit of 2026-11-15. The previous
+version of this section described `3ce2a65` of 2026-11-09. This is the only roadmap of the project
+(DOC-10). [BACKLOG.md](BACKLOG.md) holds the items and their status, and section 5 of `PROJECT.md`
+links here.
 
 ### What works
 
@@ -109,9 +110,9 @@ Each row is a limit a user meets today, and the item that removes it.
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | Revoking a member does not close its client connections or cancel its tasks | `members revoke` blocks new handshakes and disconnects the member's worker sessions only | ENROLL-1c, ENROLL-1d |
 | No run across two real networks is recorded | NAT traversal, the relay path and the USB kit on another network are tested on one network only | LINK-1, USB-1c, TEST-24 |
-| The audit of 2026-11-15 found open bugs and security gaps | A QUIC worker that stops reading can grow master memory, one slow worker can stall a dispatch pass, a `rusty-grid.toml` in the working directory configures `worker` and `submit`, and the macOS profile starts from `(allow default)` | BUG-19, BUG-20, SEC-10 to SEC-15 |
+| The audit of 2026-11-15 found security gaps that are still open | A `rusty-grid.toml` in the working directory configures `worker` and `submit`, an elevated Windows worker can fall back to its own token under isolation, the macOS profile starts from `(allow default)`, an output can be swapped for a link between its check and its upload, and the Agent Mesh launchers are not safe by default. BUG-19, BUG-20 and SEC-14 from the same audit are fixed (pull requests 236, 241, 237) | SEC-10 to SEC-13, SEC-15 |
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux | AND-1, AND-5 |
-| GPU work beyond the built-in benchmark is not yet documented as a user path | Tasks can ask for VRAM and the master does not overcommit a worker's VRAM (FEAT-9a, pull request 232). Running PyTorch, Blender or CUDA programs as command tasks, and ML runtimes inside the sandbox, are being recorded and built (spike R20 of design 0064, design 0074) | FEAT-9 (decision D6), R20 |
+| GPU work beyond the built-in benchmark is not yet documented as a user path | Tasks can ask for VRAM and the master does not overcommit a worker's VRAM (FEAT-9a, pull request 232). Running PyTorch, Blender or CUDA programs as command tasks, and ML runtimes inside the sandbox, are being recorded and built (spike R20 of design 0064; design 0074 is in review) | FEAT-9 (decision D6), R20 |
 
 ## Purpose
 
@@ -723,4 +724,5 @@ answers.
   cluster over hours. It adds TEST-24 to TEST-26 (Planned) and open decisions Q57 to Q59. Nothing
   is built.
 - 2026-11-15: Owner approved `Q56`, implemented as `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md), pull request 232): `TaskRequirements::vram_mb` (protocol v9, store v3), CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, and master scheduler VRAM budget tracking with anti-starvation hold-back.
-- 2026-11-15: DOC-10. "Where the project stands" now describes `c2462e3` (release 0.2.0 plus SCALE-2): new rows for per-machine keys, adding a machine, discovery, scale work and observability, and the open limits found by the audit of 2026-11-15 (BUG-19, BUG-20, SEC-10 to SEC-15). This file is the only roadmap: section 5 of `PROJECT.md` links here, and the untracked `docs/ROADMAP_AND_VISION.md` draft of 2026-11-11 was moved out of the repository (its six sound points had already landed through pull request 206). No item, order or decision changed.
+- 2026-11-15: DOC-10. "Where the project stands" now describes `f4a4a74` (release 0.2.0 plus SCALE-2 and FEAT-9a): new rows for per-machine keys, adding a machine, discovery, scale work and observability, and the open limits found by the audit of 2026-11-15 (BUG-19, BUG-20, SEC-10 to SEC-15). This file is the only roadmap: section 5 of `PROJECT.md` links here, and the untracked `docs/ROADMAP_AND_VISION.md` draft of 2026-11-11 was moved out of the repository (its six sound points had already landed through pull request 206). No item, order or decision changed.
+- 2026-11-16: "Where the project stands" describes `96ce571`. BUG-19, BUG-20 and SEC-14 left the row of open audit findings (pull requests 236, 241, 237); SEC-10 to SEC-13 and SEC-15 stay.
