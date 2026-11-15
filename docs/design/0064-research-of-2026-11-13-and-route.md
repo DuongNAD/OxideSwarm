@@ -202,7 +202,7 @@ The right column is a recommended default, not a decision. They are listed in
 |---|---|---|
 | Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21, and close where Mesh-LLM already does the work? | Yes. No model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running call that works without the tasks extension (D2), with the extension used when a client has it? | Yes |
-| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9? | Yes, after R20. It is a wire change and gets a design record |
+| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9? | Yes, after R20. It is a wire change and gets a design record (`0068`, approved and implemented) |
 
 ## Risks
 
@@ -216,10 +216,11 @@ The right column is a recommended default, not a decision. They are listed in
 
 ## Records
 
-None yet.
+- `FEAT-9a` (`Q56`): [docs/design/0068-task-vram-accounting.md](0068-task-vram-accounting.md).
 
 ## Status log
 
 - 2026-11-13: Written at the owner's request from five research documents. The statements
   marked `issue` and `source` were checked that day. Nothing is built or measured, and no item
   is in the backlog.
+- 2026-11-15: Owner approved `Q56` and implementation landed as `FEAT-9a` in design `0068`.

@@ -27,7 +27,10 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
         TaskSpec::new_command("echo", vec!["hi".into()]),
         TaskRequirements::default(),
     );
-    let msg = ClientMessage::SubmitTask { task, wait: false };
+    let msg = ClientMessage::SubmitTask {
+        task: task.clone(),
+        wait: false,
+    };
     let mut raw = serialize_message(&msg, WireCodec::Bincode)
         .unwrap()
         .to_vec();
@@ -36,6 +39,26 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
         // A v5 client sent no `workspace` (a one-byte `None` before `wait` and the version).
         assert_eq!(raw[len - 6], 0);
         raw.remove(len - 6);
+    }
+    if version < 9 {
+        // Clients before v9 sent no `vram_mb` (a one-byte `None` at the end of `TaskRequirements`).
+        let mut task_with_vram = task.clone();
+        task_with_vram.requirements.vram_mb = Some(0x1122_3344_5566_7788);
+        let with_vram = serialize_message(
+            &ClientMessage::SubmitTask {
+                task: task_with_vram,
+                wait: false,
+            },
+            WireCodec::Bincode,
+        )
+        .unwrap();
+        let vram_tag_offset = raw
+            .iter()
+            .zip(with_vram.iter())
+            .position(|(a, b)| a != b)
+            .expect("vram_mb byte offset");
+        assert_eq!(raw[vram_tag_offset], 0);
+        raw.remove(vram_tag_offset);
     }
     let len = raw.len();
     raw[len - 4..].copy_from_slice(&version.to_le_bytes());
@@ -162,6 +185,18 @@ async fn a_v6_client_gets_a_clear_version_error_from_a_v7_master() {
             "{message}"
         );
     }
+    let _ = server.shutdown();
+}
+
+#[tokio::test]
+async fn a_v8_client_gets_a_clear_version_error_from_a_v9_master() {
+    let (server, addr) = spawn_master().await;
+    let message = send_raw_expect_error(addr, submit_task_frame(8)).await;
+    assert!(
+        message.contains("Incompatible protocol version 8")
+            && message.contains(&format!("{PROTOCOL_VERSION_CURRENT}")),
+        "{message}"
+    );
     let _ = server.shutdown();
 }
 

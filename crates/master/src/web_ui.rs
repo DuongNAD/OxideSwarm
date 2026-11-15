@@ -823,6 +823,9 @@ struct SubmitTaskPayload {
     /// RAM the task needs in MB (default 0 = unconstrained).
     #[serde(default)]
     ram_mb: Option<u64>,
+    /// Minimum GPU VRAM the task needs in MB (default none). Implies `gpu_required`.
+    #[serde(default)]
+    vram_mb: Option<u64>,
 }
 
 impl SubmitTaskPayload {
@@ -842,12 +845,14 @@ impl SubmitTaskPayload {
         if cores == 0 || cores > 4096 {
             return Err("\"cores\" must be between 1 and 4096".into());
         }
+        let vram_mb = self.vram_mb.filter(|&v| v > 0);
         let reqs = TaskRequirements {
             cpu_cores: cores,
             ram_mb: self.ram_mb.unwrap_or(0),
-            gpu_required: self.gpu_required,
+            gpu_required: self.gpu_required || vram_mb.is_some(),
             timeout_secs,
             max_retries: None,
+            vram_mb,
         };
         Ok(Task::new(TaskSpec::new_shell_script(command), reqs))
     }
@@ -2037,6 +2042,7 @@ mod tests {
             timeout_secs: None,
             cores: None,
             ram_mb: None,
+            vram_mb: None,
         }
     }
 
@@ -2047,6 +2053,7 @@ mod tests {
         assert_eq!(task.requirements.timeout_secs, 60);
         assert_eq!(task.requirements.cpu_cores, 1);
         assert_eq!(task.requirements.ram_mb, 0);
+        assert_eq!(task.requirements.vram_mb, None);
         assert!(!task.requirements.gpu_required);
 
         let task = SubmitTaskPayload {
@@ -2054,6 +2061,7 @@ mod tests {
             timeout_secs: Some(3600),
             cores: Some(4),
             ram_mb: Some(2048),
+            vram_mb: None,
             ..payload("train.sh")
         }
         .into_task()
@@ -2062,7 +2070,27 @@ mod tests {
         assert_eq!(task.requirements.timeout_secs, 3600);
         assert_eq!(task.requirements.cpu_cores, 4);
         assert_eq!(task.requirements.ram_mb, 2048);
+        assert_eq!(task.requirements.vram_mb, None);
         task.validate().expect("a GPU shell task is a valid task");
+
+        let vram_task = SubmitTaskPayload {
+            vram_mb: Some(6144),
+            ..payload("infer.sh")
+        }
+        .into_task()
+        .unwrap();
+        assert!(vram_task.requirements.gpu_required);
+        assert_eq!(vram_task.requirements.vram_mb, Some(6144));
+        vram_task.validate().expect("vram_mb implies gpu_required");
+
+        let zero_vram_task = SubmitTaskPayload {
+            vram_mb: Some(0),
+            ..payload("cpu.sh")
+        }
+        .into_task()
+        .unwrap();
+        assert!(!zero_vram_task.requirements.gpu_required);
+        assert_eq!(zero_vram_task.requirements.vram_mb, None);
     }
 
     #[test]
