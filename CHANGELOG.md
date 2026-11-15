@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Bounded 2-lane QUIC worker session data-lane backlog in `router_task` at `MAX_PENDING_DATA_MESSAGES = 256` and `MAX_PENDING_DATA_BYTES = 64 MiB` so `outbound_tx` backpressures senders when a worker stops draining its data stream, and added a `DATA_LANE_WRITE_TIMEOUT = 60 s` per-write timeout on `data_writer_task` that disconnects stalled sessions and fails over their tasks (`BUG-19`, [design 0069](docs/design/0069-bounded-quic-data-lane.md), `crates/master/src/{session,server}.rs`).
 - `WorkloadScheduler::dispatch` (`crates/master/src/scheduler.rs`) now attempts a non-blocking `sender.try_reserve()` first and defers full-channel deliveries to bounded per-assignment waiters (`DISPATCH_RESERVE_TIMEOUT = 5 s`, capped at `MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER = 16` per worker) that requeue timed-out assignments uncharged via `TaskQueue::requeue_dispatch_failure`, preventing one slow worker from stalling the rest of a scheduling pass (`BUG-20`, [design 0075](docs/design/0075-non-blocking-dispatch.md)).
+- Help and tool texts that described an older state: `worker --isolation` no longer says isolation is macOS only (macOS, Linux and Windows are supported; `crates/cli/src/cli_app.rs`), and the MCP `doctor` tool names checks C1 to C8 (`crates/cli/src/mcp.rs`). Documentation statuses were corrected in the same change (`DOC-9`, `docs/BACKLOG.md`).
 
 ## [0.2.0] - 2026-11-15
 

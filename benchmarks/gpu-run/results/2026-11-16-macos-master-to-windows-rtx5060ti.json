@@ -1,0 +1,69 @@
+{
+  "record": "gpu-run",
+  "run": 1,
+  "date": "2026-11-16",
+  "commit": "6a88eff",
+  "protocol_version": 9,
+  "isolation": "off",
+  "master": {"os": "macOS 27.2.1", "cpu": "Apple M5"},
+  "worker": {
+    "name": "rtx5060ti-gpurun",
+    "os": "Windows 11",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "vram_mib": 16311,
+    "driver": "621.24",
+    "cpu_cores": 20,
+    "ram_mib": 48941,
+    "features": ["gpu-wgpu"],
+    "sandbox_base_dir": "%LOCALAPPDATA%\\OxideSwarm\\sandboxes"
+  },
+  "link": "TCP/LAN",
+  "tasks": [
+    {
+      "name": "wgpu_gemm",
+      "submit": "--type gpu --gpu --matrix-dim 4096",
+      "backend": "Vulkan",
+      "exit_code": 0,
+      "task_ms": 342,
+      "gemm_ms": 342,
+      "flop": 137438953472,
+      "verified_entries": 4096,
+      "max_relative_error": 5.306e-6,
+      "tolerance": 4.883e-4,
+      "status": "VERIFIED_OK"
+    },
+    {
+      "name": "pytorch_cuda_train",
+      "script": "torch_step.py",
+      "submit": "--vram-mb 2000 --input torch_step.py --command <PYTHON_EXE> -- torch_step.py",
+      "torch": "2.8.0+cu128",
+      "cuda": "12.8",
+      "exit_code": 0,
+      "task_ms": 20495,
+      "steps": 200,
+      "first_step_ms": 9754,
+      "total_ms": 13658,
+      "ms_per_step_after_first": 19.61,
+      "peak_mem_mib": 673,
+      "loss_first": 2.3060,
+      "loss_final": 0.0000,
+      "marker": "PYTORCH_CUDA_TRAIN_OK"
+    },
+    {
+      "name": "blender_cycles_render",
+      "script": "render.py",
+      "submit": "--vram-mb 2000 --input render.py --output render.png --command blender.exe -- -b --factory-startup --python render.py",
+      "blender": "4.5.4 LTS",
+      "backend": "OPTIX",
+      "exit_code": 0,
+      "task_ms": 12040,
+      "render_ms": 10502,
+      "width": 1920,
+      "height": 1080,
+      "samples": 256,
+      "output_bytes": 1583316,
+      "output_sha256": "6a300109467308322e17ed4106e10e59c8ffc3dddfff77fb7506de00b5d08fd4",
+      "marker": "BLENDER_CYCLES_GPU_OK"
+    }
+  ]
+}
