@@ -243,6 +243,7 @@ pub fn open_regular_file_nofollow(
             }
             return Err(e);
         }
+        #[cfg(not(windows))]
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
@@ -2187,5 +2188,46 @@ mod tests {
             fifo_err.to_string().contains("not a regular file"),
             "{fifo_err}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_regular_file_nofollow_refuses_ntfs_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular.txt");
+        std::fs::write(&regular, b"hello").unwrap();
+        let (f, meta) = open_regular_file_nofollow(&regular).unwrap();
+        assert_eq!(meta.len(), 5);
+        assert_eq!(hash_reader(f).unwrap(), (BlobId::of(b"hello"), 5));
+
+        let target_dir = dir.path().join("target_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("inside.txt"), b"secret").unwrap();
+
+        let link = dir.path().join("junction_dir");
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target_dir)
+            .output();
+        match mklink {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "skipping test because mklink /J failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipping test because cmd /C mklink /J could not run: {e}");
+                return;
+            }
+        }
+
+        let junc_err = open_regular_file_nofollow(&link).unwrap_err();
+        assert_eq!(junc_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(junc_err.to_string().contains("symbolic link"), "{junc_err}");
+        assert!(hash_file(&link).is_err());
     }
 }

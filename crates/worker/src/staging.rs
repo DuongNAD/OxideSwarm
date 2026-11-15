@@ -911,12 +911,59 @@ mod tests {
         assert_eq!(cache.usage(), (0, 0));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn insert_found_outputs_refuses_ntfs_junction() {
+        let (dir, sandbox, cache) = setup();
+        let target_dir = dir.path().join("outside-target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let secret_bytes = b"worker-only secret outside sandbox";
+        std::fs::write(target_dir.join("secret.txt"), secret_bytes).unwrap();
+
+        std::fs::create_dir_all(sandbox.join("out")).unwrap();
+        let link = sandbox.join("out/result");
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target_dir)
+            .output();
+        match mklink {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "skipping test because mklink /J failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipping test because cmd /C mklink /J could not run: {e}");
+                return;
+            }
+        }
+
+        let mut found = BTreeMap::new();
+        found.insert(
+            "out/result".to_string(),
+            Found {
+                path: link,
+                size: 14,
+            },
+        );
+        let err =
+            insert_found_outputs(found, &cache, OutputLimits::default(), true, None).unwrap_err();
+        assert!(err.contains("out/result"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(!cache.contains(&BlobId::of(secret_bytes)));
+        assert_eq!(cache.usage(), (0, 0));
+    }
+
     #[test]
     fn hard_linked_outputs_and_descriptor_size_limits_work() {
         let (_dir, sandbox, cache) = setup();
         write(&sandbox, "out/normal.bin", b"normal");
         write(&sandbox, "out/shared.bin", b"shared");
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         std::fs::hard_link(sandbox.join("out/shared.bin"), sandbox.join("kept.bin")).unwrap();
 
         let outputs = collect_outputs(
@@ -931,7 +978,7 @@ mod tests {
         assert_eq!(paths, ["out/normal.bin", "out/shared.bin"]);
         assert_eq!(outputs[0].id, BlobId::of(b"normal"));
         assert_eq!(outputs[1].id, BlobId::of(b"shared"));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_eq!(
             std::fs::read(sandbox.join("kept.bin")).unwrap(),
             b"shared",

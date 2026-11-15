@@ -119,6 +119,7 @@ No wire-format, CLI, or configuration changes.
   - `swapping_selected_output_for_symlink_after_walk_is_refused`
   - `fifo_output_does_not_block_and_is_refused`
   - `hard_linked_outputs_and_descriptor_size_limits_work`
+- Windows (`#[cfg(windows)]`): `open_regular_file_nofollow_refuses_ntfs_junction`, `insert_found_outputs_refuses_ntfs_junction`, and `insert_open_file_falls_back_to_descriptor_copy_when_path_is_replaced_before_rename`.
 - End-to-end suites: `blob_transfer_e2e` and `file_staging_e2e`.
 
 ## Work items

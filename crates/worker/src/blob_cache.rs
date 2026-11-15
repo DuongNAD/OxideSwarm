@@ -776,7 +776,11 @@ fn windows_file_identity(file: &File) -> Option<(u32, u64, u32)> {
         return None;
     }
     let index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
-    if info.dwVolumeSerialNumber == 0 && index == 0 {
+    // ReFS/Dev Drive (128-bit file IDs) or network volumes can report a zero 64-bit file index
+    // alongside a non-zero volume serial number. Returning `None` when either is zero prevents two
+    // different files from comparing equal and forces `insert_open_file` to copy from the open
+    // descriptor (`copy_descriptor_verified`).
+    if info.dwVolumeSerialNumber == 0 || index == 0 {
         return None;
     }
     Some((info.dwVolumeSerialNumber, index, info.nNumberOfLinks))
@@ -885,7 +889,7 @@ mod tests {
         );
         assert!(cache.object_path(&id).exists());
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let shared = dir.path().join("shared.bin");
             let link = dir.path().join("link.bin");
@@ -985,6 +989,44 @@ mod tests {
             std::fs::read_dir(&cache.tmp).unwrap().count(),
             0,
             "rejected moved symlink in tmp/ must be cleaned up"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn insert_open_file_falls_back_to_descriptor_copy_when_path_is_replaced_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 1 << 20);
+
+        let output = dir.path().join("output.txt");
+        let original_bytes = b"legitimate task output";
+        let swapped_bytes = b"replaced same-len data";
+        assert_eq!(original_bytes.len(), swapped_bytes.len());
+        std::fs::write(&output, original_bytes).unwrap();
+
+        // Open the regular file descriptor first (Rust opens with FILE_SHARE_DELETE on Windows),
+        // then rename the original path aside and write a different regular file of equal length
+        // at `output` before `insert_open_file` renames `output` into `tmp/`.
+        let (file, meta) = open_regular_file_nofollow(&output).unwrap();
+        let aside = dir.path().join("output-aside.txt");
+        std::fs::rename(&output, &aside).unwrap();
+        std::fs::write(&output, swapped_bytes).unwrap();
+
+        let (id, size) = cache
+            .insert_open_file(&output, file, &meta, true, None)
+            .unwrap();
+        assert_eq!(id, BlobId::of(original_bytes));
+        assert_eq!(size, original_bytes.len() as u64);
+        assert!(!cache.contains(&BlobId::of(swapped_bytes)));
+        assert_eq!(
+            cache.read_verified(&id, 1024).unwrap(),
+            original_bytes,
+            "cache must store the original descriptor bytes, not the swapped file"
+        );
+        assert_eq!(
+            std::fs::read_dir(&cache.tmp).unwrap().count(),
+            0,
+            "rejected moved file in tmp/ must be cleaned up"
         );
     }
 
