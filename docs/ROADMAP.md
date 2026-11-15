@@ -76,7 +76,7 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `c2462e3` on 2026-11-15: release 0.2.0 (protocol 8) plus SCALE-2. The
+The state at `master` `f4a4a74` on 2026-11-15: release 0.2.0 plus SCALE-2 and FEAT-9a (task VRAM, protocol 9). The
 previous version of this section described `3ce2a65` of 2026-11-09. This is the only roadmap of
 the project (DOC-10). [BACKLOG.md](BACKLOG.md) holds the items and their status, and section 5 of
 `PROJECT.md` links here.
@@ -111,7 +111,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | No run across two real networks is recorded | NAT traversal, the relay path and the USB kit on another network are tested on one network only | LINK-1, USB-1c, TEST-24 |
 | The audit of 2026-11-15 found open bugs and security gaps | A QUIC worker that stops reading can grow master memory, one slow worker can stall a dispatch pass, a `rusty-grid.toml` in the working directory configures `worker` and `submit`, and the macOS profile starts from `(allow default)` | BUG-19, BUG-20, SEC-10 to SEC-15 |
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux | AND-1, AND-5 |
-| GPU compute is a seeded matrix benchmark | No user workload runs on the GPU. Task VRAM requirements are in review (FEAT-9a, pull request 232) | FEAT-9 (decision D6), design 0064 R20 |
+| GPU work beyond the built-in benchmark is not yet documented as a user path | Tasks can ask for VRAM and the master does not overcommit a worker's VRAM (FEAT-9a, pull request 232). Running PyTorch, Blender or CUDA programs as command tasks, and ML runtimes inside the sandbox, are being recorded and built (spike R20 of design 0064, design 0074) | FEAT-9 (decision D6), R20 |
 
 ## Purpose
 
@@ -576,7 +576,7 @@ answers.
 | Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
 | Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
-| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Open. Recommended: yes, after spike R20; it is a wire change and gets a design record |
+| Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Yes, approved by the owner and implemented in `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md)) |
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
@@ -722,4 +722,5 @@ answers.
   long runs. The end-to-end blob tests move at most about 5 MiB per file, and no record measures a
   cluster over hours. It adds TEST-24 to TEST-26 (Planned) and open decisions Q57 to Q59. Nothing
   is built.
+- 2026-11-15: Owner approved `Q56`, implemented as `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md), pull request 232): `TaskRequirements::vram_mb` (protocol v9, store v3), CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, and master scheduler VRAM budget tracking with anti-starvation hold-back.
 - 2026-11-15: DOC-10. "Where the project stands" now describes `c2462e3` (release 0.2.0 plus SCALE-2): new rows for per-machine keys, adding a machine, discovery, scale work and observability, and the open limits found by the audit of 2026-11-15 (BUG-19, BUG-20, SEC-10 to SEC-15). This file is the only roadmap: section 5 of `PROJECT.md` links here, and the untracked `docs/ROADMAP_AND_VISION.md` draft of 2026-11-11 was moved out of the repository (its six sound points had already landed through pull request 206). No item, order or decision changed.

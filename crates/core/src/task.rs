@@ -467,6 +467,9 @@ pub struct TaskRequirements {
     /// Maximum allowable retries on worker failure. None inherits cluster default.
     #[serde(default)]
     pub max_retries: Option<u32>,
+    /// Minimum GPU video memory required in MB. None omits any fixed VRAM threshold.
+    #[serde(default)]
+    pub vram_mb: Option<u64>,
 }
 
 impl Default for TaskRequirements {
@@ -477,6 +480,7 @@ impl Default for TaskRequirements {
             gpu_required: false,
             timeout_secs: 60,
             max_retries: None,
+            vram_mb: None,
         }
     }
 }
@@ -489,6 +493,7 @@ impl TaskRequirements {
             gpu_required,
             timeout_secs,
             max_retries: None,
+            vram_mb: None,
         }
     }
 
@@ -500,6 +505,7 @@ impl TaskRequirements {
             gpu_required: false,
             timeout_secs,
             max_retries: None,
+            vram_mb: None,
         }
     }
 
@@ -511,6 +517,7 @@ impl TaskRequirements {
             gpu_required: true,
             timeout_secs,
             max_retries: None,
+            vram_mb: None,
         }
     }
 
@@ -518,6 +525,27 @@ impl TaskRequirements {
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_retries = Some(retries);
         self
+    }
+
+    /// Configures minimum required GPU video memory in MB (`0` clears the constraint).
+    pub fn with_vram_mb(mut self, vram_mb: u64) -> Self {
+        if vram_mb > 0 {
+            self.vram_mb = Some(vram_mb);
+            self.gpu_required = true;
+        } else {
+            self.vram_mb = None;
+        }
+        self
+    }
+
+    /// Returns the required GPU video memory in MB, treating `None` as `0`.
+    pub fn effective_vram_mb(&self) -> u64 {
+        self.vram_mb.unwrap_or(0)
+    }
+
+    /// Returns `true` when GPU capability is required either explicitly or via positive `vram_mb`.
+    pub fn requires_gpu_or_vram(&self) -> bool {
+        self.gpu_required || self.effective_vram_mb() > 0
     }
 
     /// Validates the requirements specification.
@@ -2150,7 +2178,7 @@ impl Task {
         self.spec.validate()?;
         self.requirements.validate()?;
 
-        if self.spec.requires_gpu() && !self.requirements.gpu_required {
+        if self.spec.requires_gpu() && !self.requirements.requires_gpu_or_vram() {
             return Err(
                 "TaskSpec requires GPU, but TaskRequirements.gpu_required is false".to_string(),
             );
@@ -3043,10 +3071,46 @@ mod tests {
         let decoded: TaskRequirements = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.max_retries, Some(5));
 
-        // Test backward compatibility: JSON without max_retries field deserializes to None
+        // Test backward compatibility: JSON without max_retries or vram_mb deserializes to None
         let legacy_json = r#"{"cpu_cores":1,"ram_mb":512,"gpu_required":false,"timeout_secs":60}"#;
         let decoded_legacy: TaskRequirements = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(decoded_legacy.max_retries, None);
+        assert_eq!(decoded_legacy.vram_mb, None);
+    }
+
+    #[test]
+    fn test_task_requirements_vram_mb() {
+        let req_default = TaskRequirements::default();
+        assert_eq!(req_default.vram_mb, None);
+        assert_eq!(req_default.effective_vram_mb(), 0);
+        assert!(!req_default.requires_gpu_or_vram());
+
+        let req_zero = TaskRequirements::generic(2, 30).with_vram_mb(0);
+        assert_eq!(req_zero.vram_mb, None);
+        assert_eq!(req_zero.effective_vram_mb(), 0);
+        assert!(!req_zero.gpu_required);
+
+        let req_vram = TaskRequirements::generic(2, 30).with_vram_mb(8_192);
+        assert_eq!(req_vram.vram_mb, Some(8_192));
+        assert_eq!(req_vram.effective_vram_mb(), 8_192);
+        assert!(req_vram.gpu_required);
+        assert!(req_vram.requires_gpu_or_vram());
+
+        let json = serde_json::to_string(&req_vram).unwrap();
+        let decoded_json: TaskRequirements = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded_json, req_vram);
+
+        let encoded = bincode::serialize(&req_vram).unwrap();
+        let decoded_bin: TaskRequirements = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded_bin, req_vram);
+
+        let direct = TaskRequirements {
+            vram_mb: Some(4_096),
+            ..TaskRequirements::generic(1, 30)
+        };
+        assert!(!direct.gpu_required);
+        assert!(direct.requires_gpu_or_vram());
+        assert_eq!(direct.effective_vram_mb(), 4_096);
     }
 
     #[test]

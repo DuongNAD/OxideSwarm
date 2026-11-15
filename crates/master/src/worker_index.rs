@@ -766,8 +766,10 @@ impl RegisteredIndex {
 
 #[inline]
 fn statically_fits_caps(req: &TaskRequirements, caps: &WorkerCapabilities) -> bool {
+    let req_vram = req.effective_vram_mb();
     (req.cpu_cores == 0 || caps.cpu_cores >= req.cpu_cores)
         && (req.ram_mb == 0 || caps.ram_mb >= req.ram_mb)
+        && (req_vram == 0 || caps.vram_mb.is_some_and(|v| v >= req_vram))
 }
 
 #[cfg(test)]
@@ -1006,5 +1008,23 @@ mod tests {
 
         let reg_both = RegisteredIndex::build(&workers);
         assert!(reg_both.any_has_features(&workers, ProtocolCapabilities::TREE_V2));
+    }
+
+    #[test]
+    fn statically_fits_caps_enforces_explicit_vram_mb() {
+        let caps_8g =
+            WorkerCapabilities::new("gpu-8g", 8, 16384, true, true, None).with_vram_mb(Some(8192));
+        let caps_4g =
+            WorkerCapabilities::new("gpu-4g", 8, 16384, true, true, None).with_vram_mb(Some(4096));
+        let caps_unknown = WorkerCapabilities::new("gpu-sim", 8, 16384, true, false, None);
+
+        let req_6g = TaskRequirements::new(1, 512, true, 60).with_vram_mb(6144);
+        assert!(statically_fits_caps(&req_6g, &caps_8g));
+        assert!(!statically_fits_caps(&req_6g, &caps_4g));
+        assert!(!statically_fits_caps(&req_6g, &caps_unknown));
+
+        let req_any_gpu = TaskRequirements::gpu(60);
+        assert!(statically_fits_caps(&req_any_gpu, &caps_8g));
+        assert!(statically_fits_caps(&req_any_gpu, &caps_unknown));
     }
 }

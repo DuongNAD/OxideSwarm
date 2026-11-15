@@ -566,6 +566,10 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Minimum RAM in MB required (default: 0)"
                     },
+                    "vram_mb": {
+                        "type": "integer",
+                        "description": "Minimum GPU VRAM in MB required (default: 0; > 0 implies gpu=true)"
+                    },
                     "gpu": {
                         "type": "boolean",
                         "description": "Require GPU execution (default: false)"
@@ -978,6 +982,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             check_opt_u64(obj, "cores")?;
             check_opt_u64(obj, "ram_mb")?;
+            check_opt_u64(obj, "vram_mb")?;
             check_opt_bool(obj, "gpu")?;
             let os_opt = check_opt_str(obj, "os")?;
             let arch_opt = check_opt_str(obj, "arch")?;
@@ -1233,6 +1238,7 @@ async fn tool_status(state: &McpState, args: &Value) -> ToolCallResult {
                                 "id": listed_worker_id(w),
                                 "cpu_cores": w.cpu_cores,
                                 "ram_mb": w.ram_mb,
+                                "vram_mb": w.vram_mb,
                                 "has_gpu": w.has_gpu,
                                 "is_simulated_gpu": w.is_simulated_gpu,
                                 "gpu_device_name": w.gpu_device_name,
@@ -1308,6 +1314,7 @@ async fn tool_workers(state: &McpState, args: &Value) -> ToolCallResult {
                         "id": listed_worker_id(&w),
                         "cpu_cores": w.cpu_cores,
                         "ram_mb": w.ram_mb,
+                        "vram_mb": w.vram_mb,
                         "has_gpu": w.has_gpu,
                         "is_simulated_gpu": w.is_simulated_gpu,
                         "gpu_device_name": w.gpu_device_name,
@@ -2027,13 +2034,15 @@ async fn check_matching_worker_warning(
         return Some(msg);
     }
 
+    let req_vram = requirements.effective_vram_mb();
     let any_matches = workers.iter().any(|w| {
         let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
         connected
             && placement.matches_listed(w)
-            && (!requirements.gpu_required || w.has_gpu)
+            && (!requirements.requires_gpu_or_vram() || w.can_execute_gpu())
             && w.cpu_cores >= requirements.cpu_cores
             && w.ram_mb >= requirements.ram_mb
+            && (req_vram == 0 || w.vram_mb.is_some_and(|v| v >= req_vram))
     });
 
     if any_matches {
@@ -2215,10 +2224,15 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     // Requirements
     let cores = args.get("cores").and_then(Value::as_u64).unwrap_or(1) as usize;
     let ram_mb = args.get("ram_mb").and_then(Value::as_u64).unwrap_or(0);
+    let vram_mb = args
+        .get("vram_mb")
+        .and_then(Value::as_u64)
+        .filter(|&v| v > 0);
     let gpu = args
         .get("gpu")
         .and_then(Value::as_bool)
-        .unwrap_or(task_type == "gpu");
+        .unwrap_or(task_type == "gpu")
+        || vram_mb.is_some();
     let has_workspace = args.get("workspace").is_some_and(|v| !v.is_null());
     let default_timeout_secs = if has_workspace { 1800 } else { 60 };
     let timeout_secs = args
@@ -2231,6 +2245,9 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         .unwrap_or_else(|| timeout_secs.saturating_add(DEFAULT_WAIT_MARGIN_SECS));
 
     let mut requirements = TaskRequirements::new(cores, ram_mb, gpu, timeout_secs);
+    if let Some(vram) = vram_mb {
+        requirements = requirements.with_vram_mb(vram);
+    }
     if let Some(retries) = args.get("max_retries").and_then(Value::as_u64) {
         requirements = requirements.with_max_retries(retries as u32);
     }
@@ -4339,6 +4356,88 @@ mod tests {
             explicit_task.placement().unwrap().tools,
             vec!["cargo".to_string(), "git".to_string()]
         );
+
+        let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_submit_vram_mb_argument_validates_sets_requirements_and_warns() {
+        assert_eq!(
+            validate_tool_arguments("submit", &json!({"command": "echo", "vram_mb": 4096})),
+            Ok(())
+        );
+        for bad in [
+            json!({"command": "echo", "vram_mb": "4096"}),
+            json!({"command": "echo", "vram_mb": -1}),
+            json!({"command": "echo", "vram_mb": 1.5}),
+        ] {
+            assert!(
+                validate_tool_arguments("submit", &bad).is_err(),
+                "expected invalid vram_mb arg {bad} to be rejected"
+            );
+        }
+
+        let submit_schema = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap()
+            .input_schema;
+        assert_eq!(submit_schema["properties"]["vram_mb"]["type"], "integer");
+        assert!(
+            submit_schema["properties"]["vram_mb"]["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("VRAM")),
+            "expected VRAM description on vram_mb schema property"
+        );
+
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+
+        let state = McpState::new(master.server_addr().to_string(), None);
+        let submit_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "command",
+                "command": "echo",
+                "args": ["needs-vram"],
+                "vram_mb": 4096,
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!submit_res.is_error, "{submit_res:?}");
+
+        let body: Value = serde_json::from_str(match &submit_res.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(
+            body["warning"],
+            "Warning: no connected worker matches the task resource requirements; the task waits in the queue until one does"
+        );
+
+        let tid = rusty_grid_core::TaskId::from_uuid(
+            Uuid::parse_str(body["task_id"].as_str().unwrap()).unwrap(),
+        );
+        let task = master
+            .queue()
+            .get_task_spec(&tid)
+            .await
+            .expect("submitted task spec");
+        assert_eq!(task.requirements.vram_mb, Some(4096));
+        assert!(task.requirements.gpu_required);
+        assert!(task.requirements.requires_gpu_or_vram());
 
         let _ = master.shutdown();
     }
