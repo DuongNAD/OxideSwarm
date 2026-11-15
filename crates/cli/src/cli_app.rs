@@ -174,6 +174,9 @@ pub enum Commands {
     /// Create, list, or revoke OXS-AUTH v3 machine enrollment invites
     Invite(crate::members_cmd::InviteArgs),
 
+    /// Create encrypted USB setup kits (`oxideswarm usb create <DIR>`)
+    Usb(crate::usb_kit::UsbCliArgs),
+
     /// List, approve, reject, revoke, or rename enrolled cluster members
     Members(crate::members_cmd::MembersCliArgs),
 
@@ -1268,6 +1271,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Invite(args) => {
             crate::members_cmd::run_invite(args, config_file, secret_opts).await
         }
+        Commands::Usb(args) => crate::usb_kit::run_usb(args, config_file, secret_opts).await,
         Commands::Members(args) => {
             crate::members_cmd::run_members(args, config_file, secret_opts).await
         }
@@ -3966,16 +3970,31 @@ async fn run_submit_with_secret_inner(
             };
         match uploaded {
             Ok(report) => {
-                eprintln!(
-                    "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
-                    args.workspace.as_deref().unwrap_or(""),
-                    scan.prepared.files,
-                    rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
-                    report.uploaded,
-                    report.blobs,
-                    rusty_grid_worker::staging::human_bytes(report.bytes),
-                    report.blobs - report.uploaded
-                );
+                if scan.prepared.skipped.is_empty() {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                } else {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}), {} skipped ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        scan.prepared.skipped.len(),
+                        scan.prepared.skipped.join("; "),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                }
                 Some(report)
             }
             Err(e) => {

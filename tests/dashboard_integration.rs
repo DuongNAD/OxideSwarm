@@ -28,6 +28,14 @@ use rusty_grid_master::dashboard::dto::{ClusterStatusDto, DashboardStreamMessage
 use rusty_grid_master::queue::TaskInfo;
 use rusty_grid_master::registry::{WorkerInfo, WorkerStatus};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+fn http_client() -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client")
+}
 use rusty_grid_worker::client::WorkerClient;
 
 /// Test 1: HTTP REST endpoints validation with ephemeral port 0.
@@ -60,10 +68,7 @@ async fn test_dashboard_http_rest_endpoints() {
         .expect("read dashboard port file");
     assert_eq!(port_str.trim().parse::<u16>().unwrap(), dash_addr.port());
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("build reqwest client");
+    let client = http_client();
 
     let base_url = format!("http://{}", dash_addr);
 
@@ -330,10 +335,7 @@ async fn test_dashboard_sse_stream() {
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("build reqwest client");
+    let client = http_client();
 
     let mut resp = client
         .get(format!("http://{}/api/stream/sse", dash_addr))

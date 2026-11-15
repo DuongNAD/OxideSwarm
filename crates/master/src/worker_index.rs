@@ -154,7 +154,8 @@ const KNOWN_FEATURES: ProtocolCapabilities = ProtocolCapabilities(
     ProtocolCapabilities::FILE_STAGING.0
         | ProtocolCapabilities::BLOB_TRANSFER.0
         | ProtocolCapabilities::THREE_D.0
-        | ProtocolCapabilities::WORKSPACES.0,
+        | ProtocolCapabilities::WORKSPACES.0
+        | ProtocolCapabilities::TREE_V2.0,
 );
 
 /// Attribute bitset index over any slice of `WorkerInfo`.
@@ -174,6 +175,7 @@ pub(crate) struct WorkerAttrIndex {
     feat_blob_transfer: BitSet,
     feat_three_d: BitSet,
     feat_workspaces: BitSet,
+    feat_tree_v2: BitSet,
 }
 
 impl WorkerAttrIndex {
@@ -195,6 +197,7 @@ impl WorkerAttrIndex {
         let mut feat_blob_transfer = BitSet::new(len);
         let mut feat_three_d = BitSet::new(len);
         let mut feat_workspaces = BitSet::new(len);
+        let mut feat_tree_v2 = BitSet::new(len);
 
         let mut seen_os: HashSet<String> = HashSet::new();
         let mut seen_arch: HashSet<String> = HashSet::new();
@@ -278,6 +281,9 @@ impl WorkerAttrIndex {
             if worker.features.contains(ProtocolCapabilities::WORKSPACES) {
                 feat_workspaces.set(idx);
             }
+            if worker.features.contains(ProtocolCapabilities::TREE_V2) {
+                feat_tree_v2.set(idx);
+            }
         }
 
         Self {
@@ -296,6 +302,7 @@ impl WorkerAttrIndex {
             feat_blob_transfer,
             feat_three_d,
             feat_workspaces,
+            feat_tree_v2,
         }
     }
 
@@ -413,6 +420,12 @@ impl WorkerAttrIndex {
         }
         if required_features.contains(ProtocolCapabilities::WORKSPACES) {
             mask.and_assign(&self.feat_workspaces);
+            if mask.is_empty() {
+                return false;
+            }
+        }
+        if required_features.contains(ProtocolCapabilities::TREE_V2) {
+            mask.and_assign(&self.feat_tree_v2);
             if mask.is_empty() {
                 return false;
             }
@@ -897,6 +910,7 @@ mod tests {
                     ProtocolCapabilities::FILE_STAGING,
                     ProtocolCapabilities::BLOB_TRANSFER,
                     ProtocolCapabilities::WORKSPACES,
+                    ProtocolCapabilities::TREE_V2,
                     ProtocolCapabilities::THREE_D | ProtocolCapabilities::WORKSPACES,
                 ] {
                     let expected: Vec<usize> = workers
@@ -920,5 +934,77 @@ mod tests {
         let reg_index = RegisteredIndex::build(&workers);
         assert!(reg_index.any_has_features(&workers, ProtocolCapabilities::FILE_STAGING));
         assert!(!reg_index.any_has_features(&workers, ProtocolCapabilities::WORKSPACES));
+    }
+
+    #[test]
+    fn tree_v2_feature_indexed_in_worker_and_registered_indices() {
+        let w_v1 = make_worker(
+            Uuid::new_v4(),
+            "w-v1",
+            4,
+            8192,
+            false,
+            false,
+            Vec::new(),
+            ProtocolCapabilities::WORKSPACES | ProtocolCapabilities::FILE_STAGING,
+        );
+        let w_v2 = make_worker(
+            Uuid::new_v4(),
+            "w-v2",
+            4,
+            8192,
+            false,
+            false,
+            Vec::new(),
+            ProtocolCapabilities::WORKSPACES
+                | ProtocolCapabilities::FILE_STAGING
+                | ProtocolCapabilities::TREE_V2,
+        );
+        let workers = vec![w_v1, w_v2];
+        let meta = vec![
+            SeatStaticMeta {
+                host_busy: false,
+                is_gpu: false,
+                is_real_gpu: false,
+                initial_load: 0,
+            },
+            SeatStaticMeta {
+                host_busy: false,
+                is_gpu: false,
+                is_real_gpu: false,
+                initial_load: 0,
+            },
+        ];
+        let index = WorkerIndex::build(&workers, meta, &[4, 4], &[[true; 4]; 2]);
+
+        let tree_v2_only: Vec<usize> = index
+            .free_candidate_mask(
+                &Placement::default(),
+                false,
+                ProtocolCapabilities::TREE_V2,
+                1,
+                false,
+                &[],
+            )
+            .map_or_else(Vec::new, |m| m.iter_ones().collect());
+        assert_eq!(tree_v2_only, vec![1]);
+
+        let ws_plus_v2: Vec<usize> = index
+            .free_candidate_mask(
+                &Placement::default(),
+                false,
+                ProtocolCapabilities::WORKSPACES | ProtocolCapabilities::TREE_V2,
+                1,
+                false,
+                &[],
+            )
+            .map_or_else(Vec::new, |m| m.iter_ones().collect());
+        assert_eq!(ws_plus_v2, vec![1]);
+
+        let reg_v1_only = RegisteredIndex::build(&workers[..1]);
+        assert!(!reg_v1_only.any_has_features(&workers[..1], ProtocolCapabilities::TREE_V2));
+
+        let reg_both = RegisteredIndex::build(&workers);
+        assert!(reg_both.any_has_features(&workers, ProtocolCapabilities::TREE_V2));
     }
 }

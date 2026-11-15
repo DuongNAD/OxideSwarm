@@ -109,6 +109,7 @@ async fn test_metrics_requires_observer_scope_and_rejects_unauthenticated() {
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{dash_addr}");
 
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -208,6 +209,7 @@ async fn test_metrics_scrape_live_master_worker_blob_journal_and_redaction() {
     );
     wait_for_connected_worker(&master).await;
 
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

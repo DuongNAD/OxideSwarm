@@ -6,7 +6,7 @@
 # folder is changed except the per-user autostart entry. The user's own ~/.oxideswarm is never
 # read or written: the installed worker keeps its state in <install folder>/home.
 #
-#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--no-workspaces] [--isolation off|fs]
+#   bash install.sh [--name NAME] [--install-root DIR] [--no-autostart] [--workspaces|--no-workspaces] [--isolation off|fs]
 #                   [--gpu|--no-gpu] [--slots N] [--update]
 #
 # --slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
@@ -24,6 +24,7 @@ NAME=""
 ROOT=""
 AUTOSTART=1
 WORKSPACES=1
+WORKSPACES_EXPLICIT=0
 GPU=""
 UPDATE=0
 ISOLATION=""
@@ -31,15 +32,90 @@ EXPLICIT_ISOLATION=0
 ISO_SET_BY_FLAG=0
 SLOTS_SET=""
 
-say() { printf '%s\n' "$*"; }
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+INSTALL_LOG_ACTIVE=""
+INSTALL_LOG_TMP=$(mktemp "${TMPDIR:-/tmp}/oxideswarm-usb-install.XXXXXX" 2>/dev/null || true)
+TMP=""
+FRESH_INSTALL=0
+PREEXISTING_ROOT=0
+ROLLBACK_ARMED=0
+CREATED_AUTOSTART_MAC=0
+CREATED_AUTOSTART_SYS=0
+CREATED_AUTOSTART_XDG=""
+IS_V1_KIT=0
+KIT_VERSION=""
+KIT_WORKSPACES=""
+KIT_HAS_WORKER=1
+KIT_HAS_CLIENT=1
+
+log_append() {
+  if [ -n "$INSTALL_LOG_ACTIVE" ]; then
+    printf '%s\n' "$*" >> "$INSTALL_LOG_ACTIVE" 2>/dev/null || true
+  elif [ -n "$INSTALL_LOG_TMP" ]; then
+    printf '%s\n' "$*" >> "$INSTALL_LOG_TMP" 2>/dev/null || true
+  fi
+}
+
+say() {
+  printf '%s\n' "$*"
+  log_append "$*"
+}
+
+rollback_fresh_install() {
+  [ "$ROLLBACK_ARMED" = 1 ] || return 0
+  ROLLBACK_ARMED=0
+  [ "$FRESH_INSTALL" = 1 ] || return 0
+  if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/worker.pid" ]; then
+    _rb_pid=$(cat "$RUN_DIR/worker.pid" 2>/dev/null || true)
+    if [ -n "$_rb_pid" ]; then
+      case "$(ps -ww -p "$_rb_pid" -o command= 2>/dev/null || true)" in
+        *"${ROOT:-}/bin/oxideswarm "*) kill "$_rb_pid" 2>/dev/null || true ;;
+      esac
+    fi
+  fi
+  if [ "$CREATED_AUTOSTART_MAC" = 1 ]; then
+    launchctl bootout "gui/$(id -u)/com.oxideswarm.usb-worker" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
+  fi
+  if [ "$CREATED_AUTOSTART_SYS" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now oxideswarm-usb-worker.service 2>/dev/null || true
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/oxideswarm-usb-worker.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+  if [ -n "$CREATED_AUTOSTART_XDG" ]; then
+    rm -f "$CREATED_AUTOSTART_XDG"
+  fi
+  if [ -n "${ROOT:-}" ] && [ -d "$ROOT" ]; then
+    cd "${TMPDIR:-/tmp}" 2>/dev/null || cd / || true
+    if [ "$PREEXISTING_ROOT" = 0 ]; then
+      rm -rf "$ROOT"
+    else
+      rm -f "$ROOT/kit-install.conf" "$ROOT/start-worker.sh"
+      rm -rf "${ROOT:?}/bin" "${ROOT:?}/home" "${ROOT:?}/run" "${ROOT:?}/logs" "${ROOT:?}/workspaces"
+    fi
+  fi
+}
+
+cleanup_on_exit() {
+  if [ -n "$TMP" ] && [ -d "$TMP" ]; then rm -rf "$TMP"; fi
+  if [ "$ROLLBACK_ARMED" = 1 ]; then rollback_fresh_install; fi
+  if [ -n "$INSTALL_LOG_TMP" ] && [ -f "$INSTALL_LOG_TMP" ]; then rm -f "$INSTALL_LOG_TMP"; fi
+}
+trap cleanup_on_exit EXIT
+
+fail() {
+  log_append "ERROR: $*"
+  printf 'ERROR: %s\n' "$*" >&2
+  rollback_fresh_install
+  exit 1
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) [ $# -ge 2 ] || fail "--name needs a value"; NAME=$2; shift ;;
     --install-root) [ $# -ge 2 ] || fail "--install-root needs a value"; ROOT=$2; shift ;;
     --no-autostart) AUTOSTART=0 ;;
-    --no-workspaces) WORKSPACES=0 ;;
+    --no-workspaces) WORKSPACES=0; WORKSPACES_EXPLICIT=1 ;;
+    --workspaces) WORKSPACES=1; WORKSPACES_EXPLICIT=1 ;;
     --update) UPDATE=1 ;;
     --gpu) [ "$GPU" = 0 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=1 ;;
     --no-gpu) [ "$GPU" = 1 ] && fail "--gpu and --no-gpu cannot be used together"; GPU=0 ;;
@@ -81,9 +157,41 @@ if [ -z "$ROOT" ]; then
   fi
 fi
 
-[ "$UPDATE" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token is missing from the kit"
+INVITE_FILE="$KIT_DIR/invite.oxs"
+KIT_JSON="$KIT_DIR/kit.json"
+if [ -f "$INVITE_FILE" ]; then
+  IS_V1_KIT=1
+  [ -f "$KIT_JSON" ] || fail "kit.json is missing from this v1 kit"
+fi
+if [ -f "$KIT_JSON" ]; then
+  _flat_json=$(tr '\r\n' '  ' < "$KIT_JSON")
+  _kit_format=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"kit_format"[[:space:]]*:[[:space:]]*[0-9]+/)) { s=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*/, "", s); print s } }')
+  [ "$_kit_format" = "1" ] || fail "unsupported kit_format '$_kit_format' in kit.json (expected 1)"
+  KIT_VERSION=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"version"[[:space:]]*:[[:space:]]*"[^"]*"/)) { s=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*"/, "", s); sub(/"$/, "", s); print s } }')
+  case "$KIT_VERSION" in
+    ''|*..*|*/*|*\\*|*[!A-Za-z0-9.+_-]*) fail "invalid version '$KIT_VERSION' in kit.json" ;;
+  esac
+  _ws_raw=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"workspaces"[[:space:]]*:[[:space:]]*(true|false)/)) { s=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*/, "", s); print s } }')
+  case "$_ws_raw" in
+    true) KIT_WORKSPACES=1 ;;
+    false) KIT_WORKSPACES=0 ;;
+    *) KIT_WORKSPACES="" ;;
+  esac
+  _roles_raw=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"roles"[[:space:]]*:[[:space:]]*\[[^]]*\]/)) { print substr($0,RSTART,RLENGTH) } }')
+  [ -n "$_roles_raw" ] || fail "kit.json is missing roles"
+  if printf '%s\n' "$_roles_raw" | grep -q '"worker"'; then KIT_HAS_WORKER=1; else KIT_HAS_WORKER=0; fi
+  if printf '%s\n' "$_roles_raw" | grep -q '"client"'; then KIT_HAS_CLIENT=1; else KIT_HAS_CLIENT=0; fi
+  [ "$KIT_HAS_WORKER" = 1 ] || [ "$KIT_HAS_CLIENT" = 1 ] || fail "kit.json roles lists neither worker nor client"
+fi
+[ "$UPDATE" = 1 ] || [ "$IS_V1_KIT" = 1 ] || [ -f "$KIT_DIR/join.token" ] || fail "join.token (or invite.oxs) is missing from the kit"
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 [ -f "$KIT_DIR/no-autostart" ] && AUTOSTART=0
+if [ "$IS_V1_KIT" = 1 ] && [ "$UPDATE" = 0 ] && [ "$WORKSPACES_EXPLICIT" = 0 ] && [ -n "$KIT_WORKSPACES" ]; then
+  WORKSPACES=$KIT_WORKSPACES
+fi
+if [ "$KIT_HAS_WORKER" = 0 ]; then
+  GPU=0
+fi
 if [ -z "$ISOLATION" ]; then
   if [ -f "$KIT_DIR/isolation" ]; then
     BAKED_ISO=$(tr -d ' \r\n\t' < "$KIT_DIR/isolation")
@@ -99,11 +207,13 @@ fi
 
 PLIST="$HOME/Library/LaunchAgents/com.oxideswarm.usb-worker.plist"
 UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/oxideswarm-usb-worker.service"
-# Whether this install's worker is started at login now (a LaunchAgent or a systemd user unit that
-# runs this install's binary).
+XDG_DESKTOP="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/oxideswarm-usb-worker.desktop"
+# Whether this install's worker is started at login now (a LaunchAgent, systemd user unit, or
+# XDG autostart entry that runs this install's binary/launcher).
 has_autostart() {
   { [ -f "$PLIST" ] && grep -qF "$ROOT/bin/oxideswarm" "$PLIST"; } ||
-    { [ -f "$UNIT" ] && grep -qF "$ROOT/bin/oxideswarm" "$UNIT"; }
+    { [ -f "$UNIT" ] && grep -qF "$ROOT/bin/oxideswarm" "$UNIT"; } ||
+    { [ -f "$XDG_DESKTOP" ] && grep -qF "$ROOT/start-worker.sh" "$XDG_DESKTOP"; }
 }
 if [ "$UPDATE" = 1 ]; then
   [ -x "$ROOT/bin/oxideswarm" ] || fail "there is no OxideSwarm from a USB kit in $ROOT; run the installer first"
@@ -113,7 +223,9 @@ if [ "$UPDATE" = 1 ]; then
       case "$key" in
         name) [ -n "$NAME" ] || NAME=$value ;;
         gpu) [ -n "$GPU" ] || case "$value" in 0|1) GPU=$value ;; esac ;;
-        workspaces) [ "$value" = 0 ] && WORKSPACES=0 ;;
+        workspaces) [ "$WORKSPACES_EXPLICIT" = 1 ] || case "$value" in 0|1) WORKSPACES=$value ;; esac ;;
+        worker) [ "$IS_V1_KIT" = 1 ] || case "$value" in 0|1) KIT_HAS_WORKER=$value ;; esac ;;
+        client) [ "$IS_V1_KIT" = 1 ] || case "$value" in 0|1) KIT_HAS_CLIENT=$value ;; esac ;;
         # The isolation the worker ran with is kept, and an update never weakens it silently.
         isolation) [ "$ISO_SET_BY_FLAG" = 1 ] || case "$value" in off|fs) ISOLATION=$value; EXPLICIT_ISOLATION=1 ;; esac ;;
         # Slots chosen with --slots at install time are kept; an automatic choice is made again.
@@ -131,16 +243,24 @@ if [ "$UPDATE" = 1 ]; then
 fi
 
 ARCHIVE=""
-for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
-  [ -f "$f" ] && ARCHIVE=$f
-done
-[ -n "$ARCHIVE" ] || fail "no archive for $TARGET in $KIT_DIR/archives"
+if [ "$IS_V1_KIT" = 1 ] && [ -n "$KIT_VERSION" ] && [ -f "$KIT_DIR/archives/oxideswarm-$KIT_VERSION-$TARGET.tar.gz" ]; then
+  ARCHIVE="$KIT_DIR/archives/oxideswarm-$KIT_VERSION-$TARGET.tar.gz"
+else
+  for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET".tar.gz; do
+    [ -f "$f" ] && ARCHIVE=$f
+  done
+fi
+[ -f "$ARCHIVE" ] || fail "no archive for $TARGET in $KIT_DIR/archives"
 # A kit made with make_kit.sh --gpu also holds the gpu-wgpu build, which uses this machine's GPU
 # when it finds one. It is installed only when the person at the keyboard agrees (or --gpu).
 GPU_ARCHIVE=""
-for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
-  [ -f "$f" ] && GPU_ARCHIVE=$f
-done
+if [ "$IS_V1_KIT" = 1 ] && [ -n "$KIT_VERSION" ] && [ -f "$KIT_DIR/archives/oxideswarm-$KIT_VERSION-$TARGET-gpu.tar.gz" ]; then
+  GPU_ARCHIVE="$KIT_DIR/archives/oxideswarm-$KIT_VERSION-$TARGET-gpu.tar.gz"
+else
+  for f in "$KIT_DIR"/archives/oxideswarm-*-"$TARGET"-gpu.tar.gz; do
+    [ -f "$f" ] && GPU_ARCHIVE=$f
+  done
+fi
 if [ "$GPU" = 1 ] && [ -z "$GPU_ARCHIVE" ]; then
   [ "$UPDATE" = 1 ] && fail "this install uses the GPU build, which this kit lacks; update from a kit made with make_kit.sh --gpu, or add --no-gpu"
   fail "this kit has no GPU build for $TARGET (make it with make_kit.sh --gpu)"
@@ -166,17 +286,98 @@ elif [ -n "$GPU_ARCHIVE" ]; then
 fi
 ARCHIVE_NAME=$(basename "$ARCHIVE")
 
-# 1. Check the archive against the kit's SHA256SUMS. This catches a corrupted or outdated copy;
-#    it cannot catch a deliberate swap of the whole stick (design 0053, Security).
-EXPECTED=$(awk -v n="$ARCHIVE_NAME" '$2 == n {print $1}' "$KIT_DIR/archives/SHA256SUMS")
+# 1. Check the archive against the kit's SHA256SUMS (and online release SHA256SUMS when
+#    configured or reachable).
+lookup_sum_entry() {
+  _sums_file=$1
+  _target_name=$2
+  awk -v n="$_target_name" '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      h = $1
+      f = $2
+      sub(/^\*/, "", f)
+      if (f == n && h ~ /^[0-9a-fA-F]{64}$/) {
+        print tolower(h)
+        exit
+      }
+    }' "$_sums_file"
+}
+
+verify_online_sums() {
+  _v_name=$1
+  _v_expected=$2
+  _online_url=${OXIDESWARM_USB_ONLINE_SUMS_URL:-}
+  _strict=0
+  case "$_online_url" in
+    off|OFF|0|none|NONE)
+      say "  online:  skipped (OXIDESWARM_USB_ONLINE_SUMS_URL=off)"
+      return 0 ;;
+    '')
+      [ "$IS_V1_KIT" = 1 ] && [ -n "$KIT_VERSION" ] || return 0
+      _online_url="https://github.com/DuongNAD/OxideSwarm/releases/download/v${KIT_VERSION}/SHA256SUMS"
+      _strict=0 ;;
+    *)
+      _strict=1 ;;
+  esac
+
+  _online_tmp=$(mktemp "${TMPDIR:-/tmp}/oxideswarm-online-sums.XXXXXX")
+  _fetched=0
+  case "$_online_url" in
+    file://localhost/*)
+      _local_sums=${_online_url#file://localhost}
+      if [ -f "$_local_sums" ] && [ ! -L "$_local_sums" ]; then
+        cp "$_local_sums" "$_online_tmp" 2>/dev/null && _fetched=1
+      fi
+      [ "$_fetched" = 1 ] || { rm -f "$_online_tmp"; fail "cannot read online SHA256SUMS from $_online_url"; } ;;
+    file:///*)
+      _local_sums=${_online_url#file://}
+      if [ -f "$_local_sums" ] && [ ! -L "$_local_sums" ]; then
+        cp "$_local_sums" "$_online_tmp" 2>/dev/null && _fetched=1
+      fi
+      [ "$_fetched" = 1 ] || { rm -f "$_online_tmp"; fail "cannot read online SHA256SUMS from $_online_url"; } ;;
+    https://*)
+      case "$_online_url" in
+        https://*:*@*|https://*@*)
+          rm -f "$_online_tmp"
+          fail "refusing online SHA256SUMS URL with embedded credentials" ;;
+      esac
+      if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --proto =https --connect-timeout 5 --max-time 12 -o "$_online_tmp" "$_online_url" 2>/dev/null; then
+          _fetched=1
+        fi
+      fi
+      if [ "$_fetched" != 1 ]; then
+        rm -f "$_online_tmp"
+        if [ "$_strict" = 1 ]; then
+          fail "could not fetch online SHA256SUMS from $_online_url"
+        else
+          say "  online:  unavailable (offline or unreleased v$KIT_VERSION); relying on stick SHA256SUMS"
+          return 0
+        fi
+      fi ;;
+    *)
+      rm -f "$_online_tmp"
+      fail "refusing online SHA256SUMS URL '$_online_url': only https:// or file:// is allowed" ;;
+  esac
+
+  _online_expected=$(lookup_sum_entry "$_online_tmp" "$_v_name")
+  rm -f "$_online_tmp"
+  [ -n "$_online_expected" ] || fail "$_v_name is not listed in online SHA256SUMS"
+  [ "$_online_expected" = "$_v_expected" ] || fail "online SHA256SUMS mismatch for $_v_name (stick $_v_expected vs online $_online_expected); refusing tampered kit"
+  say "  online:  $_v_name matches online SHA256SUMS"
+}
+
+EXPECTED=$(lookup_sum_entry "$KIT_DIR/archives/SHA256SUMS" "$ARCHIVE_NAME")
 [ -n "$EXPECTED" ] || fail "$ARCHIVE_NAME is not listed in SHA256SUMS"
 if command -v shasum >/dev/null 2>&1; then
-  ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+  ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print tolower($1)}')
 else
-  ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+  ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print tolower($1)}')
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || fail "checksum mismatch for $ARCHIVE_NAME: the copy on the stick is damaged"
 say "  archive: $ARCHIVE_NAME (checksum OK)"
+verify_online_sums "$ARCHIVE_NAME" "$EXPECTED"
 
 # Stop the worker this install's start-at-login entry keeps alive before its binary changes; step 8
 # puts the entry back.
@@ -184,7 +385,17 @@ if has_autostart; then
   if [ "$OS" = Darwin ]; then
     launchctl bootout "gui/$(id -u)/com.oxideswarm.usb-worker" 2>/dev/null || true
   else
-    systemctl --user stop oxideswarm-usb-worker.service 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user stop oxideswarm-usb-worker.service 2>/dev/null || true
+    fi
+    if [ -f "$ROOT/run/worker.pid" ]; then
+      _old_xdg_pid=$(cat "$ROOT/run/worker.pid" 2>/dev/null || true)
+      if [ -n "$_old_xdg_pid" ]; then
+        case "$(ps -ww -p "$_old_xdg_pid" -o command= 2>/dev/null || true)" in
+          *"$ROOT/bin/oxideswarm "*) kill "$_old_xdg_pid" 2>/dev/null || true ;;
+        esac
+      fi
+    fi
   fi
 fi
 
@@ -193,10 +404,24 @@ BIN_DIR="$ROOT/bin"
 STATE="$ROOT/home"
 RUN_DIR="$ROOT/run"
 LOG_DIR="$ROOT/logs"
+if [ -d "$ROOT" ]; then PREEXISTING_ROOT=1; fi
+if [ "$UPDATE" != 1 ] && [ ! -e "$BIN_DIR/oxideswarm" ] && [ ! -e "$STATE/node.key" ] && [ ! -e "$STATE/cluster.secret" ]; then
+  FRESH_INSTALL=1
+  ROLLBACK_ARMED=1
+fi
 mkdir -p "$BIN_DIR" "$STATE" "$RUN_DIR" "$LOG_DIR"
 chmod 700 "$STATE"
+INSTALL_LOG_ACTIVE="$LOG_DIR/install.log"
+{
+  printf '=== OxideSwarm USB installer run (%s) ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+  if [ -n "$INSTALL_LOG_TMP" ] && [ -f "$INSTALL_LOG_TMP" ]; then
+    cat "$INSTALL_LOG_TMP"
+    rm -f "$INSTALL_LOG_TMP"
+    INSTALL_LOG_TMP=""
+  fi
+} >> "$INSTALL_LOG_ACTIVE" 2>/dev/null || true
+chmod 600 "$INSTALL_LOG_ACTIVE" 2>/dev/null || true
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/oxideswarm-usb.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT
 tar -xzf "$ARCHIVE" -C "$TMP"
 SRC=$(find "$TMP" -type f -name oxideswarm | head -n 1)
 [ -n "$SRC" ] || fail "the archive holds no oxideswarm binary"
@@ -234,13 +459,19 @@ if [ -f "$RUN_DIR/worker.pid" ]; then
   rm -f "$RUN_DIR/worker.pid"
 fi
 
-# 4. Join: the token is read from standard input only, never from the command line. An update keeps
-# the existing membership.
+# 4. Join: the token (v0) is read from stdin; the encrypted invite (v1) reads the passphrase
+#    and confirmation from stdin directly. An update keeps the existing membership.
 if [ "$UPDATE" = 0 ]; then
   say ""
   say "Joining the cluster ..."
-  if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
-    fail "join failed (see the message above); nothing was started"
+  if [ "$IS_V1_KIT" = 1 ]; then
+    if ! "$BIN" join --invite-file "$INVITE_FILE" --no-doctor; then
+      fail "join failed (see the message above); nothing was started"
+    fi
+  else
+    if ! "$BIN" join --no-doctor < "$KIT_DIR/join.token"; then
+      fail "join failed (see the message above); nothing was started"
+    fi
   fi
 fi
 
@@ -264,11 +495,12 @@ if [ -z "$NAME" ]; then
   NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
   [ -n "$NAME" ] || NAME=worker
 fi
+if [ "$KIT_HAS_WORKER" = 1 ]; then
 # A stable worker id for this machine and name in this cluster, so that a reinstall shows up as the
 # same worker instead of a new one beside a disconnected old entry. It is a SHA-256 over the
-# machine's own id, the name and the cluster secret: the machine id never leaves the machine, and the
-# same machine gets unrelated ids in different clusters. An existing id file is kept.
-# OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
+# machine's own id, the name and the cluster secret (or master_key on v1 invite kits): the machine id
+# never leaves the machine, and the same machine gets unrelated ids in different clusters. An existing
+# id file is kept. OXIDESWARM_USB_MACHINE_ID replaces the machine id (tests).
 ID_FILE="$STATE/worker_id.$NAME"
 if [ ! -s "$ID_FILE" ]; then
   MACHINE_ID=${OXIDESWARM_USB_MACHINE_ID:-}
@@ -282,7 +514,22 @@ if [ ! -s "$ID_FILE" ]; then
   fi
   if [ -n "$MACHINE_ID" ]; then
     if command -v shasum >/dev/null 2>&1; then SHA="shasum -a 256"; else SHA=sha256sum; fi
-    H=$({ printf 'oxideswarm-usb-worker-id-v1\n%s\n%s\n' "$MACHINE_ID" "$NAME"; cat "$STATE/cluster.secret" 2>/dev/null || true; } | $SHA | cut -c1-32)
+    if [ -s "$STATE/cluster.secret" ]; then
+      H=$({ printf 'oxideswarm-usb-worker-id-v1\n%s\n%s\n' "$MACHINE_ID" "$NAME"; cat "$STATE/cluster.secret" 2>/dev/null || true; } | $SHA | cut -c1-32)
+    else
+      MASTER_KEY_SEED=""
+      if [ -s "$STATE/master_key" ]; then
+        MASTER_KEY_SEED=$(cat "$STATE/master_key" 2>/dev/null || true)
+      elif [ -f "$STATE/rusty-grid.toml" ]; then
+        MASTER_KEY_SEED=$(awk '
+          /^[[:space:]]*master_key[[:space:]]*=/ {
+            v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]*(#.*)?$/, "", v)
+            if (v ~ /^'"'"'.*'"'"'$/ || v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+            print v; exit
+          }' "$STATE/rusty-grid.toml" 2>/dev/null || true)
+      fi
+      H=$({ printf 'oxideswarm-usb-worker-id-v1\n%s\n%s\n' "$MACHINE_ID" "$NAME"; if [ -n "$MASTER_KEY_SEED" ]; then printf '%s\n' "$MASTER_KEY_SEED"; fi; } | $SHA | cut -c1-32)
+    fi
     # UUID version 8 (vendor-specific) with the RFC 9562 variant bits.
     VARIANT=$(printf '%x' $(( (0x$(printf '%s' "$H" | cut -c17) & 3) | 8 )))
     UUID="$(printf '%s' "$H" | cut -c1-8)-$(printf '%s' "$H" | cut -c9-12)-8$(printf '%s' "$H" | cut -c14-16)-$VARIANT$(printf '%s' "$H" | cut -c18-20)-$(printf '%s' "$H" | cut -c21-32)"
@@ -386,12 +633,15 @@ while [ $i -lt 30 ]; do
 done
 [ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
 say "  connected (isolation: $ISOLATION)"
+fi
 # What an update keeps: the name, the build, the workspace choice and the isolation.
 GPU_USED=0
-if [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
-printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\nslots=%s\n' "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" "$SLOTS_SET" > "$ROOT/kit-install.conf"
+if [ "$KIT_HAS_WORKER" = 1 ] && [ -n "$GPU_ARCHIVE" ] && [ "$ARCHIVE" = "$GPU_ARCHIVE" ]; then GPU_USED=1; fi
+printf 'name=%s\ngpu=%s\nworkspaces=%s\nisolation=%s\nslots=%s\nworker=%s\nclient=%s\n' \
+  "$NAME" "$GPU_USED" "$WORKSPACES" "$ISOLATION" "$SLOTS_SET" "$KIT_HAS_WORKER" "$KIT_HAS_CLIENT" > "$ROOT/kit-install.conf"
 
 # 8. Start at login. The running worker is handed over to the autostart entry.
+if [ "$KIT_HAS_WORKER" = 1 ]; then
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$OS" = Darwin ]; then
     mkdir -p "$HOME/Library/LaunchAgents"
@@ -412,6 +662,7 @@ if [ "$AUTOSTART" = 1 ]; then
       printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$LOG_DIR/worker.log"
       printf '</dict></plist>\n'
     } > "$PLIST"
+    CREATED_AUTOSTART_MAC=1
     kill "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || true
     rm -f "$RUN_DIR/worker.pid"
     sleep 2
@@ -428,6 +679,7 @@ if [ "$AUTOSTART" = 1 ]; then
       printf 'ExecStart=%s %s --isolation %s\n' "$BIN" "$WORKER_ARGS" "$ISOLATION"
       printf 'Restart=on-failure\n\n[Install]\nWantedBy=default.target\n'
     } > "$UNIT_DIR/oxideswarm-usb-worker.service"
+    CREATED_AUTOSTART_SYS=1
     kill "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || true
     rm -f "$RUN_DIR/worker.pid"
     sleep 2
@@ -435,28 +687,81 @@ if [ "$AUTOSTART" = 1 ]; then
     systemctl --user enable --now oxideswarm-usb-worker.service
     say "  autostart: systemd user unit oxideswarm-usb-worker"
   else
-    say "  autostart: not available here; the worker runs until you log out (PID $(cat "$RUN_DIR/worker.pid"))"
+    START_SCRIPT="$ROOT/start-worker.sh"
+    {
+      printf '#!/bin/sh\nset -eu\n'
+      printf 'ROOT_DIR=$(cd "$(dirname "$0")" && pwd)\n'
+      printf 'export OXIDESWARM_HOME="$ROOT_DIR/home"\n'
+      printf 'RUN_DIR="$ROOT_DIR/run"\n'
+      printf 'LOG_DIR="$ROOT_DIR/logs"\n'
+      printf 'mkdir -p "$RUN_DIR" "$LOG_DIR"\n'
+      printf 'if [ -f "$RUN_DIR/worker.pid" ]; then\n'
+      printf '  OLD_PID=$(cat "$RUN_DIR/worker.pid" 2>/dev/null || true)\n'
+      printf '  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then\n'
+      printf '    case "$(ps -ww -p "$OLD_PID" -o command= 2>/dev/null || true)" in\n'
+      printf '      *"$ROOT_DIR/bin/oxideswarm "*) exit 0 ;;\n'
+      printf '    esac\n'
+      printf '  fi\n'
+      printf 'fi\n'
+      printf 'cd "$ROOT_DIR"\n'
+      printf 'nohup "$ROOT_DIR/bin/oxideswarm" %s --isolation %s >> "$LOG_DIR/worker.log" 2>&1 &\n' "$WORKER_ARGS" "$ISOLATION"
+      printf 'echo $! > "$RUN_DIR/worker.pid"\n'
+    } > "$START_SCRIPT"
+    chmod 755 "$START_SCRIPT"
+    XDG_AUTO_DIR=$(dirname "$XDG_DESKTOP")
+    mkdir -p "$XDG_AUTO_DIR"
+    {
+      printf '[Desktop Entry]\n'
+      printf 'Type=Application\n'
+      printf 'Version=1.0\n'
+      printf 'Name=OxideSwarm Worker\n'
+      printf 'Comment=Start OxideSwarm USB worker at login\n'
+      printf 'Exec="%s"\n' "$START_SCRIPT"
+      printf 'Terminal=false\n'
+      printf 'X-GNOME-Autostart-enabled=true\n'
+    } > "$XDG_DESKTOP"
+    CREATED_AUTOSTART_XDG="$XDG_DESKTOP"
+    say "  autostart: XDG entry $XDG_DESKTOP (worker PID $(cat "$RUN_DIR/worker.pid"))"
   fi
 else
   say "  autostart: skipped (--no-autostart); worker PID $(cat "$RUN_DIR/worker.pid")"
 fi
+fi
+
+ROLLBACK_ARMED=0
 
 if [ "$UPDATE" = 1 ]; then
   say ""
-  say "Updated. Worker '$NAME' runs $("$BIN" --version) from $ROOT."
+  if [ "$KIT_HAS_WORKER" = 1 ]; then
+    say "Updated. Worker '$NAME' runs $("$BIN" --version) from $ROOT."
+  else
+    say "Updated. Machine '$NAME' runs $("$BIN" --version) from $ROOT."
+  fi
   exit 0
 fi
 
 # 9. Check the cluster.
-say ""
-say "Checking the cluster (oxideswarm doctor) ..."
-if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" doctor --master "$TICKET"; else RUST_LOG=off "$BIN" doctor; fi; }; then
-  DOCTOR="passed"
-else
-  DOCTOR="reported a problem (see above)"
-fi
+if [ "$KIT_HAS_CLIENT" = 1 ]; then
+  say ""
+  say "Checking the cluster (oxideswarm doctor) ..."
+  if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" doctor --master "$TICKET"; else RUST_LOG=off "$BIN" doctor; fi; }; then
+    DOCTOR="passed"
+  else
+    DOCTOR="reported a problem (see above)"
+  fi
 
-say ""
-say "Done. Worker '$NAME' is part of the cluster; the doctor check $DOCTOR."
-say "Files: $ROOT   Log: $LOG_DIR/worker.log"
+  say ""
+  if [ "$KIT_HAS_WORKER" = 1 ]; then
+    say "Done. Worker '$NAME' is part of the cluster; the doctor check $DOCTOR."
+    say "Files: $ROOT   Log: $LOG_DIR/worker.log"
+  else
+    say "Done. Machine '$NAME' is enrolled as a client; the doctor check $DOCTOR."
+    say "Files: $ROOT   Log: $INSTALL_LOG_ACTIVE"
+  fi
+else
+  say ""
+  say "Skipping doctor check (worker-only kit; roles do not include 'client')."
+  say "Done. Worker '$NAME' is part of the cluster (doctor skipped: worker-only kit)."
+  say "Files: $ROOT   Log: $LOG_DIR/worker.log"
+fi
 say "To remove it, run uninstall from the stick."

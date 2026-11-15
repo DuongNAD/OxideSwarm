@@ -59,7 +59,7 @@ What happens on this first (cold) run:
 1. `scan_workspace_source` (`crates/cli/src/blobs.rs`) walks the current directory (`.` by default, or `--sync <DIR>`), applies `.gitignore`, `.ignore`, and `.git/info/exclude` inside the root, skips `.git/` and ignored directories such as `target/`, and hashes regular files with BLAKE3.
 2. `upload_inputs` (`crates/cli/src/blobs.rs`) asks the master which file blobs are missing and uploads only the new blobs (up to 8 blobs and 16 requests in flight).
 3. `Engine::place` (`crates/master/src/scheduler.rs`) routes the task to a connected worker with `WORKSPACES` and `tool:cargo`, preferring the worker that last ran `oxideswarm-dev` (`TaskQueue` in `crates/master/src/queue.rs`), and allows at most one active task per workspace name at a time.
-4. `WorkspaceGuard::sync` (`crates/worker/src/workspace.rs`) writes new or changed files and removes any previously tracked files that were deleted locally in `<workspace_root>/oxideswarm-dev/tree`, while leaving untracked build outputs such as `target/` untouched.
+4. `WorkspaceGuard::sync` (`crates/worker/src/workspace.rs`) writes new or changed files, relative in-tree symbolic links, and empty directories, and removes any previously tracked entries that were deleted locally in `<workspace_root>/oxideswarm-dev/tree`, while leaving untracked build outputs such as `target/` untouched.
 5. `TaskRunner` (`crates/worker/src/runner.rs`) runs `cargo test -p rusty_grid_core --lib` in `<workspace_root>/oxideswarm-dev/tree` with `CARGO_TARGET_DIR=<workspace_root>/oxideswarm-dev/tree/target` and a default timeout of `1800` s (`--timeout-secs`).
 
 Expected output on the first (cold) run:
@@ -67,7 +67,6 @@ Expected output on the first (cold) run:
 - Standard error prints the blob upload summary and Cargo's compilation output:
 
 ```text
-Warning: --workspace skips ./ox-mode (symbolic links are not sent)
 Workspace 'oxideswarm-dev': <N> files (<SIZE>); sent <M> of <M> blobs (<SIZE>), 0 already on the master
 Stderr:
    Compiling ...
@@ -140,7 +139,7 @@ On the client machine (from the repository root). An MCP client keeps standard i
 }
 ```
 
-`uploaded_bytes` counts only the blobs that the master did not hold yet, so it is `0` when another workspace or an earlier `submit` already sent the same files. `skipped` counts the symbolic links left out of the scan. Output beyond the inline limit (`max_output_bytes`, default 16384) is cut in the middle and marked with `truncated`. On the warm second run with unchanged files, `"uploaded_bytes"` is `0` and neither `"stderr"` nor `"stdout"` contains `Compiling`. Response `id: 3` (`workspaces`) returns the master's affinity table as JSON, with `last_used_utc` in Unix seconds (`[{"name": "oxideswarm-dev", "worker": "<WORKER_UUID>", "last_used_utc": <UNIX_SECONDS>}]`).
+`uploaded_bytes` counts only the blobs that the master did not hold yet, so it is `0` when another workspace or an earlier `submit` already sent the same files. `skipped` counts any out-of-tree or chained symbolic links and special files left out of the scan. Output beyond the inline limit (`max_output_bytes`, default 16384) is cut in the middle and marked with `truncated`. On the warm second run with unchanged files, `"uploaded_bytes"` is `0` and neither `"stderr"` nor `"stdout"` contains `Compiling`. Response `id: 3` (`workspaces`) returns the master's affinity table as JSON, with `last_used_utc` in Unix seconds (`[{"name": "oxideswarm-dev", "worker": "<WORKER_UUID>", "last_used_utc": <UNIX_SECONDS>}]`).
 
 ## Verify
 

@@ -374,6 +374,10 @@ pub struct TaskEntry {
     pub submitter: SubmitterId,
     /// Compact metadata retained in RAM after the full `TaskResult` spills to `cold_results/`.
     pub cold_result: Option<ColdResultSummary>,
+    /// True when the task's input trees or workspace source tree require `oxideswarm-tree/2`
+    /// (`ProtocolCapabilities::TREE_V2`), recorded when `BlobStore::resolve_inputs_with_features`
+    /// decodes the manifest at task admission or store recovery.
+    pub requires_tree_v2: bool,
 }
 
 impl TaskEntry {
@@ -560,6 +564,24 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
         }
     }
     features
+}
+
+/// True when `task` references any tree manifest (`InputSource::Tree` or `WorkspaceSource::Tree`).
+///
+/// Direct `TaskQueue::submit` / `try_submit_slot` / `attach_store_and_replay` paths that have not
+/// yet inspected the manifest via `admit_blob_task` / `repin_recovered_blobs` default
+/// `requires_tree_v2` to `task_has_tree_input(task)` so uninspected tree tasks fail closed
+/// (requiring `TREE_V2` until the manifest is verified to be v1).
+fn task_has_tree_input(task: &Task) -> bool {
+    task.inputs
+        .iter()
+        .any(|i| matches!(i.source, rusty_grid_core::blob::InputSource::Tree { .. }))
+        || task.workspace.as_ref().is_some_and(|w| {
+            matches!(
+                w.source,
+                Some(rusty_grid_core::task::WorkspaceSource::Tree { .. })
+            )
+        })
 }
 
 pub use rusty_grid_core::task::WorkspaceAffinity;
@@ -2003,6 +2025,7 @@ impl TaskQueue {
                 };
 
                 let has_hold = adoptable_by.is_some() || fail_if_not_adopted;
+                let requires_tree_v2 = task_has_tree_input(&p.task);
                 let task_key = crate::speed::TaskKey::for_task(&p.task);
                 let entry = TaskEntry {
                     task: p.task,
@@ -2033,6 +2056,7 @@ impl TaskQueue {
                     error_message: p.error_message,
                     submitter: SubmitterId::Default,
                     cold_result: p.cold_result,
+                    requires_tree_v2,
                 };
 
                 let is_terminal = entry.state.is_terminal();
@@ -2201,9 +2225,11 @@ impl TaskQueue {
         };
 
         for (task_id, inputs) in active_inputs {
-            match blob_store.resolve_inputs(&inputs).await {
-                Ok(ids) => {
+            match blob_store.resolve_inputs_with_features(&inputs).await {
+                Ok((ids, needs_tree_v2)) => {
                     let missing = blob_store.pin_task(task_id, ids);
+                    self.set_requires_tree_v2(&task_id, needs_tree_v2 || !missing.is_empty())
+                        .await;
                     if !missing.is_empty() {
                         tracing::warn!(
                             task_id = %task_id,
@@ -2213,6 +2239,7 @@ impl TaskQueue {
                     }
                 }
                 Err(err) => {
+                    self.set_requires_tree_v2(&task_id, true).await;
                     tracing::warn!(
                         task_id = %task_id,
                         error = %err,
@@ -2730,6 +2757,7 @@ impl TaskQueue {
 
             let task = task_slot.take().expect("task_slot checked above");
             let task_id = task.id;
+            let requires_tree_v2 = task_has_tree_input(&task);
             let task_key = crate::speed::TaskKey::for_task(&task);
             inner.next_sequence += 1;
 
@@ -2762,6 +2790,7 @@ impl TaskQueue {
                 result: None,
                 cold_result: None,
                 error_message: None,
+                requires_tree_v2,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -2820,7 +2849,9 @@ impl TaskQueue {
     /// queued, running or finished is refused instead of replacing the entry (which would orphan
     /// its queue keys and run the work twice).
     pub async fn submit_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
-        self.submit_from(task, priority, SubmitterId::Default).await
+        let requires_tree_v2 = task_has_tree_input(&task);
+        self.submit_from_with_tree_v2(task, priority, SubmitterId::Default, requires_tree_v2)
+            .await
     }
 
     /// Submits a task with explicit scheduling `priority` attributed to `submitter` for multi-client
@@ -2830,6 +2861,32 @@ impl TaskQueue {
         task: Task,
         priority: u32,
         submitter: SubmitterId,
+    ) -> GridResult<TaskId> {
+        let requires_tree_v2 = task_has_tree_input(&task);
+        self.submit_from_with_tree_v2(task, priority, submitter, requires_tree_v2)
+            .await
+    }
+
+    /// Submits a task with explicit scheduling priority and whether its input/workspace tree
+    /// manifests require `ProtocolCapabilities::TREE_V2`.
+    pub async fn submit_with_priority_and_tree_v2(
+        &self,
+        task: Task,
+        priority: u32,
+        requires_tree_v2: bool,
+    ) -> GridResult<TaskId> {
+        self.submit_from_with_tree_v2(task, priority, SubmitterId::Default, requires_tree_v2)
+            .await
+    }
+
+    /// Submits a task with explicit `priority`, `submitter` fair-share attribution, and
+    /// pre-checked `requires_tree_v2` feature requirement.
+    pub async fn submit_from_with_tree_v2(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+        requires_tree_v2: bool,
     ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
         #[cfg(feature = "otel")]
@@ -2920,6 +2977,7 @@ impl TaskQueue {
                 result: None,
                 cold_result: None,
                 error_message: None,
+                requires_tree_v2,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -2995,6 +3053,15 @@ impl TaskQueue {
 
     // --- Scheduler Matchmaking & Queries ---
 
+    /// Records whether `task_id` requires `ProtocolCapabilities::TREE_V2` (used when store replay
+    /// resolves input manifests).
+    pub async fn set_requires_tree_v2(&self, task_id: &TaskId, requires_tree_v2: bool) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.tasks.get_mut(task_id) {
+            entry.requires_tree_v2 = requires_tree_v2;
+        }
+    }
+
     /// Returns a list of tasks currently in `Queued` state in priority-FIFO order.
     pub async fn get_schedulable_tasks(&self) -> Vec<Task> {
         let inner = self.inner.read().await;
@@ -3047,6 +3114,9 @@ impl TaskQueue {
                 continue;
             };
             let mut view = TaskView::of_with_key(&entry.task, entry.task_key);
+            if entry.requires_tree_v2 {
+                view.required_features.insert(ProtocolCapabilities::TREE_V2);
+            }
             view.avoid = entry.avoid_workers.clone();
             view.queued_for = now.saturating_duration_since(entry.queued_instant);
             views.push(view);
@@ -3112,6 +3182,9 @@ impl TaskQueue {
                     continue;
                 };
                 let mut view = TaskView::of_with_key(&entry.task, entry.task_key);
+                if entry.requires_tree_v2 {
+                    view.required_features.insert(ProtocolCapabilities::TREE_V2);
+                }
                 view.avoid = entry.avoid_workers.clone();
                 view.queued_for = now.saturating_duration_since(entry.queued_instant);
                 views.push(view);
@@ -7775,6 +7848,7 @@ mod tests {
                         result: None,
                         cold_result: None,
                         error_message: None,
+                        requires_tree_v2: false,
                     },
                 );
             }
@@ -8809,6 +8883,32 @@ mod tests {
         let tree_features = TaskView::of(&ws_tree_task).required_features;
         assert!(tree_features.contains(ProtocolCapabilities::WORKSPACES));
         assert!(tree_features.contains(ProtocolCapabilities::BLOB_TRANSFER));
+        assert!(!tree_features.contains(ProtocolCapabilities::TREE_V2));
+
+        // When `submit_with_priority_and_tree_v2(..., true)` records `requires_tree_v2` on the
+        // queue entry, `ready_views` adds `ProtocolCapabilities::TREE_V2` for that task only.
+        let v2_queue = TaskQueue::new();
+        let v1_task = ws_tree_task.clone();
+        let mut v2_task = ws_tree_task;
+        v2_task.id = TaskId::new();
+        v2_queue
+            .submit_with_priority_and_tree_v2(v1_task.clone(), 0, false)
+            .await
+            .unwrap();
+        v2_queue
+            .submit_with_priority_and_tree_v2(v2_task.clone(), 0, true)
+            .await
+            .unwrap();
+        let (views, _) = v2_queue.ready_views(None, 10).await;
+        assert_eq!(views.len(), 2);
+        let v1_view = views.iter().find(|v| v.task_id == v1_task.id).unwrap();
+        let v2_view = views.iter().find(|v| v.task_id == v2_task.id).unwrap();
+        assert!(!v1_view
+            .required_features
+            .contains(ProtocolCapabilities::TREE_V2));
+        assert!(v2_view
+            .required_features
+            .contains(ProtocolCapabilities::TREE_V2));
     }
 
     #[tokio::test]
@@ -9616,5 +9716,40 @@ mod tests {
             .find(|v| set_a.contains(&v.task_id) || v.task_id == a_high)
             .unwrap();
         assert_eq!(first_a.task_id, a_high);
+    }
+
+    #[tokio::test]
+    async fn ready_views_fair_propagates_requires_tree_v2() {
+        let q = TaskQueue::new();
+        let sub_a = SubmitterId::Client(Uuid::new_v4());
+        let sub_b = SubmitterId::Client(Uuid::new_v4());
+
+        let id_v1 = q
+            .submit_from_with_tree_v2(echo_task("v1-fair"), 0, sub_a, false)
+            .await
+            .unwrap();
+        let id_v2 = q
+            .submit_from_with_tree_v2(echo_task("v2-fair"), 0, sub_b, true)
+            .await
+            .unwrap();
+
+        let mut cursor = crate::fair_share::FairWalkCursor::default();
+        let views = q.ready_views_fair(&mut cursor, 10).await;
+        assert_eq!(views.len(), 2);
+
+        let v1_view = views.iter().find(|v| v.task_id == id_v1).unwrap();
+        let v2_view = views.iter().find(|v| v.task_id == id_v2).unwrap();
+        assert!(
+            !v1_view
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "v1 fair view must not require TREE_V2"
+        );
+        assert!(
+            v2_view
+                .required_features
+                .contains(ProtocolCapabilities::TREE_V2),
+            "v2 fair view must propagate TREE_V2"
+        );
     }
 }

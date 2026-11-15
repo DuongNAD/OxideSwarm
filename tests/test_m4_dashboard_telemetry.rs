@@ -23,6 +23,14 @@ use rusty_grid_master::web_ui::{
     create_web_ui_router, create_web_ui_router_with_auth, DashboardStatus, WorkerUiInfo,
 };
 
+fn http_client() -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+}
+
 /// 1. Verifies that WorkerUiInfo includes and correctly serializes/deserializes
 ///    interconnect_type, is_relayed, and rtt_ms.
 #[test]
@@ -245,10 +253,7 @@ async fn test_m4_api_status_endpoint_returns_telemetry() {
             .await;
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     let base_url = format!("http://{}", bound_addr);
 
@@ -335,10 +340,7 @@ async fn test_m4_dashboard_html_visual_elements() {
             .await;
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
+    let client = http_client();
 
     let resp = client
         .get(format!("http://{}/", bound_addr))
