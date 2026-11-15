@@ -66,6 +66,7 @@ before adding or changing a document.
 | [design/0068-task-vram-accounting.md](design/0068-task-vram-accounting.md) | Implemented: optional `TaskRequirements::vram_mb`, CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, protocol version 9, store format 3, and scheduler VRAM accounting (`FEAT-9a`, decision `Q56`) | Contributors |
 | [design/0069-bounded-quic-data-lane.md](design/0069-bounded-quic-data-lane.md) | Implemented: cap 2-lane QUIC worker session `pending_data` backlog at `256` messages and `64 MiB` and enforce a `60 s` data-lane write timeout (`BUG-19`) | Contributors |
 | [design/0071-remove-dashboard-chat.md](design/0071-remove-dashboard-chat.md) | Implemented: remove `POST /api/chat`, `run_agy` child-process execution on the master host, and the dashboard chat UI (`SEC-14`, decision D9) | Contributors |
+| [design/0075-non-blocking-dispatch.md](design/0075-non-blocking-dispatch.md) | Implemented: non-blocking `try_reserve` scheduler dispatch with bounded per-assignment waiter timeout (`DISPATCH_RESERVE_TIMEOUT = 5 s`) and per-worker waiter cap (`BUG-20`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
