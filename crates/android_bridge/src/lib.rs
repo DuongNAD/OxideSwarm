@@ -54,6 +54,7 @@ impl MobileTelemetry {
 /// Global state representing the in-process worker instance.
 struct WorkerState {
     running: AtomicBool,
+    stopping: AtomicBool,
     p2p_minimal_preset: AtomicBool,
     worker_id: Mutex<Option<Uuid>>,
     p2p_ticket: Mutex<Option<String>>,
@@ -75,6 +76,7 @@ impl WorkerState {
     fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             p2p_minimal_preset: AtomicBool::new(false),
             worker_id: Mutex::new(None),
             p2p_ticket: Mutex::new(None),
@@ -88,6 +90,10 @@ impl WorkerState {
             thread_handle: Mutex::new(None),
         }
     }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 static WORKER_STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
@@ -107,7 +113,8 @@ fn get_worker_state() -> Arc<WorkerState> {
 /// one (`/data/local/tmp`) is not writable for an app. An empty string clears the setting.
 pub fn set_sandbox_dir_impl(dir: String) -> bool {
     let dir = dir.trim();
-    *get_worker_state().sandbox_dir.lock().unwrap() = (!dir.is_empty()).then(|| PathBuf::from(dir));
+    *lock_unpoisoned(&get_worker_state().sandbox_dir) =
+        (!dir.is_empty()).then(|| PathBuf::from(dir));
     true
 }
 
@@ -127,7 +134,7 @@ pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
     let state = get_worker_state();
     let trimmed = secret_text.trim();
     if trimmed.is_empty() {
-        *state.cluster_secret.lock().unwrap() = None;
+        *lock_unpoisoned(&state.cluster_secret) = None;
         return true;
     }
 
@@ -139,14 +146,14 @@ pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
                 Ok(s) => s,
                 Err(e) => {
                     error!(error = %e, "Invalid cluster secret: neither valid hex nor loadable file");
-                    *state.status.lock().unwrap() = format!("ERROR: Invalid cluster secret: {e}");
+                    *lock_unpoisoned(&state.status) = format!("ERROR: Invalid cluster secret: {e}");
                     return false;
                 }
             }
         }
     };
 
-    *state.cluster_secret.lock().unwrap() = Some(secret);
+    *lock_unpoisoned(&state.cluster_secret) = Some(secret);
     true
 }
 
@@ -171,9 +178,11 @@ fn check_sandbox_usable(sandbox: &SandboxConfig) -> Result<(), SandboxError> {
 /// Core implementation for starting the native worker client in a background Tokio runtime.
 /// Accepts an optional `p2p_ticket` for connecting across WAN/CGNAT via Iroh QUIC/DERP relays.
 ///
-/// Returns `false`, with the reason in the status (`ERROR: ...`, see [`get_worker_status_impl`]),
-/// when the worker cannot start at all: no writable sandbox directory, or the thread cannot be
-/// spawned. A failure after that point (an invalid P2P ticket) is reported through the status.
+/// Returns `false`, with the reason in the status (`ERROR: ...` or `STOPPING`, see
+/// [`get_worker_status_impl`]), when the worker cannot start at all: a previous worker is still
+/// draining after [`stop_worker_impl`], no writable sandbox directory is configured, or the thread
+/// cannot be spawned. A failure after that point (an invalid P2P ticket) is reported through the
+/// status.
 pub fn start_worker_impl(
     master_addr: String,
     p2p_ticket: Option<String>,
@@ -184,9 +193,33 @@ pub fn start_worker_impl(
     heartbeat_interval_secs: i64,
 ) -> bool {
     let state = get_worker_state();
-    if state.running.load(Ordering::SeqCst) {
+    // Claim `running` atomically up front so two concurrent start calls start at most one worker;
+    // every early-return error path below releases it (`running = false`).
+    if state
+        .running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         info!("Worker is already running in-process");
         return true;
+    }
+
+    // If a previous `stop_worker_impl` call is still draining its worker thread, wait briefly
+    // (up to 30 ms) for an already-idle runtime to finish joining; if the old worker is still
+    // draining tasks after that window, refuse the start immediately with status `STOPPING`
+    // rather than blocking the calling UI thread on `join()` or running two workers at once.
+    if state.stopping.load(Ordering::SeqCst) {
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(2));
+            if !state.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        if state.stopping.load(Ordering::SeqCst) {
+            *lock_unpoisoned(&state.status) = "STOPPING".to_string();
+            state.running.store(false, Ordering::SeqCst);
+            return false;
+        }
     }
 
     let mut config = WorkerConfig::new(&master_addr);
@@ -205,11 +238,15 @@ pub fn start_worker_impl(
     if ram_mb > 0 {
         config = config.with_ram_mb(ram_mb as u64);
     }
-    config = config.with_simulate_gpu(simulate_gpu);
-    if let Some(dir) = state.sandbox_dir.lock().unwrap().clone() {
+    config = config
+        .with_simulate_gpu(simulate_gpu)
+        .with_no_gpu(!simulate_gpu)
+        .with_no_blender(true)
+        .with_no_cuda(true);
+    if let Some(dir) = lock_unpoisoned(&state.sandbox_dir).clone() {
         config = config.with_sandbox_base_dir(dir);
     }
-    if let Some(sec) = state.cluster_secret.lock().unwrap().clone() {
+    if let Some(sec) = lock_unpoisoned(&state.cluster_secret).clone() {
         config = config.with_cluster_secret(sec);
     }
     // Battery / thermal readings pushed by the Android app (`update_telemetry_*`) flow into the
@@ -228,7 +265,8 @@ pub fn start_worker_impl(
     };
     if let Err(e) = check_sandbox_usable(&sandbox) {
         error!(error = %e, "Android worker cannot start: task sandboxes cannot be created");
-        *state.status.lock().unwrap() = format!("ERROR: {e}");
+        *lock_unpoisoned(&state.status) = format!("ERROR: {e}");
+        state.running.store(false, Ordering::SeqCst);
         return false;
     }
 
@@ -236,16 +274,18 @@ pub fn start_worker_impl(
     let worker_id = config.worker_id.unwrap_or_else(Uuid::new_v4);
     config = config.with_worker_id(worker_id);
 
-    *state.worker_id.lock().unwrap() = Some(worker_id);
-    *state.p2p_ticket.lock().unwrap() = p2p_ticket;
-    *state.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
-    *state.status.lock().unwrap() = "STARTING".to_string();
-    state.running.store(true, Ordering::SeqCst);
+    *lock_unpoisoned(&state.worker_id) = Some(worker_id);
+    *lock_unpoisoned(&state.p2p_ticket) = p2p_ticket;
+    *lock_unpoisoned(&state.shutdown_tx) = Some(shutdown_tx);
+    *lock_unpoisoned(&state.status) = "STARTING".to_string();
 
     let state_clone = Arc::clone(&state);
     let handle = std::thread::Builder::new()
         .name("OxideWorker-Tokio".to_string())
         .spawn(move || {
+            if *shutdown_rx.borrow() {
+                return;
+            }
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -253,37 +293,62 @@ pub fn start_worker_impl(
                 Ok(rt) => rt,
                 Err(e) => {
                     error!("Failed to initialize Tokio runtime for Android worker: {}", e);
-                    state_clone.running.store(false, Ordering::SeqCst);
-                    *state_clone.status.lock().unwrap() = format!("ERROR: {}", e);
+                    if !*shutdown_rx.borrow() {
+                        *lock_unpoisoned(&state_clone.status) = format!("ERROR: {}", e);
+                        state_clone.running.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
 
             rt.block_on(async {
-                *state_clone.status.lock().unwrap() = "RUNNING".to_string();
-                let mut client = WorkerClient::new(config);
-                info!(worker_id = %worker_id, "In-process Android worker starting run loop");
-                let outcome = client.run(shutdown_rx).await;
-                *state_clone.status.lock().unwrap() = match outcome {
-                    Ok(()) => "STOPPED".to_string(),
-                    Err(e) => {
-                        error!(worker_id = %worker_id, error = %e, "Worker supervisor exited with error");
-                        format!("ERROR: {e}")
-                    }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                *lock_unpoisoned(&state_clone.status) = "RUNNING".to_string();
+                let mut init_shutdown_rx = shutdown_rx.clone();
+                let client_opt = tokio::select! {
+                    biased;
+                    _ = init_shutdown_rx.changed() => None,
+                    res = tokio::task::spawn_blocking(move || WorkerClient::new(config)) => res.ok(),
                 };
-                state_clone.running.store(false, Ordering::SeqCst);
+                let Some(mut client) = client_opt else {
+                    if !*shutdown_rx.borrow() {
+                        *lock_unpoisoned(&state_clone.status) = "STOPPED".to_string();
+                        state_clone.running.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                };
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                info!(worker_id = %worker_id, "In-process Android worker starting run loop");
+                let stop_check_rx = shutdown_rx.clone();
+                let outcome = client.run(shutdown_rx).await;
+                if !*stop_check_rx.borrow() {
+                    *lock_unpoisoned(&state_clone.status) = match outcome {
+                        Ok(()) => "STOPPED".to_string(),
+                        Err(e) => {
+                            error!(worker_id = %worker_id, error = %e, "Worker supervisor exited with error");
+                            format!("ERROR: {e}")
+                        }
+                    };
+                    state_clone.running.store(false, Ordering::SeqCst);
+                }
             });
+            rt.shutdown_background();
         });
 
     match handle {
         Ok(h) => {
-            *state.thread_handle.lock().unwrap() = Some(h);
+            *lock_unpoisoned(&state.thread_handle) = Some(h);
             true
         }
         Err(e) => {
             error!("Failed to spawn native worker thread: {}", e);
+            *lock_unpoisoned(&state.shutdown_tx) = None;
             state.running.store(false, Ordering::SeqCst);
-            *state.status.lock().unwrap() = format!("SPAWN_ERROR: {}", e);
+            *lock_unpoisoned(&state.status) = format!("SPAWN_ERROR: {}", e);
             false
         }
     }
@@ -337,21 +402,43 @@ pub fn start_worker_with_secret_impl(
     )
 }
 
-/// Core implementation for stopping the native worker client gracefully.
+/// Core implementation for stopping the native worker client without blocking the calling thread.
+///
+/// Signals the worker's shutdown channel, marks the bridge as stopping (`running = false`,
+/// `stopping = true`, status `STOPPING`), and spawns a detached thread to `join()` the worker
+/// thread and set the final status (`STOPPED`) once the worker finishes draining.
 pub fn stop_worker_impl() -> bool {
     let state = get_worker_state();
-    if !state.running.load(Ordering::SeqCst) {
+    let was_running = state
+        .running
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    let handle_opt = lock_unpoisoned(&state.thread_handle).take();
+    if !was_running && handle_opt.is_none() {
         return true;
     }
 
-    if let Some(tx) = state.shutdown_tx.lock().unwrap().take() {
-        let _ = tx.send(true);
-    }
-    state.running.store(false, Ordering::SeqCst);
-    *state.status.lock().unwrap() = "STOPPED".to_string();
+    if let Some(h) = handle_opt {
+        state.stopping.store(true, Ordering::SeqCst);
+        *lock_unpoisoned(&state.status) = "STOPPING".to_string();
 
-    if let Some(h) = state.thread_handle.lock().unwrap().take() {
-        let _ = h.join();
+        if let Some(tx) = lock_unpoisoned(&state.shutdown_tx).take() {
+            let _ = tx.send(true);
+        }
+
+        let state_clone = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _ = h.join();
+            *lock_unpoisoned(&state_clone.status) = "STOPPED".to_string();
+            state_clone.stopping.store(false, Ordering::SeqCst);
+        });
+    } else {
+        if let Some(tx) = lock_unpoisoned(&state.shutdown_tx).take() {
+            let _ = tx.send(true);
+        }
+        if !state.stopping.load(Ordering::SeqCst) {
+            *lock_unpoisoned(&state.status) = "STOPPED".to_string();
+        }
     }
     true
 }
@@ -365,16 +452,13 @@ pub fn is_running_impl() -> bool {
 /// Core implementation for querying detailed worker status JSON.
 pub fn get_worker_status_impl() -> String {
     let state = get_worker_state();
-    let status = state.status.lock().unwrap().clone();
-    let worker_id_str = state
-        .worker_id
-        .lock()
-        .unwrap()
+    let status = lock_unpoisoned(&state.status).clone();
+    let worker_id_str = lock_unpoisoned(&state.worker_id)
         .map(|u| u.to_string())
         .unwrap_or_default();
     let is_running = state.running.load(Ordering::SeqCst);
-    let p2p_ticket = state.p2p_ticket.lock().unwrap().clone();
-    let telemetry = state.telemetry.lock().unwrap().clone();
+    let p2p_ticket = lock_unpoisoned(&state.p2p_ticket).clone();
+    let telemetry = lock_unpoisoned(&state.telemetry).clone();
 
     serde_json::json!({
         "status": status,
@@ -419,7 +503,7 @@ pub fn update_telemetry_detailed_impl(
         }
     });
 
-    let mut telem = state.telemetry.lock().unwrap();
+    let mut telem = lock_unpoisoned(&state.telemetry);
     telem.battery_pct = pct;
     telem.battery_temperature = temp;
     telem.is_charging = Some(is_charging);
@@ -458,9 +542,9 @@ pub fn trigger_fast_evacuation_impl(reason: &str) -> bool {
         reason.trim().to_string()
     };
     info!(reason = %r, "Triggering fast pre-sleep task evacuation (<50ms)");
-    *state.evacuation_reason.lock().unwrap() = Some(r);
+    *lock_unpoisoned(&state.evacuation_reason) = Some(r);
     rusty_grid_worker::client::set_evacuation_reason_hook(get_evacuation_reason_impl);
-    if let Some(tx) = state.shutdown_tx.lock().unwrap().as_ref() {
+    if let Some(tx) = lock_unpoisoned(&state.shutdown_tx).as_ref() {
         let _ = tx.send(true);
     }
     true
@@ -468,13 +552,15 @@ pub fn trigger_fast_evacuation_impl(reason: &str) -> bool {
 
 /// Retrieves the active evacuation reason, if any.
 pub fn get_evacuation_reason_impl() -> Option<String> {
-    get_worker_state().evacuation_reason.lock().unwrap().clone()
+    let state = get_worker_state();
+    let reason = lock_unpoisoned(&state.evacuation_reason).clone();
+    reason
 }
 
 /// Retrieves the current cached mobile telemetry.
 pub fn get_telemetry_impl() -> MobileTelemetry {
     let state = get_worker_state();
-    let telem = state.telemetry.lock().unwrap().clone();
+    let telem = lock_unpoisoned(&state.telemetry).clone();
     telem
 }
 
@@ -808,23 +894,36 @@ mod tests {
 
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn wait_until_not_stopping() {
+        let ws = get_worker_state();
+        for _ in 0..200 {
+            if !ws.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn reset_test_state() {
         stop_worker_impl();
+        wait_until_not_stopping();
         set_p2p_minimal_preset_for_testing(false);
         let ws = get_worker_state();
-        *ws.telemetry.lock().unwrap() = MobileTelemetry::default();
+        *lock_unpoisoned(&ws.telemetry) = MobileTelemetry::default();
         ws.mobile.set(None);
-        *ws.worker_id.lock().unwrap() = None;
-        *ws.p2p_ticket.lock().unwrap() = None;
-        *ws.cluster_secret.lock().unwrap() = None;
-        *ws.sandbox_dir.lock().unwrap() = None;
-        *ws.status.lock().unwrap() = "STOPPED".to_string();
+        *lock_unpoisoned(&ws.worker_id) = None;
+        *lock_unpoisoned(&ws.p2p_ticket) = None;
+        *lock_unpoisoned(&ws.cluster_secret) = None;
+        *lock_unpoisoned(&ws.sandbox_dir) = None;
+        *lock_unpoisoned(&ws.evacuation_reason) = None;
+        *lock_unpoisoned(&ws.status) = "STOPPED".to_string();
         ws.running.store(false, Ordering::SeqCst);
+        ws.stopping.store(false, Ordering::SeqCst);
     }
 
     #[test]
     fn test_jni_telemetry_reaches_the_handle_shared_with_the_worker() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         let state = get_worker_state();
         assert!(
@@ -870,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_worker_start_refuses_an_unwritable_sandbox_dir_and_says_why() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         // What an app sees when nobody handed it a writable directory: the base cannot be created.
         let dir = scratch_dir("blocked");
@@ -903,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_worker_start_uses_the_sandbox_dir_the_app_handed_over() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         let dir = scratch_dir("handed-over");
         let sandboxes = dir.join("cache").join("sandboxes");
@@ -929,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_worker_that_fails_after_starting_reports_the_reason_in_its_status() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         set_p2p_minimal_preset_for_testing(true);
         let dir = scratch_dir("bad-ticket");
@@ -965,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_initial_worker_state() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         let state = get_worker_state();
         let status = get_worker_status_impl();
@@ -978,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_worker_lifecycle_stop() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         assert!(stop_worker_impl());
         assert!(!is_running_impl());
@@ -987,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_injection_and_retrieval() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         assert!(update_telemetry_impl(85, true, false));
         let telem = get_telemetry_impl();
@@ -1011,7 +1110,7 @@ mod tests {
 
     #[test]
     fn test_detailed_telemetry() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         assert!(update_telemetry_detailed_impl(
             80,
@@ -1044,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_discover_master_impl() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
         let res = discover_master_impl(50);
         assert!(res.contains("found"));
@@ -1053,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_bridge_cluster_secret_handling() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
 
         // 1. Valid hex secret (64 hex characters / 32 bytes)
@@ -1061,7 +1160,7 @@ mod tests {
         assert!(set_cluster_secret_impl(valid_hex));
         {
             let state = get_worker_state();
-            let sec = state.cluster_secret.lock().unwrap();
+            let sec = lock_unpoisoned(&state.cluster_secret);
             assert!(sec.is_some());
             assert_eq!(sec.as_ref().unwrap().to_hex(), valid_hex);
         }
@@ -1070,7 +1169,7 @@ mod tests {
         assert!(set_cluster_secret_impl("   "));
         {
             let state = get_worker_state();
-            assert!(state.cluster_secret.lock().unwrap().is_none());
+            assert!(lock_unpoisoned(&state.cluster_secret).is_none());
         }
 
         // 3. Valid secret file
@@ -1080,7 +1179,7 @@ mod tests {
         assert!(set_cluster_secret_impl(&secret_path.display().to_string()));
         {
             let state = get_worker_state();
-            let sec = state.cluster_secret.lock().unwrap();
+            let sec = lock_unpoisoned(&state.cluster_secret);
             assert!(sec.is_some());
             assert_eq!(sec.as_ref().unwrap().to_hex(), valid_hex);
         }
@@ -1092,6 +1191,222 @@ mod tests {
             status.starts_with("ERROR: Invalid cluster secret:"),
             "{status}"
         );
+
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stop_worker_returns_in_under_100ms_while_worker_drains() {
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
+        reset_test_state();
+        let dir = scratch_dir("stop-nonblocking");
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
+
+        let state = get_worker_state();
+        let (drain_release_tx, drain_release_rx) = std::sync::mpsc::channel::<()>();
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        *lock_unpoisoned(&state.shutdown_tx) = Some(shutdown_tx);
+        *lock_unpoisoned(&state.status) = "RUNNING".to_string();
+        state.running.store(true, Ordering::SeqCst);
+
+        // Simulate a worker thread that takes 500 ms to drain after receiving the shutdown signal
+        // (matching `TASK_DRAIN_TIMEOUT` task cleanup on a running `WorkerClient`).
+        let handle = std::thread::Builder::new()
+            .name("OxideWorker-DrainSim".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let _ = worker_started_tx.send(());
+                    let _ = shutdown_rx.changed().await;
+                    let _ = drain_release_rx.recv_timeout(Duration::from_millis(500));
+                });
+            })
+            .unwrap();
+        *lock_unpoisoned(&state.thread_handle) = Some(handle);
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        assert!(stop_worker_impl());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "stop_worker_impl took {elapsed:?} (>= 100 ms); must not block the calling thread"
+        );
+        assert!(!is_running_impl());
+        assert_eq!(status_text(), "STOPPING");
+
+        // Starting while the previous worker is still draining is refused without blocking.
+        let start_while_stopping = std::time::Instant::now();
+        assert!(
+            !start_worker_impl(
+                "127.0.0.1:59993".into(),
+                None,
+                "BlockedWhileStopping".into(),
+                2,
+                1024,
+                false,
+                5,
+            ),
+            "start_worker_impl must refuse to start while the previous worker is still stopping"
+        );
+        assert!(
+            start_while_stopping.elapsed() < Duration::from_millis(100),
+            "start refusal while stopping must not block"
+        );
+        assert_eq!(status_text(), "STOPPING");
+
+        // Release the simulated drain and verify the join thread sets final status `STOPPED`.
+        let _ = drain_release_tx.send(());
+        wait_until_not_stopping();
+        assert_eq!(status_text(), "STOPPED");
+
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_concurrent_start_calls_start_only_one_worker() {
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
+        reset_test_state();
+        let dir = scratch_dir("concurrent-start");
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = Arc::clone(&accepted);
+        let accept_stop = Arc::new(AtomicBool::new(false));
+        let accept_stop_clone = Arc::clone(&accept_stop);
+
+        listener.set_nonblocking(true).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            let mut held_streams = Vec::new();
+            while !accept_stop_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted_clone.fetch_add(1, Ordering::SeqCst);
+                        // Hold the connection open during the window so the single worker does not
+                        // immediately reconnect and increment the connection count a second time.
+                        held_streams.push(stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut join_handles = Vec::new();
+        for idx in 0..2 {
+            let b = Arc::clone(&barrier);
+            let master_addr = addr.clone();
+            join_handles.push(std::thread::spawn(move || {
+                b.wait();
+                start_worker_impl(
+                    master_addr,
+                    None,
+                    format!("ConcurrentWorker-{idx}"),
+                    2,
+                    1024,
+                    false,
+                    5,
+                )
+            }));
+        }
+
+        for h in join_handles {
+            assert!(h.join().unwrap());
+        }
+        assert!(is_running_impl());
+
+        // Wait for the started worker to connect to our listener.
+        for _ in 0..100 {
+            if accepted.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Give any hypothetical second worker thread time to connect as well.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "Two concurrent start_worker_impl calls must spawn exactly one worker"
+        );
+
+        accept_stop.store(true, Ordering::SeqCst);
+        let _ = accept_thread.join();
+        assert!(stop_worker_impl());
+        wait_until_not_stopping();
+        assert_eq!(status_text(), "STOPPED");
+
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stop_then_start_again_works() {
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
+        reset_test_state();
+        let dir = scratch_dir("stop-then-start");
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
+
+        assert!(start_worker_impl(
+            "127.0.0.1:59994".into(),
+            None,
+            "FirstRun".into(),
+            2,
+            1024,
+            false,
+            5,
+        ));
+        assert!(is_running_impl());
+        let first_id: serde_json::Value = serde_json::from_str(&get_worker_status_impl()).unwrap();
+        let first_worker_id = first_id["worker_id"].as_str().unwrap().to_string();
+        assert!(!first_worker_id.is_empty());
+
+        let stop_start = std::time::Instant::now();
+        assert!(stop_worker_impl());
+        assert!(
+            stop_start.elapsed() < Duration::from_millis(100),
+            "stop_worker_impl must return in under 100 ms"
+        );
+        assert!(!is_running_impl());
+
+        assert!(start_worker_impl(
+            "127.0.0.1:59994".into(),
+            None,
+            "SecondRun".into(),
+            2,
+            1024,
+            false,
+            5,
+        ));
+        assert!(is_running_impl());
+        let second_id: serde_json::Value = serde_json::from_str(&get_worker_status_impl()).unwrap();
+        let second_worker_id = second_id["worker_id"].as_str().unwrap().to_string();
+        assert!(!second_worker_id.is_empty());
+        assert_ne!(first_worker_id, second_worker_id);
+
+        assert!(stop_worker_impl());
+        wait_until_not_stopping();
+        assert_eq!(status_text(), "STOPPED");
 
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);
