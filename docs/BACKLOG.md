@@ -2454,11 +2454,12 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   1. The Index row of FEAT-6 is titled "Master failover" and set to Implemented. What was built is
      the refusal of `ClaimMasterRole` (design 0026). The item's own "Done when" says no document
      may say failover is finished. Master high availability is SCALE-4.
-  2. The SCALE-2 note quotes the 500-worker gain, but its 1000-worker burst rate fell from 419.7 to
-     414.4 tasks/s and the burst assign p50 rose from 17.4 to 18.9 ms
-     (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
-     `2026-11-15-scale2-windows-amd64-1000w.json`). Its "Done when" asks for an improvement by the
-     bound of Q8.
+  2. The SCALE-2 note quotes the 1000-worker result without its baseline. At 500 workers, the
+     target of Q8, the burst rate rose from 375.2 to 409.1 tasks/s. At 1000 workers, the stretch
+     run of Q8, it fell from 419.7 to 414.4 tasks/s, and the burst assign p50 rose from 17.4 to
+     18.9 ms (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
+     `2026-11-15-scale2-windows-amd64-1000w.json`). The status Implemented stands on the
+     500-worker target.
   3. Six Index rows mark merged pull requests "(open)": TEST-21 (198), TEST-22 (200), DOC-8 (196),
      LOG-1 (194), FEAT-3d (183) and FEAT-4 (186).
   4. `docs/ROADMAP.md`, "Where the project stands", describes `3ce2a65` of 2026-11-09. Its table
@@ -2484,8 +2485,8 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
       2026-11-01 (AEAD "on a branch", restart "Design only") without a date on the table itself.
 - **Do:** Correct each statement in its own document. Rename the FEAT-6 row to "Refuse the
   master-role claim" and keep it Implemented, or set it to Design only; name SCALE-4 for real
-  failover. Set SCALE-2 to Partial until the owner sets the bound of Q8 and a 1000-worker run meets
-  it. Date the snapshot table. Pick one status vocabulary for design records and state it in
+  failover. Add the 1000-worker baseline to the SCALE-2 note, so the stretch run reads as no
+  gain. Date the snapshot table. Pick one status vocabulary for design records and state it in
   `docs/README.md`.
 - **Done when:** Each of the eleven points is corrected or marked as decided by the owner, and a
   search for "macOS only for now", "C1-C6" and "(open)" next to a merged pull request finds
