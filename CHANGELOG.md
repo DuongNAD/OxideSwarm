@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Scheduler and queue scale-out (`SCALE-2`, [design 0050](docs/design/0050-scale-out-architecture.md)): `WorkerIndex` / `RegisteredIndex` bitset matching across placement attributes, protocol capabilities (including `WORKSPACES` and `TREE_V2`), free slots, and mobile thermal/battery buckets (`crates/master/src/worker_index.rs`); `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`master --max-batch-size`, `RUSTY_GRID_MAX_BATCH_SIZE`, `[master].max_batch_size`), adaptive micro-batch debounce, and up to 16-batch drain (`crates/master/src/{scheduler,server}.rs`, `crates/cli/src/{cli_app,config}.rs`); weighted round-robin per-submitter `FairShareQueues` tagged per client connection (`crates/master/src/fair_share.rs`, `queue.rs`); `receiver_count() > 0` fast-path guards on dashboard broadcasts; single-flight batched `ColdResultStore` spill of terminal `TaskResult` payloads under `<state_dir>/cold_results/<xx>/<task_id>.bin` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`, replay file reuse) with RAM-only `GetTaskStatus` (`crates/master/src/{cold_results,queue,store}.rs`); and post-`SCALE-2` 3-run `500w` / `1000w` benchmark records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`).
 
+### Fixed
+- Bounded 2-lane QUIC worker session data-lane backlog in `router_task` at `MAX_PENDING_DATA_MESSAGES = 256` and `MAX_PENDING_DATA_BYTES = 64 MiB` so `outbound_tx` backpressures senders when a worker stops draining its data stream, and added a `DATA_LANE_WRITE_TIMEOUT = 60 s` per-write timeout on `data_writer_task` that disconnects stalled sessions and fails over their tasks (`BUG-19`, [design 0069](docs/design/0069-bounded-quic-data-lane.md), `crates/master/src/{session,server}.rs`).
+
 ## [0.2.0] - 2026-11-15
 
 A minor feature release introducing protocol version 8, invite-based machine enrollment (`ENROLL-1b`),
