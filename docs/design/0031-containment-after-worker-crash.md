@@ -1,7 +1,7 @@
 # 0031: Containment after a worker crash
 
-Status: Accepted
-Created: 2026-11-08    Updated: 2026-11-08
+Status: Implemented
+Created: 2026-11-08    Updated: 2026-11-15
 
 ## Summary
 
@@ -135,3 +135,4 @@ In `run_chaos_test.sh`:
 - 2026-11-08: Initial draft written for `FEAT-2` (Phase B of `docs/ROADMAP.md`).
 - 2026-11-08: Addressed review `116-fix`: dropped `PR_SET_CHILD_SUBREAPER` and `PR_SET_PDEATHSIG` from the task leader, moved Linux cgroup v2 leaf assignment into `pre_exec` before `execve`, held `SPAWN_LOCK` across `pipe` + `fcntl(FD_CLOEXEC)` and `cmd.spawn()` on macOS, chose `KERN_PROCARGS2` on macOS and stated the `env -i` + `setsid` limitation in G3 and Security, documented Android's 32 phantom-process limit in Compatibility, and added the direct `waitpid(-1)` (`ECHILD`) and normal-exit `setsid` cleanup tests to the Test plan.
 - 2026-11-08: Addressed review `123-fix`: switched the environment sweep needle and cgroup v2 leaf name from `TaskId` to a per-attempt `RUSTY_GRID_RUN_TOKEN` UUID v4, documented the macOS `KERN_PROCARGS2` platform-binary limitation in G3, Security, and D3.2, gated `SYS_close_range` to Linux only (never Android), removed the 16384 fd cap in favor of `RLIMIT_NOFILE`, moved worker-side `ProcessTree` kills off runtime threads and outside the `LIVE` lock, added a lifeline dismissal byte on normal `ProcessTree` teardown, and consolidated all `FEAT-2` tests into `crates/worker/tests/test_sec5_hardened_runner.rs`.
+- 2026-11-15: Status set to Implemented: `FEAT-2` merged in pull request 123 and is Implemented in `docs/BACKLOG.md` (DOC-9).
