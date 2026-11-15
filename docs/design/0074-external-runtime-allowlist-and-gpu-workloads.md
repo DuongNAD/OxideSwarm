@@ -1,6 +1,6 @@
 # 0074: External read-only runtime allowlist and sandboxed GPU workload route
 
-Status: Implemented
+Status: Partial
 Created: 2026-11-16    Updated: 2026-11-16
 
 ## Summary
@@ -112,7 +112,11 @@ before any policy rule or Windows ACL is applied:
 - **macOS (`Apple M5`, Metal, 2026-11-15)**: Under `--isolation fs` and `--isolation fs+net`,
   in-process `wgpu`, out-of-process `gemm_bench`, and native Swift Metal (`MTLCompilerService`)
   succeeded (`rc=0`) while canary/account-home reads were denied; a `~/.pyenv` Python runtime failed
-  with `rc=71` before allowlisting and outside-home `/opt/homebrew` Python succeeded (`rc=0`).
+  with `rc=71` before allowlisting and outside-home `/opt/homebrew` Python succeeded (`rc=0`); in
+  Round 1 verification on `Apple M5` (`--isolation fs --isolation-read-dir /Users/<USER>/.pyenv/versions/3.11.8 --gpu --vram-mb 8192`),
+  `pyenv` Python `3.11.8` exited `0` with writes inside the runtime dir and reads of `cluster.secret`
+  and `~/.ssh` denied (`PermissionError`), and Metal `wgpu` compute exited `0` (`VERIFIED_OK`)
+  while the control without `--isolation-read-dir` failed with exit code `71`.
 - **Windows 11 (`NVIDIA GeForce RTX 5060 Ti`, 2026-11-15/16)**:
   - Host baseline probe (`win_r20_gpu_probe.md`): `wgpu` Vulkan (`19/19` compute, `10/10`
     adversarial), `nvcuda.dll` PTX JIT, `nvidia-smi.exe`, `nvcc.exe`, and Blender 4.5.4 LTS Cycles
@@ -168,7 +172,7 @@ Workers without `--isolation-read-dir` retain identical default confinement beha
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| `R20` | Spike: a GPU inside the sandbox on each system (`design 0064` D3) | `docs/design/0074-external-runtime-allowlist-and-gpu-workloads.md`, `docs/design/0064-research-of-2026-11-13-and-route.md` | Recorded for macOS, Windows, and Linux (`--isolation off` vs `fs` / `fs+net` plus minimal rule where needed) | Partial (macOS and Windows recorded; Linux Planned) |
+| `R20` | Spike: a GPU inside the sandbox on each system (`design 0064` D3) | `docs/design/0074-external-runtime-allowlist-and-gpu-workloads.md`, `docs/design/0064-research-of-2026-11-13-and-route.md` | Recorded for macOS, Windows, and Linux (`--isolation off` vs `fs` / `fs+net` plus minimal rule where needed; macOS and Windows recorded, Linux Planned) | Partial |
 | `FEAT-3e` | External read-only runtime directory allowlist (`--isolation-read-dir`, `RUSTY_GRID_ISOLATION_READ_DIRS`, `[worker].isolation_read_dirs`) and GPU workload guide | `crates/worker/src/{isolation.rs, isolation/linux.rs, client.rs, lib.rs, client/tests.rs}`, `crates/worker/tests/test_feat3_os_isolation.rs`, `crates/cli/src/{config.rs, cli_app.rs}`, `tests/cli_isolation_e2e.rs`, `docs/guides/gpu-workloads.md`, `README.md`, `docs/README.md`, `CHANGELOG.md` | Unit, AppContainer/Seatbelt/Landlock integration, CLI E2E, and live Windows AppContainer CUDA loopback probes pass with home/secret reads and runtime writes denied | Implemented |
 
 ## Status log
@@ -176,5 +180,7 @@ Workers without `--isolation-read-dir` retain identical default confinement beha
 - 2026-11-16: Authored design `0074` (`FEAT-3e`), added `--isolation-read-dir` /
   `RUSTY_GRID_ISOLATION_READ_DIRS` / `[worker].isolation_read_dirs` across worker and CLI, added
   `docs/guides/gpu-workloads.md`, updated `README.md` / `docs/design/0033` / `docs/design/0064`,
-  and recorded live `NVIDIA GeForce RTX 5060 Ti` AppContainer CUDA pass (`Exit Code: 0`) under
-  `--isolation fs --isolation-read-dir` alongside control failure (`Exit Code: 1`) without it.
+  recorded live `NVIDIA GeForce RTX 5060 Ti` AppContainer CUDA pass (`Exit Code: 0`) under
+  `--isolation fs --isolation-read-dir` alongside control failure (`Exit Code: 1`) without it,
+  and recorded Apple M5 Seatbelt `--isolation-read-dir` live verification (`exit_code: 71` without
+  flag -> `exit_code: 0` `VERIFIED_OK` with flag).

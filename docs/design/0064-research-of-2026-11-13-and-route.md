@@ -189,7 +189,7 @@ Sizes are the backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| R20 | Spike: a GPU inside the sandbox on each system (D3) | S for each system | A machine of each system with a GPU | `benchmarks/` | The record holds, for each system, the result with isolation off and on, and the rule where one was found | Partial (macOS Metal and Windows AppContainer Vulkan/CUDA/OptiX recorded; Linux Planned) |
+| R20 | Spike: a GPU inside the sandbox on each system (D3) | S for each system | A machine of each system with a GPU | `benchmarks/` | The record holds, for each system, the result with isolation off and on, and the rule where one was found (macOS Metal and Windows AppContainer Vulkan/CUDA/OptiX recorded; Linux Planned) | Partial |
 | R21 | Spike: what Mesh-LLM already does (D3) | S | The owner's two machines | `benchmarks/`, this record | The table of D3 is in this record's status log | Planned |
 | SCHED-5 | A worker lowers its slots on battery, heat or memory pressure (D4) | M | A design record | `crates/worker/src/` | A worker on battery reports fewer slots and takes fewer tasks, and a test shows both | Planned |
 

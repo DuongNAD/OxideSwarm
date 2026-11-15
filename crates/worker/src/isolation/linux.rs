@@ -1225,7 +1225,7 @@ mod tests {
         let open = read_only_grants(&host, &[]);
         assert!(open.contains(&extra), "{open:?}");
 
-        let carved = read_only_grants(&host, &[secret.clone()]);
+        let carved = read_only_grants(&host, std::slice::from_ref(&secret));
         assert!(!carved.contains(&extra), "{carved:?}");
         assert!(carved.contains(&bin), "{carved:?}");
         assert!(!carved.contains(&secret), "{carved:?}");

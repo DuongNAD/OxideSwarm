@@ -732,7 +732,7 @@ async fn assert_extra_read_only_dir_confinement(level: IsolationLevel) {
     .await
     .expect("extra_read_only_dirs startup check must succeed");
 
-    let cfg = RunnerConfig::new(SandboxConfig::new(sandbox_base.clone()))
+    let cfg = RunnerConfig::new(SandboxConfig::new(sandbox_base))
         .with_isolation(level)
         .with_host_dirs(host)
         .with_protected_files(protected);
@@ -6239,9 +6239,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
                 program: r"C:\Windows\System32\cmd.exe".into(),
                 args: vec![
                     "/C".into(),
-                    format!(
-                        r#"findstr /L "in-home-runtime" "%T_IN_HOME_TXT%" >nul 2>&1 && echo READ_IN_HOME_OK & findstr /L "external-runtime" "%T_EXT_TXT%" >nul 2>&1 && echo READ_EXT_OK & (echo pwn > "%T_IN_HOME_DIR%\pwn.txt") >nul 2>&1 && echo LEAK_WRITE_IN_HOME || echo DENY_WRITE_IN_HOME & (echo pwn > "%T_EXT_DIR%\pwn.txt") >nul 2>&1 && echo LEAK_WRITE_EXT || echo DENY_WRITE_EXT & type "%T_SECRET%" >nul 2>&1 && echo LEAK_SECRET || echo DENY_SECRET & type "%T_NODE_KEY%" >nul 2>&1 && echo LEAK_NODE_KEY || echo DENY_NODE_KEY & type "%T_SSH_KEY%" >nul 2>&1 && echo LEAK_SSH_KEY || echo DENY_SSH_KEY"#
-                    ),
+                    r#"(findstr /L "in-home-runtime" "%T_IN_HOME_TXT%" >.sink 2>.err_ro1 && echo READ_IN_HOME_OK || type .err_ro1 1>&2) & (findstr /L "external-runtime" "%T_EXT_TXT%" >.sink 2>.err_ro2 && echo READ_EXT_OK || type .err_ro2 1>&2) & ((echo pwn>"%T_IN_HOME_DIR%\pwn.txt") >.sink 2>.err & if exist "%T_IN_HOME_DIR%\pwn.txt" (echo LEAK_WRITE_IN_HOME) else (echo DENY_WRITE_IN_HOME)) & ((echo pwn>"%T_EXT_DIR%\pwn.txt") >.sink 2>.err & if exist "%T_EXT_DIR%\pwn.txt" (echo LEAK_WRITE_EXT) else (echo DENY_WRITE_EXT)) & (type "%T_SECRET%" >.sink 2>.err && echo LEAK_SECRET || echo DENY_SECRET) & (type "%T_NODE_KEY%" >.sink 2>.err && echo LEAK_NODE_KEY || echo DENY_NODE_KEY) & (type "%T_SSH_KEY%" >.sink 2>.err && echo LEAK_SSH_KEY || echo DENY_SSH_KEY)"#.into(),
                 ],
                 env: HashMap::from([
                     (
@@ -6290,6 +6288,11 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             res.is_success(),
             "extra_read_only_dir probe task failed: {:?} / {}",
             res.error,
+            res.stderr_str()
+        );
+        assert!(
+            !res.stderr_str().contains("Access is denied"),
+            "unexpected redirection failure on stderr: {}",
             res.stderr_str()
         );
         let got = lines(&res);

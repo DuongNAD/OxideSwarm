@@ -545,7 +545,7 @@ fn policy_path_starts_with(child: &Path, parent: &Path) -> bool {
         if child.as_os_str().is_empty() || parent.as_os_str().is_empty() {
             return false;
         }
-        normalize_policy_path(child).starts_with(&normalize_policy_path(parent))
+        normalize_policy_path(child).starts_with(normalize_policy_path(parent))
     }
 }
 
@@ -1102,7 +1102,7 @@ mod macos {
     /// The home directory the account database names for this user (`getpwuid_r`), which can
     /// differ from `$HOME` when the worker was started with another one.
     #[cfg(target_os = "macos")]
-    fn account_home() -> Option<PathBuf> {
+    pub(super) fn account_home() -> Option<PathBuf> {
         use std::ffi::CStr;
         let mut buf = vec![0u8; 4096];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -1128,13 +1128,13 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn account_home() -> Option<PathBuf> {
+    pub(super) fn account_home() -> Option<PathBuf> {
         None
     }
 
     /// The per-user temporary directory (`DARWIN_USER_TEMP_DIR`, `/var/folders/../T`).
     #[cfg(target_os = "macos")]
-    fn user_temp_dir() -> Option<PathBuf> {
+    pub(super) fn user_temp_dir() -> Option<PathBuf> {
         let mut buf = vec![0 as libc::c_char; 1024];
         // SAFETY: the buffer is valid for `len` bytes.
         let n =
@@ -1150,14 +1150,14 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn user_temp_dir() -> Option<PathBuf> {
+    pub(super) fn user_temp_dir() -> Option<PathBuf> {
         None
     }
 
     /// The per-user cache directory (`DARWIN_USER_CACHE_DIR`, `/var/folders/../C`), next to the
     /// temp directory.
     #[cfg(target_os = "macos")]
-    fn user_cache_dir() -> Option<PathBuf> {
+    pub(super) fn user_cache_dir() -> Option<PathBuf> {
         let mut buf = vec![0 as libc::c_char; 1024];
         // SAFETY: the buffer is valid for `len` bytes.
         let n =
@@ -1173,7 +1173,7 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn user_cache_dir() -> Option<PathBuf> {
+    pub(super) fn user_cache_dir() -> Option<PathBuf> {
         None
     }
 

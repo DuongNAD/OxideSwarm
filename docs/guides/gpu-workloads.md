@@ -43,6 +43,8 @@ On a Windows GPU worker (NVIDIA CUDA/OptiX + an AppData Python 3.11 runtime, Pow
   --secret-file "$env:USERPROFILE\.oxideswarm\cluster.secret"
 ```
 
+On Windows machines where `%TEMP%` grants access to another local account or a leftover SID, `ensure_private_dir` refuses the default `%TEMP%\rusty_grid\sandboxes` at start-up. Pass `--sandbox-base-dir "$env:LOCALAPPDATA\OxideSwarm\sandboxes"` so the worker creates a private sandbox directory without changing `%TEMP%` permissions (see [benchmarks/gpu-run/README.md](../../benchmarks/gpu-run/README.md#finding-the-default-sandbox-base-on-windows)).
+
 Note for Linux GPU workers: the current Landlock ruleset in `crates/worker/src/isolation/linux.rs` only permits basic character devices (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`) and does not yet open `/dev/nvidia*` or `/dev/dri/*`. Run owner-trusted Linux GPU workers with `--isolation off --max-concurrency 1` until the Linux `R20` GPU probe adds device rules ([design 0074](../design/0074-external-runtime-allowlist-and-gpu-workloads.md)).
 
 ### 2. Verify advertised GPU and isolation capabilities
@@ -116,6 +118,8 @@ On the client machine, run the built-in `wgpu` verification task with explicit V
 
 Expected: output includes `Exit Code: 0` and reports the worker GPU matrix-multiply check succeeded against the CPU sample. Confirm with `oxideswarm workers --master <MASTER_IP>:8088 --json` that `"has_gpu": true` and `"iso:fs"` remain healthy with `state:connected`.
 
+For a recorded two-machine baseline (macOS master to Windows NVIDIA worker running `wgpu`, PyTorch CUDA, and Blender Cycles OptiX), see [benchmarks/gpu-run/README.md](../../benchmarks/gpu-run/README.md).
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -126,3 +130,4 @@ Expected: output includes `Exit Code: 0` and reports the worker GPU matrix-multi
 | Windows staged binary `--input ./app.exe:app.exe --command ./app.exe` fails to spawn | Windows AppContainer relative `./` lookup targets worker CWD instead of task sandbox | Invoke via `cmd.exe -- /d /c .\app.exe` |
 | Task stays queued or fails as unfulfillable when `--vram-mb` is set | Connected GPU worker reports `vram_mb: null` (unified/simulated) or less free VRAM than requested | Set `--vram-mb <MB>` on the worker start command (or pass a smaller `--vram-mb`) |
 | Need to remove AppContainer ACLs added by `--isolation-read-dir` on Windows | Start-up granted `oxideswarm.toolchain` read/execute ACEs recorded in `windows_acl_grants.txt` | Run `powershell -NoProfile -ExecutionPolicy Bypass -File windows\revoke-isolation-acls.ps1` |
+| Windows worker refuses default `%TEMP%\rusty_grid\sandboxes` at start-up | `%TEMP%` DACL grants rights to another account or leftover SID (`ensure_private_dir`) | Pass `--sandbox-base-dir "$env:LOCALAPPDATA\OxideSwarm\sandboxes"` |
