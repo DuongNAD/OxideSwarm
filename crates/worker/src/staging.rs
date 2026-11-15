@@ -921,7 +921,7 @@ mod tests {
         std::fs::write(target_dir.join("secret.txt"), secret_bytes).unwrap();
 
         std::fs::create_dir_all(sandbox.join("out")).unwrap();
-        let link = sandbox.join("out/result");
+        let link = sandbox.join("out").join("result");
         let mklink = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(&link)
