@@ -170,6 +170,7 @@ fn task(n: u8, spec: TaskSpec) -> Task {
             gpu_required: false,
             timeout_secs: 90,
             max_retries: Some(4),
+            vram_mb: Some(6_144),
         },
         created_at_utc: EPOCH_SECS,
         tags: vec!["require:os=linux".into(), "batch-7".into()],

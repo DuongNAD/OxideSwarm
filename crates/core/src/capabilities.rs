@@ -734,8 +734,9 @@ impl WorkerCapabilities {
 
     /// Evaluates whether this worker satisfies the requirements of a given task.
     pub fn satisfies(&self, requirements: &TaskRequirements) -> bool {
-        // 1. Strict GPU constraint (Requirement R3, AC4)
-        if requirements.gpu_required && !self.can_execute_gpu() {
+        let req_vram = requirements.effective_vram_mb();
+        // 1. Strict GPU constraint (Requirement R3, AC4; positive vram_mb also implies GPU)
+        if requirements.requires_gpu_or_vram() && !self.can_execute_gpu() {
             return false;
         }
 
@@ -746,6 +747,12 @@ impl WorkerCapabilities {
 
         // 3. RAM constraint
         if requirements.ram_mb > 0 && self.ram_mb < requirements.ram_mb {
+            return false;
+        }
+
+        // 4. VRAM constraint (Q56 / design 0068): omitted or zero vram_mb matches any GPU worker;
+        // positive vram_mb requires an explicitly advertised vram_mb >= req_vram.
+        if req_vram > 0 && self.vram_mb.is_none_or(|cap| cap < req_vram) {
             return false;
         }
 
@@ -2524,6 +2531,35 @@ mod tests {
         // GPU worker satisfies both generic and GPU tasks
         assert!(gpu_worker.satisfies(&generic_req));
         assert!(gpu_worker.satisfies(&gpu_req));
+    }
+
+    #[test]
+    fn test_capabilities_satisfies_vram_requirements() {
+        let cpu_worker = WorkerCapabilities::new("cpu-worker", 8, 16384, false, false, None);
+        let gpu_no_vram = WorkerCapabilities::new("gpu-unknown", 8, 16384, true, true, None);
+        let gpu_8g = WorkerCapabilities::new("gpu-8g", 8, 16384, true, false, Some("RTX".into()))
+            .with_vram_mb(Some(8_192));
+
+        let generic_gpu = TaskRequirements::gpu(60);
+        let req_4g = TaskRequirements::gpu(60).with_vram_mb(4_096);
+        let req_8g = TaskRequirements::gpu(60).with_vram_mb(8_192);
+        let req_16g = TaskRequirements::gpu(60).with_vram_mb(16_384);
+        let req_implicit_gpu = TaskRequirements {
+            vram_mb: Some(2_048),
+            ..TaskRequirements::generic(1, 60)
+        };
+
+        assert!(gpu_no_vram.satisfies(&generic_gpu));
+        assert!(!gpu_no_vram.satisfies(&req_4g));
+
+        assert!(gpu_8g.satisfies(&generic_gpu));
+        assert!(gpu_8g.satisfies(&req_4g));
+        assert!(gpu_8g.satisfies(&req_8g));
+        assert!(!gpu_8g.satisfies(&req_16g));
+        assert!(gpu_8g.satisfies(&req_implicit_gpu));
+
+        assert!(!cpu_worker.satisfies(&req_implicit_gpu));
+        assert!(!cpu_worker.satisfies(&req_4g));
     }
 
     #[test]
