@@ -16,7 +16,9 @@
 
 #[cfg(feature = "p2p")]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf};
@@ -89,6 +91,126 @@ impl LaneKind {
     }
 }
 
+/// Maximum number of outbound data-lane messages buffered in `router_task` once `data_out_tx`
+/// is full (`BUG-19`).
+pub(crate) const MAX_PENDING_DATA_MESSAGES: usize = 256;
+
+/// Maximum estimated bytes of outbound data-lane messages buffered in `router_task` once
+/// `data_out_tx` is full (`BUG-19`, 64 MiB).
+pub(crate) const MAX_PENDING_DATA_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fixed byte estimate for non-`BlobReply` data-lane messages (`AssignTask`,
+/// `AssignTaskWithCheckpoint`, `CancelTask`) in `pending_data`.
+pub(crate) const ESTIMATED_DATA_MESSAGE_BYTES: usize = 1024;
+
+/// Maximum time a single outbound frame write on the multiplexed QUIC data lane may block before
+/// the master ends the worker session (`BUG-19`).
+pub(crate) const DATA_LANE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Estimates the memory footprint of a data-lane [`MasterMessage`] buffered in `pending_data`.
+/// `BlobReply` frames are sized by their payload length; task control frames use
+/// [`ESTIMATED_DATA_MESSAGE_BYTES`].
+pub(crate) fn estimate_data_message_bytes(msg: &MasterMessage) -> usize {
+    match msg {
+        MasterMessage::BlobReply { reply, .. } => match reply {
+            rusty_grid_core::blob_transfer::BlobReply::Chunk { data, .. } => data.len(),
+            rusty_grid_core::blob_transfer::BlobReply::Missing { ids } => {
+                ids.len() * std::mem::size_of::<rusty_grid_core::blob::BlobId>()
+            }
+            rusty_grid_core::blob_transfer::BlobReply::Failed { message } => message.len(),
+            rusty_grid_core::blob_transfer::BlobReply::Written { .. }
+            | rusty_grid_core::blob_transfer::BlobReply::NotFound { .. } => {
+                ESTIMATED_DATA_MESSAGE_BYTES
+            }
+        },
+        _ => ESTIMATED_DATA_MESSAGE_BYTES,
+    }
+}
+
+/// Live and high-water-mark counters for a multiplexed session's `pending_data` buffer in
+/// `router_task`.
+#[derive(Debug, Default)]
+pub(crate) struct RouterBacklogStats {
+    pending_messages: AtomicUsize,
+    pending_bytes: AtomicUsize,
+    max_pending_messages: AtomicUsize,
+    max_pending_bytes: AtomicUsize,
+}
+
+impl RouterBacklogStats {
+    fn record(&self, messages: usize, bytes: usize) {
+        self.pending_messages.store(messages, Ordering::Relaxed);
+        self.pending_bytes.store(bytes, Ordering::Relaxed);
+        self.max_pending_messages
+            .fetch_max(messages, Ordering::Relaxed);
+        self.max_pending_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_messages(&self) -> usize {
+        self.pending_messages.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending_bytes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_pending_messages(&self) -> usize {
+        self.max_pending_messages.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_pending_bytes(&self) -> usize {
+        self.max_pending_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Bounded FIFO buffer for data-lane messages overflowed from `data_out_tx` inside `router_task`.
+struct PendingDataBuffer {
+    queue: VecDeque<(MasterMessage, usize)>,
+    bytes: usize,
+    stats: Arc<RouterBacklogStats>,
+}
+
+impl PendingDataBuffer {
+    fn new(stats: Arc<RouterBacklogStats>) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            stats,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn is_at_cap(&self) -> bool {
+        self.queue.len() >= MAX_PENDING_DATA_MESSAGES || self.bytes >= MAX_PENDING_DATA_BYTES
+    }
+
+    fn fits(&self, msg_bytes: usize) -> bool {
+        self.queue.len() < MAX_PENDING_DATA_MESSAGES
+            && (self.queue.is_empty()
+                || self.bytes.saturating_add(msg_bytes) <= MAX_PENDING_DATA_BYTES)
+    }
+
+    fn push_back(&mut self, msg: MasterMessage, msg_bytes: usize) {
+        self.queue.push_back((msg, msg_bytes));
+        self.bytes = self.bytes.saturating_add(msg_bytes);
+        self.stats.record(self.queue.len(), self.bytes);
+    }
+
+    fn pop_front(&mut self) -> Option<MasterMessage> {
+        let (msg, msg_bytes) = self.queue.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(msg_bytes);
+        self.stats.record(self.queue.len(), self.bytes);
+        Some(msg)
+    }
+}
+
 /// Pre-registration transport state before authentication and `Register` completion.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PreAuthSession<
@@ -110,6 +232,8 @@ pub(crate) enum PreAuthSession<
         data_transport: MessageTransport<StampedStream<D>>,
         remote_addr: SocketAddr,
         rx_clock: Arc<RxClock>,
+        data_write_timeout: Duration,
+        router_backlog_stats: Arc<RouterBacklogStats>,
         #[cfg(feature = "p2p")]
         p2p_conn: Option<iroh::endpoint::Connection>,
         #[cfg(feature = "p2p")]
@@ -173,10 +297,23 @@ impl<
             data_transport,
             remote_addr,
             rx_clock,
+            data_write_timeout: DATA_LANE_WRITE_TIMEOUT,
+            router_backlog_stats: Arc::new(RouterBacklogStats::default()),
             #[cfg(feature = "p2p")]
             p2p_conn,
             #[cfg(feature = "p2p")]
             p2p_conns,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn router_backlog_stats(&self) -> Option<Arc<RouterBacklogStats>> {
+        match self {
+            Self::Single { .. } => None,
+            Self::Multiplexed {
+                router_backlog_stats,
+                ..
+            } => Some(Arc::clone(router_backlog_stats)),
         }
     }
 
@@ -267,6 +404,7 @@ pub(crate) enum ActiveLanes<
     Multiplexed {
         ctrl_reader: MessageReader<ReadHalf<StampedStream<C>>>,
         data_reader: MessageReader<ReadHalf<StampedStream<D>>>,
+        data_writer_err_rx: mpsc::Receiver<ProtocolError>,
         ctrl_reply_tx: mpsc::Sender<MasterMessage>,
         _router_guard: AbortOnDrop,
         _ctrl_writer_guard: AbortOnDrop,
@@ -306,6 +444,7 @@ impl<
             Self::Multiplexed {
                 ctrl_reader,
                 data_reader,
+                data_writer_err_rx,
                 ..
             } => {
                 tokio::select! {
@@ -318,6 +457,9 @@ impl<
                         data_res
                             .map(|msg| (LaneKind::Data, msg))
                             .map_err(|e| (LaneKind::Data, e))
+                    }
+                    Some(err) = data_writer_err_rx.recv() => {
+                        Err((LaneKind::Data, err))
                     }
                 }
             }
@@ -842,6 +984,8 @@ impl<
             PreAuthSession::Multiplexed {
                 ctrl_transport,
                 data_transport,
+                data_write_timeout,
+                router_backlog_stats,
                 ..
             } => {
                 let (mut ctrl_writer, ctrl_reader) = ctrl_transport.split();
@@ -849,11 +993,11 @@ impl<
 
                 let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<MasterMessage>(64);
                 let (data_out_tx, mut data_out_rx) = mpsc::channel::<MasterMessage>(64);
+                let (data_writer_err_tx, data_writer_err_rx) = mpsc::channel::<ProtocolError>(1);
                 let ctrl_reply_tx = ctrl_out_tx.clone();
 
                 let router_task = tokio::spawn(async move {
-                    let mut pending_data: std::collections::VecDeque<MasterMessage> =
-                        std::collections::VecDeque::new();
+                    let mut pending_data = PendingDataBuffer::new(router_backlog_stats);
 
                     loop {
                         if pending_data.is_empty() {
@@ -868,7 +1012,9 @@ impl<
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(
                                                 data_msg,
                                             )) => {
-                                                pending_data.push_back(data_msg);
+                                                let msg_bytes =
+                                                    estimate_data_message_bytes(&data_msg);
+                                                pending_data.push_back(data_msg, msg_bytes);
                                             }
                                             Err(
                                                 tokio::sync::mpsc::error::TrySendError::Closed(_),
@@ -882,6 +1028,15 @@ impl<
                                     }
                                 },
                                 None => break,
+                            }
+                        } else if pending_data.is_at_cap() {
+                            match data_out_tx.reserve().await {
+                                Ok(permit) => {
+                                    if let Some(msg) = pending_data.pop_front() {
+                                        permit.send(msg);
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         } else {
                             tokio::select! {
@@ -902,7 +1057,27 @@ impl<
                                             | MasterMessage::AssignTaskWithCheckpoint { .. }
                                             | MasterMessage::CancelTask { .. }
                                             | MasterMessage::BlobReply { .. } => {
-                                                pending_data.push_back(msg);
+                                                let msg_bytes = estimate_data_message_bytes(&msg);
+                                                let mut closed = false;
+                                                while !pending_data.fits(msg_bytes) {
+                                                    match data_out_tx.reserve().await {
+                                                        Ok(permit) => {
+                                                            if let Some(front) =
+                                                                pending_data.pop_front()
+                                                            {
+                                                                permit.send(front);
+                                                            }
+                                                        }
+                                                        Err(_) => {
+                                                            closed = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if closed {
+                                                    break;
+                                                }
+                                                pending_data.push_back(msg, msg_bytes);
                                             }
                                             ctrl_msg => {
                                                 if ctrl_out_tx.send(ctrl_msg).await.is_err() {
@@ -956,7 +1131,29 @@ impl<
                 let data_broadcast_tx = broadcast_tx.clone();
                 let data_writer_task = tokio::spawn(async move {
                     while let Some(msg) = data_out_rx.recv().await {
-                        match data_writer.send_msg(&msg).await {
+                        let send_res = match tokio::time::timeout(
+                            data_write_timeout,
+                            data_writer.send_msg(&msg),
+                        )
+                        .await
+                        {
+                            Ok(res) => res,
+                            Err(_) => {
+                                let timeout_secs = data_write_timeout.as_secs();
+                                warn!(
+                                    worker_id = %worker_id,
+                                    session_id = session_id,
+                                    variant = %msg.variant_name(),
+                                    timeout_secs = timeout_secs,
+                                    "Data lane write timed out; terminating worker session"
+                                );
+                                Err(ProtocolError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!("data lane write timed out after {timeout_secs}s"),
+                                )))
+                            }
+                        };
+                        match send_res {
                             Ok(()) => {}
                             Err(ProtocolError::FrameTooLarge { size, max }) => {
                                 handle_oversized_master_message(
@@ -977,6 +1174,7 @@ impl<
                             }
                             Err(e) => {
                                 debug!(error = %e, "Data writer send error; terminating");
+                                let _ = data_writer_err_tx.try_send(e);
                                 break;
                             }
                         }
@@ -986,6 +1184,7 @@ impl<
                 ActiveLanes::Multiplexed {
                     ctrl_reader,
                     data_reader,
+                    data_writer_err_rx,
                     ctrl_reply_tx,
                     _router_guard: AbortOnDrop(router_task.abort_handle()),
                     _ctrl_writer_guard: AbortOnDrop(ctrl_writer_task.abort_handle()),
@@ -1441,17 +1640,47 @@ mod tests {
         stop_rx: watch::Receiver<bool>,
         blob_store: Option<Arc<BlobStore>>,
     ) -> tokio::task::JoinHandle<GridResult<()>> {
-        tokio::spawn(async move {
-            let pre_auth = PreAuthSession::new_multiplexed(
-                ctrl_master,
-                data_master,
-                SocketAddr::from(([127, 0, 0, 1], 55_000)),
-                WireCodec::Bincode,
-                #[cfg(feature = "p2p")]
-                None,
-                #[cfg(feature = "p2p")]
-                None,
-            );
+        let (handle, _stats) = spawn_test_multiplexed_session_with_stats(
+            ctrl_master,
+            data_master,
+            registry,
+            queue,
+            scheduler_notify,
+            waiters,
+            stop_rx,
+            blob_store,
+        );
+        handle
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_test_multiplexed_session_with_stats(
+        ctrl_master: tokio::io::DuplexStream,
+        data_master: tokio::io::DuplexStream,
+        registry: WorkerRegistry,
+        queue: TaskQueue,
+        scheduler_notify: Arc<tokio::sync::Notify>,
+        waiters: WaiterMap,
+        stop_rx: watch::Receiver<bool>,
+        blob_store: Option<Arc<BlobStore>>,
+    ) -> (
+        tokio::task::JoinHandle<GridResult<()>>,
+        Arc<RouterBacklogStats>,
+    ) {
+        let pre_auth = PreAuthSession::new_multiplexed(
+            ctrl_master,
+            data_master,
+            SocketAddr::from(([127, 0, 0, 1], 55_000)),
+            WireCodec::Bincode,
+            #[cfg(feature = "p2p")]
+            None,
+            #[cfg(feature = "p2p")]
+            None,
+        );
+        let stats = pre_auth
+            .router_backlog_stats()
+            .expect("multiplexed PreAuthSession must carry RouterBacklogStats");
+        let handle = tokio::spawn(async move {
             WorkerSession::run_connection(
                 pre_auth,
                 registry,
@@ -1471,7 +1700,8 @@ mod tests {
                 None,
             )
             .await
-        })
+        });
+        (handle, stats)
     }
 
     #[tokio::test]
@@ -2228,6 +2458,478 @@ mod tests {
         assert_eq!(
             registry.get_worker(worker_id).await.unwrap().status,
             crate::registry::WorkerStatus::Disconnected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiplexed_data_lane_backlog_capped_by_messages_and_bytes() {
+        use rusty_grid_core::blob_transfer::BLOB_CHUNK_BYTES;
+
+        // Part 1: Message-count cap (`MAX_PENDING_DATA_MESSAGES = 256`) when the data lane is
+        // never drained.
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+            let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+            let (stop_tx, stop_rx) = watch::channel(false);
+
+            let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+            // 64-byte data duplex buffer so the very first `AssignTask` blocks inside
+            // `data_writer_task` while `_d_worker` is never read.
+            let (d_master, _d_worker) = tokio::io::duplex(64);
+            let (session_task, stats) = spawn_test_multiplexed_session_with_stats(
+                c_master,
+                d_master,
+                registry.clone(),
+                queue.clone(),
+                Arc::clone(&scheduler_notify),
+                Arc::clone(&waiters),
+                stop_rx,
+                None,
+            );
+
+            let mut mux_ctrl = MessageTransport::new(c_worker);
+            let worker_id = Uuid::new_v4();
+            mux_ctrl
+                .send_msg(&WorkerMessage::Register {
+                    worker_id,
+                    capabilities: WorkerCapabilities::new(
+                        "bug19-msg-cap-worker",
+                        4,
+                        4096,
+                        false,
+                        false,
+                        None,
+                    ),
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+            match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+                Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+                other => panic!("expected RegisterAck, got {other:?}"),
+            }
+            let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
+            let outbound_tx = registry
+                .reserve_dispatch(&worker_id, session_id)
+                .await
+                .unwrap();
+
+            // Send enough small `AssignTask` messages to fill:
+            //   1 in `data_writer_task` (blocked writing to `d_master`),
+            //  64 in `data_out_tx` (capacity 64),
+            // 256 in `pending_data` (`MAX_PENDING_DATA_MESSAGES`),
+            // 128 in `outbound_rx` (capacity 128).
+            let total_capacity = 1 + 64 + MAX_PENDING_DATA_MESSAGES + 128;
+            let mut accepted = 0usize;
+            for i in 0..(total_capacity + 32) {
+                let task = Task::new(
+                    TaskSpec::Command {
+                        program: "echo".into(),
+                        args: vec![format!("msg-cap-{i}"), "x".repeat(256)],
+                        env: HashMap::new(),
+                        working_dir: None,
+                        stdin: None,
+                    },
+                    TaskRequirements::generic(1, 64),
+                );
+                match outbound_tx.try_send(MasterMessage::AssignTask { task }) {
+                    Ok(()) => {
+                        accepted += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let retry_task = Task::new(
+                            TaskSpec::Command {
+                                program: "echo".into(),
+                                args: vec![format!("msg-cap-retry-{i}"), "x".repeat(256)],
+                                env: HashMap::new(),
+                                working_dir: None,
+                                stdin: None,
+                            },
+                            TaskRequirements::generic(1, 64),
+                        );
+                        if outbound_tx
+                            .try_send(MasterMessage::AssignTask { task: retry_task })
+                            .is_ok()
+                        {
+                            accepted += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        panic!("outbound_tx closed unexpectedly");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            assert_eq!(
+                stats.pending_messages(),
+                MAX_PENDING_DATA_MESSAGES,
+                "router pending_data must stop at MAX_PENDING_DATA_MESSAGES"
+            );
+            assert_eq!(
+                stats.max_pending_messages(),
+                MAX_PENDING_DATA_MESSAGES,
+                "router pending_data count must never exceed MAX_PENDING_DATA_MESSAGES"
+            );
+            assert_eq!(
+                stats.pending_bytes(),
+                MAX_PENDING_DATA_MESSAGES * ESTIMATED_DATA_MESSAGE_BYTES
+            );
+            assert!(stats.max_pending_bytes() <= MAX_PENDING_DATA_BYTES);
+            assert_eq!(
+                accepted, total_capacity,
+                "once data_writer (1) + data_out_tx (64) + pending_data (256) + outbound_rx (128) are full, outbound_tx must backpressure further sends"
+            );
+            assert!(
+                matches!(
+                    outbound_tx.try_send(MasterMessage::CancelTask {
+                        task_id: rusty_grid_core::task::TaskId::new(),
+                        reason: None,
+                    }),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                ),
+                "outbound_tx must remain full and reject additional data messages while data lane is undrained"
+            );
+
+            // Control-lane behavior while `pending_data` is at its cap:
+            // - Inbound control messages answered via `ctrl_reply_tx` (`Heartbeat` ->
+            //   `HeartbeatAck`, `ClaimMasterRole` -> `RoleHandoverAck`, and master `Shutdown`)
+            //   write directly to `ctrl_out_tx`, bypassing `outbound_rx` and `router_task`, so
+            //   they continue flowing unimpeded even when `pending_data` is at its cap and
+            //   `outbound_tx` is completely full.
+            // - No control message is sent through the shared `outbound_tx` channel today.
+            //   `router_task` still forwards a non-data `MasterMessage` it finds there (a
+            //   defensive `ctrl_msg` arm). Such a message would wait in `outbound_rx` behind the
+            //   stalled data backlog once `pending_data` reaches `MAX_PENDING_DATA_MESSAGES` or
+            //   `MAX_PENDING_DATA_BYTES`, until `data_out_tx` drains `pending_data` below the cap
+            //   or `DATA_LANE_WRITE_TIMEOUT` ends the session.
+            for ts in [3_001_u64, 3_002, 3_003] {
+                mux_ctrl
+                    .send_msg(&WorkerMessage::Heartbeat {
+                        worker_id,
+                        timestamp: ts,
+                        active_tasks: 0,
+                        cpu_usage_pct: 20.0,
+                        ram_available_mb: 4096,
+                    })
+                    .await
+                    .unwrap();
+                let ack = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    mux_ctrl.recv_msg::<MasterMessage>(),
+                )
+                .await
+                .expect(
+                    "HeartbeatAck must arrive on control lane while pending_data is at message cap",
+                )
+                .expect("control lane decode must succeed")
+                .expect("control lane must stay open");
+                assert_eq!(ack, MasterMessage::HeartbeatAck { timestamp: ts });
+            }
+
+            let _ = stop_tx.send(true);
+            session_task.abort();
+        }
+
+        // Part 2: Byte cap (`MAX_PENDING_DATA_BYTES = 64 MiB`) when the data lane is never
+        // drained, including a leading small `AssignTask` so a 4 MiB `BlobReply::Chunk` at the
+        // boundary cannot push `pending_bytes` above `MAX_PENDING_DATA_BYTES`.
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+            let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+            let (stop_tx, stop_rx) = watch::channel(false);
+
+            let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+            let (d_master, _d_worker) = tokio::io::duplex(64);
+            let (session_task, stats) = spawn_test_multiplexed_session_with_stats(
+                c_master,
+                d_master,
+                registry.clone(),
+                queue.clone(),
+                Arc::clone(&scheduler_notify),
+                Arc::clone(&waiters),
+                stop_rx,
+                None,
+            );
+
+            let mut mux_ctrl = MessageTransport::new(c_worker);
+            let worker_id = Uuid::new_v4();
+            mux_ctrl
+                .send_msg(&WorkerMessage::Register {
+                    worker_id,
+                    capabilities: WorkerCapabilities::new(
+                        "bug19-byte-cap-worker",
+                        4,
+                        4096,
+                        false,
+                        false,
+                        None,
+                    ),
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+            match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+                Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+                other => panic!("expected RegisterAck, got {other:?}"),
+            }
+            let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
+            let outbound_tx = registry
+                .reserve_dispatch(&worker_id, session_id)
+                .await
+                .unwrap();
+
+            // Share one 4 MiB `Bytes` buffer across all `BlobReply::Chunk` messages so the test
+            // exercises the 64 MiB byte cap without allocating hundreds of MiB.
+            let shared_chunk = Bytes::from(vec![0x5A_u8; BLOB_CHUNK_BYTES]);
+            let blob_id = BlobId::of(b"bug19-byte-cap-blob");
+
+            // First fill `data_writer_task` (1) and `data_out_tx` (64), then place 1 small
+            // `AssignTask` (1024 B) into `pending_data` followed by 4 MiB `BlobReply::Chunk`s.
+            // Because 1024 B + 16 * 4 MiB > 64 MiB, `pending_data` may accept at most 15 of the
+            // 4 MiB chunks (16 messages total: 1024 B + 60 MiB < 64 MiB) and must hold the 16th
+            // 4 MiB chunk waiting for `data_out_tx` room without exceeding `MAX_PENDING_DATA_BYTES`.
+            for i in 0..66 {
+                let task = Task::new(
+                    TaskSpec::Command {
+                        program: "echo".into(),
+                        args: vec![format!("seed-{i}"), "s".repeat(256)],
+                        env: HashMap::new(),
+                        working_dir: None,
+                        stdin: None,
+                    },
+                    TaskRequirements::generic(1, 64),
+                );
+                outbound_tx
+                    .send(MasterMessage::AssignTask { task })
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(stats.pending_messages(), 1);
+            assert_eq!(stats.pending_bytes(), ESTIMATED_DATA_MESSAGE_BYTES);
+
+            let mut sent_chunks = 0usize;
+            for req_id in 0..200_u64 {
+                let msg = MasterMessage::BlobReply {
+                    request_id: req_id,
+                    reply: BlobReply::Chunk {
+                        id: blob_id,
+                        offset: 0,
+                        total_size: BLOB_CHUNK_BYTES as u64,
+                        data: shared_chunk.clone(),
+                    },
+                };
+                match outbound_tx.try_send(msg) {
+                    Ok(()) => {
+                        sent_chunks += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(retry_msg)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if outbound_tx.try_send(retry_msg).is_ok() {
+                            sent_chunks += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        panic!("outbound_tx closed unexpectedly");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            assert!(
+                stats.pending_messages() < MAX_PENDING_DATA_MESSAGES,
+                "byte cap must trigger well below MAX_PENDING_DATA_MESSAGES (got {})",
+                stats.pending_messages()
+            );
+            assert_eq!(
+                stats.pending_messages(),
+                16,
+                "1 AssignTask (1 KiB) + 15 BlobReply chunks (60 MiB) fit in pending_data while the 16th 4 MiB chunk waits for data_out_tx room"
+            );
+            assert_eq!(
+                stats.pending_bytes(),
+                ESTIMATED_DATA_MESSAGE_BYTES + 15 * BLOB_CHUNK_BYTES
+            );
+            assert!(
+                stats.pending_bytes() <= MAX_PENDING_DATA_BYTES,
+                "pending_bytes ({}) must not exceed MAX_PENDING_DATA_BYTES ({MAX_PENDING_DATA_BYTES})",
+                stats.pending_bytes()
+            );
+            assert!(
+                stats.max_pending_bytes() <= MAX_PENDING_DATA_BYTES,
+                "max_pending_bytes ({}) must never exceed MAX_PENDING_DATA_BYTES ({MAX_PENDING_DATA_BYTES})",
+                stats.max_pending_bytes()
+            );
+            assert!(
+                sent_chunks >= 16 + 128,
+                "15 chunks in pending_data + 1 staged chunk + 128 in outbound_rx must fill outbound_tx"
+            );
+
+            // Heartbeats on the control lane must still be answered while `pending_data` is
+            // blocked at the byte cap.
+            mux_ctrl
+                .send_msg(&WorkerMessage::Heartbeat {
+                    worker_id,
+                    timestamp: 4_004,
+                    active_tasks: 0,
+                    cpu_usage_pct: 25.0,
+                    ram_available_mb: 4096,
+                })
+                .await
+                .unwrap();
+            let ack = tokio::time::timeout(
+                Duration::from_secs(2),
+                mux_ctrl.recv_msg::<MasterMessage>(),
+            )
+            .await
+            .expect("HeartbeatAck must arrive on control lane while pending_data is at byte cap")
+            .expect("control lane decode must succeed")
+            .expect("control lane must stay open");
+            assert_eq!(ack, MasterMessage::HeartbeatAck { timestamp: 4_004 });
+
+            let _ = stop_tx.send(true);
+            session_task.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_multiplexed_data_lane_write_timeout_ends_session_and_requeues_tasks() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        // 64-byte duplex buffer on the data stream so a ~1 KiB `AssignTask` frame blocks inside
+        // `data_writer.send_msg` when `_d_worker` is never read.
+        let (d_master, _d_worker) = tokio::io::duplex(64);
+        let session_task = spawn_test_multiplexed_session(
+            c_master,
+            d_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            None,
+        );
+
+        let mut mux_ctrl = MessageTransport::new(c_worker);
+        let worker_id = Uuid::new_v4();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "bug19-write-timeout-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+        let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
+
+        // Schedule and start a task on this session, then enqueue an `AssignTask` frame that
+        // exceeds the 64-byte duplex buffer so `data_writer.send_msg` blocks mid-frame.
+        let task = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["stalled-data-write".into(), "p".repeat(1024)],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 64),
+        );
+        let task_id = queue.submit(task.clone()).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(task_id, worker_id, session_id)])
+            .await;
+        queue
+            .mark_running_from(worker_id, Some(session_id), &task_id)
+            .await
+            .unwrap();
+        registry
+            .send_to_worker(&worker_id, MasterMessage::AssignTask { task })
+            .await
+            .unwrap();
+
+        // Let `router_task` forward the message to `data_writer_task` and start the blocked write.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Halfway through `DATA_LANE_WRITE_TIMEOUT` (30 s), the session must still be alive.
+        tokio::time::advance(DATA_LANE_WRITE_TIMEOUT / 2).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.get_worker(worker_id).await.unwrap().status,
+            crate::registry::WorkerStatus::Connected,
+            "session must remain connected before DATA_LANE_WRITE_TIMEOUT elapses"
+        );
+        assert_eq!(queue.get_state(&task_id).await, Some(TaskState::Running));
+
+        // Advance past `DATA_LANE_WRITE_TIMEOUT` (60 s total): `data_writer_task` times out,
+        // signals the session loop through `data_writer_err_rx`, and ends the session through
+        // `handle_worker_disconnect_with_broadcast`, requeuing `task_id`.
+        tokio::time::advance(DATA_LANE_WRITE_TIMEOUT / 2 + Duration::from_secs(1)).await;
+        let res = session_task
+            .await
+            .expect("session task must not panic on data lane write timeout");
+        assert!(res.is_ok());
+
+        let worker_after = registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(
+            worker_after.status,
+            crate::registry::WorkerStatus::Disconnected,
+            "worker session must be marked Disconnected after data lane write timeout"
+        );
+        // `handle_worker_disconnect_with_broadcast` fails the running task over with
+        // `immediate_reschedule = false`, unassigning the dead worker and moving the task into
+        // `Retrying` with the data-lane timeout recorded in `retry_history`.
+        let task_after = queue.get_task(&task_id).await.unwrap();
+        assert_eq!(
+            task_after.state,
+            TaskState::Retrying,
+            "failover sweep must transition the session's in-flight task out of Running when data lane write times out"
+        );
+        assert_eq!(task_after.assigned_worker_id, None);
+        assert_eq!(task_after.retry_count, 1);
+        assert_eq!(task_after.failover_count, 1);
+        let history = queue.get_retry_history(&task_id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0]
+                .reason
+                .contains("Data stream socket error: I/O error: data lane write timed out"),
+            "expected disconnect reason from LaneKind::Data error path, got: {}",
+            history[0].reason
         );
     }
 }

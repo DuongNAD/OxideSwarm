@@ -2323,8 +2323,12 @@ impl Drop for BlobPipeline {
 
 /// Answers one worker connection's `BlobRequest`s in arrival order, off its inbound loop. A
 /// worker caps its requests in flight per session at [`MAX_IN_FLIGHT_REQUESTS`], smaller than
-/// this queue, so a cooperative worker never fills the queue and blocks its own heartbeats or
-/// results; the bounded channel still caps buffered requests if a peer ignores that limit.
+/// this queue (`MAX_IN_FLIGHT_REQUESTS * 2`), so a cooperative worker never fills the queue and
+/// blocks its own heartbeats or results. If a peer ignores that limit or stops draining its data
+/// lane, buffering for the session is bounded across this request channel, the 128-slot session
+/// `outbound_tx` channel, the 64-slot `data_out_tx` channel, and `router_task`'s `pending_data`
+/// cap (`MAX_PENDING_DATA_MESSAGES = 256`, `MAX_PENDING_DATA_BYTES = 64 MiB` in `session.rs`),
+/// while `DATA_LANE_WRITE_TIMEOUT` (`60 s`) terminates a session whose data stream stalls.
 pub(crate) struct BlobService {
     requests: mpsc::Sender<(u64, BlobRequest)>,
     _task: AbortOnDrop,
