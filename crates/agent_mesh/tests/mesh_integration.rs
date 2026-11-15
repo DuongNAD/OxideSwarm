@@ -262,6 +262,7 @@ async fn test_rest_observability_endpoints() {
     client.connect().await.expect("Connect failed");
     tokio::time::sleep(Duration::from_millis(150)).await;
 
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let http_client = reqwest::Client::new();
 
     // 1. Test /api/health

@@ -1,7 +1,7 @@
 # 0053: Set up machines from a USB stick
 
-Status: Accepted (decision Q13, 2026-11-09). Kit format v0 is built in `packaging/usb/`; `usb create` needs ENROLL-1b
-Created: 2026-11-09    Updated: 2026-11-10
+Status: Partial (USB-1a and USB-1b built; USB-1c awaits a cross-machine live stick record). Accepted under decision Q13 (2026-11-09)
+Created: 2026-11-09    Updated: 2026-11-14
 
 ## Summary
 
@@ -100,7 +100,7 @@ name.
 1. It detects the system and the architecture, picks the archive, and checks it against
    `archives/SHA256SUMS`.
 2. It unpacks the archive into a per-user folder: `~/Library/Application Support/OxideSwarm/bin`,
-   `%LOCALAPPDATA%\OxideSwarm\bin` or `~/.local/share/oxideswarm/bin`.
+   `%LOCALAPPDATA%\OxideSwarm-USB\bin` or `~/.local/share/oxideswarm/bin`.
 3. It runs `oxideswarm join --invite-file <stick>/OxideSwarm/invite.oxs`. `join` asks for the
    passphrase with echo off, decrypts the invite in memory and enrols as in 0051 D4. It prints the
    master's fingerprint and the pairing check, waits for the approval, and asks the user to confirm
@@ -185,9 +185,9 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| USB-1a | `usb create`, `invite.oxs` format, `join --invite-file`, archive checks (offline and online), `kit.json` | `crates/cli/src/usb_kit.rs` (new), `crates/cli/src/join.rs`, `crates/cli/src/cli_app.rs` | `cli_usb_kit_e2e` passes on Linux, macOS and Windows | Planned |
-| USB-1b | The installers and uninstallers for the three systems, user-level start, rollback | `packaging/usb/` (new), `tests/test_launcher_scripts.py` | Launcher tests pass on Linux and macOS, and the `.cmd` path passes on Windows CI | Planned |
-| USB-1c | Guide section and live record | `docs/guides/add-a-machine.md`, `README.md` | A stick made on one system sets up a machine of another, recorded | Planned |
+| USB-1a | `usb create`, `invite.oxs` format, `join --invite-file`, archive checks (offline and online), `kit.json` | `crates/cli/src/usb_kit.rs` (new), `crates/cli/src/join.rs`, `crates/cli/src/cli_app.rs` | `cli_usb_kit_e2e` passes on Linux, macOS and Windows | Implemented |
+| USB-1b | The installers and uninstallers for the three systems, user-level start, rollback | `packaging/usb/` (new), `tests/test_launcher_scripts.py` | Launcher tests pass on Linux and macOS, and the `.cmd` path passes on Windows CI | Implemented |
+| USB-1c | Guide section and live record | `docs/guides/add-a-machine.md`, `README.md` | A stick made on one system sets up a machine of another, recorded | Partial |
 
 ## Status log
 
@@ -283,3 +283,8 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   tasks (see `SCHED-4`, design 0060).
 - 2026-11-10: A bootable image stays a non-goal of the kit. [Design 0056](0056-frontier-program.md)
   plans one as a separate item (IMG-1), which reuses the kit's invite.
+- 2026-11-14: `USB-1a` and `USB-1b` built: `oxideswarm usb create` (`crates/cli/src/usb_kit.rs`),
+  `oxideswarm join --invite-file` (`crates/cli/src/join.rs`), encrypted `invite.oxs` + `kit.json`,
+  and v1 `packaging/usb/` installers/uninstallers with fresh-install rollback and `logs/install.log`
+  (`cli_usb_kit_e2e` and Windows/POSIX launcher tests). `USB-1c` docs are updated, while `USB-1`
+  stays `Partial` pending a cross-machine live stick run.

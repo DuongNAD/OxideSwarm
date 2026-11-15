@@ -857,6 +857,14 @@ pub struct JoinArgs {
 
     #[arg(
         long,
+        value_name = "PATH",
+        conflicts_with_all = ["code", "pair_host"],
+        help = "Read an encrypted USB setup kit invite (`invite.oxs`) from this file"
+    )]
+    pub invite_file: Option<PathBuf>,
+
+    #[arg(
+        long,
         help = "Save the secret and the address but do not run the doctor checks"
     )]
     pub no_doctor: bool,
@@ -879,6 +887,9 @@ pub async fn run_join(
     }
     if args.code.is_some() {
         return crate::pair::run_join_code(args, secret_opts, config).await;
+    }
+    if let Some(invite_path) = args.invite_file.clone() {
+        return run_join_invite_file(invite_path, &args, secret_opts, config).await;
     }
     let stdin = std::io::stdin();
     let stdin_is_terminal = stdin.is_terminal();
@@ -1288,6 +1299,129 @@ async fn run_worker_member_readonly_check(
         }
     })
     .await
+}
+
+async fn run_join_invite_file(
+    path: PathBuf,
+    args: &JoinArgs,
+    secret_opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+) -> ExitCode {
+    use crate::members_cmd::InviteToken;
+
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Cannot read invite file '{}': {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink() || (meta.file_attributes() & 0x0400) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
+    if is_reparse || !meta.is_file() {
+        eprintln!(
+            "Refusing invite file '{}': must be a regular file (not a symbolic link)",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let mut file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Cannot open invite file '{}': {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let cap = (crate::usb_kit::INVITE_OXS_MAX_FILE_BYTES + 1) as u64;
+    let mut bytes = Vec::new();
+    if let Err(e) = (&mut file).take(cap).read_to_end(&mut bytes) {
+        eprintln!("Failed to read invite file '{}': {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = crate::usb_kit::validate_invite_oxs_header(&bytes) {
+        eprintln!("Invalid invite file '{}': {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+
+    let passphrase = match read_invite_passphrase() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to read USB kit passphrase: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let decrypted = match crate::usb_kit::decrypt_invite_oxs(&bytes, &passphrase) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Cannot unlock '{}': {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let trimmed = decrypted.trim().to_string();
+    drop(decrypted);
+    if let Err(e) = InviteToken::decode(&trimmed) {
+        eprintln!("Decrypted invite file '{}' is invalid: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    run_join_invite_with_pair(args.clone(), secret_opts, config, trimmed, true, None).await
+}
+
+fn read_invite_passphrase() -> GridResult<zeroize::Zeroizing<String>> {
+    use std::io::{IsTerminal, Write};
+    let is_tty = std::io::stdin().is_terminal();
+    let _echo = if is_tty {
+        Some(EchoOff::stdin().map_err(|e| {
+            GridError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to disable terminal echo: {e}"),
+            ))
+        })?)
+    } else {
+        None
+    };
+    eprint!("USB kit passphrase: ");
+    let _ = std::io::stderr().flush();
+
+    let mut stdin = std::io::stdin();
+    let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(128));
+    let mut byte = [0u8; 1];
+    while raw.len() < 1024 {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                raw.push(byte[0]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(GridError::Io(e)),
+        }
+    }
+    drop(_echo);
+    if is_tty {
+        eprintln!();
+    }
+    if raw.len() >= 1024 && byte[0] != b'\n' {
+        return Err(GridError::Config(
+            "passphrase input exceeds 1024 bytes".into(),
+        ));
+    }
+    while raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    let pass = String::from_utf8(raw.to_vec())
+        .map_err(|_| GridError::Config("passphrase is not valid UTF-8".into()))?;
+    if pass.is_empty() {
+        return Err(GridError::Config("passphrase cannot be empty".into()));
+    }
+    Ok(zeroize::Zeroizing::new(pass))
 }
 
 async fn run_join_invite(
@@ -2246,5 +2380,28 @@ mod tests {
             JoinArgs::try_parse_from(["join", "--code", "7-rocket-violin", "oxs1-secret-value"])
                 .unwrap();
         assert_eq!(with_secret.refused_argument, vec!["oxs1-secret-value"]);
+
+        // `--invite-file` parses cleanly and conflicts with `--code` and `--pair-host`.
+        let with_file = JoinArgs::try_parse_from(["join", "--invite-file", "invite.oxs"]).unwrap();
+        assert_eq!(
+            with_file.invite_file.as_deref(),
+            Some(Path::new("invite.oxs"))
+        );
+        assert!(JoinArgs::try_parse_from([
+            "join",
+            "--invite-file",
+            "invite.oxs",
+            "--code",
+            "7-rocket-violin"
+        ])
+        .is_err());
+        assert!(JoinArgs::try_parse_from([
+            "join",
+            "--invite-file",
+            "invite.oxs",
+            "--pair-host",
+            "127.0.0.1:8088"
+        ])
+        .is_err());
     }
 }

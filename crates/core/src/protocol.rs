@@ -104,6 +104,9 @@ impl ProtocolCapabilities {
     /// Worker session resumption across transient master restarts or network drops
     /// (`WorkerMessage::ResumeSession`, `master_features::SESSION_RESUME_PREFIX`).
     pub const SESSION_RESUME: Self = Self(1 << 12);
+    /// `oxideswarm-tree/2` directory manifests carrying symbolic links or empty directories
+    /// (design 0039 W11).
+    pub const TREE_V2: Self = Self(1 << 13);
 
     pub const fn all_supported() -> Self {
         Self(
@@ -117,7 +120,8 @@ impl ProtocolCapabilities {
                 | Self::ADAPTIVE_KEEPALIVE.0
                 | Self::BLOB_TRANSFER.0
                 | Self::THREE_D.0
-                | Self::SESSION_RESUME.0,
+                | Self::SESSION_RESUME.0
+                | Self::TREE_V2.0,
         )
     }
 
