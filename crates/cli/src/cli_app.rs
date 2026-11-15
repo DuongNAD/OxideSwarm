@@ -450,7 +450,7 @@ pub struct WorkerArgs {
     #[arg(
         long,
         value_name = "LEVEL",
-        help = "Confine task processes at the OS level: off (default), fs (a task writes only its own sandbox and cannot read the owner's home, other sandboxes or the blob cache) or fs+net (fs plus no network sockets). The worker refuses to start where the level cannot be enforced; advertised as the iso:<level> tag; env RUSTY_GRID_ISOLATION, config [worker].isolation"
+        help = "Confine task processes at the OS level: off (default), fs (a task writes only its own sandbox and cannot read the owner's home, other sandboxes or the blob cache) or fs+net (fs plus no network sockets). The worker refuses to start where the level cannot be enforced (for example Linux without Landlock); supported on macOS, Linux and Windows; advertised as the iso:<level> tag; env RUSTY_GRID_ISOLATION, config [worker].isolation"
     )]
     pub isolation: Option<String>,
 

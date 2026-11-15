@@ -93,7 +93,7 @@ The table covers the subsystems of milestones M1 to M5. Later work has no row he
 | **Master Grid** | 8-State Task FSM | `Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed`/`Failed`/`Retrying`/`Cancelled` | Implemented |
 | **Master Grid** | Scheduler & Dispatch | Weighted least-loaded scheduling, real-GPU priority over simulated GPU, batch dispatch, anti-stuttering backpressure | Implemented |
 | **Master Grid** | Memory Bounding | Finish-order eviction of terminal tasks in `TaskQueue` with count and byte-size bounds (`--max-retained-tasks`, `--max-retained-mb`) and active queue caps (`--max-queue-size`, `--max-active-mb`) | Implemented |
-| **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading (checks C1-C6) | Implemented |
+| **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading, link kind and blob throughput (checks C1-C8) | Implemented |
 | **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
 | **Worker Engine** | Execution Runner | Bounded head-and-tail stdout/stderr capture ([design 0022](docs/design/0022-head-and-tail-stream-capture.md)), cancellation, configurable process priority | Implemented |
 | **Worker Engine** | Child Containment | Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`, with a `taskkill /F /T` fallback if job assignment fails) and Unix process groups with a double-forked lifeline-pipe supervisor, optional Linux cgroup v2 leaf, and per-attempt `RUSTY_GRID_RUN_TOKEN` `setsid()` sweep ([design 0031](docs/design/0031-containment-after-worker-crash.md)) | Implemented |
@@ -102,24 +102,19 @@ The table covers the subsystems of milestones M1 to M5. Later work has no row he
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`) | Partial |
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
 | **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration starting an embedded master and routing `grid_*` commands to it | Implemented |
-| **Mobile Coordination** | Dynamic Throttling & Arbitrage | Multi-tier thermal/battery throttling, RRC adaptive keepalive, and pre-sleep evacuation; the 5-rule mobile master refusal matrix (`check_mobile_master_eligibility`, not called in production) and automatic coordinator failover/election (`ClaimMasterRole`, refused by `reject_master_role_claim` in `server.rs`) are design only ([design 0002](docs/design/0002-mobile-coordination.md)) | Partial |
+| **Mobile Coordination** | Dynamic Throttling & Arbitrage | Multi-tier thermal/battery throttling, RRC adaptive keepalive, and pre-sleep evacuation; the mobile master refusal matrix was removed in FEAT-11, and automatic coordinator failover/election (`ClaimMasterRole`, refused by `reject_master_role_claim` in `server.rs`) is design only ([design 0002](docs/design/0002-mobile-coordination.md)) | Partial |
 | **File Staging** | Task input and output files | `submit --input` (files and directories) and `--output` patterns as BLAKE3 blobs through a bounded master store and worker cache across both the CLI and the MCP server, nothing sent twice, `RustCompilation` artifacts returned ([design 0006](docs/design/0006-content-addressed-data-plane.md)); legacy inline staging retained for wire compatibility ([design 0003](docs/design/0003-distributed-file-staging.md)) | Partial |
 | **AI Tooling** | MCP Server | Model Context Protocol server over JSON-RPC 2.0 stdio (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces` (MCP-1 to MCP-3 are Implemented in [docs/BACKLOG.md](docs/BACKLOG.md); [design 0004](docs/design/0004-mcp-and-discovery.md), [design 0012](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md), [design 0022](docs/design/0022-head-and-tail-stream-capture.md)) | Implemented |
-| **Discovery** | Subnet-Isolated Fallback | 3-tier discovery hierarchy: UDP broadcast, authenticated HTTP probe (`GET /api/discovery/probe`), and signed rendezvous registry (`OXIDESWARM_RENDEZVOUS`) ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Partial |
+| **Discovery** | Subnet-Isolated Fallback | 3-tier discovery hierarchy: UDP broadcast, authenticated HTTP probe (`GET /api/discovery/probe`), and keyed rendezvous registry (`OXIDESWARM_RENDEZVOUS`, standalone `oxideswarm rendezvous` on `:8090`) ([design 0004](docs/design/0004-mcp-and-discovery.md), [design 0066](docs/design/0066-usable-rendezvous-discovery.md)); no run across two real networks is recorded yet (LINK-1) | Implemented |
 
 ---
 
-## 5. Milestone Roadmap
+## 5. Roadmap
 
-Milestones M1 to M5 are past work. The direction after the completion backlog is in [docs/ROADMAP.md](docs/ROADMAP.md).
-
-| Milestone | Scope | Deliverables & Verification | Status |
-| :--- | :--- | :--- | :--- |
-| **M1: Baseline Hygiene & Doc Rewrite** | Fix clippy blocker, normalize script line endings, remove legacy status files, update inbound links, repair ANDROID_ARCHITECTURE anchors, translate Vietnamese content, full doc rewrite | Clippy clean (`-D warnings`), launcher scripts tests pass, doc mode verification passes | Implemented |
-| **M2: Functional Gap Completion** | Android JNI cluster secret auth, Agent Mesh `--grid-master` bridge, Real-GPU priority scheduler | Clean build, targeted integration tests pass (Kotlin app pending `AND-1`) | Partial |
-| **M3: Security & Process Hardening** | Authenticated wire stream encryption (`0x04`), protocol version & capability negotiation, Windows Job Object & Linux PDEATHSIG containment | Wire encryption tests, version negotiation tests, process containment tests pass | Partial |
-| **M4: Isolation & Verification** | Test state isolation (`OXIDESWARM_HOME`, ephemeral keys), final documentation synchronization, full workspace verification | Workspace unit, integration, and Python test suites with `OXIDESWARM_HOME` isolation | Implemented |
-| **M5: Production Completion & Verification** | Two-node readiness ([design 0001](docs/design/0001-two-node-readiness.md)), mobile coordination & dynamic policies ([design 0002](docs/design/0002-mobile-coordination.md)), distributed file staging ([design 0003](docs/design/0003-distributed-file-staging.md)), MCP server & discovery fallback ([design 0004](docs/design/0004-mcp-and-discovery.md)), full workspace verification | Unit and integration tests, 2-worker live `doctor` checks C1–C6 pass, documentation sync | Partial |
+The only roadmap is [docs/ROADMAP.md](docs/ROADMAP.md): the purpose, the phases, what waits and the
+owner's decisions. Work items and their status are in [docs/BACKLOG.md](docs/BACKLOG.md). Milestones
+M1 to M5 (hygiene, functional gaps, hardening, test isolation, two-node readiness) are past work;
+their changes are in [CHANGELOG.md](CHANGELOG.md) and the design records.
 
 ---
 

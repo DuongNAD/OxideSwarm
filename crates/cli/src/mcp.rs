@@ -19,7 +19,7 @@
 //!    environment variables, staged files, expected outputs, and synchronous wait options.
 //! 4. `task_result`: Query task outcome, logs, exit code, and artifacts with optional blocking poll.
 //! 5. `cancel`: Cancel a queued or running task by its UUID.
-//! 6. `doctor`: Run cluster diagnostics (checks C1-C6) and return a structured report.
+//! 6. `doctor`: Run cluster diagnostics (checks C1-C8) and return a structured report.
 //! 7. `workspaces`: List persistent agent workspaces and their worker affinities.
 //!
 //! # Stdout Hygiene
@@ -716,7 +716,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "doctor",
-            description: "Run diagnostic health checks (C1-C6) on the cluster and return a structured report.",
+            description: "Run diagnostic health checks (C1-C8) on the cluster and return a structured report.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
