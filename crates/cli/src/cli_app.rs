@@ -634,6 +634,13 @@ pub struct SubmitArgs {
     )]
     pub ram_mb: u64,
 
+    #[arg(
+        long,
+        alias = "vram",
+        help = "Minimum GPU VRAM in MB required (implies --gpu when > 0)"
+    )]
+    pub vram_mb: Option<u64>,
+
     #[arg(long, help = "Require GPU worker node")]
     pub gpu: bool,
 
@@ -3675,6 +3682,13 @@ fn listed_as_connected(caps: &WorkerCapabilities) -> bool {
     tag_value(&caps.tags, STATE_TAG_PREFIX) != Some("disconnected")
 }
 
+/// True when at least one connected GPU worker advertises `>= req_vram_mb` MB of VRAM.
+fn any_connected_worker_satisfies_vram(workers: &[WorkerCapabilities], req_vram_mb: u64) -> bool {
+    workers.iter().any(|w| {
+        listed_as_connected(w) && w.can_execute_gpu() && w.vram_mb.is_some_and(|v| v >= req_vram_mb)
+    })
+}
+
 /// The name of the listed worker with this id, if the list has it.
 fn listed_worker_name(workers: &[WorkerCapabilities], worker_id: Uuid) -> Option<String> {
     workers
@@ -3919,9 +3933,10 @@ async fn run_submit_with_secret_inner(
     };
 
     let had_secret = secret.is_some();
+    let vram_mb = args.vram_mb.filter(|&v| v > 0);
     // A constrained or workspace task nobody can take would wait silently; say so (it is still
     // submitted, a matching worker may connect later).
-    if !placement.is_empty() || workspace_ref.is_some() {
+    if !placement.is_empty() || workspace_ref.is_some() || vram_mb.is_some() {
         if let Some(workers) = fetch_workers(&mut transport, &master_addr, had_secret).await {
             if workspace_ref.is_some()
                 && !workers
@@ -3941,10 +3956,20 @@ async fn run_submit_with_secret_inner(
                     "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
                 );
             }
+            if let Some(req_vram) = vram_mb {
+                if !any_connected_worker_satisfies_vram(&workers, req_vram) {
+                    eprintln!(
+                        "Warning: no connected GPU worker advertises >= {req_vram} MB VRAM; the task waits in the queue until one does"
+                    );
+                }
+            }
         }
     }
 
-    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu") || spec.requires_gpu();
+    let is_gpu = args.gpu
+        || vram_mb.is_some()
+        || args.task_type.eq_ignore_ascii_case("gpu")
+        || spec.requires_gpu();
     let default_timeout_secs = if args.workspace.is_some() { 1800 } else { 60 };
     let timeout_secs = resolve_u64(
         args.timeout_secs,
@@ -3959,6 +3984,7 @@ async fn run_submit_with_secret_inner(
         gpu_required: is_gpu,
         timeout_secs,
         max_retries: args.max_retries,
+        vram_mb,
     };
 
     // Only the input blobs the master lacks are sent, on a connection of their own.
@@ -8587,5 +8613,40 @@ max_workspaces = 4
         let hex = "11".repeat(32);
         let cli_w = parse(&["worker", "--master-key", &hex]);
         assert_eq!(cli_w.master_key.as_deref(), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn test_submit_vram_mb_flag_and_preflight_helper() {
+        let with_vram = submit_args(&["--vram-mb", "8192", "--", "python", "train.py"]);
+        assert_eq!(with_vram.vram_mb, Some(8192));
+
+        let with_alias = submit_args(&["--vram", "4096", "--", "echo", "ok"]);
+        assert_eq!(with_alias.vram_mb, Some(4096));
+
+        let with_zero = submit_args(&["--vram-mb", "0", "--", "echo", "ok"]);
+        assert_eq!(with_zero.vram_mb, Some(0));
+
+        let without_vram = submit_args(&["--", "echo", "ok"]);
+        assert_eq!(without_vram.vram_mb, None);
+
+        let w_8g =
+            WorkerCapabilities::new("gpu-8g", 4, 8192, true, true, None).with_vram_mb(Some(8192));
+        let w_4g =
+            WorkerCapabilities::new("gpu-4g", 4, 8192, true, true, None).with_vram_mb(Some(4096));
+        let w_unknown = WorkerCapabilities::new("gpu-sim", 4, 8192, true, false, None);
+        let mut w_disconnected = WorkerCapabilities::new("gpu-16g-off", 4, 8192, true, true, None)
+            .with_vram_mb(Some(16384));
+        w_disconnected
+            .tags
+            .push(format!("{STATE_TAG_PREFIX}disconnected"));
+
+        assert!(any_connected_worker_satisfies_vram(
+            &[w_4g.clone(), w_8g.clone()],
+            6144
+        ));
+        assert!(!any_connected_worker_satisfies_vram(
+            &[w_4g, w_unknown, w_disconnected],
+            6144
+        ));
     }
 }
