@@ -6,7 +6,7 @@ design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of de
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
-Created: 2026-11-07    Updated: 2026-11-13
+Created: 2026-11-07    Updated: 2026-11-15
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -76,24 +76,26 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `3ce2a65` on 2026-11-09, after the live two-machine run. On 2026-11-15 two
-rows left the table "What is missing": FEAT-3d (`cargo` under the Windows AppContainer, release
-0.1.2) and design 0039 W11 (symbolic links and empty directories in workspace trees, release
-0.2.0). DOC-10 in [BACKLOG.md](BACKLOG.md) brings this section up to 0.2.0.
+The state at `master` `c2462e3` on 2026-11-15: release 0.2.0 (protocol 8) plus SCALE-2. The
+previous version of this section described `3ce2a65` of 2026-11-09. This is the only roadmap of
+the project (DOC-10). [BACKLOG.md](BACKLOG.md) holds the items and their status, and section 5 of
+`PROJECT.md` links here.
 
 ### What works
 
 | Area | What the code does | Code |
 |---|---|---|
-| Scheduling | Task state machine with retries, placement by OS, architecture, worker and tag, GPU gating, host CPU backpressure, requeue when a worker is lost | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/core/src/placement.rs` |
-| Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP | `crates/core/src/cluster_auth.rs`, `crates/core/src/transport.rs` |
+| Scheduling | Task state machine with retries, placement by OS, architecture, worker and tag, GPU gating, host CPU backpressure, requeue when a worker is lost. Speed-aware placement (SCHED-4a, SCHED-4b), a bitset worker index, fair share per submitter and cold results on disk (SCALE-2). Measured with 100 to 1000 simulated workers (SCALE-1) | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/speed.rs`, `crates/master/src/worker_index.rs`, `crates/master/src/fair_share.rs`, `crates/core/src/placement.rs`, [benchmarks](../benchmarks/grid/README.md) |
+| Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP. Per-machine keys (Noise `IK`, `master --auth secret\|members\|both`), invites, approval and `members revoke` (ENROLL-1a, ENROLL-1b) | `crates/core/src/cluster_auth.rs`, `crates/core/src/noise_auth.rs`, `crates/core/src/transport.rs`, `crates/master/src/members.rs` |
+| Adding a machine | One join token (`secret join-token`, `join`), an invite, a spoken short code on a LAN (`invite --code`, SPAKE2) or an encrypted USB setup kit (`usb create`, `join --invite-file`) | `crates/cli/src/join.rs`, `crates/cli/src/pair.rs`, `crates/cli/src/usb_kit.rs`, `packaging/usb/` |
+| Discovery | UDP beacon on a LAN, an authenticated HTTP probe, and a keyed rendezvous registry (`oxideswarm rendezvous`) for masters on other subnets | `crates/core/src/discovery.rs`, `crates/master/src/rendezvous.rs`, design 0066 |
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
 | Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
 | Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
 | Durability | `master --state-dir` keeps queued, running and finished tasks in a journal and replays it at start. A worker keeps its tasks across a short disconnect, and the master adopts them again (`ResumeSession`) | `crates/master/src/store.rs`, `crates/master/src/session.rs`, `tests/master_restart_recovery.rs` |
-| Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
-| Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
-| Operations | `oxideswarm doctor`, the dashboard, launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
+| Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer, with `cargo` and workspaces on a worker that is not elevated, FEAT-3d). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
+| Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Symbolic links inside the tree and empty directories travel too (W11). Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
+| Operations | `oxideswarm doctor` (checks C1 to C8, link kind and blob throughput), the dashboard, Prometheus `GET /metrics` and OTLP trace export (`--features otel`), launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/metrics.rs`, `crates/master/src/otel.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
 | Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows. Every job is a required check on `master`. A changed wire layout fails CI without a protocol version bump | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs` |
 
 ### What is missing
@@ -102,10 +104,14 @@ Each row is a limit a user meets today, and the item that removes it.
 
 | Limit | Effect | Item |
 |---|---|---|
-| There is one master and no failover | The master is a single point of failure | FEAT-6 (Design only, decision D1) |
+| There is one master and no failover | The master is a single point of failure. `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 (Q9). FEAT-6 only refuses the claim message (D1) |
 | Delivery is at least once | A task can run twice after a worker is lost. A master with `--state-dir` and a worker that resumes shrink the window | FEAT-1, FEAT-2 |
-| The Android app does not compile | There is no Android worker app to install | AND-1 |
-| GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
+| Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
+| Revoking a member does not close its client connections or cancel its tasks | `members revoke` blocks new handshakes and disconnects the member's worker sessions only | ENROLL-1c, ENROLL-1d |
+| No run across two real networks is recorded | NAT traversal, the relay path and the USB kit on another network are tested on one network only | LINK-1, USB-1c, TEST-24 |
+| The audit of 2026-11-15 found open bugs and security gaps | A QUIC worker that stops reading can grow master memory, one slow worker can stall a dispatch pass, a `rusty-grid.toml` in the working directory configures `worker` and `submit`, and the macOS profile starts from `(allow default)` | BUG-19, BUG-20, SEC-10 to SEC-15 |
+| The Android app does not compile | There is no Android worker app to install; phones join through Termux | AND-1, AND-5 |
+| GPU compute is a seeded matrix benchmark | No user workload runs on the GPU. Task VRAM requirements are in review (FEAT-9a, pull request 232) | FEAT-9 (decision D6), design 0064 R20 |
 
 ## Purpose
 
@@ -716,3 +722,4 @@ answers.
   long runs. The end-to-end blob tests move at most about 5 MiB per file, and no record measures a
   cluster over hours. It adds TEST-24 to TEST-26 (Planned) and open decisions Q57 to Q59. Nothing
   is built.
+- 2026-11-15: DOC-10. "Where the project stands" now describes `c2462e3` (release 0.2.0 plus SCALE-2): new rows for per-machine keys, adding a machine, discovery, scale work and observability, and the open limits found by the audit of 2026-11-15 (BUG-19, BUG-20, SEC-10 to SEC-15). This file is the only roadmap: section 5 of `PROJECT.md` links here, and the untracked `docs/ROADMAP_AND_VISION.md` draft of 2026-11-11 was moved out of the repository (its six sound points had already landed through pull request 206). No item, order or decision changed.

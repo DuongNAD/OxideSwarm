@@ -109,17 +109,12 @@ The table covers the subsystems of milestones M1 to M5. Later work has no row he
 
 ---
 
-## 5. Milestone Roadmap
+## 5. Roadmap
 
-Milestones M1 to M5 are past work. The direction after the completion backlog is in [docs/ROADMAP.md](docs/ROADMAP.md).
-
-| Milestone | Scope | Deliverables & Verification | Status |
-| :--- | :--- | :--- | :--- |
-| **M1: Baseline Hygiene & Doc Rewrite** | Fix clippy blocker, normalize script line endings, remove legacy status files, update inbound links, repair ANDROID_ARCHITECTURE anchors, translate Vietnamese content, full doc rewrite | Clippy clean (`-D warnings`), launcher scripts tests pass, doc mode verification passes | Implemented |
-| **M2: Functional Gap Completion** | Android JNI cluster secret auth, Agent Mesh `--grid-master` bridge, Real-GPU priority scheduler | Clean build, targeted integration tests pass (Kotlin app pending `AND-1`) | Partial |
-| **M3: Security & Process Hardening** | Authenticated wire stream encryption (`0x04`), protocol version & capability negotiation, Windows Job Object & Linux PDEATHSIG containment | Wire encryption tests, version negotiation tests, process containment tests pass | Partial |
-| **M4: Isolation & Verification** | Test state isolation (`OXIDESWARM_HOME`, ephemeral keys), final documentation synchronization, full workspace verification | Workspace unit, integration, and Python test suites with `OXIDESWARM_HOME` isolation | Implemented |
-| **M5: Production Completion & Verification** | Two-node readiness ([design 0001](docs/design/0001-two-node-readiness.md)), mobile coordination & dynamic policies ([design 0002](docs/design/0002-mobile-coordination.md)), distributed file staging ([design 0003](docs/design/0003-distributed-file-staging.md)), MCP server & discovery fallback ([design 0004](docs/design/0004-mcp-and-discovery.md)), full workspace verification | Unit and integration tests, 2-worker live `doctor` checks C1–C6 pass, documentation sync | Partial |
+The only roadmap is [docs/ROADMAP.md](docs/ROADMAP.md): the purpose, the phases, what waits and the
+owner's decisions. Work items and their status are in [docs/BACKLOG.md](docs/BACKLOG.md). Milestones
+M1 to M5 (hygiene, functional gaps, hardening, test isolation, two-node readiness) are past work;
+their changes are in [CHANGELOG.md](CHANGELOG.md) and the design records.
 
 ---
 
