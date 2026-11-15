@@ -1,7 +1,7 @@
 # 0050: Scale-out architecture (`SCALE-1` to `SCALE-6`, `ECO-3`, `ECO-4`)
 
 Status: Partial
-Created: 2026-11-09    Updated: 2026-11-14
+Created: 2026-11-09    Updated: 2026-11-15
 
 ## Summary
 
@@ -9,7 +9,7 @@ Today one master runs the whole grid for one owner or one small team. This recor
 of that design with evidence, and a staged architecture that grows it to many workers and many
 submitters: a load harness first, then a faster scheduler, worker-to-worker blob distribution, a
 highly available master, autoscaling providers and, last, federation of sites. It also covers
-multi-tenancy and observability, which a shared grid needs. D1 (`SCALE-1`, with baseline records at 100, 500 and 1000 simulated workers) and D7 (`ECO-4`) are built; D2 to D6 and D8 are planned. Each open choice lists its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
+multi-tenancy and observability, which a shared grid needs. D1 (`SCALE-1`, with baseline records at 100, 500 and 1000 simulated workers), D2 (`SCALE-2`, with post-change records at 500 and 1000 simulated workers) and D7 (`ECO-4`) are built; the remaining stages are planned. Each open choice lists its options, and the owner decides in [ROADMAP.md](../ROADMAP.md) (Q8, Q9, Q12).
 
 ## Context
 
@@ -125,6 +125,30 @@ Open options, in order of cost:
 Recommended order: A, then B with D6, then C only when the harness shows A and B fall short.
 Option A keeps the 8-state machine (`TaskQueue::can_transition_to`) and the `Engine::hold_back`
 rule that keeps wide tasks from starving.
+
+Implemented (`SCALE-2`): `WorkerIndex` and `RegisteredIndex` in `crates/master/src/worker_index.rs`
+maintain `O(W / 64)` `u64` bitsets over OS, architecture, worker id/name, isolation level, tools,
+tags, GPU capability, protocol features (including `WORKSPACES` and `TREE_V2`), free slots, and
+mobile thermal/battery buckets for fast candidate filtering and `fail_unfulfillable_tasks` checks.
+`WorkloadScheduler` (`crates/master/src/scheduler.rs`) scans `SCAN_PAGE = 512` ready tasks per step,
+`MasterServer::spawn` raises the default batch cap to `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024`
+(configurable via `master --max-batch-size`, `RUSTY_GRID_MAX_BATCH_SIZE`, and
+`[master].max_batch_size`), and both scheduler loops use adaptive micro-batch debounce plus a
+bounded multi-batch drain (`MAX_CONSECUTIVE_BATCHES = 16`). `FairShareQueues` in
+`crates/master/src/fair_share.rs` interleaves queued submissions per `SubmitterId` with weighted
+round-robin while preserving priority ordering, wide-task hold-back, and `SpeedBook`
+hold-back. Dashboard broadcast sites guard on `b_tx.receiver_count() > 0` before calling
+`get_task`/`stats`, and `ColdResultStore` (`crates/master/src/cold_results.rs`, stored under
+`<state_dir>/cold_results/<xx>/<task_id>.bin` in `OXSWCLD1` format) spills terminal `TaskResult`
+payloads past the hot limits (`DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024` /
+`DEFAULT_MAX_HOT_TERMINAL_BYTES = 4 MiB`) via single-flight `spawn_cold_maintenance` / `put_batch`
+with parallel staging, per-shard directory caching, and byte-exact file reuse on `journal.bin`
+replay while keeping `GetTaskStatus` RAM-only via `TaskStatusDetail`.
+The `2026-11-15` post-`SCALE-2` runs on the same Core i5-14600KF host (`ec228a01`,
+[benchmarks/grid/README.md](../../benchmarks/grid/README.md)) achieve `409.1` tasks/s at `500w`
+(`+9.0 %` over `375.2` baseline, unloaded assign p50 `16.69 ms` vs `31.01 ms`, steady RSS
+`57.2 MiB`, `51.36 ms` replay) and `414.4` tasks/s at `1000w` (unloaded assign p50 `17.67 ms`,
+steady RSS `91.8 MiB`, `55.52 ms` replay) with `0` failed tasks.
 
 ### D3: Worker-to-worker blob distribution (`SCALE-3`)
 
@@ -278,7 +302,7 @@ only if the owner's Q8 target needs more than one site.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | SCALE-1 | Load harness with simulated workers (D1) | `benchmarks/grid/scale_harness.py`, `crates/cli/examples/scale_load_driver.rs`, `crates/worker/src/sim.rs` | Dated records at 100, 500 and 1000 workers are committed | Implemented |
-| SCALE-2 | Scheduler and queue at scale (D2) | `crates/master/src/scheduler.rs`, `queue.rs` | The SCALE-1 numbers improve by the Q8 target, with no change in placement results | Planned |
+| SCALE-2 | Scheduler and queue at scale (D2) | `crates/master/src/{worker_index,fair_share,cold_results,scheduler,queue,server,store}.rs` | The SCALE-1 numbers improve by the Q8 target, with no change in placement results | Implemented |
 | SCALE-3 | Worker-to-worker blob distribution (D3) | `crates/core/src/blob_transfer.rs`, `crates/worker/src/blob_client.rs`, `crates/master/src/blob_store.rs` | A test shows the master sends one blob once to N workers | Planned |
 | SCALE-4 | Master high availability (D4) | `crates/master/src/store.rs`, `server.rs`, `crates/worker/src/client.rs` | Killing the leader loses no accepted task | Planned |
 | SCALE-5 | Autoscaling providers (D5) | new `crates/` module or bin | A queue backlog starts workers and idle time drains them, recorded live | Planned |
@@ -301,3 +325,5 @@ SCALE-6 only on need. ECO-3 and ECO-4 can start after SCALE-1.
   `task_id` in `crates/master/src/otel.rs`, `scheduler.rs`, and `crates/cli/src/cli_app.rs`
   (`tests/observability_metrics_otel_test.rs`).
 - 2026-11-14: Implemented SCALE-1 (D1) in pull request 222: WorkerClient::simulated, FakeRunnerConfig, SimulatedLinkStream (crates/worker/src/sim.rs, crates/worker/tests/scale1_simulated_worker.rs), scale_load_driver (crates/cli/examples/scale_load_driver.rs), benchmarks/grid/scale_harness.py (tests/test_scale_harness.py), and 3-run baseline records at 100, 500 and 1000 loopback workers plus 100 workers on a 25 ms + 10 ms, 1 % loss simulated link (benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json). Status changed from Draft to Partial.
+- 2026-11-14: Implemented D2 (`SCALE-2`) scheduler bitset index (`WorkerIndex` and `RegisteredIndex`), `SCAN_PAGE = 512` and `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size`), adaptive micro-batch debounce and multi-batch drain, per-submitter `FairShareQueues`, dashboard receiver guards, and `ColdResultStore` disk spill. Marked Partial until the 500-worker / 20-submitter `SCALE-1` harness run is recorded after PR #222 lands.
+- 2026-11-15: Finalized D2 (`SCALE-2`) in pull request 227: added `TREE_V2` bitset indexing across `WorkerIndex` / `RegisteredIndex` and `ready_views_fair`, raised `DEFAULT_MAX_HOT_TERMINAL_TASKS` to `1024`, replaced overlapping cold-flush tasks with single-flight `spawn_cold_maintenance` + batched `ColdResultStore::put_batch` + uncompacted `journal.bin` replay file reuse, and recorded post-`SCALE-2` 3-run benchmarks at `500w` (`409.1 tasks/s`, `16.69 ms` unloaded assign p50, `57.2 MiB` steady RSS, `51.36 ms` replay, `benchmarks/grid/results/2026-11-15-scale2-windows-amd64-500w.json`) and `1000w` (`414.4 tasks/s`, `17.67 ms` unloaded assign p50, `91.8 MiB` steady RSS, `55.52 ms` replay, `benchmarks/grid/results/2026-11-15-scale2-windows-amd64-1000w.json`). Marked `SCALE-2` Implemented.

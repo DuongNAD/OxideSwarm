@@ -127,7 +127,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-15, at `master` `fda4ff21` plus SCALE-1 (PR 222): 76 items Implemented, 7 Partial and 39 Planned. Five items
+On 2026-11-15, at `master` `cd0f2c19` plus SCALE-2 (PR 227): 77 items Implemented, 7 Partial and 38 Planned. Five items
 were added on 2026-11-08 from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1, REAPI-1,
 JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-8) were added on
 2026-11-09 from Phases F and G of the roadmap and [design 0050](design/0050-scale-out-architecture.md). Four items (LV-1, LV-5, LV-10 and LV-14) were added on 2026-11-10 from [design 0058](design/0058-lasting-value.md).
@@ -235,7 +235,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented | 226 |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented | 222, (design 0050) |
-| SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Planned |  |
+| SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented | 227, (design 0050) |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | 214, (design 0060) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned |  |
@@ -1786,6 +1786,14 @@ owner's decisions Q8, Q9 and Q12 are open.
 - **Done when:** The SCALE-1 numbers improve by the bound the owner sets (Q8) with identical
   placement results on the existing scheduler tests, and a test shows a second submitter's task
   placed while a first submitter's backlog is larger than the free slots.
+- **Implemented (`2026-11-15`):** Pull request 227 (`ec228a01`, [design 0050](design/0050-scale-out-architecture.md))
+  added `WorkerIndex` / `RegisteredIndex` capability and resource bitsets (`crates/master/src/worker_index.rs`,
+  including `WORKSPACES` and `TREE_V2`), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024`
+  (`--max-batch-size`), adaptive debounce and 16-batch drain, weighted round-robin per-submitter
+  `FairShareQueues` (`crates/master/src/fair_share.rs`, `queue.rs`), dashboard broadcast receiver guards,
+  and single-flight batched `ColdResultStore` disk spill (`crates/master/src/cold_results.rs`), with
+  post-`SCALE-2` 3-run `scale_harness.py` records at `500w` (`409.1` vs `375.2 tasks/s`, `16.69` vs
+  `31.01 ms` unloaded assign p50) and `1000w` (`414.4 tasks/s`, `91.8 MiB` steady RSS, `0` failures).
 
 ### SCALE-3: Worker-to-worker blob distribution
 
@@ -2601,3 +2609,4 @@ Add one dated line per finished item, newest last.
   budgets, segment-by-segment on-disk link target checks in `WorkspaceGuard::sync`, and fail-closed
   `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 75 Implemented, 7 Partial and 40 Planned.
 - 2026-11-15: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 76 Implemented, 7 Partial and 39 Planned.
+- 2026-11-15: Implemented SCALE-2 ([design 0050](design/0050-scale-out-architecture.md), pull request 227): added `WorkerIndex` / `RegisteredIndex` capability and attribute bitsets (`WORKSPACES`, `TREE_V2`, free slots, mobile buckets), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size` / `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`), adaptive micro-batch debounce and 16-batch drain, per-submitter `FairShareQueues` weighted round-robin, dashboard `receiver_count() > 0` guards, single-flight batched `ColdResultStore` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`) with uncompacted replay reuse, and committed 3-run post-`SCALE-2` records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`, `500w` `409.1` vs `375.2 tasks/s` and `16.69` vs `31.01 ms` unloaded assign p50, `1000w` `414.4 tasks/s` and `91.8 MiB` steady RSS, `0` failed tasks). The Index counts are now 77 Implemented, 7 Partial and 38 Planned.

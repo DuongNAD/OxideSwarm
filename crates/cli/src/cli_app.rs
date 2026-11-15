@@ -407,6 +407,13 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "N",
+        help = "Maximum tasks placed in a single scheduling pass (default 1024; env RUSTY_GRID_MAX_BATCH_SIZE)"
+    )]
+    pub max_batch_size: Option<String>,
+
+    #[arg(
+        long,
         value_name = "URL",
         help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
     )]
@@ -1402,10 +1409,55 @@ fn resolve_speed_hold_factor(flag: Option<String>, cfg_val: Option<f64>) -> Resu
     Ok(SchedulerConfig::default().speed_hold_factor)
 }
 
+fn parse_positive_usize(source: &str, raw: &str) -> Result<usize, String> {
+    let trimmed = raw.trim();
+    let parsed: usize = trimmed
+        .parse()
+        .map_err(|_| format!("{source}: invalid positive integer '{trimmed}'"))?;
+    if parsed == 0 {
+        return Err(format!("{source}: must be at least 1"));
+    }
+    Ok(parsed)
+}
+
+/// Resolve `max_batch_size` with precedence CLI `--max-batch-size`, then an explicit
+/// `RUSTY_GRID_MAX_BATCH_SIZE` env value, then `[master].max_batch_size`, then
+/// `DEFAULT_MASTER_MAX_BATCH_SIZE` (`1024`), rejecting `0` or non-integer values.
+fn resolve_max_batch_size_with_env(
+    flag: Option<String>,
+    env_val: Option<&str>,
+    cfg_val: Option<usize>,
+) -> Result<usize, String> {
+    if let Some(raw) = flag {
+        return parse_positive_usize("--max-batch-size", &raw);
+    }
+    if let Some(raw) = env_val {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return parse_positive_usize("RUSTY_GRID_MAX_BATCH_SIZE", trimmed);
+        }
+    }
+    if let Some(cfg) = cfg_val {
+        if cfg == 0 {
+            return Err("max_batch_size: must be at least 1".to_string());
+        }
+        return Ok(cfg);
+    }
+    Ok(rusty_grid_master::DEFAULT_MASTER_MAX_BATCH_SIZE)
+}
+
+/// Resolve `max_batch_size` from CLI flag, `RUSTY_GRID_MAX_BATCH_SIZE`, or `[master].max_batch_size`.
+fn resolve_max_batch_size(flag: Option<String>, cfg_val: Option<usize>) -> Result<usize, String> {
+    let env_val = std::env::var("RUSTY_GRID_MAX_BATCH_SIZE").ok();
+    resolve_max_batch_size_with_env(flag, env_val.as_deref(), cfg_val)
+}
+
 /// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
-/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and `--speed-hold-factor` /
-/// `RUSTY_GRID_SPEED_HOLD_FACTOR` / `[master].speed_hold_factor`, and carrying `preserve_gpu`,
+/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy`, `--speed-hold-factor` /
+/// `RUSTY_GRID_SPEED_HOLD_FACTOR` / `[master].speed_hold_factor`, and `--max-batch-size` /
+/// `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`, and carrying `preserve_gpu`,
 /// `max_host_cpu`, and `fail_unfulfillable_tasks`.
+#[allow(clippy::too_many_arguments)]
 fn build_master_scheduler_config(
     flag: Option<String>,
     cfg_val: Option<String>,
@@ -1414,16 +1466,20 @@ fn build_master_scheduler_config(
     fail_unfulfillable_tasks: bool,
     speed_hold_factor_flag: Option<String>,
     speed_hold_factor_cfg: Option<f64>,
+    max_batch_size_flag: Option<String>,
+    max_batch_size_cfg: Option<usize>,
 ) -> Result<SchedulerConfig, String> {
     let scheduler_policy = resolve_scheduler_policy(flag, cfg_val)?;
     let speed_hold_factor =
         resolve_speed_hold_factor(speed_hold_factor_flag, speed_hold_factor_cfg)?;
+    let max_batch_size = resolve_max_batch_size(max_batch_size_flag, max_batch_size_cfg)?;
     Ok(SchedulerConfig {
         policy: scheduler_policy,
         preserve_gpu_for_gpu_tasks: preserve_gpu,
         max_host_cpu_pct: max_host_cpu,
         fail_unfulfillable_tasks,
         speed_hold_factor,
+        max_batch_size,
         ..Default::default()
     })
 }
@@ -1830,6 +1886,8 @@ async fn run_master_inner(
         fail_unfulfillable_tasks,
         args.speed_hold_factor,
         master_cfg.as_ref().and_then(|m| m.speed_hold_factor),
+        args.max_batch_size,
+        master_cfg.as_ref().and_then(|m| m.max_batch_size),
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -6503,6 +6561,8 @@ max_active_mb = 768
             true,
             Some("2.0".into()),
             Some(1.8),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6514,12 +6574,55 @@ max_active_mb = 768
         assert_eq!(built_sched_cfg.max_host_cpu_pct, 72.5);
         assert!(built_sched_cfg.fail_unfulfillable_tasks);
         assert_eq!(built_sched_cfg.speed_hold_factor, 2.0);
+        assert_eq!(
+            built_sched_cfg.max_batch_size,
+            rusty_grid_master::DEFAULT_MASTER_MAX_BATCH_SIZE
+        );
+        assert_eq!(
+            resolve_max_batch_size_with_env(None, None, None).unwrap(),
+            1024
+        );
+        assert_eq!(
+            resolve_max_batch_size_with_env(None, Some(""), Some(256)).unwrap(),
+            256
+        );
+        assert_eq!(
+            resolve_max_batch_size_with_env(None, Some("512"), Some(256)).unwrap(),
+            512
+        );
+        assert_eq!(
+            resolve_max_batch_size_with_env(Some("2048".into()), Some("512"), Some(256)).unwrap(),
+            2048
+        );
+        assert!(resolve_max_batch_size_with_env(Some("0".into()), None, None).is_err());
+        assert!(resolve_max_batch_size_with_env(Some("nope".into()), None, None).is_err());
+        assert!(resolve_max_batch_size_with_env(None, Some("0"), None).is_err());
+        assert!(resolve_max_batch_size_with_env(None, Some("-4"), None).is_err());
+        assert!(resolve_max_batch_size_with_env(None, None, Some(0)).is_err());
+        assert_eq!(
+            build_master_scheduler_config(
+                None,
+                None,
+                true,
+                85.0,
+                false,
+                None,
+                None,
+                Some("2048".into()),
+                Some(256),
+            )
+            .unwrap()
+            .max_batch_size,
+            2048
+        );
         assert!(build_master_scheduler_config(
             Some("bogus-policy".into()),
             None,
             true,
             85.0,
             false,
+            None,
+            None,
             None,
             None,
         )
@@ -6531,6 +6634,32 @@ max_active_mb = 768
             85.0,
             false,
             Some("1.0".into()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(build_master_scheduler_config(
+            None,
+            None,
+            true,
+            85.0,
+            false,
+            None,
+            None,
+            Some("0".into()),
+            None,
+        )
+        .is_err());
+        assert!(build_master_scheduler_config(
+            None,
+            None,
+            true,
+            85.0,
+            false,
+            None,
+            None,
+            Some("abc".into()),
             None,
         )
         .is_err());
