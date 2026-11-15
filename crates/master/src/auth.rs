@@ -386,9 +386,7 @@ mod middleware {
             {
                 Some(AuthScope::Observer)
             }
-            (&Method::POST, p) if p.starts_with("/api/tasks") || p.starts_with("/api/chat") => {
-                Some(AuthScope::Submitter)
-            }
+            (&Method::POST, p) if p.starts_with("/api/tasks") => Some(AuthScope::Submitter),
             (&Method::POST, p) if p.starts_with("/api/modes/run") => Some(AuthScope::Admin),
             (&Method::GET, _) => Some(AuthScope::Observer),
             _ => Some(AuthScope::Admin),
@@ -1007,11 +1005,11 @@ mod tests {
                 Some(AuthScope::Submitter)
             );
             assert_eq!(
-                route_required_scope(&Method::POST, "/api/chat"),
-                Some(AuthScope::Submitter)
+                route_required_scope(&Method::POST, "/api/modes/run"),
+                Some(AuthScope::Admin)
             );
             assert_eq!(
-                route_required_scope(&Method::POST, "/api/modes/run"),
+                route_required_scope(&Method::POST, "/api/unknown"),
                 Some(AuthScope::Admin)
             );
             // Anything unexpected needs Admin rather than slipping through.
