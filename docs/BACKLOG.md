@@ -199,7 +199,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
 | DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 |
-| DOC-9 | Correct the statuses and statements that the audit found wrong | P1 | M |  |  | Implemented | PRNUM |
+| DOC-9 | Correct the statuses and statements that the audit found wrong | P1 | M |  |  | Implemented | 234 |
 | DOC-10 | Keep one roadmap | P2 | S | DOC-9 | Yes | Planned |  |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
@@ -2502,7 +2502,7 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** Each of the eleven points is corrected or marked as decided by the owner, and a
   search for "macOS only for now", "C1-C6" and "(open)" next to a merged pull request finds
   nothing.
-- **Implemented (2026-11-15, pull request PRNUM):** each point, in order:
+- **Implemented (2026-11-15, pull request 234):** each point, in order:
   1. FEAT-6 row renamed, with a note.
   2. A 1000-worker note was added to SCALE-2.
   3. The six "(open)" markers were removed.
@@ -2891,4 +2891,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-15: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 76 Implemented, 7 Partial and 39 Planned.
 - 2026-11-15: Implemented SCALE-2 ([design 0050](design/0050-scale-out-architecture.md), pull request 227): added `WorkerIndex` / `RegisteredIndex` capability and attribute bitsets (`WORKSPACES`, `TREE_V2`, free slots, mobile buckets), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size` / `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`), adaptive micro-batch debounce and 16-batch drain, per-submitter `FairShareQueues` weighted round-robin, dashboard `receiver_count() > 0` guards, single-flight batched `ColdResultStore` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`) with uncompacted replay reuse, and committed 3-run post-`SCALE-2` records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`, `500w` `409.1` vs `375.2 tasks/s` and `16.69` vs `31.01 ms` unloaded assign p50, `1000w` `414.4 tasks/s` and `91.8 MiB` steady RSS, `0` failed tasks). The Index counts are now 77 Implemented, 7 Partial and 38 Planned.
 - 2026-11-15: Audit of `c2462e3` (read-only, with clippy, fmt and `cargo test --workspace --lib` run on macOS): added BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10 (Phase 11), decisions D8 to D10, and a size note on MAINT-1. Statuses of existing items are unchanged; DOC-9 lists the ones to correct. The Index counts are now 77 Implemented, 7 Partial and 49 Planned.
-- 2026-11-15: DOC-9 implemented (pull request PRNUM): statuses and statements corrected across `docs/BACKLOG.md`, `docs/ROADMAP.md`, `docs/README.md`, `CLAUDE.md`, `PROJECT.md`, `README.md`, designs 0031 and 0033, and two help texts in `crates/cli`. The Index counts are now 78 Implemented, 7 Partial and 48 Planned.
+- 2026-11-15: DOC-9 implemented (pull request 234): statuses and statements corrected across `docs/BACKLOG.md`, `docs/ROADMAP.md`, `docs/README.md`, `CLAUDE.md`, `PROJECT.md`, `README.md`, designs 0031 and 0033, and two help texts in `crates/cli`. The Index counts are now 78 Implemented, 7 Partial and 48 Planned.
