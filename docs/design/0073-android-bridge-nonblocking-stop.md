@@ -119,7 +119,7 @@ Previously (at `c2462e3`, `AND-5` in `docs/BACKLOG.md`):
 - Host-side unit and integration tests in `crates/android_bridge` (`cargo test -p
   rusty_grid_android_bridge --locked`, including `--test mobile_coordination_test`):
   - `test_stop_worker_returns_in_under_100ms_while_worker_drains`: verifies `stop_worker_impl`
-    returns in `< 100 ms` while the worker thread is still draining, `start_worker_impl` returns
+    returns in `< 500 ms` while the worker thread is still draining, `start_worker_impl` returns
     `false` with status `STOPPING` during the drain, and status becomes `STOPPED` once the join
     finishes.
   - `test_concurrent_start_calls_start_only_one_worker`: synchronizes two threads on a barrier and

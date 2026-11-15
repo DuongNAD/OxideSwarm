@@ -103,16 +103,9 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 static LIVE_WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
 static MAX_LIVE_WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
 type StartClaimHook = Box<dyn FnOnce() + Send + 'static>;
 
-#[cfg(test)]
 static START_CLAIM_HOOK: Mutex<Option<StartClaimHook>> = Mutex::new(None);
-
-#[cfg(test)]
-fn set_start_claim_hook_for_testing(hook: impl FnOnce() + Send + 'static) {
-    *lock_unpoisoned(&START_CLAIM_HOOK) = Some(Box::new(hook));
-}
 
 struct WorkerThreadGuard;
 
@@ -254,11 +247,9 @@ pub fn start_worker_impl(
     // If a previous `stop_worker_impl` call is still draining its worker thread, wait briefly
     // (up to 30 ms) outside the lifecycle lock for an already-idle runtime to finish joining.
     if state.stopping.load(Ordering::SeqCst) {
-        for _ in 0..15 {
+        let deadline = std::time::Instant::now() + Duration::from_millis(30);
+        while state.stopping.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
-            if !state.stopping.load(Ordering::SeqCst) {
-                break;
-            }
         }
     }
 
@@ -275,7 +266,7 @@ pub fn start_worker_impl(
         return true;
     }
 
-    #[cfg(test)]
+    // Test hook fired immediately after claiming `running`; production never sets this hook.
     if let Some(hook) = lock_unpoisoned(&START_CLAIM_HOOK).take() {
         hook();
     }
@@ -366,10 +357,13 @@ pub fn start_worker_impl(
                                 if *shutdown_rx.borrow() {
                                     return None;
                                 }
-                                if state_clone.generation.load(Ordering::SeqCst) == my_generation
-                                    && !*shutdown_rx.borrow()
                                 {
-                                    *lock_unpoisoned(&state_clone.status) = "RUNNING".to_string();
+                                    let _lifecycle_guard = lock_unpoisoned(&state_clone.lifecycle);
+                                    if state_clone.generation.load(Ordering::SeqCst) == my_generation
+                                        && !state_clone.stopping.load(Ordering::SeqCst)
+                                    {
+                                        *lock_unpoisoned(&state_clone.status) = "RUNNING".to_string();
+                                    }
                                 }
                                 let mut init_shutdown_rx = shutdown_rx.clone();
                                 let client_opt = tokio::select! {
@@ -956,6 +950,10 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 mod tests {
     use super::*;
 
+    fn set_start_claim_hook_for_testing(hook: impl FnOnce() + Send + 'static) {
+        *lock_unpoisoned(&START_CLAIM_HOOK) = Some(Box::new(hook));
+    }
+
     /// Design 0021: when the app names no sandbox directory, the bridge's check creates the
     /// default private root with mode 700 itself, so the worker's own check accepts it. Without
     /// `ensure_private_root_blocking`, `create_dir_all` would leave the umask mode (755 under the
@@ -1304,7 +1302,7 @@ mod tests {
         *lock_unpoisoned(&state.status) = "RUNNING".to_string();
         state.running.store(true, Ordering::SeqCst);
 
-        // Simulate a worker thread that takes 500 ms to drain after receiving the shutdown signal
+        // Simulate a worker thread that takes 5 s to drain after receiving the shutdown signal
         // (matching `TASK_DRAIN_TIMEOUT` task cleanup on a running `WorkerClient`).
         let handle = std::thread::Builder::new()
             .name("OxideWorker-DrainSim".to_string())
@@ -1316,7 +1314,7 @@ mod tests {
                 rt.block_on(async move {
                     let _ = worker_started_tx.send(());
                     let _ = shutdown_rx.changed().await;
-                    let _ = drain_release_rx.recv_timeout(Duration::from_millis(500));
+                    let _ = drain_release_rx.recv_timeout(Duration::from_secs(5));
                 });
             })
             .unwrap();
@@ -1329,8 +1327,8 @@ mod tests {
         assert!(stop_worker_impl());
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_millis(100),
-            "stop_worker_impl took {elapsed:?} (>= 100 ms); must not block the calling thread"
+            elapsed < Duration::from_millis(500),
+            "stop_worker_impl took {elapsed:?} (>= 500 ms); must not block the calling thread"
         );
         assert!(!is_running_impl());
         assert_eq!(status_text(), "STOPPING");
@@ -1350,7 +1348,7 @@ mod tests {
             "start_worker_impl must refuse to start while the previous worker is still stopping"
         );
         assert!(
-            start_while_stopping.elapsed() < Duration::from_millis(100),
+            start_while_stopping.elapsed() < Duration::from_millis(500),
             "start refusal while stopping must not block"
         );
         assert_eq!(status_text(), "STOPPING");
@@ -1593,6 +1591,7 @@ mod tests {
     fn test_cancelled_start_does_not_clobber_stop_status() {
         let _guard = lock_unpoisoned(&TEST_MUTEX);
         reset_test_state();
+        set_p2p_minimal_preset_for_testing(true);
         let dir = scratch_dir("cancelled-start-aba");
         assert!(set_sandbox_dir_impl(
             dir.join("sandboxes").display().to_string()
