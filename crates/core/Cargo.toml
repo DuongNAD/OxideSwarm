@@ -32,6 +32,8 @@ socket2 = { version = "0.6", features = ["all"] }
 
 # Content-addressed blob ids (already in Cargo.lock via iroh).
 blake3 = "1.8"
+# Canonical Unicode decomposition (NFD) for case- and normalization-insensitive path checks.
+icu_normalizer = { version = "2.4", default-features = false, features = ["compiled_data"] }
 
 [target.'cfg(unix)'.dependencies]
 # killpg() for probe process groups (already in Cargo.lock via tokio)

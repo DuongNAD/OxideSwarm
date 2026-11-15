@@ -2083,6 +2083,7 @@ impl TaskRunner {
             guard
                 .check_existing_dirs()
                 .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
+            let mut sync_warning: Option<String> = None;
             if let Some(WorkspaceSource::Tree {
                 manifest,
                 manifest_size,
@@ -2100,13 +2101,18 @@ impl TaskRunner {
                     .map_err(|e| format!("workspace '{}': directory manifest: {e}", ws_clone.name))?;
                 let tree = TreeManifest::decode(&bytes)
                     .map_err(|e| format!("workspace '{}': {e}", ws_clone.name))?;
-                if let Err(err) = guard.sync(&tree, cache.as_ref()) {
-                    if let WorkspaceError::Integrity { ref path } = err {
-                        if let Some(f) = tree.files().iter().find(|f| f.path == *path) {
-                            cache.drop_corrupt(&f.id);
-                        }
+                match guard.sync(&tree, cache.as_ref()) {
+                    Ok(report) => {
+                        sync_warning = report.warning;
                     }
-                    return Err(err.to_string());
+                    Err(err) => {
+                        if let WorkspaceError::Integrity { ref path } = err {
+                            if let Some(f) = tree.files().iter().find(|f| f.path == *path) {
+                                cache.drop_corrupt(&f.id);
+                            }
+                        }
+                        return Err(err.to_string());
+                    }
                 }
             } else if !guard.is_ready() {
                 return Err(format!(
@@ -2141,6 +2147,7 @@ impl TaskRunner {
                         effective_cwd,
                         env,
                         stdin.map(|b| b.to_vec()),
+                        sync_warning,
                     ))
                 }
                 TaskSpec::ShellScript {
@@ -2197,14 +2204,14 @@ impl TaskRunner {
                         )
                     };
 
-                    Ok((guard, prog, args, tree_dir, env, None))
+                    Ok((guard, prog, args, tree_dir, env, None, sync_warning))
                 }
                 _ => unreachable!("checked before execute_workspace_workload"),
             }
         })
         .await;
 
-        let (guard, program, args, effective_cwd, env, stdin_data) = match prepared {
+        let (guard, program, args, effective_cwd, env, stdin_data, sync_warning) = match prepared {
             Ok(Ok(tuple)) => tuple,
             Ok(Err(e)) => return fail(e),
             Err(e) => return fail(format!("workspace preparation panicked: {e}")),
@@ -2243,6 +2250,9 @@ impl TaskRunner {
         let mut result = self
             .collect_blob_outputs_from_dir(&tree_dir, task, result, &[], false)
             .await;
+        if let Some(warning) = sync_warning {
+            result.stderr = append_note(result.stderr, &format!("[rusty_grid: {warning}]\n"));
+        }
 
         let finish_res = tokio::task::spawn_blocking(move || {
             let res = guard.finish();
