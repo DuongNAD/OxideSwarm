@@ -131,7 +131,7 @@ Previously (at `c2462e3`, `AND-5` in `docs/BACKLOG.md`):
     iterations of interleaved `start_worker_impl` and `stop_worker_impl` across two threads and
     verifies that at most one worker thread is ever live simultaneously.
   - `test_cancelled_start_does_not_clobber_stop_status`: drives `Start1 -> Stop -> Start2` using a
-    test hook after Start1's running claim and verifies that exactly one worker thread is live,
+    test hook after Start1's running claim and verifies that at most one worker thread is live,
     Start2's `worker_id` and `p2p_ticket` are preserved, and the status is not left stuck at
     `STARTING`.
   - `test_self_exiting_worker_then_immediate_start_does_not_panic`: starts a worker that self-exits
