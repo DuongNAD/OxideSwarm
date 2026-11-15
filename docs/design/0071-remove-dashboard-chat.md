@@ -18,7 +18,7 @@ Behaviour before this change (at `c2462e3`):
 | Area | Behaviour | Code |
 |---|---|---|
 | Dashboard router and handler | `create_web_ui_router_full` registered `.route("/api/chat", post(api_chat))`. `api_chat` formatted live worker telemetry and the caller's prompt, located an `agy` binary in `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, or `PATH` via `resolve_agy_binary`, and spawned `agy -p <prompt>` on the master host via `run_agy`. | `create_web_ui_router_full`, `api_chat`, `run_agy`, `resolve_agy_binary` (`crates/master/src/web_ui.rs`) |
-| Dashboard RBAC scope mapping | `AuthConfig::route_required_scope` mapped `POST /api/chat` to `Some(AuthScope::Submitter)` alongside `POST /api/tasks`. | `AuthConfig::route_required_scope` (`crates/master/src/auth.rs`) |
+| Dashboard RBAC scope mapping | `auth::route_required_scope` (a free function in `mod middleware`, re-exported by `auth`) mapped `POST /api/chat` to `Some(AuthScope::Submitter)` alongside `POST /api/tasks`. | `auth::route_required_scope` (`crates/master/src/auth.rs`) |
 | Embedded dashboard SPA | `crates/master/src/dashboard.html` defaulted the console input to AI chat mode (`setChatMode('ai')`, `quickAI`) and sent non-shell prompts to `POST /api/chat` inside `sendCmd`. | `setChatMode`, `quickAI`, `sendCmd` (`crates/master/src/dashboard.html`) |
 
 Although `api_chat` bounded concurrency (`MAX_CONCURRENT_CHATS = 2`), sanitized worker telemetry lines, enforced a 60 s timeout (`CHAT_TIMEOUT`), and killed the Unix process group on drop, what `agy` may read, write, or execute on the master host depends on that external CLI's own configuration. Invoking developer agent tooling inside the master process does not belong in the production coordinator (`SEC-14`, owner decision D9).
@@ -26,7 +26,7 @@ Although `api_chat` bounded concurrency (`MAX_CONCURRENT_CHATS = 2`), sanitized 
 ## Goals
 
 - **G1** Remove `POST /api/chat` and all `agy` process-spawning code from `rusty_grid_master`.
-- **G2** Remove `/api/chat` from `AuthConfig::route_required_scope` so unknown `POST` routes require `AuthScope::Admin` and answer `404 Not Found` once authenticated.
+- **G2** Remove `/api/chat` from `auth::route_required_scope` (a free function in `mod middleware`, re-exported by `auth`) so unknown `POST` routes require `AuthScope::Admin` and answer `404 Not Found` once authenticated.
 - **G3** Remove the AI chat panel controls and `/api/chat` client code from `crates/master/src/dashboard.html` while keeping dashboard shell task submission (`POST /api/tasks`), workflow modes, and device telemetry intact.
 
 ## Non-goals
@@ -42,7 +42,7 @@ Delete `.route("/api/chat", post(api_chat))` from `create_web_ui_router_full`, `
 
 ### D2 Remove `/api/chat` from `crates/master/src/auth.rs`
 
-In `AuthConfig::route_required_scope`, restrict the `AuthScope::Submitter` `POST` arm to `p.starts_with("/api/tasks")`. Any other `POST` path (except the public `/api/rendezvous/register`) falls through to `_ => Some(AuthScope::Admin)`, and the Axum router returns `404 Not Found` when no route matches.
+In `auth::route_required_scope` (a free function in `mod middleware`, re-exported by `auth`), restrict the `AuthScope::Submitter` `POST` arm to `p.starts_with("/api/tasks")`. Any other `POST` path (except the public `/api/rendezvous/register`) falls through to `_ => Some(AuthScope::Admin)`, and the Axum router returns `404 Not Found` when no route matches.
 
 ### D3 Remove the chat UI from `crates/master/src/dashboard.html`
 
@@ -59,7 +59,7 @@ Rename the first tab from `Chat` (`#btnTabChat`, `#tabChat`, `#chatFeed`) to `Co
 
 ## Test plan
 
-- **Unit (`crates/master/src/auth.rs`):** `test_route_scope_mapping_covers_every_route_and_method` verifies `POST /api/tasks` requires `AuthScope::Submitter` and unknown `POST` paths require `AuthScope::Admin`.
+- **Unit (`crates/master/src/auth.rs`):** `test_route_required_scope_covers_every_dashboard_route` (`mod tests::dashboard_gate`) verifies `POST /api/tasks` requires `AuthScope::Submitter` and unknown `POST` paths require `AuthScope::Admin`.
 - **Unit (`crates/master/src/web_ui.rs`):** `test_dashboard_html_remediation_integrity` verifies the embedded `dashboard.html` keeps executor lookup, `Cancelled` state handling in `sendCmd`, and workflow mode controls.
 - **Integration (`tests/dashboard_security_test.rs`):** `test_registered_token_reaches_every_route_class` verifies `POST /api/chat` with an `Admin` bearer token returns `404 Not Found`, and `test_a_bare_loopback_master_has_a_usable_local_dashboard` verifies `POST /api/chat` without a token on a local dashboard returns `404 Not Found`.
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo check -p rusty_grid_master --no-default-features --locked`, `cargo test -p rusty_grid_master --lib --locked`, `cargo test -p rusty_grid_master --locked --test dashboard_security_test --test dashboard_api_test --test dashboard_integration --test rbac_security_test`, and `python3 tests/test_m1_challenger_hygiene.py`.
