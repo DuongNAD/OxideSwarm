@@ -140,6 +140,25 @@ Stdout:
 paired-ok
 ```
 
+## Set up machines from a USB stick
+
+When you are provisioning several machines or cannot broadcast pairing codes over UDP `8087`, prepare an encrypted v1 USB setup kit ([design 0053](../design/0053-usb-setup-kit.md), [../../packaging/usb/README.md](../../packaging/usb/README.md)):
+
+```bash
+oxideswarm usb create <USB_MOUNT_DIR> --machines 4 --expires 7d --roles worker --archives <ARCHIVES_DIR>
+# Or fetch release archives and SHA256SUMS over HTTPS:
+oxideswarm usb create <USB_MOUNT_DIR> --machines 4 --download
+```
+
+`oxideswarm usb create` writes `<USB_MOUNT_DIR>/OxideSwarm/` containing the cross-platform installers, verified archives, `SHA256SUMS`, `kit.json`, and an Argon2id + ChaCha20-Poly1305 encrypted `invite.oxs` capped at `--machines` enrollments (printing the 4-word passphrase once; pass `--passphrase-stdin` to supply your own, `--workspaces` to enable shared-folder workspaces when Cargo is available, `--gpu` to bundle `-gpu` builds, and `--isolation fs|off` to set the default worker sandbox mode).
+
+On each target machine, run the per-user installer from the `OxideSwarm` folder:
+- **macOS:** double-click `Install OxideSwarm.command`
+- **Windows:** double-click `Install OxideSwarm.cmd`
+- **Linux:** run `bash install.sh`
+
+The installer verifies `SHA256SUMS` (including online `SHA256SUMS` over HTTPS/file when reachable, refusing plain `http://`), unpacks `oxideswarm` into a user-private directory, joins via `oxideswarm join --invite-file invite.oxs`, and rolls back newly created files on fresh-install failure while recording `logs/install.log`. Approve each pending machine on the admin host with `oxideswarm members pending` / `oxideswarm members approve` unless `--no-approval` was set. If a stick is lost, revoke it with `oxideswarm invite --revoke <invite_id>` (recorded in `kit.json`). To remove an installation later, run `Uninstall OxideSwarm.command`, `Uninstall OxideSwarm.cmd`, or `bash uninstall.sh`.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -149,3 +168,5 @@ paired-ok
 | Inviter exits with `the code was used by someone who did not know it; nothing was shared; make a new code` | The joining machine typed a wrong code after the SPAKE2 exchange began, timed out (5 s step limit), or closed early; the burn rule revoked the invite after one guess | Run `oxideswarm invite --code` again to generate a fresh nameplate and word pair |
 | `did you mean '...'?` from `join --code` | One of the two words is not in the 2048-word BIP-0039 list | Re-run with the corrected word; typos fail locally before any network packet is sent |
 | `A join token must not be given as an argument` | An invite or cluster join token (`oxs1-...`) was passed on the command line instead of piped on stdin | Pipe `oxs1-...` tokens into `oxideswarm join` with no `--code` and no positional arguments |
+| USB installer reports `SHA256SUMS` mismatch or refuses plain `http://` | Archive was corrupted/tampered with, or `OXIDESWARM_USB_ONLINE_SUMS_URL` used an insecure `http://` URL | Re-create the kit with verified archives; use `https://` or `file://` if overriding `OXIDESWARM_USB_ONLINE_SUMS_URL` (set `off` only offline with a trusted stick) |
+| USB v1 install rolls back after wrong passphrase or `invite.oxs` rejection | Wrong 4-word passphrase, exceeded `--machines` limit, expired invite, or revoked `invite_id` | Check `<install_root>/logs/install.log`, retry with the printed 4-word passphrase, or create a new kit if exhausted, expired, or revoked via `oxideswarm invite --revoke` |

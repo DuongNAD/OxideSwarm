@@ -47,6 +47,15 @@ use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+fn http_client(timeout: Option<Duration>) -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder();
+    if let Some(t) = timeout {
+        builder = builder.timeout(t);
+    }
+    builder.build().expect("build reqwest client")
+}
+
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::dashboard::dto::{ClusterStatusDto, DashboardStreamMessage};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -125,10 +134,7 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
                 }
                 _ => {
                     // Abrupt drop on SSE stream
-                    let client = reqwest::Client::builder()
-                        .timeout(Duration::from_millis(200))
-                        .build()
-                        .unwrap();
+                    let client = http_client(Some(Duration::from_millis(200)));
                     let url = format!("http://{}/api/stream/sse", dash_addr);
                     if let Ok(mut resp) = client.get(url).send().await {
                         let _ = resp.chunk().await;
@@ -154,10 +160,7 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
     let _ = churn_handle.await;
 
     // Post-burst verification: Server must remain completely healthy and responsive
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .expect("build reqwest client");
+    let client = http_client(Some(Duration::from_secs(3)));
 
     let status_resp = client
         .get(format!("http://{}/api/status", dash_addr))
@@ -317,10 +320,7 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("build reqwest client");
+    let client = http_client(Some(Duration::from_secs(10)));
 
     let mut resp = client
         .get(format!("http://{}/api/stream/sse", dash_addr))
@@ -502,7 +502,7 @@ async fn test_stress_high_throughput_concurrency() {
     }
 
     // 6. Verify REST API /api/status confirms all tasks completed
-    let client = reqwest::Client::new();
+    let client = http_client(None);
     let status_resp = client
         .get(format!("http://{}/api/status", dash_addr))
         .send()
@@ -696,7 +696,7 @@ async fn test_stress_master_graceful_shutdown_drains_telemetry_streams() {
     }
 
     // Connect 2 SSE clients
-    let reqwest_client = reqwest::Client::new();
+    let reqwest_client = http_client(None);
     let mut sse_resps = Vec::new();
     for _ in 0..2 {
         let mut resp = reqwest_client

@@ -1,15 +1,19 @@
-# USB setup kit (kit format v0)
+# USB setup kit (kit format v1 and v0)
 
-These scripts put OxideSwarm on a USB stick, so a machine joins a cluster as a worker after one
-double-click. This is the first version of [design 0053](../../docs/design/0053-usb-setup-kit.md). It
-carries a **join token** ([design 0048](../../docs/design/0048-join-token.md)), which holds the cluster
-secret. Once ENROLL-1 ([design 0051](../../docs/design/0051-machine-identity-and-invites.md)) is built,
-`oxideswarm usb create` replaces the token with an invite that is encrypted with a passphrase and
-works a limited number of times.
+These scripts put OxideSwarm on a USB stick so a machine joins a cluster after one double-click
+([design 0053](../../docs/design/0053-usb-setup-kit.md)).
+
+- **Kit format v1 (recommended):** created by `oxideswarm usb create <DIR> --machines N` using an
+  Argon2id + ChaCha20-Poly1305 encrypted invite (`invite.oxs`, [design 0051](../../docs/design/0051-machine-identity-and-invites.md)),
+  a metadata manifest (`kit.json`), per-machine `node.key` identity, optional admin approval with
+  pairing check digits, and instant revocation (`oxideswarm invite --revoke <invite_id>`). No
+  cluster secret is written to the stick.
+- **Kit format v0 (legacy):** created by `make_kit.sh` with a shared `join.token` ([design 0048](../../docs/design/0048-join-token.md)).
 
 | File | What it does |
 |---|---|
-| `make_kit.sh` | Writes `<DIR>/OxideSwarm/`: these installers, the release archives for macOS (arm64 and x86_64), Windows and Linux with `SHA256SUMS`, and the join token read from standard input |
+| `oxideswarm usb create` | Recommended CLI command (`crates/cli/src/usb_kit.rs`) writing `<DIR>/OxideSwarm/` v1 kits with `invite.oxs` and `kit.json` |
+| `make_kit.sh` | Legacy v0 helper writing `<DIR>/OxideSwarm/`: these installers, the release archives for macOS (arm64 and x86_64), Windows and Linux with `SHA256SUMS`, and the join token read from standard input |
 | `install.sh`, `Install OxideSwarm.command` | Install on Linux and macOS |
 | `install.ps1`, `Install OxideSwarm.cmd` | Install on Windows |
 | `Update OxideSwarm.command`, `Update OxideSwarm.cmd` | Update an install in place (`install.sh --update`, `install.ps1 -Update`) |
@@ -19,7 +23,21 @@ works a limited number of times.
 
 ## Make a kit
 
-On the master machine, with the stick mounted (for example at `/Volumes/<STICK>`):
+On an admin machine with the stick mounted (for example `/Volumes/<STICK>` on macOS or `E:\` on
+Windows):
+
+```bash
+oxideswarm usb create /Volumes/<STICK> --machines 4 --expires 7d --roles worker --archives <DIR>
+# or download matching GitHub release archives directly:
+oxideswarm usb create /Volumes/<STICK> --machines 4 --download
+```
+
+`oxideswarm usb create` generates a random 4-word passphrase (or reads one via `--passphrase-stdin`),
+prints it once on the terminal, writes `invite.oxs` + `kit.json` (storing `version`, `machines`,
+`roles`, `workspaces`, `gpu`, `require_approval`, and `invite_id`), and verifies every archive
+against `SHA256SUMS` (and an optional online `SHA256SUMS` check).
+
+### Legacy v0 kit (`make_kit.sh`)
 
 ```bash
 oxideswarm secret join-token --master <MASTER_IP>:8088 | bash packaging/usb/make_kit.sh /Volumes/<STICK> --version 0.1.0
@@ -71,9 +89,23 @@ directly or through a relay. The master keeps the same ticket across restarts as
 - **Linux:** run `bash install.sh` in a terminal opened in the kit folder.
 
 Each installer does the following, without administrator rights:
-1. It checks the archive against `SHA256SUMS`.
-2. It installs into a per-user folder: `~/Library/Application Support/OxideSwarm`,
-   `%LOCALAPPDATA%\OxideSwarm` or `~/.local/share/oxideswarm`.
+1. It checks the archive against `SHA256SUMS`, and on v1 kits also checks the online GitHub
+   release `SHA256SUMS` over HTTPS when reachable (or against `OXIDESWARM_USB_ONLINE_SUMS_URL` if
+   set to `https://...`, `file://...`, or `off`; plain `http://` is always refused).
+2. It writes an install log to `<folder>/logs/install.log`, unpacks the binary into a per-user
+   folder (`~/Library/Application Support/OxideSwarm`, `%LOCALAPPDATA%\OxideSwarm-USB`, or
+   `~/.local/share/oxideswarm`), and automatically rolls back newly created files/registry entries if
+   a fresh install fails (such as a wrong passphrase).
+3. It joins the cluster (`oxideswarm join --invite-file invite.oxs --no-doctor` on v1, prompting for
+   the 4-word passphrase and pairing check confirmation) and seeds `worker_id.<name>` from
+   `cluster.secret` or `master_key` in `rusty-grid.toml`.
+4. When `kit.json` includes `worker` (and honors `workspaces` unless overridden by `--workspaces` /
+   `--no-workspaces` / `-Workspaces` / `-NoWorkspaces`), it starts the worker and configures logon
+   autostart (LaunchAgent on macOS, `systemd --user` or `~/.config/autostart` XDG `.desktop` +
+   `start-worker.sh` on Linux, `HKCU Run` on Windows).
+5. When `kit.json` includes `client` (or on legacy v0 kits), it runs `oxideswarm doctor` (skipped on
+   worker-only v1 kits). On uninstall, `--keep-key` / `-KeepKey` (or answering `y` at the prompt)
+   retains `<folder>/home/node.key` so rejoining keeps the same machine identity.
 3. It runs `oxideswarm join` with the token on standard input. The installed worker keeps its state
    in `<folder>/home` (through `OXIDESWARM_HOME`), so an existing `~/.oxideswarm` is never read or
    changed.
@@ -142,7 +174,7 @@ Double-click `Update OxideSwarm.command` (macOS) or `Update OxideSwarm.cmd` (Win
 `bash install.sh --update` on Linux, from a stick that carries the newer kit. The update:
 
 - finds the install (`--install-root`, else on Windows the folder recorded in
-  `HKCU\Software\OxideSwarm\UsbKit`, else the default folder) and stops if there is none;
+  `HKCU\Software\OxideSwarm\UsbKit`, else `%LOCALAPPDATA%\OxideSwarm-USB` falling back to legacy `%LOCALAPPDATA%\OxideSwarm`) and stops if there is none;
 - keeps its name, build (GPU or plain) and workspace choice from `kit-install.conf`
   (`kit-install.txt` on Windows), which the installer writes; for an older install the name comes
   from its `home/worker_id.<name>` file and, without a terminal, the plain build is kept;
@@ -157,9 +189,11 @@ An install that uses the GPU build is not updated from a kit without one, unless
 ### Another drive on Windows
 
 When the machine has another fixed NTFS or ReFS drive, `install.ps1` asks where to keep its files
-and lists `%LOCALAPPDATA%\OxideSwarm` (the default) and `<drive>:\OxideSwarm` for each such drive,
-with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
-the folder in advance. A folder outside `%LOCALAPPDATA%`:
+and lists `%LOCALAPPDATA%\OxideSwarm-USB` (the default) and `<drive>:\OxideSwarm-USB` for each such
+drive, with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
+the folder in advance (`-Update` still accepts legacy `%LOCALAPPDATA%\OxideSwarm` installs, while
+fresh installs refuse `%LOCALAPPDATA%\OxideSwarm` and `%LOCALAPPDATA%\oxideswarm\workspaces` so they
+never collide with a non-USB worker's default workspace root). A folder outside `%LOCALAPPDATA%`:
 
 - must be on a fixed NTFS or ReFS drive, not on the kit's drive, not the root of a drive, and new,
   empty or an earlier install of the kit. FAT and exFAT keep no permissions, and a removable drive
@@ -170,13 +204,18 @@ the folder in advance. A folder outside `%LOCALAPPDATA%`:
   on, and no folder on the way to it may be renamed, deleted or re-permissioned by another account.
   The result is checked before anything is written, for an update too. A new folder at the root of
   a data drive otherwise lets every local account change its content;
-- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`)
-  and the workspaces (`--workspace-root <folder>\workspaces`), which otherwise go to `%TEMP%` and the
-  user's cache folder on drive C.
+- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`),
+  while `%TEMP%\oxideswarm-usb\sandboxes` holds task folders for an install under `%LOCALAPPDATA%`.
+  In both locations, whenever `--workspaces` is enabled, `install.ps1` always passes
+  `--workspace-root <folder>\workspaces` (or `<folder>\usb-kit\workspaces` when updating a legacy
+  `%LOCALAPPDATA%\OxideSwarm` install) and marks it with `.oxideswarm-usb-workspaces`.
 
 The installer records the folder in `HKCU\Software\OxideSwarm\UsbKit`, and `uninstall.ps1` removes
-that install when it gets no `-InstallRoot`. While an install exists in one folder, the installer
-refuses another one unless `-InstallRoot` asks for it.
+that install when it gets no `-InstallRoot` (falling back to `%LOCALAPPDATA%\OxideSwarm-USB`, then
+legacy `%LOCALAPPDATA%\OxideSwarm`). Before stopping or deleting anything, `uninstall.ps1` refuses to
+remove `$InstallRoot` if `$InstallRoot\workspaces` lacks `.oxideswarm-usb-workspaces` or is used by
+another worker or service, naming which worker uses it. While an install exists in one folder, the
+installer refuses another one unless `-InstallRoot` asks for it.
 
 The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
 logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P
@@ -187,15 +226,20 @@ ticket before it passes the ticket to `oxideswarm`, because PowerShell 5.1 drops
 - **The token is the cluster secret.** Anyone holding the stick can join the cluster and run work on
   its workers. Keep the stick with people you trust. If it is lost, change the cluster secret
   (`docs/SECURITY.md` section 5).
-- **Checksums catch damage, not swaps.** They catch a damaged or outdated copy. They cannot catch
-  someone who replaced the archives, `SHA256SUMS` and the scripts together.
-- **Joining gives the cluster code execution.** A machine that joins a cluster runs that cluster's
-  work.
+- **Checksums catch damage, and online `SHA256SUMS` catches tampered release archives.** Stick
+  checksums detect corrupted copies, and online `SHA256SUMS` comparison catches mismatched archives
+  over HTTPS/file (while plain `http://` is refused). Always confirm the master fingerprint and
+  pairing check digits during `join` so an offline stick swap cannot redirect you to an unknown master.
+- **v1 invite kits isolate risk.** Each v1 kit uses an Argon2id + ChaCha20-Poly1305 encrypted
+  `invite.oxs` capped at N machines and expiry; revoke a lost stick immediately with
+  `oxideswarm invite --revoke <invite_id>` (see `kit.json`). On legacy v0 kits, rotate `cluster.secret`.
+- **Joining gives the cluster code execution.** Only join clusters of people you trust.
 
 ## Tests
 
-`python3 tests/test_launcher_scripts.py` (class `UsbKitTests`) runs `make_kit.sh`, `install.sh` and
-`uninstall.sh` against fake binaries in a private home directory, on Linux and macOS. The Windows
+`cargo test --locked --test cli_usb_kit_e2e` tests end-to-end `usb create` + `join --invite-file` +
+approval + expiry/use-cap + revocation + privacy. `python3 tests/test_launcher_scripts.py` tests
+`make_kit.sh`, `install.sh`, `uninstall.sh`, `install.ps1`, and `uninstall.ps1` (v0 and v1 flows).
 scripts were run by hand from a stick on Windows 11 on 2026-11-09: `install.ps1` joined the worker, and `uninstall.ps1` stopped it.
 On 2026-11-10, a P2P-only trial kit made with `--no-autostart` passed under Windows PowerShell 5.1
 through `Install OxideSwarm.cmd` with no manual change, and from a stick on macOS.
