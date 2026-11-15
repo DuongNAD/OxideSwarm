@@ -16,7 +16,7 @@ before adding or changing a document.
 | [guides/multi-agent-collaboration.md](guides/multi-agent-collaboration.md) | Runbook: cross-machine coding agent coordination and root-cause diagnostics via `OxideSwarm_Agent_Hub` | Coding agents |
 | [SECURITY.md](SECURITY.md) | Threat model, cluster secret, ports, tokens, who runs tasks | Users, reviewers |
 | [DEPLOYMENT.md](../DEPLOYMENT.md) | Agent Mesh deployment and operations (not the compute grid) | Users |
-| [PROJECT.md](../PROJECT.md) | Architecture, workspace layout, feature inventory, roadmap | Contributors |
+| [PROJECT.md](../PROJECT.md) | Architecture, workspace layout, feature inventory, and a link to the roadmap | Contributors |
 | [CLAUDE.md](../CLAUDE.md) | Build and test commands, architecture map for coding agents | Coding agents |
 | [ANDROID_ARCHITECTURE.md](../ANDROID_ARCHITECTURE.md) | Android design; parts are design only (see its status section) | Contributors |
 | [windows/README.md](../windows/README.md) | Windows launchers | Users |
@@ -24,23 +24,47 @@ before adding or changing a document.
 | [scripts/sync_network/README.md](../scripts/sync_network/README.md) | Shared-folder reachability probe (not part of the grid) | Users |
 | [benchmarks/interconnect/](../benchmarks/interconnect/COMPARATIVE_INTERCONNECT_BENCHMARK.md) | Recorded interconnect comparison and its validator | Contributors |
 | [benchmarks/model-bringup/README.md](../benchmarks/model-bringup/README.md) | Spike R14 of design 0056: where the time goes between a machine with no model and the first result. Session 1 has a script and one record. Sessions for spikes R15 to R18 of design 0062 are Planned | Owner, contributors |
+| [benchmarks/gpu-run/README.md](../benchmarks/gpu-run/README.md) | GPU tasks across two machines: `wgpu`, PyTorch CUDA and Blender Cycles from a macOS master to a Windows worker, isolation off (one record, 2026-11-16). The run under `--isolation fs` is Planned | Owner, contributors |
 | [design/](design/) | Design records, one per change to behaviour, CLI or wire format | Contributors |
+| [design/0001-two-node-readiness.md](design/0001-two-node-readiness.md) | Implemented: Two-node readiness: task placement, task inputs and a cluster check | Contributors |
+| [design/0002-mobile-coordination.md](design/0002-mobile-coordination.md) | Partial: Mobile coordination: thermal and battery throttling, adaptive keepalive and role arbitrage | Contributors |
+| [design/0003-distributed-file-staging.md](design/0003-distributed-file-staging.md) | Implemented: Distributed file staging and output artifact collection | Contributors |
+| [design/0004-mcp-and-discovery.md](design/0004-mcp-and-discovery.md) | Implemented: Model Context Protocol server and subnet-isolated discovery fallback | Contributors |
+| [design/0005-cluster-auth-v2-record-layer.md](design/0005-cluster-auth-v2-record-layer.md) | Implemented: Cluster authentication v2 for the encrypted record layer | Contributors |
+| [design/0006-content-addressed-data-plane.md](design/0006-content-addressed-data-plane.md) | Implemented: Content-addressed task inputs and output files | Contributors |
+| [design/0007-agent-bridge-message-trigger.md](design/0007-agent-bridge-message-trigger.md) | Implemented: Message trigger for the agent bridge | Contributors |
+| [design/0008-oversized-task-results-and-active-queue-budget.md](design/0008-oversized-task-results-and-active-queue-budget.md) | Implemented: Oversized task results and active queue byte budget | Contributors |
+| [design/0009-blender-and-3d-process-supervision.md](design/0009-blender-and-3d-process-supervision.md) | Implemented: Process supervision for Blender and 3D workloads | Contributors |
+| [design/0010-cli-cancel-and-result.md](design/0010-cli-cancel-and-result.md) | Implemented: CLI `cancel` and `result` subcommands | Contributors |
+| [design/0011-agent-mesh-hardening.md](design/0011-agent-mesh-hardening.md) | Implemented: Agent Mesh Command Hardening, Process Controls, and Launcher Integration | Contributors |
+| [design/0012-mcp-concurrent-deadlines-and-cancel.md](design/0012-mcp-concurrent-deadlines-and-cancel.md) | Implemented: Concurrent MCP server with client deadlines, cancellation, and progress | Contributors |
+| [design/0013-task-output-validation-and-harvesting.md](design/0013-task-output-validation-and-harvesting.md) | Implemented: Task Output Validation, Mandatory Harvesting Failure Semantics, and Staging Flag Enforcement | Contributors |
+| [design/0014-worker-max-concurrency-slots-tag.md](design/0014-worker-max-concurrency-slots-tag.md) | Implemented: Worker `--max-concurrency` (`slots:<n>`) Tag on the Master | Contributors |
+| [design/0015-engine-names-and-cpu-fallback.md](design/0015-engine-names-and-cpu-fallback.md) | Implemented: 3D Engine Name Validation, Strict Fallback Removal, and Default CPU Execution | Contributors |
+| [design/0016-mapreduce-cli-script-shipping.md](design/0016-mapreduce-cli-script-shipping.md) | Implemented: Ship Local Mapper/Reducer Scripts and Command Stages in `oxideswarm mapreduce` | Contributors |
+| [design/0017-honest-3d-sdf-fallback.md](design/0017-honest-3d-sdf-fallback.md) | Implemented: Honest 3D Procedural SDF Fallback, Neural Model Refusal, and Environment Isolation | Contributors |
+| [design/0018-inbound-json-blob-request-routing.md](design/0018-inbound-json-blob-request-routing.md) | Implemented: Unambiguous JSON routing for `InboundMessage::Worker(BlobRequest)` | Contributors |
+| [design/0019-agent-node-disconnect-fails-pending-commands.md](design/0019-agent-node-disconnect-fails-pending-commands.md) | Implemented: Fail pending Python Agent Mesh commands on socket disconnect | Contributors |
+| [design/0020-bounded-host-capability-probes.md](design/0020-bounded-host-capability-probes.md) | Implemented: Bounded host capability probes at worker start-up | Contributors |
+| [design/0021-private-default-sandbox-base.md](design/0021-private-default-sandbox-base.md) | Implemented: Private task directories | Contributors |
+| [design/0022-head-and-tail-stream-capture.md](design/0022-head-and-tail-stream-capture.md) | Implemented: Head-and-tail worker stream capture and midpoint truncation detection | Contributors |
 | [design/0023-generative-3d-and-autorig-subsystem.md](design/0023-generative-3d-and-autorig-subsystem.md) | Generative 3D (`gen3d`) and skeletal auto-rigging (`autorig`) architecture, Python/Blender drivers (`engines/`), and current limits (`3D-2`, `3D-3`) | Contributors |
 | [design/0024-wire-cli-flags-and-retire-ttl-eviction.md](design/0024-wire-cli-flags-and-retire-ttl-eviction.md) | Wire `--max-queue-size`, `--scheduler-policy`, `--wire-codec`, `[submit].timeout_secs`, and worker `--master` precedence, and remove dead TTL eviction (`SCHED-2`) | Contributors |
+| [design/0025-windows-executable-resolution.md](design/0025-windows-executable-resolution.md) | Implemented: Windows task executable resolution and PE validation | Contributors |
 | [design/0026-refuse-claim-master-role.md](design/0026-refuse-claim-master-role.md) | Refuse `WorkerMessage::ClaimMasterRole` on the master and drop `ROLE_ARBITRAGE` from `ProtocolCapabilities::all_supported()` (`FEAT-6`, decision D1) | Contributors |
 | [design/0027-ox-mode-honest-reporting.md](design/0027-ox-mode-honest-reporting.md) | Move the `ox-mode` workflow-mode execution engine to `crates/cli` and report real benchmark, simulation, cluster status, test, and doc results (`MODE-1`) | Contributors |
 | [design/0028-host-battery-probe-override.md](design/0028-host-battery-probe-override.md) | Host battery probe override (`WorkerConfig::with_no_battery` and `RUSTY_GRID_NO_BATTERY`) and start-up warning | Contributors |
 | [design/0029-mesh-client-wss-tls.md](design/0029-mesh-client-wss-tls.md) | Enable `wss://` TLS in the Rust `agent-mesh` client and add `--tls-ca` (`OXIDE_MESH_TLS_CA`) for private TLS proxies (`MESH-1`) | Contributors |
 | [design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md](design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md) | MCP post-reply `notifications/cancelled` (`completed_submits`), `4 s` stdio EOF grace window, and P2P master relay readiness (`5 s`) and endpoint shutdown | Contributors |
-| [design/0031-containment-after-worker-crash.md](design/0031-containment-after-worker-crash.md) | Per-task lifeline pipe and supervisor so a task tree dies within 5 s after a worker `SIGKILL` on Linux, macOS, and Android (`FEAT-2`) | Contributors |
+| [design/0031-containment-after-worker-crash.md](design/0031-containment-after-worker-crash.md) | Implemented: per-task lifeline pipe and supervisor so a task tree dies within 5 s after a worker `SIGKILL` on Linux, macOS, and Android (`FEAT-2`) | Contributors |
 | [design/0032-p2p-handshake-refusal-delivery.md](design/0032-p2p-handshake-refusal-delivery.md) | P2P QUIC handshake and cluster-auth refusal delivery via stream finish and bounded `conn.closed()` drain (`BUG-17`) | Contributors |
-| [design/0033-os-level-task-isolation.md](design/0033-os-level-task-isolation.md) | Accepted: OS-level task isolation (`--isolation off\|fs\|fs+net`) via Landlock/`seccomp`/namespaces on Linux (`FEAT-3b`), `sandbox-exec` on macOS (`FEAT-3a`), and per-task AppContainer on Windows (`FEAT-3c`), plus `iso:` tag, `require:iso=` placement and `doctor` reporting (`FEAT-3`, all three platforms implemented) | Contributors |
+| [design/0033-os-level-task-isolation.md](design/0033-os-level-task-isolation.md) | Implemented: OS-level task isolation (`--isolation off\|fs\|fs+net`) via Landlock/`seccomp`/namespaces on Linux (`FEAT-3b`), `sandbox-exec` on macOS (`FEAT-3a`), and per-task AppContainer on Windows (`FEAT-3c`), plus `iso:` tag, `require:iso=` placement and `doctor` reporting (`FEAT-3`, all three platforms implemented) | Contributors |
 | [design/0034-fail-unfulfillable-tasks.md](design/0034-fail-unfulfillable-tasks.md) | Fail unfulfillable tasks (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) when no registered worker can satisfy capabilities or placement constraints (`SCHED-3`) | Contributors |
 | [design/0036-bounded-uncharged-worker-evacuations.md](design/0036-bounded-uncharged-worker-evacuations.md) | Bounded uncharged voluntary worker drains (`WorkerMessage::Disconnecting`, `RetryPolicy::max_evacuations`, `TaskInfo::evacuation_count`), `retry_history` audit entries, and `Running` `max_retries == 0` guard (`MOB-3`) | Contributors |
 | [design/0038-large-language-model-inference.md](design/0038-large-language-model-inference.md) | Planned: language model inference on the grid, by expert routing to local model servers and by llama.cpp RPC over an authenticated tunnel (`LLM-1` to `LLM-5`) | Contributors |
-| [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Accepted, W1–W11 built and recorded live on two machines (`Task::workspace`, `Hello`, `ListWorkspaces`, protocol version 7, `oxideswarm-tree/2`): persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
+| [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Implemented, W1–W11 built and recorded live on two machines (`Task::workspace`, `Hello`, `ListWorkspaces`, protocol version 7, `oxideswarm-tree/2`): persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
 | [design/0040-protocol-versioning.md](design/0040-protocol-versioning.md) | Protocol version 9 (initially 3), golden-bytes version-bump enforcement, `RegisterAck` feature-bit gating, and client-path protocol versioning (`FEAT-8`, `FEAT-1`, `ENROLL-1b`, `FEAT-9a`) | Contributors |
-| [design/0044-dead-code-and-connection-loop-unification.md](design/0044-dead-code-and-connection-loop-unification.md) | Planned: remove dead code, merge TCP and 2-lane QUIC worker connection loops into `WorkerSession`, sweep leftover sandboxes at start-up, and gate `gen3d`/`autorig` behind Cargo feature `3d` (`FEAT-11`, decision Q2) | Contributors |
+| [design/0044-dead-code-and-connection-loop-unification.md](design/0044-dead-code-and-connection-loop-unification.md) | Implemented: remove dead code, merge TCP and 2-lane QUIC worker connection loops into `WorkerSession`, sweep leftover sandboxes at start-up, and gate `gen3d`/`autorig` behind Cargo feature `3d` (`FEAT-11`, decision Q2) | Contributors |
 | [design/0045-distributed-training.md](design/0045-distributed-training.md) | Planned, after the core of the roadmap: training on several workers with a framework the owner installs, by independent runs, low-communication rounds and adapter rounds (`TRAIN-1` to `TRAIN-5`), and a first workload for independent runs: grading edits to the weights of a small model (spike `R19`) | Contributors |
 | [design/0046-master-durability.md](design/0046-master-durability.md) | Implemented: append-only task journal and snapshot store (`--state-dir`), startup replay, store-health reporting (`ClusterStatus.store_error`, protocol version 5), and worker session resume (`WorkerMessage::ResumeSession`) (`FEAT-1`) | Contributors |
 | [design/0047-windows-private-files.md](design/0047-windows-private-files.md) | Implemented: files created as private on Windows (cluster secret, master P2P key, ticket file and their directory) get a protected DACL for the current user, SYSTEM and Administrators at creation, and loading them warns with the `icacls` fix when the DACL is wider (`SEC-9`) | Contributors |
@@ -71,6 +95,9 @@ before adding or changing a document.
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
+Design record numbers 0035, 0037, 0041 and 0043 were never used. 0042 (remote workspaces) was a
+draft that design 0039 replaced before it merged.
+
 ## Document types
 
 | Type | Location | Purpose | Required sections |
@@ -95,7 +122,10 @@ before adding or changing a document.
 6. **Nothing that drifts silently:** no item counts in headings, no performance number without the
    script that measured it.
 7. **Fixed vocabulary.** Status: Implemented, Partial, Planned, Design only. Dates: ISO 8601
-   (`2026-10-23`). Units: MB, MiB, ms, GFLOP/s.
+   (`2026-10-23`). Units: MB, MiB, ms, GFLOP/s. The `Status:` line of a design record is the
+   exception: it states where the record stands (Draft, Accepted, Partial, Implemented or
+   Superseded by NNNN), and its work-item table uses the fixed vocabulary. A record moves to
+   Implemented when every work item in its table is Implemented.
 8. **Headings** in sentence case, without emoji; numbered only in long reference documents.
 9. **Code and documentation land together.** A change to the wire protocol, a CLI flag, a port, an
    environment variable or a default updates the `README.md` reference in the same change (commit,
@@ -109,7 +139,7 @@ Design record:
 ```text
 # NNNN: <Title>
 
-Status: Draft | Accepted | Implemented | Superseded by NNNN
+Status: Draft | Accepted | Partial | Implemented | Superseded by NNNN
 Created: YYYY-MM-DD    Updated: YYYY-MM-DD
 
 ## Summary          what changes, in five lines or fewer
