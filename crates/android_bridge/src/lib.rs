@@ -9,7 +9,7 @@
 //! against the Android 12+ Phantom Process Killer (PPK) and W^X execution restrictions.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -94,6 +94,48 @@ impl WorkerState {
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static LIVE_WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
+static MAX_LIVE_WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+struct WorkerThreadGuard;
+
+impl WorkerThreadGuard {
+    fn new() -> Self {
+        let live = LIVE_WORKER_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_LIVE_WORKER_THREADS.fetch_max(live, Ordering::SeqCst);
+        assert!(
+            live <= 1,
+            "Invariant violated: multiple worker threads alive simultaneously (count={live})"
+        );
+        Self
+    }
+}
+
+impl Drop for WorkerThreadGuard {
+    fn drop(&mut self) {
+        LIVE_WORKER_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Returns the current number of active worker threads (for testing).
+#[doc(hidden)]
+pub fn live_worker_threads_for_testing() -> usize {
+    LIVE_WORKER_THREADS.load(Ordering::SeqCst)
+}
+
+/// Returns the maximum number of simultaneously active worker threads observed (for testing).
+#[doc(hidden)]
+pub fn max_live_worker_threads_for_testing() -> usize {
+    MAX_LIVE_WORKER_THREADS.load(Ordering::SeqCst)
+}
+
+/// Resets the worker thread count and high-water mark (for testing).
+#[doc(hidden)]
+pub fn reset_worker_thread_counts_for_testing() {
+    LIVE_WORKER_THREADS.store(0, Ordering::SeqCst);
+    MAX_LIVE_WORKER_THREADS.store(0, Ordering::SeqCst);
 }
 
 static WORKER_STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
@@ -279,10 +321,18 @@ pub fn start_worker_impl(
     *lock_unpoisoned(&state.shutdown_tx) = Some(shutdown_tx);
     *lock_unpoisoned(&state.status) = "STARTING".to_string();
 
+    let mut handle_guard = lock_unpoisoned(&state.thread_handle);
+    if !state.running.load(Ordering::SeqCst) || state.stopping.load(Ordering::SeqCst) {
+        *lock_unpoisoned(&state.shutdown_tx) = None;
+        state.running.store(false, Ordering::SeqCst);
+        return false;
+    }
+
     let state_clone = Arc::clone(&state);
     let handle = std::thread::Builder::new()
         .name("OxideWorker-Tokio".to_string())
         .spawn(move || {
+            let _worker_guard = WorkerThreadGuard::new();
             if *shutdown_rx.borrow() {
                 return;
             }
@@ -341,10 +391,12 @@ pub fn start_worker_impl(
 
     match handle {
         Ok(h) => {
-            *lock_unpoisoned(&state.thread_handle) = Some(h);
+            *handle_guard = Some(h);
+            drop(handle_guard);
             true
         }
         Err(e) => {
+            drop(handle_guard);
             error!("Failed to spawn native worker thread: {}", e);
             *lock_unpoisoned(&state.shutdown_tx) = None;
             state.running.store(false, Ordering::SeqCst);
@@ -404,28 +456,36 @@ pub fn start_worker_with_secret_impl(
 
 /// Core implementation for stopping the native worker client without blocking the calling thread.
 ///
-/// Signals the worker's shutdown channel, marks the bridge as stopping (`running = false`,
-/// `stopping = true`, status `STOPPING`), and spawns a detached thread to `join()` the worker
-/// thread and set the final status (`STOPPED`) once the worker finishes draining.
+/// Signals the worker's shutdown channel, marks the bridge as stopping (`stopping = true`,
+/// status `STOPPING`), releases the running state, and spawns a detached thread to `join()` the
+/// worker thread and set the final status (`STOPPED`) once the worker finishes draining.
 pub fn stop_worker_impl() -> bool {
     let state = get_worker_state();
+    let was_stopping = state.stopping.swap(true, Ordering::SeqCst);
+
+    let handle_opt = lock_unpoisoned(&state.thread_handle).take();
+    let tx_opt = lock_unpoisoned(&state.shutdown_tx).take();
+    if let Some(ref tx) = tx_opt {
+        let _ = tx.send(true);
+    }
+
+    if handle_opt.is_some() {
+        *lock_unpoisoned(&state.status) = "STOPPING".to_string();
+    }
+
     let was_running = state
         .running
         .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
-    let handle_opt = lock_unpoisoned(&state.thread_handle).take();
+
     if !was_running && handle_opt.is_none() {
+        if !was_stopping {
+            state.stopping.store(false, Ordering::SeqCst);
+        }
         return true;
     }
 
     if let Some(h) = handle_opt {
-        state.stopping.store(true, Ordering::SeqCst);
-        *lock_unpoisoned(&state.status) = "STOPPING".to_string();
-
-        if let Some(tx) = lock_unpoisoned(&state.shutdown_tx).take() {
-            let _ = tx.send(true);
-        }
-
         let state_clone = Arc::clone(&state);
         std::thread::spawn(move || {
             let _ = h.join();
@@ -433,12 +493,10 @@ pub fn stop_worker_impl() -> bool {
             state_clone.stopping.store(false, Ordering::SeqCst);
         });
     } else {
-        if let Some(tx) = lock_unpoisoned(&state.shutdown_tx).take() {
-            let _ = tx.send(true);
+        if !was_stopping {
+            state.stopping.store(false, Ordering::SeqCst);
         }
-        if !state.stopping.load(Ordering::SeqCst) {
-            *lock_unpoisoned(&state.status) = "STOPPED".to_string();
-        }
+        *lock_unpoisoned(&state.status) = "STOPPED".to_string();
     }
     true
 }
@@ -907,6 +965,7 @@ mod tests {
     fn reset_test_state() {
         stop_worker_impl();
         wait_until_not_stopping();
+        reset_worker_thread_counts_for_testing();
         set_p2p_minimal_preset_for_testing(false);
         let ws = get_worker_state();
         *lock_unpoisoned(&ws.telemetry) = MobileTelemetry::default();
@@ -1407,6 +1466,93 @@ mod tests {
         assert!(stop_worker_impl());
         wait_until_not_stopping();
         assert_eq!(status_text(), "STOPPED");
+
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_interleaved_stop_start_at_most_one_worker_thread() {
+        let _guard = lock_unpoisoned(&TEST_MUTEX);
+        reset_test_state();
+        let dir = scratch_dir("interleave-stop-start");
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier2 = Arc::clone(&barrier);
+
+        let start_time = std::time::Instant::now();
+
+        let h1 = std::thread::spawn(move || {
+            for i in 0..200 {
+                barrier.wait();
+                if i % 2 == 0 {
+                    start_worker_impl(
+                        "127.0.0.1:59995".to_string(),
+                        None,
+                        format!("Interleave-T1-{i}"),
+                        1,
+                        512,
+                        false,
+                        5,
+                    );
+                } else {
+                    stop_worker_impl();
+                }
+                assert!(
+                    live_worker_threads_for_testing() <= 1,
+                    "More than 1 worker thread detected in thread 1 at iteration {i}"
+                );
+            }
+        });
+
+        let h2 = std::thread::spawn(move || {
+            for i in 0..200 {
+                barrier2.wait();
+                if i % 2 == 0 {
+                    stop_worker_impl();
+                } else {
+                    start_worker_impl(
+                        "127.0.0.1:59995".to_string(),
+                        None,
+                        format!("Interleave-T2-{i}"),
+                        1,
+                        512,
+                        false,
+                        5,
+                    );
+                }
+                assert!(
+                    live_worker_threads_for_testing() <= 1,
+                    "More than 1 worker thread detected in thread 2 at iteration {i}"
+                );
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let elapsed = start_time.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "Test exceeded 10s: took {elapsed:?}"
+        );
+
+        assert!(stop_worker_impl());
+        wait_until_not_stopping();
+
+        assert_eq!(
+            live_worker_threads_for_testing(),
+            0,
+            "Expected 0 live worker threads after stop"
+        );
+        assert!(
+            max_live_worker_threads_for_testing() <= 1,
+            "Max live worker threads exceeded 1: {}",
+            max_live_worker_threads_for_testing()
+        );
 
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);
