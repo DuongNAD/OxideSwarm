@@ -532,7 +532,7 @@ impl TaskView {
             task_key,
             queued_for: Duration::ZERO,
             requirements: task.requirements.clone(),
-            requires_gpu: task.requirements.gpu_required || task.spec.requires_gpu(),
+            requires_gpu: task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu(),
             heavy: matches!(
                 task.spec,
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
@@ -601,6 +601,9 @@ pub struct AssignedLoad {
     /// Declared RAM of the assigned tasks that have not started yet. A running task's memory
     /// already shows in the worker's reported free RAM; a merely scheduled one does not.
     pub unstarted_ram_mb: u64,
+    /// Declared GPU VRAM of all active tasks (`Scheduled`, `Running`, or held for adoption).
+    /// Unlike host RAM, worker heartbeats report static total VRAM rather than live free VRAM.
+    pub vram_mb: u64,
 }
 
 /// What `TaskQueue::record_result_from` did with a worker's result.
@@ -3294,6 +3297,9 @@ impl TaskQueue {
                 if entry.state == TaskState::Scheduled {
                     load.unstarted_ram_mb += entry.task.requirements.ram_mb;
                 }
+                load.vram_mb = load
+                    .vram_mb
+                    .saturating_add(entry.task.requirements.effective_vram_mb());
             }
             if load.tasks > 0 {
                 loads.insert(*worker_id, load);
@@ -3309,6 +3315,9 @@ impl TaskQueue {
                         let load = loads.entry(worker_id).or_default();
                         load.tasks += 1;
                         load.slots += entry.task.requirements.cpu_cores.max(1);
+                        load.vram_mb = load
+                            .vram_mb
+                            .saturating_add(entry.task.requirements.effective_vram_mb());
                     }
                 }
             }
@@ -7484,6 +7493,57 @@ mod tests {
         let loads = queue.assigned_loads().await;
         assert!(!loads.contains_key(&b));
         assert_eq!(loads[&a].tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn test_assigned_loads_track_vram_across_scheduled_running_and_finished() {
+        let queue = TaskQueue::new();
+        let worker = Uuid::new_v4();
+        let gpu_a = Task::new(
+            TaskSpec::command("train-a", vec![]),
+            TaskRequirements::new(1, 1024, true, 60).with_vram_mb(4096),
+        );
+        let gpu_b = Task::new(
+            TaskSpec::command("train-b", vec![]),
+            TaskRequirements::new(1, 512, true, 60).with_vram_mb(2048),
+        );
+        let id_a = submit_and_assign(&queue, gpu_a, worker, 1).await;
+        let id_b = submit_and_assign(&queue, gpu_b, worker, 1).await;
+
+        let loads = queue.assigned_loads().await;
+        assert_eq!(loads[&worker].unstarted_ram_mb, 1024 + 512);
+        assert_eq!(loads[&worker].vram_mb, 4096 + 2048);
+
+        // Once `gpu_a` transitions to Running, host RAM leaves `unstarted_ram_mb`,
+        // but VRAM stays reserved because heartbeats report static total VRAM.
+        queue
+            .mark_running_from(worker, Some(1), &id_a)
+            .await
+            .unwrap();
+        let loads = queue.assigned_loads().await;
+        assert_eq!(loads[&worker].unstarted_ram_mb, 512);
+        assert_eq!(loads[&worker].vram_mb, 4096 + 2048);
+
+        queue
+            .record_result_from(
+                worker,
+                Some(1),
+                TaskResult::success(worker, id_a, "", 1, false),
+            )
+            .await
+            .unwrap();
+        let loads = queue.assigned_loads().await;
+        assert_eq!(loads[&worker].vram_mb, 2048);
+
+        queue
+            .record_result_from(
+                worker,
+                Some(1),
+                TaskResult::success(worker, id_b, "", 1, false),
+            )
+            .await
+            .unwrap();
+        assert!(!queue.assigned_loads().await.contains_key(&worker));
     }
 
     #[tokio::test]
