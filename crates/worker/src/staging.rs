@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusty_grid_core::blob::{
-    join_blob_path, validate_blob_path, BlobFile, InputSource, OutputPattern, TaskInput,
-    TreeManifest, MAX_MANIFEST_BYTES,
+    join_blob_path, open_regular_file_nofollow, validate_blob_path, BlobFile, InputSource,
+    OutputPattern, TaskInput, TreeManifest, MAX_MANIFEST_BYTES,
 };
 
 use crate::blob_cache::{BlobCache, CachePin};
@@ -173,7 +173,7 @@ fn collect_outputs_inner(
     limits: OutputLimits,
     process_failed: bool,
     allow_move: bool,
-    mut pin: Option<&mut CachePin>,
+    pin: Option<&mut CachePin>,
 ) -> Result<Vec<BlobFile>, String> {
     let patterns = patterns
         .iter()
@@ -268,7 +268,17 @@ fn collect_outputs_inner(
         ));
     }
 
-    let total: u64 = found.values().map(|f| f.size).sum();
+    insert_found_outputs(found, cache, limits, allow_move, pin)
+}
+
+fn check_output_limits(
+    found: &BTreeMap<String, Found>,
+    limits: OutputLimits,
+) -> Result<(), String> {
+    let total: u64 = found
+        .values()
+        .map(|f| f.size)
+        .fold(0u64, u64::saturating_add);
     if found.len() > limits.max_files || total > limits.max_bytes {
         let (largest_path, largest) = found
             .iter()
@@ -286,15 +296,45 @@ fn collect_outputs_inner(
             human_bytes(limits.max_bytes)
         ));
     }
+    Ok(())
+}
+
+fn format_output_error(rel: &str, err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::InvalidInput {
+        format!(
+            "output '{rel}' is not a regular file or directory (symbolic links are never returned): {err}"
+        )
+    } else {
+        format!("output '{rel}': {err}")
+    }
+}
+
+fn insert_found_outputs(
+    mut found: BTreeMap<String, Found>,
+    cache: &BlobCache,
+    limits: OutputLimits,
+    allow_move: bool,
+    mut pin: Option<&mut CachePin>,
+) -> Result<Vec<BlobFile>, String> {
+    check_output_limits(&found, limits)?;
 
     let mut outputs = Vec::with_capacity(found.len());
-    for (rel, file) in found {
-        let executable = is_executable(&file.path);
-        let (id, size) = match pin.as_deref_mut() {
-            Some(pin) => cache.insert_file_pinned(&file.path, allow_move, pin),
-            None => cache.insert_file(&file.path, allow_move),
+    let paths: Vec<String> = found.keys().cloned().collect();
+    for rel in paths {
+        let path = found[&rel].path.clone();
+        let (file, meta) =
+            open_regular_file_nofollow(&path).map_err(|e| format_output_error(&rel, e))?;
+        let descriptor_size = meta.len();
+        found.get_mut(&rel).expect("key from found").size = descriptor_size;
+        check_output_limits(&found, limits)?;
+        let executable = is_executable(&meta);
+        let (id, size) = cache
+            .insert_open_file(&path, file, &meta, allow_move, pin.as_deref_mut())
+            .map_err(|e| format_output_error(&rel, e))?;
+        if size != descriptor_size {
+            found.get_mut(&rel).expect("key from found").size = size;
+            check_output_limits(&found, limits)?;
         }
-        .map_err(|e| format!("output '{rel}': {e}"))?;
         outputs.push(BlobFile {
             path: rel,
             id,
@@ -363,15 +403,15 @@ fn check_selected_entry_path(rel: &str, entry_utf8: bool) -> Result<(), String> 
     validate_blob_path(rel).map_err(|e| format!("output '{rel}': {e}"))
 }
 
-fn is_executable(path: &Path) -> bool {
+fn is_executable(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = meta;
         false
     }
 }
@@ -793,5 +833,136 @@ mod tests {
             err.contains("cannot read output directory 'out/locked'"),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapping_selected_output_for_symlink_after_walk_is_refused() {
+        let (dir, sandbox, cache) = setup();
+        let secret = dir.path().join("outside-secret.txt");
+        let secret_bytes = b"worker-only secret outside sandbox";
+        std::fs::write(&secret, secret_bytes).unwrap();
+
+        write(&sandbox, "out/result.txt", b"initial output");
+        let target_path = sandbox.join("out/result.txt");
+        let mut found = BTreeMap::new();
+        found.insert(
+            "out/result.txt".to_string(),
+            Found {
+                path: target_path.clone(),
+                size: 14,
+            },
+        );
+
+        // Simulate a surviving process replacing the selected output with a symlink after the walk
+        // and before insertion into the blob cache.
+        std::fs::remove_file(&target_path).unwrap();
+        std::os::unix::fs::symlink(&secret, &target_path).unwrap();
+
+        let err =
+            insert_found_outputs(found, &cache, OutputLimits::default(), true, None).unwrap_err();
+        assert!(err.contains("out/result.txt"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            !cache.contains(&BlobId::of(secret_bytes)),
+            "symlink target bytes must never enter the cache"
+        );
+        assert_eq!(cache.usage(), (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_output_does_not_block_and_is_refused() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, sandbox, cache) = setup();
+        let fifo = sandbox.join("pipe.out");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a valid NUL-terminated path in a private tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        // 1. Literal output pattern naming a FIFO is refused during the walk.
+        let walk_err = collect_outputs(
+            &sandbox,
+            &["pipe.out".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(walk_err.contains("pipe.out"), "{walk_err}");
+        assert!(walk_err.contains("not a regular file"), "{walk_err}");
+
+        // 2. A selected output replaced by a FIFO after the walk and before insertion is opened
+        //    with O_NONBLOCK (never blocks) and refused.
+        let mut found = BTreeMap::new();
+        found.insert(
+            "pipe.out".to_string(),
+            Found {
+                path: fifo,
+                size: 0,
+            },
+        );
+        let insert_err =
+            insert_found_outputs(found, &cache, OutputLimits::default(), true, None).unwrap_err();
+        assert!(insert_err.contains("pipe.out"), "{insert_err}");
+        assert!(insert_err.contains("not a regular file"), "{insert_err}");
+        assert_eq!(cache.usage(), (0, 0));
+    }
+
+    #[test]
+    fn hard_linked_outputs_and_descriptor_size_limits_work() {
+        let (_dir, sandbox, cache) = setup();
+        write(&sandbox, "out/normal.bin", b"normal");
+        write(&sandbox, "out/shared.bin", b"shared");
+        #[cfg(unix)]
+        std::fs::hard_link(sandbox.join("out/shared.bin"), sandbox.join("kept.bin")).unwrap();
+
+        let outputs = collect_outputs(
+            &sandbox,
+            &["out/**".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap();
+        let paths: Vec<&str> = outputs.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, ["out/normal.bin", "out/shared.bin"]);
+        assert_eq!(outputs[0].id, BlobId::of(b"normal"));
+        assert_eq!(outputs[1].id, BlobId::of(b"shared"));
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(sandbox.join("kept.bin")).unwrap(),
+            b"shared",
+            "hard-linked output is copied into the cache without stealing the other link"
+        );
+
+        // Output size limits are checked against the open descriptor's size even if the file grew
+        // after the directory walk recorded a smaller `Found.size`.
+        let grown = sandbox.join("out/grown.bin");
+        std::fs::write(&grown, vec![7u8; 4096]).unwrap();
+        let mut found = BTreeMap::new();
+        found.insert(
+            "out/grown.bin".to_string(),
+            Found {
+                path: grown,
+                size: 16,
+            },
+        );
+        let err = insert_found_outputs(
+            found,
+            &cache,
+            OutputLimits {
+                max_bytes: 1024,
+                max_files: 10,
+            },
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("out/grown.bin"), "{err}");
+        assert!(err.contains("--output-limit-mb"), "{err}");
+        assert!(!cache.contains(&BlobId::of(&vec![7u8; 4096])));
     }
 }

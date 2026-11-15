@@ -192,9 +192,10 @@ pub fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<(BlobId, u64)> {
     Ok((hasher.finish(), len))
 }
 
-/// Opens `path` for reading without following a final symbolic link (`O_NOFOLLOW` on Unix,
-/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows) and inspects the open descriptor with `fstat`
-/// (`file.metadata()`), refusing anything that is not a regular file.
+/// Opens `path` for reading without following a final symbolic link (`O_NOFOLLOW | O_NONBLOCK` on
+/// Unix so a FIFO cannot block the open, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows) and inspects
+/// the open descriptor with `fstat` (`file.metadata()`), refusing anything that is not a regular
+/// file.
 pub fn open_regular_file_nofollow(
     path: &Path,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
@@ -203,7 +204,7 @@ pub fn open_regular_file_nofollow(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -219,6 +220,28 @@ pub fn open_regular_file_nofollow(
                 std::io::ErrorKind::InvalidInput,
                 "symbolic links are not sent",
             ));
+        }
+        #[cfg(windows)]
+        Err(e) => {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if let Ok(m) = std::fs::symlink_metadata(path) {
+                if m.file_type().is_symlink()
+                    || (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "symbolic links are not sent",
+                    ));
+                }
+                if !m.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ));
+                }
+            }
+            return Err(e);
         }
         Err(e) => return Err(e),
     };
@@ -246,9 +269,11 @@ pub fn open_regular_file_nofollow(
     Ok((file, meta))
 }
 
-/// Hashes the file at `path`: its blob id and its length.
+/// Hashes the regular file at `path` without following a final symbolic link: its blob id and its
+/// length.
 pub fn hash_file(path: &Path) -> std::io::Result<(BlobId, u64)> {
-    hash_reader(std::fs::File::open(path)?)
+    let (file, _) = open_regular_file_nofollow(path)?;
+    hash_reader(file)
 }
 
 /// Checks that `path` is a canonical relative blob path: `/`-separated segments that are not
@@ -2130,5 +2155,37 @@ mod tests {
             .collect();
         let err_bytes = TreeManifest::with_entries(over_byte_budget, vec![], vec![]).unwrap_err();
         assert!(err_bytes.contains("byte limit"), "{err_bytes}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_nofollow_refuses_symlinks_and_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular.txt");
+        std::fs::write(&regular, b"hello").unwrap();
+        let (f, meta) = open_regular_file_nofollow(&regular).unwrap();
+        assert_eq!(meta.len(), 5);
+        assert_eq!(hash_reader(f).unwrap(), (BlobId::of(b"hello"), 5));
+
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let link_err = open_regular_file_nofollow(&link).unwrap_err();
+        assert_eq!(link_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(link_err.to_string().contains("symbolic link"), "{link_err}");
+        assert!(hash_file(&link).is_err());
+
+        let fifo = dir.path().join("pipe.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a valid NUL-terminated path in a private tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let fifo_err = open_regular_file_nofollow(&fifo).unwrap_err();
+        assert_eq!(fifo_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            fifo_err.to_string().contains("not a regular file"),
+            "{fifo_err}"
+        );
     }
 }

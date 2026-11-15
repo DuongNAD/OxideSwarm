@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use rusty_grid_core::blob::{hash_file, BlobHasher, BlobId};
+use rusty_grid_core::blob::{hash_reader, open_regular_file_nofollow, BlobHasher, BlobId};
 use rusty_grid_core::task::TaskId;
 
 /// Default bound of the worker's blob cache: 2 GiB.
@@ -378,9 +378,21 @@ impl BlobCache {
         &self,
         path: &Path,
         allow_move: bool,
+        pin: Option<&mut CachePin>,
+    ) -> io::Result<(BlobId, u64)> {
+        let (file, meta) = open_regular_file_nofollow(path)?;
+        self.insert_open_file(path, file, &meta, allow_move, pin)
+    }
+
+    pub(crate) fn insert_open_file(
+        &self,
+        path: &Path,
+        mut file: File,
+        meta: &std::fs::Metadata,
+        allow_move: bool,
         mut pin: Option<&mut CachePin>,
     ) -> io::Result<(BlobId, u64)> {
-        let (id, size) = hash_file(path)?;
+        let (id, size) = hash_reader(&mut file)?;
         {
             let mut inner = self.lock();
             if inner.touch(&id) && self.object_path(&id).exists() {
@@ -392,9 +404,21 @@ impl BlobCache {
             }
         }
         let tmp = self.temp_path();
-        let moved = allow_move && single_link(path) && std::fs::rename(path, &tmp).is_ok();
+        let moved = if allow_move
+            && descriptor_is_single_link(&file, meta)
+            && std::fs::rename(path, &tmp).is_ok()
+        {
+            if moved_entry_matches_descriptor(&tmp, &file, meta, size) {
+                true
+            } else {
+                remove_moved_entry(&tmp);
+                false
+            }
+        } else {
+            false
+        };
         if !moved {
-            if let Err(e) = copy_verified(path, &tmp, id) {
+            if let Err(e) = copy_descriptor_verified(&mut file, &tmp, id, size) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
@@ -627,17 +651,135 @@ fn copy_verified(src: &Path, dest: &Path, id: BlobId) -> io::Result<()> {
     Ok(())
 }
 
-/// True when moving `path` cannot change any other file: it is the only link to its content.
-fn single_link(path: &Path) -> bool {
+/// Copies the open `input` descriptor (rewound to offset 0) to the new file `dest`, hashing on the
+/// way, and fails with `InvalidData` unless the content has `expected_size` bytes and matches `id`.
+fn copy_descriptor_verified(
+    input: &mut File,
+    dest: &Path,
+    id: BlobId,
+    expected_size: u64,
+) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    input.seek(SeekFrom::Start(0))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    let mut hasher = BlobHasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+        written += n as u64;
+    }
+    if written != expected_size || hasher.finish() != id {
+        return Err(corrupt(&id));
+    }
+    Ok(())
+}
+
+/// True when moving the open descriptor cannot change any other file: it is a regular file with a
+/// single link to its content.
+fn descriptor_is_single_link(file: &File, meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.nlink() == 1)
+        let _ = file;
+        meta.is_file() && !meta.file_type().is_symlink() && meta.nlink() == 1
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+        windows_file_identity(file).is_some_and(|(_, _, nlink)| meta.is_file() && nlink == 1)
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, meta);
+        false
+    }
+}
+
+/// True when `tmp` after `rename(path, tmp)` is a regular file (never a symbolic link or reparse
+/// point) with the same inode/file-index and single link as the open descriptor `file` / `meta`.
+fn moved_entry_matches_descriptor(
+    tmp: &Path,
+    file: &File,
+    meta: &std::fs::Metadata,
+    expected_size: u64,
+) -> bool {
+    let Ok(tmp_meta) = std::fs::symlink_metadata(tmp) else {
+        return false;
+    };
+    if tmp_meta.file_type().is_symlink() || !tmp_meta.is_file() || tmp_meta.len() != expected_size {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        tmp_meta.dev() == meta.dev() && tmp_meta.ino() == meta.ino() && tmp_meta.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let _ = meta;
+        if (tmp_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return false;
+        }
+        let Some((vol, idx, _)) = windows_file_identity(file) else {
+            return false;
+        };
+        let Ok((tmp_file, _)) = open_regular_file_nofollow(tmp) else {
+            return false;
+        };
+        windows_file_identity(&tmp_file)
+            .is_some_and(|(t_vol, t_idx, t_nlink)| t_vol == vol && t_idx == idx && t_nlink == 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, meta);
+        false
+    }
+}
+
+fn remove_moved_entry(tmp: &Path) {
+    if std::fs::remove_file(tmp).is_err()
+        && std::fs::remove_dir(tmp).is_err()
+        && std::fs::symlink_metadata(tmp).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain integer fields.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns `handle` for the duration of this call.
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        return None;
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return None;
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+    if info.dwVolumeSerialNumber == 0 && index == 0 {
+        return None;
+    }
+    Some((info.dwVolumeSerialNumber, index, info.nNumberOfLinks))
 }
 
 #[cfg(test)]
@@ -755,6 +897,95 @@ mod tests {
                 "a linked file is copied, not moved"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_file_refuses_symlink_outside_sandbox_and_never_caches_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 1 << 20);
+        let secret = dir.path().join("outside-secret.txt");
+        let secret_bytes = b"private host secret";
+        std::fs::write(&secret, secret_bytes).unwrap();
+
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let link = sandbox.join("out.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        for allow_move in [true, false] {
+            let err = cache.insert_file(&link, allow_move).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("symbolic link"), "{err}");
+            assert!(!cache.contains(&BlobId::of(secret_bytes)));
+            assert!(!cache.object_path(&BlobId::of(secret_bytes)).exists());
+            assert_eq!(cache.usage(), (0, 0));
+        }
+        assert_eq!(std::fs::read(&secret).unwrap(), secret_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_file_refuses_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 1 << 20);
+        let fifo = dir.path().join("output.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a valid NUL-terminated path in a private tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let err = cache.insert_file(&fifo, true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert_eq!(cache.usage(), (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_open_file_falls_back_to_descriptor_copy_when_path_is_swapped_for_symlink_before_rename(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 1 << 20);
+        let secret = dir.path().join("secret.txt");
+        let secret_bytes = b"worker-only secret";
+        std::fs::write(&secret, secret_bytes).unwrap();
+
+        let output = dir.path().join("output.txt");
+        let regular_bytes = b"legitimate task output";
+        std::fs::write(&output, regular_bytes).unwrap();
+
+        // Open the regular file descriptor first, then simulate a surviving process replacing the
+        // path on disk with a symlink to `secret` before `insert_open_file` renames `output`.
+        let (file, meta) = open_regular_file_nofollow(&output).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        std::os::unix::fs::symlink(&secret, &output).unwrap();
+
+        let (id, size) = cache
+            .insert_open_file(&output, file, &meta, true, None)
+            .unwrap();
+        assert_eq!(id, BlobId::of(regular_bytes));
+        assert_eq!(size, regular_bytes.len() as u64);
+        assert!(!cache.contains(&BlobId::of(secret_bytes)));
+
+        let cached_path = cache.object_path(&id);
+        let cached_meta = std::fs::symlink_metadata(&cached_path).unwrap();
+        assert!(
+            cached_meta.is_file() && !cached_meta.file_type().is_symlink(),
+            "cache object must never be a symbolic link"
+        );
+        assert_eq!(
+            cache.read_verified(&id, 1024).unwrap(),
+            regular_bytes,
+            "cache must store bytes from the open descriptor, not the swapped symlink"
+        );
+        assert_eq!(
+            std::fs::read_dir(&cache.tmp).unwrap().count(),
+            0,
+            "rejected moved symlink in tmp/ must be cleaned up"
+        );
     }
 
     #[test]
