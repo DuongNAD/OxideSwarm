@@ -120,6 +120,9 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D5 | Rewrite git history to remove owner data? | No, scrub the current tree only | REL-2 |
 | D6 | Is a user GPU kernel in scope? | No, label GPU compute as a benchmark | FEAT-9 |
 | D7 | Keep `scripts/agent_bridge.py serve-secret`? | Delete it | SEC-4 |
+| D8 | May a `rusty-grid.toml` in the working directory still configure `worker` and `submit`? | No. Skip it with a notice on stderr, as `mcp` already does. `--config ./rusty-grid.toml` still loads it | SEC-10 |
+| D9 | Keep the `/api/chat` route, which runs `agy` on the master host, in the master dashboard? | Remove it from the master. If it stays, it needs Admin scope and an opt-in flag | SEC-14 |
+| D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 
 ## Index
@@ -134,6 +137,9 @@ JOIN-1, LINK-1 and BENCH-1. Fourteen items (SCALE-1 to SCALE-6 and ECO-1 to ECO-
 One item (TEST-23) was added on 2026-11-11 from a CI failure on Windows.
 Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
 [design 0065](design/0065-large-transfer-and-long-run-tests.md).
+Eleven items (BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10) were added on 2026-11-15
+from the audit of `c2462e3` (Phase 11). The Index now holds 77 items Implemented, 7 Partial and
+49 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -152,12 +158,20 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 |  | Implemented | 25 |
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
+| SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Planned |  |
+| SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
+| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
+| SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Planned |  |
+| SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Planned |  |
+| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
 | BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
 | BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
+| BUG-19 | Bound the data-lane backlog of a QUIC worker session | P1 | S |  |  | Planned |  |
+| BUG-20 | Keep one slow worker from stalling every dispatch | P1 | M |  |  | Planned |  |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -182,6 +196,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
 | DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 (open) |
+| DOC-9 | Correct the statuses and statements that the audit found wrong | P1 | M |  |  | Planned |  |
+| DOC-10 | Keep one roadmap | P2 | S | DOC-9 | Yes | Planned |  |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
@@ -208,6 +224,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
+| AND-5 | Stop the Android worker without blocking the calling thread, and build the bridge in CI | P2 | S | SEC-3 |  | Planned |  |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
@@ -1538,6 +1555,10 @@ Each item below needs a design record before code.
 - **Done when:** none of the six files has a production part above 3,000 lines, the allowlist is
   empty or only shrinks, the CI size check runs on every pull request, and the full test suite and
   `crates/core/tests/data/wire_layout.txt` are unchanged by the split.
+- **Note (2026-11-15):** At `c2462e3` the production parts (lines before each file's `mod tests`)
+  have grown in five of the six files since the table above: `server.rs` 6,275, `queue.rs` 5,915,
+  `cli_app.rs` 5,463, `protocol.rs` 5,269 and `runner.rs` 4,333. `client.rs` is 4,540 after its
+  tests moved to `client/tests.rs`. Each new item that touches these files makes the split harder.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -2263,6 +2284,231 @@ none needs a design record of its own.
   `tests/test_m1_challenger_hygiene.py` passes, and the status log records what the repository
   page shows as the licence after step 3.
 
+## Phase 11: findings of the audit of 2026-11-15
+
+These items come from a read-only audit of `master` at `c2462e3` (after 0.2.0 and SCALE-2). Line
+numbers refer to that commit. Evidence "Read" means the code was read and nothing was run, so
+confirm each item before you fix it (rule 5). On that commit `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo fmt --all -- --check` and `cargo test --workspace --lib`
+(1139 passed, 0 failed) passed on an Apple Silicon Mac.
+
+### BUG-19: Bound the data-lane backlog of a QUIC worker session
+
+- **Evidence:** Read.
+- **Problem:** In the QUIC branch of `WorkerSession`, `router_task` moves `AssignTask`,
+  `AssignTaskWithCheckpoint`, `CancelTask` and `BlobReply` into `pending_data` whenever the 64-slot
+  `data_out_tx` is full (`crates/master/src/session.rs:854-925`). `pending_data` is a `VecDeque`
+  with no bound. The router keeps draining the 128-slot `outbound_rx` (`session.rs:647`) into it,
+  so that channel no longer limits memory. The data writer awaits `send_msg` with no write
+  timeout (`session.rs:957-983`). A worker that keeps its control lane alive but stops reading its
+  data lane makes the master hold every assignment and every `BlobReply` chunk (up to 4 MiB each)
+  for it. The comment on `BlobService` (`crates/master/src/server.rs:2321-2324`) says the bounded
+  channel caps this buffering.
+- **Do:**
+  1. Cap `pending_data` by message count and by bytes.
+  2. At the cap, stop reading `outbound_rx`, so its bound pushes back on the senders again.
+  3. Add a write timeout on the data lane. When it expires, end the session with a logged reason,
+     so the failover sweep requeues its tasks.
+- **Done when:** A test with a QUIC worker that heartbeats but never reads its data lane shows the
+  master's buffered bytes for that session stay under the cap. The session ends within the
+  timeout, and its tasks are requeued.
+
+### BUG-20: Keep one slow worker from stalling every dispatch
+
+- **Evidence:** Read.
+- **Problem:** `schedule_batch` delivers its assignments one after another
+  (`crates/master/src/scheduler.rs:1956-1969`). Each delivery awaits `sender.reserve()` on the
+  worker's channel with no timeout (`scheduler.rs:2019`). The comment above it says a slow worker
+  can keep the pass there for a long time. While one worker's channel is full, no other worker
+  receives an assignment from that pass. The reaper does not end such a session, because any
+  received byte counts as proof of life and the timeout is 10 s (`crates/master/src/reaper.rs:29`).
+- **Do:** Deliver without blocking the pass on one worker. Either reserve with `try_reserve` and
+  requeue the task for that worker when the channel is full (`requeue_dispatch_failure`), or
+  dispatch to different workers concurrently with a per-worker deadline. Keep the check under the
+  queue lock (`TaskQueue::deliver_if_scheduled`) that a cancelled task is never assigned.
+- **Done when:** A test with one worker whose channel stays full and one healthy worker shows the
+  healthy worker receives its assignments within one scheduling interval. The existing scheduler
+  tests and the `Engine::hold_back` tests pass unchanged.
+
+### SEC-10: Stop a working-directory config file from configuring `worker` and `submit`
+
+- **Evidence:** Read.
+- **Problem:** Every command except `mcp` loads `./rusty-grid.toml` or `./rusty-grid.json` from
+  the working directory before `~/.oxideswarm/rusty-grid.toml`, and prints nothing
+  (`crates/cli/src/config.rs:466-477`, called from `crates/cli/src/cli_app.rs:1239`). That file
+  can set `master`, `secret` and `insecure` (`config.rs:190-210`). The quick start tells users to
+  run `submit --workspace` from a project root (`README.md:81-85`). A checkout from someone else
+  that ships a `rusty-grid.toml` could point `submit` at another master, or start `worker`
+  against a master that then runs its commands on this machine. `mcp` already skips these files
+  and prints a notice (`config.rs:452-455`).
+- **Do (default of D8):** Skip a working-directory config file for every command, with the same
+  stderr notice that `mcp` prints. `--config <PATH>` and `RUSTY_GRID_CONFIG` still load any file.
+  Update `README.md`, `CLAUDE.md` (the `config.rs` precedence line) and a design record, in the
+  same pull request (rule 7).
+- **Done when:** A test runs `submit` and `worker` in a directory with a `rusty-grid.toml` that
+  names another master. Neither connects to that master, and both print the notice.
+
+### SEC-11: Refuse instead of falling back to the elevated token under Windows isolation
+
+- **Evidence:** Read.
+- **Problem:** On an elevated Windows worker, the AppContainer child starts from a restricted
+  (LUA) token through `CreateProcessAsUserW` (`crates/worker/src/isolation.rs:4646-4670`). If
+  `get_or_init_worker_lua_token` returns `None` (`isolation.rs:2321-2381`), or
+  `CreateProcessAsUserW` fails, the code calls `CreateProcessW` with the worker's own elevated
+  token (`isolation.rs:4674-4689`). It logs nothing. The child still runs in the AppContainer, but
+  its token derives from the elevated token that the LUA path exists to avoid.
+- **Do:** When the worker is elevated and the LUA path fails, fail the task with the Win32 error,
+  and log the reason once. Keep `CreateProcessW` for a worker that is not elevated.
+- **Done when:** A Windows test that forces the LUA token to fail sees the task fail with a
+  message naming the cause, and no task process starts.
+
+### SEC-12: Test and narrow the macOS isolation profile
+
+- **Evidence:** Read. The escape below is inferred and has not been tried.
+- **Problem:** The Seatbelt profile starts with `(allow default)` and then denies file writes
+  outside the sandbox and reads of selected directories (`crates/worker/src/isolation.rs:640-667`).
+  Mach and XPC service lookups stay open apart from the pasteboard, which design 0033 states. A
+  task might ask `launchd` or another XPC service to start a process outside the sandbox, for
+  example with `launchctl submit`. Linux uses an allowlist (Landlock and seccomp) instead.
+- **Do:**
+  1. Add tests under `--isolation fs` that try `launchctl submit`, `open -a`, and `osascript`, and
+     that hard-link a file from the owner's home into the sandbox.
+  2. Deny `mach-lookup` by default, with an allowlist of the services that `cargo`, `rustc`,
+     `git` and the system linker need.
+  3. Record the result and any remaining limit in design 0033 and `docs/SECURITY.md`.
+- **Done when:** The tests above pass on `macos-latest` in CI, and `cargo build` of a workspace
+  still works under `--isolation fs` on macOS.
+
+### SEC-13: Collect outputs through the descriptor that was checked
+
+- **Evidence:** Read. The attack needs a task process that outlives the task.
+- **Problem:** Output collection checks each entry's type without following links
+  (`crates/worker/src/staging.rs:329-352`). The worker then opens the path again with
+  `File::open`, which follows a symbolic link (`hash_file` in `crates/core/src/blob.rs:250`,
+  called from `BlobCache::insert_file_inner` in `crates/worker/src/blob_cache.rs:377-395`, and
+  `copy_verified` at `blob_cache.rs:606`). On macOS, and on Linux without a delegated cgroup, a
+  task process that calls `setsid` and drops `RUSTY_GRID_RUN_TOKEN` survives the end of the task
+  (`crates/worker/src/process_tree.rs:513-545`, `1210-1231`). Between the check and the open it
+  can replace an output with a link to a file that only the worker can read. The worker would then
+  upload that file. Under `--isolation off` the task can read such files anyway, so this matters
+  under `--isolation fs|fs+net`.
+- **Do:** Open each selected output once with `O_NOFOLLOW` (on Windows,
+  `FILE_FLAG_OPEN_REPARSE_POINT` and a reparse-point check), check type and size on that
+  descriptor, and hash and copy from it.
+- **Done when:** A test replaces an output with a symbolic link between the check and the upload,
+  and the task fails or the link is skipped. The target's content never reaches the master.
+
+### SEC-14: Take the `agy` chat route out of the master dashboard
+
+- **Evidence:** Read.
+- **Problem:** `POST /api/chat` (`crates/master/src/web_ui.rs:333`) starts an `agy -p <prompt>`
+  process on the master host (`run_agy` at `web_ui.rs:1255`, binary search at `web_ui.rs:1440-1476`).
+  The route needs Submitter scope only (`crates/master/src/auth.rs:389-390`). The prompt is one
+  argument, a timeout applies and the process group is killed, but what `agy` may do depends on
+  that tool's own configuration. This is developer tooling inside the production master.
+- **Do (default of D9):** Remove the route and its dashboard panel from the master. If the owner
+  keeps it, require Admin scope and an opt-in master flag, documented in `README.md` and
+  `docs/SECURITY.md`.
+- **Done when:** `POST /api/chat` answers 404 on a default master, or 403 to a Submitter token and
+  404 without the opt-in flag, with a test for each case.
+
+### SEC-15: Make the Agent Mesh launchers safe by default
+
+- **Evidence:** Read.
+- **Problem:** A mesh node runs `shell_exec` unless it is started with `--no-shell`
+  (`crates/agent_mesh/src/client.rs:140`), so one hub token gives a shell on every node.
+  `packaging/agent_mesh/windows/run_agent_node.ps1` has no way to pass `--no-shell`, while its
+  `.cmd` sibling (`run_agent_node.cmd:24-27`) and the macOS launcher
+  (`packaging/agent_mesh/macos/run_agent_node.sh:15-21`) do. The Android launcher puts the token
+  on the `adb shell` command line (`packaging/agent_mesh/android/run_agent_node_adb.sh:56`). The
+  hub serves `ws://` only, so a token sent to a hub that is not on loopback travels in clear.
+- **Do:**
+  1. Add `-NoShell` and `OXIDE_MESH_NO_SHELL` to `run_agent_node.ps1`.
+  2. Pass the token to the phone through a file with mode 600 or through standard input.
+  3. Make a node print a warning when it sends a token over `ws://` to a host that is not on
+     loopback.
+- **Done when:** `tests/test_launcher_scripts.py` checks `-NoShell` in the `.ps1` launcher. The
+  adb launcher's command line holds no token. A test shows the `ws://` warning.
+
+### AND-5: Stop the Android worker without blocking the calling thread, and build the bridge in CI
+
+- **Evidence:** Read.
+- **Problem:** `stop_worker_impl` joins the worker thread on the calling thread
+  (`crates/android_bridge/src/lib.rs:353-355`). The worker can drain for up to 10 s
+  (`TASK_DRAIN_TIMEOUT`, `crates/worker/src/client.rs:143`). The Kotlin app calls this from its
+  activity and service (`MainActivity.kt`, `OxideWorkerService.kt`), so the user interface can
+  freeze long enough for an "application not responding" dialog. `running` is read at `lib.rs:187`
+  and set at `lib.rs:243`, so two quick starts can both pass the check. No CI job compiles the
+  bridge for an Android target.
+- **Do:**
+  1. Make the stop call return at once, and join the worker thread on a thread of its own.
+  2. Claim `running` with `compare_exchange` at the start.
+  3. Add a CI step that runs `cargo check -p rusty_grid_android_bridge --target aarch64-linux-android`.
+- **Done when:** A host-side test shows the stop call returns in under 100 ms while a task drains.
+  Two concurrent start calls start one worker. The CI step runs on every pull request.
+
+### DOC-9: Correct the statuses and statements that the audit found wrong
+
+- **Evidence:** Read. Each line below was checked against the code at `c2462e3`.
+- **Problem:** These statements disagree with the code or with git:
+  1. The Index row of FEAT-6 is titled "Master failover" and set to Implemented. What was built is
+     the refusal of `ClaimMasterRole` (design 0026). The item's own "Done when" says no document
+     may say failover is finished. Master high availability is SCALE-4.
+  2. The SCALE-2 note quotes the 500-worker gain, but its 1000-worker burst rate fell from 419.7 to
+     414.4 tasks/s and the burst assign p50 rose from 17.4 to 18.9 ms
+     (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
+     `2026-11-15-scale2-windows-amd64-1000w.json`). Its "Done when" asks for an improvement by the
+     bound of Q8.
+  3. Six Index rows mark merged pull requests "(open)": TEST-21 (198), TEST-22 (200), DOC-8 (196),
+     LOG-1 (194), FEAT-3d (183) and FEAT-4 (186).
+  4. `docs/ROADMAP.md`, "Where the project stands", describes `3ce2a65` of 2026-11-09. Its table
+     "What is missing" still lists FEAT-3d and design 0039 W11, which both shipped in 0.2.0.
+  5. `CLAUDE.md` lists six MCP tools (`mcp.rs` serves seven, with `workspaces`). It names doctor
+     checks C1-C6 (`crates/cli/src/doctor.rs` runs C1-C8). It says the project is "verified across"
+     Android ARM64 devices, while `README.md` says the worker has not run on a device.
+  6. `PROJECT.md` cites `check_mobile_master_eligibility`, which FEAT-11 removed, and marks
+     discovery Partial after FEAT-7 shipped.
+  7. The help text of `worker --isolation` says "macOS only for now"
+     (`crates/cli/src/cli_app.rs:453`). Linux and Windows are implemented.
+  8. `README.md` says revoking a member "does not yet cut active lanes". The revoke handler does
+     disconnect the member's worker sessions and requeues their tasks
+     (`crates/master/src/server.rs:4654-4676`). Client connections stay open until ENROLL-1c.
+  9. `README.md` does not say that the network namespace of Linux `fs+net` is best effort. Where
+     user namespaces are forbidden, seccomp and Landlock remain
+     (`crates/worker/src/isolation/linux.rs:26-28`).
+  10. `docs/README.md` shows design 0044 as Planned (the record says Implemented) and design 0039
+      as Accepted. It has no entry for designs 0001 to 0022 and 0025. Records 0031 and 0033 still
+      say Accepted, though both are built. Records use both the template vocabulary (Draft,
+      Accepted) and the status vocabulary (Implemented, Partial, Planned, Design only).
+  11. The table "Is the project finished?" at the top of this file shows the snapshot of
+      2026-11-01 (AEAD "on a branch", restart "Design only") without a date on the table itself.
+- **Do:** Correct each statement in its own document. Rename the FEAT-6 row to "Refuse the
+  master-role claim" and keep it Implemented, or set it to Design only; name SCALE-4 for real
+  failover. Set SCALE-2 to Partial until the owner sets the bound of Q8 and a 1000-worker run meets
+  it. Date the snapshot table. Pick one status vocabulary for design records and state it in
+  `docs/README.md`.
+- **Done when:** Each of the eleven points is corrected or marked as decided by the owner, and a
+  search for "macOS only for now", "C1-C6" and "(open)" next to a merged pull request finds
+  nothing.
+
+### DOC-10: Keep one roadmap
+
+- **Evidence:** Read.
+- **Problem:** Four documents describe direction and status: `docs/ROADMAP.md` (updated
+  2026-11-13, before 0.2.0), section 5 of `PROJECT.md`, the preamble of this file, and the untracked
+  `docs/ROADMAP_AND_VISION.md`. The last calls itself "Approved for Implementation". Several of its
+  statements disagree with the code: the Agent Mesh hub port (it says 8765; the default is
+  `127.0.0.1:8088`, `crates/agent_mesh/src/main.rs:35`), the checkpoint type (`CheckpointData` in
+  `crates/core/src/task.rs`), the chunk size and hash (4 MiB and BLAKE3,
+  `crates/core/src/blob_transfer.rs:29`), the tree manifest version (`tree/2`,
+  `crates/core/src/blob.rs:54`) and "no Prometheus `/metrics`" (ECO-4 added it).
+- **Do:** Keep `docs/ROADMAP.md` as the only roadmap and bring "Where the project stands" up to
+  0.2.0. Replace section 5 of `PROJECT.md` with a link to it. The owner decides whether
+  `docs/ROADMAP_AND_VISION.md` is deleted, or corrected and merged into `docs/ROADMAP.md`; it is
+  not committed as it stands.
+- **Done when:** One roadmap document exists, `PROJECT.md` links to it, and no committed document
+  calls a plan "Approved for Implementation" without a decision in `docs/ROADMAP.md`.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -2610,3 +2856,4 @@ Add one dated line per finished item, newest last.
   `requires_tree_v2` gating on `TaskQueue`. The Index counts stay 75 Implemented, 7 Partial and 40 Planned.
 - 2026-11-15: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 76 Implemented, 7 Partial and 39 Planned.
 - 2026-11-15: Implemented SCALE-2 ([design 0050](design/0050-scale-out-architecture.md), pull request 227): added `WorkerIndex` / `RegisteredIndex` capability and attribute bitsets (`WORKSPACES`, `TREE_V2`, free slots, mobile buckets), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size` / `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`), adaptive micro-batch debounce and 16-batch drain, per-submitter `FairShareQueues` weighted round-robin, dashboard `receiver_count() > 0` guards, single-flight batched `ColdResultStore` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`) with uncompacted replay reuse, and committed 3-run post-`SCALE-2` records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`, `500w` `409.1` vs `375.2 tasks/s` and `16.69` vs `31.01 ms` unloaded assign p50, `1000w` `414.4 tasks/s` and `91.8 MiB` steady RSS, `0` failed tasks). The Index counts are now 77 Implemented, 7 Partial and 38 Planned.
+- 2026-11-15: Audit of `c2462e3` (read-only, with clippy, fmt and `cargo test --workspace --lib` run on macOS): added BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10 (Phase 11), decisions D8 to D10, and a size note on MAINT-1. Statuses of existing items are unchanged; DOC-9 lists the ones to correct. The Index counts are now 77 Implemented, 7 Partial and 49 Planned.
