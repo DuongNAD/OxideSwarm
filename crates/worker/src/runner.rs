@@ -164,6 +164,8 @@ pub struct RunnerConfig {
     /// Additive offset (ms) applied to `BuiltinTest` sleep durations in integration tests (`0` in production).
     #[doc(hidden)]
     pub test_sleep_offset_ms: u64,
+    /// Optional in-process simulated task runner (`SCALE-1` load harness and simulation tests).
+    pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
 }
 
 impl Default for RunnerConfig {
@@ -193,6 +195,7 @@ impl RunnerConfig {
             workspace_lock_wait: DEFAULT_WORKSPACE_LOCK_WAIT,
             test_sleep_multiplier: 1,
             test_sleep_offset_ms: 0,
+            fake_runner: None,
         }
     }
 
@@ -290,6 +293,12 @@ impl RunnerConfig {
 
     pub fn with_stop_grace(mut self, grace: Duration) -> Self {
         self.stop_grace = grace;
+        self
+    }
+
+    /// Configures an in-process synthetic runner for load-harness simulations.
+    pub fn with_fake_runner(mut self, fake: Option<crate::sim::FakeRunnerConfig>) -> Self {
+        self.fake_runner = fake;
         self
     }
 }
@@ -1086,6 +1095,88 @@ impl TaskRunner {
             .flatten()
     }
 
+    async fn execute_fake_task(
+        &self,
+        task: &Task,
+        fake: &crate::sim::FakeRunnerConfig,
+        timeout_duration: Duration,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        if let Some(ref cb) = fake.on_task_started {
+            cb(task.id);
+        }
+
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_CANCELLED,
+                Bytes::new(),
+                Bytes::new(),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Cancelled: {reason}")),
+            );
+        }
+
+        let delay = fake.effective_execution_delay();
+        if !delay.is_zero() {
+            tokio::select! {
+                biased;
+                reason = cancellation(&mut cancel_rx) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_CANCELLED,
+                        Bytes::new(),
+                        Bytes::new(),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Cancelled: {reason}")),
+                    );
+                }
+                _ = tokio::time::sleep(timeout_duration) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_TIMEOUT,
+                        Bytes::new(),
+                        Bytes::new(),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Task timed out after {}s", timeout_duration.as_secs())),
+                    );
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        if matches!(
+            task.spec,
+            TaskSpec::BuiltinTest {
+                should_fail: true,
+                ..
+            }
+        ) {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(b"Simulated BuiltinTest forced failure\n"),
+                elapsed_ms,
+                Some("BuiltinTest should_fail was true".to_string()),
+            );
+        }
+
+        TaskResult::success(
+            self.worker_id,
+            task.id,
+            fake.stdout_payload.clone(),
+            elapsed_ms,
+            matches!(task.spec, TaskSpec::GpuCompute { .. }),
+        )
+    }
+
     /// Primary execution dispatcher with checkpoint resumption and mid-task checkpoint emission.
     pub async fn execute_task_with_checkpoint(
         &self,
@@ -1126,6 +1217,12 @@ impl TaskRunner {
                     outputs: Vec::new(),
                 };
             }
+        }
+
+        if let Some(ref fake) = self.config.fake_runner {
+            return self
+                .execute_fake_task(task, fake, timeout_duration, cancel_rx, start_time)
+                .await;
         }
 
         if let Some(ref ws) = task.workspace {

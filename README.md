@@ -46,9 +46,10 @@ coding agents can send work to: `cargo test`, scripts, compile jobs, file proces
 | The same offload, scripted, median of 3 fresh workspaces | 209.6 s cold, **7.6 s** warm | [benchmarks, (c)](benchmarks/grid/README.md) |
 | Repeated upload of a 500-file, 16 MB tree, on loopback | 0 of 501 blobs sent again; one changed file sends 2 blobs | [benchmarks, (b)](benchmarks/grid/README.md) |
 | `submit --wait` of an empty task, whole CLI process, 1 worker, on loopback, p50 | 6.3 ms on Linux (arm64 VM), 26 ms on macOS (under load), 69 ms on Windows | [benchmarks, (a)](benchmarks/grid/README.md) |
+| 100, 500 and 1000 simulated workers against one master (`SCALE-1`, 3 runs each on loopback, 10 to 20 submitters) | **160.2**, **375.2** and **419.7 tasks/s**; burst submit-to-assign p50 **31.1**, **17.1** and **17.4 ms**; 1000-worker reconnect in **641.5 ms**; steady master RSS **25.7** to **87.6 MiB** (`507` to `845 MiB` peak during `100 x 10 MiB` blob fan-out) | [benchmarks, (d)](benchmarks/grid/README.md) · [100w](benchmarks/grid/results/2026-11-14-scale1-windows-amd64-100w.json) · [500w](benchmarks/grid/results/2026-11-14-scale1-windows-amd64-500w.json) · [1000w](benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json) |
 
 Each number links to the dated record of its run. The first two rows come from a run by hand, and
-the others from `benchmarks/grid/bench_grid.py`. Each record states its machines, its load and its
+the others from `benchmarks/grid/bench_grid.py` and `benchmarks/grid/scale_harness.py`. Each record states its machines, its load and its
 limits.
 
 ## Quick start
