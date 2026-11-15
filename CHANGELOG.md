@@ -5,11 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+A minor feature release introducing protocol version 8, invite-based machine enrollment (`ENROLL-1b`),
+short-code LAN pairing (`JOIN-2a`), usable rendezvous discovery (`FEAT-7`), Prometheus/OTLP
+observability (`ECO-4`), speed-aware task placement (`SCHED-4a`, `SCHED-4b`), `wgpu` `30.0.2` /
+`pollster` `1.0.1` and `reqwest` `0.13` upgrades, simulated-worker scale load harness (`SCALE-1`),
+symbolic-link and empty-directory workspace manifests (`W11`), and updated USB setup kit and
+Windows ACL hardening (`USB-1a`, `USB-1b`, `USB-3`).
+
 ### Upgrading
 
-- **Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`):** protocol 8 refuses protocol 7 (and older) peers on both worker registration and the client `Hello` check. Always **upgrade and restart the master first**, then the workers and CLIs ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5, as in `[0.1.0]`).
+- **Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`):** protocol 8 refuses protocol 7 (and older) peers on both worker registration and the client `Hello` check. Always **upgrade and restart the master first**, then the workers and CLIs ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5, as in `[0.1.0]`). When `--state-dir` is used, stop the `0.1.x` master cleanly (`SIGINT` or `SIGTERM`) before replacing the binary so `journal.bin` compacts into `snapshot.bin` (`TaskStore::open` upgrades `snapshot.bin` across protocol versions automatically, whereas an uncompacted older `journal.bin` is refused at startup with `GridError::Storage`).
 - **Master state files (`node.key`, `master_noise.key`, `members.json`):** on startup, the master writes `master_noise.key` and `members.json` under `--state-dir` (or `~/.oxideswarm/` when `--state-dir` is not set and the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run) and auto-enrols the host's own `~/.oxideswarm/node.key` as `local-host` with the `admin` role in `members.json`.
 - **Workers and CLIs on the master's host:** a worker on the master's host authenticates with `cluster.secret` (or loopback no-auth when no secret is configured and no non-host member is enrolled in `members.json`) unless `--master-key` (`RUSTY_GRID_MASTER_KEY`, `[worker].master_key`) is explicitly configured for it; it never uses the host's `admin`-only `local-host` key unless enrolled or given `--roles worker,admin`. Loopback CLI commands (`status`, `workers`, `submit`, `invite`, `members`) prefer `cluster.secret` when present and fall back to the local `node.key` + `master_noise.key` pair (including under `--auth members`); member and invite administration always requires v2 cluster-secret or v3 `admin` authentication.
+- **Partial / environment-gated items shipped in `0.2.0`:**
+  - `ENROLL-1`: `ENROLL-1a` (per-machine X25519 keys, OXS-AUTH v3, `--auth secret|members|both`) and `ENROLL-1b` (`oxideswarm invite`, `join`, `members`, `release-worker`, `members revoke` blocking future handshakes) ship; `ENROLL-1c` (live revocation teardown across active lanes and task cancellation) and `ENROLL-1d` (dashboard members page and enrollment guide) remain planned.
+  - `USB-1`: kit format v1 (`oxideswarm usb create`, `join --invite-file`, encrypted `invite.oxs` + `kit.json`, offline/online `SHA256SUMS`, `packaging/usb/` installers/uninstallers) ships (`USB-1a`, `USB-1b`); a cross-machine physical USB-stick live test (`USB-1c`) is not recorded yet.
+  - `JOIN-1`: single-token join (`oxideswarm secret join-token`, `oxideswarm join`) and `doctor` diagnostics ship; Android QR camera scanning awaits `AND-1`.
+  - `LINK-1`: `doctor` `DIRECT` vs `RELAY` link column, C8 throughput probe, and `--relay-url` custom iroh relay support ship; a live two-network run through an owner-hosted `iroh-relay` is not recorded yet.
 
 ### Added
 - USB setup kit format v1 (`USB-1a`, `USB-1b`, [design 0053](docs/design/0053-usb-setup-kit.md); `USB-1c` cross-machine live test pending):
@@ -26,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Protocol version 8 (`PROTOCOL_VERSION_CURRENT = 8`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`): adds `ClientMessage` and `ClientResponse` variants for OXS-AUTH v3 enrollment, invites, and member management ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 - Windows USB setup kit (`packaging/usb/install.ps1`, `uninstall.ps1`): defaults `-InstallRoot` to `%LOCALAPPDATA%\OxideSwarm-USB` (`<drive>:\OxideSwarm-USB` on secondary drives, while still reading legacy `%LOCALAPPDATA%\OxideSwarm` for `-Update` and `uninstall.ps1`), always passes `--workspace-root <folder>\workspaces` when `--workspaces` is enabled (marking `<folder>\workspaces\.oxideswarm-usb-workspaces` and refusing fresh installs into `%LOCALAPPDATA%\OxideSwarm`), and makes `uninstall.ps1` refuse to delete a folder holding an unmarked or foreign-used `workspaces` directory while naming the worker using it (`USB-3`, [design 0053](docs/design/0053-usb-setup-kit.md)).
 - Upgraded optional GPU compute dependencies in `rusty_grid_worker` (`--features gpu-wgpu`) from `wgpu` `22.1.0` to `30.0.2` and `pollster` `0.3.0` to `1.0.1` (`crates/worker/Cargo.toml`, `crates/worker/src/wgpu_engine.rs`).
+- Upgraded HTTP client dependency `reqwest` from `0.12` to `0.13` across workspace crates (`Cargo.toml`, `crates/cli`, `crates/master`).
 
 ### Security
 - Windows workers now create and validate `<sandbox_base>\cache`, `cache\blobs`, `objects`, `tmp`, fanout subdirectories, and `.locks` through `ensure_private_dir` (refusing reparse points, untrusted owners, and foreign write-class grants); `packaging/windows/install_windows_service.ps1` checks reparse points and owners (`SYSTEM` or `Administrators`) before stopping a service or modifying any path, creates missing directories in one step with a protected DACL, grants Modify by SID (`*<serviceSid>:(OI)(CI)M`), checks every `icacls` exit code, verifies resulting DACLs, and resets child ownership and inherited ACLs under `$DataDir` (`/setowner *S-1-5-32-544 /T /C`, `/reset /T /C`); and `packaging/usb/install.ps1` sets the private DACL on an existing open install root via a single `FILE_FLAG_OPEN_REPARSE_POINT` handle while bounding `-Update`'s open-root scan to control directories ([design 0021](docs/design/0021-private-default-sandbox-base.md)).
