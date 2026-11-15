@@ -9,6 +9,9 @@ The Index and the status log are kept current. The rest of the file describes th
 
 ## Is the project finished?
 
+This section is the snapshot of 2026-11-01 and is not updated. The current state is the Index
+below and the status log at the end.
+
 No. One master on a trusted LAN running command tasks works and is well tested. Most features
 beyond that path are partial, and several documents mark them as finished.
 
@@ -182,8 +185,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
-| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 (open) |
-| TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 (open) |
+| TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 |
+| TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Planned |  |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
@@ -195,14 +198,14 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 |  | Implemented | 70 |
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
-| DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 (open) |
-| DOC-9 | Correct the statuses and statements that the audit found wrong | P1 | M |  |  | Planned |  |
+| DOC-8 | Update `CLAUDE.md` and `SECURITY.md` for Windows isolation | P1 | S | FEAT-3 |  | Implemented | 196 |
+| DOC-9 | Correct the statuses and statements that the audit found wrong | P1 | M |  |  | Implemented | PRNUM |
 | DOC-10 | Keep one roadmap | P2 | S | DOC-9 | Yes | Planned |  |
 | REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
 | REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
 | CLI-1 | Add `cancel` and `result` commands | P1 | M | INT-4 |  | Implemented | 30, 47 |
-| LOG-1 | Close P2P client endpoints cleanly and send client logs to stderr | P1 | S | FEAT-4 |  | Implemented | 194 (open) |
+| LOG-1 | Close P2P client endpoints cleanly and send client logs to stderr | P1 | S | FEAT-4 |  | Implemented | 194 |
 | MCP-1 | Make the MCP server concurrent, with deadlines | P1 | M | SEC-2 |  | Implemented | 31, 41 |
 | MCP-2 | Return outputs safely to an LLM | P1 | M | MCP-1 |  | Implemented | 62 |
 | MCP-3 | Correct JSON-RPC and argument handling | P2 | S | MCP-1 |  | Implemented | 97 |
@@ -228,10 +231,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
-| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented | 183 (open) |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177, 186 (open) |
+| FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented | 183 |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177, 186 |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
-| FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
+| FEAT-6 | Refuse the master-role claim (failover itself is SCALE-4) | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented | (design 0066), 224 |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
@@ -1449,6 +1452,9 @@ Each item below needs a design record before code.
   `ROLE_ARBITRAGE` from `all_supported()`. Mark the design as Design only. Real failover needs
   replicated state, renewed leases and a fencing epoch, and it starts after FEAT-1.
 - **Done when:** A test shows that a claim is refused, and no document says failover is finished.
+- **Note (2026-11-15):** Implemented means the refusal of decision D1 (pull request 81, design
+  0026). The master still has no failover. Master high availability is SCALE-4, which is Planned
+  (DOC-9).
 
 ### FEAT-7: Usable rendezvous discovery
 
@@ -1815,6 +1821,11 @@ owner's decisions Q8, Q9 and Q12 are open.
   and single-flight batched `ColdResultStore` disk spill (`crates/master/src/cold_results.rs`), with
   post-`SCALE-2` 3-run `scale_harness.py` records at `500w` (`409.1` vs `375.2 tasks/s`, `16.69` vs
   `31.01 ms` unloaded assign p50) and `1000w` (`414.4 tasks/s`, `91.8 MiB` steady RSS, `0` failures).
+- **Note (2026-11-15):** The 1000-worker run is the stretch run of Q8 and shows no gain: the burst
+  rate went from `419.7` (SCALE-1) to `414.4 tasks/s`, and the burst assign p50 from `17.4` to
+  `18.9 ms` (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
+  `2026-11-15-scale2-windows-amd64-1000w.json`). The status rests on the 500-worker target
+  (DOC-9).
 
 ### SCALE-3: Worker-to-worker blob distribution
 
@@ -2491,6 +2502,28 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** Each of the eleven points is corrected or marked as decided by the owner, and a
   search for "macOS only for now", "C1-C6" and "(open)" next to a merged pull request finds
   nothing.
+- **Implemented (2026-11-15, pull request PRNUM):** each point, in order:
+  1. FEAT-6 row renamed, with a note.
+  2. A 1000-worker note was added to SCALE-2.
+  3. The six "(open)" markers were removed.
+  4. Two rows left the table "What is missing" in `docs/ROADMAP.md`, its summary no longer
+     counts Android among the running workers, and a dated note points to DOC-10.
+  5. `CLAUDE.md` names seven MCP tools and checks C1 to C8, and states the Android limit.
+  6. `PROJECT.md` drops `check_mobile_master_eligibility`, sets discovery to Implemented with
+     design 0066, and names checks C1 to C8.
+  7. The `--isolation` help text and the MCP `doctor` description were corrected.
+  8. The revocation row of `README.md` now says what `members revoke` does.
+  9. The Linux row of the platform table states that the network namespace is best effort.
+  10. In `docs/README.md`:
+      - rows for designs 0001 to 0022 and 0025 were added;
+      - 0031, 0033, 0039 and 0044 now show Implemented;
+      - the unused numbers are named;
+      - rule 7 states the design status vocabulary.
+      The records 0031 and 0033 say Implemented.
+  11. The snapshot section is dated.
+
+  The remaining "C1 to C6" and "(open)" strings are in the dated snapshot section and in this
+  item's own text.
 
 ### DOC-10: Keep one roadmap
 
@@ -2858,3 +2891,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-15: Implemented SCALE-1 ([design 0050](design/0050-scale-out-architecture.md), pull request 222): simulated workers (`WorkerClient::simulated`, `FakeRunnerConfig`, `SimulatedLinkStream` in `crates/worker/src/sim.rs`, `crates/worker/tests/scale1_simulated_worker.rs`), 7-phase fleet driver (`crates/cli/examples/scale_load_driver.rs`), `benchmarks/grid/scale_harness.py` (`tests/test_scale_harness.py`), and committed 3-run baseline records at 100, 500 and 1000 simulated workers on loopback plus 100 workers under a `25 ms + 10 ms`, `1 %`-loss simulated link (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-*.json`, linked from `README.md` and `benchmarks/grid/README.md`). The Index counts are now 76 Implemented, 7 Partial and 39 Planned.
 - 2026-11-15: Implemented SCALE-2 ([design 0050](design/0050-scale-out-architecture.md), pull request 227): added `WorkerIndex` / `RegisteredIndex` capability and attribute bitsets (`WORKSPACES`, `TREE_V2`, free slots, mobile buckets), `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024` (`--max-batch-size` / `RUSTY_GRID_MAX_BATCH_SIZE` / `[master].max_batch_size`), adaptive micro-batch debounce and 16-batch drain, per-submitter `FairShareQueues` weighted round-robin, dashboard `receiver_count() > 0` guards, single-flight batched `ColdResultStore` (`OXSWCLD1`, `DEFAULT_MAX_HOT_TERMINAL_TASKS = 1024`) with uncompacted replay reuse, and committed 3-run post-`SCALE-2` records (`benchmarks/grid/results/2026-11-15-scale2-windows-amd64-{500w,1000w}.json`, `500w` `409.1` vs `375.2 tasks/s` and `16.69` vs `31.01 ms` unloaded assign p50, `1000w` `414.4 tasks/s` and `91.8 MiB` steady RSS, `0` failed tasks). The Index counts are now 77 Implemented, 7 Partial and 38 Planned.
 - 2026-11-15: Audit of `c2462e3` (read-only, with clippy, fmt and `cargo test --workspace --lib` run on macOS): added BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10 (Phase 11), decisions D8 to D10, and a size note on MAINT-1. Statuses of existing items are unchanged; DOC-9 lists the ones to correct. The Index counts are now 77 Implemented, 7 Partial and 49 Planned.
+- 2026-11-15: DOC-9 implemented (pull request PRNUM): statuses and statements corrected across `docs/BACKLOG.md`, `docs/ROADMAP.md`, `docs/README.md`, `CLAUDE.md`, `PROJECT.md`, `README.md`, designs 0031 and 0033, and two help texts in `crates/cli`. The Index counts are now 78 Implemented, 7 Partial and 48 Planned.

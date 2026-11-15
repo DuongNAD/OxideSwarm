@@ -14,8 +14,8 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Summary
 
-- Today one master on a trusted network runs command tasks on macOS, Windows, Linux and Android
-  workers. Transport is authenticated and encrypted, files move as content-addressed blobs, and an
+- Today one master on a trusted network runs command tasks on macOS, Windows and Linux workers.
+  An Android worker builds and passes host-side tests but has not run on a device (AND-1). Transport is authenticated and encrypted, files move as content-addressed blobs, and an
   MCP server lets coding agents submit work.
 - Purpose: **a coding agent runs builds and tests on the machines its owner already has.**
   Work that serves this purpose goes first.
@@ -76,7 +76,10 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `3ce2a65` on 2026-11-09, after the live two-machine run.
+The state at `master` `3ce2a65` on 2026-11-09, after the live two-machine run. On 2026-11-15 two
+rows left the table "What is missing": FEAT-3d (`cargo` under the Windows AppContainer, release
+0.1.2) and design 0039 W11 (symbolic links and empty directories in workspace trees, release
+0.2.0). DOC-10 in [BACKLOG.md](BACKLOG.md) brings this section up to 0.2.0.
 
 ### What works
 
@@ -101,8 +104,6 @@ Each row is a limit a user meets today, and the item that removes it.
 |---|---|---|
 | There is one master and no failover | The master is a single point of failure | FEAT-6 (Design only, decision D1) |
 | Delivery is at least once | A task can run twice after a worker is lost. A master with `--state-dir` and a worker that resumes shrink the window | FEAT-1, FEAT-2 |
-| `cargo` does not run inside the Windows AppContainer, so a Windows worker refuses `--workspaces` with `--isolation fs\|fs+net` | A Windows workspace worker runs `cargo` without OS isolation | FEAT-3d |
-| Workspace trees carry no symbolic links or empty directories | A project that relies on a link inside its tree does not build remotely | Design 0039 W11 |
 | The Android app does not compile | There is no Android worker app to install | AND-1 |
 | GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
 
