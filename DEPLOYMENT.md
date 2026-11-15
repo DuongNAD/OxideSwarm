@@ -274,7 +274,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 ### 3.5 Upgrading a running grid (master and workers)
 All nodes in a cluster (`master`, `worker`, and CLI/MCP clients) must run one build: `Task`, `TaskResult`, and message
 frames are encoded positionally with bincode. Workers, clients, and the master exchange `PROTOCOL_VERSION_CURRENT`
-(currently version 8, `PROTOCOL_VERSION_MIN_COMPATIBLE = 8`; see `docs/design/0040-protocol-versioning.md`). Every
+(version 9 on `master` and version 8 in release `0.2.0`, each with `PROTOCOL_VERSION_MIN_COMPATIBLE` equal to it; see `docs/design/0040-protocol-versioning.md`). Every
 protocol version bump breaks older peers (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT`), and each side
 refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v8 refuses v7 and older peers).
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`

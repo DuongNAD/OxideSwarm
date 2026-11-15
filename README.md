@@ -370,7 +370,7 @@ OxideSwarm `0.2.0` covers the user story above. What it does not do yet:
 | On Windows, `cargo` under isolation needs a worker that is not elevated | Since release `0.1.2` (FEAT-3d) a Windows workspace worker runs with `--isolation fs`; an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](docs/design/0033-os-level-task-isolation.md) D4) |
 | Workspace trees skip symbolic links that leave the tree or traverse another link, and creating links on Windows needs Developer Mode | Out-of-tree or chained links are skipped with a notice; a Windows worker without Developer Mode skips symbolic links during sync and prints a warning to the task's `stderr` | By design ([design 0039](docs/design/0039-agent-workspaces.md) W11) |
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
-| GPU support is a verified matrix-multiply benchmark | No user workload runs on the GPU yet | FEAT-9 |
+| GPU work beyond the built-in benchmark has no guide and no sandbox rules yet | The built-in GPU task is a verified matrix-multiply benchmark. A command task can use a worker's GPU with `--isolation off`: a recorded run sent PyTorch CUDA and Blender OptiX tasks from a Mac to a Windows worker ([benchmarks/gpu-run](benchmarks/gpu-run/README.md)). `--vram-mb` (FEAT-9a) is on `master` and in no release yet. Runtimes under `--isolation fs` are being recorded | FEAT-9, spike R20 of [design 0064](docs/design/0064-research-of-2026-11-13-and-route.md) |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
 
 The plan and the order of the work are in [docs/ROADMAP.md](docs/ROADMAP.md). Every item, with its
