@@ -2368,6 +2368,7 @@ mod tests {
             )
             .await;
         });
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let status = reqwest::Client::new()
             .get(format!("http://{addr}/api/status"))
             .send()
