@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 - Master dashboard `POST /api/chat` route, `run_agy` child-process launcher, and dashboard chat UI (`SEC-14`, [design 0071](docs/design/0071-remove-dashboard-chat.md)).
 
+### Fixed
+- Bounded 2-lane QUIC worker session data-lane backlog in `router_task` at `MAX_PENDING_DATA_MESSAGES = 256` and `MAX_PENDING_DATA_BYTES = 64 MiB` so `outbound_tx` backpressures senders when a worker stops draining its data stream, and added a `DATA_LANE_WRITE_TIMEOUT = 60 s` per-write timeout on `data_writer_task` that disconnects stalled sessions and fails over their tasks (`BUG-19`, [design 0069](docs/design/0069-bounded-quic-data-lane.md), `crates/master/src/{session,server}.rs`).
+
 ## [0.2.0] - 2026-11-15
 
 A minor feature release introducing protocol version 8, invite-based machine enrollment (`ENROLL-1b`),
