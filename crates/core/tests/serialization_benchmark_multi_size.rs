@@ -318,6 +318,7 @@ fn test_multi_payload_size_benchmark_matrix() {
                 gpu_required: true,
                 timeout_secs: 30,
                 max_retries: None,
+                vram_mb: None,
             },
         );
         let msg = MasterMessage::AssignTask { task };

@@ -247,3 +247,12 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   `Workspaces` so every v7 request and response keeps the v8 layout and is refused by the version
   check with a clear `Incompatible protocol version 7` error in both directions. Regenerated
   `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-15: Protocol version 9 (design 0068 `FEAT-9a` / `Q56`): appended `vram_mb: Option<u64>`
+  last in `TaskRequirements`, which shifts the layout of `Task` inside `ClientMessage::SubmitTask`.
+  `LegacyPreV9TaskRequirements` and `LegacyV6ToV8Task` / `LegacyV6ToV8BinaryClientMessage` let a
+  v9 master recognize `SubmitTask` frames from v5 and v6..=v8 clients and reply with an explicit
+  `Incompatible protocol version` error instead of an opaque EOF error; every other v8 request and
+  response keeps the v9 layout and is refused by the version check in both directions. The master
+  journal (`store.rs`) embeds `Task`, so `STORE_FORMAT_VERSION` is 3; clean-shutdown format 1 and
+  format 2 files still upgrade (`docs/design/0046-master-durability.md`). Regenerated
+  `crates/core/tests/data/wire_layout.txt`.

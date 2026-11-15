@@ -30,9 +30,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 8;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 9;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 8;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 9;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -2348,7 +2348,7 @@ enum BinaryClientMessage {
 #[allow(clippy::large_enum_variant, dead_code)]
 enum LegacyV2BinaryClientMessage {
     SubmitTask {
-        task: Task,
+        task: LegacyV5Task,
         wait: bool,
     },
     GetTaskStatus {
@@ -2370,6 +2370,18 @@ enum LegacyV2BinaryClientMessage {
     },
 }
 
+/// Pre-v9 (protocol version 3 to 8) positional bincode layout of [`TaskRequirements`], which
+/// ended at `max_retries` before `vram_mb` was appended in v9.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LegacyPreV9TaskRequirements {
+    cpu_cores: usize,
+    ram_mb: u64,
+    gpu_required: bool,
+    timeout_secs: u64,
+    max_retries: Option<u32>,
+}
+
 /// Protocol v3 to v5 positional bincode layout of [`Task`], which ended at `output_globs` before
 /// `workspace` was appended in v6. Used only to read a v5 `SubmitTask` far enough to recognise it.
 #[derive(Deserialize)]
@@ -2377,7 +2389,7 @@ enum LegacyV2BinaryClientMessage {
 struct LegacyV5Task {
     id: crate::task::TaskId,
     spec: crate::task::TaskSpec,
-    requirements: crate::task::TaskRequirements,
+    requirements: LegacyPreV9TaskRequirements,
     created_at_utc: u64,
     tags: Vec<String>,
     latest_checkpoint: Option<crate::task::CheckpointData>,
@@ -2387,16 +2399,48 @@ struct LegacyV5Task {
     output_globs: Vec<String>,
 }
 
+/// Protocol v6 to v8 positional bincode layout of [`Task`], whose [`TaskRequirements`] ended at
+/// `max_retries` before `vram_mb` was appended in v9. Used only so a v9 Master can refuse a
+/// v6..=v8 `SubmitTask` frame with [`ProtocolError::IncompatibleVersion`].
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LegacyV6ToV8Task {
+    id: crate::task::TaskId,
+    spec: crate::task::TaskSpec,
+    requirements: LegacyPreV9TaskRequirements,
+    created_at_utc: u64,
+    tags: Vec<String>,
+    latest_checkpoint: Option<crate::task::CheckpointData>,
+    staged_files: Vec<crate::task::StagedFile>,
+    expected_outputs: Vec<String>,
+    inputs: Vec<crate::blob::TaskInput>,
+    output_globs: Vec<String>,
+    workspace: Option<crate::task::WorkspaceRef>,
+}
+
 /// Protocol v3 to v5 positional bincode layout of [`ClientMessage`]: the same variants as v6
-/// except `Hello`, but `SubmitTask` carries a [`LegacyV5Task`]. Used only so a v6 Master can
+/// except `Hello`, but `SubmitTask` carries a [`LegacyV5Task`]. Used only so a v6+ Master can
 /// refuse a v5 client frame with [`ProtocolError::IncompatibleVersion`] instead of an opaque
-/// bincode error. Every other variant has the v6 layout and is refused by the version check of
-/// [`BinaryClientMessage`] itself.
+/// bincode error. Every other variant keeps the current layout and is refused by the version check
+/// of [`BinaryClientMessage`] itself.
 #[derive(Deserialize)]
 #[allow(clippy::large_enum_variant, dead_code)]
 enum LegacyV5BinaryClientMessage {
     SubmitTask {
         task: LegacyV5Task,
+        wait: bool,
+        protocol_version: u32,
+    },
+}
+
+/// Protocol v6 to v8 positional bincode layout of [`ClientMessage::SubmitTask`] carrying
+/// [`LegacyV6ToV8Task`]. Used only so a v9+ Master refuses a v6..=v8 `SubmitTask` with
+/// [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode error.
+#[derive(Deserialize)]
+#[allow(clippy::large_enum_variant, dead_code)]
+enum LegacyV6ToV8BinaryClientMessage {
+    SubmitTask {
+        task: LegacyV6ToV8Task,
         wait: bool,
         protocol_version: u32,
     },
@@ -4506,6 +4550,14 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, Protocol
                     return Err(incompatible_version_error(protocol_version));
                 }
             }
+            if let Ok(LegacyV6ToV8BinaryClientMessage::SubmitTask {
+                protocol_version, ..
+            }) = bincode_exact_deserialize::<LegacyV6ToV8BinaryClientMessage>(slice)
+            {
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(incompatible_version_error(protocol_version));
+                }
+            }
             Err(ProtocolError::Bincode(err))
         }
     }
@@ -5380,6 +5432,7 @@ mod tests {
                         gpu_required: false,
                         timeout_secs: 60,
                         max_retries: None,
+                        vram_mb: None,
                     },
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
@@ -5407,6 +5460,7 @@ mod tests {
                         gpu_required: false,
                         timeout_secs: 60,
                         max_retries: None,
+                        vram_mb: None,
                     },
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
@@ -6851,27 +6905,47 @@ mod tests {
         )
     }
 
-    /// The bytes a v5 client sent for `SubmitTask`: the v6 frame without the `workspace` tag byte
-    /// (`None`), which sits just before the one-byte `wait` and the four-byte version trailer.
-    fn v5_submit_task_frame(wait: bool) -> Vec<u8> {
+    /// The bytes a pre-v9 client sent for `SubmitTask` without `TaskRequirements::vram_mb`.
+    fn pre_v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
         let msg = ClientMessage::SubmitTask {
-            task: sample_workspace_task(),
+            task: task.clone(),
             wait,
         };
-        let raw = serialize_client_message_with_version(&msg, 5, WireCodec::Bincode)
+        let mut raw = serialize_client_message_with_version(&msg, version, WireCodec::Bincode)
             .unwrap()
             .to_vec();
-        let len = raw.len();
-        assert_eq!(raw[len - 6], 0, "workspace None tag byte");
-        let mut v5 = raw[..len - 6].to_vec();
-        v5.extend_from_slice(&raw[len - 5..]);
+        let vram_tag_offset = 1
+            + 4
+            + bincode::serialized_size(&(
+                task.id,
+                &task.spec,
+                task.requirements.cpu_cores,
+                task.requirements.ram_mb,
+                task.requirements.gpu_required,
+                task.requirements.timeout_secs,
+                task.requirements.max_retries,
+            ))
+            .unwrap() as usize;
+        assert_eq!(raw[vram_tag_offset], 0, "vram_mb None tag byte");
+        raw.remove(vram_tag_offset);
+        raw
+    }
+
+    /// The bytes a v5 client sent for `SubmitTask`: without `TaskRequirements::vram_mb` and without
+    /// the `workspace` tag byte (`None`), which sits just before `wait` and the version trailer.
+    fn v5_submit_task_frame(wait: bool) -> Vec<u8> {
+        let task = sample_workspace_task();
+        let mut v5 = pre_v9_submit_task_frame(&task, 5, wait);
+        let len = v5.len();
+        assert_eq!(v5[len - 6], 0, "workspace None tag byte");
+        v5.remove(len - 6);
         v5
     }
 
     #[test]
     fn test_protocol_6_hello_round_trips_in_both_codecs_and_is_appended_last() {
-        assert_eq!(PROTOCOL_VERSION_CURRENT, 8);
-        assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 8);
+        assert_eq!(PROTOCOL_VERSION_CURRENT, 9);
+        assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 9);
         for codec in [WireCodec::Bincode, WireCodec::Json] {
             let raw = serialize_message(&ClientMessage::Hello, codec).unwrap();
             let (msg, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();
@@ -7244,5 +7318,45 @@ mod tests {
         let mut other_out = base.clone();
         other_out.stdout = crate::task::Bytes::from_static(b"changed");
         assert_ne!(master_features::result_ack_token(&other_out), token1);
+    }
+
+    #[test]
+    fn test_protocol_9_task_vram_mb_round_trips_and_refuses_v8_submit() {
+        let task = Task::new(
+            TaskSpec::gpu_compute("vram_kernel", 64),
+            crate::task::TaskRequirements::gpu(60).with_vram_mb(6_144),
+        );
+        let msg = ClientMessage::SubmitTask { task, wait: true };
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            let raw = serialize_message(&msg, codec).unwrap();
+            let (back, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();
+            assert_eq!(back, msg, "{codec:?}");
+            assert_eq!(detected, codec);
+        }
+
+        let base_task = sample_workspace_task();
+        for version in [6, 7, 8] {
+            let frame = pre_v9_submit_task_frame(&base_task, version, false);
+            match deserialize_message::<ClientMessage>(&frame) {
+                Err(ProtocolError::IncompatibleVersion {
+                    peer_version,
+                    current_version,
+                    min_compatible_version,
+                }) => {
+                    assert_eq!(peer_version, version);
+                    assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                    assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                }
+                other => panic!("expected IncompatibleVersion({version}), got {other:?}"),
+            }
+            match deserialize_message::<InboundMessage>(&frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, version);
+                }
+                other => {
+                    panic!("expected InboundMessage IncompatibleVersion({version}), got {other:?}")
+                }
+            }
+        }
     }
 }
