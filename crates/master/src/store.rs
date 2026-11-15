@@ -213,6 +213,8 @@ pub struct PersistedTaskEntry {
     pub result: Option<TaskResult>,
     #[serde(default)]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_result: Option<crate::cold_results::ColdResultSummary>,
 }
 
 /// Point-in-time image of the queue written by compaction.
@@ -313,6 +315,7 @@ struct Shared {
 /// releases `store.lock`.
 pub struct TaskStore {
     dir: PathBuf,
+    cold_results: Arc<crate::cold_results::ColdResultStore>,
     tx: Option<mpsc::Sender<Cmd>>,
     thread: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
@@ -337,6 +340,7 @@ impl TaskStore {
     ) -> GridResult<(TaskStore, Recovered)> {
         let dir = state_dir.as_ref().to_path_buf();
         prepare_dir(&dir)?;
+        let cold_results = Arc::new(crate::cold_results::ColdResultStore::open(&dir)?);
 
         let lock_path = dir.join(LOCK_FILE);
         let lock = open_rw(&lock_path)?;
@@ -412,6 +416,7 @@ impl TaskStore {
 
         let store = TaskStore {
             dir,
+            cold_results,
             tx: Some(tx),
             thread: Some(thread),
             shared,
@@ -423,6 +428,11 @@ impl TaskStore {
             stale_journal_discarded: loaded.stale,
         };
         Ok((store, recovered))
+    }
+
+    /// The out-of-band cold terminal result store under `<state_dir>/cold_results`.
+    pub(crate) fn cold_results(&self) -> &Arc<crate::cold_results::ColdResultStore> {
+        &self.cold_results
     }
 
     /// The state directory this store owns.
@@ -748,7 +758,7 @@ fn note_fsync(_dir: &Path, _kind: &'static str) {
 
 /// The only places that call `sync_all` / `sync_data`: each syncs and then records `kind`, so a
 /// test that expects a log entry fails when the sync is skipped.
-fn sync_file_all(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
+pub(crate) fn sync_file_all(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
     file.sync_all()?;
     note_fsync(dir, kind);
     Ok(())
@@ -762,7 +772,7 @@ fn sync_file_data(file: &File, dir: &Path, kind: &'static str) -> std::io::Resul
 
 /// `fsync` of a directory so a create or rename in it survives a crash. A no-op on Windows,
 /// which has no directory fsync.
-fn sync_dir(dir: &Path, kind: &'static str) -> GridResult<()> {
+pub(crate) fn sync_dir(dir: &Path, kind: &'static str) -> GridResult<()> {
     #[cfg(unix)]
     File::open(dir)
         .and_then(|d| sync_file_all(&d, dir, kind))
@@ -772,12 +782,12 @@ fn sync_dir(dir: &Path, kind: &'static str) -> GridResult<()> {
     Ok(())
 }
 
-fn storage_io(path: &Path, what: &str, err: std::io::Error) -> GridError {
+pub(crate) fn storage_io(path: &Path, what: &str, err: std::io::Error) -> GridError {
     GridError::Storage(format!("cannot {what} {}: {err}", path.display()))
 }
 
 /// Creates `dir` (mode 0700 on Unix) and verifies it is a real directory owned by this user.
-fn prepare_dir(dir: &Path) -> GridResult<()> {
+pub(crate) fn prepare_dir(dir: &Path) -> GridResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1506,6 +1516,7 @@ mod tests {
                 retry_history: vec![attempt()],
                 result: None,
                 error_message: None,
+                cold_result: None,
             })
             .collect();
         SnapshotImage {
@@ -2024,6 +2035,7 @@ mod tests {
                 retry_history: vec![],
                 result: Some(result),
                 error_message: None,
+                cold_result: None,
             }],
             terminal_order: vec![id],
         };

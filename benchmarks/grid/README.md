@@ -195,6 +195,30 @@ All 12 runs finished with `0` failed burst tasks and `0` failed post-reconnect t
 simulated packet-loss stalls in the impaired run, range `643` to `654`). Peak master RSS (`507` to
 `845 MiB` vs `25.6` to `87.6 MiB` steady) occurs during simultaneous `100 x 10 MiB` `GetBlob` fan-out.
 
+**(d) Post-`SCALE-2` recorded runs.** `2026-11-15` (UTC), same machine (`Intel(R) Core(TM) i5-14600KF`,
+20 logical CPUs, `47.79` GiB RAM, Windows `amd64`, AC power), release build of `ec228a01` (with `WorkerIndex`,
+`FairShareQueues`, `SCAN_PAGE = 512`, `DEFAULT_MASTER_MAX_BATCH_SIZE = 1024`, dashboard receiver guards,
+and single-flight batched `ColdResultStore` active), 3 fresh clusters per scenario:
+
+- 500w loopback (post-`SCALE-2`): [`results/2026-11-15-scale2-windows-amd64-500w.json`](results/2026-11-15-scale2-windows-amd64-500w.json)
+- 1000w loopback (post-`SCALE-2`): [`results/2026-11-15-scale2-windows-amd64-1000w.json`](results/2026-11-15-scale2-windows-amd64-1000w.json)
+
+| Scenario | Registration, ms | Unloaded assign p50 / p99, ms | Burst throughput, tasks/s | Burst assign p50 / p99, ms | Reconnect storm, ms |
+|---|---|---|---|---|---|
+| 500w loopback (`SCALE-2`, 20 sub, 2000 tasks) | 251.7 (233.9 to 265.2) | 16.69 (16.63 to 16.77) / 30.69 (29.59 to 40.86) | 409.1 (403.3 to 412.8) | 17.47 (17.42 to 17.51) / 33.69 (33.67 to 34.17) | 653.8 (648.7 to 654.7) |
+| 1000w loopback (`SCALE-2`, 20 sub, 2000 tasks) | 359.0 (358.9 to 374.6) | 17.67 (17.67 to 17.74) / 32.23 (31.98 to 34.14) | 414.4 (413.2 to 417.9) | 18.91 (18.81 to 18.97) / 35.35 (34.58 to 36.46) | 643.0 (642.9 to 676.1) |
+
+| Scenario | Steady / Peak RSS, MiB | Peak / Steady master CPU, % | Quiet heartbeats (acks/s, rx / tx B/s) | `100 x 10 MiB` fan-out (ms, MiB/s) | Journal bytes / replay / restart, ms |
+|---|---|---|---|---|---|
+| 500w loopback (`SCALE-2`) | 57.2 (55.5 to 57.2) / 683.3 (615.2 to 805.5) | 983.5 (892.7 to 1316.3) / 3.79 (1.64 to 7.18) | 166.3, 6985 / 14303 | 1529.6 (1525.6 to 1530.0), 653.77 (653.61 to 655.47) | 1372548 / 51.36 (49.60 to 52.92) / 62.03 (59.70 to 63.26) |
+| 1000w loopback (`SCALE-2`) | 91.8 (91.6 to 97.4) / 749.2 (747.3 to 770.4) | 918.1 (855.2 to 1086.4) / 2.82 (1.75 to 6.14) | 336.0, 14114 / 28227 | 1495.6 (1461.6 to 1526.1), 668.61 (655.27 to 684.16) | 1372548 / 55.52 (54.23 to 55.57) / 61.37 (59.14 to 81.60) |
+
+All 6 post-`SCALE-2` runs finished with `0` failed burst tasks and `0` failed post-reconnect tasks.
+Compared against the `SCALE-1` baseline on the same host, `500w` burst throughput rises from `375.2` to
+`409.1` tasks/s (`+9.0 %`), `500w` unloaded assign p50 drops from `31.01` to `16.69 ms` (`-46.2 %`),
+and `1000w` maintains `414.4` tasks/s with `91.8 MiB` steady master RSS while holding full fair-share
+queues, bitset worker indexing, and durable cold-result spilling.
+
 ## Limits
 
 - (a) and (b) run on one machine over loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs

@@ -119,6 +119,8 @@ pub struct MasterFileConfig {
     pub auth: Option<String>,
     pub secret_file: Option<String>,
     pub secret: Option<SecretText>,
+    /// Maximum tasks placed in a single scheduling batch (`master --max-batch-size`).
+    pub max_batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

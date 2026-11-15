@@ -30,13 +30,15 @@ use rusty_grid_core::placement::Placement;
 use rusty_grid_core::protocol::{MasterMessage, ProtocolCapabilities};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 
+use crate::fair_share::FairWalkCursor;
 use crate::queue::{AssignedLoad, QueueOrderKey, TaskQueue, TaskView};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::server::WaiterMap;
 use crate::speed::{new_shared_speed_book, SharedSpeedBook, SpeedBook, TaskKey};
+use crate::worker_index::{RegisteredIndex, SeatStaticMeta, WorkerIndex};
 
 /// Queued tasks examined per page of a scheduling pass (each page is one short read lock).
-const SCAN_PAGE: usize = 256;
+const SCAN_PAGE: usize = 512;
 
 /// How long an idle probe of the queue for GPU work is trusted (see `GpuDemand`).
 const GPU_PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -366,16 +368,6 @@ fn placement_admits(placement: &Placement, worker: &WorkerInfo) -> bool {
     )
 }
 
-/// [`statically_fits`] and [`placement_admits`] for a queued task's view. A view whose constraints
-/// cannot be read fits nowhere.
-fn view_fits(view: &TaskView, worker: &WorkerInfo) -> bool {
-    statically_fits(&view.requirements, worker)
-        && view
-            .placement
-            .as_ref()
-            .is_ok_and(|placement| placement_admits(placement, worker))
-}
-
 /// One worker as the placement engine tracks it during a pass.
 struct Seat<'a> {
     worker: &'a WorkerInfo,
@@ -425,11 +417,14 @@ enum Verdict {
 /// and picks a worker for each. Free of I/O and global state, so it is deterministic and testable.
 struct Engine<'a> {
     config: &'a SchedulerConfig,
+    workers: &'a [WorkerInfo],
     seats: Vec<Seat<'a>>,
+    worker_index: WorkerIndex,
     /// All registered workers in the cluster (including `Disconnected` and cooling-down ones),
     /// used by `fail_unfulfillable_tasks` so tasks are not failed while their matching worker is
     /// still registered.
     registered: &'a [WorkerInfo],
+    registered_index: RegisteredIndex,
     rr_cursor: usize,
     /// A GPU task that some GPU worker could run is waiting (see
     /// `SchedulerConfig::preserve_gpu_for_gpu_tasks`).
@@ -533,6 +528,66 @@ fn effective_scheduler_battery_tier(
     }
 }
 
+/// Evaluates Stage 4 (mobile & environmental constraints) once per worker across all 4
+/// `(cpu_cores > 1, heavy)` combinations (`bucket = (multi_core as usize) | ((heavy as usize) << 1)`).
+fn compute_mobile_flags(config: &SchedulerConfig, worker: &WorkerInfo) -> [bool; 4] {
+    let live_mobile = effective_mobile_live_status(worker);
+    let is_thermal_throttled = worker
+        .capabilities
+        .tags
+        .iter()
+        .any(|t| t == "thermal_throttled")
+        || live_mobile.as_ref().is_some_and(|m| m.thermal_throttled);
+    let is_low_battery = worker.capabilities.tags.iter().any(|t| t == "low_battery")
+        || live_mobile.as_ref().is_some_and(|m| {
+            m.battery_pct
+                .is_some_and(|pct| pct < config.mobile_min_battery_pct)
+                && m.is_charging == Some(false)
+        });
+    let live_tiers = live_mobile.as_ref().and_then(|live| {
+        let bat =
+            effective_scheduler_battery_tier(worker, worker.capabilities.mobile.as_ref(), live);
+        let therm = effective_scheduler_thermal_tier(live);
+        let is_charging = live.is_charging.unwrap_or(false);
+        let eff = calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
+        if eff == 0 || bat == BatteryTier::Critical || therm == ThermalTier::Critical {
+            None
+        } else {
+            Some((bat, therm, is_charging))
+        }
+    });
+    if live_mobile.is_some() && live_tiers.is_none() {
+        return [false; 4];
+    }
+    let mut flags = [false; 4];
+    for (bucket, slot) in flags.iter_mut().enumerate() {
+        let multi_core = (bucket & 1) != 0;
+        let heavy = (bucket & 2) != 0;
+        if is_thermal_throttled && (multi_core || heavy) {
+            continue;
+        }
+        if is_low_battery && heavy {
+            continue;
+        }
+        if let Some((bat, therm, is_charging)) = live_tiers {
+            if matches!(bat, BatteryTier::SubLow) && (multi_core || heavy) {
+                continue;
+            }
+            if matches!(bat, BatteryTier::Low) && heavy {
+                continue;
+            }
+            match therm {
+                ThermalTier::Critical => continue,
+                ThermalTier::Hot if multi_core || heavy => continue,
+                ThermalTier::Warm if heavy && !is_charging => continue,
+                _ => {}
+            }
+        }
+        *slot = true;
+    }
+    flags
+}
+
 impl<'a> Engine<'a> {
     /// `loads` is the master's own accounting per worker. `None` takes each worker's
     /// `active_tasks` as its load instead (the pure `matchmake` API, which has no queue).
@@ -574,22 +629,41 @@ impl<'a> Engine<'a> {
                     max_slots,
                     max_tasks,
                     base,
-                    placed: AssignedLoad::default(),
                     running: Vec::new(),
+                    placed: AssignedLoad::default(),
                 }
             })
             .collect();
-        let free_slots = seats
-            .iter()
-            .filter(|seat| seat.worker.status != WorkerStatus::Disconnected)
-            .map(Seat::remaining_slots)
-            .sum();
+        let mut seat_meta = Vec::with_capacity(seats.len());
+        let mut remaining_slots = Vec::with_capacity(seats.len());
+        let mut mobile_flags = Vec::with_capacity(seats.len());
+        let mut free_slots = 0usize;
+        for seat in &seats {
+            let rem = seat.remaining_slots();
+            if seat.worker.status != WorkerStatus::Disconnected {
+                free_slots += rem;
+            }
+            seat_meta.push(SeatStaticMeta {
+                host_busy: seat.worker.cpu_usage_pct > config.max_host_cpu_pct,
+                is_gpu: seat.worker.capabilities.can_execute_gpu(),
+                is_real_gpu: seat.worker.capabilities.has_gpu
+                    && !seat.worker.capabilities.is_simulated_gpu,
+                initial_load: seat.base.tasks,
+            });
+            remaining_slots.push(rem);
+            mobile_flags.push(compute_mobile_flags(config, seat.worker));
+        }
+        let worker_index = WorkerIndex::build(workers, seat_meta, &remaining_slots, &mobile_flags);
+        let registered_index = RegisteredIndex::build(registered);
         Self {
             config,
+            workers,
             any_gpu_worker: registered.iter().any(|w| w.capabilities.can_execute_gpu()),
             registered,
+            registered_index,
             reserved: vec![false; seats.len()],
             seats,
+            worker_index,
             rr_cursor: 0,
             gpu_waiting,
             gpu_recent: gpu_recent || gpu_waiting,
@@ -634,14 +708,23 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn any_gpu_worker_fits_view(&self, view: &TaskView) -> bool {
+        view.requires_gpu
+            && view.placement.as_ref().is_ok_and(|placement| {
+                self.worker_index
+                    .attrs()
+                    .any_gpu_fits(self.workers, &view.requirements, placement)
+            })
+    }
+
     fn skip_reason(&self, view: &TaskView, placement: &Placement) -> ScheduleSkipReason {
         if view.requires_gpu && !self.any_gpu_worker {
             ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !view.required_features.is_empty()
             && !self
-                .seats
-                .iter()
-                .any(|seat| seat.worker.features.contains(view.required_features))
+                .worker_index
+                .attrs()
+                .any_has_features(self.workers, view.required_features)
         {
             ScheduleSkipReason::ClusterLacksCapability(format!(
                 "cluster lacks workers with {} capability",
@@ -650,10 +733,7 @@ impl<'a> Engine<'a> {
         } else if view.requires_gpu {
             ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !placement.is_empty()
-            && !self
-                .seats
-                .iter()
-                .any(|seat| placement_admits(placement, seat.worker))
+            && !self.worker_index.attrs().any_matches_placement(placement)
         {
             ScheduleSkipReason::ClusterLacksCapability(format!(
                 "no worker matches the placement constraints ({placement})"
@@ -681,9 +761,8 @@ impl<'a> Engine<'a> {
             }
             let nobody_has_features = !view.required_features.is_empty()
                 && !self
-                    .registered
-                    .iter()
-                    .any(|w| w.features.contains(view.required_features));
+                    .registered_index
+                    .any_has_features(self.registered, view.required_features);
             if nobody_has_features {
                 let verdict = Verdict::Unfulfillable(format!(
                     "Cluster lacks workers with {} capability",
@@ -692,11 +771,8 @@ impl<'a> Engine<'a> {
                 self.dead.insert(shape, verdict.clone());
                 return verdict;
             }
-            let nobody_matches = !placement.is_empty()
-                && !self
-                    .registered
-                    .iter()
-                    .any(|w| placement_admits(placement, w));
+            let nobody_matches =
+                !placement.is_empty() && !self.registered_index.any_matches_placement(placement);
             if nobody_matches {
                 let verdict = Verdict::Unfulfillable(format!(
                     "No registered worker matches the placement constraints ({placement})"
@@ -704,12 +780,13 @@ impl<'a> Engine<'a> {
                 self.dead.insert(shape, verdict.clone());
                 return verdict;
             }
-            let nobody_fits = !self.registered.iter().any(|w| {
-                statically_fits(&view.requirements, w)
-                    && placement_admits(placement, w)
-                    && (!view.requires_gpu || w.capabilities.can_execute_gpu())
-                    && w.features.contains(view.required_features)
-            });
+            let nobody_fits = !self.registered_index.any_fits_all(
+                self.registered,
+                &view.requirements,
+                placement,
+                view.requires_gpu,
+                view.required_features,
+            );
             if nobody_fits {
                 let verdict = Verdict::Unfulfillable(format!(
                     "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})",
@@ -882,6 +959,9 @@ impl<'a> Engine<'a> {
         self.free_slots = self
             .free_slots
             .saturating_sub(free_before.saturating_sub(free_after));
+        let reserved_chosen = self.reserved[chosen];
+        self.worker_index
+            .sync_seat_free(chosen, free_after > 0, reserved_chosen);
         self.dead_speed.clear();
         Verdict::Placed(chosen)
     }
@@ -911,10 +991,78 @@ impl<'a> Engine<'a> {
         };
         if !self.reserved[idx] {
             self.reserved[idx] = true;
+            self.worker_index.set_seat_reserved(idx);
             let seat = &self.seats[idx];
             // Its free slots are out of reach for the rest of the pass.
             self.free_slots = self.free_slots.saturating_sub(seat.remaining_slots());
             self.dead_speed.clear();
+        }
+    }
+
+    fn is_seat_ram_short(&self, seat: &Seat<'_>, req_ram_mb: u64) -> bool {
+        req_ram_mb > 0 && seat.worker.ram_available_mb > 0 && {
+            let reserved = seat.base.unstarted_ram_mb + seat.placed.unstarted_ram_mb;
+            seat.worker.ram_available_mb.saturating_sub(reserved) < req_ram_mb
+        }
+    }
+
+    fn apply_stage6_and_7(
+        &self,
+        view: &TaskView,
+        weight: usize,
+        found: &mut Vec<usize>,
+        matching: &mut Vec<usize>,
+    ) {
+        let config = self.config;
+        // Stage 6: GPU preservation. While a GPU task waits, a generic task takes a CPU-only worker
+        // whenever one can run it and only spills onto a GPU worker when none can. While GPU work
+        // waits or is likely, a spill-over must leave that GPU worker some slots free.
+        if !view.requires_gpu
+            && config.preserve_gpu_for_gpu_tasks
+            && (self.gpu_waiting || self.gpu_recent)
+        {
+            if self.gpu_waiting && found.iter().any(|idx| !self.worker_index.meta(*idx).is_gpu) {
+                found.retain(|idx| !self.worker_index.meta(*idx).is_gpu);
+                matching.retain(|idx| !self.worker_index.meta(*idx).is_gpu);
+            } else {
+                found.retain(|idx| {
+                    if !self.worker_index.meta(*idx).is_gpu {
+                        return true;
+                    }
+                    let seat = &self.seats[*idx];
+                    let reserve = config
+                        .gpu_reserved_slots
+                        .min(seat.max_slots.saturating_sub(1))
+                        .min(seat.max_tasks.saturating_sub(1));
+                    seat.max_slots.saturating_sub(seat.used_slots() + weight) >= reserve
+                        && seat.max_tasks.saturating_sub(seat.load() + 1) >= reserve
+                });
+                matching.retain(|idx| {
+                    if !self.worker_index.meta(*idx).is_gpu {
+                        return true;
+                    }
+                    let seat = &self.seats[*idx];
+                    let reserve = config
+                        .gpu_reserved_slots
+                        .min(seat.max_slots.saturating_sub(1))
+                        .min(seat.max_tasks.saturating_sub(1));
+                    seat.max_slots.saturating_sub(weight) >= reserve
+                        && seat.max_tasks.saturating_sub(1) >= reserve
+                });
+            }
+        }
+
+        // Stage 7: Real-GPU priority.
+        // For GPU-requiring tasks, prioritize hardware GPU (wgpu) workers over simulated
+        // GPU workers. Simulated GPU workers are only used when no idle real-GPU worker is available.
+        if view.requires_gpu {
+            let has_idle_real_gpu = found.iter().any(|&idx| {
+                self.worker_index.meta(idx).is_real_gpu && self.seats[idx].used_slots() == 0
+            });
+            if has_idle_real_gpu {
+                found.retain(|&idx| self.worker_index.meta(idx).is_real_gpu);
+                matching.retain(|&idx| self.worker_index.meta(idx).is_real_gpu);
+            }
         }
     }
 
@@ -936,190 +1084,103 @@ impl<'a> Engine<'a> {
         full.clear();
         matching.clear();
 
-        for (idx, seat) in self.seats.iter().enumerate() {
-            let worker = seat.worker;
-            // Stage 1: Connectivity
-            if worker.status == WorkerStatus::Disconnected || avoided.contains(&worker.worker_id) {
-                continue;
-            }
+        let Ok(ref placement) = view.placement else {
+            return found;
+        };
 
-            // Stage 2: Hardware requirements (CPU & RAM), placement constraints (os, arch, worker,
-            // tag) & Anti-stuttering backpressure
-            if !view_fits(view, worker) {
-                continue;
-            }
-            // Anti-stuttering: if host CPU exceeds threshold, back off and skip this worker
-            let host_busy = worker.cpu_usage_pct > config.max_host_cpu_pct;
-            // Free RAM check against what the worker last reported free, minus the declared RAM of
-            // tasks that were handed to it but have not started (they are not in that figure yet).
-            let ram_short = req.ram_mb > 0 && worker.ram_available_mb > 0 && {
-                let reserved = seat.base.unstarted_ram_mb + seat.placed.unstarted_ram_mb;
-                worker.ram_available_mb.saturating_sub(reserved) < req.ram_mb
-            };
-            if (host_busy || ram_short) && seat.load() == 0 {
-                continue;
-            }
+        let speed_active = self.speed_book.is_some()
+            && config.speed_hold_factor.is_finite()
+            && config.speed_hold_factor > 1.0;
 
-            // Stage 3: Strict GPU Gating (Requirement R3 & AC4)
-            // Dual-gated: if task demands GPU, worker MUST advertise has_gpu or is_simulated_gpu
-            // Non-GPU workers NEVER receive GPU tasks under any circumstances!
-            if view.requires_gpu && !worker.capabilities.can_execute_gpu() {
-                continue;
+        if !speed_active {
+            if let Some(mask) = self.worker_index.free_candidate_mask(
+                placement,
+                view.requires_gpu,
+                view.required_features,
+                req.cpu_cores,
+                view.heavy,
+                avoided,
+            ) {
+                for idx in mask.iter_ones() {
+                    let seat = &self.seats[idx];
+                    if !statically_fits(req, seat.worker)
+                        || self.is_seat_ram_short(seat, req.ram_mb)
+                        || !seat.worker.features.contains(view.required_features)
+                    {
+                        continue;
+                    }
+                    let used = seat.used_slots();
+                    let tasks = seat.load();
+                    if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
+                        continue;
+                    }
+                    found.push(idx);
+                }
             }
-
-            // Stage 3b: file staging / blob transfer capability gating (Requirement R2)
-            if !worker.features.contains(view.required_features) {
-                continue;
+            self.apply_stage6_and_7(view, weight, &mut found, matching);
+            if !found.is_empty() {
+                return found;
             }
-
-            // Stage 4: Mobile & Environmental Constraints via capability tags and mobile telemetry
-            let live_mobile = effective_mobile_live_status(worker);
-            let is_thermal_throttled = worker
-                .capabilities
-                .tags
-                .iter()
-                .any(|t| t == "thermal_throttled")
-                || live_mobile.as_ref().is_some_and(|m| m.thermal_throttled);
-            let is_low_battery = worker.capabilities.tags.iter().any(|t| t == "low_battery")
-                || live_mobile.as_ref().is_some_and(|m| {
-                    m.battery_pct
-                        .is_some_and(|pct| pct < config.mobile_min_battery_pct)
-                        && m.is_charging == Some(false)
-                });
-
-            if is_thermal_throttled && (req.cpu_cores > 1 || view.heavy) {
-                continue;
+            if let Some(mask) = self.worker_index.unblocked_static_mask(
+                placement,
+                view.requires_gpu,
+                view.required_features,
+                req.cpu_cores,
+                view.heavy,
+                avoided,
+            ) {
+                for idx in mask.iter_ones() {
+                    let seat = &self.seats[idx];
+                    if !statically_fits(req, seat.worker)
+                        || self.is_seat_ram_short(seat, req.ram_mb)
+                        || !seat.worker.features.contains(view.required_features)
+                    {
+                        continue;
+                    }
+                    let used = seat.used_slots();
+                    let tasks = seat.load();
+                    if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
+                        full.push(idx);
+                    }
+                }
             }
-            if is_low_battery && view.heavy {
-                continue;
-            }
+            return Vec::new();
+        }
 
-            if let Some(ref live) = live_mobile {
-                let bat = effective_scheduler_battery_tier(
-                    worker,
-                    worker.capabilities.mobile.as_ref(),
-                    live,
-                );
-                let therm = effective_scheduler_thermal_tier(live);
-                let is_charging = live.is_charging.unwrap_or(false);
-
-                // Zero effective concurrency means complete load-shedding
-                let eff =
-                    calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
-                if eff == 0 {
+        if let Some(mask) = self.worker_index.matching_static_mask(
+            placement,
+            view.requires_gpu,
+            view.required_features,
+            req.cpu_cores,
+            view.heavy,
+            avoided,
+        ) {
+            for idx in mask.iter_ones() {
+                let seat = &self.seats[idx];
+                if !statically_fits(req, seat.worker)
+                    || !seat.worker.features.contains(view.required_features)
+                {
                     continue;
                 }
-
-                // Task eligibility based on battery tier
-                match bat {
-                    BatteryTier::Critical => continue,
-                    BatteryTier::SubLow => {
-                        if req.cpu_cores > 1 || view.heavy {
-                            continue;
-                        }
-                    }
-                    BatteryTier::Low => {
-                        if view.heavy {
-                            continue;
-                        }
-                    }
-                    BatteryTier::Normal => {}
+                let host_busy = self.worker_index.meta(idx).host_busy;
+                let ram_short = self.is_seat_ram_short(seat, req.ram_mb);
+                if (host_busy || ram_short) && seat.load() == 0 {
+                    continue;
                 }
-
-                // Task eligibility based on thermal tier
-                match therm {
-                    ThermalTier::Critical => continue,
-                    ThermalTier::Hot => {
-                        if req.cpu_cores > 1 || view.heavy {
-                            continue;
-                        }
-                    }
-                    ThermalTier::Warm => {
-                        if view.heavy && !is_charging {
-                            continue;
-                        }
-                    }
-                    ThermalTier::Normal => {}
+                matching.push(idx);
+                if self.reserved[idx] || host_busy || ram_short {
+                    continue;
                 }
-            }
-
-            matching.push(idx);
-
-            if self.reserved[idx] || host_busy || ram_short {
-                continue;
-            }
-
-            // Stage 5: Concurrency saturation:
-            // (a) Task-count cap (`max_tasks`, from `slots:<n>`): a worker can run at most
-            //     `max_tasks` tasks at once (one worker semaphore permit per task).
-            // (b) Core-slot budget (`max_slots`): a task occupies `cpu_cores` core slots, so
-            //     eight 8-core builds cannot all land on a 16-core machine. An idle worker
-            //     always takes a task it is capable of as long as `max_tasks >= 1`.
-            let used = seat.used_slots();
-            let tasks = seat.load();
-            if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
-                full.push(idx);
-                continue;
-            }
-
-            found.push(idx);
-        }
-
-        // Stage 6: GPU preservation. While a GPU task waits, a generic task takes a CPU-only worker
-        // whenever one can run it and only spills onto a GPU worker when none can. While GPU work
-        // waits or is likely, a spill-over must leave that GPU worker some slots free.
-        if !view.requires_gpu
-            && config.preserve_gpu_for_gpu_tasks
-            && (self.gpu_waiting || self.gpu_recent)
-        {
-            let is_gpu = |idx: &usize| self.seats[*idx].worker.capabilities.can_execute_gpu();
-            if self.gpu_waiting && found.iter().any(|idx| !is_gpu(idx)) {
-                found.retain(|idx| !is_gpu(idx));
-                matching.retain(|idx| !is_gpu(idx));
-            } else {
-                found.retain(|idx| {
-                    if !is_gpu(idx) {
-                        return true;
-                    }
-                    let seat = &self.seats[*idx];
-                    let reserve = config
-                        .gpu_reserved_slots
-                        .min(seat.max_slots.saturating_sub(1))
-                        .min(seat.max_tasks.saturating_sub(1));
-                    seat.max_slots.saturating_sub(seat.used_slots() + weight) >= reserve
-                        && seat.max_tasks.saturating_sub(seat.load() + 1) >= reserve
-                });
-                matching.retain(|idx| {
-                    if !is_gpu(idx) {
-                        return true;
-                    }
-                    let seat = &self.seats[*idx];
-                    let reserve = config
-                        .gpu_reserved_slots
-                        .min(seat.max_slots.saturating_sub(1))
-                        .min(seat.max_tasks.saturating_sub(1));
-                    seat.max_slots.saturating_sub(weight) >= reserve
-                        && seat.max_tasks.saturating_sub(1) >= reserve
-                });
+                let used = seat.used_slots();
+                let tasks = seat.load();
+                if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
+                    full.push(idx);
+                    continue;
+                }
+                found.push(idx);
             }
         }
-
-        // Stage 7: Real-GPU priority.
-        // For GPU-requiring tasks, prioritize hardware GPU (wgpu) workers over simulated
-        // GPU workers. Simulated GPU workers are only used when no idle real-GPU worker is available.
-        if view.requires_gpu {
-            let is_real_gpu = |seat: &Seat<'_>| {
-                seat.worker.capabilities.has_gpu && !seat.worker.capabilities.is_simulated_gpu
-            };
-            let has_idle_real_gpu = found
-                .iter()
-                .any(|&idx| is_real_gpu(&self.seats[idx]) && self.seats[idx].used_slots() == 0);
-            if has_idle_real_gpu {
-                found.retain(|&idx| is_real_gpu(&self.seats[idx]));
-                matching.retain(|&idx| is_real_gpu(&self.seats[idx]));
-            }
-        }
-
+        self.apply_stage6_and_7(view, weight, &mut found, matching);
         found
     }
 
@@ -1604,132 +1665,234 @@ impl WorkloadScheduler {
         let mut report = ScheduleReport::default();
         let mut placements: Vec<(TaskId, usize)> = Vec::new();
         if (engine.free_slots > 0 || need_unfulfillable_sweep) && max_batch_size > 0 {
-            let mut cursor: Option<QueueOrderKey> = if engine.free_slots == 0 {
-                sweep_cursor
-            } else {
-                None
-            };
-            let mut scanned = 0usize;
-            let mut sweeping_from_cursor = engine.free_slots == 0;
+            let mut need_sweep = need_unfulfillable_sweep;
             let scan_budget = self.config.max_scan_per_pass.max(1);
-            'scan: loop {
-                let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(scanned));
-                if page_limit == 0 {
-                    if !sweeping_from_cursor
-                        && need_unfulfillable_sweep
-                        && sweep_cursor.is_some()
-                        && self
-                            .unfulfillable_sweep
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .cursor
-                            == sweep_cursor
+            let mut ran_fair = false;
+            if engine.free_slots > 0 && self.queue.active_submitter_count().await > 1 {
+                ran_fair = true;
+                let mut fair_cursor = FairWalkCursor::default();
+                let mut fair_scanned = 0usize;
+                let mut fair_exhausted = false;
+                while engine.free_slots > 0 && fair_scanned < scan_budget {
+                    let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(fair_scanned));
+                    if page_limit == 0 {
+                        break;
+                    }
+                    let views = self
+                        .queue
+                        .ready_views_fair(&mut fair_cursor, page_limit)
+                        .await;
+                    let fetched = views.len();
+                    fair_scanned += fetched;
+                    if !engine.gpu_waiting
+                        && self.config.preserve_gpu_for_gpu_tasks
+                        && views.iter().any(|v| engine.any_gpu_worker_fits_view(v))
                     {
-                        sweeping_from_cursor = true;
-                        engine.free_slots = 0;
-                        cursor = sweep_cursor;
-                        scanned = 0;
-                        continue 'scan;
+                        engine.note_gpu_waiting();
+                        self.note_gpu_demand();
                     }
-                    break;
-                }
-                let (views, next) = self.queue.ready_views(cursor, page_limit).await;
-                scanned += views.len();
-                if !engine.gpu_waiting
-                    && self.config.preserve_gpu_for_gpu_tasks
-                    && views.iter().any(|v| {
-                        v.requires_gpu
-                            && workers
-                                .iter()
-                                .any(|w| w.capabilities.can_execute_gpu() && view_fits(v, w))
-                    })
-                {
-                    engine.note_gpu_waiting();
-                    self.note_gpu_demand();
-                }
-                for view in &views {
-                    #[cfg(feature = "otel")]
-                    let place_span = tracing::info_span!(
-                        target: crate::otel::OTEL_SPAN_TARGET,
-                        "place",
-                        task_id = %view.task_id,
-                        requires_gpu = view.requires_gpu,
-                        worker_id = tracing::field::Empty,
-                        verdict = tracing::field::Empty,
-                    );
-                    match engine.place(view) {
-                        Verdict::Placed(idx) => {
-                            #[cfg(feature = "otel")]
-                            {
-                                place_span.record("verdict", "placed");
-                                place_span.record(
-                                    "worker_id",
-                                    tracing::field::display(engine.seats[idx].worker.worker_id),
-                                );
-                            }
-                            placements.push((view.task_id, idx));
-                            if view.requires_gpu {
-                                self.note_gpu_demand();
-                            }
-                            if placements.len() >= max_batch_size {
-                                engine.free_slots = 0;
-                            }
-                            if engine.free_slots == 0 && !need_unfulfillable_sweep {
+                    let mut broke_early = false;
+                    for view in &views {
+                        #[cfg(feature = "otel")]
+                        let place_span = tracing::info_span!(
+                            target: crate::otel::OTEL_SPAN_TARGET,
+                            "place",
+                            task_id = %view.task_id,
+                            requires_gpu = view.requires_gpu,
+                            worker_id = tracing::field::Empty,
+                            verdict = tracing::field::Empty,
+                        );
+                        match engine.place(view) {
+                            Verdict::Placed(idx) => {
                                 #[cfg(feature = "otel")]
-                                drop(place_span);
-                                break 'scan;
+                                {
+                                    place_span.record("verdict", "placed");
+                                    place_span.record(
+                                        "worker_id",
+                                        tracing::field::display(engine.seats[idx].worker.worker_id),
+                                    );
+                                }
+                                placements.push((view.task_id, idx));
+                                if view.requires_gpu {
+                                    self.note_gpu_demand();
+                                }
+                                if placements.len() >= max_batch_size {
+                                    engine.free_slots = 0;
+                                }
+                                if engine.free_slots == 0 && !need_sweep {
+                                    #[cfg(feature = "otel")]
+                                    drop(place_span);
+                                    broke_early = true;
+                                    break;
+                                }
                             }
-                        }
-                        Verdict::Skip(reason) => {
-                            #[cfg(feature = "otel")]
-                            place_span.record("verdict", "skipped");
-                            if report.skipped.len() < max_batch_size {
-                                report.skipped.push((view.task_id, reason));
-                            }
-                            // A worker held back for this task may have been the last one with room.
-                            if engine.free_slots == 0 && !need_unfulfillable_sweep {
+                            Verdict::Skip(reason) => {
                                 #[cfg(feature = "otel")]
-                                drop(place_span);
-                                break 'scan;
+                                place_span.record("verdict", "skipped");
+                                if report.skipped.len() < max_batch_size {
+                                    report.skipped.push((view.task_id, reason));
+                                }
+                                // A worker held back for this task may have been the last one with room.
+                                if engine.free_slots == 0 && !need_sweep {
+                                    #[cfg(feature = "otel")]
+                                    drop(place_span);
+                                    broke_early = true;
+                                    break;
+                                }
+                            }
+                            Verdict::Unfulfillable(reason) => {
+                                #[cfg(feature = "otel")]
+                                place_span.record("verdict", "unfulfillable");
+                                report.unfulfillable.push((view.task_id, reason));
                             }
                         }
-                        Verdict::Unfulfillable(reason) => {
-                            #[cfg(feature = "otel")]
-                            place_span.record("verdict", "unfulfillable");
-                            report.unfulfillable.push((view.task_id, reason));
-                        }
+                        #[cfg(feature = "otel")]
+                        drop(place_span);
                     }
-                    #[cfg(feature = "otel")]
-                    drop(place_span);
+                    if broke_early {
+                        break;
+                    }
+                    if fetched < page_limit {
+                        fair_exhausted = true;
+                        break;
+                    }
                 }
-                match next {
-                    Some(key) => {
-                        cursor = Some(key);
-                        if self.config.fail_unfulfillable_tasks {
-                            let mut state = self
+                if fair_exhausted && self.config.fail_unfulfillable_tasks {
+                    *self
+                        .unfulfillable_sweep
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = UnfulfillableSweep {
+                        epochs: Some(sweep_state),
+                        cursor: None,
+                        completed: true,
+                    };
+                    need_sweep = false;
+                } else if need_sweep {
+                    engine.free_slots = 0;
+                }
+            }
+            if (engine.free_slots > 0 && !ran_fair) || need_sweep {
+                let mut cursor: Option<QueueOrderKey> = if engine.free_slots == 0 {
+                    sweep_cursor
+                } else {
+                    None
+                };
+                let mut scanned = 0usize;
+                let mut sweeping_from_cursor = engine.free_slots == 0;
+                'scan: loop {
+                    let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(scanned));
+                    if page_limit == 0 {
+                        if !sweeping_from_cursor
+                            && need_sweep
+                            && sweep_cursor.is_some()
+                            && self
                                 .unfulfillable_sweep
                                 .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            if state.epochs == Some(sweep_state) && !state.completed {
-                                state.cursor = Some(match state.cursor {
-                                    Some(prev) if prev > key => prev,
-                                    _ => key,
-                                });
-                            }
-                        }
-                    }
-                    None => {
-                        if self.config.fail_unfulfillable_tasks {
-                            *self
-                                .unfulfillable_sweep
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = UnfulfillableSweep {
-                                epochs: Some(sweep_state),
-                                cursor: None,
-                                completed: true,
-                            };
+                                .unwrap_or_else(|e| e.into_inner())
+                                .cursor
+                                == sweep_cursor
+                        {
+                            sweeping_from_cursor = true;
+                            engine.free_slots = 0;
+                            cursor = sweep_cursor;
+                            scanned = 0;
+                            continue 'scan;
                         }
                         break;
+                    }
+                    let (views, next) = self.queue.ready_views(cursor, page_limit).await;
+                    scanned += views.len();
+                    if !engine.gpu_waiting
+                        && self.config.preserve_gpu_for_gpu_tasks
+                        && views.iter().any(|v| engine.any_gpu_worker_fits_view(v))
+                    {
+                        engine.note_gpu_waiting();
+                        self.note_gpu_demand();
+                    }
+                    for view in &views {
+                        #[cfg(feature = "otel")]
+                        let place_span = tracing::info_span!(
+                            target: crate::otel::OTEL_SPAN_TARGET,
+                            "place",
+                            task_id = %view.task_id,
+                            requires_gpu = view.requires_gpu,
+                            worker_id = tracing::field::Empty,
+                            verdict = tracing::field::Empty,
+                        );
+                        match engine.place(view) {
+                            Verdict::Placed(idx) => {
+                                #[cfg(feature = "otel")]
+                                {
+                                    place_span.record("verdict", "placed");
+                                    place_span.record(
+                                        "worker_id",
+                                        tracing::field::display(engine.seats[idx].worker.worker_id),
+                                    );
+                                }
+                                placements.push((view.task_id, idx));
+                                if view.requires_gpu {
+                                    self.note_gpu_demand();
+                                }
+                                if placements.len() >= max_batch_size {
+                                    engine.free_slots = 0;
+                                }
+                                if engine.free_slots == 0 && !need_sweep {
+                                    #[cfg(feature = "otel")]
+                                    drop(place_span);
+                                    break 'scan;
+                                }
+                            }
+                            Verdict::Skip(reason) => {
+                                #[cfg(feature = "otel")]
+                                place_span.record("verdict", "skipped");
+                                if report.skipped.len() < max_batch_size {
+                                    report.skipped.push((view.task_id, reason));
+                                }
+                                // A worker held back for this task may have been the last one with room.
+                                if engine.free_slots == 0 && !need_sweep {
+                                    #[cfg(feature = "otel")]
+                                    drop(place_span);
+                                    break 'scan;
+                                }
+                            }
+                            Verdict::Unfulfillable(reason) => {
+                                #[cfg(feature = "otel")]
+                                place_span.record("verdict", "unfulfillable");
+                                report.unfulfillable.push((view.task_id, reason));
+                            }
+                        }
+                        #[cfg(feature = "otel")]
+                        drop(place_span);
+                    }
+                    match next {
+                        Some(key) => {
+                            cursor = Some(key);
+                            if self.config.fail_unfulfillable_tasks {
+                                let mut state = self
+                                    .unfulfillable_sweep
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if state.epochs == Some(sweep_state) && !state.completed {
+                                    state.cursor = Some(match state.cursor {
+                                        Some(prev) if prev > key => prev,
+                                        _ => key,
+                                    });
+                                }
+                            }
+                        }
+                        None => {
+                            if self.config.fail_unfulfillable_tasks {
+                                *self
+                                    .unfulfillable_sweep
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = UnfulfillableSweep {
+                                    epochs: Some(sweep_state),
+                                    cursor: None,
+                                    completed: true,
+                                };
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -1938,18 +2101,38 @@ impl WorkloadScheduler {
 
             let mut ticker = tokio::time::interval(self.config.tick_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_pass: Option<Instant> = None;
+            const MAX_CONSECUTIVE_BATCHES: usize = 16;
 
             loop {
                 tokio::select! {
                     _ = self.trigger.notified() => {
                         debug!("Scheduler loop woken by event notification");
-                        if self.config.micro_batch_window > Duration::ZERO {
-                            tokio::time::sleep(self.config.micro_batch_window).await;
+                        let delay = last_pass.map_or(Duration::ZERO, |t| {
+                            self.config.micro_batch_window.saturating_sub(t.elapsed())
+                        });
+                        if delay > Duration::ZERO {
+                            tokio::time::sleep(delay).await;
                         }
-                        let _ = self.schedule_once().await;
+                        for _ in 0..MAX_CONSECUTIVE_BATCHES {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                            let batch_cap = self.config.max_batch_size.max(1);
+                            let report = self.schedule_once().await;
+                            last_pass = Some(Instant::now());
+                            let filled = report
+                                .as_ref()
+                                .is_ok_and(|r| r.assignments.len() >= batch_cap);
+                            if !filled {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
                     }
                     _ = ticker.tick() => {
                         let _ = self.schedule_once().await;
+                        last_pass = Some(Instant::now());
                     }
                     res = shutdown_rx.changed() => {
                         if res.is_ok() && *shutdown_rx.borrow() {
@@ -6074,5 +6257,397 @@ mod tests {
             matches!(err, rusty_grid_core::error::GridError::Config(_)),
             "expected GridError::Config for invalid speed_hold_factor, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn worker_index_matches_all_stages_and_speed_hold_back() {
+        let cfg = SchedulerConfig {
+            preserve_gpu_for_gpu_tasks: true,
+            gpu_reserved_slots: 1,
+            ..Default::default()
+        };
+
+        let mut w_real_gpu = tagged_worker(
+            "win-gpu",
+            &["os:windows", "arch:x86_64", "iso:fs+net", "tool:cargo"],
+        );
+        w_real_gpu.capabilities.cpu_cores = 8;
+        w_real_gpu.capabilities.ram_mb = 16384;
+        w_real_gpu.ram_available_mb = 16384;
+        w_real_gpu.capabilities.has_gpu = true;
+        w_real_gpu.capabilities.is_simulated_gpu = false;
+        w_real_gpu.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let mut w_sim_gpu = tagged_worker("lin-sim", &["os:linux", "arch:x86_64", "iso:fs"]);
+        w_sim_gpu.capabilities.cpu_cores = 8;
+        w_sim_gpu.capabilities.ram_mb = 16384;
+        w_sim_gpu.ram_available_mb = 16384;
+        w_sim_gpu.capabilities.has_gpu = true;
+        w_sim_gpu.capabilities.is_simulated_gpu = true;
+
+        let mut w_cpu_fast = tagged_worker(
+            "lin-fast",
+            &["os:linux", "arch:x86_64", "iso:fs", "tool:cargo", "fast"],
+        );
+        w_cpu_fast.capabilities.cpu_cores = 8;
+        w_cpu_fast.ram_available_mb = 8192;
+
+        let mut w_busy = tagged_worker("lin-busy", &["os:linux", "arch:x86_64", "busy-only"]);
+        w_busy.cpu_usage_pct = 99.0;
+
+        let mut w_ram_short = tagged_worker("lin-lowram", &["os:linux", "lowram-only"]);
+        w_ram_short.ram_available_mb = 64;
+
+        let mut w_mobile_warm = tagged_worker("mobile-warm", &["os:android", "warm-only"]);
+        w_mobile_warm.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(80),
+            is_charging: Some(false),
+            thermal_throttled: false,
+            battery_temperature: Some(36.0),
+            thermal_tier: Some(ThermalTier::Warm),
+            ..Default::default()
+        });
+
+        let workers = vec![
+            w_real_gpu.clone(),
+            w_sim_gpu.clone(),
+            w_cpu_fast.clone(),
+            w_busy.clone(),
+            w_ram_short.clone(),
+            w_mobile_warm.clone(),
+        ];
+
+        // 1. Real GPU preferred over simulated GPU when both idle; WORKSPACES gated.
+        let mut gpu_task = Task::new(
+            TaskSpec::new_gpu_compute("mat", 64),
+            TaskRequirements {
+                gpu_required: true,
+                ..TaskRequirements::generic(1, 256)
+            },
+        );
+        gpu_task.id = TaskId::new();
+        let ws_task = Task::new(
+            TaskSpec::new_command("ws", vec![]),
+            TaskRequirements::generic(1, 32),
+        )
+        .with_workspace(rusty_grid_core::task::WorkspaceRef::new("ws-demo"));
+        let r1 = WorkloadScheduler::matchmake(&cfg, &[gpu_task.clone(), ws_task.clone()], &workers);
+        let m1: HashMap<TaskId, Uuid> = r1
+            .assignments
+            .iter()
+            .map(|a| (a.task_id, a.worker_id))
+            .collect();
+        assert_eq!(m1.get(&gpu_task.id), Some(&w_real_gpu.worker_id));
+        assert_eq!(m1.get(&ws_task.id), Some(&w_real_gpu.worker_id));
+
+        // 2. Host-busy idle worker rejected; RAM-short worker rejects 256 MB but accepts 32 MB.
+        let t_busy = constrained_task(&["require:tag=busy-only"]);
+        let t_big_ram = Task::new(
+            TaskSpec::builtin_test("hash", 10),
+            TaskRequirements::new(1, 256, false, 30),
+        )
+        .with_tags(vec!["require:tag=lowram-only".into()]);
+        let t_small_ram = Task::new(
+            TaskSpec::builtin_test("hash", 10),
+            TaskRequirements::new(1, 32, false, 30),
+        )
+        .with_tags(vec!["require:tag=lowram-only".into()]);
+        let r2 =
+            WorkloadScheduler::matchmake(&cfg, &[t_busy, t_big_ram, t_small_ram.clone()], &workers);
+        assert_eq!(r2.assignments.len(), 1);
+        assert_eq!(r2.assignments[0].task_id, t_small_ram.id);
+        assert_eq!(r2.assignments[0].worker_id, w_ram_short.worker_id);
+
+        // 3. Mobile Warm + !charging rejects heavy RustCompilation, allows light command.
+        let mut sources = HashMap::new();
+        sources.insert("Cargo.toml".into(), "[package]\nname = \"m\"".into());
+        let t_heavy_mob = Task::new(
+            TaskSpec::new_rust_compilation("m", sources, vec![]),
+            TaskRequirements::generic(1, 32),
+        )
+        .with_tags(vec!["require:tag=warm-only".into()]);
+        let t_light_mob = constrained_task(&["require:tag=warm-only"]);
+        let r3 = WorkloadScheduler::matchmake(&cfg, &[t_heavy_mob, t_light_mob.clone()], &workers);
+        assert_eq!(r3.assignments.len(), 1);
+        assert_eq!(r3.assignments[0].task_id, t_light_mob.id);
+
+        // 4. GPU preservation + avoid preference + fallback.
+        let engine = Engine::new(&cfg, &workers, &workers, None, true, true);
+        let generic_v = TaskView::of(&constrained_task(&["require:os=linux"]));
+        let mut full = Vec::new();
+        let mut matching = Vec::new();
+        let cands = engine.candidates_and_matching(&generic_v, &[], &mut full, &mut matching);
+        assert!(
+            cands
+                .iter()
+                .all(|&i| !workers[i].capabilities.can_execute_gpu()),
+            "gpu_waiting must steer generic task away from sim GPU onto CPU"
+        );
+        // Avoiding the only matching worker falls back via second pass in Engine::place.
+        let only_fast = constrained_task(&["require:tag=fast"]);
+        let mut avoid_map = HashMap::new();
+        avoid_map.insert(only_fast.id, vec![w_cpu_fast.worker_id]);
+        let r_avoid = WorkloadScheduler::matchmake_with_avoid(
+            &cfg,
+            std::slice::from_ref(&only_fast),
+            &workers,
+            &avoid_map,
+        );
+        assert_eq!(r_avoid.assignments.len(), 1);
+        assert_eq!(r_avoid.assignments[0].worker_id, w_cpu_fast.worker_id);
+
+        // 5. Wide-task hold-back on partially busy worker.
+        let mut w_hold = make_worker("hold-w", 4, 8192, false, false);
+        w_hold.active_tasks = 1;
+        let t_wide = Task::new(
+            TaskSpec::builtin_test("wide", 10),
+            TaskRequirements::generic(4, 32),
+        );
+        let t_narrow = Task::new(
+            TaskSpec::builtin_test("narrow", 10),
+            TaskRequirements::generic(1, 32),
+        );
+        let r_hold = WorkloadScheduler::matchmake(
+            &cfg,
+            &[t_wide.clone(), t_narrow.clone()],
+            std::slice::from_ref(&w_hold),
+        );
+        assert!(r_hold.assignments.is_empty());
+        assert_eq!(r_hold.skipped.len(), 2);
+
+        // 6. SpeedBook hold-back.
+        let mut fast = make_worker("fast-sb", 4, 8192, false, false);
+        fast.capabilities.tags = vec!["slots:1".into()];
+        fast.active_tasks = 1;
+        let slow = make_worker("slow-sb", 4, 8192, false, false);
+        let sb_task = Task::new(
+            TaskSpec::new_command("sb-cmd", vec![]),
+            TaskRequirements::generic(1, 32),
+        );
+        let sb_key = TaskKey::of(&sb_task.spec);
+        let mut sb = SpeedBook::new();
+        for _ in 0..3 {
+            sb.record_sample(fast.worker_id, sb_key, 100, 60);
+            sb.record_sample(slow.worker_id, sb_key, 2_000, 60);
+        }
+        let mut sb_running = HashMap::new();
+        sb_running.insert(fast.worker_id, vec![(sb_key, Duration::ZERO)]);
+        let r_sb = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            std::slice::from_ref(&sb_task),
+            &[fast, slow],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &sb,
+            &sb_running,
+        );
+        assert_eq!(
+            r_sb.skipped,
+            vec![(sb_task.id, ScheduleSkipReason::WaitingForFasterWorker)]
+        );
+    }
+
+    #[test]
+    fn schedule_1000_heterogeneous_workers_scales_cleanly() {
+        let oses = ["os:linux", "os:windows", "os:macos"];
+        let arches = ["arch:x86_64", "arch:aarch64"];
+        let isos = ["iso:fs", "iso:fs+net"];
+        let tools = ["tool:cargo", "tool:python"];
+
+        let workers: Vec<WorkerInfo> = (0..1000)
+            .map(|i| {
+                let mut w = make_worker(&format!("w-{i}"), 8, 16384, i % 5 == 0, false);
+                w.capabilities.tags = vec![
+                    oses[i % oses.len()].into(),
+                    arches[(i / 3) % arches.len()].into(),
+                    isos[i % isos.len()].into(),
+                    tools[(i / 2) % tools.len()].into(),
+                    format!("shard-{}", i % 10),
+                ];
+                w
+            })
+            .collect();
+
+        let req_oses = ["require:os=linux", "require:os=windows", "require:os=macos"];
+        let req_arches = ["require:arch=x86_64", "require:arch=aarch64"];
+        let tasks: Vec<Task> = (0..1000)
+            .map(|i| {
+                let gpu = i % 5 == 0;
+                Task::new(
+                    TaskSpec::builtin_test("scale", 10),
+                    TaskRequirements {
+                        gpu_required: gpu,
+                        timeout_secs: 60,
+                        ..TaskRequirements::generic(1, 32)
+                    },
+                )
+                .with_tags(vec![
+                    req_oses[i % req_oses.len()].into(),
+                    req_arches[(i / 3) % req_arches.len()].into(),
+                    format!("require:tag=shard-{}", i % 10),
+                ])
+            })
+            .collect();
+
+        let cfg = SchedulerConfig::default().with_max_batch_size(1024);
+        let start = Instant::now();
+        let report = WorkloadScheduler::matchmake(&cfg, &tasks, &workers);
+        let elapsed = start.elapsed();
+
+        assert_eq!(report.assignments.len(), 1000);
+        assert!(
+            report.skipped.is_empty(),
+            "expected 0 skipped, got {:?}",
+            report.skipped.len()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "1000-worker heterogeneous scheduling took {elapsed:?} (>= 2s)"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_submitter_fair_share_prevents_starvation_and_preserves_hold_back() {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let mut rxs = Vec::new();
+        for idx in 0..2 {
+            let wid = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(1024);
+            rxs.push(rx);
+            registry
+                .register(
+                    wid,
+                    WorkerCapabilities::new(format!("w-{idx}"), 8, 16384, false, false, None),
+                    format!("127.0.0.1:920{idx}").parse().unwrap(),
+                    tx,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let sub_a = crate::fair_share::SubmitterId::Client(Uuid::new_v4());
+        let sub_b = crate::fair_share::SubmitterId::Client(Uuid::new_v4());
+        let mut set_a = HashSet::new();
+        let mut set_b = HashSet::new();
+        for i in 0..500 {
+            let tid = queue
+                .submit_from(
+                    Task::new(
+                        TaskSpec::new_command(format!("a-{i}"), vec![]),
+                        TaskRequirements::generic(1, 32),
+                    ),
+                    0,
+                    sub_a,
+                )
+                .await
+                .unwrap();
+            set_a.insert(tid);
+        }
+        for i in 0..20 {
+            let tid = queue
+                .submit_from(
+                    Task::new(
+                        TaskSpec::new_command(format!("b-{i}"), vec![]),
+                        TaskRequirements::generic(1, 32),
+                    ),
+                    0,
+                    sub_b,
+                )
+                .await
+                .unwrap();
+            set_b.insert(tid);
+        }
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_max_batch_size(16),
+            registry,
+            queue,
+            notify,
+        )
+        .with_waiters(waiters);
+        let report = sched.schedule_batch(16).await.unwrap();
+        assert_eq!(report.assignments.len(), 16);
+        let a_placed = report
+            .assignments
+            .iter()
+            .filter(|a| set_a.contains(&a.task_id))
+            .count();
+        let b_placed = report
+            .assignments
+            .iter()
+            .filter(|a| set_b.contains(&a.task_id))
+            .count();
+        assert!(
+            a_placed >= 7 && b_placed >= 7,
+            "expected fair-share interleaving across submitters, got a={a_placed}, b={b_placed}"
+        );
+
+        // Wide-task hold_back must still block trailing tasks from another submitter.
+        let (reg2, q2, w2, n2) = scheduler_fixture().await;
+        let wid2 = Uuid::new_v4();
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
+        reg2.register(
+            wid2,
+            WorkerCapabilities::new("w-hold", 4, 8192, false, false, None),
+            "127.0.0.1:9209".parse().unwrap(),
+            tx2,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _running_t = q2
+            .submit_from(
+                Task::new(
+                    TaskSpec::new_command("run-1", vec![]),
+                    TaskRequirements::generic(1, 32),
+                ),
+                0,
+                sub_a,
+            )
+            .await
+            .unwrap();
+        let sched2 = WorkloadScheduler::new(
+            SchedulerConfig::default().with_max_batch_size(16),
+            reg2,
+            q2.clone(),
+            n2,
+        )
+        .with_waiters(w2);
+        let r_init = sched2.schedule_batch(1).await.unwrap();
+        assert_eq!(r_init.assignments.len(), 1);
+
+        let wide_id = q2
+            .submit_from(
+                Task::new(
+                    TaskSpec::new_command("wide-4", vec![]),
+                    TaskRequirements::generic(4, 32),
+                ),
+                0,
+                sub_a,
+            )
+            .await
+            .unwrap();
+        let _other_id = q2
+            .submit_from(
+                Task::new(
+                    TaskSpec::new_command("other-1", vec![]),
+                    TaskRequirements::generic(1, 32),
+                ),
+                0,
+                sub_b,
+            )
+            .await
+            .unwrap();
+        let r_held = sched2.schedule_batch(16).await.unwrap();
+        assert!(
+            r_held.assignments.is_empty(),
+            "held worker must not accept sub_b narrow task while sub_a wide task waits"
+        );
+        assert!(r_held.skipped.iter().any(|(id, reason)| *id == wide_id
+            && *reason == ScheduleSkipReason::AllEligibleWorkersSaturated));
+        drop(rxs);
     }
 }
