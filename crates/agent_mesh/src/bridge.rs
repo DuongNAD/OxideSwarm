@@ -172,6 +172,7 @@ impl AgentGridBridge {
                     gpu_required: require_gpu,
                     timeout_secs,
                     max_retries: None,
+                    vram_mb: None,
                 },
             )
         } else {
@@ -214,6 +215,7 @@ impl AgentGridBridge {
                     gpu_required,
                     timeout_secs,
                     max_retries: None,
+                    vram_mb: None,
                 },
             )
         };
@@ -664,6 +666,7 @@ impl AgentGridBridge {
             gpu_required,
             timeout_secs,
             max_retries: None,
+            vram_mb: None,
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -794,6 +797,7 @@ impl AgentGridBridge {
             gpu_required: false,
             timeout_secs,
             max_retries: None,
+            vram_mb: None,
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
