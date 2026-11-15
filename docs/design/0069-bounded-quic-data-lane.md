@@ -120,7 +120,7 @@ In `PreAuthSession::Multiplexed` (`crates/master/src/session.rs`):
   - `test_multiplexed_data_lane_write_timeout_ends_session_and_requeues_tasks`: uses
     `#[tokio::test(start_paused = true)]` to verify that a data-lane write blocked for longer than
     `DATA_LANE_WRITE_TIMEOUT` (`60 s`) terminates the session, marks the worker `Disconnected`, and
-    requeues its running task to `TaskState::Queued`.
+    moves its running task to `TaskState::Retrying` (no worker, `retry_count` 1, `failover_count` 1).
 - **Integration and hygiene gates:**
   - `cargo fmt --all -- --check`
   - `cargo clippy --workspace --all-targets --locked -- -D warnings`

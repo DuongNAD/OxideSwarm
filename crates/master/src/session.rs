@@ -2604,11 +2604,12 @@ mod tests {
             //   write directly to `ctrl_out_tx`, bypassing `outbound_rx` and `router_task`, so
             //   they continue flowing unimpeded even when `pending_data` is at its cap and
             //   `outbound_tx` is completely full.
-            // - Control messages sent through the shared `outbound_tx` channel (`ResultAck`)
-            //   are forwarded by `router_task` while `pending_data` is below its cap, but wait in
-            //   `outbound_rx` behind the stalled data backlog once `pending_data` reaches
-            //   `MAX_PENDING_DATA_MESSAGES` or `MAX_PENDING_DATA_BYTES` until `data_out_tx` drains
-            //   `pending_data` below the cap again.
+            // - No control message is sent through the shared `outbound_tx` channel today.
+            //   `router_task` still forwards a non-data `MasterMessage` it finds there (a
+            //   defensive `ctrl_msg` arm). Such a message would wait in `outbound_rx` behind the
+            //   stalled data backlog once `pending_data` reaches `MAX_PENDING_DATA_MESSAGES` or
+            //   `MAX_PENDING_DATA_BYTES`, until `data_out_tx` drains `pending_data` below the cap
+            //   or `DATA_LANE_WRITE_TIMEOUT` ends the session.
             for ts in [3_001_u64, 3_002, 3_003] {
                 mux_ctrl
                     .send_msg(&WorkerMessage::Heartbeat {
