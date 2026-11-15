@@ -767,3 +767,146 @@ fn test_insecure_opt_in_lets_a_worker_and_clients_use_a_remote_master_without_a_
     assert!(log.contains("WARNING: --insecure"), "{log}");
     assert!(log.contains("Cluster authentication: OFF"), "{log}");
 }
+
+#[test]
+fn test_working_directory_config_is_skipped_by_submit_status_and_worker() {
+    let home = tempdir();
+    let cwd = tempdir();
+    let cwd_toml = cwd.path().join("rusty-grid.toml");
+    fs::write(
+        &cwd_toml,
+        r#"
+[submit]
+master = "127.0.0.1:1"
+
+[status]
+master = "127.0.0.1:1"
+
+[worker]
+master = "192.0.2.1:8088"
+"#,
+    )
+    .expect("write cwd rusty-grid.toml");
+
+    // 1. `submit` in a directory containing `./rusty-grid.toml` with an empty HOME skips the
+    //    working-directory file, prints the notice on stderr only, and does not dial 127.0.0.1:1.
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path()).args(["submit", "--", "true"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("Skipping config file ./rusty-grid.toml in the working directory"),
+        "expected skip notice on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--config"),
+        "skip notice must tell the user to pass --config, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Skipping config file"),
+        "skip notice must never go to stdout, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("127.0.0.1:1") && !stderr.contains("127.0.0.1:1"),
+        "submit must not use 127.0.0.1:1 from ./rusty-grid.toml, stdout: {stdout}, stderr: {stderr}"
+    );
+
+    // 2. `status` in the same directory also skips `./rusty-grid.toml` and does not use 127.0.0.1:1.
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path()).args(["status"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("Skipping config file ./rusty-grid.toml in the working directory"),
+        "expected skip notice on stderr for status, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Skipping config file"),
+        "skip notice must never go to stdout, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("127.0.0.1:1") && !stderr.contains("127.0.0.1:1"),
+        "status must not use 127.0.0.1:1 from ./rusty-grid.toml, stdout: {stdout}, stderr: {stderr}"
+    );
+
+    // 3. `worker` in the same directory skips `[worker].master = "192.0.2.1:8088"` (which would
+    //    otherwise fail at credential check with exit code 6) and prints the notice on stderr.
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path())
+        .args(["worker", "--wire-codec", "bogus"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(6),
+        "worker must not read remote master 192.0.2.1:8088 from ./rusty-grid.toml: {stderr}"
+    );
+    assert!(
+        stderr.contains("Skipping config file ./rusty-grid.toml in the working directory"),
+        "expected skip notice on stderr for worker, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("192.0.2.1:8088") && !stdout.contains("Skipping config file"),
+        "worker output must not reference skipped master or pollute stdout, stdout: {stdout}, stderr: {stderr}"
+    );
+
+    // 4. Passing `--config` or `RUSTY_GRID_CONFIG` explicitly loads `./rusty-grid.toml` without
+    //    printing the skip notice (worker immediately refuses 192.0.2.1:8088 with exit code 6).
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path())
+        .args(["--config", "rusty-grid.toml", "worker"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(stderr.contains("192.0.2.1:8088"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("Skipping config file"),
+        "explicit --config must not print skip notice: {stderr}"
+    );
+
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path())
+        .env("RUSTY_GRID_CONFIG", &cwd_toml)
+        .args(["worker"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(stderr.contains("192.0.2.1:8088"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("Skipping config file"),
+        "explicit RUSTY_GRID_CONFIG must not print skip notice: {stderr}"
+    );
+
+    // 5. `~/.oxideswarm/rusty-grid.toml` remains the default, and `status --json` stdout stays
+    //    clean JSON even when `./rusty-grid.json` is skipped in the working directory.
+    fs::remove_file(&cwd_toml).expect("remove cwd toml");
+    let cwd_json = cwd.path().join("rusty-grid.json");
+    fs::write(&cwd_json, r#"{"status":{"master":"127.0.0.1:1"}}"#).expect("write cwd json");
+
+    let master = start_master(home.path(), "127.0.0.1:0", &[]);
+    let ox_dir = home.path().join(".oxideswarm");
+    fs::create_dir_all(&ox_dir).expect("create ~/.oxideswarm");
+    fs::write(
+        ox_dir.join("rusty-grid.toml"),
+        format!("[status]\nmaster = \"{}\"\n", master.addr),
+    )
+    .expect("write ~/.oxideswarm/rusty-grid.toml");
+
+    let mut cmd = cli(home.path());
+    cmd.current_dir(cwd.path()).args(["status", "--json"]);
+    let out = run_bounded(cmd, Duration::from_secs(20));
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "status --json failed: {stderr}");
+    assert!(
+        stderr.contains("Skipping config file ./rusty-grid.json in the working directory"),
+        "expected skip notice for ./rusty-grid.json on stderr, got: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must remain clean JSON");
+    assert_eq!(parsed["worker_count"], 0);
+    assert!(!stdout.contains("Skipping config file"));
+}
