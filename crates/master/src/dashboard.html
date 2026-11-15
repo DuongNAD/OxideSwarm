@@ -263,7 +263,7 @@
         }
 
         /* ========================================================
-           TAB 1: TERMINAL / CHAT FEED
+           TAB 1: TERMINAL CONSOLE
            ======================================================== */
         .terminal-wrapper {
             flex: 1 1 auto;
@@ -318,7 +318,7 @@
             border-color: var(--accent);
         }
 
-        .chat-feed {
+        .console-feed {
             flex: 1 1 auto;
             min-height: 160px;
             overflow-y: auto;
@@ -382,7 +382,7 @@
         .layout.term-maximized .quick-chips { display: none; }
 
         /* Terminal Bottom Controls */
-        .chat-bottom {
+        .console-bottom {
             padding: 8px 12px;
             background: var(--surface);
             border-top: 1px solid var(--border);
@@ -415,15 +415,6 @@
         .chip:active {
             border-color: var(--accent);
             color: var(--text);
-        }
-        .chip-mode {
-            font-weight: 700;
-            border-color: var(--accent);
-            color: var(--accent);
-        }
-        .chip-mode.active {
-            background: var(--accent);
-            color: #000;
         }
         .input-row {
             display: flex;
@@ -1092,13 +1083,13 @@
 
         <!-- 3-Tab Navigation Bar -->
         <nav class="tab-nav-bar" id="tabNavBar">
-            <button class="tab-btn active" id="btnTabChat" onclick="switchTab('chat')">Chat</button>
+            <button class="tab-btn active" id="btnTabConsole" onclick="switchTab('console')">Console</button>
             <button class="tab-btn" id="btnTabModes" onclick="switchTab('modes')">Modes</button>
             <button class="tab-btn" id="btnTabDevices" onclick="switchTab('devices')">Devices (<span id="tabDevicesBadge">0</span>)</button>
         </nav>
 
-        <!-- TAB 1: TERMINAL & CHAT FEED -->
-        <div class="tab-pane active" id="tabChat">
+        <!-- TAB 1: TERMINAL CONSOLE -->
+        <div class="tab-pane active" id="tabConsole">
             <div class="terminal-wrapper" id="terminalWrapper">
                 <div class="terminal-header">
                     <div class="term-title-group">
@@ -1111,7 +1102,7 @@
                     </div>
                 </div>
 
-                <div class="chat-feed" id="chatFeed">
+                <div class="console-feed" id="consoleFeed">
                     <div class="term-welcome">
                         <div class="welcome-line"><span class="w-accent">OxideSwarm Mobile Cluster Console</span> ready.</div>
                         <div class="welcome-hint">Tap a preset chip below or enter a shell command to dispatch across cluster.</div>
@@ -1119,18 +1110,15 @@
                 </div>
             </div>
             
-            <div class="chat-bottom">
+            <div class="console-bottom">
                 <div class="quick-chips">
-                    <button class="chip chip-mode active" id="btnModeAI" onclick="setChatMode('ai')">🤖 AI Model</button>
-                    <button class="chip chip-mode" id="btnModeShell" onclick="setChatMode('shell')">💻 Shell</button>
-                    <button class="chip" onclick="quickAI('Vẽ sơ đồ cụm hiện tại dạng khối ASCII kèm bảng tóm tắt và biểu tượng trực quan')">🗺️ Sơ đồ cụm</button>
                     <button class="chip" onclick="quickShell('uname -sm')">uname</button>
                     <button class="chip" onclick="quickShell('python3 -c &quot;print(1+1)&quot;')">python</button>
                     <button class="chip" onclick="quickShell('df -h | head -n 3')">disk</button>
                     <button class="chip" onclick="quickShell('uptime')">uptime</button>
                 </div>
                 <div class="input-row">
-                    <input type="text" id="inputCmd" class="cmd-input" placeholder="Hỏi trợ lý AI (Gemini)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onkeydown="if(event.key==='Enter') sendCmd()">
+                    <input type="text" id="inputCmd" class="cmd-input" placeholder="Nhập lệnh shell cluster ($ cmd)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onkeydown="if(event.key==='Enter') sendCmd()">
                     <button class="btn-run" id="btnRun" onclick="sendCmd()">GỬI</button>
                 </div>
             </div>
@@ -1563,21 +1551,21 @@
 
         // 1. Tab Switching (Preserves active terminal buffer)
         function switchTab(name) {
-            const isChat = name === 'chat';
+            const isConsole = name === 'console';
             const isDevices = name === 'devices';
             const isModes = name === 'modes';
 
-            const tabChat = document.getElementById('tabChat');
+            const tabConsole = document.getElementById('tabConsole');
             const tabDevices = document.getElementById('tabDevices');
             const tabModes = document.getElementById('tabModes');
-            const btnChat = document.getElementById('btnTabChat');
+            const btnConsole = document.getElementById('btnTabConsole');
             const btnDevices = document.getElementById('btnTabDevices');
             const btnModes = document.getElementById('btnTabModes');
 
-            if (tabChat) tabChat.classList.toggle('active', isChat);
+            if (tabConsole) tabConsole.classList.toggle('active', isConsole);
             if (tabDevices) tabDevices.classList.toggle('active', isDevices);
             if (tabModes) tabModes.classList.toggle('active', isModes);
-            if (btnChat) btnChat.classList.toggle('active', isChat);
+            if (btnConsole) btnConsole.classList.toggle('active', isConsole);
             if (btnDevices) btnDevices.classList.toggle('active', isDevices);
             if (btnModes) btnModes.classList.toggle('active', isModes);
 
@@ -1720,7 +1708,7 @@
         }
 
         function clearTerminal() {
-            const feed = document.getElementById('chatFeed');
+            const feed = document.getElementById('consoleFeed');
             setHtml(feed, html`
                 <div class="term-welcome">
                     <div class="welcome-hint">// Terminal cleared. Console ready for commands.</div>
@@ -2495,27 +2483,13 @@
             if (!activeModalWorker) return;
             const targetName = String(activeModalWorker.name || '').toLowerCase();
             closeDeviceModal();
-            switchTab('chat');
+            switchTab('console');
             const isMac = targetName.includes('mac');
             const cmd = isMac ? 'uname -a && sysctl -n hw.model hw.ncpu' : 'uname -a && head -n 4 /proc/meminfo';
             quickShell(cmd);
         }
 
-        // 8. Chat & Command Execution (AI Model by default, Shell mode on demand)
-        let currentMode = 'ai'; // 'ai' or 'shell'
-
-        function setChatMode(mode) {
-            currentMode = mode;
-            const btnAI = document.getElementById('btnModeAI');
-            const btnShell = document.getElementById('btnModeShell');
-            if (btnAI) btnAI.classList.toggle('active', mode === 'ai');
-            if (btnShell) btnShell.classList.toggle('active', mode === 'shell');
-            const input = document.getElementById('inputCmd');
-            if (input) {
-                input.placeholder = mode === 'ai' ? 'Hỏi trợ lý AI (Gemini)...' : 'Nhập lệnh shell cluster ($ cmd)...';
-            }
-        }
-
+        // 8. Distributed Shell Command Execution
         function quick(cmd) {
             const input = document.getElementById('inputCmd') || document.getElementById('cmdInput');
             if (input) input.value = cmd;
@@ -2524,16 +2498,9 @@
         window.quickRun = quick;
 
         function quickShell(cmd) {
-            setChatMode('shell');
             quick(cmd);
         }
-
-        function quickAI(prompt) {
-            setChatMode('ai');
-            quick(prompt);
-        }
         window.quickShell = quickShell;
-        window.quickAI = quickAI;
 
         // GET /api/tasks/:id reports the state in snake_case ("completed") while /api/status uses
         // PascalCase ("Completed"): fold both into one canonical spelling before comparing.
@@ -2578,83 +2545,24 @@
             if (!raw) return;
             input.value = '';
 
-            const feed = document.getElementById('chatFeed');
+            const feed = document.getElementById('consoleFeed');
             const status = document.getElementById('termStatus');
 
-            // Detect whether this should be executed as a shell command
-            let isShell = currentMode === 'shell';
             let cmd = raw;
             if (raw.startsWith('$ ') || raw.startsWith('! ')) {
-                isShell = true;
                 cmd = raw.slice(2).trim();
             } else if (raw.startsWith('$') || raw.startsWith('!')) {
-                isShell = true;
                 cmd = raw.slice(1).trim();
             }
+            if (!cmd) return;
 
             // Append Prompt Line
             const p = document.createElement('div');
             p.className = 'prompt-line';
-            p.textContent = (isShell ? '$ ' : '💬 ') + raw;
+            p.textContent = '$ ' + cmd;
             feed.appendChild(p);
 
-            // ==========================================
-            // BRANCH 1: SEND TO REAL AI MODEL (/api/chat)
-            // ==========================================
-            if (!isShell) {
-                if (status) {
-                    status.textContent = '🧠 AI THINKING';
-                    status.style.color = 'var(--tag-orch)';
-                }
-                const report = document.createElement('div');
-                report.className = 'report-box';
-                setHtml(report, html`
-                    <div class="report-meta">
-                        <span style="color: var(--tag-orch); font-weight:700;">[Antigravity AI]</span>
-                        <span style="color: var(--accent);">Đang kết nối model...</span>
-                    </div>
-                    <div class="res-content" style="color: var(--text-dim); font-style: italic;">Đang xử lý câu hỏi của bạn...</div>
-                `);
-                feed.appendChild(report);
-                feed.scrollTop = feed.scrollHeight;
-
-                try {
-                    const post = await apiFetch('/api/chat', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: raw })
-                    });
-                    if (!post.ok) throw new Error(await errorText(post));
-                    const data = await post.json();
-                    if (status) {
-                        status.textContent = '● READY';
-                        status.style.color = 'var(--dot-green)';
-                    }
-                    setHtml(report, html`
-                        <div class="report-meta">
-                            <span style="color: var(--accent); font-weight: 700;">[${data.model || 'Antigravity AI'}] • ${num(data.execution_time_ms)}ms</span>
-                            <span style="color: var(--dot-green); font-weight: 700;">Trả lời</span>
-                        </div>
-                        <div class="res-content" style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; font-size: 13.5px;">${data.reply}</div>
-                    `);
-                    feed.scrollTop = feed.scrollHeight;
-                } catch (err) {
-                    if (status) {
-                        status.textContent = err.isAuth ? '🔒 CẦN TOKEN' : '● LỖI AI';
-                        status.style.color = err.isAuth ? 'var(--dot-busy)' : 'var(--dot-red)';
-                    }
-                    setHtml(report, html`
-                        <div class="report-meta" style="color: var(--dot-red); font-weight: 700;">[Lỗi phản hồi AI]</div>
-                        <div class="res-content" style="color: var(--dot-red);">Không thể nhận phản hồi từ model: ${err.isAuth ? 'cần nhập token truy cập.' : err.message}</div>
-                    `);
-                    feed.scrollTop = feed.scrollHeight;
-                }
-                return;
-            }
-
-            // ==========================================
-            // BRANCH 2: DISTRIBUTED SHELL EXECUTION (/api/tasks)
-            // ==========================================
+            // DISTRIBUTED SHELL EXECUTION (/api/tasks)
             if (status) {
                 status.textContent = '⚡ RUNNING';
                 status.style.color = 'var(--accent)';

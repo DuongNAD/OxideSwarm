@@ -64,6 +64,7 @@ before adding or changing a document.
 | [design/0065-large-transfer-and-long-run-tests.md](design/0065-large-transfer-and-long-run-tests.md) | Draft, plan: a harness that moves files of 1 to 8 GiB and large trees between machines on LAN and through a relay, and a 24-hour run under load and faults, with records and a short run on a schedule in CI (`TEST-24` to `TEST-26`). Builds nothing | Owner, contributors |
 | [design/0066-usable-rendezvous-discovery.md](design/0066-usable-rendezvous-discovery.md) | Implemented: standalone `oxideswarm rendezvous` registry (`:8090`), deterministic Ed25519 keyed slots and read auth, MAC'd `p2p_ticket` with P2P fallback, upfront `https://` rejection (`FEAT-7`) | Contributors |
 | [design/0068-task-vram-accounting.md](design/0068-task-vram-accounting.md) | Implemented: optional `TaskRequirements::vram_mb`, CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, protocol version 9, store format 3, and scheduler VRAM accounting (`FEAT-9a`, decision `Q56`) | Contributors |
+| [design/0071-remove-dashboard-chat.md](design/0071-remove-dashboard-chat.md) | Implemented: remove `POST /api/chat`, `run_agy` child-process execution on the master host, and the dashboard chat UI (`SEC-14`, decision D9) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
