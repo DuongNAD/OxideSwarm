@@ -156,6 +156,8 @@ pub struct WorkerFileConfig {
     pub sandbox_base_dir: Option<String>,
     /// Task isolation level: `off`, `fs` or `fs+net` (`worker --isolation`).
     pub isolation: Option<String>,
+    /// Extra read-only directories accessible to isolated tasks (`worker --isolation-read-dir`).
+    pub isolation_read_dirs: Option<Vec<String>>,
     pub keep_sandboxes: Option<bool>,
     /// Megabytes of task input and output files the worker caches (`worker --blob-cache-mb`).
     pub blob_cache_mb: Option<u64>,
@@ -983,6 +985,28 @@ relay_url = "https://client.relay.example.com:8443"
         assert_eq!(
             client_fallback.status_relay_url().as_deref(),
             Some("https://client.relay.example.com:8443")
+        );
+    }
+
+    #[test]
+    fn test_worker_config_parses_isolation_read_dirs_from_toml() {
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+[worker]
+isolation = "fs"
+isolation_read_dirs = ["/opt/cuda", "/opt/pyenv/versions/3.11.8"]
+"#,
+        )
+        .expect("parse toml");
+
+        let worker = parsed.worker.expect("worker section");
+        assert_eq!(worker.isolation.as_deref(), Some("fs"));
+        assert_eq!(
+            worker.isolation_read_dirs,
+            Some(vec![
+                "/opt/cuda".to_string(),
+                "/opt/pyenv/versions/3.11.8".to_string(),
+            ])
         );
     }
 }

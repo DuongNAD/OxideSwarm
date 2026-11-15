@@ -674,6 +674,186 @@ echo TASK2_RAN
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn assert_extra_read_only_dir_confinement(level: IsolationLevel) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("home");
+    let outside = tempfile::tempdir().expect("outside");
+    let ox_dir = home.path().join(".oxideswarm");
+    let ssh_dir = home.path().join(".ssh");
+    let in_home_runtime = home.path().join(".pyenv").join("versions").join("3.11.8");
+    let ext_runtime = outside.path().join("ext_runtime");
+    let sandbox_base = outside.path().join("sandboxes");
+    for dir in [
+        &ox_dir,
+        &ssh_dir,
+        &in_home_runtime,
+        &ext_runtime,
+        &sandbox_base,
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let secret_file = ox_dir.join("cluster.secret");
+    let node_key_file = ox_dir.join("node.key");
+    let ssh_key_file = ssh_dir.join("test_key");
+    std::fs::write(&secret_file, SECRET).unwrap();
+    std::fs::write(&node_key_file, "dummy-node-key-feat3").unwrap();
+    std::fs::write(&ssh_key_file, KEY).unwrap();
+
+    let in_home_txt = in_home_runtime.join("runtime.txt");
+    let ext_txt = ext_runtime.join("ext.txt");
+    std::fs::write(&in_home_txt, "in-home-runtime").unwrap();
+    std::fs::write(&ext_txt, "external-runtime").unwrap();
+
+    let in_home_bin = in_home_runtime.join("hello.sh");
+    std::fs::write(&in_home_bin, "#!/bin/sh\necho IN_HOME_BIN_OK\n").unwrap();
+    std::fs::set_permissions(&in_home_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ext_bin = ext_runtime.join("ext.sh");
+    std::fs::write(&ext_bin, "#!/bin/sh\necho EXT_BIN_OK\n").unwrap();
+    std::fs::set_permissions(&ext_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let real = HostDirs::detect();
+    let host = HostDirs::from_home(
+        home.path().to_path_buf(),
+        Some(real.rustup_home),
+        Some(real.cargo_home),
+    )
+    .with_extra_read_only_dirs(vec![in_home_runtime.clone(), ext_runtime.clone()]);
+    let protected = vec![secret_file.clone(), node_key_file.clone()];
+
+    rusty_grid_worker::isolation::verify_isolation_support_with_config(
+        level,
+        &sandbox_base,
+        &host,
+        &protected,
+    )
+    .await
+    .expect("extra_read_only_dirs startup check must succeed");
+
+    let cfg = RunnerConfig::new(SandboxConfig::new(sandbox_base.clone()))
+        .with_isolation(level)
+        .with_host_dirs(host)
+        .with_protected_files(protected);
+    let caps = WorkerCapabilities::new("feat3-extra-ro", 2, 4096, false, false, None);
+    let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, cfg);
+
+    let bin_task = Task::new(
+        TaskSpec::Command {
+            program: in_home_bin.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 30),
+    );
+    let bin_res = runner.execute_task(&bin_task, None, None).await;
+    assert!(
+        bin_res.is_success() && bin_res.stdout_str().contains("IN_HOME_BIN_OK"),
+        "{level}: executable in allowlisted home dir must run: {:?} / {} / {}",
+        bin_res.error,
+        bin_res.stdout_str(),
+        bin_res.stderr_str()
+    );
+
+    let ext_bin_task = Task::new(
+        TaskSpec::Command {
+            program: ext_bin.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 30),
+    );
+    let ext_bin_res = runner.execute_task(&ext_bin_task, None, None).await;
+    assert!(
+        ext_bin_res.is_success() && ext_bin_res.stdout_str().contains("EXT_BIN_OK"),
+        "{level}: executable in allowlisted external dir must run: {:?} / {} / {}",
+        ext_bin_res.error,
+        ext_bin_res.stdout_str(),
+        ext_bin_res.stderr_str()
+    );
+
+    let probe_script = r#"
+set +e
+[ "$(cat "$T_IN_HOME_TXT" 2>/dev/null)" = "in-home-runtime" ] && echo READ_IN_HOME_OK
+[ "$(cat "$T_EXT_TXT" 2>/dev/null)" = "external-runtime" ] && echo READ_EXT_OK
+if (echo pwn > "$T_IN_HOME_DIR/pwn.txt") 2>/dev/null; then echo LEAK_WRITE_IN_HOME; else echo DENY_WRITE_IN_HOME; fi
+if (echo pwn > "$T_EXT_DIR/pwn.txt") 2>/dev/null; then echo LEAK_WRITE_EXT; else echo DENY_WRITE_EXT; fi
+if cat "$T_SECRET" >/dev/null 2>&1; then echo LEAK_SECRET; else echo DENY_SECRET; fi
+if cat "$T_NODE_KEY" >/dev/null 2>&1; then echo LEAK_NODE_KEY; else echo DENY_NODE_KEY; fi
+if cat "$T_SSH_KEY" >/dev/null 2>&1; then echo LEAK_SSH_KEY; else echo DENY_SSH_KEY; fi
+"#;
+    let probe_task = Task::new(
+        TaskSpec::Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), probe_script.into()],
+            env: HashMap::from([
+                (
+                    "T_IN_HOME_TXT".into(),
+                    in_home_txt.to_string_lossy().into_owned(),
+                ),
+                ("T_EXT_TXT".into(), ext_txt.to_string_lossy().into_owned()),
+                (
+                    "T_IN_HOME_DIR".into(),
+                    in_home_runtime.to_string_lossy().into_owned(),
+                ),
+                (
+                    "T_EXT_DIR".into(),
+                    ext_runtime.to_string_lossy().into_owned(),
+                ),
+                (
+                    "T_SECRET".into(),
+                    secret_file.to_string_lossy().into_owned(),
+                ),
+                (
+                    "T_NODE_KEY".into(),
+                    node_key_file.to_string_lossy().into_owned(),
+                ),
+                (
+                    "T_SSH_KEY".into(),
+                    ssh_key_file.to_string_lossy().into_owned(),
+                ),
+            ]),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 30),
+    );
+    let res = runner.execute_task(&probe_task, None, None).await;
+    assert!(
+        res.is_success(),
+        "{level} extra_read_only_dir probe task failed: {:?} / {}",
+        res.error,
+        res.stderr_str()
+    );
+    let got = lines(&res);
+    for expected in [
+        "READ_IN_HOME_OK",
+        "READ_EXT_OK",
+        "DENY_WRITE_IN_HOME",
+        "DENY_WRITE_EXT",
+        "DENY_SECRET",
+        "DENY_NODE_KEY",
+        "DENY_SSH_KEY",
+    ] {
+        assert!(
+            got.iter().any(|l| l == expected),
+            "{level}: missing {expected}; got={got:?}; stderr={}",
+            res.stderr_str()
+        );
+    }
+    assert!(
+        !got.iter().any(|l| l.starts_with("LEAK_")),
+        "{level}: forbidden access succeeded: {got:?}"
+    );
+    assert!(!in_home_runtime.join("pwn.txt").exists());
+    assert!(!ext_runtime.join("pwn.txt").exists());
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
@@ -1465,6 +1645,13 @@ sys.stdout.write(out.decode("utf-8", "replace"))
             "{}",
             result.stderr_str()
         );
+    }
+
+    #[tokio::test]
+    async fn test_extra_read_only_dir_inside_home_is_readable_while_secrets_stay_denied() {
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_extra_read_only_dir_confinement(level).await;
+        }
     }
 }
 
@@ -2535,6 +2722,14 @@ cargo build --offline 2>&1
         require_landlock!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             assert_workspace_tree_swap_regression(level).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extra_read_only_dir_inside_home_is_readable_while_secrets_stay_denied() {
+        require_landlock!();
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert_extra_read_only_dir_confinement(level).await;
         }
     }
 }
@@ -5948,6 +6143,182 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             res.stdout_str(),
             res.stderr_str()
         );
+    }
+
+    #[tokio::test]
+    async fn test_extra_read_only_dir_inside_home_is_readable_while_secrets_stay_denied() {
+        require_appcontainer!();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let outside = tempfile::tempdir().expect("outside");
+        let ox_dir = temp_home.path().join(".oxideswarm");
+        let ssh_dir = temp_home.path().join(".ssh");
+        let rustup_home = temp_home.path().join(".rustup");
+        let cargo_home = temp_home.path().join(".cargo");
+        let in_home_runtime = temp_home
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Python")
+            .join("Python311");
+        let ext_runtime = outside.path().join("ext_runtime");
+        let sandbox_base = outside.path().join("sandboxes");
+        for dir in [
+            &ox_dir,
+            &ssh_dir,
+            &rustup_home,
+            &cargo_home,
+            &in_home_runtime,
+            &ext_runtime,
+            &sandbox_base,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let secret_file = ox_dir.join("cluster.secret");
+        let node_key_file = ox_dir.join("node.key");
+        let ssh_key_file = ssh_dir.join("test_key");
+        std::fs::write(&secret_file, SECRET).unwrap();
+        std::fs::write(&node_key_file, "dummy-node-key-feat3").unwrap();
+        std::fs::write(&ssh_key_file, KEY).unwrap();
+
+        let in_home_txt = in_home_runtime.join("runtime.txt");
+        let ext_txt = ext_runtime.join("ext.txt");
+        std::fs::write(&in_home_txt, "in-home-runtime").unwrap();
+        std::fs::write(&ext_txt, "external-runtime").unwrap();
+
+        let copied_cmd = in_home_runtime.join("probe_cmd.exe");
+        std::fs::copy(r"C:\Windows\System32\cmd.exe", &copied_cmd).unwrap();
+
+        let host = HostDirs::from_home(
+            temp_home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        )
+        .with_extra_read_only_dirs(vec![in_home_runtime.clone(), ext_runtime.clone()]);
+        let protected = vec![secret_file.clone(), node_key_file.clone()];
+        let manifest_path = rusty_grid_worker::isolation::acl_grant_manifest_path(&host);
+
+        let verify_res = rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &sandbox_base,
+            &host,
+            &protected,
+        )
+        .await;
+        if let Err(err) = verify_res {
+            let _ = rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(
+                &manifest_path,
+            );
+            panic!("extra_read_only_dirs startup check must succeed: {err}");
+        }
+
+        let manifest_body = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+
+        let runner_cfg = RunnerConfig::new(SandboxConfig::new(sandbox_base))
+            .with_isolation(IsolationLevel::Fs)
+            .with_host_dirs(host)
+            .with_protected_files(protected);
+        let caps = WorkerCapabilities::new("feat3-extra-ro", 2, 4096, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_cfg);
+
+        let exe_task = Task::new(
+            TaskSpec::Command {
+                program: copied_cmd.to_string_lossy().into_owned(),
+                args: vec!["/C".into(), "echo IN_HOME_EXE_OK".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let exe_res = runner.execute_task(&exe_task, None, None).await;
+
+        let probe_task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    format!(
+                        r#"findstr /L "in-home-runtime" "%T_IN_HOME_TXT%" >nul 2>&1 && echo READ_IN_HOME_OK & findstr /L "external-runtime" "%T_EXT_TXT%" >nul 2>&1 && echo READ_EXT_OK & (echo pwn > "%T_IN_HOME_DIR%\pwn.txt") >nul 2>&1 && echo LEAK_WRITE_IN_HOME || echo DENY_WRITE_IN_HOME & (echo pwn > "%T_EXT_DIR%\pwn.txt") >nul 2>&1 && echo LEAK_WRITE_EXT || echo DENY_WRITE_EXT & type "%T_SECRET%" >nul 2>&1 && echo LEAK_SECRET || echo DENY_SECRET & type "%T_NODE_KEY%" >nul 2>&1 && echo LEAK_NODE_KEY || echo DENY_NODE_KEY & type "%T_SSH_KEY%" >nul 2>&1 && echo LEAK_SSH_KEY || echo DENY_SSH_KEY"#
+                    ),
+                ],
+                env: HashMap::from([
+                    (
+                        "T_IN_HOME_TXT".into(),
+                        in_home_txt.to_string_lossy().into_owned(),
+                    ),
+                    ("T_EXT_TXT".into(), ext_txt.to_string_lossy().into_owned()),
+                    (
+                        "T_IN_HOME_DIR".into(),
+                        in_home_runtime.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "T_EXT_DIR".into(),
+                        ext_runtime.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "T_SECRET".into(),
+                        secret_file.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "T_NODE_KEY".into(),
+                        node_key_file.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "T_SSH_KEY".into(),
+                        ssh_key_file.to_string_lossy().into_owned(),
+                    ),
+                ]),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let res = runner.execute_task(&probe_task, None, None).await;
+        let revoke_res =
+            rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(&manifest_path);
+
+        assert!(
+            exe_res.is_success() && exe_res.stdout_str().contains("IN_HOME_EXE_OK"),
+            "executable inside allowlisted home dir must run under AppContainer: {:?} / {} / {}",
+            exe_res.error,
+            exe_res.stdout_str(),
+            exe_res.stderr_str()
+        );
+        assert!(
+            res.is_success(),
+            "extra_read_only_dir probe task failed: {:?} / {}",
+            res.error,
+            res.stderr_str()
+        );
+        let got = lines(&res);
+        for expected in [
+            "READ_IN_HOME_OK",
+            "READ_EXT_OK",
+            "DENY_WRITE_IN_HOME",
+            "DENY_WRITE_EXT",
+            "DENY_SECRET",
+            "DENY_NODE_KEY",
+            "DENY_SSH_KEY",
+        ] {
+            assert!(
+                got.iter().any(|l| l == expected),
+                "missing {expected}; got={got:?}; stderr={}",
+                res.stderr_str()
+            );
+        }
+        assert!(
+            !got.iter().any(|l| l.starts_with("LEAK_")),
+            "forbidden access succeeded: {got:?}"
+        );
+        assert!(
+            manifest_body.contains("Python311") && manifest_body.contains("ext_runtime"),
+            "ACL grant manifest must record extra_read_only_dirs: {manifest_body}"
+        );
+        assert!(!in_home_runtime.join("pwn.txt").exists());
+        assert!(!ext_runtime.join("pwn.txt").exists());
+        revoke_res.expect("revoke_oxideswarm_toolchain_acls must succeed");
     }
 }
 

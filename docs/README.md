@@ -14,6 +14,7 @@ before adding or changing a document.
 | [guides/mcp-client-setup.md](guides/mcp-client-setup.md) | Runbook: connect Claude Code, Codex, or Cursor to `oxideswarm mcp` over stdio | Users, coding agents |
 | [guides/offload-cargo-test.md](guides/offload-cargo-test.md) | Runbook: offload `cargo test` from a local checkout to a persistent worker workspace via `submit --workspace` or `oxideswarm mcp` | Users, coding agents |
 | [guides/multi-agent-collaboration.md](guides/multi-agent-collaboration.md) | Runbook: cross-machine coding agent coordination and root-cause diagnostics via `OxideSwarm_Agent_Hub` | Coding agents |
+| [guides/gpu-workloads.md](guides/gpu-workloads.md) | Runbook: run GPU command tasks (CUDA, OptiX, Metal, `wgpu`, Blender, PyTorch) under `--isolation fs` with `--isolation-read-dir` and `--vram-mb` | Users, coding agents |
 | [SECURITY.md](SECURITY.md) | Threat model, cluster secret, ports, tokens, who runs tasks | Users, reviewers |
 | [DEPLOYMENT.md](../DEPLOYMENT.md) | Agent Mesh deployment and operations (not the compute grid) | Users |
 | [PROJECT.md](../PROJECT.md) | Architecture, workspace layout, feature inventory, roadmap | Contributors |
@@ -65,6 +66,7 @@ before adding or changing a document.
 | [design/0066-usable-rendezvous-discovery.md](design/0066-usable-rendezvous-discovery.md) | Implemented: standalone `oxideswarm rendezvous` registry (`:8090`), deterministic Ed25519 keyed slots and read auth, MAC'd `p2p_ticket` with P2P fallback, upfront `https://` rejection (`FEAT-7`) | Contributors |
 | [design/0068-task-vram-accounting.md](design/0068-task-vram-accounting.md) | Implemented: optional `TaskRequirements::vram_mb`, CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, protocol version 9, store format 3, and scheduler VRAM accounting (`FEAT-9a`, decision `Q56`) | Contributors |
 | [design/0071-remove-dashboard-chat.md](design/0071-remove-dashboard-chat.md) | Implemented: remove `POST /api/chat`, `run_agy` child-process execution on the master host, and the dashboard chat UI (`SEC-14`, decision D9) | Contributors |
+| [design/0074-external-runtime-allowlist-and-gpu-workloads.md](design/0074-external-runtime-allowlist-and-gpu-workloads.md) | Implemented: opt-in worker `--isolation-read-dir` (`RUSTY_GRID_ISOLATION_READ_DIRS`, `[worker].isolation_read_dirs`) across macOS Seatbelt, Linux Landlock, and Windows AppContainer, plus recorded `R20` GPU sandbox results (`R20`, `FEAT-3e`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 

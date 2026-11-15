@@ -189,7 +189,7 @@ Sizes are the backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| R20 | Spike: a GPU inside the sandbox on each system (D3) | S for each system | A machine of each system with a GPU | `benchmarks/` | The record holds, for each system, the result with isolation off and on, and the rule where one was found | Planned |
+| R20 | Spike: a GPU inside the sandbox on each system (D3) | S for each system | A machine of each system with a GPU | `benchmarks/` | The record holds, for each system, the result with isolation off and on, and the rule where one was found | Partial (macOS Metal and Windows AppContainer Vulkan/CUDA/OptiX recorded; Linux Planned) |
 | R21 | Spike: what Mesh-LLM already does (D3) | S | The owner's two machines | `benchmarks/`, this record | The table of D3 is in this record's status log | Planned |
 | SCHED-5 | A worker lowers its slots on battery, heat or memory pressure (D4) | M | A design record | `crates/worker/src/` | A worker on battery reports fewer slots and takes fewer tasks, and a test shows both | Planned |
 
@@ -217,6 +217,7 @@ The right column is a recommended default, not a decision. They are listed in
 ## Records
 
 - `FEAT-9a` (`Q56`): [docs/design/0068-task-vram-accounting.md](0068-task-vram-accounting.md).
+- `R20` (macOS and Windows) / `FEAT-3e`: [docs/design/0074-external-runtime-allowlist-and-gpu-workloads.md](0074-external-runtime-allowlist-and-gpu-workloads.md).
 
 ## Status log
 
@@ -224,3 +225,4 @@ The right column is a recommended default, not a decision. They are listed in
   marked `issue` and `source` were checked that day. Nothing is built or measured, and no item
   is in the backlog.
 - 2026-11-15: Owner approved `Q56` and implementation landed as `FEAT-9a` in design `0068`.
+- 2026-11-16: Recorded `R20` GPU sandbox results on macOS (`Apple M5` Metal) and Windows 11 (`NVIDIA` Vulkan/CUDA/OptiX) and added worker `--isolation-read-dir` external runtime allowlisting in design `0074`; Linux `R20` GPU device rules remain `Planned`.

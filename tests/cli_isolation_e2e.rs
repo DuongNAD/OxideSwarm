@@ -30,6 +30,7 @@ fn worker(home: &Path, isolation: &str) -> Command {
         .env_remove("OXIDESWARM_SECRET_FILE")
         .env_remove("RUSTY_GRID_CONFIG")
         .env_remove("RUSTY_GRID_ISOLATION")
+        .env_remove("RUSTY_GRID_ISOLATION_READ_DIRS")
         .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
         .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
         .env("RUSTY_GRID_NO_BATTERY", "1")
@@ -229,5 +230,56 @@ fn test_procenv_finds_no_secret_in_an_isolated_worker_that_uses_a_secret_file() 
     assert!(
         !String::from_utf8_lossy(&args.stdout).contains(SECRET),
         "the command line holds no secret"
+    );
+}
+
+#[test]
+fn test_isolated_worker_refuses_broad_or_secret_isolation_read_dir() {
+    let home = TempDir::new().unwrap();
+    let ox_dir = home.path().join(".oxideswarm");
+    let ssh_dir = home.path().join(".ssh");
+    std::fs::create_dir_all(&ox_dir).unwrap();
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    let secret_file = ox_dir.join("cluster.secret");
+    std::fs::write(&secret_file, SECRET).unwrap();
+
+    for (label, flag_dir) in [
+        ("home", home.path()),
+        ("ssh", ssh_dir.as_path()),
+        ("oxideswarm", ox_dir.as_path()),
+    ] {
+        let mut cmd = worker(home.path(), "fs");
+        cmd.arg("--secret-file")
+            .arg(&secret_file)
+            .arg("--isolation-read-dir")
+            .arg(flag_dir);
+        let (code, err) = refused(cmd);
+        assert_ne!(code, Some(0), "{label} must fail: {err}");
+        assert_ne!(
+            code,
+            Some(AUTH_EXIT_CODE),
+            "{label} must fail on isolation config, not auth: {err}"
+        );
+        assert!(
+            !err.contains(SECRET),
+            "{label} refusal output must not leak secret"
+        );
+    }
+
+    let mut env_cmd = worker(home.path(), "fs");
+    env_cmd
+        .arg("--secret-file")
+        .arg(&secret_file)
+        .env("RUSTY_GRID_ISOLATION_READ_DIRS", &ssh_dir);
+    let (code, err) = refused(env_cmd);
+    assert_ne!(code, Some(0), "env ssh must fail: {err}");
+    assert_ne!(
+        code,
+        Some(AUTH_EXIT_CODE),
+        "env ssh must fail on isolation config, not auth: {err}"
+    );
+    assert!(
+        !err.contains(SECRET),
+        "env refusal output must not leak secret"
     );
 }

@@ -3901,3 +3901,58 @@ fn test_advertised_tags_drops_tool_cargo_on_elevated_windows_worker_with_isolati
         assert!(tags.iter().any(|t| t == "custom-tag"));
     }
 }
+
+#[test]
+fn test_worker_client_plumbs_and_validates_isolation_read_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandbox_base = temp.path().join("sandboxes");
+    let workspace_root = temp.path().join("workspaces");
+    let runtime_dir = temp.path().join("cuda_runtime");
+    std::fs::create_dir_all(&sandbox_base).unwrap();
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_sandbox_base_dir(&sandbox_base)
+            .with_workspace_root(Some(workspace_root.clone()))
+            .with_isolation(IsolationLevel::Fs)
+            .with_isolation_read_dirs(vec![runtime_dir.clone()])
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    assert_eq!(
+        client.runner().config().host_dirs.extra_read_only_dirs,
+        vec![runtime_dir]
+    );
+    client
+        .validate_isolation_config()
+        .expect("narrow runtime directory must pass validation");
+
+    let overlapping_sandbox = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_sandbox_base_dir(&sandbox_base)
+            .with_isolation(IsolationLevel::Fs)
+            .with_isolation_read_dirs(vec![sandbox_base])
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    match overlapping_sandbox.validate_isolation_config() {
+        Err(GridError::Config(msg)) => assert!(msg.contains("sandbox_base"), "{msg}"),
+        other => panic!("expected Config error, got {other:?}"),
+    }
+
+    let overlapping_workspace = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_sandbox_base_dir(temp.path().join("sb2"))
+            .with_workspace_root(Some(workspace_root.clone()))
+            .with_isolation(IsolationLevel::Fs)
+            .with_isolation_read_dirs(vec![workspace_root])
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    match overlapping_workspace.validate_isolation_config() {
+        Err(GridError::Config(msg)) => assert!(msg.contains("workspace_root"), "{msg}"),
+        other => panic!("expected Config error, got {other:?}"),
+    }
+}
