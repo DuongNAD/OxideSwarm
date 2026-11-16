@@ -1405,6 +1405,57 @@ mod macos {
     }
 }
 
+/// How an AppContainer child starts on Windows (SEC-11, design 0078).
+///
+/// An elevated worker starts the child from a restricted (LUA) token through
+/// `CreateProcessAsUserW`. It never falls back to `CreateProcessW`, because that call derives the
+/// child token from the worker's own elevated token. A worker that is not elevated has no LUA
+/// token and uses `CreateProcessW`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenSpawnPlan {
+    /// Try `CreateProcessAsUserW` with the LUA token.
+    Lua,
+    /// Use `CreateProcessW` (the worker is not elevated).
+    Plain,
+    /// The worker is elevated and has no LUA token: refuse.
+    RefuseNoLuaToken,
+}
+
+/// Picks the spawn plan from whether the worker is elevated and whether a LUA token exists.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn plan_token_spawn(elevated: bool, lua_token_available: bool) -> TokenSpawnPlan {
+    match (elevated, lua_token_available) {
+        (_, true) => TokenSpawnPlan::Lua,
+        (true, false) => TokenSpawnPlan::RefuseNoLuaToken,
+        (false, false) => TokenSpawnPlan::Plain,
+    }
+}
+
+/// Message of the refusal. `cause` names what failed, `win32_error` is the last Win32 error
+/// (`None` when no call failed, such as a missing LUA token).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn elevated_token_refusal_message(cause: &str, win32_error: Option<u32>) -> String {
+    match win32_error {
+        Some(code) => format!(
+            "refusing to start the task with the worker's elevated token: {cause} (Win32 error {code})"
+        ),
+        None => format!("refusing to start the task with the worker's elevated token: {cause}"),
+    }
+}
+
+/// Decides what to do after `CreateProcessAsUserW` failed with `win32_error`: an elevated worker
+/// refuses (returns the message), a worker that is not elevated may use `CreateProcessW`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn after_lua_spawn_failure(elevated: bool, win32_error: u32) -> Option<String> {
+    elevated.then(|| {
+        elevated_token_refusal_message(
+            "CreateProcessAsUserW with the restricted (LUA) token failed",
+            Some(win32_error),
+        )
+    })
+}
+
 /// The Windows implementation (design 0033 D4, FEAT-3c):
 /// - Dedicated custom capability SID `oxideswarm.toolchain` derived via
 ///   `DeriveCapabilitySidsFromName` for read+execute on worker-owned toolchains (`rustup_home`,
@@ -2670,6 +2721,33 @@ pub mod windows {
         }
         let line = format!("{prefix}{orig_sddl}");
         record_manifest_line(manifest_path, &line)
+    }
+
+    /// Test-only failure injection for the LUA spawn path (SEC-11). Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(crate) mod lua_test_hook {
+        use std::cell::Cell;
+        pub(crate) const OFF: u8 = 0;
+        /// Behave as an elevated worker whose LUA token could not be created.
+        pub(crate) const NO_TOKEN: u8 = 1;
+        /// Behave as an elevated worker whose `CreateProcessAsUserW` fails (invalid token).
+        pub(crate) const BAD_TOKEN: u8 = 2;
+        // Per thread, so a test that injects a failure cannot affect tests running in parallel.
+        thread_local! {
+            pub(crate) static MODE: Cell<u8> = const { Cell::new(OFF) };
+        }
+        pub(crate) fn mode() -> u8 {
+            MODE.with(Cell::get)
+        }
+    }
+
+    /// Logs once per worker process why an elevated worker refuses to use its own token.
+    fn log_elevated_token_refusal_once(message: &str) {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!("{message}");
+        }
     }
 
     /// Returns `true` if the current worker process token is elevated (`TokenElevation != 0`).
@@ -5251,30 +5329,82 @@ pub mod windows {
                         // `SECURITY_CAPABILITIES`) so the child never inherits administrative
                         // elevation. Clone `cmdline` before `CreateProcessAsUserW` because Win32
                         // `CreateProcessAsUserW` may mutate `lpCommandLine` in place.
+                        #[cfg(test)]
+                        let hook_mode = lua_test_hook::mode();
+                        #[cfg(test)]
+                        let elevated = is_process_elevated() || hook_mode != lua_test_hook::OFF;
+                        #[cfg(not(test))]
+                        let elevated = is_process_elevated();
+                        #[cfg(test)]
+                        let lua_token = match hook_mode {
+                            lua_test_hook::NO_TOKEN => None,
+                            // An invalid handle makes `CreateProcessAsUserW` fail for real.
+                            lua_test_hook::BAD_TOKEN => Some(usize::MAX as HANDLE),
+                            _ => get_or_init_worker_lua_token(),
+                        };
+                        #[cfg(not(test))]
                         let lua_token = get_or_init_worker_lua_token();
+                        let mut refusal: Option<io::Error> = None;
                         let spawned = unsafe {
-                            let res = if let Some(tok) = lua_token {
-                                let mut lua_cmdline = cmdline.clone();
-                                CreateProcessAsUserW(
-                                    tok,
-                                    app_name_wide.as_ptr(),
-                                    lua_cmdline.as_mut_ptr(),
-                                    std::ptr::null(),
-                                    std::ptr::null(),
-                                    1,
-                                    flags,
-                                    env_block.as_ptr() as *const core::ffi::c_void,
-                                    cwd_ptr,
-                                    &si_ex.StartupInfo,
-                                    &mut pi,
-                                )
-                            } else {
-                                0
-                            };
-                            if res != 0 {
-                                res
-                            } else {
-                                CreateProcessW(
+                            match super::plan_token_spawn(elevated, lua_token.is_some()) {
+                                super::TokenSpawnPlan::Lua => {
+                                    let mut lua_cmdline = cmdline.clone();
+                                    let res = CreateProcessAsUserW(
+                                        lua_token.expect("plan Lua implies a token"),
+                                        app_name_wide.as_ptr(),
+                                        lua_cmdline.as_mut_ptr(),
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                        1,
+                                        flags,
+                                        env_block.as_ptr() as *const core::ffi::c_void,
+                                        cwd_ptr,
+                                        &si_ex.StartupInfo,
+                                        &mut pi,
+                                    );
+                                    if res == 0 {
+                                        let code =
+                                            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                                                as u32;
+                                        if let Some(msg) =
+                                            super::after_lua_spawn_failure(elevated, code)
+                                        {
+                                            log_elevated_token_refusal_once(&msg);
+                                            refusal = Some(io::Error::new(
+                                                io::ErrorKind::PermissionDenied,
+                                                msg,
+                                            ));
+                                            // Not 0: the error is carried in `refusal`.
+                                            1
+                                        } else {
+                                            CreateProcessW(
+                                                app_name_wide.as_ptr(),
+                                                cmdline.as_mut_ptr(),
+                                                std::ptr::null(),
+                                                std::ptr::null(),
+                                                1,
+                                                flags,
+                                                env_block.as_ptr() as *const core::ffi::c_void,
+                                                cwd_ptr,
+                                                &si_ex.StartupInfo,
+                                                &mut pi,
+                                            )
+                                        }
+                                    } else {
+                                        res
+                                    }
+                                }
+                                super::TokenSpawnPlan::RefuseNoLuaToken => {
+                                    let msg = super::elevated_token_refusal_message(
+                                        "the restricted (LUA) token could not be created",
+                                        None,
+                                    );
+                                    log_elevated_token_refusal_once(&msg);
+                                    refusal =
+                                        Some(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+                                    1
+                                }
+                                super::TokenSpawnPlan::Plain => CreateProcessW(
                                     app_name_wide.as_ptr(),
                                     cmdline.as_mut_ptr(),
                                     std::ptr::null(),
@@ -5285,10 +5415,12 @@ pub mod windows {
                                     cwd_ptr,
                                     &si_ex.StartupInfo,
                                     &mut pi,
-                                )
+                                ),
                             }
                         };
-                        if spawned == 0 {
+                        if let Some(err) = refusal {
+                            Some(err)
+                        } else if spawned == 0 {
                             Some(io::Error::last_os_error())
                         } else {
                             None
@@ -5977,5 +6109,103 @@ mod tests {
             err_home_link.contains("symlink") || err_home_link.contains("junction"),
             "{err_home_link}"
         );
+    }
+
+    #[test]
+    fn test_plan_token_spawn_never_falls_back_to_plain_when_elevated() {
+        assert_eq!(plan_token_spawn(true, true), TokenSpawnPlan::Lua);
+        assert_eq!(plan_token_spawn(false, true), TokenSpawnPlan::Lua);
+        assert_eq!(
+            plan_token_spawn(true, false),
+            TokenSpawnPlan::RefuseNoLuaToken,
+            "an elevated worker without a LUA token must refuse"
+        );
+        assert_eq!(
+            plan_token_spawn(false, false),
+            TokenSpawnPlan::Plain,
+            "a worker that is not elevated keeps CreateProcessW"
+        );
+    }
+
+    #[test]
+    fn test_after_lua_spawn_failure_refuses_only_when_elevated() {
+        let msg = after_lua_spawn_failure(true, 1314).expect("elevated must refuse");
+        assert!(
+            msg.starts_with("refusing to start the task with the worker's elevated token:"),
+            "{msg}"
+        );
+        assert!(msg.contains("CreateProcessAsUserW"), "{msg}");
+        assert!(msg.contains("Win32 error 1314"), "{msg}");
+        assert!(after_lua_spawn_failure(false, 1314).is_none());
+        let none = elevated_token_refusal_message("the LUA token could not be created", None);
+        assert!(!none.contains("Win32 error"), "{none}");
+    }
+
+    #[cfg(windows)]
+    fn run_forced_lua_failure(mode: u8) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let base = windows::normalize_win_path(home.path());
+        let probe_dir = base.join("sec11");
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let probe_dir = windows::normalize_win_path(&probe_dir);
+        let empty_host =
+            HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &empty_host,
+            protected_files: &[],
+            sandbox_base: &base,
+            sandbox_dir: &probe_dir,
+            extra_writable_dir: None,
+            workspace_root: None,
+        };
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo started > marker"]);
+        cmd.current_dir(&probe_dir);
+        cmd.env_clear();
+        for (name, value) in inherited_environment(std::env::vars_os()) {
+            cmd.env(name, value);
+        }
+        let guard = windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd)
+            .expect("AppContainer setup");
+        windows::lua_test_hook::MODE.with(|m| m.set(mode));
+        let res = guard.spawn_in_appcontainer(&mut cmd, 0);
+        windows::lua_test_hook::MODE.with(|m| m.set(windows::lua_test_hook::OFF));
+        let err = match res {
+            Ok(_) => panic!("the spawn must be refused when the LUA path fails"),
+            Err(e) => e.to_string(),
+        };
+        drop(guard);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !probe_dir.join("marker").exists(),
+            "no task process may have started"
+        );
+        err
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_elevated_worker_refuses_when_lua_token_is_missing() {
+        let err = run_forced_lua_failure(windows::lua_test_hook::NO_TOKEN);
+        assert!(
+            err.contains("refusing to start the task with the worker's elevated token"),
+            "{err}"
+        );
+        assert!(err.contains("LUA"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_elevated_worker_refuses_when_create_process_as_user_fails() {
+        let err = run_forced_lua_failure(windows::lua_test_hook::BAD_TOKEN);
+        assert!(
+            err.contains("refusing to start the task with the worker's elevated token"),
+            "{err}"
+        );
+        assert!(err.contains("CreateProcessAsUserW"), "{err}");
+        assert!(err.contains("Win32 error"), "{err}");
     }
 }
