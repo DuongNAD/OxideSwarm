@@ -1028,17 +1028,22 @@ mod macos {
 
     /// Mach services a confined task may look up; every other lookup is denied (SEC-12).
     ///
-    /// The list is empty on purpose: it was found empirically (denials read from the unified
-    /// log, `log show --predicate 'eventMessage CONTAINS "mach-lookup"'`) by running the macOS
-    /// isolation tests, a `cargo build --offline` of a crate with and without a cached
-    /// dependency, `cc` compile and link, `git init/add/commit/log`, `curl` over TLS and a DNS
-    /// lookup with all lookups denied, and none of `cargo`, `rustc`, `git`, `cc` or `ld` needed
-    /// one. What does stop working: user and group names (`id -un`, `whoami` print the numeric
-    /// uid: `com.apple.system.opendirectoryd.libinfo`), `confstr(_CS_DARWIN_USER_TEMP_DIR)`
-    /// (`com.apple.bsd.dirhelper`), and `os_log` (`com.apple.logd`), none of which a build needs
-    /// (`TMPDIR` points into the sandbox). Add a name here only with the reason, the test that
-    /// needs it, and what the service could do for a task.
-    const MACH_SERVICES: &[&str] = &[];
+    /// Found empirically (denials read from the unified log, `log show --predicate
+    /// 'eventMessage CONTAINS "mach-lookup"'`) by running the macOS isolation tests, a
+    /// `cargo build --offline` with and without a cached dependency, `cc` compile and link,
+    /// `git init/add/commit/log`, `curl` over TLS and a DNS lookup with all lookups denied:
+    /// `cargo`, `rustc`, `git`, `cc` and `ld` need no service. What stops working: user and
+    /// group names (`id -un` prints the uid: `com.apple.system.opendirectoryd.libinfo`),
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)` (`com.apple.bsd.dirhelper`) and `os_log`
+    /// (`com.apple.logd`), none of which a build needs (`TMPDIR` points into the sandbox).
+    /// Add a name only with the reason, the test that needs it, and what the service could do
+    /// for a task.
+    const MACH_SERVICES: &[&str] = &[
+        // Metal shader compilation for GPU tasks (design 0074, `gemm_bench` under `fs`): with
+        // the lookup denied wgpu fails with "Parent device is lost". The service compiles
+        // shaders for the calling process and cannot start arbitrary programs.
+        "com.apple.MTLCompilerService",
+    ];
 
     /// The Seatbelt profile text. All paths arrive as `-D` parameters (`SANDBOX_DIR`,
     /// `EXTRA_WRITABLE_DIR`, `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`,
@@ -5542,6 +5547,13 @@ mod tests {
             .expect("workspace deny file-write-create on tree and tmp");
         assert!(ws_allow_write < ws_deny_unlink && ws_deny_unlink < ws_deny_create);
         assert!(ws.contains("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
+        // SEC-12: Mach lookups are denied except the Metal compiler, job creation is denied, and
+        // the pasteboard deny comes after the allow (last match wins).
+        let deny_all = at("(deny mach-lookup)\n");
+        let allow_mtl = at("(global-name \"com.apple.MTLCompilerService\")");
+        let pasteboard = at("(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))");
+        assert!(deny_all < allow_mtl && allow_mtl < pasteboard);
+        assert!(fs.contains("(deny job-creation)\n"));
         let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));

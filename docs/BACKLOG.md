@@ -2465,8 +2465,8 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
 - **Done when:** The tests above pass on `macos-latest` in CI, and `cargo build` of a workspace
   still works under `--isolation fs` on macOS.
 - **Implemented (2026-11-16, pull request 257, [design 0033](design/0033-os-level-task-isolation.md)):**
-  the macOS profile denies `mach-lookup` and `job-creation`; the allowlist is empty because
-  `cargo`, `rustc`, `git`, `cc` and `ld` needed no service. `launchctl submit` was already refused
+  the macOS profile denies `mach-lookup` and `job-creation`; the allowlist has one service,
+  `com.apple.MTLCompilerService` for Metal GPU tasks; `cargo`, `rustc`, `git`, `cc` and `ld` needed none. `launchctl submit` was already refused
   (`deny(1) job-creation`). Tests for `launchctl submit`, `open -a`, `osascript` and a hard link
   to a secret were added. The profile is still a denylist inside `(allow default)`.
 

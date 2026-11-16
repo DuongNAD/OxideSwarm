@@ -1797,6 +1797,78 @@ echo DONE
         }
     }
 
+    /// SEC-12 / design 0074: Metal needs `com.apple.MTLCompilerService`, the one Mach service
+    /// the profile allows. Runs the `gemm_bench` example (built with `--features gpu-wgpu`:
+    /// `cargo build --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench`;
+    /// found under `$RUSTY_GRID_GEMM_BENCH` or `$CARGO_TARGET_DIR/{release,debug}/examples`)
+    /// as a task under `fs` and `fs+net` and expects a GPU speed-up line. Skips with a notice
+    /// when the binary or a Metal adapter is missing, unless `RUSTY_GRID_REQUIRE_GPU=1`.
+    #[tokio::test]
+    async fn test_a_metal_task_gets_a_gpu_device_under_fs() {
+        use std::os::unix::fs::PermissionsExt;
+        let require = std::env::var("RUSTY_GRID_REQUIRE_GPU").as_deref() == Ok("1");
+        let cannot = |why: &str| {
+            assert!(!require, "RUSTY_GRID_REQUIRE_GPU=1 but: {why}");
+            eprintln!("skipped: {why}");
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(p) = std::env::var_os("RUSTY_GRID_GEMM_BENCH") {
+            candidates.push(PathBuf::from(p));
+        }
+        if let Some(t) = std::env::var_os("CARGO_TARGET_DIR") {
+            for profile in ["release", "debug"] {
+                candidates.push(PathBuf::from(&t).join(profile).join("examples/gemm_bench"));
+            }
+        }
+        let Some(bench) = candidates.into_iter().find(|p| p.is_file()) else {
+            return cannot("no gemm_bench binary (build the example with --features gpu-wgpu)");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("gemm_bench");
+        std::fs::copy(&bench, &exe).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = std::process::Command::new(&exe)
+            .arg("128")
+            .output()
+            .unwrap();
+        let control_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr)
+        );
+        if !control_text.contains("GPU speed-up") {
+            return cannot("no Metal adapter here (the unconfined control found no GPU engine)");
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let mut rig = Rig::new(level, false);
+            rig.host.extra_read_only_dirs = vec![dir.path().to_path_buf()];
+            let config = RunnerConfig::new(SandboxConfig::new(rig.base.clone()))
+                .with_isolation(level)
+                .with_host_dirs(rig.host.clone());
+            let runner = TaskRunner::new(
+                uuid::Uuid::new_v4(),
+                WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
+                config,
+            );
+            let task = Task::new(
+                TaskSpec::Command {
+                    program: exe.to_string_lossy().into_owned(),
+                    args: vec!["128".into()],
+                    env: HashMap::new(),
+                    working_dir: None,
+                    stdin: None,
+                },
+                TaskRequirements::generic(1, 120),
+            );
+            let result = runner.execute_task(&task, None, None).await;
+            let text = format!("{}{}", result.stdout_str(), result.stderr_str());
+            assert!(
+                text.contains("GPU speed-up"),
+                "{level}: the isolated task got no GPU device: {text}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_self_check_accepts_both_levels_on_macos() {
         let base = tempfile::tempdir().unwrap();
