@@ -62,6 +62,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --features 3d --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --features otel --locked -- -D warnings
+      - name: Rust source file size check (production part at most 3,000 lines, design 0080)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --locked -p rusty_grid_cli --bin ox-mode -- test size
       - name: master compiles without default features (dashboard, p2p)
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p rusty_grid_master --no-default-features --locked

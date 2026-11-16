@@ -967,7 +967,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 ./ox-mode
 
 # Code Quality & Testing Mode (Linting + Flaky test detection):
-./ox-mode test lint
+./ox-mode test lint     # clippy + rustfmt + the source file size check
+./ox-mode test size     # only the size check: a Rust file's production part may not exceed 3,000 lines (design 0080)
 ./ox-mode test flaky --iterations 5
 
 # Development Mode (Live-reload file watcher and local dev cluster):

@@ -243,7 +243,7 @@ pub fn run_lints(workspace_root: &Path) -> ModeExecutionResult {
         ),
     };
 
-    evaluate_lint_outcomes(
+    let res = evaluate_lint_outcomes(
         clippy_ok,
         &clippy_stdout,
         &clippy_stderr,
@@ -251,7 +251,9 @@ pub fn run_lints(workspace_root: &Path) -> ModeExecutionResult {
         &fmt_stdout,
         &fmt_stderr,
         duration_ms,
-    )
+    );
+
+    crate::size_check::fold_into_lint(res, workspace_root)
 }
 
 /// Evaluates flaky test detection iterations using the supplied per-iteration runner `(iteration_1_based) -> (passed, elapsed_ms)`.
@@ -1575,6 +1577,7 @@ pub fn execute_mode_action(
         (WorkflowMode::Test, "quick") => run_quick_tests(workspace_root),
         (WorkflowMode::Test, "full") => run_full_tests(workspace_root),
         (WorkflowMode::Test, "lint") => run_lints(workspace_root),
+        (WorkflowMode::Test, "size") => crate::size_check::run_size_check(workspace_root),
         (WorkflowMode::Test, "flaky") => run_flaky_detection(workspace_root, 5),
 
         // Dev mode
