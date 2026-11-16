@@ -102,6 +102,7 @@ before adding or changing a document.
 | [design/0078-no-elevated-token-fallback.md](design/0078-no-elevated-token-fallback.md) | Implemented: an elevated Windows worker refuses to start an isolated task, with the Win32 error, instead of falling back to `CreateProcessW` with its elevated token (`SEC-11`) | Contributors |
 | [design/0079-agent-mesh-launchers-safe-by-default.md](design/0079-agent-mesh-launchers-safe-by-default.md) | Implemented: `-NoShell` / `OXIDE_MESH_NO_SHELL` for the PowerShell mesh launcher, hub token on stdin (not the command line) in the `adb` launcher, and a `ws://` token warning in both nodes (`SEC-15`) | Contributors |
 | [design/0080-source-file-size-check.md](design/0080-source-file-size-check.md) | Implemented: `ox-mode test size` and CI fail when a Rust file's production part exceeds 3,000 lines, with an allowlist that may only shrink (`MAINT-1` step 3) | Contributors |
+| [design/0081-agent-activity-status.md](design/0081-agent-activity-status.md) | Implemented: `agent_bridge.py activity` publishes what an agent is doing to `nodes/<id>_activity.json`, separate from the machine heartbeat, with `--show` and a STALE mark after 20 minutes | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
