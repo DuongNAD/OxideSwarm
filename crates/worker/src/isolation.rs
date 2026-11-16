@@ -336,8 +336,21 @@ pub(crate) struct Jail<'a> {
 /// is the `sandbox-exec` wrapper; on Linux it is the program itself and the confinement is
 /// applied by the `pre_exec` hook that [`confine_command`] registers. A platform without an
 /// implementation yields an error: a confined task is never silently started plain.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn wrap_program(
     jail: &Jail<'_>,
+    program: &str,
+    args: &[String],
+    search_path: &str,
+) -> Result<(String, Vec<String>), String> {
+    wrap_program_in_dir(jail, jail.sandbox_dir, program, args, search_path)
+}
+
+/// Like [`wrap_program`], resolving relative Windows task executables against `working_dir`
+/// inside `jail.sandbox_dir`.
+pub(crate) fn wrap_program_in_dir(
+    jail: &Jail<'_>,
+    working_dir: &Path,
     program: &str,
     args: &[String],
     search_path: &str,
@@ -345,27 +358,28 @@ pub(crate) fn wrap_program(
     debug_assert!(jail.level != IsolationLevel::Off);
     #[cfg(target_os = "macos")]
     {
+        let _ = working_dir;
         let resolved = resolve_program(program, search_path)
             .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
         macos::wrap(jail, &resolved, args)
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = jail;
+        let _ = (jail, working_dir);
         let resolved = resolve_program(program, search_path)
             .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
         Ok((resolved, args.to_vec()))
     }
     #[cfg(windows)]
     {
-        let _ = jail;
-        let resolved = windows::resolve_program(program, search_path)
-            .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
+        let resolved =
+            windows::resolve_program(program, search_path, working_dir, jail.sandbox_dir)?
+                .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
         Ok((resolved, args.to_vec()))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (jail, program, args, search_path);
+        let _ = (jail, working_dir, program, args, search_path);
         Err(unsupported_message(jail.level))
     }
 }
@@ -1377,52 +1391,90 @@ pub mod windows {
         Some((bin, lib))
     }
 
-    /// Resolves `program` against `search_path` on Windows. Returns `None` if the executable
-    /// does not exist. Expands 8.3 short names on non-reparse paths so `CreateProcessW` inside an
-    /// AppContainer never walks denied ancestor directories with `FindFirstFileW`.
-    pub(super) fn resolve_program(program: &str, search_path: &str) -> Option<String> {
+    /// Resolves `program` against `working_dir` (for relative paths inside `sandbox_dir`) and
+    /// `search_path` on Windows. Returns `Ok(None)` if the executable does not exist or fails
+    /// design 0025 validation, and `Err(...)` if a relative path escapes `sandbox_dir`. Expands
+    /// 8.3 short names on non-reparse paths so `CreateProcessW` inside an AppContainer never walks
+    /// denied ancestor directories with `FindFirstFileW`.
+    pub(super) fn resolve_program(
+        program: &str,
+        search_path: &str,
+        working_dir: &Path,
+        sandbox_dir: &Path,
+    ) -> Result<Option<String>, String> {
         let norm_file = |found: &Path| -> String {
-            if !is_reparse_point(found) {
-                normalize_win_path(found).to_string_lossy().into_owned()
+            let abs = std::path::absolute(found).unwrap_or_else(|_| found.to_path_buf());
+            if !is_reparse_point(&abs) {
+                normalize_win_path(&abs).to_string_lossy().into_owned()
             } else {
-                found.to_string_lossy().into_owned()
+                abs.to_string_lossy().into_owned()
             }
+        };
+        let check_with_exts = |base: &Path| -> Option<String> {
+            if rusty_grid_core::capabilities::is_valid_windows_executable(base) {
+                return Some(norm_file(base));
+            }
+            for ext in WINDOWS_EXEC_EXTS {
+                let mut os = base.as_os_str().to_os_string();
+                os.push(ext);
+                let candidate = PathBuf::from(os);
+                if rusty_grid_core::capabilities::is_valid_windows_executable(&candidate) {
+                    return Some(norm_file(&candidate));
+                }
+            }
+            None
         };
         let p = Path::new(program);
         let has_sep = program.contains('/') || program.contains('\\') || program.contains(':');
         if has_sep {
-            if p.is_file() {
-                return Some(norm_file(p));
+            if p.is_absolute() {
+                return Ok(check_with_exts(p));
             }
-            for ext in WINDOWS_EXEC_EXTS {
-                let candidate = PathBuf::from(format!("{program}{ext}"));
-                if candidate.is_file() {
-                    return Some(norm_file(&candidate));
+            if program.starts_with("/bin/") || program.starts_with("/usr/bin/") {
+                for seg in program.split(['/', '\\']) {
+                    if seg == ".." {
+                        return Err(format!(
+                            "program path '{program}' escapes the task sandbox ('..' traversal is not allowed)"
+                        ));
+                    }
                 }
-            }
-            if !program.starts_with("/bin/") && !program.starts_with("/usr/bin/") {
-                return None;
+                if let Some(found) = check_with_exts(p) {
+                    return Ok(Some(found));
+                }
+            } else {
+                let (resolved, is_valid) =
+                    rusty_grid_core::capabilities::resolve_relative_windows_program_in_dir(
+                        program,
+                        working_dir,
+                        Some(sandbox_dir),
+                    )?;
+                return Ok(if is_valid {
+                    Some(norm_file(&resolved))
+                } else {
+                    None
+                });
             }
         }
+        let abs_cwd = if working_dir.is_absolute() {
+            working_dir.to_path_buf()
+        } else {
+            std::path::absolute(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
+        };
         let bare = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
         for dir in std::env::split_paths(search_path) {
             let base = if dir.as_os_str().is_empty() {
-                PathBuf::from(".")
+                abs_cwd.clone()
+            } else if !dir.is_absolute() {
+                abs_cwd.join(&dir)
             } else {
                 dir
             };
             let direct = base.join(bare);
-            if direct.is_file() {
-                return Some(norm_file(&direct));
-            }
-            for ext in WINDOWS_EXEC_EXTS {
-                let with_ext = base.join(format!("{bare}{ext}"));
-                if with_ext.is_file() {
-                    return Some(norm_file(&with_ext));
-                }
+            if let Some(found) = check_with_exts(&direct) {
+                return Ok(Some(found));
             }
         }
-        None
+        Ok(None)
     }
 
     /// RAII wrapper for a SID allocated from a well-known SID, current process token, SDDL string,
@@ -4523,6 +4575,16 @@ pub mod windows {
                 "refusing to spawn AppContainer task without a private desktop",
             ));
         }
+        let prog_path = Path::new(std_cmd.get_program());
+        if !prog_path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to spawn non-absolute program path '{}' inside AppContainer",
+                    prog_path.display()
+                ),
+            ));
+        }
         let (stdin_read, stdin_write) = create_non_inheritable_pipe_pair()?;
         let (stdout_read, stdout_write) = match create_non_inheritable_pipe_pair() {
             Ok(p) => p,
@@ -4546,8 +4608,33 @@ pub mod windows {
                 return Err(e);
             }
         };
-
-        let mut cmdline = build_windows_command_line(std_cmd);
+        let is_batch_script = prog_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"));
+        let (app_name_wide, mut cmdline) = if is_batch_script {
+            let sys_root = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let cmd_exe = sys_root.join("System32").join("cmd.exe");
+            let inner_cmdline = build_windows_command_line(std_cmd);
+            let inner_len = inner_cmdline
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(inner_cmdline.len());
+            let mut wrapped_cmd = Vec::new();
+            append_windows_quoted_arg(&mut wrapped_cmd, cmd_exe.as_os_str(), true);
+            wrapped_cmd.extend(" /d /s /c \"".encode_utf16());
+            wrapped_cmd.extend_from_slice(&inner_cmdline[..inner_len]);
+            wrapped_cmd.push(b'"' as u16);
+            wrapped_cmd.push(0);
+            (to_wide(cmd_exe.as_os_str()), wrapped_cmd)
+        } else {
+            (
+                to_wide(prog_path.as_os_str()),
+                build_windows_command_line(std_cmd),
+            )
+        };
         let env_block = build_windows_env_block(std_cmd);
         let cwd_wide = std_cmd.get_current_dir().map(|p| to_wide(p.as_os_str()));
         let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
@@ -4657,7 +4744,7 @@ pub mod windows {
                                 let mut lua_cmdline = cmdline.clone();
                                 CreateProcessAsUserW(
                                     tok,
-                                    std::ptr::null(),
+                                    app_name_wide.as_ptr(),
                                     lua_cmdline.as_mut_ptr(),
                                     std::ptr::null(),
                                     std::ptr::null(),
@@ -4675,7 +4762,7 @@ pub mod windows {
                                 res
                             } else {
                                 CreateProcessW(
-                                    std::ptr::null(),
+                                    app_name_wide.as_ptr(),
                                     cmdline.as_mut_ptr(),
                                     std::ptr::null(),
                                     std::ptr::null(),

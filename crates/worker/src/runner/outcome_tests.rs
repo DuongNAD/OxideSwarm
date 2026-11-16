@@ -606,3 +606,83 @@ async fn test_resolve_windows_executable_explicit_path_and_pathext_order() {
         fake_dir.path().join("prio.cmd")
     );
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn test_task_runner_relative_windows_program_paths_and_refused_escape() {
+    use rusty_grid_core::task::StagedFile;
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let sandboxes = base_dir.path().join("sandboxes");
+    std::fs::create_dir_all(&sandboxes).unwrap();
+    let canary = base_dir.path().join("escape_canary.txt");
+
+    // Place a decoy script directly under sandboxes/ (parent of any task's sandbox dir) so
+    // `..\decoy.cmd` would hit it if relative traversal were not refused.
+    let parent_decoy = sandboxes.join("decoy.cmd");
+    std::fs::write(
+        &parent_decoy,
+        format!("@echo PWNED > \"{}\"\r\n", canary.display()),
+    )
+    .unwrap();
+
+    let runner = runner_in(&sandboxes);
+    let root_cmd = StagedFile::new("prog.cmd", b"@echo ROOT_CMD:%1\r\n".to_vec(), true);
+    let sub_cmd = StagedFile::new("sub/prog.cmd", b"@echo SUB_CMD:%1\r\n".to_vec(), true);
+
+    for (prog, working_dir, expected) in [
+        ("./prog.cmd", None, "ROOT_CMD:42"),
+        (r".\prog.cmd", None, "ROOT_CMD:42"),
+        ("sub/prog.cmd", None, "SUB_CMD:42"),
+        (r"sub\prog.cmd", None, "SUB_CMD:42"),
+        (r".\prog.cmd", Some(PathBuf::from("sub")), "SUB_CMD:42"),
+    ] {
+        let task = Task::new(
+            TaskSpec::Command {
+                program: prog.into(),
+                args: vec!["42".into()],
+                env: HashMap::new(),
+                working_dir,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 10),
+        )
+        .with_staged_files(vec![root_cmd.clone(), sub_cmd.clone()]);
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success(),
+            "relative program '{prog}' failed: {:?} / {} / {}",
+            res.error,
+            res.stdout_str(),
+            res.stderr_str()
+        );
+        assert_eq!(res.stdout_str().trim(), expected, "program={prog}");
+    }
+
+    for escaping in [r"..\decoy.cmd", "../decoy.cmd"] {
+        let task = Task::new(
+            TaskSpec::Command {
+                program: escaping.into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            !res.is_success(),
+            "escaping relative program '{escaping}' must fail"
+        );
+        let err_msg = res.error.as_deref().unwrap_or_default();
+        assert!(
+            err_msg.contains("Invalid program path") && err_msg.contains("escapes"),
+            "expected escape refusal in error for '{escaping}', got: {err_msg}"
+        );
+        assert!(
+            !canary.exists(),
+            "escaping relative program '{escaping}' must never execute parent decoy"
+        );
+    }
+}
