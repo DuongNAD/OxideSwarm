@@ -120,7 +120,7 @@ The goal of 0.4.0 is to upgrade a cluster without stopping all of it, and to run
 (release `v0.3.0`, pull request 260) comes first. Then, in order (Phase 12 of
 [BACKLOG.md](BACKLOG.md)):
 
-- PROTO-1 (the release-train rule, done) and the test fixes TEST-28 to TEST-31.
+- PROTO-1 (the release-train rule, done), the test fixes TEST-28 to TEST-32, and the findings of the Windows smoke test: SEC-16, BUG-22 and CLI-2.
 - PROTO-2 (a CI job that runs the newest release against the pull request's build).
 - PROTO-3 (an extension slot for optional wire fields; a design record first), then PROTO-4 (a
   one-version window). Both are in [design 0076](design/0076-protocol-compatibility-and-release-train.md).

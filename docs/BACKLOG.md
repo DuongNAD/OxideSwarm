@@ -146,9 +146,10 @@ items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20
 and DOC-10, with SEC-10, SEC-13 and AND-5, and with TEST-27 added, it holds 85 Implemented, 8 Partial
 and 41 Planned. After BUG-21 ([design 0077](design/0077-windows-relative-task-executables.md)), it holds
 86 Implemented, 8 Partial and 41 Planned. A recount of this table by script on 2026-11-16 (before
-Phase 12) gave 135 rows: 90 Implemented, 7 Partial and 38 Planned. Phase 12 adds eight items
-(PROTO-1 to PROTO-4 and TEST-28 to TEST-31), so the table now holds 143 rows: 91 Implemented
-(PROTO-1 counts as Implemented with its pull request), 7 Partial and 45 Planned.
+Phase 12) gave 135 rows: 90 Implemented, 7 Partial and 38 Planned. Phase 12 adds twelve items
+(PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-22 and CLI-2), so the table now holds 147
+rows: 91 Implemented (PROTO-1 counts as Implemented with its pull request), 7 Partial and 49
+Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -203,6 +204,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Planned |  |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Planned |  |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Planned |  |
+| TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -297,6 +299,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Planned | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0076) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
+| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
+| BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
+| CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Planned |  |
 
 ## Phase 0: integrate open work
 
@@ -2681,7 +2686,7 @@ exist. LLM serving across machines ([design 0067](design/0067-multi-node-llm-ser
 
 Order:
 
-1. PROTO-1 and the test fixes TEST-28 to TEST-31, first.
+1. PROTO-1 and the test fixes TEST-28 to TEST-32, first.
 2. PROTO-2.
 3. PROTO-3: a design record first, then code.
 4. PROTO-4, after PROTO-3 and an update of [design 0040](design/0040-protocol-versioning.md).
@@ -2689,6 +2694,9 @@ Order:
    TEST-27 too) and are not repeated here.
 
 REL-6 (release `v0.3.0` at protocol 9, pull request 260) is the step before this phase.
+
+The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS one passed 10 of
+10 at `9acc06e`. SEC-16, TEST-32, BUG-22 and CLI-2 come from the Windows report.
 
 ### PROTO-1: The release-train rule for wire changes
 
@@ -2772,6 +2780,56 @@ REL-6 (release `v0.3.0` at protocol 9, pull request 260) is the step before this
   group.
 - **Do:** Have the script write a second file after `setsid`, and wait for it before the kill.
 - **Done when:** The test passes 200 times in a loop on Linux.
+
+### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
+
+- **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
+  smoke test, finding F1). The worker exits with: "another account
+  (S-1-15-3-3557520199-3666692283-...) can rename, delete or re-permission ancestor directory
+  `AppData`". A read-only `icacls` shows two explicit entries for that SID, `(F)` and
+  `(OI)(CI)(IO)(F)`. It is not the `oxideswarm.toolchain` capability, which derives to
+  `S-1-15-3-1024-...`.
+- **Problem:** The worker's check is correct, but no `fs` worker can use any sandbox base below
+  `AppData`, the default `%TEMP%` included, and the worker unit tests fail under the default
+  `%TEMP%` there. Nobody knows what created the entry. A confined process that holds that
+  capability would have full control of everything that inherits from `AppData`.
+- **Do:**
+  1. Find what created the entry and whether any confined process holds that capability. Do not
+     change the ACL without the owner.
+  2. Decide whether the worker's error message should suggest a fix.
+- **Done when:** The cause is written here, and the owner has decided what to do with the entry.
+  This needs the owner's machine.
+
+### TEST-32: Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath`
+
+- **Evidence:** Reproduced 5 of 5 times on Windows (smoke test, finding F2).
+  `client::tests::test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks`
+  (`crates/worker/src/client/tests.rs`) panicked with "task 2 did not write exit marker in time".
+  With `Remove-Item Env:NoDefaultCurrentDirectoryInExePath` the same commit passes (248 passed).
+  Claude Code sessions set that variable.
+- **Problem:** The test starts `cmd.exe /C drain.cmd` with a bare name. With the variable set,
+  `cmd.exe` does not search the current directory, so the script never runs. The product is not at
+  fault: under `--isolation off` a task inherits the worker's environment, as designed.
+- **Do:** Start `.\drain.cmd`, or clear the variable for the child.
+- **Done when:** The test passes with the variable set to 1.
+
+### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
+
+- **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
+  `status --json` read `failed_tasks: 11`.
+- **Problem:** A cancel is not a failure, and a reader of the counts cannot tell them apart.
+- **Do:** Report cancelled tasks in their own field, and keep `failed_tasks` for failed tasks.
+  Check the dashboard and the MCP `status` tool for the same sum.
+- **Done when:** A test with one failed and one cancelled task shows 1 and 1.
+
+### CLI-2: Add a flag to move or disable the UDP discovery beacon
+
+- **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
+  the CLI has no flag to move it. It was free during the run and released when the master stopped.
+- **Problem:** A second loopback master on the same machine cannot start its beacon.
+- **Do:** Add a flag and an environment variable (`RUSTY_GRID_*`) to set the beacon port or turn
+  the beacon off. Update the `README.md` reference.
+- **Done when:** Two masters on one machine run at the same time, one with the beacon off.
 
 ## Status log
 
@@ -3130,4 +3188,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,377), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.
-- 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, and TEST-28 to TEST-31. The Index counts are now 91 Implemented, 7 Partial and 45 Planned (a script recount of the table before this phase gave 90, 7 and 38; the earlier sentence of 86, 8 and 41 had drifted).
+- 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (a script recount of the table before this phase gave 90, 7 and 38; the earlier sentence of 86, 8 and 41 had drifted).
