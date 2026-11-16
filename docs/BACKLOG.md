@@ -143,8 +143,8 @@ Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
 Eleven items (BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10) were added on 2026-11-15
 from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Index then held 77
 items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
-and DOC-10, with SEC-10 and SEC-13, and with TEST-27 added, it holds 84 Implemented, 8 Partial and
-42 Planned.
+and DOC-10, with SEC-10, SEC-13 and AND-5, and with TEST-27 added, it holds 85 Implemented, 8 Partial
+and 41 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -230,7 +230,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
-| AND-5 | Stop the Android worker without blocking the calling thread, and build the bridge in CI | P2 | S | SEC-3 |  | Planned | 240 (open) |
+| AND-5 | Stop the Android worker without blocking the calling thread, and build the bridge in CI | P2 | S | SEC-3 |  | Implemented | 240 (design 0073) |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Implemented | 122 (design), 129, 141, 147, 158, 167 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented | 117 (design), 133, 150, 152 |
@@ -243,7 +243,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242, 249, 250 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -1599,6 +1599,12 @@ Each item below needs a design record before code.
   have grown in five of the six files since the table above: `server.rs` 6,275, `queue.rs` 5,915,
   `cli_app.rs` 5,463, `protocol.rs` 5,269 and `runner.rs` 4,333. `client.rs` is 4,540 after its
   tests moved to `client/tests.rs`. Each new item that touches these files makes the split harder.
+- **Note (2026-11-16):** Five of the six files are split (pull requests 230, 231, 242, 249 and 250).
+  At `dde5b55` their tests live in files of their own, and the whole of each file is at most:
+  `server.rs` 2,569 lines, `client.rs` 1,656, `queue.rs` 1,469, `runner.rs` 1,336 and `protocol.rs`
+  864. The largest new submodule is `queue/lifecycle.rs` with 1,536 lines. `cli_app.rs` is not split
+  yet (about 5,484 lines before its test module), and the CI size check of step 3 is not built, so
+  the item stays Partial.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -2500,6 +2506,12 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   3. Add a CI step that runs `cargo check -p rusty_grid_android_bridge --target aarch64-linux-android`.
 - **Done when:** A host-side test shows the stop call returns in under 100 ms while a task drains.
   Two concurrent start calls start one worker. The CI step runs on every pull request.
+- **Implemented (2026-11-16, pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)):**
+  `stop_worker_impl` returns at once and joins the worker thread on a thread of its own, and a start
+  claims `running` with `compare_exchange` (`crates/android_bridge/src/lib.rs`). The host tests
+  `test_stop_worker_returns_in_under_100ms_while_worker_drains` and
+  `test_interleaved_stop_start_at_most_one_worker_thread` cover both, and the CI step "android
+  bridge compiles for aarch64-linux-android" runs in `.github/workflows/ci.yml`.
 
 ### DOC-9: Correct the statuses and statements that the audit found wrong
 
@@ -2947,3 +2959,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-15: DOC-10 implemented (pull request 235): `docs/ROADMAP.md` is the only roadmap and describes `f4a4a74`, `PROJECT.md` section 5 links to it, and the untracked `docs/ROADMAP_AND_VISION.md` left the repository. The Index counts are now 79 Implemented, 8 Partial and 46 Planned.
 - 2026-11-16: Phase 11 brought up to date before merge: BUG-19 (pull request 236, design 0069), BUG-20 (pull request 241, design 0075) and SEC-14 (pull request 237, design 0071) were merged before this phase reached `master` and are Implemented; SEC-10, SEC-13, AND-5 and MAINT-1 name their open pull requests (238, 239, 240, 230, 231, 242); "Where the project stands" in `docs/ROADMAP.md` describes `96ce571`. The Index counts are now 82 Implemented, 8 Partial and 43 Planned.
 - 2026-11-16: TEST-27 added from a macOS CI failure of `mesh_auth` on `master` `6a88eff`, and a note on TEST-23 from the result of its failed run (the process exited 0 and printed nothing). SEC-13 is Implemented (pull request 239, [design 0072](design/0072-collect-outputs-without-following-links.md)) and SEC-10 is Implemented (pull request 238, [design 0070](design/0070-no-working-directory-config.md)), both merged 2026-11-16. MAINT-1 stays Partial after the splits of `client.rs`, `runner.rs` and `protocol.rs` (pull requests 230, 231, 242). The Index counts are now 84 Implemented, 8 Partial and 42 Planned.
+- 2026-11-16: AND-5 Implemented (pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)). MAINT-1 stays Partial after the splits of `queue.rs` and `server.rs` (pull requests 249 and 250): five of six files are split, `cli_app.rs` and the CI size check remain. The Index counts are now 85 Implemented, 8 Partial and 41 Planned.
