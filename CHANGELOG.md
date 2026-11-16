@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `WorkloadScheduler::dispatch` (`crates/master/src/scheduler.rs`) now attempts a non-blocking `sender.try_reserve()` first and defers full-channel deliveries to bounded per-assignment waiters (`DISPATCH_RESERVE_TIMEOUT = 5 s`, capped at `MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER = 16` per worker) that requeue timed-out assignments uncharged via `TaskQueue::requeue_dispatch_failure`, preventing one slow worker from stalling the rest of a scheduling pass (`BUG-20`, [design 0075](docs/design/0075-non-blocking-dispatch.md)).
 - Help and tool texts that described an older state: `worker --isolation` no longer says isolation is macOS only (macOS, Linux and Windows are supported; `crates/cli/src/cli_app.rs`), and the MCP `doctor` tool names checks C1 to C8 (`crates/cli/src/mcp.rs`). Documentation statuses were corrected in the same change (`DOC-9`, `docs/BACKLOG.md`).
 
+### Security
+- Workers now open each collected task output without following symbolic links (`O_NOFOLLOW | O_NONBLOCK` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows), check `fstat` metadata and `--output-limit-mb` on that descriptor, hash and copy from the same descriptor, and verify `dev`/`ino` (or Windows file index) after moving a single-link output into the blob cache so a symlink swapped in after the sandbox walk can never be read or cached (`SEC-13`, [design 0072](docs/design/0072-collect-outputs-without-following-links.md)).
+
 ## [0.2.0] - 2026-11-15
 
 A minor feature release introducing protocol version 8, invite-based machine enrollment (`ENROLL-1b`),
