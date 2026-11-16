@@ -375,6 +375,14 @@ impl Task {
         self.requirements.extensions.retain(keep);
     }
 
+    /// True when this task must never be sent to a peer speaking protocol `version`: it carries a
+    /// critical `Worker`/`Both` extension (the receiver must enforce it) and the peer is below the
+    /// extension protocol, so `for_peer` would strip the restriction (design 0083, defense in
+    /// depth: placement already keeps such a task off a v9 worker).
+    pub fn withheld_from_peer(&self, version: u32) -> bool {
+        version < EXTENSION_PROTOCOL_VERSION && !self.required_extension_ids().is_empty()
+    }
+
     /// The copy of this task a peer speaking protocol `version` may receive (design 0083 D3).
     ///
     /// `Master`-scope extensions are removed. For `version` below 10 (the layout before the

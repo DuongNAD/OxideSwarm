@@ -348,11 +348,11 @@ At the next wire change the pull request replaces the previous file with the fil
   on-path attacker cannot lower it. A peer on loopback without a secret can claim 9, but gets only
   the v9 copy of a task: no restriction is lost (D3), and it can send nothing it could not send as 10.
 - **No restriction is dropped for an older peer.** Critical `Worker`/`Both` extensions keep tasks off
-  workers without `ext:` tags, and a v9 worker has none (D3). A security fix that needs the wire
+  workers without `ext:` tags. A v9 worker does not advertise one itself, but v0.3.0 does not reserve the prefix, so a worker started with `--tag ext:<id>` could declare it: the master therefore drops `ext:*` tags at registration from a worker below protocol 10 and refuses to send such a task to one (D3, status log M1). A security fix that needs the wire
   changed must close the window (D1), so a vulnerable v9 path does not stay open for a release.
 - **Downgrade of a master is not supported** (D6), so a window cannot be used to roll a fixed master
   back onto an old store.
-- The `proto:<n>` tag is master-added; a worker cannot claim it (reserved prefix, `placement.rs:52`).
+- The `proto:<n>` tag is master-added. v0.3.0 does not reserve `proto:` or `ext:`, so a v9 worker can send them; the master drops every worker-supplied `proto:*` (all workers) and every `ext:*` from a worker below protocol 10 at registration, and adds its own `proto:<n>`.
 
 ## Test plan
 
@@ -475,3 +475,18 @@ the owner's machines install (design 0076 Q66).
     `--pr-protocol-rs` (default: the working tree); without the first nothing is derived and the job
     behaves as before.
   - Unverified here: Windows and Linux runs, a real QUIC (iroh) v9 worker, and the CI job itself.
+- 2026-11-17: Review finding M1 (security), fixed on pull request 274. The Security section above
+  claimed that a v9 worker has no `ext:` tag and cannot claim `proto:`. That is false: v0.3.0's
+  `RESERVED_TAG_PREFIXES` has neither, so `--tag ext:32770` registered, the master copied worker tags
+  as sent, placement was satisfied, `Task::for_peer(9)` cleared the lists, and the worker ran the
+  task unrestricted (and a peer could list a fake `proto:10`). Fixes: (a) at registration the master
+  drops every worker-supplied `proto:*` tag, and every `ext:*` tag from a worker whose version is
+  below the extension protocol (`EXTENSION_PROTOCOL_VERSION`, 10), with one warning per session;
+  (b) defense in depth: `Task::withheld_from_peer(version)` is true for a task with a critical
+  `Worker`/`Both` extension and a peer below 10, and the scheduler's dispatch refuses such an
+  assignment (logs it and returns the task to the queue) instead of clearing and sending.
+  Tests: `v9_worker_cannot_forge_ext_or_proto_tags` (both forged tags dropped, ListWorkers shows only
+  the master's `proto:9`, the critical task stays Queued) and
+  `critical_worker_extensions_are_withheld_from_a_v9_peer`. S3: `v9_worker_gets_assign_task_with_checkpoint_after_failover`
+  sends a live `AssignTaskWithCheckpoint` to a v9 worker. S5: DEPLOYMENT.md 3.5 already says a
+  rollback to 0.3.0 needs a copy of `--state-dir` taken before the upgrade (format 4 is refused by 0.3.0).

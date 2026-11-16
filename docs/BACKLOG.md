@@ -304,6 +304,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented | (pull request 274), (design 0083) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Planned |  |
@@ -2761,6 +2762,16 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A worker one version back registers and runs a task.
 - **Design:** [design 0083](design/0083-one-version-window.md) (2026-11-17, based on pull request 272): Q73 to Q79 decided by the owner in chat on 2026-11-17, all on the recommended defaults.
 - **Status:** Implemented by draft pull request 274 (it merges together with PROTO-3, pull request 272, and a release follows within 48 hours, design 0076 D1). `PROTOCOL_VERSION_MIN_COMPATIBLE` is 9 at protocol 10; the master reads each peer's version, encodes for it (`serialize_message_for_peer`, `Task::for_peer`), serves protocol 9 workers and clients, and tags them `proto:9`; the layout test is a range check with `wire_layout_previous.txt` (v0.3.0) as the oracle; the skew job derives its expected table. PROTO-3d (the cross-version tests of design 0082) is built with it.
+
+### PROTO-5: Keep a skew job against the release one protocol back
+
+- **Evidence:** Read. Review of pull request 274.
+- **Problem:** The skew job compares the pull request with the newest release only. After 0.4.0 that is
+  protocol 10, so the one-version window (protocol 10 accepts 9) is no longer exercised against a real
+  protocol 9 binary.
+- **Do:** Pin a second release (v0.3.0 while the window reaches back to 9) in the skew job, with its
+  `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
+- **Done when:** Each pull request shows a table row of a real release one protocol back.
 
 ### TEST-28: Make the group-commit timing test meaningful on slow runners
 

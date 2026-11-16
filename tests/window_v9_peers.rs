@@ -441,3 +441,124 @@ async fn v9_client_submit_with_created_at_zero_is_a_v9_task() {
     let _ = stop_tx.send(true);
     let _ = master.shutdown();
 }
+
+impl V9Worker {
+    /// Like `register`, with tags the worker supplies itself.
+    async fn register_with_tags(master: &MasterHandle, name: &str, tags: Vec<String>) -> Self {
+        let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+        let mut transport = MessageTransport::with_codec(stream, WireCodec::Bincode);
+        let id = Uuid::new_v4();
+        let mut caps = WorkerCapabilities::new(name, 4, 8_192, false, false, None);
+        caps.tags = tags;
+        transport
+            .send_msg(&WorkerMessage::Register {
+                worker_id: id,
+                capabilities: caps,
+                protocol_version: V9,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let mut worker = Self {
+            transport,
+            id,
+            codec: WireCodec::Bincode,
+        };
+        assert!(matches!(
+            worker.next_message(Duration::from_secs(5)).await,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        worker
+    }
+}
+
+/// M1: a v9 worker does not reserve `ext:` / `proto:`, so it may register them. The master drops
+/// `ext:*` from a worker below protocol 10 and `proto:*` from every worker (it adds its own), so a
+/// task with a critical Worker extension still never reaches the v9 worker.
+#[tokio::test]
+async fn v9_worker_cannot_forge_ext_or_proto_tags() {
+    let master = spawn_master().await;
+    let mut v9 = V9Worker::register_with_tags(
+        &master,
+        "forger",
+        vec!["ext:32770".into(), "proto:10".into(), "zone:lab".into()],
+    )
+    .await;
+    let listed = master.list_workers().await.unwrap();
+    let tags = &listed
+        .iter()
+        .find(|w| w.worker_id == v9.id)
+        .unwrap()
+        .capabilities
+        .tags;
+    assert!(tags.contains(&"zone:lab".to_string()), "{tags:?}");
+    assert!(!tags.iter().any(|t| t.starts_with("ext:")), "{tags:?}");
+    let protos: Vec<_> = tags.iter().filter(|t| t.starts_with("proto:")).collect();
+    assert_eq!(protos, vec![&format!("{PROTO_TAG_PREFIX}{V9}")], "{tags:?}");
+
+    let task_id = master
+        .submit_task(echo_task(vec![worker_limit()]))
+        .await
+        .unwrap();
+    assert!(
+        v9.next_assigned_task(Duration::from_millis(1_200))
+            .await
+            .is_none(),
+        "a forged ext: tag must not attract a critical task"
+    );
+    assert_eq!(
+        master.queue().get_state(&task_id).await,
+        Some(TaskState::Queued)
+    );
+    let _ = master.shutdown();
+}
+
+/// S3: a task resumed from a checkpoint reaches a v9 worker as `AssignTaskWithCheckpoint` in the
+/// v9 layout: a first v9 worker takes it, reports a checkpoint and disconnects; a second one gets
+/// the resume message without extension lists.
+#[tokio::test]
+async fn v9_worker_gets_assign_task_with_checkpoint_after_failover() {
+    let master = spawn_master().await;
+    let mut first = V9Worker::register(&master, "v9-first", WireCodec::Bincode).await;
+    let task_id = master.submit_task(echo_task(vec![hint()])).await.unwrap();
+    first
+        .next_assigned_task(Duration::from_secs(5))
+        .await
+        .expect("first v9 worker gets the task");
+    first
+        .transport
+        .send_msg(&WorkerMessage::Checkpoint {
+            task_id,
+            sequence: 1,
+            delta_state: Bytes::from_static(b"state"),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(first);
+
+    let mut second = V9Worker::register(&master, "v9-second", WireCodec::Bincode).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .expect("AssignTaskWithCheckpoint must arrive");
+        let Some(msg) = second.next_message(left).await else {
+            panic!("no AssignTaskWithCheckpoint arrived");
+        };
+        if let MasterMessage::AssignTaskWithCheckpoint {
+            task,
+            latest_checkpoint,
+        } = msg
+        {
+            assert_eq!(task.id, task_id);
+            assert!(task.extensions.is_empty() && task.requirements.extensions.is_empty());
+            assert_eq!(
+                latest_checkpoint.expect("the checkpoint").delta_state,
+                Bytes::from_static(b"state")
+            );
+            break;
+        }
+    }
+    let _ = master.shutdown();
+}

@@ -290,3 +290,31 @@ fn window_rule_and_previous_file_rule() {
     // MIN above CURRENT: refused.
     assert!(verify_window_range(10, 11).is_err());
 }
+
+/// Defense in depth (design 0083, M1): a task with a critical `Worker`/`Both` extension is
+/// withheld from a peer below protocol 10, whose copy would lose the restriction.
+#[test]
+fn critical_worker_extensions_are_withheld_from_a_v9_peer() {
+    use crate::task::{Extension, TaskRequirements, TaskSpec};
+    let ext = |id: u16, critical: bool| Extension {
+        id,
+        critical,
+        bytes: vec![1],
+    };
+    let mut task = Task::new(
+        TaskSpec::command("echo", vec![]),
+        TaskRequirements::generic(1, 10),
+    );
+    assert!(!task.withheld_from_peer(9));
+    // Non-critical, and critical with Master scope: neither restricts a worker.
+    task.extensions = vec![ext(0x8001, false), ext(0x8003, true)];
+    assert!(!task.withheld_from_peer(9));
+    // Critical, Worker scope.
+    task.extensions.push(ext(0x8002, true));
+    assert!(task.withheld_from_peer(9));
+    assert!(!task.withheld_from_peer(10));
+    // Critical, Both scope, in the requirements list.
+    task.extensions.clear();
+    task.requirements.extensions = vec![ext(0x8004, true)];
+    assert!(task.withheld_from_peer(9));
+}

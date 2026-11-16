@@ -790,6 +790,27 @@ impl<
             }
         };
 
+        // Tags only the master may set (design 0083 M1): the master adds its own `proto:<n>`, so a
+        // worker-supplied `proto:*` is dropped for every worker; `ext:*` is dropped from a worker
+        // below the extension protocol, which cannot enforce an extension whatever it claims (a
+        // v0.3.0 worker does not reserve the prefix and may carry `--tag ext:<id>`).
+        let mut capabilities = capabilities;
+        let tags_before = capabilities.tags.len();
+        capabilities.tags.retain(|t| {
+            let ext_forged = peer_version < rusty_grid_core::task::EXTENSION_PROTOCOL_VERSION
+                && t.starts_with(rusty_grid_core::placement::EXT_TAG_PREFIX);
+            !(t.starts_with(rusty_grid_core::placement::PROTO_TAG_PREFIX) || ext_forged)
+        });
+        if capabilities.tags.len() != tags_before {
+            warn!(
+                worker_id = %worker_id,
+                peer_version,
+                dropped = tags_before - capabilities.tags.len(),
+                "Dropped worker-supplied master-only tags (proto:*, and ext:* from a worker below \
+                 the extension protocol) at registration"
+            );
+        }
+
         let remote_addr = pre_auth.remote_addr();
         let rx_clock = pre_auth.rx_clock().clone();
         let is_multiplexed = pre_auth.is_multiplexed();

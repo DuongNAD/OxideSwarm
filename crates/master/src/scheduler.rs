@@ -2090,6 +2090,33 @@ impl WorkloadScheduler {
 
         // Step 5: Dispatch AssignTask frames to workers
         for assignment in &report.assignments {
+            // Defense in depth (design 0083): a task with a critical Worker/Both extension never
+            // goes to a peer below protocol 10, whose copy would lose the restriction. Placement
+            // keeps it off such workers; if a pass still picks one, refuse the assignment.
+            if let Some(version) = self
+                .registry
+                .peer_version_of(&assignment.worker_id, assignment.session_id)
+                .await
+            {
+                if assignment.task.withheld_from_peer(version) {
+                    warn!(
+                        task_id = %assignment.task_id,
+                        worker_id = %assignment.worker_id,
+                        peer_version = version,
+                        "Refusing to assign a task with a critical worker extension to a peer \
+                         below the extension protocol; returning it to the queue"
+                    );
+                    let _ = self
+                        .queue
+                        .requeue_dispatch_failure(
+                            &assignment.task_id,
+                            &assignment.worker_id,
+                            assignment.session_id,
+                        )
+                        .await;
+                    continue;
+                }
+            }
             let mut task = assignment.task.clone();
             // The worker cannot enforce a master-scope extension and would refuse a critical one
             // as unknown (design 0082 D4.4); the queue keeps the stored task whole.

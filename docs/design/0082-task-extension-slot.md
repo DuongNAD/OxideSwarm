@@ -143,7 +143,8 @@ This record builds no window. It states the rule PROTO-4 follows so the slot doe
 - **No code execution.** Decoders are plain data; each registry entry's decoder is bounded by its own size limit and returns an error, never panics (fuzzable, see Test plan).
 - **No secret or ticket in extensions.** Extensions are stored in the journal and shown in task listings; nothing sensitive goes in `bytes` unless its design record covers that, as for any task field.
 - **Resource use.** Journal and queue budgets already apply to the whole `Task`; at most 256 KiB per task is added.
-- The `ext:` worker tag is self-declared. A worker that lies about it can only receive tasks it is trusted with already (the same trust as the `tool:` and `iso:` tags).
+- **Known limit (review S1).** The extension limits are checked after the whole frame is decoded with bincode: a 64 MiB frame of empty extensions decodes to about 5.8 million `Extension` structs (about 190 MB transient) before `Task::validate` refuses it. It is the same class as the existing unbounded `Vec<String>` tags. A bounded decoder is a follow-up (status log).
+- The `ext:` worker tag is self-declared on protocol 10 workers (and the master drops it from workers below protocol 10, design 0083 M1). A worker that lies about it can only receive tasks it is trusted with already (the same trust as the `tool:` and `iso:` tags).
 
 ## Test plan
 
@@ -229,3 +230,4 @@ The three first items fit one pull request (L, as in the backlog). They land at 
     (`3 + bytes.len()` per entry) in `task_active_bytes`, with a test.
   - Unverified here: Windows and Linux runs of the new tests, and test 10 (PROTO-3d).
 - 2026-11-17: PROTO-3d built with PROTO-4 (pull request 274, [design 0083](0083-one-version-window.md)): test 10 is `tests/window_v9_peers.rs` (a v9 worker registers and runs a task; a non-critical extension is dropped from its copy and a critical `Worker` extension never reaches it; a v9 client submits, polls and lists, in both codecs) plus the skew job. The D6 rule "a v10 master refuses a v9 `SubmitTask`" is replaced by the window: a v9 `SubmitTask` is read through `LegacyV9Task` (D2 of design 0083), and `legacy_v9_submit_task_is_refused_with_a_version_error` became `decode_v9_submit_task_is_accepted_and_has_empty_lists`.
+- 2026-11-17: Review follow-ups. S1: the extension limits are checked after a full bincode decode (known limit, Security section); a decoder that stops early is not built. M1 (a v9 worker forging `ext:`) is fixed in design 0083's status log.

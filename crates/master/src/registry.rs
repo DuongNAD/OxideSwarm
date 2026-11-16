@@ -742,6 +742,16 @@ impl WorkerRegistry {
         released
     }
 
+    /// The protocol version `session_id`'s worker registered with, if that session is live.
+    pub async fn peer_version_of(&self, worker_id: &Uuid, session_id: u64) -> Option<u32> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .filter(|e| e.session_id == session_id)
+            .map(|e| e.peer_version)
+    }
+
     /// Records the protocol version `session_id`'s worker registered with (design 0083 D2).
     pub async fn set_peer_version(&self, worker_id: &Uuid, session_id: u64, version: u32) {
         let mut inner = self.inner.write().await;
