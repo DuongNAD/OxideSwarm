@@ -166,10 +166,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
 | SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Implemented | 238 (design 0070) |
 | SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Implemented | 256 (design 0078) |
-| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
+| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Implemented | 257 (design 0033) |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
-| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
+| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Implemented |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
@@ -178,7 +178,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
 | BUG-19 | Bound the data-lane backlog of a QUIC worker session | P1 | S |  |  | Implemented | 236 (design 0069) |
 | BUG-20 | Keep one slow worker from stalling every dispatch | P1 | M |  |  | Implemented | 241 (design 0075) |
-| BUG-21 | Resolve relative staged executables against the task working directory on Windows | P1 | S | FEAT-3 |  | Implemented | (design 0077) |
+| BUG-21 | Resolve relative staged executables against the task working directory on Windows | P1 | S | FEAT-3 |  | Implemented | 251 (design 0077) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -245,7 +245,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242, 249, 250 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242, 249, 250, 253 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -1601,12 +1601,11 @@ Each item below needs a design record before code.
   have grown in five of the six files since the table above: `server.rs` 6,275, `queue.rs` 5,915,
   `cli_app.rs` 5,463, `protocol.rs` 5,269 and `runner.rs` 4,333. `client.rs` is 4,540 after its
   tests moved to `client/tests.rs`. Each new item that touches these files makes the split harder.
-- **Note (2026-11-16):** Five of the six files are split (pull requests 230, 231, 242, 249 and 250).
-  At `dde5b55` their tests live in files of their own, and the whole of each file is at most:
-  `server.rs` 2,569 lines, `client.rs` 1,656, `queue.rs` 1,469, `runner.rs` 1,336 and `protocol.rs`
-  864. The largest new non-test submodule is `queue/lifecycle.rs` with 1,536 lines. `cli_app.rs` is not split
-  yet (about 5,484 lines before its test module), and the CI size check of step 3 is not built, so
-  the item stays Partial.
+- **Note (2026-11-16):** All six files are split (pull requests 230, 231, 242, 249, 250 and 253).
+  At `03ace60` their tests live in files of their own, and the whole of each file is at most:
+  `server.rs` 2,569 lines, `client.rs` 1,684, `cli_app.rs` 1,629, `queue.rs` 1,469, `runner.rs`
+  1,336 and `protocol.rs` 864. The largest new non-test submodule is `queue/lifecycle.rs` with
+  1,536 lines. The CI size check of step 3 is not built, so the item stays Partial.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -2469,6 +2468,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   3. Record the result and any remaining limit in design 0033 and `docs/SECURITY.md`.
 - **Done when:** The tests above pass on `macos-latest` in CI, and `cargo build` of a workspace
   still works under `--isolation fs` on macOS.
+- **Implemented (2026-11-16, pull request 257, [design 0033](design/0033-os-level-task-isolation.md)):**
+  the macOS profile denies `mach-lookup` and `job-creation`; the allowlist has one service,
+  `com.apple.MTLCompilerService` for Metal GPU tasks; `cargo`, `rustc`, `git`, `cc` and `ld` needed none. `launchctl submit` was already refused
+  (`deny(1) job-creation`). Tests for `launchctl submit`, `open -a`, `osascript` and a hard link
+  to a secret were added. The profile is still a denylist inside `(allow default)`.
 
 ### SEC-13: Collect outputs through the descriptor that was checked
 
@@ -2523,6 +2527,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
      loopback.
 - **Done when:** `tests/test_launcher_scripts.py` checks `-NoShell` in the `.ps1` launcher. The
   adb launcher's command line holds no token. A test shows the `ws://` warning.
+- **Implemented (2026-11-16, pull request 258, [design 0079](design/0079-agent-mesh-launchers-safe-by-default.md)):**
+  `run_agent_node.ps1` has `-NoShell` and honours `OXIDE_MESH_NO_SHELL=1`, `run_agent_node_adb.sh`
+  sends the token on standard input, and the Rust node and `scripts/agent_node.py` log a warning
+  for a token over `ws://` to a non-loopback host. Tests are in `tests/test_launcher_scripts.py`
+  and `client::tests::test_cleartext_token_warning_predicate`.
 
 ### AND-5: Stop the Android worker without blocking the calling thread, and build the bridge in CI
 
@@ -2995,3 +3004,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: TEST-27 added from a macOS CI failure of `mesh_auth` on `master` `6a88eff`, and a note on TEST-23 from the result of its failed run (the process exited 0 and printed nothing). SEC-13 is Implemented (pull request 239, [design 0072](design/0072-collect-outputs-without-following-links.md)) and SEC-10 is Implemented (pull request 238, [design 0070](design/0070-no-working-directory-config.md)), both merged 2026-11-16. MAINT-1 stays Partial after the splits of `client.rs`, `runner.rs` and `protocol.rs` (pull requests 230, 231, 242). The Index counts are now 84 Implemented, 8 Partial and 42 Planned.
 - 2026-11-16: AND-5 Implemented (pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)). MAINT-1 stays Partial after the splits of `queue.rs` and `server.rs` (pull requests 249 and 250): five of six files are split, `cli_app.rs` and the CI size check remain. The Index counts are now 85 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
+- 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
