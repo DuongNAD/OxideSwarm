@@ -150,6 +150,8 @@ and 41 Planned. After BUG-21 ([design 0077](design/0077-windows-relative-task-ex
 Phase 12 adds twelve items (PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-22 and CLI-2), so
 the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with its pull request),
 7 Partial and 49 Planned.
+After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
+(TEST-33 to TEST-35), it holds 150 items: 93 Implemented, 9 Partial and 48 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -199,12 +201,15 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
-| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Planned |  |
-| TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Planned |  |
+| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Partial | 263 |
+| TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Planned |  |
-| TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Planned |  |
-| TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Planned |  |
+| TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
+| TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
+| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
+| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Planned |  |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -964,6 +969,11 @@ The standard in `docs/README.md` requires "only what the code does". These items
   3. If the delay is in the hub, fix it there. If it is the runner, raise the deadline by the
      measured margin, with a comment that names this item.
 - **Done when:** 50 runs in a row pass on `macos-latest`, and the test prints that latency.
+- **Partial (2026-11-16, pull request 263):** not reproduced in 60 local runs on macOS (30 plain, 30
+  with 12 CPU-burning processes). Steps 2 and 3 are done: the healthy-node ping now goes through a
+  separate client with a 10 s deadline, the dead-peer NACK check has 30 s, and both latencies since
+  the victim's removal are printed (at most about 8.7 ms under load). Step 1, 50 runs on
+  `macos-latest`, is not done.
 
 ### DOC-1: Correct false status claims
 
@@ -2750,6 +2760,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Measure group commit by the count of fsyncs or commits, or use a much wider bound. Keep
   what the test proves: submissions share commits, and the state survives a restart.
 - **Done when:** The test passes on a slow runner and fails if every submission commits alone.
+- **Implemented (2026-11-16, pull request 265):** the 2 s wall-clock bound is gone; a 60 s guard
+  catches a hang, and the existing `store_sync_count()` assertion (more than 0 and fewer than 200
+  syncs for 1,000 submissions) fails if every submission commits alone. 20 of 20 local runs
+  passed, one of them with 12 CPU-burning processes.
 
 ### TEST-29: Find why `workspace tests (windows-latest)` loses its runner at 60 minutes
 
@@ -2771,6 +2785,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   (`tests/test_agent_bridge.py:745`) fails there, because the test probes the real port.
 - **Do:** Make the test use a port it binds itself, or stub the probe.
 - **Done when:** The test passes with a listener on 8088.
+- **Implemented (2026-11-16, pull request 263):** `agent_bridge.py` reads the environment variable
+  `OXIDESWARM_BRIDGE_ASSUME_LISTENING` (ports reported as listening; unset means probe as before),
+  the tests set it to empty, and a new test sets it to 8088 and still sees `[SPLIT-BRAIN MASTER]`.
+  The whole file passed (45, then 53 tests with pull request 261) with a real master on 8088.
 
 ### TEST-31: Remove the race in the detached-grandchild Blender probe test
 
@@ -2780,6 +2798,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   group.
 - **Do:** Have the script write a second file after `setsid`, and wait for it before the kill.
 - **Done when:** The test passes 200 times in a loop on Linux.
+- **Partial (2026-11-16, pull request 265):** the grandchild writes a ready marker after `setsid`
+  and the child waits for it (at most 5 s) before it exits; the Unix timeouts were widened
+  (2.5 s, 4 s, 10 s) because under load the script had not written its PID file within 800 ms.
+  50 local runs on macOS passed (30 with 12 CPU-burning processes). The 200-run loop on Linux of
+  "Done when" is not done.
 
 ### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
 
@@ -2812,6 +2835,38 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   fault: under `--isolation off` a task inherits the worker's environment, as designed.
 - **Do:** Start `.\drain.cmd`, or clear the variable for the child.
 - **Done when:** The test passes with the variable set to 1.
+
+### TEST-33: Make the worker-churn stress test deterministic on Windows
+
+- **Evidence:** Reproduced once on 2026-11-16: pull request 263 at `282de6f` (run `43879650203`, job
+  `133341802791`, `workspace tests (windows-latest)`): `test_stress_high_volume_worker_churn`
+  panicked at `tests/m9_stress_challenge_1.rs:763` with "All 30 tasks must complete despite rapid
+  worker churn". The rerun passed. The pull request did not touch the master or the worker.
+- **Problem:** The test waits a fixed time for 30 tasks while workers connect and drop; on a slow
+  runner the requeue and backoff can take longer than the wait.
+- **Do:** Find the wait or backoff the test depends on, and wait for the condition (all tasks
+  terminal) with a bound that does not depend on runner speed, or count requeues.
+- **Done when:** The test passes 50 times in a loop on Windows, one run with CPU load.
+
+### TEST-34: Show and fix the Agent Mesh simulation Suite 2 failure on macOS
+
+- **Evidence:** Reproduced once on 2026-11-16: pull request 262 at `eb68ed9` (job `133354770430`,
+  `agent bridge (macos-latest)`): `tests/run_mesh_simulation_tests.py` printed "[FAILED] Suite 2 raised
+  exception:" with no exception text, then "Suite 2: Bidirectional Zero-Data-Loss & Burst ... FAILED".
+  The rerun passed. The pull request changed documents only.
+- **Problem:** The runner prints no exception text, so the cause is unknown.
+- **Do:** Print the exception type, message and traceback for a failing suite; then find the cause.
+- **Done when:** The cause is written here and fixed, or the suite passes 50 runs on `macos-latest`.
+
+### TEST-35: Make the `switch_role` launcher test stable on macOS
+
+- **Evidence:** Reproduced twice: pull request 206 on 2026-11-12, and pull request 260 at `9d8b9cc` on
+  2026-11-16 (job `133322408476`, `launcher scripts (macos-latest)`):
+  `ShellLauncherTests.test_switch_role_master_flow_and_tracked_stop` failed with "AssertionError: 1 != 0"
+  on the launcher's return code. Reruns passed.
+- **Problem:** The launcher returned 1 once in a while; the test does not print why.
+- **Do:** Print the launcher's output on failure, then find the cause.
+- **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -3190,3 +3245,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,377), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.
 - 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
 - 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
+- 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
