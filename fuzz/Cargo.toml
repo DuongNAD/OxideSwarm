@@ -1,0 +1,42 @@
+[package]
+name = "rusty_grid_fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for the parsers of untrusted bytes (LV-1); not part of the workspace"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_grid_core = { path = "../crates/core", default-features = false }
+tokio = { version = "1.40", features = ["rt", "time", "io-util", "test-util"] }
+bytes = "1.10"
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "inbound_frame"
+path = "fuzz_targets/inbound_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_handshake"
+path = "fuzz_targets/server_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_manifest"
+path = "fuzz_targets/tree_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

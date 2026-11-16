@@ -151,7 +151,9 @@ Phase 12 adds twelve items (PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-
 the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with its pull request),
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
-(TEST-33 to TEST-35), it holds 150 items: 93 Implemented, 9 Partial and 48 Planned.
+(TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned. After the
+merges of 2026-11-17 (PROTO-3 and PROTO-4 Implemented, LV-1 Partial, PROTO-5 added) a recount of the table
+by script gives 150 items: 95 Implemented, 10 Partial and 45 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -296,7 +298,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | (design 0054) |
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | (design 0054) |
-| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Planned | (design 0058) |
+| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Partial | (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
@@ -2282,6 +2284,12 @@ none needs a design record of its own.
   A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
   design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
   the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
+- **Status:** Partial (2026-11-17, pull request 270). Built: `fuzz/` with the targets `inbound_frame`,
+  `server_handshake` (v2 and v3) and `tree_manifest`, seed corpora, `fuzz/regressions/`, `fuzz/README.md`
+  with the one-hour record (no finding; 24.5 million, 7.7 million and 34.6 million executions) and the
+  `fuzz` CI job on a pinned nightly. Every function the targets call is public, so no `fuzzing`
+  feature was needed. The local runs used a stable toolchain with `-s none`. Open: the `fuzz` job has
+  not run yet on GitHub (Done when: the three targets build and run in CI); Implemented once it is green.
 
 ### LV-5: Supply chain: dependency policy, release provenance, outside checklist
 
@@ -3271,3 +3279,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
 - 2026-11-17: PROTO-3 Implemented by draft pull request 272 ([design 0082](design/0082-task-extension-slot.md)): protocol 10, store format 4, the extension slot and the `ext:` worker tag; Q68 to Q72 decided by the owner. The pull request holds until PROTO-4 (design 0076 D1); PROTO-3d waits for PROTO-4.
 - 2026-11-17: PROTO-4 Implemented by draft pull request 274 ([design 0083](design/0083-one-version-window.md)): the one-version window (protocol 10 accepts 9), Q73 to Q79 decided by the owner; PROTO-3d built with it. The pull request merges together with PROTO-3 (pull request 272).
+- 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.

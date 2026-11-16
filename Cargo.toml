@@ -8,6 +8,8 @@ members = [
     "crates/android_bridge",
     "crates/agent_mesh",
 ]
+# cargo-fuzz crate (LV-1): own Cargo.lock, built with `cargo fuzz`, see fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.3.0"
