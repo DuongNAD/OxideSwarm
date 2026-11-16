@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Help and tool texts that described an older state: `worker --isolation` no longer says isolation is macOS only (macOS, Linux and Windows are supported; `crates/cli/src/cli_app.rs`), and the MCP `doctor` tool names checks C1 to C8 (`crates/cli/src/mcp.rs`). Documentation statuses were corrected in the same change (`DOC-9`, `docs/BACKLOG.md`).
 - Android bridge non-blocking stop, start race guard, poison-tolerant locking, and `aarch64-linux-android` CI target check (`AND-5`, [design 0073](docs/design/0073-android-bridge-nonblocking-stop.md)): `stop_worker_impl` now signals shutdown, sets status `STOPPING`, and joins the worker thread on a background thread before setting `STOPPED` so `nativeStopWorker` does not block the Android UI thread; `start_worker_impl` claims `running` atomically with `compare_exchange` and refuses starts while a previous worker is still draining; mutex accesses in `crates/android_bridge/src/lib.rs` use `unwrap_or_else(|e| e.into_inner())`; and `.github/workflows/ci.yml` runs `cargo check -p rusty_grid_android_bridge --target aarch64-linux-android --locked` on `ubuntu-latest`.
 
+### Security
+- Workers now open each collected task output without following symbolic links (`O_NOFOLLOW | O_NONBLOCK` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows), check `fstat` metadata and `--output-limit-mb` on that descriptor, hash and copy from the same descriptor, and verify `dev`/`ino` (or Windows file index) after moving a single-link output into the blob cache so a symlink swapped in after the sandbox walk can never be read or cached (`SEC-13`, [design 0072](docs/design/0072-collect-outputs-without-following-links.md)).
+
 ## [0.2.0] - 2026-11-15
 
 A minor feature release introducing protocol version 8, invite-based machine enrollment (`ENROLL-1b`),
