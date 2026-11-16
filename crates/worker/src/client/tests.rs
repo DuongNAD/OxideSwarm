@@ -3051,10 +3051,13 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
             "MARKER_PATH".into(),
             marker_path.to_string_lossy().to_string(),
         );
+        // `.\drain.cmd`, not the bare name: with `NoDefaultCurrentDirectoryInExePath=1` in the
+        // worker's environment (set by hardened shells and by Claude Code) `cmd.exe` does not
+        // search the current directory for a bare command name, so `drain.cmd` would never run.
         let mut t = Task::new(
             rusty_grid_core::task::TaskSpec::Command {
                 program: "cmd.exe".into(),
-                args: vec!["/C".into(), "drain.cmd".into()],
+                args: vec!["/C".into(), r".\drain.cmd".into()],
                 env,
                 working_dir: None,
                 stdin: None,
