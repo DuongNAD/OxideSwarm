@@ -186,3 +186,4 @@ Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](..
   from `git log -G 'pub const PROTOCOL_VERSION_CURRENT: u32 = [0-9]+'` on
   `crates/core/src/protocol.rs`, and the release versions from the same file at each tag.
 - 2026-11-16: Q64, Q65 and Q66 take the recommended defaults (owner's go-ahead in chat on 2026-11-16 to build 0076 for 0.4.0): 48 hours and never across two wire changes; build the extension slot at the next wire change; the one-version window starts after D3. PROTO-1 to PROTO-4 are in Phase 12 of the backlog, and PROTO-1 is Implemented by the pull request that plans 0.4.0.
+- 2026-11-17: The design record for PROTO-3 (D3) is [0082](0082-task-extension-slot.md), Draft. It fixes the types, bounds, the placement rule and the v9 rule for PROTO-4, and asks Q68 to Q72.
