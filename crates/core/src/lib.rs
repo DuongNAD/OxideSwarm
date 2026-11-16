@@ -56,10 +56,22 @@ mod tests {
 
     fn parse_type_decl(line: &str) -> Option<&str> {
         let mut tokens = line.split_whitespace().peekable();
-        if matches!(tokens.peek(), Some(&"pub")) {
-            tokens.next();
-            if tokens.peek().is_some_and(|t| t.starts_with('(')) {
+        if let Some(&vis) = tokens.peek() {
+            if vis == "pub" {
                 tokens.next();
+                if tokens.peek().is_some_and(|t| t.starts_with('(')) {
+                    for tok in tokens.by_ref() {
+                        if tok.ends_with(')') {
+                            break;
+                        }
+                    }
+                }
+            } else if vis.starts_with("pub(") {
+                for tok in tokens.by_ref() {
+                    if tok.ends_with(')') {
+                        break;
+                    }
+                }
             }
         }
         let kw = tokens.next()?;
@@ -132,25 +144,43 @@ mod tests {
         violations
     }
 
+    fn collect_non_test_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read rust source dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_non_test_rs_files(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "tests.rs" || (name.ends_with("_tests.rs") && name != "wire_layout_tests.rs")
+            {
+                continue;
+            }
+            out.push(path);
+        }
+    }
+
     #[test]
     fn skip_serializing_if_is_kept_off_bincode_types() {
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut violations = Vec::new();
-        let mut checked_files = 0usize;
+        let mut files = Vec::new();
+        collect_non_test_rs_files(&src_dir, &mut files);
+        files.sort();
+        let checked_files = files.len();
 
-        for entry in std::fs::read_dir(&src_dir).expect("read crates/core/src") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            checked_files += 1;
+        for path in &files {
             let label = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("<unknown>");
-            let content = std::fs::read_to_string(&path).expect("read rust source file");
-            violations.extend(find_disallowed_skip_serializing_if(label, &content));
+                .strip_prefix(&src_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = std::fs::read_to_string(path).expect("read rust source file");
+            violations.extend(find_disallowed_skip_serializing_if(&label, &content));
         }
 
         assert!(checked_files > 0, "expected to scan crates/core/src/*.rs");
@@ -179,6 +209,19 @@ mod tests {
         );
         assert_eq!(after_cfg_test_fn_and_tuple_struct.len(), 1);
         assert!(after_cfg_test_fn_and_tuple_struct[0].contains("BinaryWorkerMessage"));
+
+        let pub_super_bincode = find_disallowed_skip_serializing_if(
+            "protocol/worker_master_mirrors.rs",
+            "pub(super) enum BinaryWorkerMessage {\n    Register {\n        #[serde(skip_serializing_if = \"Uuid::is_nil\")]\n        worker_id: Uuid,\n    },\n}\n",
+        );
+        assert_eq!(pub_super_bincode.len(), 1);
+        assert!(pub_super_bincode[0].contains("BinaryWorkerMessage"));
+
+        let pub_super_human = find_disallowed_skip_serializing_if(
+            "protocol/client_msg_mirrors.rs",
+            "pub(super) enum HumanClientMessage {\n    Submit {\n        #[serde(skip_serializing_if = \"Option::is_none\")]\n        note: Option<String>,\n    },\n}\n",
+        );
+        assert!(pub_super_human.is_empty());
     }
 
     #[test]
