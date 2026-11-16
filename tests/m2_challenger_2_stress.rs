@@ -341,7 +341,6 @@ async fn test_atomic_port_file_publication_concurrent_client_reads() {
         let count = Arc::clone(&read_success_count);
 
         let handle = tokio::spawn(async move {
-            let mut reads = 0;
             while active.load(Ordering::Relaxed) {
                 if let Ok(contents) = tokio::fs::read_to_string(&p_file).await {
                     let trimmed = contents.trim();
@@ -354,11 +353,10 @@ async fn test_atomic_port_file_publication_concurrent_client_reads() {
                         .parse()
                         .expect("Port file must parse to valid u16 integer");
                     assert!(port > 0, "Reader {reader_id} observed invalid port {port}");
-                    reads += 1;
+                    count.fetch_add(1, Ordering::SeqCst);
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            count.fetch_add(reads, Ordering::SeqCst);
         });
         reader_handles.push(handle);
     }
@@ -372,8 +370,18 @@ async fn test_atomic_port_file_publication_concurrent_client_reads() {
 
     let master_handle = tokio::spawn(async move { master.run(master_shutdown_rx).await });
 
-    // Allow readers to hammer the published file for 100ms
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Let the readers hammer the published file until they have made a fixed number of
+    // successful reads. The condition is a count, not a wall-clock window, so a starved CPU only
+    // makes the wait longer (TEST-37); the generous deadline only guards against a hang.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while read_success_count.load(Ordering::SeqCst) < 50 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "readers made only {} successful reads in 60 s",
+            read_success_count.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     readers_active.store(false, Ordering::Relaxed);
 
     for h in reader_handles {

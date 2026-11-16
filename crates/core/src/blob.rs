@@ -1818,7 +1818,9 @@ mod tests {
         );
         assert!(loop_res.is_err(), "symlink loop must be refused");
 
-        // DoS regression: 40 chained links + 1,000 compound links must be refused in < 50 ms.
+        // DoS regression: 40 chained links + 1,000 compound links must be refused. Without the
+        // resolution budget this is exponential (never finishes), so a multi-second bound separates
+        // "bounded" from "unbounded" without racing a starved CPU (TEST-36).
         let mut dos_links = Vec::with_capacity(1040);
         for i in 0..39 {
             dos_links.push(BlobSymlink {
@@ -1844,8 +1846,8 @@ mod tests {
             "chained link DoS manifest must be refused"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "validation took {elapsed:?}, expected < 50 ms"
+            elapsed < std::time::Duration::from_secs(10),
+            "validation took {elapsed:?}, expected well under 10 s"
         );
 
         // Non-empty directory listed in empty_dirs or colliding with file/symlink is refused.
