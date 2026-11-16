@@ -1,7 +1,7 @@
 # 0033: OS-level task isolation
 
 Status: Implemented
-Created: 2026-11-08    Updated: 2026-11-15
+Created: 2026-11-08    Updated: 2026-11-16
 
 ## Summary
 
@@ -311,3 +311,4 @@ On Windows (`mod windows` in `test_feat3_os_isolation.rs`) the tests add: the ne
 - 2026-11-10: `USB-2` and `BUG-18` implemented ([design 0055](0055-usb-kit-windows-isolation.md)): `acl_grant_manifest_path` honours `OXIDESWARM_HOME` (`RUSTY_GRID_ACL_GRANT_LOG > <OXIDESWARM_HOME>/windows_acl_grants.txt > <user_home>/.oxideswarm/windows_acl_grants.txt`), and under `--isolation fs|fs+net` on Windows `TaskRunner` resolves bare command names against `%SystemRoot%\System32` and `Git\cmd` / `Git\bin` before MSYS2 `Git\usr\bin` so `whoami` does not fail with `0xC0000142` (`STATUS_DLL_INIT_FAILURE`).
 - 2026-11-11: Security gained the risk that macOS marks `sandbox-exec` as deprecated (checked with `man sandbox-exec` on macOS 27.2). No code changed.
 - 2026-11-15: Status set to Implemented: `FEAT-3a`, `FEAT-3b`, `FEAT-3c` and `FEAT-3d` are merged (pull requests 133, 150, 152, 183). `SEC-12` in `docs/BACKLOG.md` tracks the `(allow default)` macOS profile (DOC-9).
+- 2026-11-16: Added opt-in read-only external runtime directory allowlisting (`--isolation-read-dir` / `--allow-read-dir`, `RUSTY_GRID_ISOLATION_READ_DIRS`, `[worker].isolation_read_dirs`, `HostDirs::extra_read_only_dirs`) across macOS Seatbelt, Linux Landlock, and Windows AppContainer with validation against broad home folders, secret/key/state directories, sandboxes, workspaces, and symlinks/junctions ([design 0074](0074-external-runtime-allowlist-and-gpu-workloads.md)).

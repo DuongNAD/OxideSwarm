@@ -230,6 +230,9 @@ pub struct WorkerConfig {
     /// How strongly task processes are confined (CLI `--isolation`, default `off`; design 0033).
     /// A level this host cannot enforce makes [`WorkerClient::run`] fail at start-up.
     pub isolation: IsolationLevel,
+    /// Additional read-only directories accessible to isolated tasks (`--isolation-read-dir`,
+    /// `RUSTY_GRID_ISOLATION_READ_DIRS`, `[worker].isolation_read_dirs`; design 0074).
+    pub isolation_read_dirs: Vec<PathBuf>,
     /// Files a confined task must not read even though they are outside the denied home: the
     /// cluster secret file and the config file in use (CLI, with `--isolation`).
     pub protected_files: Vec<std::path::PathBuf>,
@@ -359,6 +362,7 @@ impl WorkerConfig {
             max_concurrency: None,
             process_priority: None,
             isolation: IsolationLevel::Off,
+            isolation_read_dirs: Vec::new(),
             protected_files: Vec::new(),
             default_heartbeat_interval: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(5),
@@ -539,6 +543,11 @@ impl WorkerConfig {
 
     pub fn with_isolation(mut self, level: IsolationLevel) -> Self {
         self.isolation = level;
+        self
+    }
+
+    pub fn with_isolation_read_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.isolation_read_dirs = dirs;
         self
     }
 
@@ -1026,8 +1035,11 @@ impl WorkerClient {
         if let Some(priority) = config.process_priority {
             runner_cfg = runner_cfg.with_process_priority(priority);
         }
+        let host_dirs = crate::isolation::HostDirs::detect()
+            .with_extra_read_only_dirs(config.isolation_read_dirs.clone());
         runner_cfg = runner_cfg
             .with_isolation(config.isolation)
+            .with_host_dirs(host_dirs)
             .with_protected_files(config.protected_files.clone())
             .with_workspaces(config.workspaces)
             .with_workspace_root(config.workspace_root.clone())
@@ -1315,6 +1327,19 @@ impl WorkerClient {
         &self.runner
     }
 
+    /// Validates any `--isolation-read-dir` paths against the worker's host, sandbox, workspace,
+    /// and protected secret files (`design 0074`).
+    pub fn validate_isolation_config(&self) -> GridResult<()> {
+        crate::isolation::validate_extra_read_only_dirs(
+            &self.runner.config().host_dirs.extra_read_only_dirs,
+            &self.runner.config().host_dirs,
+            Some(&self.runner.config().sandbox_config.base_dir),
+            self.config.workspace_root.as_deref(),
+            &self.runner.config().protected_files,
+        )
+        .map_err(GridError::Config)
+    }
+
     /// Returns a reference to the active task table.
     pub fn active_task_table(&self) -> &ActiveTaskTable {
         &self.active_task_table
@@ -1433,6 +1458,9 @@ impl WorkerClient {
                 return Err(err);
             }
         }
+
+        // Validate explicit --isolation-read-dir allowlist paths before probing or accepting tasks.
+        self.validate_isolation_config()?;
 
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.

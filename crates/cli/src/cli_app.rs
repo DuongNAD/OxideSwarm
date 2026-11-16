@@ -454,6 +454,14 @@ pub struct WorkerArgs {
     )]
     pub isolation: Option<String>,
 
+    #[arg(
+        long = "isolation-read-dir",
+        alias = "allow-read-dir",
+        value_name = "DIR",
+        help = "Additional read-only directory accessible to isolated tasks (repeatable; e.g. a Python, CUDA, or Blender runtime); refuses broad roots, secrets, and symlinks; env RUSTY_GRID_ISOLATION_READ_DIRS, config [worker].isolation_read_dirs"
+    )]
+    pub isolation_read_dirs: Vec<PathBuf>,
+
     #[arg(long, alias = "cpu-cores", help = "Override advertised CPU core count")]
     pub cores: Option<usize>,
 
@@ -2594,6 +2602,22 @@ async fn run_worker(
             return ExitCode::FAILURE;
         }
     };
+    let isolation_read_dirs = resolve_isolation_read_dirs(
+        &args.isolation_read_dirs,
+        std::env::var_os(rusty_grid_worker::ISOLATION_READ_DIRS_ENV).as_deref(),
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.isolation_read_dirs.as_deref()),
+    );
+    if isolation == IsolationLevel::Off && !isolation_read_dirs.is_empty() {
+        eprintln!(
+            "Warning: --isolation-read-dir is configured while --isolation is off; extra read directories apply only when --isolation fs or fs+net is active"
+        );
+        tracing::warn!(
+            count = isolation_read_dirs.len(),
+            "--isolation-read-dir has no effect while --isolation is off"
+        );
+    }
     // A task can read the environment and argv of this user's other processes on macOS, so a
     // secret passed that way would defeat the isolation it is meant to enforce.
     if isolation != IsolationLevel::Off {
@@ -2703,7 +2727,9 @@ async fn run_worker(
     if let Some(priority) = task_priority {
         config = config.with_process_priority(priority);
     }
-    config = config.with_isolation(isolation);
+    config = config
+        .with_isolation(isolation)
+        .with_isolation_read_dirs(isolation_read_dirs);
     if isolation != IsolationLevel::Off {
         config = config.with_protected_files(crate::secret_cmd::secret_files_to_protect(
             &secret_opts,
@@ -2788,6 +2814,10 @@ async fn run_worker(
     config = config.with_wire_codec(wire_codec);
 
     let mut client = WorkerClient::new(config);
+    if let Err(e) = client.validate_isolation_config() {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
     println!(
         "RustyGrid Worker {} initializing [Name: {}, Cores: {}, RAM: {}MB, GPU: {}, Simulated: {}]",
         client.worker_id(),
@@ -3608,6 +3638,47 @@ fn resolve_isolation(
         Some(text) => text.parse(),
         None => Ok(IsolationLevel::Off),
     }
+}
+
+/// `--isolation-read-dir` > `RUSTY_GRID_ISOLATION_READ_DIRS` (`split_paths`) > `[worker].isolation_read_dirs`.
+fn resolve_isolation_read_dirs(
+    cli_dirs: &[PathBuf],
+    env_val: Option<&std::ffi::OsStr>,
+    cfg_dirs: Option<&[String]>,
+) -> Vec<PathBuf> {
+    fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+
+    let mut out = Vec::new();
+    if !cli_dirs.is_empty() {
+        for dir in cli_dirs {
+            push_unique(&mut out, dir.clone());
+        }
+        return out;
+    }
+    if let Some(raw_env) = env_val.filter(|v| !v.is_empty()) {
+        for dir in std::env::split_paths(raw_env) {
+            let trimmed = dir.to_string_lossy();
+            if !dir.as_os_str().is_empty() && !trimmed.trim().is_empty() {
+                push_unique(&mut out, dir);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Some(cfg) = cfg_dirs {
+        for raw in cfg {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                push_unique(&mut out, PathBuf::from(trimmed));
+            }
+        }
+    }
+    out
 }
 
 /// The placement constraints of `submit --os / --arch / --worker / --require-isolation / --require-tag / --require-tool`, checked and
@@ -8643,5 +8714,56 @@ max_workspaces = 4
             &[w_4g, w_unknown, w_disconnected],
             6144
         ));
+    }
+
+    #[test]
+    fn test_worker_isolation_read_dir_flags_and_precedence() {
+        let cli_dirs = match parse(&[
+            "worker",
+            "--isolation-read-dir",
+            "/opt/cuda",
+            "--allow-read-dir",
+            "/opt/python311",
+            "--isolation-read-dir",
+            "/opt/cuda",
+        ])
+        .command
+        {
+            Commands::Worker(a) => a.isolation_read_dirs,
+            other => panic!("expected Worker, got {other:?}"),
+        };
+        assert_eq!(
+            cli_dirs,
+            vec![
+                PathBuf::from("/opt/cuda"),
+                PathBuf::from("/opt/python311"),
+                PathBuf::from("/opt/cuda"),
+            ]
+        );
+
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let env_raw = std::ffi::OsString::from(format!("/env/one{sep} {sep}/env/two{sep}/env/one"));
+        let cfg = vec![
+            "/cfg/one".to_string(),
+            "  ".to_string(),
+            "/cfg/two".to_string(),
+        ];
+
+        assert_eq!(
+            resolve_isolation_read_dirs(&cli_dirs, Some(env_raw.as_os_str()), Some(&cfg)),
+            vec![PathBuf::from("/opt/cuda"), PathBuf::from("/opt/python311")],
+            "CLI --isolation-read-dir must override env and config"
+        );
+        assert_eq!(
+            resolve_isolation_read_dirs(&[], Some(env_raw.as_os_str()), Some(&cfg)),
+            vec![PathBuf::from("/env/one"), PathBuf::from("/env/two")],
+            "RUSTY_GRID_ISOLATION_READ_DIRS must override config"
+        );
+        assert_eq!(
+            resolve_isolation_read_dirs(&[], Some(std::ffi::OsStr::new("")), Some(&cfg)),
+            vec![PathBuf::from("/cfg/one"), PathBuf::from("/cfg/two")],
+            "empty env falls back to [worker].isolation_read_dirs"
+        );
+        assert!(resolve_isolation_read_dirs(&[], None, None).is_empty());
     }
 }
