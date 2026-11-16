@@ -1,6 +1,6 @@
 # 0082: An extension slot for optional task fields
 
-Status: Implemented (PROTO-3 of design 0076 D3; draft pull request PRNUM, which merges together with PROTO-4)
+Status: Implemented (PROTO-3 of design 0076 D3; draft pull request 272, which merges together with PROTO-4)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -188,7 +188,7 @@ The three first items fit one pull request (L, as in the backlog). They land at 
   `vram_mb` stay typed (Q68); workers advertise `ext:<id>` tags, a tenth reserved prefix (Q69); two
   lists (Q70); limits 16 per list, 64 KiB per extension, 256 KiB per task (Q71); the registry fixes
   `critical` per id (Q72).
-- 2026-11-17: Built by draft pull request PRNUM (PROTO-3a, PROTO-3b, PROTO-3c): protocol 10, store
+- 2026-11-17: Built by draft pull request 272 (PROTO-3a, PROTO-3b, PROTO-3c): protocol 10, store
   format 4, `Extension` and the empty registry, the frozen v9 `SubmitTask` decoder, the `ext:` tag,
   the scheduler check and the worker refusal. The pull request is a wire change and holds until
   PROTO-4 (design 0076 D1). PROTO-3d (test 10, the cross-version tests with a v9 peer) waits for

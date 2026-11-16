@@ -302,7 +302,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
-| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented | (pull request PRNUM), (design 0082) |
+| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
@@ -2745,7 +2745,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `crates/core/src/task.rs` and `crates/core/src/protocol.rs`.
 - **Done when:** An optional field can be added with no change to
   `PROTOCOL_VERSION_MIN_COMPATIBLE`.
-- **Status:** Implemented by pull request PRNUM (draft: it merges together with PROTO-4, one-version
+- **Status:** Implemented by pull request 272 (draft: it merges together with PROTO-4, one-version
   window, by the release-train rule of design 0076 D1). Protocol 10, store format 4,
   `Extension` and the empty registry in `crates/core/src/task.rs`, the `ext:` worker tag and the
   scheduler check, and the frozen v9 `SubmitTask` decoder. Q68 to Q72 decided by the owner on
@@ -3256,4 +3256,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
 - 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
-- 2026-11-17: PROTO-3 Implemented by draft pull request PRNUM ([design 0082](design/0082-task-extension-slot.md)): protocol 10, store format 4, the extension slot and the `ext:` worker tag; Q68 to Q72 decided by the owner. The pull request holds until PROTO-4 (design 0076 D1); PROTO-3d waits for PROTO-4.
+- 2026-11-17: PROTO-3 Implemented by draft pull request 272 ([design 0082](design/0082-task-extension-slot.md)): protocol 10, store format 4, the extension slot and the `ext:` worker tag; Q68 to Q72 decided by the owner. The pull request holds until PROTO-4 (design 0076 D1); PROTO-3d waits for PROTO-4.
