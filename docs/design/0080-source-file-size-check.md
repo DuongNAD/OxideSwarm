@@ -34,7 +34,7 @@ Created: 2026-11-16    Updated: 2026-11-16
 
 | File | Maximum |
 |---|---|
-| `crates/worker/src/isolation.rs` | 5,343 |
+| `crates/worker/src/isolation.rs` | 5,377 (5,343 at `03ace60`, grown by SEC-12) |
 | `crates/cli/src/mcp.rs` | 3,692 |
 | `crates/cli/src/mode_cli.rs` | 3,242 (3,239 plus the `size` dispatch and lint hook) |
 
@@ -50,6 +50,10 @@ Created: 2026-11-16    Updated: 2026-11-16
 - `ox-mode test lint` appends the same result as part 3 and fails when it fails. The size check needs no build of the workspace, so it is fast.
 - CI: one step in the Linux leg of the `clippy` job, `cargo run --locked -p rusty_grid_cli --bin ox-mode -- test size`. No job is added and no required check name changes.
 - A unit test (`size_check::tests::workspace_allowlist_holds_for_this_checkout`) runs the check against the checkout, so `cargo test --workspace --lib` also catches a violation.
+
+### D5 Known limit
+
+The production part ends at the first `#[cfg(test)]` line anywhere in the file, so a `#[cfg(test)]` attribute on an item or statement inside production code cuts the count early (for example `#[cfg(test)] let ...` lines in a function make the file measure shorter than it is). A later change can count up to the first `#[cfg(test)]` that is followed by `mod`.
 
 ## Security
 
@@ -72,4 +76,4 @@ No change to the grid, the wire format or any existing `ox-mode` action. `ox-mod
 
 ## Status log
 
-- 2026-11-16: Implemented. Allowlist: `isolation.rs` 5,343, `mcp.rs` 3,692, `mode_cli.rs` 3,242.
+- 2026-11-16: Implemented. Allowlist: `isolation.rs` 5,377, `mcp.rs` 3,692, `mode_cli.rs` 3,242.

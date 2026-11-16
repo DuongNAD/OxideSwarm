@@ -11,6 +11,9 @@
     Unique identifier for this node (default: node-windows-<hostname>)
 .PARAMETER BinaryPath
     Explicit path to executable. If omitted, searches target directories.
+.PARAMETER NoShell
+    Disable arbitrary shell_exec execution on this node (passes --no-shell). Also enabled by
+    setting the environment variable OXIDE_MESH_NO_SHELL=1, like the .cmd and macOS launchers.
 #>
 param(
     [Parameter(Mandatory=$false)]
@@ -20,10 +23,19 @@ param(
     [string]$NodeId = ("node-windows-" + $env:COMPUTERNAME.ToLower()),
 
     [Parameter(Mandatory=$false)]
-    [string]$BinaryPath = ""
+    [string]$BinaryPath = "",
+
+    [Parameter(Mandatory=$false)]
+    [switch]$NoShell
 )
 
 $ErrorActionPreference = "Continue"
+
+# --no-shell: from -NoShell or OXIDE_MESH_NO_SHELL=1 (same variable as the .cmd and macOS launchers).
+$NoShellArgs = @()
+if ($NoShell -or $env:OXIDE_MESH_NO_SHELL -eq "1") {
+    $NoShellArgs = @("--no-shell")
+}
 
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host "   OxideSwarm Windows Agent Node Runner                " -ForegroundColor Cyan
@@ -31,6 +43,9 @@ Write-Host "========================================================" -Foregroun
 Write-Host "Node ID:  $NodeId" -ForegroundColor Yellow
 Write-Host "Hub URL:  $Hub" -ForegroundColor Yellow
 Write-Host "Platform: Windows ($([System.Environment]::OSVersion.VersionString))" -ForegroundColor Gray
+if ($NoShellArgs.Count -gt 0) {
+    Write-Host "Shell:    disabled (--no-shell active)" -ForegroundColor Gray
+}
 if (-not $env:OXIDE_MESH_TOKEN) {
     Write-Host "[INFO] OXIDE_MESH_TOKEN is not set: a hub bound beyond localhost will reject this node (`$env:OXIDE_MESH_TOKEN = '<hub token>')." -ForegroundColor Yellow
 }
@@ -57,9 +72,9 @@ if (-not $BinaryPath) {
 # 2. Execution Loop with Auto-Restart
 while ($true) {
     if ($BinaryPath -and (Test-Path $BinaryPath)) {
-        Write-Host "[INFO] Starting native agent: $BinaryPath node --hub $Hub --id $NodeId --platform windows" -ForegroundColor Green
+        Write-Host "[INFO] Starting native agent: $BinaryPath node --hub $Hub --id $NodeId --platform windows $NoShellArgs" -ForegroundColor Green
         try {
-            & $BinaryPath node --hub $Hub --id $NodeId --platform windows
+            & $BinaryPath node --hub $Hub --id $NodeId --platform windows @NoShellArgs
         } catch {
             Write-Warning "Agent process exited: $_"
         }
@@ -72,7 +87,7 @@ while ($true) {
 
         Write-Host "[INFO] Native binary not found. Launching Python agent node fallback ($ScriptPath)..." -ForegroundColor Green
         try {
-            python $ScriptPath --hub $Hub --id $NodeId --platform windows
+            python $ScriptPath --hub $Hub --id $NodeId --platform windows @NoShellArgs
         } catch {
             Write-Warning "Python agent terminated: $_"
         }
