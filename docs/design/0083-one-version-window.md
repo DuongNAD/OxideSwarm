@@ -1,6 +1,6 @@
 # 0083: A one-version compatibility window
 
-Status: Implemented by draft pull request PRNUM (PROTO-4 of design 0076 D4; based on draft pull request 272, design 0082)
+Status: Implemented by draft pull request 274 (PROTO-4 of design 0076 D4; based on draft pull request 272, design 0082)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -424,7 +424,7 @@ the owner's machines install (design 0076 Q66).
   is the oracle and the stamp is dropped from the recorded bytes (Q76); workers and clients accept
   only an echo of their own version (Q77); the master-added `proto:<n>` tag, the eleventh reserved
   prefix, and a once-per-session warning (Q78); v9 JSON and bincode peers are both kept (Q79).
-- 2026-11-17: Built by draft pull request PRNUM (PROTO-4a to PROTO-4d and PROTO-3d of design 0082).
+- 2026-11-17: Built by draft pull request 274 (PROTO-4a to PROTO-4d and PROTO-3d of design 0082).
   `PROTOCOL_VERSION_MIN_COMPATIBLE` is 9 at `PROTOCOL_VERSION_CURRENT` 10. The pull request is not a
   wire change by itself (no new message or field) and merges with pull request 272 (design 0076 D1).
   Deviations from this record, where the code forced or allowed a different shape (the line numbers
