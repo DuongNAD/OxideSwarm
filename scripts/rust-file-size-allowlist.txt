@@ -1,0 +1,15 @@
+# Rust source files whose production part may exceed 3,000 lines (design 0080, MAINT-1).
+#
+# Format: <path relative to the repository root> <maximum production lines>, one per line.
+# The production part is every line before the file's first `#[cfg(test)]` (the whole file when
+# there is none). Test-only files (under tests/, tests.rs, *_tests.rs) are not measured.
+#
+# Rules enforced by `ox-mode test size` (part of `ox-mode test lint`, run in CI):
+#   - a file not listed here fails when its production part exceeds 3,000 lines;
+#   - a listed file fails when its production part exceeds its maximum: the list may only shrink;
+#   - a listed file that shrank only gets a warning: lower its maximum, or delete the entry
+#     once the file is at or below 3,000 lines. Never raise a number or add an entry.
+
+crates/worker/src/isolation.rs 5377
+crates/cli/src/mcp.rs 3692
+crates/cli/src/mode_cli.rs 3242

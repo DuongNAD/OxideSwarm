@@ -19,6 +19,7 @@ Features:
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 
 try:
@@ -213,6 +215,29 @@ def collect_telemetry(platform_tag: str) -> dict:
     }
 
 
+def token_sent_in_clear_to_remote_host(hub_url: str, has_token: bool) -> bool:
+    """True when a node holding a hub token would send it over ws:// to a host not on loopback.
+
+    The token is never part of the check or of any message (SEC-15, design 0079).
+    """
+    if not has_token:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit((hub_url or "").strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    if scheme != "ws":
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
 class OxideAgentNode:
     def __init__(
         self,
@@ -245,6 +270,11 @@ class OxideAgentNode:
     async def connect(self):
         """Establishes WebSocket connection and registers node."""
         logger.info(f"Connecting to OxideRelay Hub at {self.hub_url}...")
+        if token_sent_in_clear_to_remote_host(self.hub_url, bool(self.token)):
+            logger.warning(
+                "The hub token is sent over plain ws:// to a host that is not on loopback: "
+                "anyone on the path can read it. Use wss:// behind a TLS proxy, a VPN or an SSH tunnel."
+            )
         self.ws = await websockets.connect(
             self.hub_url,
             ping_interval=20,

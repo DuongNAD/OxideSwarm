@@ -165,11 +165,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
 | SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Implemented | 238 (design 0070) |
-| SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
-| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
+| SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Implemented | 256 (design 0078) |
+| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Implemented | 257 (design 0033) |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
-| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
+| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Implemented |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
@@ -245,7 +245,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242, 249, 250, 253 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Implemented | 211, 212, 230, 231, 242, 249, 250, 253, 259 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -1605,7 +1605,19 @@ Each item below needs a design record before code.
   At `03ace60` their tests live in files of their own, and the whole of each file is at most:
   `server.rs` 2,569 lines, `client.rs` 1,684, `cli_app.rs` 1,629, `queue.rs` 1,469, `runner.rs`
   1,336 and `protocol.rs` 864. The largest new non-test submodule is `queue/lifecycle.rs` with
-  1,536 lines. The CI size check of step 3 is not built, so the item stays Partial.
+  1,536 lines. The CI size check of step 3 is built (pull request 259, design 0080): `ox-mode test
+  size`, part of `ox-mode test lint` and a step of the Linux `clippy` job, fails when a Rust file's
+  production part exceeds 3,000 lines. Three other files were above the limit and are on the
+  allowlist at their current size: `crates/worker/src/isolation.rs` 5,377, `crates/cli/src/mcp.rs`
+  3,692 and `crates/cli/src/mode_cli.rs` 3,242. Every Done-when point holds, so the item is
+  Implemented.
+- **Implemented (2026-11-16, pull request 259, [design 0080](design/0080-source-file-size-check.md)):**
+  `crates/cli/src/size_check.rs` measures every `*.rs` file (test-only files excepted) and compares
+  it with `scripts/rust-file-size-allowlist.txt`: an unlisted file above 3,000 production lines or a
+  listed file above its maximum fails; a shrunk entry is a warning. `ox-mode test size` runs it,
+  `ox-mode test lint` includes it, and the Linux `clippy` job runs it on every pull request.
+  `crates/core/tests/data/wire_layout.txt` is unchanged. The allowlist can now only shrink; splitting
+  `isolation.rs`, `mcp.rs` and `mode_cli.rs` would empty it and is not part of this item.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -2446,6 +2458,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   and log the reason once. Keep `CreateProcessW` for a worker that is not elevated.
 - **Done when:** A Windows test that forces the LUA token to fail sees the task fail with a
   message naming the cause, and no task process starts.
+- **Implemented (2026-11-16, pull request 256, [design 0078](design/0078-no-elevated-token-fallback.md)):**
+  an elevated worker whose LUA token is missing, or whose `CreateProcessAsUserW` fails, fails the
+  spawn with the Win32 error and logs the reason once (`crates/worker/src/isolation.rs`). The
+  Windows tests `test_windows_elevated_worker_refuses_when_lua_token_is_missing` and
+  `test_windows_elevated_worker_refuses_when_create_process_as_user_fails` cover it.
 
 ### SEC-12: Test and narrow the macOS isolation profile
 
@@ -2463,6 +2480,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   3. Record the result and any remaining limit in design 0033 and `docs/SECURITY.md`.
 - **Done when:** The tests above pass on `macos-latest` in CI, and `cargo build` of a workspace
   still works under `--isolation fs` on macOS.
+- **Implemented (2026-11-16, pull request 257, [design 0033](design/0033-os-level-task-isolation.md)):**
+  the macOS profile denies `mach-lookup` and `job-creation`; the allowlist has one service,
+  `com.apple.MTLCompilerService` for Metal GPU tasks; `cargo`, `rustc`, `git`, `cc` and `ld` needed none. `launchctl submit` was already refused
+  (`deny(1) job-creation`). Tests for `launchctl submit`, `open -a`, `osascript` and a hard link
+  to a secret were added. The profile is still a denylist inside `(allow default)`.
 
 ### SEC-13: Collect outputs through the descriptor that was checked
 
@@ -2517,6 +2539,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
      loopback.
 - **Done when:** `tests/test_launcher_scripts.py` checks `-NoShell` in the `.ps1` launcher. The
   adb launcher's command line holds no token. A test shows the `ws://` warning.
+- **Implemented (2026-11-16, pull request 258, [design 0079](design/0079-agent-mesh-launchers-safe-by-default.md)):**
+  `run_agent_node.ps1` has `-NoShell` and honours `OXIDE_MESH_NO_SHELL=1`, `run_agent_node_adb.sh`
+  sends the token on standard input, and the Rust node and `scripts/agent_node.py` log a warning
+  for a token over `ws://` to a non-loopback host. Tests are in `tests/test_launcher_scripts.py`
+  and `client::tests::test_cleartext_token_warning_predicate`.
 
 ### AND-5: Stop the Android worker without blocking the calling thread, and build the bridge in CI
 
@@ -2990,3 +3017,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: AND-5 Implemented (pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)). MAINT-1 stays Partial after the splits of `queue.rs` and `server.rs` (pull requests 249 and 250): five of six files are split, `cli_app.rs` and the CI size check remain. The Index counts are now 85 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
+- 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,377), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.

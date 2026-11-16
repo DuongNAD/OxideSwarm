@@ -435,6 +435,7 @@ structured commands. Nodes execute only 5 advertised commands (`echo`, `ping`, `
 - **Dual runtime**: Rust binary `agent-mesh`, and a dependency-light Python client `scripts/agent_node.py`.
 - **Delivery tracking & integrity**: correlation ids, `DeliveryAck` / `DeliveryNack`, SHA-256 verification of data payloads.
 - **Authentication**: the hub listens on `127.0.0.1:8088` by default; a non-loopback `--listen` needs `--token` (or `OXIDE_MESH_TOKEN`), or `--insecure`. `ws://` is not encrypted, so use `wss://` behind a TLS proxy or a VPN / SSH tunnel, and **never expose the hub to the Internet**.
+- **Launchers**: every node launcher accepts `--no-shell` (PowerShell: `-NoShell`) or `OXIDE_MESH_NO_SHELL=1`. A node logs a warning, never the token, when it sends a token over `ws://` to a host that is not on loopback, and `run_agent_node_adb.sh` hands the token to the phone on standard input instead of the `adb shell` command line.
 
 ### Quickstart
 ```bash
@@ -936,7 +937,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | :--- | :--- | :--- |
 | `OXIDE_MESH_TOKEN` | Agent Mesh | Shared token authenticating `agent-mesh` nodes and HTTP API callers against `agent-mesh hub` (`--token`; stripped from child task environments) |
 | `OXIDE_MESH_TLS_CA` | Agent Mesh | Path to an additional trusted CA certificate (PEM or DER) for `wss://` hub connections behind a private TLS proxy (`--tls-ca`; proxy leaf certificate must have `CA:FALSE` and `subjectAltName`, signed by a `CA:TRUE` root) |
-| `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`) |
+| `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`; PowerShell launcher: `-NoShell`) |
 | `OXIDE_GRID_MASTER` | Agent Mesh | Bind address for the embedded Grid Master inside `agent-mesh hub` (`--grid-master`) |
 
 #### Tier G: Platform Packaging, Service Automation, Agent Hub & Launchers
@@ -967,7 +968,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 ./ox-mode
 
 # Code Quality & Testing Mode (Linting + Flaky test detection):
-./ox-mode test lint
+./ox-mode test lint     # clippy + rustfmt + the source file size check
+./ox-mode test size     # only the size check: a Rust file's production part may not exceed 3,000 lines (design 0080)
 ./ox-mode test flaky --iterations 5
 
 # Development Mode (Live-reload file watcher and local dev cluster):

@@ -51,6 +51,12 @@ adb shell "chmod +x $REMOTE_PATH"
 
 # 4. Launch on Android device
 echo "[INFO] Starting OxideSwarm Agent on Android device..."
-# The hub token (if any) is handed over as an environment variable of the remote command only;
-# it is briefly visible in the process list of this host and of the phone while the session runs.
-adb shell "${OXIDE_MESH_TOKEN:+OXIDE_MESH_TOKEN='$OXIDE_MESH_TOKEN' }$REMOTE_PATH node --hub '$HUB_URL' --id '$NODE_ID' --platform android"
+# The hub token (if any) goes through standard input, never through the command line: the remote
+# shell reads it into OXIDE_MESH_TOKEN and exports it to the agent, so `adb shell`'s arguments (and
+# the process list of this host and of the phone) hold no token. Nothing is written to the phone.
+REMOTE_CMD="$REMOTE_PATH node --hub '$HUB_URL' --id '$NODE_ID' --platform android"
+if [[ -n "${OXIDE_MESH_TOKEN:-}" ]]; then
+    printf '%s\n' "$OXIDE_MESH_TOKEN" | adb shell "IFS= read -r OXIDE_MESH_TOKEN; export OXIDE_MESH_TOKEN; exec $REMOTE_CMD"
+else
+    adb shell "$REMOTE_CMD"
+fi

@@ -86,7 +86,7 @@ impl WorkflowMode {
     /// List of standard actions available under this mode.
     pub fn available_actions(&self) -> &'static [&'static str] {
         match self {
-            Self::Test => &["quick", "full", "lint", "flaky"],
+            Self::Test => &["quick", "full", "lint", "size", "flaky"],
             Self::Dev => &["fast", "watch", "cluster", "status", "stop"],
             Self::Doc => &["build", "verify", "export", "update"],
             Self::Research => &["profile", "bench", "distributed", "report"],
@@ -179,6 +179,12 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                         id: "lint".to_string(),
                         name: "Lints & Format Check".to_string(),
                         description: "Run clippy and rustfmt checks across workspace".to_string(),
+                        dangerous: false,
+                    },
+                    ModeActionDescriptor {
+                        id: "size".to_string(),
+                        name: "Source File Size Check".to_string(),
+                        description: "Fail when a Rust file's production part exceeds 3,000 lines (allowlisted files may only shrink)".to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {

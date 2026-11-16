@@ -1026,6 +1026,25 @@ mod macos {
         "/dev/tty",
     ];
 
+    /// Mach services a confined task may look up; every other lookup is denied (SEC-12).
+    ///
+    /// Found empirically (denials read from the unified log, `log show --predicate
+    /// 'eventMessage CONTAINS "mach-lookup"'`) by running the macOS isolation tests, a
+    /// `cargo build --offline` with and without a cached dependency, `cc` compile and link,
+    /// `git init/add/commit/log`, `curl` over TLS and a DNS lookup with all lookups denied:
+    /// `cargo`, `rustc`, `git`, `cc` and `ld` need no service. What stops working: user and
+    /// group names (`id -un` prints the uid: `com.apple.system.opendirectoryd.libinfo`),
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)` (`com.apple.bsd.dirhelper`) and `os_log`
+    /// (`com.apple.logd`), none of which a build needs (`TMPDIR` points into the sandbox).
+    /// Add a name only with the reason, the test that needs it, and what the service could do
+    /// for a task.
+    const MACH_SERVICES: &[&str] = &[
+        // Metal shader compilation for GPU tasks (design 0074, `gemm_bench` under `fs`): with
+        // the lookup denied wgpu fails with "Parent device is lost". The service compiles
+        // shaders for the calling process and cannot start arbitrary programs.
+        "com.apple.MTLCompilerService",
+    ];
+
     /// The Seatbelt profile text. All paths arrive as `-D` parameters (`SANDBOX_DIR`,
     /// `EXTRA_WRITABLE_DIR`, `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`,
     /// `CARGO_HOME`, `CARGO_CRED`, `CARGO_CRED_TOML`, `EXTRA_READ_<n>` for `extra_read` entries,
@@ -1101,7 +1120,22 @@ mod macos {
         p.push_str("(deny user-preference-read user-preference-write)\n(allow user-preference-read (preference-domain \"kCFPreferencesAnyApplication\"))\n");
         // - Unix sockets of the desktop session (ssh-agent, gpg-agent, docker); DNS stays.
         p.push_str("(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
-        // - The clipboard.
+        // - Mach/XPC services (SEC-12): every lookup is denied, so a task cannot ask launchd or
+        //   another XPC service to start a process outside the sandbox. `MACH_SERVICES` lists
+        //   the exceptions.
+        p.push_str("(deny mach-lookup)\n");
+        if !MACH_SERVICES.is_empty() {
+            p.push_str("(allow mach-lookup\n");
+            for name in MACH_SERVICES {
+                p.push_str(&format!("    (global-name \"{name}\")\n"));
+            }
+            p.push_str(")\n");
+        }
+        // - Creating launchd jobs (`launchctl submit`, `SMJobSubmit`). Seatbelt already refuses
+        //   it under `(allow default)` (the log shows `deny(1) job-creation`); named so that the
+        //   refusal does not depend on that default.
+        p.push_str("(deny job-creation)\n");
+        // - The clipboard (stays denied even if an allowed prefix ever covered it).
         p.push_str("(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))\n");
         // - Keystroke injection into the controlling terminal (TIOCSTI).
         p.push_str("(deny file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n");
@@ -1403,6 +1437,57 @@ mod macos {
         let _ = std::fs::remove_dir_all(&probe_dir);
         outcome
     }
+}
+
+/// How an AppContainer child starts on Windows (SEC-11, design 0078).
+///
+/// An elevated worker starts the child from a restricted (LUA) token through
+/// `CreateProcessAsUserW`. It never falls back to `CreateProcessW`, because that call derives the
+/// child token from the worker's own elevated token. A worker that is not elevated has no LUA
+/// token and uses `CreateProcessW`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenSpawnPlan {
+    /// Try `CreateProcessAsUserW` with the LUA token.
+    Lua,
+    /// Use `CreateProcessW` (the worker is not elevated).
+    Plain,
+    /// The worker is elevated and has no LUA token: refuse.
+    RefuseNoLuaToken,
+}
+
+/// Picks the spawn plan from whether the worker is elevated and whether a LUA token exists.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn plan_token_spawn(elevated: bool, lua_token_available: bool) -> TokenSpawnPlan {
+    match (elevated, lua_token_available) {
+        (_, true) => TokenSpawnPlan::Lua,
+        (true, false) => TokenSpawnPlan::RefuseNoLuaToken,
+        (false, false) => TokenSpawnPlan::Plain,
+    }
+}
+
+/// Message of the refusal. `cause` names what failed, `win32_error` is the last Win32 error
+/// (`None` when no call failed, such as a missing LUA token).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn elevated_token_refusal_message(cause: &str, win32_error: Option<u32>) -> String {
+    match win32_error {
+        Some(code) => format!(
+            "refusing to start the task with the worker's elevated token: {cause} (Win32 error {code})"
+        ),
+        None => format!("refusing to start the task with the worker's elevated token: {cause}"),
+    }
+}
+
+/// Decides what to do after `CreateProcessAsUserW` failed with `win32_error`: an elevated worker
+/// refuses (returns the message), a worker that is not elevated may use `CreateProcessW`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn after_lua_spawn_failure(elevated: bool, win32_error: u32) -> Option<String> {
+    elevated.then(|| {
+        elevated_token_refusal_message(
+            "CreateProcessAsUserW with the restricted (LUA) token failed",
+            Some(win32_error),
+        )
+    })
 }
 
 /// The Windows implementation (design 0033 D4, FEAT-3c):
@@ -2670,6 +2755,14 @@ pub mod windows {
         }
         let line = format!("{prefix}{orig_sddl}");
         record_manifest_line(manifest_path, &line)
+    }
+
+    /// Logs once per worker process why an elevated worker refuses to use its own token.
+    fn log_elevated_token_refusal_once(message: &str) {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!("{message}");
+        }
     }
 
     /// Returns `true` if the current worker process token is elevated (`TokenElevation != 0`).
@@ -5251,30 +5344,82 @@ pub mod windows {
                         // `SECURITY_CAPABILITIES`) so the child never inherits administrative
                         // elevation. Clone `cmdline` before `CreateProcessAsUserW` because Win32
                         // `CreateProcessAsUserW` may mutate `lpCommandLine` in place.
+                        #[cfg(test)]
+                        let hook_mode = lua_test_hook::mode();
+                        #[cfg(test)]
+                        let elevated = is_process_elevated() || hook_mode != lua_test_hook::OFF;
+                        #[cfg(not(test))]
+                        let elevated = is_process_elevated();
+                        #[cfg(test)]
+                        let lua_token = match hook_mode {
+                            lua_test_hook::NO_TOKEN => None,
+                            // An invalid handle makes `CreateProcessAsUserW` fail for real.
+                            lua_test_hook::BAD_TOKEN => Some(usize::MAX as HANDLE),
+                            _ => get_or_init_worker_lua_token(),
+                        };
+                        #[cfg(not(test))]
                         let lua_token = get_or_init_worker_lua_token();
+                        let mut refusal: Option<io::Error> = None;
                         let spawned = unsafe {
-                            let res = if let Some(tok) = lua_token {
-                                let mut lua_cmdline = cmdline.clone();
-                                CreateProcessAsUserW(
-                                    tok,
-                                    app_name_wide.as_ptr(),
-                                    lua_cmdline.as_mut_ptr(),
-                                    std::ptr::null(),
-                                    std::ptr::null(),
-                                    1,
-                                    flags,
-                                    env_block.as_ptr() as *const core::ffi::c_void,
-                                    cwd_ptr,
-                                    &si_ex.StartupInfo,
-                                    &mut pi,
-                                )
-                            } else {
-                                0
-                            };
-                            if res != 0 {
-                                res
-                            } else {
-                                CreateProcessW(
+                            match super::plan_token_spawn(elevated, lua_token.is_some()) {
+                                super::TokenSpawnPlan::Lua => {
+                                    let mut lua_cmdline = cmdline.clone();
+                                    let res = CreateProcessAsUserW(
+                                        lua_token.expect("plan Lua implies a token"),
+                                        app_name_wide.as_ptr(),
+                                        lua_cmdline.as_mut_ptr(),
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                        1,
+                                        flags,
+                                        env_block.as_ptr() as *const core::ffi::c_void,
+                                        cwd_ptr,
+                                        &si_ex.StartupInfo,
+                                        &mut pi,
+                                    );
+                                    if res == 0 {
+                                        let code =
+                                            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                                                as u32;
+                                        if let Some(msg) =
+                                            super::after_lua_spawn_failure(elevated, code)
+                                        {
+                                            log_elevated_token_refusal_once(&msg);
+                                            refusal = Some(io::Error::new(
+                                                io::ErrorKind::PermissionDenied,
+                                                msg,
+                                            ));
+                                            // Not 0: the error is carried in `refusal`.
+                                            1
+                                        } else {
+                                            CreateProcessW(
+                                                app_name_wide.as_ptr(),
+                                                cmdline.as_mut_ptr(),
+                                                std::ptr::null(),
+                                                std::ptr::null(),
+                                                1,
+                                                flags,
+                                                env_block.as_ptr() as *const core::ffi::c_void,
+                                                cwd_ptr,
+                                                &si_ex.StartupInfo,
+                                                &mut pi,
+                                            )
+                                        }
+                                    } else {
+                                        res
+                                    }
+                                }
+                                super::TokenSpawnPlan::RefuseNoLuaToken => {
+                                    let msg = super::elevated_token_refusal_message(
+                                        "the restricted (LUA) token could not be created",
+                                        None,
+                                    );
+                                    log_elevated_token_refusal_once(&msg);
+                                    refusal =
+                                        Some(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+                                    1
+                                }
+                                super::TokenSpawnPlan::Plain => CreateProcessW(
                                     app_name_wide.as_ptr(),
                                     cmdline.as_mut_ptr(),
                                     std::ptr::null(),
@@ -5285,10 +5430,12 @@ pub mod windows {
                                     cwd_ptr,
                                     &si_ex.StartupInfo,
                                     &mut pi,
-                                )
+                                ),
                             }
                         };
-                        if spawned == 0 {
+                        if let Some(err) = refusal {
+                            Some(err)
+                        } else if spawned == 0 {
                             Some(io::Error::last_os_error())
                         } else {
                             None
@@ -5338,6 +5485,25 @@ pub mod windows {
             stderr: Some(stderr_file),
             exited: false,
         })
+    }
+
+    /// Test-only failure injection for the LUA spawn path (SEC-11). Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(crate) mod lua_test_hook {
+        use std::cell::Cell;
+        pub(crate) const OFF: u8 = 0;
+        /// Behave as an elevated worker whose LUA token could not be created.
+        pub(crate) const NO_TOKEN: u8 = 1;
+        /// Behave as an elevated worker whose `CreateProcessAsUserW` fails (invalid token).
+        pub(crate) const BAD_TOKEN: u8 = 2;
+        // Per thread, so a test that injects a failure cannot affect tests running in parallel.
+        thread_local! {
+            pub(crate) static MODE: Cell<u8> = const { Cell::new(OFF) };
+        }
+        pub(crate) fn mode() -> u8 {
+            MODE.with(Cell::get)
+        }
     }
 }
 
@@ -5513,6 +5679,13 @@ mod tests {
             .expect("workspace deny file-write-create on tree and tmp");
         assert!(ws_allow_write < ws_deny_unlink && ws_deny_unlink < ws_deny_create);
         assert!(ws.contains("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
+        // SEC-12: Mach lookups are denied except the Metal compiler, job creation is denied, and
+        // the pasteboard deny comes after the allow (last match wins).
+        let deny_all = at("(deny mach-lookup)\n");
+        let allow_mtl = at("(global-name \"com.apple.MTLCompilerService\")");
+        let pasteboard = at("(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))");
+        assert!(deny_all < allow_mtl && allow_mtl < pasteboard);
+        assert!(fs.contains("(deny job-creation)\n"));
         let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));
@@ -5977,5 +6150,103 @@ mod tests {
             err_home_link.contains("symlink") || err_home_link.contains("junction"),
             "{err_home_link}"
         );
+    }
+
+    #[test]
+    fn test_plan_token_spawn_never_falls_back_to_plain_when_elevated() {
+        assert_eq!(plan_token_spawn(true, true), TokenSpawnPlan::Lua);
+        assert_eq!(plan_token_spawn(false, true), TokenSpawnPlan::Lua);
+        assert_eq!(
+            plan_token_spawn(true, false),
+            TokenSpawnPlan::RefuseNoLuaToken,
+            "an elevated worker without a LUA token must refuse"
+        );
+        assert_eq!(
+            plan_token_spawn(false, false),
+            TokenSpawnPlan::Plain,
+            "a worker that is not elevated keeps CreateProcessW"
+        );
+    }
+
+    #[test]
+    fn test_after_lua_spawn_failure_refuses_only_when_elevated() {
+        let msg = after_lua_spawn_failure(true, 1314).expect("elevated must refuse");
+        assert!(
+            msg.starts_with("refusing to start the task with the worker's elevated token:"),
+            "{msg}"
+        );
+        assert!(msg.contains("CreateProcessAsUserW"), "{msg}");
+        assert!(msg.contains("Win32 error 1314"), "{msg}");
+        assert!(after_lua_spawn_failure(false, 1314).is_none());
+        let none = elevated_token_refusal_message("the LUA token could not be created", None);
+        assert!(!none.contains("Win32 error"), "{none}");
+    }
+
+    #[cfg(windows)]
+    fn run_forced_lua_failure(mode: u8) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let base = windows::normalize_win_path(home.path());
+        let probe_dir = base.join(format!(".isolation-probe-sec11-{mode}"));
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let probe_dir = windows::normalize_win_path(&probe_dir);
+        let empty_host =
+            HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &empty_host,
+            protected_files: &[],
+            sandbox_base: &base,
+            sandbox_dir: &probe_dir,
+            extra_writable_dir: None,
+            workspace_root: None,
+        };
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo started > marker"]);
+        cmd.current_dir(&probe_dir);
+        cmd.env_clear();
+        for (name, value) in inherited_environment(std::env::vars_os()) {
+            cmd.env(name, value);
+        }
+        let guard = windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd)
+            .expect("AppContainer setup");
+        windows::lua_test_hook::MODE.with(|m| m.set(mode));
+        let res = guard.spawn_in_appcontainer(&mut cmd, 0);
+        windows::lua_test_hook::MODE.with(|m| m.set(windows::lua_test_hook::OFF));
+        let err = match res {
+            Ok(_) => panic!("the spawn must be refused when the LUA path fails"),
+            Err(e) => e.to_string(),
+        };
+        drop(guard);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !probe_dir.join("marker").exists(),
+            "no task process may have started"
+        );
+        err
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_elevated_worker_refuses_when_lua_token_is_missing() {
+        let err = run_forced_lua_failure(windows::lua_test_hook::NO_TOKEN);
+        assert!(
+            err.contains("refusing to start the task with the worker's elevated token"),
+            "{err}"
+        );
+        assert!(err.contains("LUA"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_elevated_worker_refuses_when_create_process_as_user_fails() {
+        let err = run_forced_lua_failure(windows::lua_test_hook::BAD_TOKEN);
+        assert!(
+            err.contains("refusing to start the task with the worker's elevated token"),
+            "{err}"
+        );
+        assert!(err.contains("CreateProcessAsUserW"), "{err}");
+        assert!(err.contains("Win32 error"), "{err}");
     }
 }
