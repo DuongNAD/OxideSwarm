@@ -588,6 +588,103 @@ async fn test_assign_task_that_was_cancelled_before_it_arrived_is_refused_not_ru
     }
 }
 
+/// design 0082: a worker advertises one `ext:<id>` tag for each extension it understands (the
+/// test registry here; none in a release build), and a user cannot set one.
+#[test]
+fn test_worker_advertises_ext_tags_for_the_extensions_it_understands() {
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9")
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    let tags = client.capabilities().tags.clone();
+    for id in [0x8001u16, 0x8002, 0x8004] {
+        assert!(tags.contains(&format!("ext:{id}")), "{tags:?}");
+    }
+    assert!(
+        !tags.contains(&"ext:32771".to_string()),
+        "the master-scope entry is not a worker need: {tags:?}"
+    );
+    // A user tag with the reserved prefix does not reach the advertised set.
+    let spoofed = advertised_tags(&["ext:777".to_string()], 4, IsolationLevel::Off, &[], false);
+    assert!(!spoofed.contains(&"ext:777".to_string()), "{spoofed:?}");
+}
+
+/// design 0082 D2.3: a worker refuses a task with a critical extension it does not know, or a
+/// malformed list, with a failed result naming the id; it runs one with an unknown non-critical
+/// extension.
+#[tokio::test]
+async fn test_assign_refuses_unknown_critical_extension_and_runs_unknown_non_critical() {
+    use rusty_grid_core::task::Extension;
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(4)
+            .with_no_battery(true),
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    let make = |ext: Extension| {
+        let mut task = Task::new(
+            rusty_grid_core::task::TaskSpec::command("true", vec![]),
+            TaskRequirements::generic(1, 30),
+        );
+        task.extensions = vec![ext];
+        task
+    };
+
+    let task = make(Extension {
+        id: 0x1234,
+        critical: true,
+        bytes: vec![1],
+    });
+    let task_id = task.id;
+    client.handle_assign_task(task, tx.clone()).await;
+    match rx.recv().await.expect("a refusal") {
+        WorkerMessage::TaskResult {
+            task_id: rid,
+            exit_code,
+            error,
+            ..
+        } => {
+            assert_eq!(rid, task_id);
+            assert_ne!(exit_code, 0);
+            let error = error.unwrap();
+            assert!(
+                error.contains("needs extension 4660, which this worker does not support"),
+                "{error}"
+            );
+        }
+        other => panic!("Expected a failed TaskResult, got {other:?}"),
+    }
+    assert!(client.active_task_table.read().await.is_empty());
+
+    // Over a limit: refused the same way.
+    let oversized = make(Extension {
+        id: 0x1234,
+        critical: false,
+        bytes: vec![0; rusty_grid_core::task::MAX_EXTENSION_BYTES + 1],
+    });
+    client.handle_assign_task(oversized, tx.clone()).await;
+    match rx.recv().await.expect("a refusal") {
+        WorkerMessage::TaskResult { error, .. } => {
+            assert!(error.unwrap().contains("limit is 65536"));
+        }
+        other => panic!("Expected a failed TaskResult, got {other:?}"),
+    }
+
+    // Unknown but not critical: ignored, the task runs.
+    let task = make(Extension {
+        id: 0x1234,
+        critical: false,
+        bytes: vec![1],
+    });
+    let task_id = task.id;
+    client.handle_assign_task(task, tx).await;
+    match rx.recv().await.expect("progress of the run") {
+        WorkerMessage::TaskProgress { task_id: pid, .. } => assert_eq!(pid, task_id),
+        other => panic!("Expected TaskProgress, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_worker_client_concurrency_bounded_by_cores() {
     let config = WorkerConfig::new("127.0.0.1:9999")

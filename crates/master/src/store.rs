@@ -91,9 +91,10 @@ pub const JOURNAL_MAGIC: &[u8; 8] = b"OXSWJRN1";
 /// Magic bytes at the start of `snapshot.bin`.
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
 /// On-disk layout version written by this module. Version 2 appended `Task::workspace` to the
-/// bincode form of `Task` (protocol version 6), and version 3 appended `TaskRequirements::vram_mb`
-/// (protocol version 9).
-pub const STORE_FORMAT_VERSION: u32 = 3;
+/// bincode form of `Task` (protocol version 6), version 3 appended `TaskRequirements::vram_mb`
+/// (protocol version 9), and version 4 appended `Task::extensions` and
+/// `TaskRequirements::extensions` (protocol version 10, design 0082).
+pub const STORE_FORMAT_VERSION: u32 = 4;
 /// Oldest layout version this module still opens. A version 1 journal can only hold records of
 /// the old `Task` layout, and the protocol version in its header (below 6) refuses those records
 /// (`read_journal`); a version 1 snapshot is JSON and carries over unchanged, as does a version 1
@@ -1677,13 +1678,14 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// Store format 2 appended `Task::workspace` (protocol 6) and format 3 appended
-    /// `TaskRequirements::vram_mb` (protocol 9), so a clean shutdown under format 1 or 2 still
-    /// upgrades, and records of either old layout are refused.
+    /// Store format 2 appended `Task::workspace` (protocol 6), format 3 appended
+    /// `TaskRequirements::vram_mb` (protocol 9) and format 4 appended the two `extensions` lists
+    /// (protocol 10), so a clean shutdown under format 1, 2 or 3 still upgrades, and records of
+    /// any old layout are refused.
     #[test]
     fn format_1_files_of_a_clean_shutdown_load_and_format_1_records_are_refused() {
         let old = PROTOCOL_VERSION_CURRENT - 1;
-        for old_format in [1_u32, 2_u32] {
+        for old_format in [1_u32, 2_u32, 3_u32] {
             let dir = tempfile::tempdir().unwrap();
             let image = image_with(2);
             {

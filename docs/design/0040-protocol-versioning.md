@@ -256,3 +256,15 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   journal (`store.rs`) embeds `Task`, so `STORE_FORMAT_VERSION` is 3; clean-shutdown format 1 and
   format 2 files still upgrade (`docs/design/0046-master-durability.md`). Regenerated
   `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-17: Protocol version 10 (design 0082 `PROTO-3`): appended `extensions: Vec<Extension>` last in
+  `TaskRequirements` and last in `Task`, which shifts the layout of every message that embeds a
+  task (`SubmitTask`, `AssignTask`, `AssignTaskWithCheckpoint`). `PROTOCOL_VERSION_CURRENT` and
+  `PROTOCOL_VERSION_MIN_COMPATIBLE` are both 10 (PROTO-4 later lowers the minimum to 9).
+  `LegacyV9TaskRequirements` / `LegacyV9Task` / `LegacyV9BinaryClientMessage` let a v10 master
+  recognize a v9 `SubmitTask` and reply with an explicit `Incompatible protocol version` error;
+  every other v9 request and response keeps the v10 layout and is refused by the version check in
+  both directions. `STORE_FORMAT_VERSION` is 4; clean-shutdown format 1, 2 and 3 files still
+  upgrade. The registry of extension ids is recorded in `crates/core/tests/data/wire_layout.txt`
+  (none yet). From version 10 on, a new optional field of `Task` or `TaskRequirements` is an
+  extension, which moves `PROTOCOL_VERSION_CURRENT` only when a build wants it and never
+  `PROTOCOL_VERSION_MIN_COMPATIBLE`. Regenerated `crates/core/tests/data/wire_layout.txt`.

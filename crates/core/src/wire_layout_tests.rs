@@ -41,9 +41,9 @@ use crate::protocol::{
     PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use crate::task::{
-    AutoRigSpec, Bytes, CheckpointData, Generative3DSpec, OutputArtifact, StagedFile, Task, TaskId,
-    TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity, WorkspaceRef,
-    WorkspaceSource,
+    AutoRigSpec, Bytes, CheckpointData, Extension, Generative3DSpec, OutputArtifact, StagedFile,
+    Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity,
+    WorkspaceRef, WorkspaceSource, EXTENSION_REGISTRY,
 };
 
 /// The recorded encodings, relative to the crate root.
@@ -64,7 +64,9 @@ const HEADER: &str = "\
 # Bincode wire layout of the protocol messages (crates/core/src/protocol.rs): one canonical
 # instance per variant of WorkerMessage, MasterMessage, ClientMessage and ClientResponse, built in
 # crates/core/src/wire_layout_tests.rs, as `<Enum>::<Variant> <hex>` (the frame payload after the
-# 0x02 format byte), sorted by name. Read the test's failure message, then regenerate with
+# 0x02 format byte), sorted by name. The extension registry of crates/core/src/task.rs (design
+# 0082) follows as `Extension::<id> <name> <list> critical=<bool> <scope>` lines (none while the
+# registry is empty). Read the test's failure message, then regenerate with
 #   UPDATE_WIRE_LAYOUT=1 cargo test -p rusty_grid_core --lib wire_layout
 #   $env:UPDATE_WIRE_LAYOUT=1; cargo test -p rusty_grid_core --lib wire_layout   (PowerShell)
 ";
@@ -171,6 +173,12 @@ fn task(n: u8, spec: TaskSpec) -> Task {
             timeout_secs: 90,
             max_retries: Some(4),
             vram_mb: Some(6_144),
+            // A critical extension of the scheduler list (design 0082 D1).
+            extensions: vec![Extension {
+                id: 0x8004,
+                critical: true,
+                bytes: vec![0xab],
+            }],
         },
         created_at_utc: EPOCH_SECS,
         tags: vec!["require:os=linux".into(), "batch-7".into()],
@@ -208,6 +216,20 @@ fn task(n: u8, spec: TaskSpec) -> Task {
                 manifest_size: 2_048,
             }),
         }),
+        // One non-critical and one critical extension; a value that is not UTF-8 shows the hex
+        // form of the JSON codec as well (design 0082 D1).
+        extensions: vec![
+            Extension {
+                id: 0x8001,
+                critical: false,
+                bytes: vec![0x00, 0xff],
+            },
+            Extension {
+                id: 0x8002,
+                critical: true,
+                bytes: vec![0x01, 0x02, 0x03],
+            },
+        ],
     }
 }
 
@@ -1224,6 +1246,23 @@ fn current_wire_layout() -> BTreeMap<String, String> {
     record(&mut layout, "MasterMessage", master_messages());
     record(&mut layout, "ClientMessage", client_messages());
     record(&mut layout, "ClientResponse", client_responses());
+    // The extension registry (design 0082 D3), one line per id: a changed or removed id is a
+    // visible diff. Empty until the first feature that needs an extension.
+    for entry in EXTENSION_REGISTRY {
+        let key = format!("Extension::{:05}", entry.id);
+        let value = format!(
+            "{} {} critical={} {}",
+            entry.name,
+            entry.list.as_str(),
+            entry.critical,
+            entry.scope.as_str()
+        );
+        assert!(
+            layout.insert(key, value).is_none(),
+            "duplicate id {}",
+            entry.id
+        );
+    }
     layout
 }
 

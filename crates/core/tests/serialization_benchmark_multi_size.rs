@@ -319,6 +319,7 @@ fn test_multi_payload_size_benchmark_matrix() {
                 timeout_secs: 30,
                 max_retries: None,
                 vram_mb: None,
+                extensions: Vec::new(),
             },
         );
         let msg = MasterMessage::AssignTask { task };

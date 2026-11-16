@@ -1672,7 +1672,7 @@ impl WorkloadScheduler {
                 .queue
                 .any_queued(|task| {
                     (task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu())
-                        && task.placement().is_ok_and(|placement| {
+                        && task.scheduling_placement().is_ok_and(|placement| {
                             gpu_workers.iter().any(|w| {
                                 statically_fits(&task.requirements, w)
                                     && placement_admits(&placement, w)
@@ -2091,6 +2091,9 @@ impl WorkloadScheduler {
         // Step 5: Dispatch AssignTask frames to workers
         for assignment in &report.assignments {
             let mut task = assignment.task.clone();
+            // The worker cannot enforce a master-scope extension and would refuse a critical one
+            // as unknown (design 0082 D4.4); the queue keeps the stored task whole.
+            task.strip_master_extensions();
             let msg = if let Some(latest_checkpoint) = task.latest_checkpoint.take() {
                 MasterMessage::AssignTaskWithCheckpoint {
                     task,
@@ -2622,6 +2625,110 @@ mod tests {
         );
         assert_eq!(report.assignments.len(), 1);
         assert_eq!(report.assignments[0].task_id, on_macos.id);
+    }
+
+    fn extension_task(task_list: &[(u16, bool)], requirement_list: &[(u16, bool)]) -> Task {
+        use rusty_grid_core::task::Extension;
+        let make = |items: &[(u16, bool)]| {
+            items
+                .iter()
+                .map(|(id, critical)| Extension {
+                    id: *id,
+                    critical: *critical,
+                    bytes: vec![1],
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut task = constrained_task(&[]);
+        task.extensions = make(task_list);
+        task.requirements.extensions = make(requirement_list);
+        task.validate().expect("test extensions must be valid");
+        task
+    }
+
+    #[test]
+    fn test_critical_worker_extension_is_placed_only_on_workers_with_the_ext_tag() {
+        let config = SchedulerConfig::default();
+        let plain = tagged_worker("plain", &["os:linux"]);
+        let capable = tagged_worker("capable", &["os:linux", "ext:32770"]);
+        // 0x8002 = 32770, Worker scope, critical.
+        let task = extension_task(&[(0x8002, true)], &[]);
+        assert_eq!(task.required_extension_ids(), vec![0x8002]);
+
+        // Without the tag nobody takes it, and the wait names the id.
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&plain),
+        );
+        assert!(report.assignments.is_empty());
+        match &report.skipped[0].1 {
+            ScheduleSkipReason::ClusterLacksCapability(msg) => {
+                assert!(msg.contains("ext=32770"), "{msg}")
+            }
+            other => panic!("unexpected skip reason {other:?}"),
+        }
+        let strict = SchedulerConfig {
+            fail_unfulfillable_tasks: true,
+            ..SchedulerConfig::default()
+        };
+        let report = WorkloadScheduler::matchmake(
+            &strict,
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&plain),
+        );
+        assert_eq!(report.unfulfillable.len(), 1);
+        assert!(report.unfulfillable[0].1.contains("ext=32770"));
+
+        // With the tag it is placed, and only there.
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&task),
+            &[plain.clone(), capable.clone()],
+        );
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].worker_id, capable.worker_id);
+    }
+
+    #[test]
+    fn test_non_critical_and_master_scope_extensions_never_restrict_placement() {
+        let config = SchedulerConfig::default();
+        let plain = tagged_worker("plain", &["os:linux"]);
+        // 0x8001 non-critical hint, 0x8003 critical but Master scope, 0x9999 unknown non-critical.
+        let mut task = extension_task(&[(0x8001, false), (0x8003, true)], &[]);
+        task.extensions.push(rusty_grid_core::task::Extension {
+            id: 0x9999,
+            critical: false,
+            bytes: vec![],
+        });
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&plain),
+        );
+        assert_eq!(report.assignments.len(), 1, "{report:?}");
+        // The copy for the worker has no master-scope extension; the stored task keeps it, and the
+        // unknown non-critical one is relayed untouched.
+        let mut sent = report.assignments[0].task.clone();
+        assert_eq!(sent.extensions.len(), 3);
+        sent.strip_master_extensions();
+        let ids: Vec<u16> = sent.extensions.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![0x8001, 0x9999]);
+    }
+
+    #[test]
+    fn test_required_extensions_are_part_of_the_task_shape() {
+        // Same resources, different `ext:` needs: the first finds no worker, which must not make
+        // the engine skip the second as "the same kind of task".
+        let config = SchedulerConfig::default();
+        let workers = vec![tagged_worker("w", &["os:linux", "ext:32772"])];
+        let needs_a = extension_task(&[(0x8002, true)], &[]);
+        let needs_b = extension_task(&[], &[(0x8004, true)]);
+        let report =
+            WorkloadScheduler::matchmake(&config, &[needs_a.clone(), needs_b.clone()], &workers);
+        assert_eq!(report.assignments.len(), 1, "{report:?}");
+        assert_eq!(report.assignments[0].task_id, needs_b.id);
+        assert_eq!(report.skipped[0].0, needs_a.id);
     }
 
     #[test]
@@ -7028,6 +7135,56 @@ mod tests {
             "third 10240 MB task must skip once 20480 of 24576 MB VRAM is committed, got {:?}",
             report.skipped
         );
+    }
+
+    /// design 0082 D4: the worker gets the task without its master-scope extension (it cannot
+    /// enforce it), with a worker-scope one it advertised and an unknown non-critical one
+    /// untouched; the queue keeps the stored task whole.
+    #[tokio::test]
+    async fn test_dispatch_strips_master_scope_extensions_and_keeps_the_rest() {
+        use rusty_grid_core::task::Extension;
+        let (registry, queue, _waiters, notify) = scheduler_fixture().await;
+        let wid = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        registry
+            .register(
+                wid,
+                WorkerCapabilities::new("ext-worker", 4, 4096, false, false, None)
+                    .with_tags(vec!["ext:32770".to_string()]),
+                "127.0.0.1:9411".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut task = Task::new(
+            TaskSpec::builtin_test("hash_compute", 10),
+            TaskRequirements::generic(1, 30),
+        );
+        let ext = |id: u16, critical: bool| Extension {
+            id,
+            critical,
+            bytes: vec![1, 2],
+        };
+        task.extensions = vec![ext(0x8002, true), ext(0x8003, true), ext(0x9999, false)];
+        let id = queue.submit(task).await.unwrap();
+        let sched =
+            WorkloadScheduler::new(SchedulerConfig::default(), registry, queue.clone(), notify);
+        let report = sched.schedule_once().await.unwrap();
+        assert_eq!(report.assignments.len(), 1, "{report:?}");
+        match rx.recv().await {
+            Some(MasterMessage::AssignTask { task }) => {
+                let ids: Vec<u16> = task.extensions.iter().map(|e| e.id).collect();
+                assert_eq!(ids, vec![0x8002, 0x9999]);
+                assert_eq!(
+                    task.extensions[1].bytes,
+                    vec![1, 2],
+                    "relayed byte for byte"
+                );
+            }
+            other => panic!("expected AssignTask, got {other:?}"),
+        }
+        assert_eq!(queue.get_task_spec(&id).await.unwrap().extensions.len(), 3);
     }
 
     #[tokio::test]

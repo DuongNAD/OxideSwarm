@@ -48,6 +48,7 @@ otel = ["dep:tracing-subscriber", "dep:tokio-rustls", "dep:rustls-native-certs",
 test-hooks = []
 
 [dev-dependencies]
+rusty_grid_core = { workspace = true, features = ["test-extensions"] }
 rusty_grid_worker = { path = "../worker" }
 futures = { workspace = true }
 reqwest = { workspace = true }

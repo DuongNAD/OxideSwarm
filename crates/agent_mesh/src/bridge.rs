@@ -173,6 +173,7 @@ impl AgentGridBridge {
                     timeout_secs,
                     max_retries: None,
                     vram_mb: None,
+                    extensions: Vec::new(),
                 },
             )
         } else {
@@ -216,6 +217,7 @@ impl AgentGridBridge {
                     timeout_secs,
                     max_retries: None,
                     vram_mb: None,
+                    extensions: Vec::new(),
                 },
             )
         };
@@ -667,6 +669,7 @@ impl AgentGridBridge {
             timeout_secs,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -798,6 +801,7 @@ impl AgentGridBridge {
             timeout_secs,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;

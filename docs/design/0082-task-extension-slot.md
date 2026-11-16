@@ -1,6 +1,6 @@
 # 0082: An extension slot for optional task fields
 
-Status: Draft (plan; builds nothing; PROTO-3 of design 0076 D3)
+Status: Implemented (PROTO-3 of design 0076 D3; draft pull request PRNUM, which merges together with PROTO-4)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -164,9 +164,9 @@ Unit tests in `crates/core/src/task.rs` and `crates/core/src/protocol/tests.rs`,
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| PROTO-3a | `Extension`, the two fields, `extension_bytes`, registry, bounds and `Task::validate` rules (D1 to D3) | `crates/core/src/task.rs` | Tests 1 to 5 and 7 pass | Planned |
-| PROTO-3b | Protocol 10: version constants, `LegacyV9Task` and wrapper, `wire_layout.txt`, `STORE_FORMAT_VERSION` 4 (D1, D6) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/store.rs`, `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md` | Test 8 and 9 pass; "wire change" pull request, release within 48 hours | Planned |
-| PROTO-3c | `ext:` worker tag, `TaskView::required_extensions`, scheduler check, worker refusal (D2.3, D4) | `crates/core/src/placement.rs`, `crates/worker/src/client.rs`, `crates/worker/src/client/tasks.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `CLAUDE.md` | Tests 3 and 6 pass | Planned |
+| PROTO-3a | `Extension`, the two fields, `extension_bytes`, registry, bounds and `Task::validate` rules (D1 to D3) | `crates/core/src/task.rs` | Tests 1 to 5 and 7 pass | Implemented |
+| PROTO-3b | Protocol 10: version constants, `LegacyV9Task` and wrapper, `wire_layout.txt`, `STORE_FORMAT_VERSION` 4 (D1, D6) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/store.rs`, `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md` | Test 8 and 9 pass; "wire change" pull request, release within 48 hours | Implemented (the release is pending) |
+| PROTO-3c | `ext:` worker tag, `TaskView::required_extensions`, scheduler check, worker refusal (D2.3, D4) | `crates/core/src/placement.rs`, `crates/worker/src/client.rs`, `crates/worker/src/client/tasks.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `CLAUDE.md` | Tests 3 and 6 pass | Implemented |
 | PROTO-3d | Cross-version tests | `crates/master/tests/`, CI | Test 10 passes (needs PROTO-4) | Planned |
 
 The three first items fit one pull request (L, as in the backlog). They land at the next wire change (Q65).
@@ -184,3 +184,43 @@ The three first items fit one pull request (L, as in the backlog). They land at 
 ## Status log
 
 - 2026-11-17: Draft written for PROTO-3 (design 0076 D3, Q65). Statements about code were checked on `master` `619b609`. Builds nothing.
+- 2026-11-17: The owner decided Q68 to Q72 in chat, all on the recommended defaults: `workspace` and
+  `vram_mb` stay typed (Q68); workers advertise `ext:<id>` tags, a tenth reserved prefix (Q69); two
+  lists (Q70); limits 16 per list, 64 KiB per extension, 256 KiB per task (Q71); the registry fixes
+  `critical` per id (Q72).
+- 2026-11-17: Built by draft pull request PRNUM (PROTO-3a, PROTO-3b, PROTO-3c): protocol 10, store
+  format 4, `Extension` and the empty registry, the frozen v9 `SubmitTask` decoder, the `ext:` tag,
+  the scheduler check and the worker refusal. The pull request is a wire change and holds until
+  PROTO-4 (design 0076 D1). PROTO-3d (test 10, the cross-version tests with a v9 peer) waits for
+  PROTO-4; before it, the skew job (design 0076 D2) shows both cross pairs refused with the version
+  error and the pull request pair working. Deviations from this record, where the code forced or
+  allowed a different shape:
+  - **Test registry (D3).** The test entries sit in `TEST_EXTENSION_REGISTRY` behind the core
+    feature `test-extensions`, which only the dev-dependencies of `rusty_grid_master` and
+    `rusty_grid_worker` enable, so their tests can use known ids. A plain `#[cfg(test)]` entry is
+    invisible to the other crates. A release build has an empty registry and no test entry. The wire
+    layout file records `EXTENSION_REGISTRY` only (one `Extension::<id, 5 digits>` line per entry,
+    none today), so the file does not depend on the feature. As a consequence of the existing layout
+    test, adding or editing a registry id needs a `PROTOCOL_VERSION_CURRENT` bump with the
+    regeneration, and changing or removing one needs `MIN` too; that is stricter than D1's "may
+    move", and it is the visible diff D3 asked for.
+  - **`decode` (D3)** is `fn(&[u8]) -> Result<(), String>`: it checks the value. The typed value
+    arrives with the first real id, whose record fixes its type.
+  - **Placement (D4.3).** There is no `TaskView::required_extensions` and no new `Shape` field.
+    `Placement` gains `extensions: Vec<u16>`, which is not readable from `require:` tags;
+    `Task::scheduling_placement` adds the ids of the task's known critical `Worker`/`Both`
+    extensions to the placement, `TaskView::placement` carries it, the worker index matches it
+    against the `ext:<id>` tag, and `Shape` already contains the placement. The effect is the one D4
+    states, and the wait and unfulfillable message is "no worker matches the placement constraints
+    (ext=<id>)".
+  - **Stripping (D4.4)** removes every extension of scope `Master` from the worker's copy, critical
+    or not, in the one place that builds `AssignTask` (`WorkloadScheduler`); D4.4 spoke of critical
+    ones only. The stored task keeps all of them.
+  - **Messages.** Bound and registry errors read `Task <id>: ...`; the unknown critical one reads
+    `Task <id> needs extension <n>, which this master does not support` (`worker` at assignment).
+  - The worker's refusal is a plain failed `TaskResult`, not one of the `WORKER_REJECTION_MARKERS`
+    texts, so the master does not requeue the task onto another worker: no other worker would run
+    it either.
+  - `Task::validate` checks the extension lists after placement; the queue charges extension bytes
+    (`3 + bytes.len()` per entry) in `task_active_bytes`, with a test.
+  - Unverified here: Windows and Linux runs of the new tests, and test 10 (PROTO-3d).

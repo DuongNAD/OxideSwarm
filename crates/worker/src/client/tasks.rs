@@ -372,6 +372,24 @@ impl WorkerClient {
             return;
         }
 
+        // Defence in depth (design 0082 D2.3): the Master never places a task with an extension this
+        // worker lacks, but a task with an unknown critical extension, or a malformed extension
+        // list, is never run without the restriction it carries.
+        if let Err(reason) = task.validate_extensions("worker") {
+            warn!(task_id = %task_id, %reason, "Refusing task: extension check failed");
+            let result = TaskResult::failure(
+                worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                reason.clone(),
+                0,
+                Some(reason.clone()),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+            return;
+        }
+
         // Verify task requirements against worker capabilities
         if !self.capabilities.satisfies(&task.requirements) {
             warn!(task_id = %task_id, "Task requirements exceed worker capabilities");

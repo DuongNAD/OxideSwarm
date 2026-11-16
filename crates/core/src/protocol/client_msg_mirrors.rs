@@ -289,6 +289,38 @@ pub(super) struct LegacyV6ToV8Task {
     workspace: Option<crate::task::WorkspaceRef>,
 }
 
+/// Protocol v9 positional bincode layout of [`TaskRequirements`], which ended at `vram_mb`
+/// before `extensions` was appended in v10.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub(super) struct LegacyV9TaskRequirements {
+    cpu_cores: usize,
+    ram_mb: u64,
+    gpu_required: bool,
+    timeout_secs: u64,
+    max_retries: Option<u32>,
+    vram_mb: Option<u64>,
+}
+
+/// Protocol v9 positional bincode layout of [`Task`], which ended at `workspace` before
+/// `extensions` was appended in v10. Used only so a v10 Master can refuse a v9 `SubmitTask` frame
+/// with [`ProtocolError::IncompatibleVersion`].
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub(super) struct LegacyV9Task {
+    id: crate::task::TaskId,
+    spec: crate::task::TaskSpec,
+    requirements: LegacyV9TaskRequirements,
+    created_at_utc: u64,
+    tags: Vec<String>,
+    latest_checkpoint: Option<crate::task::CheckpointData>,
+    staged_files: Vec<crate::task::StagedFile>,
+    expected_outputs: Vec<String>,
+    inputs: Vec<crate::blob::TaskInput>,
+    output_globs: Vec<String>,
+    workspace: Option<crate::task::WorkspaceRef>,
+}
+
 /// Protocol v3 to v5 positional bincode layout of [`ClientMessage`]: the same variants as v6
 /// except `Hello`, but `SubmitTask` carries a [`LegacyV5Task`]. Used only so a v6+ Master can
 /// refuse a v5 client frame with [`ProtocolError::IncompatibleVersion`] instead of an opaque
@@ -312,6 +344,19 @@ pub(super) enum LegacyV5BinaryClientMessage {
 pub(super) enum LegacyV6ToV8BinaryClientMessage {
     SubmitTask {
         task: LegacyV6ToV8Task,
+        wait: bool,
+        protocol_version: u32,
+    },
+}
+
+/// Protocol v9 positional bincode layout of [`ClientMessage::SubmitTask`] carrying
+/// [`LegacyV9Task`]. Used only so a v10+ Master refuses a v9 `SubmitTask` with
+/// [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode error.
+#[derive(Deserialize)]
+#[allow(clippy::large_enum_variant, dead_code)]
+pub(super) enum LegacyV9BinaryClientMessage {
+    SubmitTask {
+        task: LegacyV9Task,
         wait: bool,
         protocol_version: u32,
     },

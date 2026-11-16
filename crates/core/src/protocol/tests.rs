@@ -114,6 +114,7 @@ fn test_master_message_roundtrip() {
                     timeout_secs: 60,
                     max_retries: None,
                     vram_mb: None,
+                    extensions: Vec::new(),
                 },
                 created_at_utc: 1726747200,
                 tags: vec!["test".into()],
@@ -123,6 +124,7 @@ fn test_master_message_roundtrip() {
                 inputs: Vec::new(),
                 output_globs: Vec::new(),
                 workspace: None,
+                extensions: Vec::new(),
             },
         },
         MasterMessage::AssignTaskWithCheckpoint {
@@ -142,6 +144,7 @@ fn test_master_message_roundtrip() {
                     timeout_secs: 60,
                     max_retries: None,
                     vram_mb: None,
+                    extensions: Vec::new(),
                 },
                 created_at_utc: 1726747200,
                 tags: vec!["test".into()],
@@ -151,6 +154,7 @@ fn test_master_message_roundtrip() {
                 inputs: Vec::new(),
                 output_globs: Vec::new(),
                 workspace: None,
+                extensions: Vec::new(),
             },
             latest_checkpoint: Some(CheckpointData::new(
                 5,

@@ -1215,6 +1215,7 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
             timeout_secs: 30,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         },
     );
 
@@ -1366,6 +1367,7 @@ pub fn run_distributed_benchmark(_workspace_root: &Path) -> ModeExecutionResult 
             timeout_secs: 60,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         });
     }
 

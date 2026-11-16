@@ -5,7 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Wire change: protocol 10** (`PROTOCOL_VERSION_CURRENT = 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 10`, `PROTO-3`, [design 0082](docs/design/0082-task-extension-slot.md)): `Task` and `TaskRequirements` end with a new `extensions` list, so every master, worker and client must run the same build; protocol 9 peers are refused. **Upgrade and restart the master first**, then workers and CLIs ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5). The master state store format advances from `3` to `4`: with `--state-dir`, stop the previous master cleanly (`SIGINT` or `SIGTERM`) first, so its journal is compacted and carries over at startup. By the release-train rule (design 0076 D1) a release follows within 48 hours.
+
 ### Added
+- The task extension slot (`PROTO-3`, [design 0082](docs/design/0082-task-extension-slot.md)): `Extension { id, critical, bytes }` in `Task::extensions` and `TaskRequirements::extensions`, a registry of ids (empty until the first feature that needs one), limits (16 per list, 64 KiB each, 256 KiB per task), and the rules for a receiver: an unknown non-critical extension is ignored and kept byte for byte, an unknown critical one is refused at submit and at assignment, and a task with a known critical worker extension is placed only on workers that advertise the `ext:<id>` tag (a tenth reserved tag prefix). There is no user-facing way to attach an extension yet.
 - `scripts/release_skew.py` and the CI job `release skew (ubuntu-latest)` run the newest release and the pull request's build in three loopback pairs and show a table of `works`, `refused with the version error` or `broken`; the job fails only on `broken` ([design 0076](docs/design/0076-protocol-compatibility-and-release-train.md) D2, `PROTO-2`).
 - `scripts/agent_bridge.py activity` reports what a coding agent is doing now (`active`, `blocked`, `done`, `idle`, with task, step and note) to `nodes/<id>_activity.json`, separate from the machine heartbeat; `activity --show` lists every agent and marks one STALE after 20 minutes without an update while `active` or `blocked`, and `diagnose` and `peek` show the line ([design 0081](docs/design/0081-agent-activity-status.md)).
 

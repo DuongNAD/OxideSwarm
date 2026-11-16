@@ -8,7 +8,7 @@ use tokio_util::codec::{Framed, FramedParts, FramedWrite, LengthDelimitedCodec};
 
 use super::client_msg_mirrors::{
     BinaryClientMessage, HumanClientMessage, LegacyV2BinaryClientMessage,
-    LegacyV5BinaryClientMessage, LegacyV6ToV8BinaryClientMessage,
+    LegacyV5BinaryClientMessage, LegacyV6ToV8BinaryClientMessage, LegacyV9BinaryClientMessage,
 };
 use super::client_resp_mirrors::{
     BinaryClientResponse, HumanClientResponse, LegacyV2BinaryClientResponse,
@@ -328,6 +328,14 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, Protocol
             if let Ok(LegacyV6ToV8BinaryClientMessage::SubmitTask {
                 protocol_version, ..
             }) = bincode_exact_deserialize::<LegacyV6ToV8BinaryClientMessage>(slice)
+            {
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(incompatible_version_error(protocol_version));
+                }
+            }
+            if let Ok(LegacyV9BinaryClientMessage::SubmitTask {
+                protocol_version, ..
+            }) = bincode_exact_deserialize::<LegacyV9BinaryClientMessage>(slice)
             {
                 if !is_protocol_version_compatible(protocol_version) {
                     return Err(incompatible_version_error(protocol_version));

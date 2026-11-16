@@ -651,8 +651,10 @@ fn sample_workspace_task() -> Task {
     )
 }
 
-/// The bytes a pre-v9 client sent for `SubmitTask` without `TaskRequirements::vram_mb`.
-fn pre_v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
+/// The bytes a v9 client sent for `SubmitTask`: without the two `extensions` lists (an empty list
+/// is its 8-byte length). `task` must have none.
+fn v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
+    assert!(task.extensions.is_empty() && task.requirements.extensions.is_empty());
     let msg = ClientMessage::SubmitTask {
         task: task.clone(),
         wait,
@@ -660,8 +662,24 @@ fn pre_v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
     let mut raw = serialize_client_message_with_version(&msg, version, WireCodec::Bincode)
         .unwrap()
         .to_vec();
-    let vram_tag_offset = 1
-        + 4
+    // Task::extensions sits just before `wait` (1 byte) and the version trailer (4 bytes).
+    let len = raw.len();
+    assert_eq!(&raw[len - 13..len - 5], &[0u8; 8], "empty Task::extensions");
+    raw.drain(len - 13..len - 5);
+    // TaskRequirements::extensions sits after `vram_mb`; with `vram_mb` None that is 1 byte on.
+    let vram_tag_offset = requirements_vram_tag_offset(task);
+    assert_eq!(raw[vram_tag_offset], 0, "vram_mb None tag byte");
+    assert_eq!(
+        &raw[vram_tag_offset + 1..vram_tag_offset + 9],
+        &[0u8; 8],
+        "empty TaskRequirements::extensions"
+    );
+    raw.drain(vram_tag_offset + 1..vram_tag_offset + 9);
+    raw
+}
+
+fn requirements_vram_tag_offset(task: &Task) -> usize {
+    1 + 4
         + bincode::serialized_size(&(
             task.id,
             &task.spec,
@@ -671,7 +689,14 @@ fn pre_v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
             task.requirements.timeout_secs,
             task.requirements.max_retries,
         ))
-        .unwrap() as usize;
+        .unwrap() as usize
+}
+
+/// The bytes a pre-v9 client sent for `SubmitTask` without `TaskRequirements::vram_mb` (and
+/// without the v10 `extensions` lists).
+fn pre_v9_submit_task_frame(task: &Task, version: u32, wait: bool) -> Vec<u8> {
+    let mut raw = v9_submit_task_frame(task, version, wait);
+    let vram_tag_offset = requirements_vram_tag_offset(task);
     assert_eq!(raw[vram_tag_offset], 0, "vram_mb None tag byte");
     raw.remove(vram_tag_offset);
     raw
@@ -690,8 +715,8 @@ fn v5_submit_task_frame(wait: bool) -> Vec<u8> {
 
 #[test]
 fn test_protocol_6_hello_round_trips_in_both_codecs_and_is_appended_last() {
-    assert_eq!(PROTOCOL_VERSION_CURRENT, 9);
-    assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 9);
+    assert_eq!(PROTOCOL_VERSION_CURRENT, 10);
+    assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 10);
     for codec in [WireCodec::Bincode, WireCodec::Json] {
         let raw = serialize_message(&ClientMessage::Hello, codec).unwrap();
         let (msg, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();
@@ -1102,6 +1127,120 @@ fn test_protocol_9_task_vram_mb_round_trips_and_refuses_v8_submit() {
             other => {
                 panic!("expected InboundMessage IncompatibleVersion({version}), got {other:?}")
             }
+        }
+    }
+}
+
+// --- Protocol version 10: Task::extensions and TaskRequirements::extensions (design 0082) --------
+
+fn sample_extensions_task() -> Task {
+    let mut task = sample_workspace_task();
+    task.extensions = vec![
+        crate::task::Extension {
+            id: 0x8001,
+            critical: false,
+            bytes: vec![0x00, 0xff, 0x10],
+        },
+        crate::task::Extension {
+            id: 0x8002,
+            critical: true,
+            bytes: vec![],
+        },
+    ];
+    task.requirements.extensions = vec![crate::task::Extension {
+        id: 0x8004,
+        critical: true,
+        bytes: vec![0xab; 5],
+    }];
+    task
+}
+
+#[test]
+fn test_protocol_10_task_extensions_round_trip_in_both_codecs() {
+    for task in [sample_workspace_task(), sample_extensions_task()] {
+        let msgs = [ClientMessage::SubmitTask {
+            task: task.clone(),
+            wait: true,
+        }];
+        for msg in msgs {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_message(&msg, codec).unwrap();
+                let (back, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();
+                assert_eq!(back, msg, "{codec:?}");
+                assert_eq!(detected, codec);
+            }
+        }
+        for msg in [
+            MasterMessage::AssignTask { task: task.clone() },
+            MasterMessage::AssignTaskWithCheckpoint {
+                task: task.clone(),
+                latest_checkpoint: None,
+            },
+        ] {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_message(&msg, codec).unwrap();
+                let (back, _) = deserialize_message::<MasterMessage>(&raw).unwrap();
+                assert_eq!(back, msg, "{codec:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_extension_json_form_is_hex_and_extensions_may_be_omitted() {
+    let ext = crate::task::Extension {
+        id: 7,
+        critical: false,
+        bytes: vec![0x00, 0xff],
+    };
+    let json = serde_json::to_string(&ext).unwrap();
+    assert_eq!(json, r#"{"id":7,"critical":false,"bytes":"00ff"}"#);
+    assert_eq!(
+        serde_json::from_str::<crate::task::Extension>(&json).unwrap(),
+        ext
+    );
+    assert!(serde_json::from_str::<crate::task::Extension>(
+        r#"{"id":7,"critical":false,"bytes":"0g"}"#
+    )
+    .is_err());
+
+    // A JSON peer may omit both lists.
+    let task = sample_workspace_task();
+    let mut value = serde_json::to_value(&task).unwrap();
+    value.as_object_mut().unwrap().remove("extensions");
+    value["requirements"]
+        .as_object_mut()
+        .unwrap()
+        .remove("extensions");
+    let back: Task = serde_json::from_value(value).unwrap();
+    assert!(back.extensions.is_empty() && back.requirements.extensions.is_empty());
+}
+
+/// A v9 client's `SubmitTask` has no `extensions` lists: a v10 Master refuses it with the
+/// version error (design 0082 D6), through both the typed and the routed decoder.
+#[test]
+fn legacy_v9_submit_task_is_refused_with_a_version_error() {
+    let task = sample_workspace_task();
+    for wait in [false, true] {
+        let frame = v9_submit_task_frame(&task, 9, wait);
+        assert!(bincode_exact_deserialize::<BinaryClientMessage>(&frame[1..]).is_err());
+        match deserialize_message::<ClientMessage>(&frame) {
+            Err(ProtocolError::IncompatibleVersion {
+                peer_version,
+                current_version,
+                min_compatible_version,
+            }) => {
+                assert_eq!(peer_version, 9);
+                assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+            }
+            other => panic!("expected IncompatibleVersion(9), got {other:?}"),
+        }
+        match deserialize_message::<InboundMessage>(&frame) {
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                assert_eq!(peer_version, 9);
+            }
+            other => panic!("expected InboundMessage IncompatibleVersion(9), got {other:?}"),
         }
     }
 }
