@@ -22,7 +22,8 @@ use super::{
 
 #[cfg(windows)]
 pub(super) use rusty_grid_core::capabilities::{
-    resolve_windows_executable, resolve_windows_executable_for_isolation,
+    resolve_windows_executable, resolve_windows_executable_for_isolation_in_dir,
+    resolve_windows_executable_in_dir,
 };
 
 #[cfg(windows)]
@@ -515,15 +516,6 @@ impl TaskRunner {
         };
 
         #[cfg(windows)]
-        let resolved_program = if self.config.isolation != IsolationLevel::Off {
-            resolve_windows_executable_for_isolation(program, &effective_path)
-        } else {
-            resolve_windows_executable(program, &effective_path)
-        };
-        #[cfg(not(windows))]
-        let resolved_program = program.to_string();
-
-        #[cfg(windows)]
         let (eff_sandbox_path, eff_cwd, eff_sandbox_base) = if self.config.isolation
             != IsolationLevel::Off
         {
@@ -532,12 +524,12 @@ impl TaskRunner {
             {
                 crate::isolation::windows::normalize_win_path(sandbox_path)
             } else {
-                sandbox_path.to_path_buf()
+                std::path::absolute(sandbox_path).unwrap_or_else(|_| sandbox_path.to_path_buf())
             };
             let cw = if cwd.exists() && !crate::isolation::windows::is_reparse_point(cwd) {
                 crate::isolation::windows::normalize_win_path(cwd)
             } else {
-                cwd.to_path_buf()
+                std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf())
             };
             let sb = if self.config.sandbox_config.base_dir.exists()
                 && !crate::isolation::windows::is_reparse_point(
@@ -545,14 +537,16 @@ impl TaskRunner {
                 ) {
                 crate::isolation::windows::normalize_win_path(&self.config.sandbox_config.base_dir)
             } else {
-                self.config.sandbox_config.base_dir.clone()
+                std::path::absolute(&self.config.sandbox_config.base_dir)
+                    .unwrap_or_else(|_| self.config.sandbox_config.base_dir.clone())
             };
             (sp, cw, sb)
         } else {
             (
-                sandbox_path.to_path_buf(),
-                cwd.to_path_buf(),
-                self.config.sandbox_config.base_dir.clone(),
+                std::path::absolute(sandbox_path).unwrap_or_else(|_| sandbox_path.to_path_buf()),
+                std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+                std::path::absolute(&self.config.sandbox_config.base_dir)
+                    .unwrap_or_else(|_| self.config.sandbox_config.base_dir.clone()),
             )
         };
         #[cfg(not(windows))]
@@ -561,6 +555,41 @@ impl TaskRunner {
             cwd.to_path_buf(),
             self.config.sandbox_config.base_dir.clone(),
         );
+
+        #[cfg(windows)]
+        let resolved_program = {
+            let res = if self.config.isolation != IsolationLevel::Off {
+                resolve_windows_executable_for_isolation_in_dir(
+                    program,
+                    &effective_path,
+                    Some(&eff_cwd),
+                    Some(&eff_sandbox_path),
+                )
+            } else {
+                resolve_windows_executable_in_dir(
+                    program,
+                    &effective_path,
+                    Some(&eff_cwd),
+                    Some(&eff_sandbox_path),
+                )
+            };
+            match res {
+                Ok(p) => p,
+                Err(e) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task_id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        "",
+                        format!("Refusing task program '{program}': {e}"),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Invalid program path '{program}': {e}")),
+                    );
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let resolved_program = program.to_string();
 
         // Under `--isolation fs|fs+net` the task is confined by the platform's mechanism (macOS:
         // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
@@ -636,8 +665,13 @@ impl TaskRunner {
         let (spawn_program, spawn_args) = match &jail {
             None => (resolved_program.clone(), args.to_vec()),
             Some(jail) => {
-                match crate::isolation::wrap_program(jail, &resolved_program, args, &effective_path)
-                {
+                match crate::isolation::wrap_program_in_dir(
+                    jail,
+                    &eff_cwd,
+                    &resolved_program,
+                    args,
+                    &effective_path,
+                ) {
                     Ok(wrapped) => wrapped,
                     Err(e) => return isolation_failure(&e),
                 }

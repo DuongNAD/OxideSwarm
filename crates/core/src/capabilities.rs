@@ -1737,8 +1737,10 @@ fn has_windows_exec_ext(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns `true` when `path` exists as a regular file with a `.com`, `.exe`, `.bat`, or `.cmd`
+/// extension (and a 2-byte `MZ` signature on `.com` / `.exe`).
 #[cfg(windows)]
-fn is_valid_windows_executable(path: &std::path::Path) -> bool {
+pub fn is_valid_windows_executable(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -1770,6 +1772,243 @@ fn is_valid_windows_executable(path: &std::path::Path) -> bool {
 }
 
 #[cfg(windows)]
+fn strip_win_verbatim_prefix(raw: std::path::PathBuf) -> std::path::PathBuf {
+    let s = raw.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{stripped}"))
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        raw
+    }
+}
+
+#[cfg(windows)]
+fn resolve_canonical_prefix(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let abs = std::path::absolute(path)
+        .map_err(|e| format!("cannot resolve path '{}': {e}", path.display()))?;
+    if abs.exists() {
+        return std::fs::canonicalize(&abs)
+            .map(strip_win_verbatim_prefix)
+            .map_err(|e| format!("cannot canonicalize '{}': {e}", abs.display()));
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if !parent.as_os_str().is_empty() && parent.exists() {
+            let mut rebuilt = std::fs::canonicalize(parent)
+                .map(strip_win_verbatim_prefix)
+                .map_err(|e| format!("cannot canonicalize '{}': {e}", parent.display()))?;
+            for part in tail.into_iter().rev() {
+                rebuilt.push(part);
+            }
+            return Ok(rebuilt);
+        }
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    Ok(abs)
+}
+
+#[cfg(windows)]
+fn win_path_starts_with_ci(child: &std::path::Path, parent: &std::path::Path) -> bool {
+    let mut c_iter = child.components();
+    for p_comp in parent.components() {
+        let Some(c_comp) = c_iter.next() else {
+            return false;
+        };
+        if !p_comp
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&c_comp.as_os_str().to_string_lossy())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn probe_candidate_with_exts(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    if is_valid_windows_executable(base) {
+        return Some(base.to_path_buf());
+    }
+    for ext in WINDOWS_EXEC_EXTS {
+        let mut os = base.as_os_str().to_os_string();
+        os.push(ext);
+        let candidate_ext = std::path::PathBuf::from(os);
+        if is_valid_windows_executable(&candidate_ext) {
+            return Some(candidate_ext);
+        }
+    }
+    None
+}
+
+/// Resolves a relative Windows task executable (`./x.exe`, `.\x.exe`, `sub/x.exe`, `sub\x.exe`)
+/// against `working_dir` while refusing `..` traversal, drive/root prefixes, and escapes outside
+/// `sandbox_root`. Returns `(resolved_absolute_path, is_valid_executable)`.
+#[cfg(windows)]
+pub fn resolve_relative_windows_program_in_dir(
+    program: &str,
+    working_dir: &std::path::Path,
+    sandbox_root: Option<&std::path::Path>,
+) -> Result<(std::path::PathBuf, bool), String> {
+    if program.contains('\0') {
+        return Err(format!(
+            "relative program path '{program}' contains a NUL byte"
+        ));
+    }
+    let rel_path = std::path::Path::new(program);
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "relative program path '{program}' must be relative to the task working directory"
+        ));
+    }
+    for seg in program.split(['/', '\\']) {
+        if seg == ".." {
+            return Err(format!(
+                "relative program path '{program}' escapes the task sandbox ('..' traversal is not allowed)"
+            ));
+        }
+    }
+    let mut clean_segments: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in rel_path.components() {
+        match comp {
+            std::path::Component::Normal(seg) => clean_segments.push(seg),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(format!(
+                    "relative program path '{program}' escapes the task sandbox ('..' traversal is not allowed)"
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "relative program path '{program}' must not contain a drive or root prefix"
+                ));
+            }
+        }
+    }
+    if clean_segments.is_empty() {
+        return Err(format!(
+            "relative program path '{program}' does not name an executable"
+        ));
+    }
+
+    let abs_cwd = if working_dir.is_absolute() {
+        working_dir.to_path_buf()
+    } else {
+        std::path::absolute(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
+    };
+    let mut base_candidate = abs_cwd;
+    for seg in clean_segments {
+        base_candidate.push(seg);
+    }
+
+    let verify_within_sandbox = |cand: &std::path::Path| -> Result<(), String> {
+        if let Some(root) = sandbox_root {
+            let canon_root = resolve_canonical_prefix(root)?;
+            let canon_cand = resolve_canonical_prefix(cand)?;
+            if !win_path_starts_with_ci(&canon_cand, &canon_root) {
+                return Err(format!(
+                    "relative program path '{program}' escapes the task sandbox"
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    verify_within_sandbox(&base_candidate)?;
+    if let Some(found) = probe_candidate_with_exts(&base_candidate) {
+        verify_within_sandbox(&found)?;
+        return Ok((found, true));
+    }
+    Ok((base_candidate, false))
+}
+
+#[cfg(windows)]
+fn resolve_explicit_windows_program(
+    program: &str,
+    working_dir: Option<&std::path::Path>,
+    sandbox_root: Option<&std::path::Path>,
+) -> Result<Option<String>, String> {
+    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
+    if !has_path_sep {
+        return Ok(None);
+    }
+    if program.contains('\0') {
+        return Err(format!("program path '{program}' contains a NUL byte"));
+    }
+    let p = std::path::Path::new(program);
+    if p.is_absolute() {
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        if let Some(found) = probe_candidate_with_exts(&abs) {
+            return Ok(Some(found.to_string_lossy().into_owned()));
+        }
+        return Ok(Some(abs.to_string_lossy().into_owned()));
+    }
+    if program.starts_with("/bin/") || program.starts_with("/usr/bin/") {
+        for seg in program.split(['/', '\\']) {
+            if seg == ".." {
+                return Err(format!(
+                    "program path '{program}' escapes the task sandbox ('..' traversal is not allowed)"
+                ));
+            }
+        }
+        if let Some(found) = probe_candidate_with_exts(p) {
+            return Ok(Some(found.to_string_lossy().into_owned()));
+        }
+        return Ok(Some(program.to_string()));
+    }
+    if let Some(cwd) = working_dir {
+        let (resolved, _) = resolve_relative_windows_program_in_dir(program, cwd, sandbox_root)?;
+        return Ok(Some(resolved.to_string_lossy().into_owned()));
+    }
+    for seg in program.split(['/', '\\']) {
+        if seg == ".." {
+            return Err(format!(
+                "relative program path '{program}' escapes the task sandbox ('..' traversal is not allowed)"
+            ));
+        }
+    }
+    if let Some(found) = probe_candidate_with_exts(p) {
+        return Ok(Some(found.to_string_lossy().into_owned()));
+    }
+    Ok(Some(program.to_string()))
+}
+
+#[cfg(windows)]
+fn resolve_path_dir(
+    dir: &std::path::Path,
+    working_dir: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    if dir.as_os_str().is_empty() {
+        match working_dir {
+            Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
+            Some(cwd) => std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            None => std::path::PathBuf::from("."),
+        }
+    } else if !dir.is_absolute() {
+        if let Some(cwd) = working_dir {
+            let abs_cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+            };
+            abs_cwd.join(dir)
+        } else {
+            dir.to_path_buf()
+        }
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
 fn probe_candidate_in_dir(dir: &std::path::Path, bare_name: &str) -> Option<String> {
     let candidate = dir.join(bare_name);
     if is_valid_windows_executable(&candidate) {
@@ -1784,26 +2023,24 @@ fn probe_candidate_in_dir(dir: &std::path::Path, bare_name: &str) -> Option<Stri
     None
 }
 
-/// Resolves `program` on Windows using the same rules as `TaskRunner` (`Git\usr\bin` / `Git\bin`
-/// fast path followed by `effective_path` entries, checking `.com`, `.exe`, `.bat`, `.cmd` and
-/// verifying `MZ` headers on `.com`/`.exe`).
+/// Resolves `program` on Windows relative to `working_dir` (and confined to `sandbox_root` for
+/// relative paths containing separators), falling back to `Git\usr\bin` / `Git\bin` and
+/// `effective_path` for bare names while checking `.com`/`.exe`/`.bat`/`.cmd` and `MZ` headers.
 #[cfg(windows)]
-pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
-    let p = std::path::Path::new(program);
-    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
-    if has_path_sep {
-        if is_valid_windows_executable(p) {
-            return program.to_string();
-        }
-        for ext in WINDOWS_EXEC_EXTS {
-            let with_ext = format!("{program}{ext}");
-            if is_valid_windows_executable(std::path::Path::new(&with_ext)) {
-                return with_ext;
-            }
-        }
-        return program.to_string();
+pub fn resolve_windows_executable_in_dir(
+    program: &str,
+    effective_path: &str,
+    working_dir: Option<&std::path::Path>,
+    sandbox_root: Option<&std::path::Path>,
+) -> Result<String, String> {
+    if program.contains('\0') {
+        return Err(format!("program path '{program}' contains a NUL byte"));
+    }
+    if let Some(explicit) = resolve_explicit_windows_program(program, working_dir, sandbox_root)? {
+        return Ok(explicit);
     }
 
+    let p = std::path::Path::new(program);
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
 
     // Fast path: check Git for Windows usr/bin first so bare Unix tool names
@@ -1811,17 +2048,88 @@ pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String
     // workers even when Git's directories sit after System32 in PATH.
     for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
         if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), bare_name) {
-            return found;
+            return Ok(found);
         }
     }
 
     for dir in std::env::split_paths(effective_path) {
-        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
-            return found;
+        let base = resolve_path_dir(&dir, working_dir);
+        if let Some(found) = probe_candidate_in_dir(&base, bare_name) {
+            return Ok(found);
         }
     }
 
-    program.to_string()
+    Ok(program.to_string())
+}
+
+/// Resolves `program` on Windows using the same rules as `TaskRunner` (`Git\usr\bin` / `Git\bin`
+/// fast path followed by `effective_path` entries, checking `.com`, `.exe`, `.bat`, `.cmd` and
+/// verifying `MZ` headers on `.com`/`.exe`).
+#[cfg(windows)]
+pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
+    resolve_windows_executable_in_dir(program, effective_path, None, None)
+        .unwrap_or_else(|_| program.to_string())
+}
+
+/// Resolves `program` on Windows for a task running inside a Windows AppContainer
+/// (`--isolation fs` or `--isolation fs+net`), resolving relative paths against `working_dir`
+/// inside `sandbox_root` and searching native directories before MSYS2 `usr\bin`.
+#[cfg(windows)]
+pub fn resolve_windows_executable_for_isolation_in_dir(
+    program: &str,
+    effective_path: &str,
+    working_dir: Option<&std::path::Path>,
+    sandbox_root: Option<&std::path::Path>,
+) -> Result<String, String> {
+    if program.contains('\0') {
+        return Err(format!("program path '{program}' contains a NUL byte"));
+    }
+    if let Some(explicit) = resolve_explicit_windows_program(program, working_dir, sandbox_root)? {
+        return Ok(explicit);
+    }
+
+    let p = std::path::Path::new(program);
+    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+
+    // 1. Search all non-MSYS2 directories in `effective_path` first (preserving caller order).
+    let mut deferred_msys_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for dir in std::env::split_paths(effective_path) {
+        let base = resolve_path_dir(&dir, working_dir);
+        if is_msys_usr_bin_dir(&base) {
+            deferred_msys_dirs.push(base);
+            continue;
+        }
+        if let Some(found) = probe_candidate_in_dir(&base, bare_name) {
+            return Ok(found);
+        }
+    }
+
+    // 2. Fallback to %SystemRoot%\System32 and native Git wrapper directories if not in PATH.
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let sys32 = std::path::Path::new(&sys_root).join("System32");
+    if let Some(found) = probe_candidate_in_dir(&sys32, bare_name) {
+        return Ok(found);
+    }
+    for base in &[r"C:\Program Files\Git\cmd", r"C:\Program Files\Git\bin"] {
+        if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), bare_name) {
+            return Ok(found);
+        }
+    }
+
+    // 3. Only check MSYS2 `usr\bin` directories as a last resort when no native binary exists.
+    for dir in &deferred_msys_dirs {
+        if let Some(found) = probe_candidate_in_dir(dir, bare_name) {
+            return Ok(found);
+        }
+    }
+    if let Some(found) = probe_candidate_in_dir(
+        std::path::Path::new(r"C:\Program Files\Git\usr\bin"),
+        bare_name,
+    ) {
+        return Ok(found);
+    }
+
+    Ok(program.to_string())
 }
 
 /// Resolves `program` on Windows for a task running inside a Windows AppContainer
@@ -1838,61 +2146,8 @@ pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String
 /// and run cleanly inside an AppContainer.
 #[cfg(windows)]
 pub fn resolve_windows_executable_for_isolation(program: &str, effective_path: &str) -> String {
-    let p = std::path::Path::new(program);
-    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
-    if has_path_sep {
-        if is_valid_windows_executable(p) {
-            return program.to_string();
-        }
-        for ext in WINDOWS_EXEC_EXTS {
-            let with_ext = format!("{program}{ext}");
-            if is_valid_windows_executable(std::path::Path::new(&with_ext)) {
-                return with_ext;
-            }
-        }
-        return program.to_string();
-    }
-
-    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
-
-    // 1. Search all non-MSYS2 directories in `effective_path` first (preserving caller order).
-    let mut deferred_msys_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for dir in std::env::split_paths(effective_path) {
-        if is_msys_usr_bin_dir(&dir) {
-            deferred_msys_dirs.push(dir);
-            continue;
-        }
-        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
-            return found;
-        }
-    }
-
-    // 2. Fallback to %SystemRoot%\System32 and native Git wrapper directories if not in PATH.
-    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let sys32 = std::path::Path::new(&sys_root).join("System32");
-    if let Some(found) = probe_candidate_in_dir(&sys32, bare_name) {
-        return found;
-    }
-    for base in &[r"C:\Program Files\Git\cmd", r"C:\Program Files\Git\bin"] {
-        if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), bare_name) {
-            return found;
-        }
-    }
-
-    // 3. Only check MSYS2 `usr\bin` directories as a last resort when no native binary exists.
-    for dir in &deferred_msys_dirs {
-        if let Some(found) = probe_candidate_in_dir(dir, bare_name) {
-            return found;
-        }
-    }
-    if let Some(found) = probe_candidate_in_dir(
-        std::path::Path::new(r"C:\Program Files\Git\usr\bin"),
-        bare_name,
-    ) {
-        return found;
-    }
-
-    program.to_string()
+    resolve_windows_executable_for_isolation_in_dir(program, effective_path, None, None)
+        .unwrap_or_else(|_| program.to_string())
 }
 
 #[cfg(test)]
@@ -3721,6 +3976,119 @@ Now drawing from 'AC Power'
                 .to_ascii_lowercase()
                 .ends_with(r"\system32\whoami.exe"),
             "whoami under isolation must resolve to System32\\whoami.exe, got: {resolved_whoami}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_relative_task_executable_resolution_and_sandbox_confinement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let sandbox = root.path().join("sandbox");
+        let sub = sandbox.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let prog_root = sandbox.join("prog.exe");
+        let prog_sub = sub.join("prog.exe");
+        std::fs::write(&prog_root, b"MZroot-pe").unwrap();
+        std::fs::write(&prog_sub, b"MZsub-pe").unwrap();
+
+        // Design 0025 validation order inside relative path resolution without extension.
+        std::fs::write(sub.join("noext"), b"#!/bin/sh\necho no\n").unwrap();
+        std::fs::write(sub.join("noext.exe"), b"").unwrap();
+        std::fs::write(sub.join("noext.bat"), b"@echo bat\r\n").unwrap();
+
+        let (resolved_bat, valid_bat) =
+            resolve_relative_windows_program_in_dir("./sub/noext", &sandbox, Some(&sandbox))
+                .expect("relative noext -> noext.bat");
+        assert!(valid_bat);
+        assert_eq!(resolved_bat, sub.join("noext.bat"));
+
+        std::fs::write(sub.join("noext.exe"), b"MZvalid-exe").unwrap();
+        let (resolved_exe, valid_exe) =
+            resolve_relative_windows_program_in_dir(r"sub\noext", &sandbox, Some(&sandbox))
+                .expect("relative noext -> noext.exe over noext.bat");
+        assert!(valid_exe);
+        assert_eq!(resolved_exe, sub.join("noext.exe"));
+
+        std::fs::write(sub.join("noext.com"), b"MZvalid-com").unwrap();
+        let (resolved_com, valid_com) =
+            resolve_relative_windows_program_in_dir("sub/noext", &sandbox, Some(&sandbox))
+                .expect("relative noext -> noext.com over noext.exe");
+        assert!(valid_com);
+        assert_eq!(resolved_com, sub.join("noext.com"));
+
+        // Resolvers in both off and isolated modes resolve ./, .\, sub/, sub\ against working_dir.
+        for resolver in [
+            resolve_windows_executable_in_dir,
+            resolve_windows_executable_for_isolation_in_dir,
+        ] {
+            let dot_slash =
+                resolver("./prog.exe", "", Some(&sandbox), Some(&sandbox)).expect("./prog.exe");
+            assert_eq!(std::path::Path::new(&dot_slash), prog_root);
+
+            let dot_bs =
+                resolver(r".\prog.exe", "", Some(&sandbox), Some(&sandbox)).expect(r".\prog.exe");
+            assert_eq!(std::path::Path::new(&dot_bs), prog_root);
+
+            let sub_slash =
+                resolver("sub/prog.exe", "", Some(&sandbox), Some(&sandbox)).expect("sub/prog.exe");
+            assert_eq!(std::path::Path::new(&sub_slash), prog_sub);
+
+            let sub_bs = resolver(r"sub\prog.exe", "", Some(&sandbox), Some(&sandbox))
+                .expect(r"sub\prog.exe");
+            assert_eq!(std::path::Path::new(&sub_bs), prog_sub);
+
+            let cwd_sub = resolver(r".\prog.exe", "", Some(&sub), Some(&sandbox))
+                .expect("cwd sub .\\prog.exe");
+            assert_eq!(std::path::Path::new(&cwd_sub), prog_sub);
+
+            // Missing explicit relative path must return an absolute candidate inside cwd, never
+            // falling back to a matching command on PATH (e.g. System32\cmd.exe).
+            let sys32_path = r"C:\Windows\System32";
+            let missing_cmd = resolver("./cmd.exe", sys32_path, Some(&sandbox), Some(&sandbox))
+                .expect("missing relative ./cmd.exe");
+            assert_eq!(std::path::Path::new(&missing_cmd), sandbox.join("cmd.exe"));
+
+            // Traversal, drive-relative, root-relative, and NUL paths are refused.
+            for bad in [
+                r"..\prog.exe",
+                "../prog.exe",
+                r"sub\..\..\prog.exe",
+                r"\prog.exe",
+                "/prog.exe",
+                "C:prog.exe",
+                "prog\0.exe",
+            ] {
+                let err = resolver(bad, sys32_path, Some(&sandbox), Some(&sandbox))
+                    .expect_err(&format!("path '{bad}' must be refused"));
+                assert!(
+                    !err.is_empty(),
+                    "refusal error for '{bad}' must be non-empty"
+                );
+            }
+        }
+
+        // A junction/symlink escaping outside sandbox_root is refused by canonical prefix check.
+        let outside_prog = outside.path().join("evil.exe");
+        std::fs::write(&outside_prog, b"MZevil").unwrap();
+        let junction = sandbox.join("escape_link");
+        let mk = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(outside.path())
+            .status()
+            .expect("mklink /J");
+        assert!(mk.success(), "mklink /J must succeed");
+        let esc_err = resolve_relative_windows_program_in_dir(
+            "escape_link/evil.exe",
+            &sandbox,
+            Some(&sandbox),
+        )
+        .expect_err("junction escaping sandbox must be refused");
+        assert!(
+            esc_err.contains("escapes the task sandbox"),
+            "unexpected escape error: {esc_err}"
         );
     }
 }

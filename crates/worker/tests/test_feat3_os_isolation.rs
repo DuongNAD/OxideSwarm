@@ -6145,6 +6145,176 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         );
     }
 
+    fn compile_tiny_windows_exe(out_dir: &Path, name: &str, src: &str) -> PathBuf {
+        let rs_path = out_dir.join(format!("{name}.rs"));
+        let exe_path = out_dir.join(format!("{name}.exe"));
+        std::fs::write(&rs_path, src).expect("write helper rust source");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = std::process::Command::new(rustc)
+            .arg(&rs_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("invoke rustc for test binary");
+        assert!(
+            output.status.success(),
+            "rustc failed compiling {name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        exe_path
+    }
+
+    /// BUG-21 regression test: relative staged executable paths (`./prog.exe`, `.\prog.exe`,
+    /// `sub/prog.exe`, `sub\prog.exe`, `--cwd sub` + `./prog.exe`, and a batch script in a
+    /// spaced subdirectory) must resolve against the task's working directory inside the sandbox
+    /// under both `--isolation off` and `--isolation fs`, while `..\decoy.exe` and
+    /// `../decoy.exe` must be refused without ever spawning an executable outside the sandbox.
+    #[tokio::test]
+    async fn test_windows_relative_staged_executables_across_isolation_modes() {
+        use rusty_grid_core::task::StagedFile;
+
+        let bin_dir = tempfile::tempdir().expect("bin_dir");
+        let ok_exe = compile_tiny_windows_exe(
+            bin_dir.path(),
+            "rel_probe",
+            r#"fn main() {
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap();
+    println!("REL_EXE_OK|{}|{}", arg, cwd.display());
+}
+"#,
+        );
+        let decoy_exe = compile_tiny_windows_exe(
+            bin_dir.path(),
+            "decoy_probe",
+            r#"fn main() {
+    if let Ok(p) = std::env::var("BUG21_CANARY") {
+        let _ = std::fs::write(p, "ESCAPED");
+    }
+    eprintln!("DECOY_EXECUTED");
+}
+"#,
+        );
+        let ok_bytes = std::fs::read(&ok_exe).expect("read compiled rel_probe.exe");
+        let decoy_bytes = std::fs::read(&decoy_exe).expect("read compiled decoy_probe.exe");
+
+        let mut levels = vec![IsolationLevel::Off];
+        if appcontainer_available() {
+            levels.push(IsolationLevel::Fs);
+        }
+
+        for level in levels {
+            let rig = Rig::new(level, false);
+            // Place decoys outside any task's sandbox directory:
+            // - under `--isolation off`: directly in `rig.base` (for `..\decoy.exe`)
+            // - under both modes: in `rig.base/other_task` (`..\other_task\decoy.exe`) and in
+            //   `rig.base`'s parent (`..\..\decoy.exe`); `--isolation fs` refuses non-sandbox
+            //   entries directly inside `rig.base`.
+            let canary = rig.home.path().join(format!("decoy_canary_{level}.txt"));
+            if level == IsolationLevel::Off {
+                std::fs::write(rig.base.join("decoy.exe"), &decoy_bytes).unwrap();
+            }
+            std::fs::write(rig.base.join("other_task").join("decoy.exe"), &decoy_bytes).unwrap();
+            std::fs::write(rig.base.parent().unwrap().join("decoy.exe"), &decoy_bytes).unwrap();
+
+            let staged = vec![
+                StagedFile::new("prog.exe", ok_bytes.clone(), true),
+                StagedFile::new("sub/prog.exe", ok_bytes.clone(), true),
+                StagedFile::new(
+                    "dir with space/run me.bat",
+                    b"@echo off\r\necho REL_BAT_OK^|%~1^|%CD%\r\n".to_vec(),
+                    true,
+                ),
+            ];
+
+            for (prog, working_dir, arg) in [
+                ("./prog.exe", None, "1024"),
+                (r".\prog.exe", None, "1024"),
+                ("sub/prog.exe", None, "1024"),
+                (r"sub\prog.exe", None, "1024"),
+                ("./prog.exe", Some(PathBuf::from("sub")), "1024"),
+                (r".\dir with space\run me.bat", None, "hello world"),
+            ] {
+                let is_bat = prog.ends_with(".bat");
+                let task = Task::new(
+                    TaskSpec::Command {
+                        program: prog.into(),
+                        args: vec![arg.into()],
+                        env: HashMap::new(),
+                        working_dir: working_dir.clone(),
+                        stdin: None,
+                    },
+                    TaskRequirements::generic(1, 30),
+                )
+                .with_staged_files(staged.clone());
+
+                let res = rig.runner.execute_task(&task, None, None).await;
+                let expected_prefix = if is_bat {
+                    format!("REL_BAT_OK|{arg}|")
+                } else {
+                    format!("REL_EXE_OK|{arg}|")
+                };
+                assert!(
+                    res.is_success() && res.stdout_str().contains(&expected_prefix),
+                    "[{level}] relative program '{prog}' (cwd={working_dir:?}) failed: exit={}, error={:?}, stdout={:?}, stderr={:?}",
+                    res.exit_code,
+                    res.error,
+                    res.stdout_str(),
+                    res.stderr_str()
+                );
+                if working_dir.is_some() {
+                    let line = res.stdout_str();
+                    assert!(
+                        line.trim_end().to_ascii_lowercase().ends_with(r"\sub"),
+                        "[{level}] expected child cwd inside \\sub, got: {line:?}"
+                    );
+                }
+            }
+
+            for escaping in [
+                r"..\decoy.exe",
+                "../decoy.exe",
+                r"..\other_task\decoy.exe",
+                "../other_task/decoy.exe",
+                r"..\..\decoy.exe",
+            ] {
+                let mut esc_env = HashMap::new();
+                esc_env.insert("BUG21_CANARY".into(), canary.to_string_lossy().into_owned());
+                let esc_task = Task::new(
+                    TaskSpec::Command {
+                        program: escaping.into(),
+                        args: Vec::new(),
+                        env: esc_env,
+                        working_dir: None,
+                        stdin: None,
+                    },
+                    TaskRequirements::generic(1, 30),
+                )
+                .with_staged_files(staged.clone());
+
+                let res = rig.runner.execute_task(&esc_task, None, None).await;
+                assert!(
+                    !res.is_success(),
+                    "[{level}] escaping program '{escaping}' must fail"
+                );
+                let combined = format!(
+                    "{} {}",
+                    res.error.as_deref().unwrap_or_default(),
+                    res.stderr_str()
+                );
+                assert!(
+                    combined.contains("escapes the task sandbox"),
+                    "[{level}] refusal for '{escaping}' must state sandbox escape, got: {combined}"
+                );
+                assert!(
+                    !canary.exists(),
+                    "[{level}] escaping program '{escaping}' must never execute decoy.exe"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_extra_read_only_dir_inside_home_is_readable_while_secrets_stay_denied() {
         require_appcontainer!();

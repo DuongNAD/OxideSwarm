@@ -233,6 +233,279 @@ fn test_procenv_finds_no_secret_in_an_isolated_worker_that_uses_a_secret_file() 
     );
 }
 
+#[cfg(windows)]
+fn cli_for_bug21(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .current_dir(home)
+        .env_remove("OXIDESWARM_HOME")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_BLOB_DIR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env_remove("RUSTY_GRID_ISOLATION")
+        .env_remove("RUSTY_GRID_ISOLATION_READ_DIRS")
+        .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
+        .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("RUSTY_GRID_NO_BATTERY", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    cmd
+}
+
+#[cfg(windows)]
+fn compile_bug21_exe(dir: &Path, name: &str, src: &str) -> std::path::PathBuf {
+    let rs = dir.join(format!("{name}.rs"));
+    let exe = dir.join(format!("{name}.exe"));
+    fs::write(&rs, src).expect("write helper rust source");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = Command::new(rustc)
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("run rustc");
+    assert!(
+        out.status.success(),
+        "rustc failed for {name}: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    exe
+}
+
+#[cfg(windows)]
+fn wait_for_condition(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if pred() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    pred()
+}
+
+/// BUG-21 CLI end-to-end test: stages a small `.exe` via `submit --input` and executes it via
+/// `./prog.exe`, `.\prog.exe`, `sub/prog.exe`, and `sub\prog.exe` under both `--isolation off` and
+/// `--isolation fs`, with decoy executables in both the worker's own working directory and outside
+/// the sandbox (`sb_base` / `sb_base\other_task` / parent), and verifies escaping paths are refused.
+#[cfg(windows)]
+#[test]
+fn test_cli_submit_staged_relative_executable_under_off_and_fs_isolation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let bin_dir = home.join("bins");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let prog_exe = compile_bug21_exe(
+        &bin_dir,
+        "prog",
+        r#"fn main() {
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap();
+    println!("CLI_REL_OK:{}:{}", arg, cwd.display());
+}
+"#,
+    );
+    let decoy_canary = home.join("decoy_canary.txt");
+    let decoy_src = format!(
+        "fn main() {{ let _ = std::fs::write(r#\"{}\"# , \"DECOY_HIT\"); println!(\"DECOY_RAN\"); }}\n",
+        decoy_canary.display()
+    );
+    let decoy_exe = compile_bug21_exe(&bin_dir, "decoy", &decoy_src);
+
+    let worker_cwd = home.join("worker_cwd");
+    fs::create_dir_all(&worker_cwd).unwrap();
+    fs::copy(&decoy_exe, worker_cwd.join("prog.exe")).unwrap();
+
+    let port_file = home.join("master.port");
+    let blob_dir = home.join("blobs");
+    let master_log = home.join("master.log");
+    let master_out = fs::File::create(&master_log).unwrap();
+    let master_err = master_out.try_clone().unwrap();
+    let mut master_cmd = cli_for_bug21(home);
+    master_cmd
+        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .arg(&port_file)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .stdout(Stdio::from(master_out))
+        .stderr(Stdio::from(master_err));
+    let _master = Running(master_cmd.spawn().expect("spawn master"));
+
+    let mut master_port = None;
+    assert!(
+        wait_for_condition(Duration::from_secs(20), || {
+            master_port = fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok());
+            master_port.is_some()
+        }),
+        "master did not publish port: {}",
+        fs::read_to_string(&master_log).unwrap_or_default()
+    );
+    let master_addr = format!("127.0.0.1:{}", master_port.unwrap());
+
+    let input_root = format!("{}:prog.exe", prog_exe.display());
+    let input_sub = format!("{}:sub/prog.exe", prog_exe.display());
+
+    let fake_cargo = home.join("fake_cargo");
+    let fake_rustup = home.join("fake_rustup");
+    fs::create_dir_all(&fake_cargo).unwrap();
+    fs::create_dir_all(&fake_rustup).unwrap();
+
+    let mut levels = vec!["off"];
+    if rusty_grid_worker::isolation::windows::OwnedSid::oxideswarm_toolchain().is_ok() {
+        levels.push("fs");
+    } else {
+        assert!(
+            std::env::var_os("RUSTY_GRID_REQUIRE_APPCONTAINER").is_none(),
+            "AppContainer required (RUSTY_GRID_REQUIRE_APPCONTAINER) but unavailable"
+        );
+        eprintln!("skipped fs leg in test_cli_submit_staged_relative_executable: no AppContainer");
+    }
+
+    let outside = TempDir::new().unwrap();
+    fs::copy(&decoy_exe, outside.path().join("prog.exe")).unwrap();
+
+    for iso in levels {
+        let worker_tag = format!("bug21-{iso}");
+        let sb_base = outside.path().join(format!("sb_{iso}"));
+        fs::create_dir_all(sb_base.join("other_task")).unwrap();
+        // Decoy outside any task's sandbox dir: in sb_base/other_task for `..\other_task\prog.exe`,
+        // in outside.path() for `..\..\prog.exe`, and (under `off`) directly in sb_base for
+        // `..\prog.exe` (`--isolation fs` refuses non-sandbox entries directly inside sb_base).
+        if iso == "off" {
+            fs::copy(&decoy_exe, sb_base.join("prog.exe")).unwrap();
+        }
+        fs::copy(&decoy_exe, sb_base.join("other_task").join("prog.exe")).unwrap();
+
+        let w_log = home.join(format!("worker_{iso}.log"));
+        let w_out = fs::File::create(&w_log).unwrap();
+        let w_err = w_out.try_clone().unwrap();
+        let mut w_cmd = cli_for_bug21(home);
+        w_cmd
+            .current_dir(&worker_cwd)
+            .env("CARGO_HOME", &fake_cargo)
+            .env("RUSTUP_HOME", &fake_rustup)
+            .args([
+                "worker",
+                "--master",
+                &master_addr,
+                "--cores",
+                "1",
+                "--isolation",
+                iso,
+                "--tag",
+                &worker_tag,
+                "--sandbox-base-dir",
+            ])
+            .arg(&sb_base)
+            .stdout(Stdio::from(w_out))
+            .stderr(Stdio::from(w_err));
+        let worker_guard = Running(w_cmd.spawn().expect("spawn worker"));
+
+        assert!(
+            wait_for_condition(Duration::from_secs(20), || {
+                cli_for_bug21(home)
+                    .args(["workers", "--master", &master_addr, "--json"])
+                    .output()
+                    .ok()
+                    .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+                    .and_then(|v| {
+                        v.as_array().map(|arr| {
+                            arr.iter().any(|w| {
+                                let connected = w.get("status").and_then(|s| s.as_str())
+                                    != Some("Disconnected");
+                                let has_tag =
+                                    w.get("tags")
+                                        .and_then(|t| t.as_array())
+                                        .is_some_and(|tags| {
+                                            tags.iter()
+                                                .any(|t| t.as_str() == Some(worker_tag.as_str()))
+                                        });
+                                connected && has_tag
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            }),
+            "[{iso}] worker did not register: {}",
+            fs::read_to_string(&w_log).unwrap_or_default()
+        );
+
+        for command in ["./prog.exe", r".\prog.exe", "sub/prog.exe", r"sub\prog.exe"] {
+            let mut sub = cli_for_bug21(home);
+            sub.args([
+                "submit",
+                "--master",
+                &master_addr,
+                "--wait",
+                "--timeout-secs",
+                "45",
+                "--require-tag",
+                &worker_tag,
+                "--input",
+                &input_root,
+                "--input",
+                &input_sub,
+            ]);
+            if iso == "fs" {
+                sub.args(["--require-isolation", "fs"]);
+            }
+            sub.args(["--command", command, "--", "1024"]);
+            let out = sub.output().expect("run submit");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "[{iso}] submit --command '{command}' failed:\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert!(
+                stdout.contains("CLI_REL_OK:1024:"),
+                "[{iso}] expected CLI_REL_OK:1024: for '{command}', got:\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert!(
+                !stdout.contains("DECOY_RAN") && !decoy_canary.exists(),
+                "[{iso}] worker_cwd decoy must never execute for '{command}'"
+            );
+        }
+
+        for escaping in [r"..\prog.exe", r"..\other_task\prog.exe", r"..\..\prog.exe"] {
+            let mut esc_cmd = cli_for_bug21(home);
+            esc_cmd.args([
+                "submit",
+                "--master",
+                &master_addr,
+                "--wait",
+                "--timeout-secs",
+                "30",
+                "--require-tag",
+                &worker_tag,
+            ]);
+            if iso == "fs" {
+                esc_cmd.args(["--require-isolation", "fs"]);
+            }
+            esc_cmd.args(["--input", &input_root, "--command", escaping]);
+            let esc_out = esc_cmd.output().expect("run escaping submit");
+            assert!(
+                !esc_out.status.success(),
+                "[{iso}] escaping --command {escaping} must be refused"
+            );
+            assert!(
+                !decoy_canary.exists(),
+                "[{iso}] escaping --command {escaping} must never execute parent decoy"
+            );
+        }
+        drop(worker_guard);
+    }
+}
+
 #[test]
 fn test_isolated_worker_refuses_broad_or_secret_isolation_read_dir() {
     let home = TempDir::new().unwrap();

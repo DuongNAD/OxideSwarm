@@ -144,7 +144,8 @@ Eleven items (BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10) were ad
 from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Index then held 77
 items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
 and DOC-10, with SEC-10, SEC-13 and AND-5, and with TEST-27 added, it holds 85 Implemented, 8 Partial
-and 41 Planned.
+and 41 Planned. After BUG-21 ([design 0077](design/0077-windows-relative-task-executables.md)), it holds
+86 Implemented, 8 Partial and 41 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -177,6 +178,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-18 | Resolve bare commands under Windows isolation against `System32` before `Git\usr\bin` | P1 | S | FEAT-3 |  | Implemented | 204 (design 0055) |
 | BUG-19 | Bound the data-lane backlog of a QUIC worker session | P1 | S |  |  | Implemented | 236 (design 0069) |
 | BUG-20 | Keep one slow worker from stalling every dispatch | P1 | M |  |  | Implemented | 241 (design 0075) |
+| BUG-21 | Resolve relative staged executables against the task working directory on Windows | P1 | S | FEAT-3 |  | Implemented | (design 0077) |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
@@ -2387,6 +2389,33 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   `WorkloadScheduler::dispatch` tries `try_reserve` first and defers a full channel instead of
   holding the pass (`crates/master/src/scheduler.rs`).
 
+### BUG-21: Resolve relative staged executables against the task working directory on Windows
+
+- **Evidence:** Reproduced in the `R20` Windows probe (`OxideSwarm_Agent_Hub`
+  `test_runs/win_r20_gpu_probe.md`, row `W2_relpath_direct`). Staging `gemm_bench.exe` with
+  `submit --input` and running `--command ./gemm_bench.exe -- 1024` fails on Windows under
+  `--isolation off` with `os error 2` at spawn and under `--isolation fs|fs+net` with
+  `"program './gemm_bench.exe' was not found in PATH"`.
+- **Problem:** `resolve_windows_executable` and `resolve_windows_executable_for_isolation`
+  (`crates/core/src/capabilities.rs`) and `windows::resolve_program`
+  (`crates/worker/src/isolation.rs`) checked relative paths containing `/` or `\` against the
+  worker process's current directory instead of the task's working directory (`eff_cwd` inside
+  the sandbox), and `CreateProcessW` / `CreateProcessAsUserW` passed `NULL` for `lpApplicationName`.
+- **Do:** Resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the
+  sandbox across `--isolation off`, `fs`, and `fs+net`, preserve `.com`/`.exe`/`.bat`/`.cmd` and
+  `MZ` rules of [design 0025](design/0025-windows-executable-resolution.md), refuse paths that
+  escape the sandbox (`..`, drive/root prefixes, junctions targeting outside), wrap `.bat`/`.cmd`
+  via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` to `CreateProcessW` /
+  `CreateProcessAsUserW`.
+- **Done when:** Windows unit, `TaskRunner`, AppContainer (`test_feat3_os_isolation`), and CLI E2E
+  (`cli_isolation_e2e`) tests stage a small `.exe` and run `./prog.exe`, `.\prog.exe`, and
+  `sub/prog.exe` under `--isolation off` and `fs`, and refuse `..\prog.exe` without running
+  outside decoys.
+- **Implemented (2026-11-16, [design 0077](design/0077-windows-relative-task-executables.md)):**
+  implemented relative task executable resolution and sandbox confinement in
+  `crates/core/src/capabilities.rs`, `crates/worker/src/runner/supervise.rs`, and
+  `crates/worker/src/isolation.rs`.
+
 ### SEC-10: Stop a working-directory config file from configuring `worker` and `submit`
 
 - **Evidence:** Read.
@@ -2960,3 +2989,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: Phase 11 brought up to date before merge: BUG-19 (pull request 236, design 0069), BUG-20 (pull request 241, design 0075) and SEC-14 (pull request 237, design 0071) were merged before this phase reached `master` and are Implemented; SEC-10, SEC-13, AND-5 and MAINT-1 name their open pull requests (238, 239, 240, 230, 231, 242); "Where the project stands" in `docs/ROADMAP.md` describes `96ce571`. The Index counts are now 82 Implemented, 8 Partial and 43 Planned.
 - 2026-11-16: TEST-27 added from a macOS CI failure of `mesh_auth` on `master` `6a88eff`, and a note on TEST-23 from the result of its failed run (the process exited 0 and printed nothing). SEC-13 is Implemented (pull request 239, [design 0072](design/0072-collect-outputs-without-following-links.md)) and SEC-10 is Implemented (pull request 238, [design 0070](design/0070-no-working-directory-config.md)), both merged 2026-11-16. MAINT-1 stays Partial after the splits of `client.rs`, `runner.rs` and `protocol.rs` (pull requests 230, 231, 242). The Index counts are now 84 Implemented, 8 Partial and 42 Planned.
 - 2026-11-16: AND-5 Implemented (pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)). MAINT-1 stays Partial after the splits of `queue.rs` and `server.rs` (pull requests 249 and 250): five of six files are split, `cli_app.rs` and the CI size check remain. The Index counts are now 85 Implemented, 8 Partial and 41 Planned.
+- 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
