@@ -215,6 +215,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
 | TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented | 276 |
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
+| TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
+| TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2940,6 +2942,29 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   channel and still require exactly one result; poll for the two slots instead of sleeping.
 - **Done when:** Implemented by this PR. 50 of 50 runs next to 12 `yes` processes and 50 of 50 next to 48.
 
+### TEST-39: Wait for the `--no-shell` mesh node to register before calling it
+
+- **Evidence:** `test_sec6_real_cli_no_shell_flag_execution` (`crates/agent_mesh/tests/test_sec6_mesh_sandbox.rs`)
+  failed on `macos-latest` in pull request 274 with `ERR_NODE_NOT_FOUND` and passed on a rerun.
+- **Problem:** The test spawned `agent-mesh node --no-shell` and slept 600 ms before sending `shell_exec`; a
+  slow start left the node unregistered. Locally the old test failed 30 of 30 runs next to 24 `yes`
+  processes, and once with no load on a cold binary.
+- **Do:** Poll `AgentMeshClient::query_node_list` until the node is listed (30 s bound), then send.
+- **Done when:** Implemented by pull request 278: 30 of 30 runs next to 24 `yes` processes.
+
+### TEST-40: Wait for each payload in the Agent Mesh large-payload test
+
+- **Evidence:** `test_adv_large_payload_boundaries` (`crates/agent_mesh/tests/adversarial_mesh_challenge.rs:520`)
+  failed on `macos-latest` in pull request 275 (run `43957863018`, job `133617088614`): "Chunk size
+  mismatch for size 131072", left `65536`. It passed on a rerun.
+- **Problem:** Same cause as TEST-34: the test slept 150 ms after each send and checked the last payload
+  received, which was still the 64 KiB one when the 128 KiB frame had not arrived.
+- **Do:** Wait (20 ms polls, 30 s bound) until the receiver holds as many payloads as were sent, then run
+  the same assertions. Pull request 278 also replaced the fixed sleeps before the burst counts of
+  `adversarial_mesh_challenge.rs`, `adversarial_challenge.rs` and `mesh_integration.rs` with the same wait.
+- **Done when:** Implemented by pull request 278. The old test did not fail locally (30 of 30 under load),
+  so the fix rests on the cause seen in CI.
+
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -2948,6 +2973,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Report cancelled tasks in their own field, and keep `failed_tasks` for failed tasks.
   Check the dashboard and the MCP `status` tool for the same sum.
 - **Done when:** A test with one failed and one cancelled task shows 1 and 1.
+- **After 0.4.0 (2026-11-17):** a separate count needs a new field in `ClientResponse::ClusterStatus`,
+  which is a wire change. Under the one-version window (design 0083) a protocol 9 client would also need
+  its own encoding of that response, and design 0076 allows one wire change per release, so BUG-22 waits
+  for the next wire change after 0.4.0.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
@@ -3325,3 +3354,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: CLI-2 Implemented (pull request 275): `master --discovery-port`; design 0084. The Index counts are now 99 Implemented, 11 Partial and 43 Planned (153 items, recounted when pull request 277 merged master).
 - 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.
 - 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).
+- 2026-11-17: TEST-39 and TEST-40 added and Implemented (pull request 278): two Agent Mesh tests wait for registration and for each payload instead of a fixed sleep; the Index gains two Implemented items. BUG-22 waits for the next wire change after 0.4.0.
