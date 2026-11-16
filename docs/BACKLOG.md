@@ -1602,7 +1602,7 @@ Each item below needs a design record before code.
 - **Note (2026-11-16):** Five of the six files are split (pull requests 230, 231, 242, 249 and 250).
   At `dde5b55` their tests live in files of their own, and the whole of each file is at most:
   `server.rs` 2,569 lines, `client.rs` 1,656, `queue.rs` 1,469, `runner.rs` 1,336 and `protocol.rs`
-  864. The largest new submodule is `queue/lifecycle.rs` with 1,536 lines. `cli_app.rs` is not split
+  864. The largest new non-test submodule is `queue/lifecycle.rs` with 1,536 lines. `cli_app.rs` is not split
   yet (about 5,484 lines before its test module), and the CI size check of step 3 is not built, so
   the item stays Partial.
 
