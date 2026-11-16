@@ -245,7 +245,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242, 249, 250, 253 |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Implemented | 211, 212, 230, 231, 242, 249, 250, 253, 259 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -1605,7 +1605,19 @@ Each item below needs a design record before code.
   At `03ace60` their tests live in files of their own, and the whole of each file is at most:
   `server.rs` 2,569 lines, `client.rs` 1,684, `cli_app.rs` 1,629, `queue.rs` 1,469, `runner.rs`
   1,336 and `protocol.rs` 864. The largest new non-test submodule is `queue/lifecycle.rs` with
-  1,536 lines. The CI size check of step 3 is not built, so the item stays Partial.
+  1,536 lines. The CI size check of step 3 is built (pull request 259, design 0080): `ox-mode test
+  size`, part of `ox-mode test lint` and a step of the Linux `clippy` job, fails when a Rust file's
+  production part exceeds 3,000 lines. Three other files were above the limit and are on the
+  allowlist at their current size: `crates/worker/src/isolation.rs` 5,343, `crates/cli/src/mcp.rs`
+  3,692 and `crates/cli/src/mode_cli.rs` 3,242. Every Done-when point holds, so the item is
+  Implemented.
+- **Implemented (2026-11-16, pull request 259, [design 0080](design/0080-source-file-size-check.md)):**
+  `crates/cli/src/size_check.rs` measures every `*.rs` file (test-only files excepted) and compares
+  it with `scripts/rust-file-size-allowlist.txt`: an unlisted file above 3,000 production lines or a
+  listed file above its maximum fails; a shrunk entry is a warning. `ox-mode test size` runs it,
+  `ox-mode test lint` includes it, and the Linux `clippy` job runs it on every pull request.
+  `crates/core/tests/data/wire_layout.txt` is unchanged. The allowlist can now only shrink; splitting
+  `isolation.rs`, `mcp.rs` and `mode_cli.rs` would empty it and is not part of this item.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -2990,3 +3002,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: AND-5 Implemented (pull request 240, [design 0073](design/0073-android-bridge-nonblocking-stop.md)). MAINT-1 stays Partial after the splits of `queue.rs` and `server.rs` (pull requests 249 and 250): five of six files are split, `cli_app.rs` and the CI size check remain. The Index counts are now 85 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
+- 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,343), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.
