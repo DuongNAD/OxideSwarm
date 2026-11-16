@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/release_skew.py` and the CI job `release skew (ubuntu-latest)` run the newest release and the pull request's build in three loopback pairs and show a table of `works`, `refused with the version error` or `broken`; the job fails only on `broken` ([design 0076](docs/design/0076-protocol-compatibility-and-release-train.md) D2, `PROTO-2`).
 - `scripts/agent_bridge.py activity` reports what a coding agent is doing now (`active`, `blocked`, `done`, `idle`, with task, step and note) to `nodes/<id>_activity.json`, separate from the machine heartbeat; `activity --show` lists every agent and marks one STALE after 20 minutes without an update while `active` or `blocked`, and `diagnose` and `peek` show the line ([design 0081](docs/design/0081-agent-activity-status.md)).
 
 ### Fixed

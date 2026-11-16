@@ -301,7 +301,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
-| PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Planned | (design 0076) |
+| PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0076) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
@@ -2730,6 +2730,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   pull request's build in three pairs (as design 0076 D2 lists them) and writes a table of the
   results to the job summary.
 - **Done when:** Each pull request shows the release-to-build table.
+- **Implemented (2026-11-17, pull request 269):** `scripts/release_skew.py` (Python standard library, unit tests in
+  `tests/test_release_skew.py`) runs the three pairs on loopback with private HOMEs and prints the table; the CI job
+  `release skew (ubuntu-latest)` builds the pull request's `oxideswarm`, downloads the newest release archive with
+  `gh release download`, checks `SHA256SUMS` and runs the script. It is not a required check, and it passes with a
+  notice when no release exists.
 
 ### PROTO-3: An extension slot for optional wire fields
 
