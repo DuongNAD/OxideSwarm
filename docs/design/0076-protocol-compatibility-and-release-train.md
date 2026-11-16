@@ -167,7 +167,7 @@ Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](..
 |---|---|---|---|---|---|---|
 | REL-6 | Release `v0.3.0` at protocol 9 | S | Owner (a tag) | `CHANGELOG.md` | A release speaks the protocol of `master` | Planned (pull request 260) |
 | PROTO-1 | The release train rule of D1 | S | Q64 | `CLAUDE.md`, `.github/pull_request_template.md` (new), `docs/README.md` | The rule is written where agents and contributors read it | Implemented by the pull request that plans 0.4.0 |
-| PROTO-2 | The skew job of D2 | M | PROTO-1 | `.github/workflows/ci.yml` | Each pull request shows the release-to-build table | Planned |
+| PROTO-2 | The skew job of D2 | M | PROTO-1 | `.github/workflows/ci.yml`, `scripts/release_skew.py` | Each pull request shows the release-to-build table | Implemented (pull request 269) |
 | PROTO-3 | The extension slot of D3 | L | Q65, a design record | `crates/core/src/task.rs`, `crates/core/src/protocol.rs` | An optional field can be added with no change to `PROTOCOL_VERSION_MIN_COMPATIBLE` | Planned |
 | PROTO-4 | The one-version window of D4 | L | Q66, PROTO-3 | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, design 0040 | A worker one version back registers and runs a task | Planned |
 
@@ -186,4 +186,5 @@ Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](..
   from `git log -G 'pub const PROTOCOL_VERSION_CURRENT: u32 = [0-9]+'` on
   `crates/core/src/protocol.rs`, and the release versions from the same file at each tag.
 - 2026-11-16: Q64, Q65 and Q66 take the recommended defaults (owner's go-ahead in chat on 2026-11-16 to build 0076 for 0.4.0): 48 hours and never across two wire changes; build the extension slot at the next wire change; the one-version window starts after D3. PROTO-1 to PROTO-4 are in Phase 12 of the backlog, and PROTO-1 is Implemented by the pull request that plans 0.4.0.
+- 2026-11-17: D2 built (PROTO-2, pull request 269): `scripts/release_skew.py` and the CI job `release skew (ubuntu-latest)`. A pair that is refused must print `Incompatible protocol version N from <role> (supported: MIN..=CUR; ...)`, which also gives both protocol versions for the table. Run locally against the `v0.3.0` macOS archive, all three pairs work at protocol 9; with the pull request build temporarily at protocol 10 the two cross pairs are refused with the version error.
 - 2026-11-17: The design record for PROTO-3 (D3) is [0082](0082-task-extension-slot.md), Draft. It fixes the types, bounds, the placement rule and the v9 rule for PROTO-4, and asks Q68 to Q72.

@@ -258,10 +258,56 @@ jobs:
       - run: python tests/test_agent_bridge.py
       - run: python tests/test_launcher_scripts.py
       - run: python tests/test_m1_challenger_hygiene.py
+      - run: python tests/test_release_skew.py
       - run: python tests/test_bench_grid.py
       - run: python tests/test_scale_harness.py
       - name: run agent mesh test suite
         run: python tests/run_mesh_simulation_tests.py
+
+  release-skew:
+    # PROTO-2, design 0076 D2: the newest release and the pull request's build, in three pairs on loopback.
+    # It does not demand compatibility. It fails only when a refused pair prints no version error, or when
+    # both speak the same protocol version and a pair does not work. Not a required check.
+    name: release skew (ubuntu-latest)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: cargo build --locked --bin oxideswarm
+      - name: download the newest release and run the skew script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            echo "::notice::No release exists yet, so there is nothing to run against the pull request's build."
+            echo "### Release skew" >> "$GITHUB_STEP_SUMMARY"
+            echo "No release exists yet." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ver="${tag#v}"
+          name="oxideswarm-${ver}-x86_64-unknown-linux-gnu"
+          dl="$RUNNER_TEMP/release-dl"
+          out="$RUNNER_TEMP/release-bin"
+          mkdir -p "$dl" "$out"
+          gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
+          (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
+          tar -xzf "$dl/${name}.tar.gz" -C "$out"
+          echo "Release ${tag} against the pull request build"
+          python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm
 
   audit:
     name: cargo audit
