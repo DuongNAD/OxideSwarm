@@ -33,6 +33,7 @@ import asyncio
 import os
 import sys
 import time
+import traceback
 
 # Ensure tests and root directory are in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +52,13 @@ except ImportError:
     from tests.test_agent_mesh_data_loss import run_data_loss_tests
     from tests.test_sec6_mesh_sandbox import run_sec6_tests
     from tests.test_challenger_m4_python_tampering import run_python_tampering_tests
+
+
+def report_suite_exception(number, exc):
+    """Say which suite failed and why: type, message and traceback, on stderr."""
+    print(f"[FAILED] Suite {number} raised {type(exc).__name__}: {exc!r}", file=sys.stderr)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+    sys.stderr.flush()
 
 
 def print_banner():
@@ -77,7 +85,7 @@ async def main_async():
     try:
         suite1_passed = await run_simulation_tests()
     except Exception as e:
-        print(f"[FAILED] Suite 1 raised exception: {e}")
+        report_suite_exception(1, e)
         suite1_passed = False
     suite1_duration = time.time() - suite1_start
     results.append(("Suite 1: 3-Node Simulation & Command Routing", suite1_passed, suite1_duration))
@@ -94,7 +102,7 @@ async def main_async():
     try:
         suite2_passed = await run_data_loss_tests()
     except Exception as e:
-        print(f"[FAILED] Suite 2 raised exception: {e}")
+        report_suite_exception(2, e)
         suite2_passed = False
     suite2_duration = time.time() - suite2_start
     results.append(("Suite 2: Bidirectional Zero-Data-Loss & Burst", suite2_passed, suite2_duration))
@@ -111,7 +119,7 @@ async def main_async():
     try:
         suite3_passed = await run_sec6_tests()
     except Exception as e:
-        print(f"[FAILED] Suite 3 raised exception: {e}")
+        report_suite_exception(3, e)
         suite3_passed = False
     suite3_duration = time.time() - suite3_start
     results.append(("Suite 3: SEC-6 Command Hardening & Process Controls", suite3_passed, suite3_duration))
@@ -128,7 +136,7 @@ async def main_async():
     try:
         suite4_passed = await run_python_tampering_tests()
     except Exception as e:
-        print(f"[FAILED] Suite 4 raised exception: {e}")
+        report_suite_exception(4, e)
         suite4_passed = False
     suite4_duration = time.time() - suite4_start
     results.append(("Suite 4: Python SHA-256 Tampering & Burst Routing", suite4_passed, suite4_duration))

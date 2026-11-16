@@ -233,6 +233,16 @@ class ShellLauncherTests(unittest.TestCase):
             timeout=90,
         )
 
+    def launcher_failure(self, res, state):
+        """Failure message for a launcher run: command, return code, output, logs and fake-binary calls."""
+        parts = ["launcher %r returned %r" % (res.args, res.returncode), "---- stdout+stderr ----", res.stdout]
+        for name in ("master.log", "worker.log", "master.log.old", "worker.log.old"):
+            path = os.path.join(state, "run", name)
+            if os.path.isfile(path):
+                parts += ["---- %s ----" % name, read(path)]
+        parts += ["---- fake binary calls ----", read(self.args_log)]
+        return "\n".join(parts)
+
     def fake_args(self):
         return [line for line in read(self.args_log).splitlines() if line.strip()]
 
@@ -312,7 +322,7 @@ class ShellLauncherTests(unittest.TestCase):
         env = dict(OXIDESWARM_HOME=state, OXIDESWARM_CLUSTER_PORT=str(cport), OXIDESWARM_DASHBOARD_PORT=str(dport))
 
         res = self.run_script(["bash", script, "master"], **env)
-        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(res.returncode, 0, self.launcher_failure(res, state))
         lines = self.fake_args()
         master_line = next(l for l in lines if l.startswith("master"))
         worker_line = next(l for l in lines if l.startswith("worker"))
@@ -333,7 +343,7 @@ class ShellLauncherTests(unittest.TestCase):
         self.assertTrue(pid_alive(master_pid) and pid_alive(worker_pid))
 
         stop = self.run_script(["bash", script, "stop"], **env)
-        self.assertEqual(stop.returncode, 0, stop.stdout)
+        self.assertEqual(stop.returncode, 0, self.launcher_failure(stop, state))
         self.assertTrue(wait_until(lambda: not pid_alive(master_pid) and not pid_alive(worker_pid)),
                         "stop must terminate the tracked master and worker")
 
