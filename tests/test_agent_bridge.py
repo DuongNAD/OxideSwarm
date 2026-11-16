@@ -52,6 +52,8 @@ class BridgeCase(unittest.TestCase):
         self.env.pop("OXIDESWARM_AGENT_HUB", None)
         self.env.pop("OXIDESWARM_AGENT_ID", None)
         self.env.pop("PYTHONIOENCODING", None)
+        # Never probe the host's real ports (an owner's master may listen on 8088).
+        self.env["OXIDESWARM_BRIDGE_ASSUME_LISTENING"] = ""
         self.children = []
         self.addCleanup(self.stop_children)
 
@@ -785,6 +787,16 @@ class Diagnose(BridgeCase):
         self.assertIn("From A to B", inbox_b)
         inbox_a = self.run_bridge("inbox", "--agent-id", "mac-a").stdout.decode("utf-8")
         self.assertIn("No unread messages", inbox_a)
+
+    def test_two_simulated_masters_on_one_platform_are_a_split_brain(self):
+        self.write_local_secret()
+        env = dict(self.env, OXIDESWARM_BRIDGE_ASSUME_LISTENING="8088")
+        for agent in ("mac-a", "mac-b"):
+            res = self.run_bridge("heartbeat", "--agent-id", agent, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+        diag = self.run_bridge("diagnose", "--agent-id", "mac-a", env=env)
+        self.assertIn("[SPLIT-BRAIN MASTER]", diag.stdout.decode("utf-8"))
+        self.assertNotEqual(diag.returncode, 0)
 
     def test_no_owner_paths_or_private_gateway_in_source(self):
         import hashlib

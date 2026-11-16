@@ -865,20 +865,38 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
     }
 
     println!("victim disconnected after {sent} x 100 KiB sends (queue cap: 8 messages / 256 KiB)");
+    let removed_at = Instant::now();
 
-    // Everyone else is unaffected, and the dead peer's id answers with a NACK from now on.
-    let res = sender
-        .send_command("healthy", "ping", Value::Null, Some(3000))
+    // Everyone else is unaffected. TEST-27: this check used to run over the flooder's own
+    // connection, behind every 100 KiB message it had already written, so on a slow macOS runner
+    // the hub's work through that backlog (not a stalled hub) could outlast the 3 s deadline. A
+    // separate prober has no such backlog, so a timeout here means the hub itself is held up.
+    // The latency is printed so a failure shows where the time went.
+    let prober = client(&url, "prober");
+    prober.connect().await.unwrap();
+    let res = prober
+        .send_command("healthy", "ping", Value::Null, Some(10_000))
         .await
         .unwrap();
+    println!(
+        "healthy node answered {:?} after the victim was removed",
+        removed_at.elapsed()
+    );
     assert!(
         matches!(res, AgentMeshEnvelope::CommandResponse { .. }),
         "{res:?}"
     );
+
+    // The dead peer's id answers with a NACK from now on. This command queues behind the
+    // flooder's backlog on its own connection, so its deadline only bounds that backlog.
     let res = sender
-        .send_command("victim", "ping", Value::Null, Some(3000))
+        .send_command("victim", "ping", Value::Null, Some(30_000))
         .await
         .unwrap();
+    println!(
+        "NACK for the dead peer arrived {:?} after the victim was removed",
+        removed_at.elapsed()
+    );
     assert!(
         matches!(res, AgentMeshEnvelope::DeliveryNack { .. }),
         "{res:?}"
@@ -886,6 +904,7 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
     assert!(node_ids(&hub).await.contains(&"flooder".to_string()));
 
     drop(victim);
+    prober.close().await;
     sender.close().await;
     healthy.close().await;
     hub.stop().await;
