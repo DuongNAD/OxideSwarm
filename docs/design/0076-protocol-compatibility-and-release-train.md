@@ -1,6 +1,6 @@
 # 0076: Protocol compatibility and a release train
 
-Status: Draft (plan; builds nothing; Q64 to Q67 are open)
+Status: Draft (plan; PROTO-1 is built; Q64 to Q66 are decided, Q67 is open)
 Created: 2026-11-16    Updated: 2026-11-16
 
 ## Summary
@@ -161,12 +161,12 @@ No code. D2 is itself a test. D3 and D4 each get a design record with tests befo
 
 ## Work items
 
-Sizes are the backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
+Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](../BACKLOG.md) under the same IDs. REL-6 is the step before that phase (pull request 260).
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| REL-6 | Release `v0.3.0` at protocol 9 | S | Owner (a tag) | `CHANGELOG.md` | A release speaks the protocol of `master` | Planned |
-| PROTO-1 | The release train rule of D1 | S | Q64 | `CLAUDE.md`, `.github/pull_request_template.md` (new), `docs/README.md` | The rule is written where agents and contributors read it | Planned |
+| REL-6 | Release `v0.3.0` at protocol 9 | S | Owner (a tag) | `CHANGELOG.md` | A release speaks the protocol of `master` | Planned (pull request 260) |
+| PROTO-1 | The release train rule of D1 | S | Q64 | `CLAUDE.md`, `.github/pull_request_template.md` (new), `docs/README.md` | The rule is written where agents and contributors read it | Implemented by the pull request that plans 0.4.0 |
 | PROTO-2 | The skew job of D2 | M | PROTO-1 | `.github/workflows/ci.yml` | Each pull request shows the release-to-build table | Planned |
 | PROTO-3 | The extension slot of D3 | L | Q65, a design record | `crates/core/src/task.rs`, `crates/core/src/protocol.rs` | An optional field can be added with no change to `PROTOCOL_VERSION_MIN_COMPATIBLE` | Planned |
 | PROTO-4 | The one-version window of D4 | L | Q66, PROTO-3 | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, design 0040 | A worker one version back registers and runs a task | Planned |
@@ -185,3 +185,4 @@ Sizes are the backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
 - 2026-11-16: Draft written from the evaluation of `master` `96ce571`. The version table comes
   from `git log -G 'pub const PROTOCOL_VERSION_CURRENT: u32 = [0-9]+'` on
   `crates/core/src/protocol.rs`, and the release versions from the same file at each tag.
+- 2026-11-16: Q64, Q65 and Q66 take the recommended defaults (owner's go-ahead in chat on 2026-11-16 to build 0076 for 0.4.0): 48 hours and never across two wire changes; build the extension slot at the next wire change; the one-version window starts after D3. PROTO-1 to PROTO-4 are in Phase 12 of the backlog, and PROTO-1 is Implemented by the pull request that plans 0.4.0.

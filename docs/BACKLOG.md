@@ -145,7 +145,10 @@ from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Inde
 items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
 and DOC-10, with SEC-10, SEC-13 and AND-5, and with TEST-27 added, it holds 85 Implemented, 8 Partial
 and 41 Planned. After BUG-21 ([design 0077](design/0077-windows-relative-task-executables.md)), it holds
-86 Implemented, 8 Partial and 41 Planned.
+86 Implemented, 8 Partial and 41 Planned. A recount of this table by script on 2026-11-16 (before
+Phase 12) gave 135 rows: 90 Implemented, 7 Partial and 38 Planned. Phase 12 adds eight items
+(PROTO-1 to PROTO-4 and TEST-28 to TEST-31), so the table now holds 143 rows: 91 Implemented
+(PROTO-1 counts as Implemented with its pull request), 7 Partial and 45 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -196,6 +199,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Planned |  |
+| TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Planned |  |
+| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Planned |  |
+| TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Planned |  |
+| TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -286,6 +293,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
+| PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
+| PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Planned | (design 0076) |
+| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0076) |
+| PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
 
 ## Phase 0: integrate open work
 
@@ -2661,6 +2672,107 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
     206.
   - A search of the tracked files finds no "Approved for Implementation".
 
+## Phase 12: 0.4.0, upgrade without stopping the cluster, and stability
+
+The goal of 0.4.0 is that a cluster can be upgraded without stopping all of it, and that it runs
+stably. The first half is [design 0076](design/0076-protocol-compatibility-and-release-train.md);
+the second half is the test and CI fixes below and the endurance and fuzz items that already
+exist. LLM serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) is 0.5.0.
+
+Order:
+
+1. PROTO-1 and the test fixes TEST-28 to TEST-31, first.
+2. PROTO-2.
+3. PROTO-3: a design record first, then code.
+4. PROTO-4, after PROTO-3 and an update of [design 0040](design/0040-protocol-versioning.md).
+5. TEST-24, TEST-25, TEST-26 and LV-1 alongside. They are already in the Index (TEST-23 and
+   TEST-27 too) and are not repeated here.
+
+REL-6 (release `v0.3.0` at protocol 9, pull request 260) is the step before this phase.
+
+### PROTO-1: The release-train rule for wire changes
+
+- **Evidence:** Read. Design 0076 D1.
+- **Problem:** A pull request that bumps `PROTOCOL_VERSION_CURRENT` makes `master` speak a version
+  that no release speaks, and nothing says when a release must follow.
+- **Do:** Add `.github/pull_request_template.md` with a "Wire change" checkbox, one line in
+  `CLAUDE.md` where the protocol-version rules are, and one line in `docs/README.md` where the
+  design-record rules are.
+- **Done when:** The three files carry the rule.
+- **Implemented (2026-11-16, this pull request):** the template, the `CLAUDE.md` line and the
+  `docs/README.md` line exist. Q64 takes its recommended default: a release within 48 hours, and
+  never across two wire changes.
+
+### PROTO-2: A CI job that runs the newest release against the pull request's build
+
+- **Evidence:** Read. Design 0076 D2.
+- **Problem:** Nothing in CI shows whether the build of a pull request still works with the
+  newest release.
+- **Do:** Add a job to `.github/workflows/ci.yml` that runs the newest release against the
+  pull request's build in three pairs (as design 0076 D2 lists them) and writes a table of the
+  results to the job summary.
+- **Done when:** Each pull request shows the release-to-build table.
+
+### PROTO-3: An extension slot for optional wire fields
+
+- **Evidence:** Read. Design 0076 D3.
+- **Problem:** Every added field moves `PROTOCOL_VERSION_MIN_COMPATIBLE`, because bincode is
+  positional.
+- **Do:** Write a design record first. Then build the slot at the next wire change (Q65), in
+  `crates/core/src/task.rs` and `crates/core/src/protocol.rs`.
+- **Done when:** An optional field can be added with no change to
+  `PROTOCOL_VERSION_MIN_COMPATIBLE`.
+
+### PROTO-4: A one-version compatibility window
+
+- **Evidence:** Read. Design 0076 D4.
+- **Problem:** Today `PROTOCOL_VERSION_MIN_COMPATIBLE` equals `PROTOCOL_VERSION_CURRENT`, so a
+  master upgrade stops every older worker.
+- **Do:** After PROTO-3 (Q66), make the master accept the previous version, update design 0040
+  and `crates/core/src/wire_layout_tests.rs`.
+- **Done when:** A worker one version back registers and runs a task.
+
+### TEST-28: Make the group-commit timing test meaningful on slow runners
+
+- **Evidence:** Reproduced once. `test_concurrent_submissions_share_group_commit_and_recover_across_restart`
+  (`crates/master/src/server/persistence_tests.rs:906`) asserts that 1,000 durable submissions
+  finish in under 2 s (line 935). On `windows-latest` (pull request 260, job `133322408308`,
+  2026-11-16) they took 2.0422361 s.
+- **Problem:** A wall-clock bound of 2 s says more about the runner than about group commit.
+- **Do:** Measure group commit by the count of fsyncs or commits, or use a much wider bound. Keep
+  what the test proves: submissions share commits, and the state survives a restart.
+- **Done when:** The test passes on a slow runner and fails if every submission commits alone.
+
+### TEST-29: Find why `workspace tests (windows-latest)` loses its runner at 60 minutes
+
+- **Evidence:** Reproduced twice on 2026-11-16: pull request 251 at `72b05c5` (job
+  `133129128530`) and pull request 256 at `ede7d01` (job `133256035744`). GitHub annotated both
+  "The hosted runner lost communication with the server". Reruns of the same heads passed in
+  about 30 minutes.
+- **Problem:** Some test hangs or starves the runner until the job limit. Nothing in the log says
+  which.
+- **Do:** Find the test: per-test timeouts, a step timeout below the job limit that prints the
+  running tests, or running the suite under the Windows agent. Then fix it.
+- **Done when:** The job finishes in its usual time on ten runs in a row, or the test that hung is
+  fixed and named here.
+
+### TEST-30: Stop `test_agent_bridge.py` from depending on the host's open ports
+
+- **Evidence:** Reproduced on a machine where a real master listens on port 8088.
+- **Problem:** `Diagnose.test_two_simulated_agents_on_one_platform_do_not_collide`
+  (`tests/test_agent_bridge.py:745`) fails there, because the test probes the real port.
+- **Do:** Make the test use a port it binds itself, or stub the probe.
+- **Done when:** The test passes with a listener on 8088.
+
+### TEST-31: Remove the race in the detached-grandchild Blender probe test
+
+- **Evidence:** Failed once on the ubuntu unit tests (pull request 238, before 2026-11-16).
+- **Problem:** The test in `crates/core/src/capabilities.rs` (script near line 3737) kills the
+  process group before the grandchild has called `setsid`, so the grandchild may still be in the
+  group.
+- **Do:** Have the script write a second file after `setsid`, and wait for it before the kill.
+- **Done when:** The test passes 200 times in a loop on Linux.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -3018,3 +3130,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,377), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.
+- 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, and TEST-28 to TEST-31. The Index counts are now 91 Implemented, 7 Partial and 45 Planned (a script recount of the table before this phase gave 90, 7 and 38; the earlier sentence of 86, 8 and 41 had drifted).
