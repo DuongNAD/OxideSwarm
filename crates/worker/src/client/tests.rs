@@ -1112,8 +1112,11 @@ async fn test_reassigned_task_id_stops_the_old_run_silently_and_the_new_run_owns
     task.spec = rusty_grid_core::task::TaskSpec::command("echo", vec!["second".into()]);
     client.handle_assign_task(task.clone(), tx.clone()).await;
 
+    // Wait for the new run's result by condition (generous bound, never a short window), then for
+    // the table to drain, then take whatever else was queued: the superseded run is already gone
+    // by then, so a second result would be sitting in the channel (TEST-38).
     let mut results = Vec::new();
-    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
+    let collect = |msg: WorkerMessage, results: &mut Vec<(i32, String, Option<String>)>| {
         if let WorkerMessage::TaskResult {
             exit_code,
             stdout,
@@ -1127,6 +1130,24 @@ async fn test_reassigned_task_id_stops_the_old_run_silently_and_the_new_run_owns
                 error,
             ));
         }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while results.is_empty() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(msg)) => collect(msg, &mut results),
+            other => panic!("no task result within 60 s: {other:?}"),
+        }
+    }
+    while !client.active_task_table().read().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "active task table never drained"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while let Ok(msg) = rx.try_recv() {
+        collect(msg, &mut results);
     }
     assert_eq!(
             results.len(),
@@ -1140,9 +1161,15 @@ async fn test_reassigned_task_id_stops_the_old_run_silently_and_the_new_run_owns
     assert!(results[0].1.contains("second"));
 
     // The old run's cleanup cannot have removed anything of the new run, and both are gone now.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(client.active_task_table().read().await.is_empty());
-    assert_eq!(client.concurrency_semaphore().available_permits(), 2);
+    let permits_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while client.concurrency_semaphore().available_permits() != 2 {
+        assert!(
+            tokio::time::Instant::now() < permits_deadline,
+            "slots never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

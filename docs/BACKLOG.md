@@ -151,9 +151,9 @@ Phase 12 adds twelve items (PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-
 the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with its pull request),
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
-(TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned. After the
-merges of 2026-11-17 (PROTO-3 and PROTO-4 Implemented, LV-1 Partial, PROTO-5 added) a recount of the table
-by script gives 150 items: 95 Implemented, 10 Partial and 45 Planned.
+(TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 278 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5 added): 154 items,
+101 Implemented, 11 Partial and 42 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -210,8 +210,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
-| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Planned |  |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Planned |  |
+| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
+| TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
+| TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented | 276 |
+| TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -309,7 +312,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
-| CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Planned |  |
+| CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
 
@@ -2888,6 +2891,17 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The runner prints no exception text, so the cause is unknown.
 - **Do:** Print the exception type, message and traceback for a failing suite; then find the cause.
 - **Done when:** The cause is written here and fixed, or the suite passes 50 runs on `macos-latest`.
+- **Implemented (2026-11-17, pull request 277):** the runner now prints the type, `repr` and
+  traceback of a failing suite on stderr. With that, the failure reproduced locally on macOS (6 of
+  about 20 plain runs, while other jobs loaded the machine): `AssertionError` with no message at
+  `tests/test_agent_mesh_data_loss.py` Phase 4, `assert len(bytes_128k) == payload_size_128k`. The cause
+  is in the test, not in the Python reference hub: after sending a payload the test slept a fixed 0.1 s
+  and then read `received_data_payloads[-1]`; when the hub had not yet delivered the 128 KB frame, that
+  was the earlier 64 KB payload. The fixed sleeps of Phases 1 to 5 are now a bounded wait
+  (`wait_for_payload_count`, 10 s) for the expected count, and every count and every payload is still
+  asserted exactly (Phase 5 keeps a 0.1 s settle so a duplicate frame is still counted). After the fix:
+  50 runs of `tests/run_mesh_simulation_tests.py` and 50 with 12 `yes` CPU burners, all passed. The
+  `macos-latest` 50-run loop of "Done when" is not run.
 
 ### TEST-35: Make the `switch_role` launcher test stable on macOS
 
@@ -2898,6 +2912,51 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The launcher returned 1 once in a while; the test does not print why.
 - **Do:** Print the launcher's output on failure, then find the cause.
 - **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
+- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
+  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
+  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
+  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
+  The launcher returns 1 only when the master port is in use, the master process is not recognised
+  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
+  race (a process still showing the launcher's command line just after the fork) was not seen in 300
+  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
+
+### TEST-36: Remove the 50 ms bound from the symlink-chain manifest test
+
+- **Evidence:** Reproduced on the owner's Windows machine under CPU starvation (4 cores, then 2 cores
+  plus 4 CPU spinners; hub report `test_runs/win_test29_2026-11-17.md`):
+  `manifest_v2_symlinks_and_empty_dirs_round_trip_and_refuse_escapes` in `crates/core/src/blob.rs`
+  asserted that refusing the chained-link manifest takes under 50 ms and measured 52.19 ms and 78.52 ms.
+- **Problem:** The test wants to prove that validation is bounded (40 chained links and 1,000 compound
+  links must not expand exponentially), but a 50 ms limit also measures the runner's load.
+- **Do:** Keep the refusal assertion and bound the time at 10 s: the unbounded expansion never finishes,
+  so the bound still tells the two apart.
+- **Done when:** Implemented by this PR. The test passed 50 of 50 runs next to 12 `yes` processes on a
+  Mac, and 50 of 50 next to 48 (the old code also passed there: this Mac did not reproduce the failure).
+
+### TEST-37: Remove the 100 ms window from the port-file reader test
+
+- **Evidence:** Reproduced on the same Windows machine and report as TEST-36:
+  `test_atomic_port_file_publication_concurrent_client_reads` in `tests/m2_challenger_2_stress.rs` let
+  ten readers poll the port file for a fixed 100 ms and required at least one successful read.
+- **Problem:** Readers add their reads to the total only when they stop, and under starvation they may not
+  be scheduled inside 100 ms, so the total can be 0 although no read was ever corrupt.
+- **Do:** Count each successful read as it happens and wait (60 s deadline against a hang) until 50 reads
+  have been made before stopping the readers. Every read is still checked to be non-empty and a valid
+  port.
+- **Done when:** Implemented by this PR. 50 of 50 runs next to 12 `yes` processes and 50 of 50 next to 48.
+
+### TEST-38: Remove the 800 ms window from the re-dispatched task id test
+
+- **Evidence:** Reproduced on the same Windows machine and report as TEST-36:
+  `test_reassigned_task_id_stops_the_old_run_silently_and_the_new_run_owns_the_slot` in
+  `crates/worker/src/client/tests.rs` collected results for 800 ms after the re-dispatch and found none
+  when `echo second` had not run yet.
+- **Problem:** The wait for the new run's result was a fixed window, and the final 100 ms sleep decided
+  when the slots were free.
+- **Do:** Wait up to 60 s for the first result, then until the active table is empty, then drain the
+  channel and still require exactly one result; poll for the two slots instead of sleeping.
+- **Done when:** Implemented by this PR. 50 of 50 runs next to 12 `yes` processes and 50 of 50 next to 48.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -2916,6 +2975,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Add a flag and an environment variable (`RUSTY_GRID_*`) to set the beacon port or turn
   the beacon off. Update the `README.md` reference.
 - **Done when:** Two masters on one machine run at the same time, one with the beacon off.
+- **Implemented (2026-11-17, pull request 275):** `master --discovery-port <PORT>` (`RUSTY_GRID_DISCOVERY_PORT`,
+  `[master].discovery_port`) moves the beacon and `0` turns it off; design 0084. A worker finds a moved
+  beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
+  once, one with the beacon off.
 
 ## Status log
 
@@ -3279,4 +3342,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
 - 2026-11-17: PROTO-3 Implemented by draft pull request 272 ([design 0082](design/0082-task-extension-slot.md)): protocol 10, store format 4, the extension slot and the `ext:` worker tag; Q68 to Q72 decided by the owner. The pull request holds until PROTO-4 (design 0076 D1); PROTO-3d waits for PROTO-4.
 - 2026-11-17: PROTO-4 Implemented by draft pull request 274 ([design 0083](design/0083-one-version-window.md)): the one-version window (protocol 10 accepts 9), Q73 to Q79 decided by the owner; PROTO-3d built with it. The pull request merges together with PROTO-3 (pull request 272).
+- 2026-11-17: CLI-2 Implemented (pull request 275): `master --discovery-port`; design 0084. The Index counts are now 99 Implemented, 11 Partial and 43 Planned (153 items, recounted when pull request 277 merged master).
 - 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.
+- 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).

@@ -724,6 +724,12 @@ async fn run_master_inner(
     if let Some(ref dpf) = dashboard_port_file {
         server_config = server_config.with_dashboard_port_file(dpf);
     }
+    let discovery_port = resolve_opt_u16(
+        args.discovery_port,
+        &["RUSTY_GRID_DISCOVERY_PORT"],
+        master_cfg.as_ref().and_then(|m| m.discovery_port),
+    );
+    server_config = apply_discovery_port(server_config, discovery_port);
     if args.dev {
         server_config = server_config.with_dev_mode(true);
     }
@@ -863,4 +869,50 @@ pub(super) fn dashboard_banner(
         );
     }
     lines
+}
+
+/// Applies the resolved `--discovery-port`: `None` keeps the default beacon port (8089), `0` turns
+/// the beacon off, anything else moves it. A set `RUSTY_GRID_DISABLE_DISCOVERY` still wins (it
+/// is read in `ServerConfig::new`, and a port never turns the beacon back on).
+fn apply_discovery_port(config: ServerConfig, port: Option<u16>) -> ServerConfig {
+    match port {
+        None => config,
+        Some(0) => config.with_discovery(false),
+        Some(p) => config.with_discovery_port(p),
+    }
+}
+
+#[cfg(test)]
+mod discovery_port_tests {
+    use super::*;
+
+    fn base() -> ServerConfig {
+        ServerConfig::new("127.0.0.1:18088".parse().unwrap()).with_discovery(true)
+    }
+
+    #[test]
+    fn unset_keeps_the_default_beacon_port() {
+        let c = apply_discovery_port(base(), None);
+        assert_eq!(c.discovery_port, rusty_grid_core::DEFAULT_DISCOVERY_PORT);
+        assert!(c.enable_discovery);
+    }
+
+    #[test]
+    fn a_port_moves_the_beacon() {
+        let c = apply_discovery_port(base(), Some(18089));
+        assert_eq!(c.discovery_port, 18089);
+        assert!(c.enable_discovery);
+    }
+
+    #[test]
+    fn zero_turns_the_beacon_off() {
+        let c = apply_discovery_port(base(), Some(0));
+        assert!(!c.enable_discovery);
+    }
+
+    #[test]
+    fn a_port_does_not_turn_a_disabled_beacon_back_on() {
+        let c = apply_discovery_port(base().with_discovery(false), Some(18089));
+        assert!(!c.enable_discovery);
+    }
 }

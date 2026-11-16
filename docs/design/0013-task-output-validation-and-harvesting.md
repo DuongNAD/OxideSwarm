@@ -60,7 +60,7 @@ In `harvest_output_artifacts`:
 1. `sanitize_relative_path(sandbox.path(), Path::new(expected))` validates relative components before filesystem access. Any parent directory traversal (`..`), absolute path, leading slash, Windows drive letter or DOS device name immediately returns `Err("output artifact '{expected}' resolves outside sandbox root")`.
 2. `tokio::fs::symlink_metadata` queries path metadata without dereferencing symlinks. If `meta.is_symlink()`, it immediately returns `Err("output artifact '{expected}' is a symbolic link (symbolic links are prohibited for security isolation)")`.
 3. `tokio::fs::canonicalize` verifies that the resolved path is rooted within the canonical sandbox directory.
-4. When a file is missing, if `process_failed` is false, it returns `Err("the task did not produce '{expected}'")`.
+4. When a file is missing (`NotFound` or `NotADirectory`), if `process_failed` is false, it returns `Err("the task did not produce '{expected}'")`. Any other error from the metadata query (access denied, a file being deleted, an invalid name) returns `Err("could not examine '{expected}': {error}")` and is logged as a warning, so the message does not claim that a file which may exist was not produced.
 
 ### D3. Inline Harvest vs. Content-Addressed Blob Data Plane
 

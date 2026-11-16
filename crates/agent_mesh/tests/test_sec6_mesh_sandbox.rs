@@ -313,7 +313,19 @@ async fn test_sec6_real_cli_no_shell_flag_execution() {
 
     let caller = AgentMeshClient::new(&hub_url, "cli-caller-rust", "windows");
     caller.connect().await.expect("caller connect failed");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The child process registers on its own schedule: wait until the hub lists it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let nodes = caller.query_node_list(Some(2000)).await.unwrap_or_default();
+        if nodes.iter().any(|n| n.node_id == "cli-noshell-rust") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for cli-noshell-rust to register with the hub"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let res = caller
         .send_command(

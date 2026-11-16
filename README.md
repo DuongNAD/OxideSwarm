@@ -224,7 +224,7 @@ flowchart LR
 |---|---|
 | `8088/tcp` | Cluster port: workers and clients connect here. It is the only valid `--master` target |
 | `8080/tcp` | Dashboard, REST and WebSocket (loopback unless you ask). Also a worker's standby portal, which listens on all interfaces without authentication unless the worker runs with `--no-portal` |
-| `8089/udp` | LAN discovery beacon (`--master auto`) |
+| `8089/udp` | LAN discovery beacon (`--master auto`; move or turn off with `master --discovery-port`) |
 | `8087/udp` | Short-code LAN pairing discovery (`oxideswarm invite --code` / `join --code`, plus an ephemeral TCP port while `invite --code` is waiting; [design 0052](docs/design/0052-short-code-pairing.md)) |
 | `8090/tcp` | Standalone HTTP rendezvous registry (`oxideswarm rendezvous`; `http://` only, use a reverse proxy for TLS) |
 
@@ -632,6 +632,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--web-ui-addr <ADDR>` | `127.0.0.1:8080` | Bind address for the embedded HTTP web dashboard (`0.0.0.0:8080` exposes it on the LAN) |
 | `--dashboard-port <PORT>` | `8080` (`RUSTY_GRID_DASHBOARD_PORT`, `OXIDE_SWARM_DASHBOARD_PORT`, `[master].dashboard_port`) | HTTP port for the embedded web dashboard (ignored if `--web-ui-addr` is given) |
 | `--dashboard-port-file <PATH>` | `RUSTY_GRID_DASHBOARD_PORT_FILE`, `OXIDE_SWARM_DASHBOARD_PORT_FILE`, `[master].dashboard_port_file` | File path where the bound dashboard HTTP port number is written |
+| `--discovery-port <PORT>` | `8089` (`RUSTY_GRID_DISCOVERY_PORT`, `[master].discovery_port`) | UDP port of the discovery beacon; `0` turns the beacon off. A worker or client finds a moved beacon only with `--master auto:<PORT>`; plain `auto` probes `8089` |
 | `--dev` | `false` (`OXIDE_DEV_MODE`) | Enable local development mode (bypasses dashboard token auth on loopback interfaces only) |
 | `--auth-token <TOKEN:NAME:SCOPES>` | Repeatable | Register an explicit dashboard API bearer token with comma-separated scopes (`admin`, `submit`, `observer`) |
 | `--auth <MODE>` | `both` (`RUSTY_GRID_AUTH`, `[master].auth`) | Peer admission mode ([design 0051](docs/design/0051-machine-identity-and-invites.md)): `both` (admits v2 cluster-secret peers and v3 `members.json` peers), `secret` (admits v2 cluster-secret peers only), or `members` (admits v3 `members.json` peers only and refuses v2 peers with `"this master admits enrolled machines only; join with an invite"`) |
@@ -844,7 +845,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `OXIDE_SWARM_DASHBOARD_PORT_FILE` | Master | Alternative alias for dashboard port file |
 | `RUSTY_GRID_DISABLE_WEB_UI` | Master | Disables embedding of Axum web dashboard server when set |
 | `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server (`1` or `true`) |
-| `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster when set |
+| `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster when set (wins over `--discovery-port`) |
+| `RUSTY_GRID_DISCOVERY_PORT` | Master | UDP discovery beacon port (`--discovery-port`; default `8089`, `0` = off) |
 | `OXIDESWARM_RENDEZVOUS` | Master, Worker & Clients | `http://HOST[:PORT][/PATH]` rendezvous registry URL for publishing or discovering the coordinator lease (`--rendezvous`; `https://` is rejected upfront) |
 | `OXIDESWARM_RENDEZVOUS_LISTEN` | Rendezvous | Listen address for `oxideswarm rendezvous` (`--listen`; default `127.0.0.1:8090`) |
 | `RUSTY_GRID_RENDEZVOUS` | Master, Worker & Clients | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
