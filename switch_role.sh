@@ -171,19 +171,15 @@ wait_registered() {
     return 1
 }
 
-# The CLI auto-loads ONE config file (RUSTY_GRID_CONFIG, ./rusty-grid.toml|json, then
-# ~/.oxideswarm/rusty-grid.toml). A p2p_ticket left in it (older connect_remote.sh wrote one
+# The CLI auto-loads ONE config file (RUSTY_GRID_CONFIG, else ~/.oxideswarm/rusty-grid.toml or
+# $OXIDESWARM_HOME/rusty-grid.toml). A p2p_ticket left in it (older connect_remote.sh wrote one
 # there) makes the worker dial that ticket instead of --master, so it never registers.
 warn_config_ticket() {
     local cfg=""
     if [[ -n "${RUSTY_GRID_CONFIG:-}" ]]; then
         cfg="$RUSTY_GRID_CONFIG"
-    elif [[ -f "rusty-grid.toml" ]]; then
-        cfg="$PWD/rusty-grid.toml"
-    elif [[ -f "rusty-grid.json" ]]; then
-        cfg="$PWD/rusty-grid.json"
-    elif [[ -f "${HOME}/.oxideswarm/rusty-grid.toml" ]]; then
-        cfg="${HOME}/.oxideswarm/rusty-grid.toml"
+    elif [[ -f "${STATE_DIR}/rusty-grid.toml" ]]; then
+        cfg="${STATE_DIR}/rusty-grid.toml"
     fi
     if [[ -n "$cfg" && -f "$cfg" ]] && grep -Eq "p2p_ticket" "$cfg" 2>/dev/null; then
         echo "[WARN] ${cfg} contains a p2p_ticket. The CLI loads that file on every run, so a worker may dial the ticket" >&2
