@@ -35,13 +35,7 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
         .unwrap()
         .to_vec();
     let len = raw.len();
-    if version < 6 {
-        // A v5 client sent no `workspace` (a one-byte `None` before `wait` and the version).
-        assert_eq!(raw[len - 6], 0);
-        raw.remove(len - 6);
-    }
-    if version < 9 {
-        // Clients before v9 sent no `vram_mb` (a one-byte `None` at the end of `TaskRequirements`).
+    let vram_tag_offset = {
         let mut task_with_vram = task.clone();
         task_with_vram.requirements.vram_mb = Some(0x1122_3344_5566_7788);
         let with_vram = serialize_message(
@@ -52,11 +46,28 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
             WireCodec::Bincode,
         )
         .unwrap();
-        let vram_tag_offset = raw
-            .iter()
+        raw.iter()
             .zip(with_vram.iter())
             .position(|(a, b)| a != b)
-            .expect("vram_mb byte offset");
+            .expect("vram_mb byte offset")
+    };
+    if version < 10 {
+        // Clients before v10 sent no `extensions` lists (an empty list is an 8-byte length):
+        // `Task::extensions` sits before `wait` and the version, `TaskRequirements::extensions`
+        // right after `vram_mb` (one byte, `None`).
+        assert_eq!(&raw[len - 13..len - 5], &[0u8; 8]);
+        raw.drain(len - 13..len - 5);
+        assert_eq!(&raw[vram_tag_offset + 1..vram_tag_offset + 9], &[0u8; 8]);
+        raw.drain(vram_tag_offset + 1..vram_tag_offset + 9);
+    }
+    let len = raw.len();
+    if version < 6 {
+        // A v5 client sent no `workspace` (a one-byte `None` before `wait` and the version).
+        assert_eq!(raw[len - 6], 0);
+        raw.remove(len - 6);
+    }
+    if version < 9 {
+        // Clients before v9 sent no `vram_mb` (a one-byte `None` in `TaskRequirements`).
         assert_eq!(raw[vram_tag_offset], 0);
         raw.remove(vram_tag_offset);
     }

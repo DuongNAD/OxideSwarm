@@ -204,6 +204,10 @@ The three first items fit one pull request (L, as in the backlog). They land at 
     test, adding or editing a registry id needs a `PROTOCOL_VERSION_CURRENT` bump with the
     regeneration, and changing or removing one needs `MIN` too; that is stricter than D1's "may
     move", and it is the visible diff D3 asked for.
+  - **Location (D1, D3).** The types, registry, limits and receiver rules sit in
+    `crates/core/src/task/extension.rs`, re-exported by `crates/core/src/task.rs` (so the path
+    `rusty_grid_core::task::Extension` is as written): `task.rs` would have passed the 3,000-line
+    check of design 0080.
   - **`decode` (D3)** is `fn(&[u8]) -> Result<(), String>`: it checks the value. The typed value
     arrives with the first real id, whose record fixes its type.
   - **Placement (D4.3).** There is no `TaskView::required_extensions` and no new `Shape` field.

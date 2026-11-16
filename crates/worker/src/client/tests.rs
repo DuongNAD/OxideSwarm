@@ -2474,6 +2474,7 @@ fn test_worker_advertises_system_tags_then_user_tags() {
         "iso:off".to_string(),
     ];
     expected.extend(rusty_grid_core::capabilities::detect_host_tools());
+    expected.extend(rusty_grid_core::task::worker_extension_tags());
     expected.push("laptop".to_string());
     assert_eq!(
             client.capabilities().tags,
