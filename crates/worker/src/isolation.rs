@@ -2723,25 +2723,6 @@ pub mod windows {
         record_manifest_line(manifest_path, &line)
     }
 
-    /// Test-only failure injection for the LUA spawn path (SEC-11). Never compiled into a
-    /// release build.
-    #[cfg(test)]
-    pub(crate) mod lua_test_hook {
-        use std::cell::Cell;
-        pub(crate) const OFF: u8 = 0;
-        /// Behave as an elevated worker whose LUA token could not be created.
-        pub(crate) const NO_TOKEN: u8 = 1;
-        /// Behave as an elevated worker whose `CreateProcessAsUserW` fails (invalid token).
-        pub(crate) const BAD_TOKEN: u8 = 2;
-        // Per thread, so a test that injects a failure cannot affect tests running in parallel.
-        thread_local! {
-            pub(crate) static MODE: Cell<u8> = const { Cell::new(OFF) };
-        }
-        pub(crate) fn mode() -> u8 {
-            MODE.with(Cell::get)
-        }
-    }
-
     /// Logs once per worker process why an elevated worker refuses to use its own token.
     fn log_elevated_token_refusal_once(message: &str) {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5471,6 +5452,25 @@ pub mod windows {
             exited: false,
         })
     }
+
+    /// Test-only failure injection for the LUA spawn path (SEC-11). Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(crate) mod lua_test_hook {
+        use std::cell::Cell;
+        pub(crate) const OFF: u8 = 0;
+        /// Behave as an elevated worker whose LUA token could not be created.
+        pub(crate) const NO_TOKEN: u8 = 1;
+        /// Behave as an elevated worker whose `CreateProcessAsUserW` fails (invalid token).
+        pub(crate) const BAD_TOKEN: u8 = 2;
+        // Per thread, so a test that injects a failure cannot affect tests running in parallel.
+        thread_local! {
+            pub(crate) static MODE: Cell<u8> = const { Cell::new(OFF) };
+        }
+        pub(crate) fn mode() -> u8 {
+            MODE.with(Cell::get)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6145,7 +6145,7 @@ mod tests {
     fn run_forced_lua_failure(mode: u8) -> String {
         let home = tempfile::tempdir().unwrap();
         let base = windows::normalize_win_path(home.path());
-        let probe_dir = base.join("sec11");
+        let probe_dir = base.join(format!(".isolation-probe-sec11-{mode}"));
         std::fs::create_dir_all(&probe_dir).unwrap();
         let probe_dir = windows::normalize_win_path(&probe_dir);
         let empty_host =
