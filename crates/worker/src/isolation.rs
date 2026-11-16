@@ -336,7 +336,7 @@ pub(crate) struct Jail<'a> {
 /// is the `sandbox-exec` wrapper; on Linux it is the program itself and the confinement is
 /// applied by the `pre_exec` hook that [`confine_command`] registers. A platform without an
 /// implementation yields an error: a confined task is never silently started plain.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn wrap_program(
     jail: &Jail<'_>,
     program: &str,
