@@ -152,8 +152,8 @@ the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with it
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
 (TEST-33 to TEST-35), it holds 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 277 (TEST-36 to TEST-38 added): 153 items, 98 Implemented,
-11 Partial and 44 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 277 (CLI-2 Implemented, TEST-36 to TEST-38 added): 153 items, 99 Implemented,
+11 Partial and 43 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -311,7 +311,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
-| CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Planned |  |
+| CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
 
@@ -2957,6 +2957,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Add a flag and an environment variable (`RUSTY_GRID_*`) to set the beacon port or turn
   the beacon off. Update the `README.md` reference.
 - **Done when:** Two masters on one machine run at the same time, one with the beacon off.
+- **Implemented (2026-11-17, pull request 275):** `master --discovery-port <PORT>` (`RUSTY_GRID_DISCOVERY_PORT`,
+  `[master].discovery_port`) moves the beacon and `0` turns it off; design 0084. A worker finds a moved
+  beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
+  once, one with the beacon off.
 
 ## Status log
 
@@ -3318,4 +3322,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
 - 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
+- 2026-11-17: CLI-2 Implemented (pull request 275): `master --discovery-port`; design 0084. The Index counts are now 99 Implemented, 11 Partial and 43 Planned (153 items, recounted when pull request 277 merged master).
 - 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.
+- 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).
