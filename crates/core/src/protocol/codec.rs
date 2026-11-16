@@ -11,17 +11,18 @@ use super::client_msg_mirrors::{
     LegacyV5BinaryClientMessage, LegacyV6ToV8BinaryClientMessage, LegacyV9BinaryClientMessage,
 };
 use super::client_resp_mirrors::{
-    BinaryClientResponse, HumanClientResponse, LegacyV2BinaryClientResponse,
-    LegacyV3V4BinaryClientResponse,
+    serialize_client_response_with_version, BinaryClientResponse, HumanClientResponse,
+    LegacyV2BinaryClientResponse, LegacyV3V4BinaryClientResponse,
 };
 use super::worker_master_mirrors::{
-    BinaryInboundMessage, LegacyBinaryMasterMessage, LegacyBinaryWorkerMessage,
+    master_message_for_peer, serialize_master_message_v9_bincode, BinaryInboundMessage,
+    LegacyBinaryMasterMessage, LegacyBinaryWorkerMessage,
 };
 use super::{
-    is_protocol_version_compatible, ClientMessage, ClientResponse, EndpointRole, InboundMessage,
-    MasterMessage, ProtocolError, WireCodec, WorkerMessage, LENGTH_FIELD_BYTES, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE,
-    WIRE_FORMAT_ENCRYPTED, WIRE_FORMAT_JSON,
+    is_master_echo_acceptable, is_protocol_version_compatible, ClientMessage, ClientResponse,
+    EndpointRole, InboundMessage, MasterMessage, ProtocolError, WireCodec, WorkerMessage,
+    LENGTH_FIELD_BYTES, MAX_FRAME_SIZE, PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
+    WIRE_FORMAT_BINCODE, WIRE_FORMAT_ENCRYPTED, WIRE_FORMAT_JSON,
 };
 
 // Error texts of the record layer. They are fixed strings on purpose: callers log them, so they
@@ -278,6 +279,164 @@ pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Byte
     }
 }
 
+/// Serializes a message for a peer speaking `peer_version` (design 0083 D3).
+///
+/// For the current version this is [`serialize_message`]. For an older one the messages whose
+/// layout or stamp differ are re-encoded: `MasterMessage` (the accepted `RegisterAck` echoes the
+/// peer's version, tasks go through `Task::for_peer` and, in bincode, take the v9 task layout)
+/// and `ClientResponse` (same layout, stamp = the peer's version, except `Error`, which keeps
+/// stamping the current version that a peer reads without a check). Every other message has the
+/// same bytes in both versions.
+pub fn serialize_message_for_peer<M: Serialize + 'static>(
+    msg: &M,
+    codec: WireCodec,
+    peer_version: u32,
+) -> Result<Bytes, ProtocolError> {
+    if peer_version >= PROTOCOL_VERSION_CURRENT {
+        return serialize_message(msg, codec);
+    }
+    let any: &dyn std::any::Any = msg;
+    if let Some(master) = any.downcast_ref::<MasterMessage>() {
+        let adapted = master_message_for_peer(master, peer_version);
+        return match codec {
+            WireCodec::Json => serialize_message(&adapted, WireCodec::Json),
+            WireCodec::Bincode => {
+                let payload = serialize_master_message_v9_bincode(adapted)?;
+                let size = 1usize.saturating_add(payload.len());
+                if size > MAX_FRAME_SIZE {
+                    return Err(ProtocolError::FrameTooLarge {
+                        size,
+                        max: MAX_FRAME_SIZE,
+                    });
+                }
+                let mut buf = Vec::with_capacity(size);
+                buf.push(WIRE_FORMAT_BINCODE);
+                buf.extend_from_slice(&payload);
+                Ok(Bytes::from(buf))
+            }
+        };
+    }
+    if let Some(resp) = any.downcast_ref::<ClientResponse>() {
+        if matches!(resp, ClientResponse::Error { .. }) {
+            return serialize_message(resp, codec);
+        }
+        return serialize_client_response_with_version(resp, peer_version, codec);
+    }
+    serialize_message(msg, codec)
+}
+
+/// Serializes a [`ClientMessage`] as a v9 client sends it (design 0083, for tests): stamped 9, and
+/// a `SubmitTask` in the v9 task layout without extensions. Every other message has the same
+/// layout in both versions. The layout is the one `wire_layout_previous.txt` (v0.3.0) pins.
+#[cfg(any(test, feature = "test-extensions"))]
+pub fn serialize_v9_client_message(
+    msg: &ClientMessage,
+    codec: WireCodec,
+) -> Result<Bytes, ProtocolError> {
+    use super::client_msg_mirrors::LegacyV9Task;
+    const V9: u32 = 9;
+    if let (ClientMessage::SubmitTask { task, wait }, WireCodec::Bincode) = (msg, codec) {
+        return serialize_message(
+            &LegacyV9BinaryClientMessage::SubmitTask {
+                task: LegacyV9Task::from(task.for_peer(V9)),
+                wait: *wait,
+                protocol_version: V9,
+            },
+            WireCodec::Bincode,
+        );
+    }
+    let msg = match msg {
+        ClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask {
+            task: task.for_peer(V9),
+            wait: *wait,
+        },
+        other => other.clone(),
+    };
+    match codec {
+        WireCodec::Bincode => serialize_message(
+            &BinaryClientMessage::from_client_message(msg, V9),
+            WireCodec::Bincode,
+        ),
+        WireCodec::Json => serialize_message(
+            &HumanClientMessage::from_client_message(msg, V9),
+            WireCodec::Json,
+        ),
+    }
+}
+
+/// Reads a frame the way a v9 peer does (a frozen reader for tests, design 0083): a
+/// `MasterMessage` in the v9 task layout whose accepted `RegisterAck` must carry version 9, a
+/// `ClientResponse` whose stamp must be 9 unless it is an `Error`. Any other type has the same
+/// layout in both versions and goes through [`deserialize_message`].
+#[cfg(any(test, feature = "test-extensions"))]
+pub fn deserialize_message_as_v9<M: DeserializeOwned + 'static>(
+    bytes: &[u8],
+) -> Result<(M, WireCodec), ProtocolError> {
+    const V9: u32 = 9;
+    let tid = std::any::TypeId::of::<M>();
+    if tid == std::any::TypeId::of::<MasterMessage>() {
+        let (msg, codec) = match bytes.first().copied() {
+            Some(WIRE_FORMAT_BINCODE) => (
+                super::worker_master_mirrors::deserialize_master_message_v9_bincode(&bytes[1..])?,
+                WireCodec::Bincode,
+            ),
+            _ => {
+                let (m, c) = deserialize_message::<MasterMessage>(bytes)?;
+                (m, c)
+            }
+        };
+        if let MasterMessage::RegisterAck {
+            accepted: true,
+            protocol_version,
+            ..
+        } = &msg
+        {
+            if *protocol_version != V9 {
+                return Err(ProtocolError::IncompatibleVersion {
+                    peer_version: *protocol_version,
+                    current_version: V9,
+                    min_compatible_version: V9,
+                });
+            }
+        }
+        return Ok((downcast_msg(msg), codec));
+    }
+    if tid == std::any::TypeId::of::<ClientResponse>() {
+        let (stamp, is_error, msg, codec) = match bytes.first().copied() {
+            Some(WIRE_FORMAT_BINCODE) => {
+                let bin: BinaryClientResponse =
+                    bincode_exact_deserialize(&bytes[1..]).map_err(ProtocolError::Bincode)?;
+                (
+                    bin.protocol_version(),
+                    bin.is_error(),
+                    ClientResponse::from(bin),
+                    WireCodec::Bincode,
+                )
+            }
+            Some(WIRE_FORMAT_JSON) => {
+                let human: HumanClientResponse = serde_json::from_slice(&bytes[1..])?;
+                (
+                    human.protocol_version(),
+                    human.is_error(),
+                    ClientResponse::from(human),
+                    WireCodec::Json,
+                )
+            }
+            Some(tag) => return Err(ProtocolError::InvalidFormatTag(tag)),
+            None => return Err(ProtocolError::UnexpectedEof),
+        };
+        if !is_error && stamp != V9 {
+            return Err(ProtocolError::IncompatibleVersion {
+                peer_version: stamp,
+                current_version: V9,
+                min_compatible_version: V9,
+            });
+        }
+        return Ok((downcast_msg(msg), codec));
+    }
+    deserialize_message::<M>(bytes)
+}
+
 pub(super) fn bincode_exact_deserialize<T: DeserializeOwned>(
     slice: &[u8],
 ) -> Result<T, Box<bincode::ErrorKind>> {
@@ -304,14 +463,50 @@ fn incompatible_version_error(peer_version: u32) -> ProtocolError {
     }
 }
 
-fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, ProtocolError> {
+/// The protocol version whose `Task` layout (no `extensions`) a v10 Master still reads in a
+/// `SubmitTask` (design 0083 D4).
+const WINDOW_LEGACY_TASK_VERSION: u32 = 9;
+
+/// Decodes `slice` as the v9 `SubmitTask` its stamp `stamp` claims, and as nothing else: a frame
+/// is never accepted under a layout its stamp contradicts (design 0083 D2).
+fn decode_legacy_v9_submit(slice: &[u8], stamp: u32) -> Result<ClientMessage, ProtocolError> {
+    match bincode_exact_deserialize::<LegacyV9BinaryClientMessage>(slice) {
+        Ok(LegacyV9BinaryClientMessage::SubmitTask {
+            task,
+            wait,
+            protocol_version,
+        }) if protocol_version == stamp && stamp == WINDOW_LEGACY_TASK_VERSION => {
+            Ok(ClientMessage::SubmitTask {
+                task: task.into(),
+                wait,
+            })
+        }
+        Ok(_) => Err(ProtocolError::Bincode(Box::new(
+            bincode::ErrorKind::Custom(format!(
+                "SubmitTask stamped {stamp} does not match the layout of that version"
+            )),
+        ))),
+        Err(e) => Err(ProtocolError::Bincode(e)),
+    }
+}
+
+/// Decodes a bincode [`ClientMessage`] and returns it with its protocol version stamp.
+fn decode_bincode_client_message(slice: &[u8]) -> Result<(ClientMessage, u32), ProtocolError> {
     match bincode_exact_deserialize::<BinaryClientMessage>(slice) {
         Ok(bin_msg) => {
             let ver = bin_msg.protocol_version();
             if !is_protocol_version_compatible(ver) {
                 return Err(incompatible_version_error(ver));
             }
-            Ok(bin_msg.into())
+            // A v9 `SubmitTask` can parse as a v10 one by accident (design 0083 D2: a
+            // `created_at_utc` of 0 reads as an empty extension list). When the stamp is below the
+            // current version, the layout of that stamp decides.
+            if ver < PROTOCOL_VERSION_CURRENT
+                && matches!(bin_msg, BinaryClientMessage::SubmitTask { .. })
+            {
+                return decode_legacy_v9_submit(slice, ver).map(|m| (m, ver));
+            }
+            Ok((bin_msg.into(), ver))
         }
         Err(err) => {
             if bincode_exact_deserialize::<LegacyV2BinaryClientMessage>(slice).is_ok() {
@@ -340,6 +535,10 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, Protocol
                 if !is_protocol_version_compatible(protocol_version) {
                     return Err(incompatible_version_error(protocol_version));
                 }
+                if protocol_version == WINDOW_LEGACY_TASK_VERSION {
+                    return decode_legacy_v9_submit(slice, protocol_version)
+                        .map(|m| (m, protocol_version));
+                }
             }
             Err(ProtocolError::Bincode(err))
         }
@@ -350,7 +549,7 @@ fn decode_bincode_client_response(slice: &[u8]) -> Result<ClientResponse, Protoc
     match bincode_exact_deserialize::<BinaryClientResponse>(slice) {
         Ok(bin_resp) => {
             let ver = bin_resp.protocol_version();
-            if !bin_resp.is_error() && !is_protocol_version_compatible(ver) {
+            if !bin_resp.is_error() && !is_master_echo_acceptable(ver) {
                 return Err(incompatible_version_error(ver));
             }
             Ok(bin_resp.into())
@@ -375,33 +574,35 @@ fn decode_bincode_client_response(slice: &[u8]) -> Result<ClientResponse, Protoc
     }
 }
 
-fn decode_bincode_inbound_message(slice: &[u8]) -> Result<InboundMessage, ProtocolError> {
+fn decode_bincode_inbound_message(
+    slice: &[u8],
+) -> Result<(InboundMessage, Option<u32>), ProtocolError> {
     // 1. Bare modern WorkerMessage opening with Register.
     if let Ok(w) = bincode_exact_deserialize::<WorkerMessage>(slice) {
         if matches!(w, WorkerMessage::Register { .. }) {
-            return Ok(InboundMessage::Worker(w));
+            return Ok((InboundMessage::Worker(w), None));
         }
     }
 
     // 2. Bare ClientMessage (checks protocol_version and legacy v2 client layout).
     let client_res = decode_bincode_client_message(slice);
-    if let Ok(c) = client_res {
-        return Ok(InboundMessage::Client(c));
+    if let Ok((c, ver)) = &client_res {
+        return Ok((InboundMessage::Client(c.clone()), Some(*ver)));
     }
 
     // 3. Bare non-Register WorkerMessage.
     if let Ok(w) = bincode_exact_deserialize::<WorkerMessage>(slice) {
-        return Ok(InboundMessage::Worker(w));
+        return Ok((InboundMessage::Worker(w), None));
     }
 
     // 4. Bare legacy WorkerMessage.
     if let Ok(legacy) = bincode_exact_deserialize::<LegacyBinaryWorkerMessage>(slice) {
-        return Ok(InboundMessage::Worker(legacy.into()));
+        return Ok((InboundMessage::Worker(legacy.into()), None));
     }
 
     // 5. Wrapped BinaryInboundMessage.
     if let Ok(wrapped) = bincode_exact_deserialize::<BinaryInboundMessage>(slice) {
-        return Ok(wrapped.into());
+        return Ok((wrapped.into(), None));
     }
 
     // 6. Surface version mismatch when the frame matched a ClientMessage layout with an
@@ -414,48 +615,56 @@ fn decode_bincode_inbound_message(slice: &[u8]) -> Result<InboundMessage, Protoc
     if slice.len() >= 4 {
         let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
         if (8..10_000).contains(&tag) {
-            return Ok(InboundMessage::Worker(WorkerMessage::UnknownVariant {
-                tag,
-                raw_bytes: slice[4..].to_vec(),
-            }));
+            return Ok((
+                InboundMessage::Worker(WorkerMessage::UnknownVariant {
+                    tag,
+                    raw_bytes: slice[4..].to_vec(),
+                }),
+                None,
+            ));
         }
     }
 
     Err(client_res.unwrap_err())
 }
 
-fn decode_json_client_message(raw: &[u8]) -> Result<ClientMessage, ProtocolError> {
+fn decode_json_client_message(raw: &[u8]) -> Result<(ClientMessage, u32), ProtocolError> {
     let human: HumanClientMessage = serde_json::from_slice(raw)?;
     let ver = human.protocol_version();
     if !is_protocol_version_compatible(ver) {
         return Err(incompatible_version_error(ver));
     }
-    Ok(human.into())
+    Ok((human.into(), ver))
 }
 
 fn decode_json_client_response(raw: &[u8]) -> Result<ClientResponse, ProtocolError> {
     let human: HumanClientResponse = serde_json::from_slice(raw)?;
     let ver = human.protocol_version();
-    if !human.is_error() && !is_protocol_version_compatible(ver) {
+    if !human.is_error() && !is_master_echo_acceptable(ver) {
         return Err(incompatible_version_error(ver));
     }
     Ok(human.into())
 }
 
-fn decode_json_typed<M: DeserializeOwned + 'static>(raw: &[u8]) -> Result<M, ProtocolError> {
+fn decode_json_typed<M: DeserializeOwned + 'static>(
+    raw: &[u8],
+) -> Result<(M, Option<u32>), ProtocolError> {
     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientMessage>() {
-        return decode_json_client_message(raw).map(downcast_msg);
+        return decode_json_client_message(raw).map(|(m, v)| (downcast_msg(m), Some(v)));
     }
     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientResponse>() {
-        return decode_json_client_response(raw).map(downcast_msg);
+        return decode_json_client_response(raw).map(|m| (downcast_msg(m), None));
     }
     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
         if let Ok(w) = serde_json::from_slice::<WorkerMessage>(raw) {
-            return Ok(downcast_msg(InboundMessage::Worker(w)));
+            return Ok((downcast_msg(InboundMessage::Worker(w)), None));
         }
-        return decode_json_client_message(raw).map(|c| downcast_msg(InboundMessage::Client(c)));
+        return decode_json_client_message(raw)
+            .map(|(c, v)| (downcast_msg(InboundMessage::Client(c)), Some(v)));
     }
-    serde_json::from_slice::<M>(raw).map_err(ProtocolError::Json)
+    serde_json::from_slice::<M>(raw)
+        .map(|m| (m, None))
+        .map_err(ProtocolError::Json)
 }
 
 fn peek_wire_codec(bytes: &[u8]) -> Option<WireCodec> {
@@ -471,9 +680,18 @@ fn peek_wire_codec(bytes: &[u8]) -> Option<WireCodec> {
 pub fn deserialize_message<M: DeserializeOwned + 'static>(
     bytes: &[u8],
 ) -> Result<(M, WireCodec), ProtocolError> {
+    deserialize_message_with_version(bytes).map(|(msg, codec, _)| (msg, codec))
+}
+
+/// Like [`deserialize_message`], and also returns the protocol version stamped on a
+/// [`ClientMessage`] (or on the one inside an [`InboundMessage`]): the version of the peer that
+/// sent it (design 0083 D2). It is `None` for every other message.
+pub fn deserialize_message_with_version<M: DeserializeOwned + 'static>(
+    bytes: &[u8],
+) -> Result<(M, WireCodec, Option<u32>), ProtocolError> {
     if bytes.is_empty() {
         return serde_json::from_slice::<M>(bytes)
-            .map(|m| (m, WireCodec::Json))
+            .map(|m| (m, WireCodec::Json, None))
             .map_err(ProtocolError::Json);
     }
 
@@ -482,19 +700,19 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
             let slice = &bytes[1..];
             if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientMessage>() {
                 return decode_bincode_client_message(slice)
-                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+                    .map(|(msg, ver)| (downcast_msg(msg), WireCodec::Bincode, Some(ver)));
             }
             if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientResponse>() {
                 return decode_bincode_client_response(slice)
-                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode, None));
             }
             if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
                 return decode_bincode_inbound_message(slice)
-                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+                    .map(|(msg, ver)| (downcast_msg(msg), WireCodec::Bincode, ver));
             }
 
             match bincode_exact_deserialize::<M>(slice) {
-                Ok(msg) => Ok((msg, WireCodec::Bincode)),
+                Ok(msg) => Ok((msg, WireCodec::Bincode, None)),
                 Err(e) => {
                     // Fallback for WorkerMessage (legacy or unknown variant)
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<WorkerMessage>() {
@@ -502,7 +720,7 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                             bincode_exact_deserialize::<LegacyBinaryWorkerMessage>(slice)
                         {
                             let msg: WorkerMessage = legacy.into();
-                            return Ok((downcast_msg(msg), WireCodec::Bincode));
+                            return Ok((downcast_msg(msg), WireCodec::Bincode, None));
                         }
                         if slice.len() >= 4 {
                             let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
@@ -511,7 +729,7 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                                     tag,
                                     raw_bytes: slice[4..].to_vec(),
                                 };
-                                return Ok((downcast_msg(unknown), WireCodec::Bincode));
+                                return Ok((downcast_msg(unknown), WireCodec::Bincode, None));
                             }
                         }
                     }
@@ -522,7 +740,7 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                             bincode_exact_deserialize::<LegacyBinaryMasterMessage>(slice)
                         {
                             let msg: MasterMessage = legacy.into();
-                            return Ok((downcast_msg(msg), WireCodec::Bincode));
+                            return Ok((downcast_msg(msg), WireCodec::Bincode, None));
                         }
                         if slice.len() >= 4 {
                             let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
@@ -531,7 +749,7 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                                     tag,
                                     raw_bytes: slice[4..].to_vec(),
                                 };
-                                return Ok((downcast_msg(unknown), WireCodec::Bincode));
+                                return Ok((downcast_msg(unknown), WireCodec::Bincode, None));
                             }
                         }
                     }
@@ -540,9 +758,11 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                 }
             }
         }
-        WIRE_FORMAT_JSON => decode_json_typed::<M>(&bytes[1..]).map(|msg| (msg, WireCodec::Json)),
+        WIRE_FORMAT_JSON => {
+            decode_json_typed::<M>(&bytes[1..]).map(|(msg, ver)| (msg, WireCodec::Json, ver))
+        }
         b'{' | b' ' | b'\t' | b'\r' | b'\n' => {
-            decode_json_typed::<M>(bytes).map(|msg| (msg, WireCodec::Json))
+            decode_json_typed::<M>(bytes).map(|(msg, ver)| (msg, WireCodec::Json, ver))
         }
         tag => Err(ProtocolError::InvalidFormatTag(tag)),
     }
@@ -552,7 +772,11 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
 pub struct MessageTransport<T> {
     inner: Framed<T, LengthDelimitedCodec>,
     codec: WireCodec,
+    /// Protocol version the peer speaks, for outbound messages (design 0083 D3).
+    peer_version: u32,
     last_detected_codec: Option<WireCodec>,
+    /// Protocol version stamped on the most recently received client message.
+    last_peer_version: Option<u32>,
     aead_writer: Option<AeadWriterSession>,
     aead_reader: Option<AeadReaderSession>,
 }
@@ -570,7 +794,9 @@ impl<T> MessageTransport<T> {
         Self {
             inner: Framed::new(io, default_codec()),
             codec,
+            peer_version: PROTOCOL_VERSION_CURRENT,
             last_detected_codec: None,
+            last_peer_version: None,
             aead_writer: None,
             aead_reader: None,
         }
@@ -601,6 +827,29 @@ impl<T> MessageTransport<T> {
     /// Returns the wire codec detected from the most recently received frame, if any.
     pub fn last_detected_codec(&self) -> Option<WireCodec> {
         self.last_detected_codec
+    }
+
+    /// Returns the protocol version outbound messages are encoded for.
+    pub fn peer_version(&self) -> u32 {
+        self.peer_version
+    }
+
+    /// Sets the protocol version outbound messages are encoded for (design 0083 D3). The default
+    /// is [`PROTOCOL_VERSION_CURRENT`], for which nothing changes.
+    pub fn set_peer_version(&mut self, version: u32) {
+        self.peer_version = version;
+    }
+
+    /// Returns the protocol version stamped on the most recently received client message, if any
+    /// (design 0083 D2).
+    pub fn last_peer_version(&self) -> Option<u32> {
+        self.last_peer_version
+    }
+
+    /// Records the version of a client message that was decoded outside this transport (from a
+    /// raw frame).
+    pub fn note_peer_version(&mut self, version: u32) {
+        self.last_peer_version = Some(version);
     }
 
     /// Consumes this transport, returning the underlying `Framed` stream.
@@ -644,21 +893,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     pub fn split(self) -> (MessageWriter<WriteHalf<T>>, MessageReader<ReadHalf<T>>) {
         let parts = self.inner.into_parts();
         let (read_half, write_half) = split(parts.io);
-        (
-            MessageWriter::with_codec_buffer_and_aead(
-                write_half,
-                self.codec,
-                parts.write_buf,
-                self.aead_writer,
-            ),
-            MessageReader::with_buffer_and_aead(read_half, parts.read_buf, self.aead_reader),
-        )
+        let mut writer = MessageWriter::with_codec_buffer_and_aead(
+            write_half,
+            self.codec,
+            parts.write_buf,
+            self.aead_writer,
+        );
+        writer.set_peer_version(self.peer_version);
+        let mut reader =
+            MessageReader::with_buffer_and_aead(read_half, parts.read_buf, self.aead_reader);
+        reader.last_peer_version = self.last_peer_version;
+        (writer, reader)
     }
 
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     /// If encryption is enabled, the frame is encrypted using the AEAD writer session.
-    pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
-        let payload = serialize_message(msg, self.codec)?;
+    pub async fn send_msg<M: Serialize + 'static>(&mut self, msg: &M) -> Result<(), ProtocolError> {
+        let payload = serialize_message_for_peer(msg, self.codec, self.peer_version)?;
         let frame = match self.aead_writer.as_mut() {
             Some(w) => w.encrypt_frame(&payload)?,
             None => payload,
@@ -676,12 +927,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     /// Serializes and sends a message framed with a 4-byte length prefix, requiring write progress
     /// at least once every `idle_timeout` so large frames over slow links succeed as long as bytes
     /// continue to drain.
-    pub async fn send_msg_with_idle_timeout<M: Serialize>(
+    pub async fn send_msg_with_idle_timeout<M: Serialize + 'static>(
         &mut self,
         msg: &M,
         idle_timeout: std::time::Duration,
     ) -> Result<(), ProtocolError> {
-        let payload = serialize_message(msg, self.codec)?;
+        let payload = serialize_message_for_peer(msg, self.codec, self.peer_version)?;
         let frame = match self.aead_writer.as_mut() {
             Some(w) => w.encrypt_frame(&payload)?,
             None => payload,
@@ -797,8 +1048,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
                 if let Some(detected) = peek_wire_codec(&plaintext) {
                     self.last_detected_codec = Some(detected);
                 }
-                let (msg, codec) = deserialize_message::<M>(&plaintext)?;
+                let (msg, codec, version) = deserialize_message_with_version::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
+                if version.is_some() {
+                    self.last_peer_version = version;
+                }
                 Ok(Some((msg, codec)))
             }
             Some(Err(e)) => {
@@ -892,6 +1146,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
 pub struct MessageReader<R> {
     inner: Framed<R, LengthDelimitedCodec>,
     last_detected_codec: Option<WireCodec>,
+    last_peer_version: Option<u32>,
     aead_reader: Option<AeadReaderSession>,
 }
 
@@ -917,6 +1172,7 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
         Self {
             inner: Framed::from_parts(parts),
             last_detected_codec: None,
+            last_peer_version: None,
             aead_reader,
         }
     }
@@ -954,8 +1210,11 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                 if let Some(detected) = peek_wire_codec(&plaintext) {
                     self.last_detected_codec = Some(detected);
                 }
-                let (msg, codec) = deserialize_message::<M>(&plaintext)?;
+                let (msg, codec, version) = deserialize_message_with_version::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
+                if version.is_some() {
+                    self.last_peer_version = version;
+                }
                 Ok(Some((msg, codec)))
             }
             Some(Err(e)) => {
@@ -977,6 +1236,12 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
     /// Returns the wire codec detected from the most recently received frame, if any.
     pub fn last_detected_codec(&self) -> Option<WireCodec> {
         self.last_detected_codec
+    }
+
+    /// Returns the protocol version stamped on the most recently received client message, if any
+    /// (design 0083 D2).
+    pub fn last_peer_version(&self) -> Option<u32> {
+        self.last_peer_version
     }
 
     /// Reads raw frame bytes without deserializing.
@@ -1004,6 +1269,8 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
 pub struct MessageWriter<W> {
     inner: FramedWrite<W, LengthDelimitedCodec>,
     codec: WireCodec,
+    /// Protocol version the peer speaks, for outbound messages (design 0083 D3).
+    peer_version: u32,
     aead_writer: Option<AeadWriterSession>,
 }
 
@@ -1042,6 +1309,7 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
         Self {
             inner: framed,
             codec,
+            peer_version: PROTOCOL_VERSION_CURRENT,
             aead_writer,
         }
     }
@@ -1066,9 +1334,19 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
         self.codec = codec;
     }
 
+    /// Returns the protocol version outbound messages are encoded for.
+    pub fn peer_version(&self) -> u32 {
+        self.peer_version
+    }
+
+    /// Sets the protocol version outbound messages are encoded for (design 0083 D3).
+    pub fn set_peer_version(&mut self, version: u32) {
+        self.peer_version = version;
+    }
+
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
-    pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
-        let payload = serialize_message(msg, self.codec)?;
+    pub async fn send_msg<M: Serialize + 'static>(&mut self, msg: &M) -> Result<(), ProtocolError> {
+        let payload = serialize_message_for_peer(msg, self.codec, self.peer_version)?;
         let frame = match self.aead_writer.as_mut() {
             Some(w) => w.encrypt_frame(&payload)?,
             None => payload,

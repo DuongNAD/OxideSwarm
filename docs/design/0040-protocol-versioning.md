@@ -52,6 +52,10 @@ Before this change:
   enforce `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (`3..=3`), **every bump of
   `PROTOCOL_VERSION_CURRENT` breaks older peers** (an older v3 peer will refuse a v4 peer even if
   the change was purely additive). All nodes in a cluster must run matching builds.
+  **Changed from protocol 10 on:** the master accepts one version back
+  (`PROTOCOL_VERSION_MIN_COMPATIBLE = CURRENT - 1`) and a pull request that cannot keep the window
+  closes it; see [design 0083](0083-one-version-window.md). This non-goal and the `MIN` bullets of D1
+  below describe protocols 3 to 9.
 - Replacing `bincode` 1.x in this pull request (see D4 for the migration plan).
 
 ## Design
@@ -82,7 +86,8 @@ normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against the git baseline c
   `wire_layout.txt`.
 - If any previously recorded variant changed its bytes or was removed and
   `PROTOCOL_VERSION_MIN_COMPATIBLE < PROTOCOL_VERSION_CURRENT`, the test fails and requires bumping
-  `PROTOCOL_VERSION_MIN_COMPATIBLE` to `PROTOCOL_VERSION_CURRENT`.
+  `PROTOCOL_VERSION_MIN_COMPATIBLE` to `PROTOCOL_VERSION_CURRENT`. (Protocols 3 to 9. From protocol 10 on
+  `MIN` is `CURRENT - 1` or `CURRENT`, and the window is proved by `window_tests.rs`: design 0083 D1.)
 
 ### D2: Acknowledged feature-bit enforcement (`crates/worker/src/client.rs`)
 
@@ -268,3 +273,4 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   (none yet). From version 10 on, a new optional field of `Task` or `TaskRequirements` is an
   extension, which moves `PROTOCOL_VERSION_CURRENT` only when a build wants it and never
   `PROTOCOL_VERSION_MIN_COMPATIBLE`. Regenerated `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-17: Rule change by [design 0083](0083-one-version-window.md) (PROTO-4, pull request PRNUM): from protocol 10 on the master accepts one version back (`PROTOCOL_VERSION_MIN_COMPATIBLE = CURRENT - 1`, now 9). The non-goal "every bump breaks older peers" and the `MIN` bullets of D1 describe protocols 3 to 9. The layout test (`wire_layout_tests.rs`) requires `CURRENT - 1 <= MIN <= CURRENT`, records the `ClientMessage` / `ClientResponse` entries with a fixed stamp `0`, and requires `crates/core/tests/data/wire_layout_previous.txt` (the layout file of the release one version back) while `MIN < CURRENT`; `window_tests.rs` replays it against the current codec. A worker or client takes only an echo of its own version from the master (`is_master_echo_acceptable`); a newer peer is still refused by an older master.

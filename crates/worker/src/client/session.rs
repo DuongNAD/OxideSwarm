@@ -16,9 +16,9 @@ use rusty_grid_core::cluster_auth::{client_handshake, WIRE_FORMAT_AUTH};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::noise_auth::{v3_client_handshake, HandshakePurpose};
 use rusty_grid_core::protocol::{
-    format_incompatible_version_error, is_protocol_version_compatible, master_features,
-    EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
-    ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+    format_incompatible_version_error, is_master_echo_acceptable, master_features, EndpointRole,
+    MasterMessage, MessageReader, MessageTransport, MessageWriter, ProtocolCapabilities,
+    ProtocolError, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{TaskId, TaskResult};
 
@@ -1323,7 +1323,9 @@ impl WorkerClient {
                     return Err(GridError::RegistrationRejected(reason));
                 }
 
-                if !is_protocol_version_compatible(protocol_version) {
+                // Only an echo of the own version (design 0083 D5): the window protects a newer
+                // master from older peers, never the reverse.
+                if !is_master_echo_acceptable(protocol_version) {
                     return Err(GridError::HandshakeFailed(
                         format_incompatible_version_error("Master", protocol_version),
                     ));

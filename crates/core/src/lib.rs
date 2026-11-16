@@ -17,6 +17,8 @@ pub mod task;
 pub mod transport;
 
 #[cfg(test)]
+mod window_tests;
+#[cfg(test)]
 mod wire_layout_tests;
 
 pub use arbitrage::{LeaseValidationError, MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};

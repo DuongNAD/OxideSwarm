@@ -374,4 +374,24 @@ impl Task {
         self.extensions.retain(keep);
         self.requirements.extensions.retain(keep);
     }
+
+    /// The copy of this task a peer speaking protocol `version` may receive (design 0083 D3).
+    ///
+    /// `Master`-scope extensions are removed. For `version` below 10 (the layout before the
+    /// extension slot) both extension lists are cleared: a v9 worker never advertises `ext:<id>`,
+    /// so a task with a critical `Worker`/`Both` extension is never placed on it, and what is left
+    /// is non-critical, which is defined as ignorable. The stored task keeps every extension; only
+    /// this copy for the wire changes.
+    pub fn for_peer(&self, version: u32) -> Task {
+        let mut copy = self.clone();
+        copy.strip_master_extensions();
+        if version < EXTENSION_PROTOCOL_VERSION {
+            copy.extensions.clear();
+            copy.requirements.extensions.clear();
+        }
+        copy
+    }
 }
+
+/// The first protocol version whose `Task` and `TaskRequirements` carry `extensions`.
+pub const EXTENSION_PROTOCOL_VERSION: u32 = 10;

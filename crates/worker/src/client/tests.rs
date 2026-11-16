@@ -4054,3 +4054,92 @@ fn test_worker_client_plumbs_and_validates_isolation_read_dirs() {
         other => panic!("expected Config error, got {other:?}"),
     }
 }
+
+/// Design 0083 D5: with the compatibility window open the generic range check also lets the
+/// previous version through, but a worker takes only an echo of its own version from the master.
+/// A master that answers at the previous version is refused, so the upgrade order stays "master
+/// first".
+#[tokio::test]
+async fn test_worker_refuses_a_register_ack_stamped_with_the_previous_version() {
+    let (client_io, master_io) = tokio::io::duplex(4096);
+    let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+    let worker_id = client.worker_id();
+
+    tokio::spawn(async move {
+        let mut master_transport = MessageTransport::new(master_io);
+        let _ = master_transport
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        // A master of the previous version answers at its own version.
+        master_transport
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: true,
+                worker_id,
+                heartbeat_interval_secs: 3,
+                message: None,
+                protocol_version: PROTOCOL_VERSION_CURRENT - 1,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut client_transport = MessageTransport::new(client_io);
+    let err = client
+        .perform_handshake(&mut client_transport)
+        .await
+        .expect_err("worker must refuse a RegisterAck stamped with the previous version");
+    assert!(
+        err.to_string().contains(&format!(
+            "Incompatible protocol version {}",
+            PROTOCOL_VERSION_CURRENT - 1
+        )),
+        "{err}"
+    );
+}
+
+/// A master of the previous version refuses this worker's `Register` (version 10 is above its
+/// range); the worker reports the refusal text rather than a version mismatch of its own.
+#[tokio::test]
+async fn test_worker_reports_a_previous_version_master_refusing_its_register() {
+    let (client_io, master_io) = tokio::io::duplex(4096);
+    let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+    let worker_id = client.worker_id();
+
+    tokio::spawn(async move {
+        let mut master_transport = MessageTransport::new(master_io);
+        let _ = master_transport
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = format!(
+            "Incompatible protocol version {PROTOCOL_VERSION_CURRENT} from worker \
+             (supported: {0}..={0}; upgrade both master and worker to matching builds)",
+            PROTOCOL_VERSION_CURRENT - 1
+        );
+        master_transport
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id,
+                heartbeat_interval_secs: 0,
+                message: Some(reason),
+                protocol_version: PROTOCOL_VERSION_CURRENT - 1,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut client_transport = MessageTransport::new(client_io);
+    let err = client
+        .perform_handshake(&mut client_transport)
+        .await
+        .expect_err("a refused registration is an error");
+    assert!(
+        matches!(&err, GridError::RegistrationRejected(m) if m.contains("Incompatible protocol version")),
+        "{err:?}"
+    );
+}

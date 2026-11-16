@@ -382,6 +382,22 @@ impl<
         }
     }
 
+    /// Encodes everything this session sends from now on for a peer speaking `version`, on every
+    /// lane (design 0083 D2: both QUIC lanes and the single TCP stream use the same value).
+    fn set_peer_version(&mut self, version: u32) {
+        match self {
+            Self::Single { transport, .. } => transport.set_peer_version(version),
+            Self::Multiplexed {
+                ctrl_transport,
+                data_transport,
+                ..
+            } => {
+                ctrl_transport.set_peer_version(version);
+                data_transport.set_peer_version(version);
+            }
+        }
+    }
+
     async fn send_register_ack(&mut self, ack: &MasterMessage) -> Result<(), ProtocolError> {
         match self {
             Self::Single { transport, .. } => transport.send_msg(ack).await,
@@ -713,7 +729,7 @@ impl<
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
     ) -> GridResult<Option<Self>> {
         // 2. Validate Register message
-        let (worker_id, capabilities, worker_features) = match worker_msg {
+        let (worker_id, capabilities, worker_features, peer_version) = match worker_msg {
             WorkerMessage::Register {
                 worker_id,
                 capabilities,
@@ -747,7 +763,7 @@ impl<
                         "cpu_cores must be > 0".into(),
                     ));
                 }
-                (worker_id, capabilities, features)
+                (worker_id, capabilities, features, protocol_version)
             }
             WorkerMessage::ClaimMasterRole { ticket } => {
                 let ack = reject_master_role_claim(&ticket);
@@ -829,6 +845,22 @@ impl<
             }
         };
         let session_id = registration.session_id;
+
+        // The session speaks the version the worker registered with (design 0083 D2): the accepted
+        // `RegisterAck`, every task and every later message are encoded for it.
+        pre_auth.set_peer_version(peer_version);
+        registry
+            .set_peer_version(&worker_id, session_id, peer_version)
+            .await;
+        if peer_version < PROTOCOL_VERSION_CURRENT {
+            warn!(
+                worker_id = %worker_id,
+                peer_version,
+                "worker speaks protocol {peer_version}, one version behind this master's \
+                 {PROTOCOL_VERSION_CURRENT}; upgrade it before the master moves to {}",
+                PROTOCOL_VERSION_CURRENT + 1
+            );
+        }
 
         queue.set_worker_session_resume(worker_id, worker_supports_resume);
         queue.set_worker_session_resume_connected(worker_id, session_id, worker_supports_resume);
@@ -1901,6 +1933,115 @@ mod tests {
                     ids: vec![probe_id_2],
                 },
             }
+        );
+
+        let _ = stop_tx.send(true);
+        session_task.abort();
+    }
+
+    /// Design 0083 D2/D3: a worker that registers with protocol 9 on a two-lane (QUIC-shaped)
+    /// session gets the same peer version on both lanes: the accepted `RegisterAck` on the control
+    /// lane echoes 9, and an `AssignTask` on the data lane takes the v9 task layout without the
+    /// extension lists (the stored task keeps them).
+    #[tokio::test]
+    async fn test_multiplexed_v9_worker_gets_v9_on_both_lanes() {
+        use rusty_grid_core::protocol::deserialize_message_as_v9;
+        use rusty_grid_core::task::Extension;
+
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
+        let session_task = spawn_test_multiplexed_session(
+            c_master,
+            d_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            None,
+        );
+
+        let mut mux_ctrl = MessageTransport::new(c_worker);
+        let mut mux_data = MessageTransport::new(d_worker);
+        let worker_id = Uuid::new_v4();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new("mux-v9-worker", 2, 4096, false, false, None),
+                protocol_version: 9,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let ack = mux_ctrl
+            .recv_raw_frame()
+            .await
+            .unwrap()
+            .expect("RegisterAck");
+        match deserialize_message_as_v9::<MasterMessage>(&ack).unwrap().0 {
+            MasterMessage::RegisterAck {
+                accepted: true,
+                protocol_version: 9,
+                ..
+            } => {}
+            other => panic!("expected a RegisterAck stamped 9, got {other:?}"),
+        }
+        let info = registry.get_worker(worker_id).await.unwrap();
+        assert!(
+            info.capabilities.tags.contains(&"proto:9".to_string()),
+            "{:?}",
+            info.capabilities.tags
+        );
+
+        let session_id = info.session_id;
+        let outbound_tx = registry
+            .reserve_dispatch(&worker_id, session_id)
+            .await
+            .unwrap();
+        let mut task = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["v9".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 64),
+        );
+        task.extensions = vec![Extension {
+            id: 0x8001,
+            critical: false,
+            bytes: vec![1],
+        }];
+        outbound_tx
+            .send(MasterMessage::AssignTask { task: task.clone() })
+            .await
+            .unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), mux_data.recv_raw_frame())
+            .await
+            .expect("AssignTask must arrive on the data lane")
+            .unwrap()
+            .expect("a frame");
+        match deserialize_message_as_v9::<MasterMessage>(&frame)
+            .unwrap()
+            .0
+        {
+            MasterMessage::AssignTask { task: received } => {
+                assert_eq!(received.id, task.id);
+                assert!(received.extensions.is_empty());
+            }
+            other => panic!("expected AssignTask, got {other:?}"),
+        }
+        assert!(
+            rusty_grid_core::protocol::deserialize_message::<MasterMessage>(&frame).is_err(),
+            "the data lane carries the v9 task layout"
         );
 
         let _ = stop_tx.send(true);

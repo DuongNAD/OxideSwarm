@@ -2,6 +2,7 @@
 """Release skew check (PROTO-2, design 0076 D2).
 
 Usage: release_skew.py RELEASE_OXIDESWARM PR_OXIDESWARM [--timeout SECONDS]
+                       [--release-protocol-rs FILE] [--pr-protocol-rs FILE]
 
 Runs three master/worker/client pairs on loopback, each with a private temporary HOME, an
 ephemeral grid port and no use of the real ~/.oxideswarm:
@@ -17,10 +18,22 @@ with timeouts. A pair is classified as:
   refused with the version error a peer was refused and the text names the protocol versions
   broken                         anything else
 
-The script does not demand compatibility. It exits 1 only when a pair is `broken` (this covers a
-refusal that prints no version error, and a pair that speaks the same version but does not work),
-or when a pair is refused although the peer's version lies inside the refuser's supported range.
-The three-row Markdown table goes to stdout and to $GITHUB_STEP_SUMMARY when that is set.
+The expected verdict of each pair follows from the two binaries' protocol constants and the
+one-version window (design 0083): a master accepts a peer whose version is `MIN..=CURRENT` of the
+master. Both constants of each binary are read from its `crates/core/src/protocol.rs`
+(`--release-protocol-rs` is `git show <tag>:crates/core/src/protocol.rs`, `--pr-protocol-rs`
+defaults to the working tree's file). With them the table says what each pair should do:
+
+  pair                                        works                    refused with the version error
+  1 release master, pull request peers        PR CURRENT in rel range  otherwise (the usual case)
+  2 pull request master, release peers        rel CURRENT in PR range  otherwise (window closed)
+  3 pull request master and peers             always                   never
+
+A pair whose result differs from its expected one fails the job. Without the two files nothing is
+expected and the script falls back to the checks below. It also exits 1 when a pair is `broken`
+(this covers a refusal that prints no version error, and a pair that speaks the same version but
+does not work), or when a pair is refused although the peer's version lies inside the refuser's
+supported range. The Markdown table goes to stdout and to $GITHUB_STEP_SUMMARY when that is set.
 
 Python standard library only. Every process it starts is stopped by its own handle, never by name.
 """
@@ -47,6 +60,41 @@ BROKEN = "broken"
 VERSION_ERROR = re.compile(
     r"Incompatible protocol version (\d+) from \w+ \(supported: (\d+)\.\.=(\d+)"
 )
+
+
+PROTOCOL_CURRENT = re.compile(r"pub const PROTOCOL_VERSION_CURRENT: u32 = (\d+);")
+PROTOCOL_MIN = re.compile(r"pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = (\d+);")
+
+
+def parse_protocol_constants(text):
+    """Returns (CURRENT, MIN_COMPATIBLE) read from the text of crates/core/src/protocol.rs."""
+    current, minimum = PROTOCOL_CURRENT.search(text), PROTOCOL_MIN.search(text)
+    if not (current and minimum):
+        raise ValueError("PROTOCOL_VERSION_CURRENT / PROTOCOL_VERSION_MIN_COMPATIBLE not found")
+    return int(current.group(1)), int(minimum.group(1))
+
+
+def accepts(master, peer_version):
+    """True when a master with constants `master` = (CURRENT, MIN) accepts `peer_version`."""
+    current, minimum = master
+    return minimum <= peer_version <= current
+
+
+def expected_verdicts(release, pr):
+    """The expected verdict of the three pairs for binaries with constants (CURRENT, MIN).
+
+    A worker and client accept only an echo of their own version from the master (design 0083 D5),
+    which a master of another version never gives, so a pair works exactly when the master accepts
+    the peers' version.
+    """
+    pair1 = WORKS if accepts(release, pr[0]) else REFUSED
+    pair2 = WORKS if accepts(pr, release[0]) else REFUSED
+    return [pair1, pair2, WORKS]
+
+
+def mismatch(verdict, want):
+    """True when a pair's verdict differs from the verdict derived for it (None derives nothing)."""
+    return want is not None and verdict != want
 
 
 def find_version_error(*texts):
@@ -236,12 +284,20 @@ def run_pair(label, master_bin, worker_bin, timeout, root):
 
 
 def render_table(rows):
-    lines = [
-        "| Master | Worker and client | Result | Protocol versions | Detail |",
-        "|---|---|---|---|---|",
-    ]
-    for master, worker, verdict, versions, detail in rows:
-        lines.append(f"| {master} | {worker} | {verdict} | {versions} | {detail} |")
+    """Rows are (master, worker, verdict, versions, detail[, expected])."""
+    with_expected = any(len(row) > 5 for row in rows)
+    header = "| Master | Worker and client | Result | Protocol versions | Detail |"
+    divider = "|---|---|---|---|---|"
+    if with_expected:
+        header += " Expected |"
+        divider += "---|"
+    lines = [header, divider]
+    for row in rows:
+        master, worker, verdict, versions, detail = row[:5]
+        line = f"| {master} | {worker} | {verdict} | {versions} | {detail} |"
+        if with_expected:
+            line += f" {row[5] if len(row) > 5 else ''} |"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -260,6 +316,15 @@ def main(argv=None):
     parser.add_argument("release_bin", help="oxideswarm binary of the newest release")
     parser.add_argument("pr_bin", help="oxideswarm binary built from the pull request")
     parser.add_argument("--timeout", type=int, default=30, help="seconds per step (default 30)")
+    parser.add_argument(
+        "--release-protocol-rs",
+        help="crates/core/src/protocol.rs of the release (git show <tag>:crates/core/src/protocol.rs)",
+    )
+    parser.add_argument(
+        "--pr-protocol-rs",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crates", "core", "src", "protocol.rs"),
+        help="crates/core/src/protocol.rs of the pull request (default: this working tree)",
+    )
     args = parser.parse_args(argv)
 
     release_bin = os.path.abspath(args.release_bin)
@@ -268,6 +333,22 @@ def main(argv=None):
         if not (os.path.isfile(path) and os.access(path, os.X_OK)):
             print(f"error: {path} is not an executable file", file=sys.stderr)
             return 2
+
+    expected = [None, None, None]
+    if args.release_protocol_rs:
+        try:
+            with open(args.release_protocol_rs, encoding="utf-8") as f:
+                release_constants = parse_protocol_constants(f.read())
+            with open(args.pr_protocol_rs, encoding="utf-8") as f:
+                pr_constants = parse_protocol_constants(f.read())
+        except (OSError, ValueError) as err:
+            print(f"error: cannot read the protocol constants: {err}", file=sys.stderr)
+            return 2
+        expected = expected_verdicts(release_constants, pr_constants)
+        print(
+            f"release protocol {release_constants[0]} (accepts {release_constants[1]}..={release_constants[0]}), "
+            f"pull request protocol {pr_constants[0]} (accepts {pr_constants[1]}..={pr_constants[0]})"
+        )
 
     plan = [
         ("release", "pull request", release_bin, pr_bin),
@@ -281,9 +362,18 @@ def main(argv=None):
             verdict, ok, versions, detail, transcript = run_pair(
                 f"{master_label}/{worker_label}", master_bin, worker_bin, args.timeout, root
             )
-            rows.append((master_label, worker_label, verdict, versions_text(index, versions), detail))
+            want = expected[index - 1]
+            rows.append(
+                (master_label, worker_label, verdict, versions_text(index, versions), detail, want or "not derived")
+            )
             if not ok:
                 failed.append(f"{master_label} master with {worker_label} worker: {detail}")
+                transcripts.append(f"== {master_label} master, {worker_label} worker ==\n{transcript}")
+            elif mismatch(verdict, want):
+                failed.append(
+                    f"{master_label} master with {worker_label} worker: expected {want} from the "
+                    f"protocol constants and the window, got {verdict}"
+                )
                 transcripts.append(f"== {master_label} master, {worker_label} worker ==\n{transcript}")
     finally:
         shutil.rmtree(root, ignore_errors=True)

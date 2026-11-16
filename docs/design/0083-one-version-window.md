@@ -1,6 +1,6 @@
 # 0083: A one-version compatibility window
 
-Status: Draft (PROTO-4 of design 0076 D4; based on draft pull request 272, design 0082)
+Status: Implemented by draft pull request PRNUM (PROTO-4 of design 0076 D4; based on draft pull request 272, design 0082)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -392,11 +392,11 @@ encoder written in the test.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| PROTO-4a | Constants, range rule, stamp-neutral samples, previous file (D1, D7 tests 3 and 4) | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout_previous.txt` | Test 1.4 passes; `MIN` is 9 | Planned |
-| PROTO-4b | Peer version: `last_peer_version`, `set_peer_version`, `serialize_message` with a version, `Task::for_peer`, generic `BinaryMasterMessage`, `Serialize` v9 types, v9 decode (D2, D3) | `crates/core/src/protocol/codec.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/worker_master_mirrors.rs`, `crates/core/src/task/extension.rs` | Tests 1 to 2 pass | Planned |
-| PROTO-4c | Master: `peer_version` in the session, stamps, `proto:` tag, warning; peer-side echo check (D3, D4, D5) | `crates/master/src/session.rs`, `crates/master/src/server/client_and_members.rs`, `crates/master/src/server/handshakes.rs`, `crates/core/src/placement.rs`, `crates/worker/src/client/session.rs`, `crates/cli/src/connect.rs` | Tests 3 to 8 pass | Planned |
-| PROTO-4d | Documents and the skew job: design 0040, `DEPLOYMENT.md` 3.5, `CLAUDE.md`, `release_skew.py`, its test (Compatibility, test 10) | `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md`, `CLAUDE.md`, `scripts/release_skew.py`, `tests/test_release_skew.py`, `.github/workflows/ci.yml` | Test 10 passes; the CI table shows pair 2 `works` | Planned |
-| PROTO-3d | Cross-version tests of design 0082 (its test 10) | see design 0082 | Tests 3 to 5 of this record | Planned |
+| PROTO-4a | Constants, range rule, stamp-neutral samples, previous file (D1, D7 tests 3 and 4) | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout_previous.txt` | Test 1.4 passes; `MIN` is 9 | Implemented |
+| PROTO-4b | Peer version: `last_peer_version`, `set_peer_version`, `serialize_message` with a version, `Task::for_peer`, generic `BinaryMasterMessage`, `Serialize` v9 types, v9 decode (D2, D3) | `crates/core/src/protocol/codec.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/worker_master_mirrors.rs`, `crates/core/src/task/extension.rs` | Tests 1 to 2 pass | Implemented |
+| PROTO-4c | Master: `peer_version` in the session, stamps, `proto:` tag, warning; peer-side echo check (D3, D4, D5) | `crates/master/src/session.rs`, `crates/master/src/server/client_and_members.rs`, `crates/master/src/server/handshakes.rs`, `crates/core/src/placement.rs`, `crates/worker/src/client/session.rs`, `crates/cli/src/connect.rs` | Tests 3 to 8 pass | Implemented |
+| PROTO-4d | Documents and the skew job: design 0040, `DEPLOYMENT.md` 3.5, `CLAUDE.md`, `release_skew.py`, its test (Compatibility, test 10) | `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md`, `CLAUDE.md`, `scripts/release_skew.py`, `tests/test_release_skew.py`, `.github/workflows/ci.yml` | Test 10 passes; the CI table shows pair 2 `works` | Implemented |
+| PROTO-3d | Cross-version tests of design 0082 (its test 10) | see design 0082 | Tests 3 to 5 of this record | Implemented |
 
 The four items fit one pull request (L, as in the backlog), based on pull request 272, which merges
 first. They are released together: protocol 10 with the window is the first version people outside
@@ -418,3 +418,60 @@ the owner's machines install (design 0076 Q66).
 
 - 2026-11-17: Draft written for PROTO-4 (design 0076 D4, Q66). Statements about code were checked on
   the PROTO-3 branch (`origin/claude/proto-3-extension-slot`, pull request 272). Builds nothing.
+- 2026-11-17: The owner decided Q73 to Q79 in chat, all on the recommended defaults: the window ships
+  in the same release as protocol 10 (Q73); a non-critical extension is dropped from a v9 worker's
+  copy (Q74); an uncompacted format 3 journal is not read (Q75); the previous release's layout file
+  is the oracle and the stamp is dropped from the recorded bytes (Q76); workers and clients accept
+  only an echo of their own version (Q77); the master-added `proto:<n>` tag, the eleventh reserved
+  prefix, and a once-per-session warning (Q78); v9 JSON and bincode peers are both kept (Q79).
+- 2026-11-17: Built by draft pull request PRNUM (PROTO-4a to PROTO-4d and PROTO-3d of design 0082).
+  `PROTOCOL_VERSION_MIN_COMPATIBLE` is 9 at `PROTOCOL_VERSION_CURRENT` 10. The pull request is not a
+  wire change by itself (no new message or field) and merges with pull request 272 (design 0076 D1).
+  Deviations from this record, where the code forced or allowed a different shape (the line numbers
+  quoted in Context were approximate and were checked against the code):
+  - **Echo check in the decoders (D5).** The client side of "accept only an echo of the own version"
+    sits in the `ClientResponse` decoders of `crates/core/src/protocol/codec.rs`
+    (`is_master_echo_acceptable`, both codecs), not in `connect_master`, so every reader of a
+    `ClientResponse` gets it and `connect_master` maps the resulting version error as before. The
+    worker check is in `crates/worker/src/client/session.rs`.
+  - **`proto:<n>` is added in `WorkerEntry::to_info` (D4)**, not in `listed_worker`, so the
+    dashboard and the scheduler's `WorkerInfo` carry the tag too; `WorkerInfo` has no new field
+    (a new public field would have broken every struct literal of the integration tests). The tag
+    reads the registry's per-session `peer_version`, set by `WorkerRegistry::set_peer_version`.
+  - **Where the client reply version is set (D2).** `send_client_response`
+    (`crates/master/src/server/tasks_and_blobs.rs`) copies `MessageTransport::last_peer_version()`
+    into `set_peer_version` before each reply, which covers every reply path of the client loop
+    (map-reduce and the blob pipeline included) in one place. The first frame, which the handshake
+    decodes outside the transport, is recorded with `note_peer_version`.
+  - **Owned v9 task instead of `LegacyV9TaskRef` (D3).** `Task::for_peer(9)` returns an owned copy
+    and `From<Task> for LegacyV9Task` moves its fields, so there is one clone per assignment and no
+    borrowed form. `serialize_message` keeps its signature; the new `serialize_message_for_peer`
+    needs `M: 'static` (a `TypeId` dispatch), so `send_msg` and `send_msg_with_idle_timeout` carry
+    that bound. `deserialize_message_with_version` returns the stamp of a client message.
+  - **Layout test (D1).** The recorded `ClientMessage` and `ClientResponse` entries are encoded with
+    the stamp `0`. `wire_layout_previous.txt` is the `wire_layout.txt` of `v0.3.0` verbatim (its
+    entries still carry the stamp 9, and its `RegisterAck` and `Register` samples carry the marker
+    `0x0a0b0c0d`); `window_tests.rs` normalises them when it compares. "A changed entry needs
+    `MIN == CURRENT` or a passing window test" is enforced as a range check
+    (`verify_window_range`, `CURRENT - 1 <= MIN <= CURRENT`) plus the separate window tests, which
+    fail the suite on their own; the two are not wired into one function. The previous-file rule is
+    `verify_previous_layout_file`.
+  - **Frozen readers and writers for tests.** `deserialize_message_as_v9` (a frozen v9 reader of
+    `MasterMessage` and `ClientResponse`) and `serialize_v9_client_message` sit behind the core
+    feature `test-extensions` that the master and worker dev-dependencies already enable. The
+    in-process v9 peers of `tests/window_v9_peers.rs` encode messages whose layout did not change
+    (`Register`, `TaskResult`, ...) with the current encoder, which `window_tests.rs` proves is the
+    same bytes as `wire_layout_previous.txt`; the changed ones (`AssignTask`, `SubmitTask`) go
+    through the v9 types that the same test replays against the recorded bytes. The real `v0.3.0`
+    binaries run in `scripts/release_skew.py`.
+  - **Test plan.** Test 6 is split: the worker side is in `crates/worker/src/client/tests.rs`, the
+    client side is the probe test and `a_previous_version_hello_is_answered_with_the_clients_own_stamp`
+    in `crates/cli/tests/test_hello_probe_e2e.rs`. Test 4 asserts that the task stays `Queued` and
+    never reaches the v9 worker, not the `ClusterLacksCapability` text. Test 8 is
+    `test_multiplexed_v9_worker_gets_v9_on_both_lanes` on the in-memory two-lane session (a real
+    iroh connection is not started). Test 9 is the existing store tests, unchanged.
+  - **Skew job.** `scripts/release_skew.py` gets `--release-protocol-rs` (CI passes
+    `gh api .../contents/crates/core/src/protocol.rs?ref=<tag>`, so the checkout needs no tags) and
+    `--pr-protocol-rs` (default: the working tree); without the first nothing is derived and the job
+    behaves as before.
+  - Unverified here: Windows and Linux runs, a real QUIC (iroh) v9 worker, and the CI job itself.

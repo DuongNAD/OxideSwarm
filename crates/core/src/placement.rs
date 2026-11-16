@@ -6,10 +6,11 @@
 //!
 //! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
-//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`
+//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`,
+//!   `proto:<n>` (the protocol version the worker registered with, design 0083)
 //!   and `feat:<feature>` (`feat:workspaces` when the worker negotiated `WORKSPACES`), and the
 //!   worker adds its task isolation level as `iso:<level>` ([`IsolationLevel`], design 0033)
-//!   and probed host tools as `tool:<name>` (design 0039). Those ten prefixes are
+//!   and probed host tools as `tool:<name>` (design 0039). Those eleven prefixes are
 //!   [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
@@ -46,10 +47,13 @@ pub const FEAT_TAG_PREFIX: &str = "feat:";
 /// Prefix of an extension tag a worker adds itself, one per extension id it understands
 /// (`ext:32770`, design 0082 D4).
 pub const EXT_TAG_PREFIX: &str = "ext:";
+/// Prefix of the tag the master adds to a listed worker with the protocol version it registered
+/// with (`proto:9`, design 0083 D4).
+pub const PROTO_TAG_PREFIX: &str = "proto:";
 /// Tag the master adds to a listed worker when it negotiated `ProtocolCapabilities::WORKSPACES`.
 pub const FEAT_WORKSPACES_TAG: &str = "feat:workspaces";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 10] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 11] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
@@ -60,6 +64,7 @@ pub const RESERVED_TAG_PREFIXES: [&str; 10] = [
     TOOL_TAG_PREFIX,
     FEAT_TAG_PREFIX,
     EXT_TAG_PREFIX,
+    PROTO_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;

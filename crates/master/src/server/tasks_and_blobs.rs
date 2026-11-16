@@ -829,6 +829,10 @@ pub(super) async fn send_client_response<S: AsyncRead + AsyncWrite + Unpin + Sen
     transport: &mut MessageTransport<S>,
     resp: &ClientResponse,
 ) -> Result<(), rusty_grid_core::protocol::ProtocolError> {
+    // The reply is encoded for the version the client stamped on its last frame (design 0083 D2).
+    if let Some(version) = transport.last_peer_version() {
+        transport.set_peer_version(version);
+    }
     match transport.send_msg(resp).await {
         Ok(()) => Ok(()),
         Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {

@@ -332,3 +332,49 @@ async fn a_probe_reply_cut_off_mid_frame_is_a_closed_or_io_error() {
         "got {err:?}"
     );
 }
+
+/// Design 0083 D2/D3: a `Hello` stamped with the previous version (what a v9 client sends) is
+/// answered by a v10 master, and the reply is stamped with the client's version so that the v9
+/// client's own range check accepts it. A v10 client would refuse that reply (it takes only an
+/// echo of its own version), which is what the next test shows from the other side.
+#[tokio::test]
+async fn a_previous_version_hello_is_answered_with_the_clients_own_stamp() {
+    let (server, addr) = spawn_master().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut t = MessageTransport::with_codec(stream, WireCodec::Bincode);
+    t.send_raw_frame(hello_frame(PROTOCOL_VERSION_CURRENT - 1).into())
+        .await
+        .unwrap();
+    let raw = t
+        .recv_raw_frame()
+        .await
+        .unwrap()
+        .expect("the master answers a previous-version Hello");
+    let len = raw.len();
+    assert_eq!(
+        raw[len - 4..],
+        (PROTOCOL_VERSION_CURRENT - 1).to_le_bytes(),
+        "the reply carries the client's version"
+    );
+    // The window's own bound: the number `Hello` reports.
+    assert_eq!(
+        raw[len - 8..len - 4],
+        PROTOCOL_VERSION_MIN_COMPATIBLE.to_le_bytes()
+    );
+    assert!(
+        rusty_grid_core::protocol::deserialize_message::<ClientResponse>(&raw).is_err(),
+        "a v10 reader takes only its own stamp"
+    );
+
+    // A client below the window is still refused with the version error.
+    let message =
+        send_raw_expect_error(addr, hello_frame(PROTOCOL_VERSION_MIN_COMPATIBLE - 1)).await;
+    assert!(
+        message.contains(&format!(
+            "Incompatible protocol version {}",
+            PROTOCOL_VERSION_MIN_COMPATIBLE - 1
+        )),
+        "{message}"
+    );
+    let _ = server.shutdown();
+}

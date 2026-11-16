@@ -157,7 +157,7 @@ Unit tests in `crates/core/src/task.rs` and `crates/core/src/protocol/tests.rs`,
 6. Scheduler: a task with a known critical `Worker`-scope extension waits (`ClusterLacksCapability` names the id) when no worker has `ext:<id>`, and is placed when one has it; a `Master`-scope extension does not restrict workers and is absent from the copy sent to the worker; `Shape` differs between tasks with different required ids.
 7. A decoder fuzz-style test: random bytes for each registered decoder never panic.
 8. `crates/core/tests/data/wire_layout.txt`: regenerate under `UPDATE_WIRE_LAYOUT=1`. `sample_task()` (`crates/core/src/wire_layout_tests.rs:144`, `:173`) gets one non-critical and one critical extension in `Task` and one in `TaskRequirements`, so the bytes of the lists are recorded. The test still has to fail when the lists change without a version bump. The registry table is recorded in the same file (one `Extension::<id> <name> <list> <critical> <scope>` line per entry, sorted by id), so a changed or removed id is a visible diff.
-9. `legacy_v9_submit_task_is_refused_with_a_version_error` (D6, before PROTO-4); store test that a format-3 snapshot loads in format 4.
+9. `legacy_v9_submit_task_is_refused_with_a_version_error` (D6, before PROTO-4; replaced by `decode_v9_submit_task_is_accepted_and_has_empty_lists` when PROTO-4 opens the window); store test that a format-3 snapshot loads in format 4.
 10. **Cross-version (after PROTO-4):** the skew job of design 0076 D2 and an in-process test with a v9 peer: a v9 `SubmitTask` becomes a task with empty lists; a v10 task with a non-critical extension reaches a v9 worker without it and runs; a v10 task with a critical `Worker` extension never reaches a v9 worker.
 
 ## Work items
@@ -167,7 +167,7 @@ Unit tests in `crates/core/src/task.rs` and `crates/core/src/protocol/tests.rs`,
 | PROTO-3a | `Extension`, the two fields, `extension_bytes`, registry, bounds and `Task::validate` rules (D1 to D3) | `crates/core/src/task.rs` | Tests 1 to 5 and 7 pass | Implemented |
 | PROTO-3b | Protocol 10: version constants, `LegacyV9Task` and wrapper, `wire_layout.txt`, `STORE_FORMAT_VERSION` 4 (D1, D6) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/store.rs`, `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md` | Test 8 and 9 pass; "wire change" pull request, release within 48 hours | Implemented (the release is pending) |
 | PROTO-3c | `ext:` worker tag, `TaskView::required_extensions`, scheduler check, worker refusal (D2.3, D4) | `crates/core/src/placement.rs`, `crates/worker/src/client.rs`, `crates/worker/src/client/tasks.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `CLAUDE.md` | Tests 3 and 6 pass | Implemented |
-| PROTO-3d | Cross-version tests | `crates/master/tests/`, CI | Test 10 passes (needs PROTO-4) | Planned |
+| PROTO-3d | Cross-version tests | `tests/window_v9_peers.rs`, `crates/core/src/window_tests.rs`, `scripts/release_skew.py` | Test 10 passes (needs PROTO-4) | Implemented (pull request PRNUM, design 0083) |
 
 The three first items fit one pull request (L, as in the backlog). They land at the next wire change (Q65).
 
@@ -228,3 +228,4 @@ The three first items fit one pull request (L, as in the backlog). They land at 
   - `Task::validate` checks the extension lists after placement; the queue charges extension bytes
     (`3 + bytes.len()` per entry) in `task_active_bytes`, with a test.
   - Unverified here: Windows and Linux runs of the new tests, and test 10 (PROTO-3d).
+- 2026-11-17: PROTO-3d built with PROTO-4 (pull request PRNUM, [design 0083](0083-one-version-window.md)): test 10 is `tests/window_v9_peers.rs` (a v9 worker registers and runs a task; a non-critical extension is dropped from its copy and a critical `Worker` extension never reaches it; a v9 client submits, polls and lists, in both codecs) plus the skew job. The D6 rule "a v10 master refuses a v9 `SubmitTask`" is replaced by the window: a v9 `SubmitTask` is read through `LegacyV9Task` (D2 of design 0083), and `legacy_v9_submit_task_is_refused_with_a_version_error` became `decode_v9_submit_task_is_accepted_and_has_empty_lists`.

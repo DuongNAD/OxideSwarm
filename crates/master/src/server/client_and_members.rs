@@ -65,7 +65,7 @@ async fn task_status_response(queue: &TaskQueue, task_id: TaskId) -> ClientRespo
 }
 
 /// A worker as `ClusterStatus` and `ListWorkers` report it: its capabilities plus the tags only the
-/// master knows, `link:<path>`, `id:<worker id>` and `state:<state>` (see
+/// master knows, `link:<path>`, `id:<worker id>`, `state:<state>` and `proto:<version>` (see
 /// `rusty_grid_core::placement`). Clients get no `WorkerInfo`, so the `id:` tag is how they learn
 /// the id a `require:worker=` constraint can name.
 async fn listed_worker(
