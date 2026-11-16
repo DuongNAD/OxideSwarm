@@ -1,5 +1,6 @@
 //! Connection authentication (v2 and v3), refusal draining, connection dispatch, and rendezvous.
 
+#[cfg(feature = "p2p")]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tokio::task::AbortHandle;
 use tracing::{debug, warn};
+#[cfg(feature = "p2p")]
 use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::{

@@ -11,13 +11,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "p2p")]
 use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
-use rusty_grid_core::noise_auth::PublicKey;
-#[cfg(feature = "p2p")]
-use rusty_grid_core::noise_auth::{master_noise_key_path, NodeKeypair};
+use rusty_grid_core::noise_auth::{master_noise_key_path, NodeKeypair, PublicKey};
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
 use rusty_grid_core::transport::{
@@ -64,11 +63,12 @@ pub(crate) use tasks_and_blobs::{
     prune_closed_waiters, resolve_terminal_waiters, serve_worker_blob_request, BlobService,
 };
 pub use tasks_and_blobs::{
-    handle_task_progress, handle_task_progress_with_broadcast, handle_task_result,
-    handle_task_result_with_broadcast, handle_worker_disconnect,
+    handle_task_progress, handle_task_result, handle_worker_disconnect,
     handle_worker_disconnect_with_broadcast, handle_worker_disconnect_with_waiters,
     handle_worker_evacuate_with_broadcast,
 };
+#[cfg(feature = "dashboard")]
+pub use tasks_and_blobs::{handle_task_progress_with_broadcast, handle_task_result_with_broadcast};
 use tasks_and_blobs::{spawn_blob_store_sweeper, terminal_result};
 
 use crate::auth::DevBypass;
@@ -78,6 +78,8 @@ use crate::queue::{
     QueueStats, TaskInfo, TaskQueue, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
     DEFAULT_MAX_TERMINAL_TASKS,
 };
+#[cfg(not(feature = "dashboard"))]
+use crate::reaper::spawn_reaper_with_queue;
 use crate::reaper::ReaperConfig;
 use crate::registry::{WorkerInfo, WorkerRegistry};
 use crate::scheduler::{SchedulerConfig, WorkloadScheduler};

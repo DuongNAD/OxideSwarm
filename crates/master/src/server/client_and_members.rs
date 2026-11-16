@@ -1,5 +1,6 @@
 //! Client request dispatch, cluster member store resync, enrollment, and admin handling.
 
+#[cfg(feature = "p2p")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
