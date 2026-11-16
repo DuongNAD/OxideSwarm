@@ -169,7 +169,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
-| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
+| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Implemented |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
@@ -2517,6 +2517,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
      loopback.
 - **Done when:** `tests/test_launcher_scripts.py` checks `-NoShell` in the `.ps1` launcher. The
   adb launcher's command line holds no token. A test shows the `ws://` warning.
+- **Implemented (2026-11-16, pull request 258, [design 0079](design/0079-agent-mesh-launchers-safe-by-default.md)):**
+  `run_agent_node.ps1` has `-NoShell` and honours `OXIDE_MESH_NO_SHELL=1`, `run_agent_node_adb.sh`
+  sends the token on standard input, and the Rust node and `scripts/agent_node.py` log a warning
+  for a token over `ws://` to a non-loopback host. Tests are in `tests/test_launcher_scripts.py`
+  and `client::tests::test_cleartext_token_warning_predicate`.
 
 ### AND-5: Stop the Android worker without blocking the calling thread, and build the bridge in CI
 

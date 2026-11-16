@@ -542,6 +542,57 @@ class ShellLauncherTests(unittest.TestCase):
             f"macOS launcher native binary path did not pass --no-shell: {lines}",
         )
 
+    def test_android_adb_launcher_keeps_token_off_the_adb_command_line(self):
+        """SEC-15: the hub token reaches the phone through stdin, never through `adb` arguments."""
+        token = "SEC15-secret-token-0123456789"
+        bindir = os.path.join(self.tmp, "fakebin")
+        os.makedirs(bindir)
+        stdin_log = os.path.join(self.tmp, "fake_adb_stdin.log")
+        fake_adb = (
+            "#!/bin/bash\n"
+            'echo "$*" >> "${FAKE_ARGS_LOG:?}"\n'
+            'if [ "$1" = "devices" ]; then\n'
+            '    printf "List of devices attached\\nSERIAL01\\tdevice\\n"\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "$1" = "shell" ]; then\n'
+            '    cat >> "${FAKE_STDIN_LOG:?}" || true\n'
+            "fi\n"
+            "exit 0\n"
+        )
+        adb_path = os.path.join(bindir, "adb")
+        with open(adb_path, "w", newline="\n") as f:
+            f.write(fake_adb)
+        os.chmod(adb_path, 0o755)
+        target = os.path.join(self.repo, "target", "aarch64-linux-android", "release")
+        os.makedirs(target)
+        with open(os.path.join(target, "agent-mesh"), "w") as f:
+            f.write("#!/bin/sh\n")
+        script = self.copy_script("packaging/agent_mesh/android/run_agent_node_adb.sh")
+        path = bindir + os.pathsep + os.environ.get("PATH", "")
+
+        res = self.run_script(
+            ["bash", script, "ws://192.0.2.10:8088/ws", "node-phone"],
+            PATH=path, OXIDE_MESH_TOKEN=token, FAKE_STDIN_LOG=stdin_log,
+        )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        args_text = read(self.args_log)
+        self.assertIn("node --hub 'ws://192.0.2.10:8088/ws'", args_text, "the agent must still be started")
+        self.assertNotIn(token, args_text, "the token must not appear in any adb argument")
+        self.assertNotIn("OXIDE_MESH_TOKEN=", args_text, "the token must not be an env assignment on the command line")
+        self.assertNotIn(token, res.stdout, "the launcher must not print the token")
+        self.assertIn(token, read(stdin_log), "the token must be handed over on standard input")
+
+        # Without a token nothing is sent on stdin and the command still runs.
+        open(self.args_log, "w").close()
+        open(stdin_log, "w").close()
+        res = self.run_script(
+            ["bash", script, "ws://127.0.0.1:8088/ws"], PATH=path, FAKE_STDIN_LOG=stdin_log,
+        )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("node --hub", read(self.args_log))
+        self.assertEqual(read(stdin_log).strip(), "")
+
 
 # A stand-in for the released binary inside the USB-kit archives (packaging/usb). It records its
 # arguments, checks that `join` gets the token on standard input, and answers `workers --json` with
@@ -2298,6 +2349,18 @@ Write-Output 'USB_HELPERS_OK'
             self.assertIn("OXIDE_MESH_NO_SHELL", text, f"{path} must support OXIDE_MESH_NO_SHELL")
             self.assertIn("--no-shell", text, f"{path} must support --no-shell")
 
+    def test_windows_ps1_agent_launcher_supports_no_shell(self):
+        """SEC-15: run_agent_node.ps1 has -NoShell and OXIDE_MESH_NO_SHELL and passes --no-shell on."""
+        path = os.path.join(ROOT, "packaging", "agent_mesh", "windows", "run_agent_node.ps1")
+        text = read(path)
+        self.assertRegex(text, r"\[switch\]\s*\$NoShell\b", "-NoShell switch parameter")
+        self.assertIn("OXIDE_MESH_NO_SHELL", text)
+        self.assertIn('"--no-shell"', text)
+        # Both launch paths (native binary and Python fallback) must splat the flag.
+        self.assertEqual(len(re.findall(r"--platform windows @NoShellArgs", text)), 2, text)
+        data = read_bytes(path)
+        self.assertEqual(data.count(b"\r\n"), data.count(b"\n"), "the .ps1 launcher must stay CRLF")
+
     def test_gitignore_covers_test_reports_and_jnilibs_so_files(self):
         probe = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
@@ -2959,6 +3022,58 @@ public class Program {
                 env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
             )
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class AgentNodeCleartextTokenWarningTests(unittest.TestCase):
+    """SEC-15: scripts/agent_node.py warns when it sends a token over ws:// beyond loopback."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "agent_node_under_test", os.path.join(ROOT, "scripts", "agent_node.py"))
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_predicate_warns_only_for_remote_ws_with_a_token(self):
+        f = self.mod.token_sent_in_clear_to_remote_host
+        for url in ("ws://127.0.0.1:8088/ws", "ws://localhost:8088/ws", "ws://[::1]:8088/ws",
+                    "ws://127.9.9.9/ws", "wss://hub.example.com/ws"):
+            self.assertFalse(f(url, True), url)
+        self.assertFalse(f("ws://192.0.2.1:8088/ws", False), "no token, no warning")
+        for url in ("ws://192.0.2.1:8088/ws", "ws://hub.example.com/ws", "ws://[2001:db8::1]:8088/ws",
+                    "ws://127.0.0.1@192.0.2.1/ws"):
+            self.assertTrue(f(url, True), url)
+
+    def _connect_logs(self, hub_url, token):
+        import asyncio
+        import types
+        mod = self.mod
+
+        async def refuse(*_a, **_k):
+            raise RuntimeError("stop after the warning")
+
+        saved = mod.websockets
+        mod.websockets = types.SimpleNamespace(connect=refuse)
+        try:
+            node = mod.OxideAgentNode(hub_url, "n1", "linux", token=token)
+            with self.assertLogs("OxideAgent", level="INFO") as logs:
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(node.connect())
+            return "\n".join(logs.output)
+        finally:
+            mod.websockets = saved
+
+    def test_connect_logs_warning_without_the_token(self):
+        token = "SEC15-py-token-0123456789"
+        text = self._connect_logs("ws://192.0.2.1:8088/ws", token)
+        self.assertIn("plain ws://", text)
+        self.assertIn("WARNING", text)
+        self.assertNotIn(token, text)
+
+    def test_connect_does_not_warn_on_loopback(self):
+        text = self._connect_logs("ws://127.0.0.1:8088/ws", "tok")
+        self.assertNotIn("plain ws://", text)
 
 
 if __name__ == "__main__":
