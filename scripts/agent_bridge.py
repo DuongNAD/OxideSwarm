@@ -164,6 +164,10 @@ def normalize_agent_short(raw_id):
 
 
 AGENT_ID_ENV = "OXIDESWARM_AGENT_ID"
+# Test seam: when set, `collect_state` does not probe the host's ports. The value is a comma-separated
+# list of local ports to report as listening (empty string = none), so tests do not depend on what
+# runs on the machine (for example a real master on 8088). Unset, the ports are probed as usual.
+LOCAL_PORTS_ENV = "OXIDESWARM_BRIDGE_ASSUME_LISTENING"
 
 
 def resolve_self_short(args=None):
@@ -385,6 +389,13 @@ def get_binaries_info(repo_dir):
     return bins
 
 
+def local_port_listening(port):
+    assumed = os.environ.get(LOCAL_PORTS_ENV)
+    if assumed is not None:
+        return str(port) in [item.strip() for item in assumed.split(",")]
+    return check_tcp_port("127.0.0.1", port, 0.3)
+
+
 def collect_state(repo_dir=None, agent_short=None):
     self_short = agent_short or SELF_SHORT
     repo = find_repo_dir(repo_dir)
@@ -397,8 +408,8 @@ def collect_state(repo_dir=None, agent_short=None):
         "updated_at_utc": utc_now_iso(),
         "lan_ip": lan_ip,
         "local_ports": {
-            "master_cluster_8088_listening": check_tcp_port("127.0.0.1", 8088, 0.3),
-            "dashboard_8080_listening": check_tcp_port("127.0.0.1", 8080, 0.3),
+            "master_cluster_8088_listening": local_port_listening(8088),
+            "dashboard_8080_listening": local_port_listening(8080),
         },
         "git": get_git_info(repo),
         "security_and_config": get_oxideswarm_home_info(),
