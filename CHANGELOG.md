@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `fuzz/`: the first `cargo fuzz` (libFuzzer) targets for the parsers of untrusted bytes (`LV-1`): `inbound_frame` (frame reader, format dispatch and both decoders), `server_handshake` (cluster authentication v2 and v3, first frames) and `tree_manifest` (`TreeManifest::decode`), with seed corpora, `fuzz/regressions/` inputs and a `fuzz` CI job (60 s per target on pull requests, 10 minutes weekly). The crate is outside the workspace; a normal build does not change.
 - `scripts/agent_bridge.py activity` reports what a coding agent is doing now (`active`, `blocked`, `done`, `idle`, with task, step and note) to `nodes/<id>_activity.json`, separate from the machine heartbeat; `activity --show` lists every agent and marks one STALE after 20 minutes without an update while `active` or `blocked`, and `diagnose` and `peek` show the line ([design 0081](docs/design/0081-agent-activity-status.md)).
 
 ### Fixed
