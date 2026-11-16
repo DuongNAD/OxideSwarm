@@ -145,11 +145,11 @@ from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Inde
 items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
 and DOC-10, with SEC-10, SEC-13 and AND-5, and with TEST-27 added, it holds 85 Implemented, 8 Partial
 and 41 Planned. After BUG-21 ([design 0077](design/0077-windows-relative-task-executables.md)), it holds
-86 Implemented, 8 Partial and 41 Planned. A recount of this table by script on 2026-11-16 (before
-Phase 12) gave 135 rows: 90 Implemented, 7 Partial and 38 Planned. Phase 12 adds twelve items
-(PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-22 and CLI-2), so the table now holds 147
-rows: 91 Implemented (PROTO-1 counts as Implemented with its pull request), 7 Partial and 49
-Planned.
+86 Implemented, 8 Partial and 41 Planned. After SEC-11, SEC-12, SEC-15 and MAINT-1 (pull requests 256 to 259), it holds
+90 Implemented, 7 Partial and 38 Planned (135 items).
+Phase 12 adds twelve items (PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-22 and CLI-2), so
+the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with its pull request),
+7 Partial and 49 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -173,7 +173,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Implemented | 257 (design 0033) |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
-| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Implemented |  |
+| SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Implemented | 258 (design 0079) |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
@@ -3188,4 +3188,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: BUG-21 is Implemented ([design 0077](design/0077-windows-relative-task-executables.md)): `resolve_windows_executable_in_dir`, `resolve_windows_executable_for_isolation_in_dir`, `resolve_relative_windows_program_in_dir`, `windows::resolve_program`, and `spawn_with_security_capabilities` now resolve `./`, `.\`, `sub/`, and `sub\` against the task working directory inside the sandbox across all three Windows isolation modes, refuse sandbox escapes, wrap `.bat`/`.cmd` via `cmd.exe /d /s /c`, and pass an absolute `lpApplicationName` (`crates/core/src/capabilities.rs`, `crates/worker/src/{isolation,runner/supervise}.rs`, `tests/cli_isolation_e2e.rs`). The Index counts are now 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 stays Partial after the split of `cli_app.rs` (pull request 253): all six files are split, and the CI size check of step 3 remains. The BUG-21 row names pull request 251. The Index counts are unchanged: 86 Implemented, 8 Partial and 41 Planned.
 - 2026-11-16: MAINT-1 Implemented (pull request 259, [design 0080](design/0080-source-file-size-check.md)): `ox-mode test size`, `ox-mode test lint` and the Linux `clippy` job fail when a Rust file's production part exceeds 3,000 lines, with `isolation.rs` (5,377), `mcp.rs` (3,692) and `mode_cli.rs` (3,242) on an allowlist that may only shrink. The Index counts are not recounted here.
-- 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (a script recount of the table before this phase gave 90, 7 and 38; the earlier sentence of 86, 8 and 41 had drifted).
+- 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
+- 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
