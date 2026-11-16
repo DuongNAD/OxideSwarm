@@ -303,7 +303,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented | (pull request 272), (design 0082) |
-| PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
+| PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Planned |  |
@@ -2759,6 +2759,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** After PROTO-3 (Q66), make the master accept the previous version, update design 0040
   and `crates/core/src/wire_layout_tests.rs`.
 - **Done when:** A worker one version back registers and runs a task.
+- **Design:** [design 0083](design/0083-one-version-window.md) (Draft, 2026-11-17, based on pull request 272): decisions Q73 to Q79 are open.
 
 ### TEST-28: Make the group-commit timing test meaningful on slow runners
 
