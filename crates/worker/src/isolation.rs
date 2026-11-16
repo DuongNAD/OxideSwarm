@@ -146,7 +146,14 @@ pub struct HostDirs {
     pub rustup_home: PathBuf,
     /// `$CARGO_HOME`, else `<user_home>/.cargo`.
     pub cargo_home: PathBuf,
+    /// Extra read-only runtime directories explicitly allowlisted for isolated tasks
+    /// (`--isolation-read-dir` / `RUSTY_GRID_ISOLATION_READ_DIRS` / `[worker].isolation_read_dirs`).
+    pub extra_read_only_dirs: Vec<PathBuf>,
 }
+
+/// Environment variable supplying extra read-only runtime directories for isolated tasks.
+/// Uses the platform path-list separator (`;` on Windows, `:` on Unix), matching `PATH`.
+pub const ISOLATION_READ_DIRS_ENV: &str = "RUSTY_GRID_ISOLATION_READ_DIRS";
 
 impl HostDirs {
     /// Resolves the directories from the environment of this process. Call it before anything
@@ -190,7 +197,16 @@ impl HostDirs {
             user_home,
             rustup_home,
             cargo_home,
+            extra_read_only_dirs: Vec::new(),
         }
+    }
+
+    /// Attaches operator-allowlisted read-only external runtime directories (`design 0074`).
+    /// Raw paths are preserved here so [`validate_extra_read_only_dirs`] inspects symlinks and
+    /// NTFS junctions before canonicalization.
+    pub fn with_extra_read_only_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.extra_read_only_dirs = dirs;
+        self
     }
 }
 
@@ -431,6 +447,14 @@ pub async fn verify_isolation_support_with_config(
     host: &HostDirs,
     protected_files: &[PathBuf],
 ) -> GridResult<()> {
+    validate_extra_read_only_dirs(
+        &host.extra_read_only_dirs,
+        host,
+        Some(sandbox_base),
+        None,
+        protected_files,
+    )
+    .map_err(GridError::Config)?;
     if level == IsolationLevel::Off {
         return Ok(());
     }
@@ -459,6 +483,361 @@ pub async fn verify_isolation_support_with_config(
         let _ = (sandbox_base, host, protected_files);
         Err(GridError::Config(unsupported_message(level)))
     }
+}
+
+#[cfg(not(windows))]
+fn lexically_clean_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn normalize_policy_path(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows::normalize_win_path(p)
+    }
+    #[cfg(not(windows))]
+    {
+        let clean = lexically_clean_path(p);
+        if let Ok(canon) = std::fs::canonicalize(&clean) {
+            return canon;
+        }
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur: &Path = &clean;
+        while let Some(parent) = cur.parent() {
+            if let Some(name) = cur.file_name() {
+                tail.push(name.to_os_string());
+            }
+            if !parent.as_os_str().is_empty() {
+                if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+                    let mut rebuilt = canon_parent;
+                    for part in tail.into_iter().rev() {
+                        rebuilt.push(part);
+                    }
+                    return lexically_clean_path(&rebuilt);
+                }
+            }
+            if parent == cur {
+                break;
+            }
+            cur = parent;
+        }
+        clean
+    }
+}
+
+fn policy_path_starts_with(child: &Path, parent: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows::path_starts_with_ci(child, parent)
+    }
+    #[cfg(not(windows))]
+    {
+        if child.as_os_str().is_empty() || parent.as_os_str().is_empty() {
+            return false;
+        }
+        normalize_policy_path(child).starts_with(normalize_policy_path(parent))
+    }
+}
+
+fn is_symlink_or_reparse(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink() || windows::is_reparse_point(path))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+}
+
+/// Validates `--isolation-read-dir` / `HostDirs::extra_read_only_dirs` entries across all
+/// platforms (`design 0074`). Allows narrow runtime subdirectories (for example
+/// `~/.pyenv/versions/3.11.8` or `%LOCALAPPDATA%\Programs\Python\Python311`) while refusing
+/// symlinks/junctions, broad home/system/temp containers, credential stores, OxideSwarm state/key
+/// directories, `cargo_home`, `sandbox_base`, `workspace_root`, and `protected_files`.
+pub fn validate_extra_read_only_dirs(
+    dirs: &[PathBuf],
+    host: &HostDirs,
+    sandbox_base: Option<&Path>,
+    workspace_root: Option<&Path>,
+    protected_files: &[PathBuf],
+) -> Result<(), String> {
+    if dirs.is_empty() {
+        return Ok(());
+    }
+
+    let mut container_roots: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mut push_container = |label: &'static str, path: PathBuf| {
+        if !path.as_os_str().is_empty() && path.is_absolute() {
+            container_roots.push((label, path));
+        }
+    };
+
+    if !host.user_home.as_os_str().is_empty() {
+        push_container("user home", host.user_home.clone());
+        for (label, rel) in [
+            ("Desktop", "Desktop"),
+            ("Documents", "Documents"),
+            ("Downloads", "Downloads"),
+            ("Pictures", "Pictures"),
+            ("Music", "Music"),
+            ("Videos", "Videos"),
+            ("Movies", "Movies"),
+            ("Public", "Public"),
+            ("Library", "Library"),
+            ("Library/Application Support", "Library/Application Support"),
+            ("Library/Caches", "Library/Caches"),
+            ("Library/Preferences", "Library/Preferences"),
+            (".config", ".config"),
+            (".local", ".local"),
+            (".local/share", ".local/share"),
+            (".cache", ".cache"),
+            ("AppData", "AppData"),
+            ("AppData/Local", "AppData/Local"),
+            ("AppData/Local/Programs", "AppData/Local/Programs"),
+            ("AppData/Roaming", "AppData/Roaming"),
+            ("AppData/LocalLow", "AppData/LocalLow"),
+            ("AppData/Local/Temp", "AppData/Local/Temp"),
+        ] {
+            push_container(label, host.user_home.join(rel));
+        }
+    }
+
+    for (label, env_var) in [
+        ("USERPROFILE", "USERPROFILE"),
+        ("HOME", "HOME"),
+        ("LOCALAPPDATA", "LOCALAPPDATA"),
+        ("APPDATA", "APPDATA"),
+        ("PUBLIC", "PUBLIC"),
+        ("ProgramData", "ProgramData"),
+        ("ProgramFiles", "ProgramFiles"),
+        ("ProgramFiles(x86)", "ProgramFiles(x86)"),
+        ("SystemRoot", "SystemRoot"),
+        ("XDG_CONFIG_HOME", "XDG_CONFIG_HOME"),
+        ("XDG_DATA_HOME", "XDG_DATA_HOME"),
+        ("XDG_CACHE_HOME", "XDG_CACHE_HOME"),
+        ("TEMP", "TEMP"),
+        ("TMP", "TMP"),
+        ("TMPDIR", "TMPDIR"),
+    ] {
+        if let Some(val) = std::env::var_os(env_var).filter(|v| !v.is_empty()) {
+            push_container(label, PathBuf::from(val));
+        }
+    }
+    push_container("temp directory", std::env::temp_dir());
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = macos::account_home() {
+            push_container("account home", h);
+        }
+        if let Some(t) = macos::user_temp_dir() {
+            push_container("user temp directory", t);
+        }
+        if let Some(c) = macos::user_cache_dir() {
+            push_container("user cache directory", c);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for (label, path) in [
+            ("/tmp", "/tmp"),
+            ("/private/tmp", "/private/tmp"),
+            ("/var/tmp", "/var/tmp"),
+            ("/private/var/tmp", "/private/var/tmp"),
+            ("/Users/Shared", "/Users/Shared"),
+            ("/Volumes", "/Volumes"),
+            ("/Users", "/Users"),
+            ("/home", "/home"),
+            ("/opt", "/opt"),
+            ("/etc", "/etc"),
+            ("/var", "/var"),
+        ] {
+            push_container(label, PathBuf::from(path));
+        }
+    }
+
+    let mut forbidden_subtrees: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mut push_forbidden = |label: &'static str, path: PathBuf| {
+        if !path.as_os_str().is_empty() && path.is_absolute() {
+            forbidden_subtrees.push((label, path));
+        }
+    };
+
+    push_forbidden("CARGO_HOME", host.cargo_home.clone());
+    if let Some(ox_home) = std::env::var_os("OXIDESWARM_HOME").filter(|v| !v.is_empty()) {
+        push_forbidden("OXIDESWARM_HOME", PathBuf::from(ox_home));
+    }
+    let mut homes_to_protect = Vec::new();
+    if !host.user_home.as_os_str().is_empty() {
+        homes_to_protect.push(host.user_home.clone());
+    }
+    for env_home in ["HOME", "USERPROFILE"] {
+        if let Some(val) = std::env::var_os(env_home).filter(|v| !v.is_empty()) {
+            homes_to_protect.push(PathBuf::from(val));
+        }
+    }
+    for home in homes_to_protect {
+        for (label, rel) in [
+            (".oxideswarm", ".oxideswarm"),
+            (".ssh", ".ssh"),
+            (".gnupg", ".gnupg"),
+            (".aws", ".aws"),
+            (".azure", ".azure"),
+            (".kube", ".kube"),
+            (".docker", ".docker"),
+            (".pki", ".pki"),
+            (".password-store", ".password-store"),
+            (".git-credentials", ".git-credentials"),
+            (".netrc", ".netrc"),
+            (".npmrc", ".npmrc"),
+            (".pypirc", ".pypirc"),
+            (".config/gcloud", ".config/gcloud"),
+            (".config/gh", ".config/gh"),
+            (".config/op", ".config/op"),
+            ("Library/Keychains", "Library/Keychains"),
+            (
+                "AppData/Roaming/Microsoft/Credentials",
+                "AppData/Roaming/Microsoft/Credentials",
+            ),
+            (
+                "AppData/Local/Microsoft/Credentials",
+                "AppData/Local/Microsoft/Credentials",
+            ),
+            (
+                "AppData/Roaming/Microsoft/Protect",
+                "AppData/Roaming/Microsoft/Protect",
+            ),
+            (
+                "AppData/Local/Google/Cloud SDK",
+                "AppData/Local/Google/Cloud SDK",
+            ),
+        ] {
+            push_forbidden(label, home.join(rel));
+        }
+    }
+    if let Some(sb) = sandbox_base {
+        push_forbidden("sandbox_base", sb.to_path_buf());
+    }
+    if let Some(wr) = workspace_root {
+        push_forbidden("workspace_root", wr.to_path_buf());
+    }
+    for pf in protected_files {
+        push_forbidden("protected file", pf.clone());
+    }
+
+    for raw_dir in dirs {
+        if raw_dir.as_os_str().is_empty() {
+            return Err(
+                "refusing empty --isolation-read-dir entry; omit it or pass an absolute runtime directory"
+                    .to_string(),
+            );
+        }
+        if !raw_dir.is_absolute() {
+            return Err(format!(
+                "refusing relative --isolation-read-dir path '{}'; pass an absolute directory path",
+                raw_dir.display()
+            ));
+        }
+        if raw_dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "refusing --isolation-read-dir '{}' containing '..' traversal components",
+                raw_dir.display()
+            ));
+        }
+        let meta = std::fs::symlink_metadata(raw_dir).map_err(|e| {
+            format!(
+                "refusing --isolation-read-dir '{}': directory is inaccessible ({e})",
+                raw_dir.display()
+            )
+        })?;
+        if is_symlink_or_reparse(raw_dir) {
+            return Err(format!(
+                "refusing --isolation-read-dir '{}': symlinks and NTFS junctions are not allowed",
+                raw_dir.display()
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!(
+                "refusing --isolation-read-dir '{}': path must be an existing directory, not a file",
+                raw_dir.display()
+            ));
+        }
+
+        if !host.user_home.as_os_str().is_empty() {
+            for anc in raw_dir.ancestors().skip(1) {
+                if anc.as_os_str().is_empty() || anc.parent().is_none() {
+                    break;
+                }
+                if anc
+                    .parent()
+                    .is_some_and(|p| policy_path_starts_with(p, &host.user_home))
+                    && is_symlink_or_reparse(anc)
+                {
+                    return Err(format!(
+                        "refusing --isolation-read-dir '{}': parent directory '{}' inside home is a symlink or junction",
+                        raw_dir.display(),
+                        anc.display()
+                    ));
+                }
+                if policy_path_starts_with(&host.user_home, anc) {
+                    break;
+                }
+            }
+        }
+
+        let canon_dir = normalize_policy_path(raw_dir);
+        if canon_dir.parent().is_none() {
+            return Err(format!(
+                "refusing broad filesystem root '{}' as --isolation-read-dir",
+                raw_dir.display()
+            ));
+        }
+        if !cfg!(windows) && canon_dir.components().count() <= 2 {
+            return Err(format!(
+                "refusing broad top-level directory '{}' (resolved '{}') as --isolation-read-dir; specify a narrower runtime subdirectory",
+                raw_dir.display(),
+                canon_dir.display()
+            ));
+        }
+        for (label, container) in &container_roots {
+            if policy_path_starts_with(container, &canon_dir) {
+                return Err(format!(
+                    "refusing broad {label} container '{}' as --isolation-read-dir; specify a narrow runtime subdirectory such as '%LOCALAPPDATA%\\Programs\\Python\\Python311' or '~/.pyenv/versions/3.11.8'",
+                    raw_dir.display()
+                ));
+            }
+        }
+        for (label, forbidden) in &forbidden_subtrees {
+            if policy_path_starts_with(&canon_dir, forbidden)
+                || policy_path_starts_with(forbidden, &canon_dir)
+            {
+                return Err(format!(
+                    "refusing --isolation-read-dir '{}' because it overlaps protected {label} path '{}'",
+                    raw_dir.display(),
+                    forbidden.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -584,6 +963,13 @@ fn validate_jail_dirs(jail: &Jail<'_>) -> Result<(), String> {
             ));
         }
     }
+    validate_extra_read_only_dirs(
+        &jail.host.extra_read_only_dirs,
+        jail.host,
+        Some(jail.sandbox_base),
+        jail.workspace_root,
+        jail.protected_files,
+    )?;
     Ok(())
 }
 
@@ -628,13 +1014,15 @@ mod macos {
 
     /// The Seatbelt profile text. All paths arrive as `-D` parameters (`SANDBOX_DIR`,
     /// `EXTRA_WRITABLE_DIR`, `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`,
-    /// `CARGO_HOME`, `CARGO_CRED`, `CARGO_CRED_TOML`, `ANCESTOR_<n>` for `ancestors` entries),
-    /// so no path is ever spliced into the profile text.
+    /// `CARGO_HOME`, `CARGO_CRED`, `CARGO_CRED_TOML`, `EXTRA_READ_<n>` for `extra_read` entries,
+    /// `PROTECTED_<n>`, `ANCESTOR_<n>` for `ancestors` entries), so no path is ever spliced into
+    /// the profile text.
     pub(super) fn profile(
         level: IsolationLevel,
         has_extra_writable: bool,
         ancestors: usize,
         extra_denied: usize,
+        extra_read: usize,
         protected: usize,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n");
@@ -669,9 +1057,11 @@ mod macos {
         if has_extra_writable {
             p.push_str("    (subpath (param \"EXTRA_WRITABLE_DIR\"))\n");
         }
-        p.push_str(
-            "    (subpath (param \"RUSTUP_HOME\"))\n    (subpath (param \"CARGO_HOME\")))\n",
-        );
+        p.push_str("    (subpath (param \"RUSTUP_HOME\"))\n    (subpath (param \"CARGO_HOME\"))");
+        for i in 0..extra_read {
+            p.push_str(&format!("\n    (subpath (param \"EXTRA_READ_{i}\"))"));
+        }
+        p.push_str(")\n");
         p.push_str(
             "(deny file-read*\n    (literal (param \"CARGO_CRED\"))\n    (literal (param \"CARGO_CRED_TOML\")))\n",
         );
@@ -712,7 +1102,7 @@ mod macos {
     /// The home directory the account database names for this user (`getpwuid_r`), which can
     /// differ from `$HOME` when the worker was started with another one.
     #[cfg(target_os = "macos")]
-    fn account_home() -> Option<PathBuf> {
+    pub(super) fn account_home() -> Option<PathBuf> {
         use std::ffi::CStr;
         let mut buf = vec![0u8; 4096];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -738,13 +1128,13 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn account_home() -> Option<PathBuf> {
+    pub(super) fn account_home() -> Option<PathBuf> {
         None
     }
 
     /// The per-user temporary directory (`DARWIN_USER_TEMP_DIR`, `/var/folders/../T`).
     #[cfg(target_os = "macos")]
-    fn user_temp_dir() -> Option<PathBuf> {
+    pub(super) fn user_temp_dir() -> Option<PathBuf> {
         let mut buf = vec![0 as libc::c_char; 1024];
         // SAFETY: the buffer is valid for `len` bytes.
         let n =
@@ -760,14 +1150,14 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn user_temp_dir() -> Option<PathBuf> {
+    pub(super) fn user_temp_dir() -> Option<PathBuf> {
         None
     }
 
     /// The per-user cache directory (`DARWIN_USER_CACHE_DIR`, `/var/folders/../C`), next to the
     /// temp directory.
     #[cfg(target_os = "macos")]
-    fn user_cache_dir() -> Option<PathBuf> {
+    pub(super) fn user_cache_dir() -> Option<PathBuf> {
         let mut buf = vec![0 as libc::c_char; 1024];
         // SAFETY: the buffer is valid for `len` bytes.
         let n =
@@ -783,7 +1173,7 @@ mod macos {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn user_cache_dir() -> Option<PathBuf> {
+    pub(super) fn user_cache_dir() -> Option<PathBuf> {
         None
     }
 
@@ -834,6 +1224,17 @@ mod macos {
             }
         }
 
+        let mut extra_read: Vec<PathBuf> = Vec::new();
+        for dir in &jail.host.extra_read_only_dirs {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let dir = canonical(dir);
+            if !extra_read.contains(&dir) {
+                extra_read.push(dir);
+            }
+        }
+
         // Directories on the way to an allowed path that the deny rules cover: their metadata
         // must stay readable for `realpath()`.
         let denied: Vec<&PathBuf> = [&home, &base, &cache]
@@ -845,6 +1246,7 @@ mod macos {
         if let Some(ref extra_dir) = extra_writable {
             targets.push(extra_dir);
         }
+        targets.extend(extra_read.iter());
         for target in targets {
             for dir in target.ancestors().skip(1) {
                 if dir.as_os_str().is_empty() || dir == Path::new("/") {
@@ -868,6 +1270,7 @@ mod macos {
                 extra_writable.is_some(),
                 ancestors.len(),
                 extra.len(),
+                extra_read.len(),
                 protected.len(),
             ),
         ];
@@ -888,6 +1291,9 @@ mod macos {
         define("CARGO_CRED_TOML", &cargo.join("credentials.toml"));
         for (i, dir) in extra.iter().enumerate() {
             define(&format!("DENIED_{i}"), dir);
+        }
+        for (i, dir) in extra_read.iter().enumerate() {
+            define(&format!("EXTRA_READ_{i}"), dir);
         }
         for (i, file) in protected.iter().enumerate() {
             define(&format!("PROTECTED_{i}"), file);
@@ -2596,6 +3002,11 @@ pub mod windows {
         if !host.cargo_home.as_os_str().is_empty() {
             forbidden_roots.push(("CARGO_HOME", host.cargo_home.clone()));
         }
+        for extra_dir in &host.extra_read_only_dirs {
+            if !extra_dir.as_os_str().is_empty() {
+                forbidden_roots.push(("isolation read dir", extra_dir.clone()));
+            }
+        }
         if let Some((_, _, grant_roots)) = discover_msvc_details() {
             for r in grant_roots {
                 forbidden_roots.push(("MSVC/Windows SDK toolchain", r));
@@ -2699,6 +3110,18 @@ pub mod windows {
                     sandbox_base.display(),
                     label,
                     dir.display()
+                ));
+            }
+        }
+        for extra_dir in &host.extra_read_only_dirs {
+            if !extra_dir.as_os_str().is_empty()
+                && (path_starts_with_ci(extra_dir, sandbox_base)
+                    || path_starts_with_ci(sandbox_base, extra_dir))
+            {
+                return Err(format!(
+                    "refusing '{}' as sandbox_base because it overlaps --isolation-read-dir '{}'",
+                    sandbox_base.display(),
+                    extra_dir.display()
                 ));
             }
         }
@@ -2833,6 +3256,18 @@ pub mod windows {
                     ws_root.display(),
                     label,
                     dir.display()
+                ));
+            }
+        }
+        for extra_dir in &host.extra_read_only_dirs {
+            if !extra_dir.as_os_str().is_empty()
+                && (path_starts_with_ci(extra_dir, ws_root)
+                    || path_starts_with_ci(ws_root, extra_dir))
+            {
+                return Err(format!(
+                    "refusing '{}' as workspace_root because it overlaps --isolation-read-dir '{}'",
+                    ws_root.display(),
+                    extra_dir.display()
                 ));
             }
         }
@@ -3006,6 +3441,13 @@ pub mod windows {
         sandbox_base: Option<&Path>,
     ) -> Result<(), String> {
         ensure_process_token_default_dacl_grants_current_user();
+        super::validate_extra_read_only_dirs(
+            &host.extra_read_only_dirs,
+            host,
+            sandbox_base,
+            None,
+            protected_files,
+        )?;
         validate_protected_files_outside_toolchains(host, protected_files)?;
         if let Some(base) = sandbox_base {
             validate_sandbox_base_safe(base, host)?;
@@ -3054,7 +3496,12 @@ pub mod windows {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
         {
-            for rel in ["cluster.secret", "p2p_secret.key"] {
+            for rel in [
+                "cluster.secret",
+                "node.key",
+                "p2p_secret.key",
+                "master_noise.key",
+            ] {
                 let sec = ox_home.join(rel);
                 if sec.exists()
                     && !is_reparse_point(&sec)
@@ -3065,7 +3512,12 @@ pub mod windows {
             }
         }
         if !host.user_home.as_os_str().is_empty() {
-            for rel in [".oxideswarm/cluster.secret", ".oxideswarm/p2p_secret.key"] {
+            for rel in [
+                ".oxideswarm/cluster.secret",
+                ".oxideswarm/node.key",
+                ".oxideswarm/p2p_secret.key",
+                ".oxideswarm/master_noise.key",
+            ] {
                 let sec = host.user_home.join(rel);
                 if sec.exists()
                     && !is_reparse_point(&sec)
@@ -3115,6 +3567,34 @@ pub mod windows {
                         host.cargo_home.display()
                     )
                 })?;
+        }
+
+        for dir in &host.extra_read_only_dirs {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            if !dir.exists() || is_reparse_point(dir) {
+                return Err(format!(
+                    "refusing to grant AppContainer ACL on missing or reparse-point --isolation-read-dir {}",
+                    dir.display()
+                ));
+            }
+            let norm_dir = normalize_win_path(dir);
+            if !host.user_home.as_os_str().is_empty()
+                && path_starts_with_ci(&host.user_home, &norm_dir)
+            {
+                return Err(format!(
+                    "refusing to grant AppContainer ACL on '{}' because USERPROFILE '{}' is equal to or inside it",
+                    norm_dir.display(),
+                    host.user_home.display()
+                ));
+            }
+            grant_rx_recursive(&norm_dir, toolchain_sid.as_psid(), manifest_opt).map_err(|e| {
+                format!(
+                    "failed to prepare --isolation-read-dir {}: {e}",
+                    dir.display()
+                )
+            })?;
         }
 
         Ok(())
@@ -3358,6 +3838,14 @@ pub mod windows {
             cmd_rustup_home: Option<&Path>,
         ) -> io::Result<Self> {
             ensure_process_token_default_dacl_grants_current_user();
+            super::validate_extra_read_only_dirs(
+                &jail.host.extra_read_only_dirs,
+                jail.host,
+                Some(jail.sandbox_base),
+                jail.workspace_root,
+                jail.protected_files,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
             validate_protected_files_outside_toolchains(jail.host, jail.protected_files)
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
             validate_sandbox_base_safe(jail.sandbox_base, jail.host)
@@ -3457,12 +3945,23 @@ pub mod windows {
                 let in_system = path_starts_with_ci(prog_path, &sys_root)
                     || path_starts_with_ci(prog_path, &prog_files)
                     || path_starts_with_ci(prog_path, &prog_files_x86);
+                let in_extra_read = jail
+                    .host
+                    .extra_read_only_dirs
+                    .iter()
+                    .any(|d| !d.as_os_str().is_empty() && path_starts_with_ci(prog_path, d));
                 let already_granted = dacl_already_grants_sid(
                     prog_path,
                     toolchain_sid.as_psid(),
                     FILE_READ_ATTRIBUTES,
                 );
-                if !(in_sandbox || in_cargo || in_rustup || in_msvc || in_system || already_granted)
+                if !(in_sandbox
+                    || in_cargo
+                    || in_rustup
+                    || in_msvc
+                    || in_system
+                    || in_extra_read
+                    || already_granted)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -3873,28 +4372,42 @@ pub mod windows {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
         {
-            let ox_secret = ox_home.join("cluster.secret");
-            if ox_secret.exists() {
-                let norm_ox = if !is_reparse_point(&ox_secret) {
-                    normalize_win_path(&ox_secret)
-                } else {
-                    ox_secret
-                };
-                if !existing_protected.contains(&norm_ox) {
-                    existing_protected.push(norm_ox);
+            for rel in [
+                "cluster.secret",
+                "node.key",
+                "p2p_secret.key",
+                "master_noise.key",
+            ] {
+                let ox_secret = ox_home.join(rel);
+                if ox_secret.exists() {
+                    let norm_ox = if !is_reparse_point(&ox_secret) {
+                        normalize_win_path(&ox_secret)
+                    } else {
+                        ox_secret
+                    };
+                    if !existing_protected.contains(&norm_ox) {
+                        existing_protected.push(norm_ox);
+                    }
                 }
             }
         }
         if !host.user_home.as_os_str().is_empty() {
-            let default_secret = host.user_home.join(".oxideswarm").join("cluster.secret");
-            if default_secret.exists() {
-                let norm_def = if !is_reparse_point(&default_secret) {
-                    normalize_win_path(&default_secret)
-                } else {
-                    default_secret
-                };
-                if !existing_protected.contains(&norm_def) {
-                    existing_protected.push(norm_def);
+            for rel in [
+                "cluster.secret",
+                "node.key",
+                "p2p_secret.key",
+                "master_noise.key",
+            ] {
+                let default_secret = host.user_home.join(".oxideswarm").join(rel);
+                if default_secret.exists() {
+                    let norm_def = if !is_reparse_point(&default_secret) {
+                        normalize_win_path(&default_secret)
+                    } else {
+                        default_secret
+                    };
+                    if !existing_protected.contains(&norm_def) {
+                        existing_protected.push(norm_def);
+                    }
                 }
             }
         }
@@ -4862,16 +5375,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_seatbelt_profile_orders_deny_allow_deny_and_adds_network_rule_for_fs_net() {
-        let fs = macos::profile(IsolationLevel::Fs, false, 2, 1, 1);
+        let fs = macos::profile(IsolationLevel::Fs, false, 2, 1, 1, 1);
         let at = |needle: &str| {
             fs.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing in\n{fs}"))
         };
-        // Last match wins: broad deny, then the allows, then the credentials deny.
+        // Last match wins: broad deny, then the allows (including EXTRA_READ_0), then credentials
+        // and protected files deny.
         let deny_home = at("(deny file-read*\n    (subpath (param \"USER_HOME\"))");
         let allow_tools = at("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))");
+        let allow_extra_read = at("(subpath (param \"EXTRA_READ_0\"))");
         let deny_cred = at("(deny file-read*\n    (literal (param \"CARGO_CRED\"))");
-        assert!(deny_home < allow_tools && allow_tools < deny_cred);
+        let deny_protected = at("(deny file-read*\n    (literal (param \"PROTECTED_0\")))");
+        assert!(
+            deny_home < allow_tools
+                && allow_tools < allow_extra_read
+                && allow_extra_read < deny_cred
+                && deny_cred < deny_protected
+        );
         assert!(fs.contains("(deny file-write* (subpath \"/\"))"));
         assert!(fs.contains("(literal (param \"ANCESTOR_1\"))"));
         assert!(!fs.contains("ANCESTOR_2"));
@@ -4893,7 +5414,7 @@ mod tests {
         ] {
             assert!(fs.contains(rule), "{rule} missing in\n{fs}");
         }
-        let ws = macos::profile(IsolationLevel::Fs, true, 1, 1, 0);
+        let ws = macos::profile(IsolationLevel::Fs, true, 1, 1, 0, 0);
         let ws_allow_write = ws
             .find("(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))")
             .expect("workspace allow file-write*");
@@ -4905,7 +5426,7 @@ mod tests {
             .expect("workspace deny file-write-create on tree and tmp");
         assert!(ws_allow_write < ws_deny_unlink && ws_deny_unlink < ws_deny_create);
         assert!(ws.contains("(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"EXTRA_WRITABLE_DIR\"))"));
-        let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0);
+        let net = macos::profile(IsolationLevel::FsNet, false, 0, 0, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));
     }
@@ -4917,7 +5438,10 @@ mod tests {
             PathBuf::from("/nonexistent-home"),
             Some("/nonexistent-home/.rustup".into()),
             None,
-        );
+        )
+        .with_extra_read_only_dirs(vec![PathBuf::from(
+            "/nonexistent-home/.pyenv/versions/3.11.8",
+        )]);
         let jail = Jail {
             level: IsolationLevel::Fs,
             host: &h,
@@ -4942,6 +5466,12 @@ mod tests {
         assert!(args.contains(&"CARGO_HOME=/nonexistent-home/.cargo".to_string()));
         assert!(
             args.contains(&"CARGO_CRED_TOML=/nonexistent-home/.cargo/credentials.toml".to_string())
+        );
+        assert!(args.contains(&"EXTRA_READ_0=/nonexistent-home/.pyenv/versions/3.11.8".to_string()));
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with("=/nonexistent-home/.pyenv/versions") && a.starts_with("ANCESTOR_")),
+            "parent components under USER_HOME must receive ANCESTOR_* metadata traversal: {args:?}"
         );
         assert!(
             args.contains(&"ANCESTOR_0=/nonexistent-home".to_string())
@@ -5164,6 +5694,201 @@ mod tests {
                 Some(ox_home.as_os_str()),
             ),
             explicit_log
+        );
+    }
+
+    #[test]
+    fn test_validate_extra_read_only_dirs_allows_narrow_runtime_and_refuses_broad_or_secret_paths()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let fake_home = root.path().join("home");
+        let outside = root.path().join("outside");
+        let sandbox_base = outside.join("sandboxes");
+        let workspace_root = outside.join("workspaces");
+
+        let pyenv_runtime = fake_home.join(".pyenv").join("versions").join("3.11.8");
+        let win_python = fake_home
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Python")
+            .join("Python311");
+        let mac_blender = fake_home
+            .join("Library")
+            .join("Application Support")
+            .join("Blender")
+            .join("4.5");
+        let ext_runtime = outside.join("ext_runtime");
+        let ssh_dir = fake_home.join(".ssh").join("keys");
+        let aws_dir = fake_home.join(".aws");
+        let ox_dir = fake_home.join(".oxideswarm");
+        let cargo_dir = fake_home.join(".cargo");
+        let cargo_bin = cargo_dir.join("bin");
+        let sb_task = sandbox_base.join("task_1");
+        let secret_parent = outside.join("secret_holder");
+        let secret_file = secret_parent.join("cluster.secret");
+
+        for d in [
+            &pyenv_runtime,
+            &win_python,
+            &mac_blender,
+            &ext_runtime,
+            &ssh_dir,
+            &aws_dir,
+            &ox_dir,
+            &cargo_bin,
+            &sb_task,
+            &workspace_root,
+            &secret_parent,
+            &fake_home.join("Desktop"),
+            &fake_home.join("Documents"),
+            &fake_home.join("Downloads"),
+            &fake_home.join(".config"),
+            &fake_home.join(".local"),
+            &fake_home.join("AppData").join("Local").join("Temp"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let regular_file = outside.join("not_a_dir.txt");
+        std::fs::write(&regular_file, "x").unwrap();
+        std::fs::write(&secret_file, "secret").unwrap();
+
+        let host = HostDirs::from_home(fake_home.clone(), None, Some(cargo_dir.clone()));
+
+        assert!(validate_extra_read_only_dirs(
+            &[],
+            &host,
+            Some(&sandbox_base),
+            Some(&workspace_root),
+            std::slice::from_ref(&secret_file),
+        )
+        .is_ok());
+
+        for allowed in [&pyenv_runtime, &win_python, &mac_blender, &ext_runtime] {
+            validate_extra_read_only_dirs(
+                std::slice::from_ref(allowed),
+                &host,
+                Some(&sandbox_base),
+                Some(&workspace_root),
+                std::slice::from_ref(&secret_file),
+            )
+            .unwrap_or_else(|e| panic!("expected {} to be allowed, got: {e}", allowed.display()));
+        }
+
+        let refused_paths = [
+            fake_home.clone(),
+            fake_home.join("Desktop"),
+            fake_home.join("Documents"),
+            fake_home.join("Downloads"),
+            fake_home.join(".config"),
+            fake_home.join(".local"),
+            fake_home.join("AppData"),
+            fake_home.join("AppData").join("Local"),
+            fake_home.join("AppData").join("Local").join("Programs"),
+            fake_home.join("AppData").join("Local").join("Temp"),
+            std::env::temp_dir(),
+            fake_home.join(".ssh"),
+            ssh_dir,
+            aws_dir,
+            ox_dir,
+            cargo_dir,
+            cargo_bin,
+            sandbox_base.clone(),
+            sb_task,
+            outside.clone(),
+            workspace_root.clone(),
+            secret_parent,
+            secret_file.clone(),
+            regular_file,
+            outside.join("does_not_exist"),
+            outside.join("ext_runtime").join("..").join("ext_runtime"),
+            PathBuf::from("relative/runtime"),
+            PathBuf::new(),
+        ];
+
+        for bad in refused_paths {
+            let err = validate_extra_read_only_dirs(
+                std::slice::from_ref(&bad),
+                &host,
+                Some(&sandbox_base),
+                Some(&workspace_root),
+                std::slice::from_ref(&secret_file),
+            )
+            .expect_err(&format!("path {} must be refused", bad.display()));
+            assert!(
+                !err.is_empty(),
+                "error message for {} must not be empty",
+                bad.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_extra_read_only_dirs_refuses_symlinks_and_junctions() {
+        let root = tempfile::tempdir().unwrap();
+        let fake_home = root.path().join("home");
+        let target = root.path().join("target_runtime");
+        let target_nested = target.join("nested");
+        let real_sub = fake_home.join("real_sub").join("py311");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&real_sub).unwrap();
+        std::fs::create_dir_all(&target_nested).unwrap();
+
+        let direct_link = fake_home.join("link_runtime");
+        let parent_link = fake_home.join("parent_link");
+        let home_link = fake_home.join("link_to_home");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &direct_link).unwrap();
+            std::os::unix::fs::symlink(&target, &parent_link).unwrap();
+            std::os::unix::fs::symlink(&fake_home, &home_link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            for (link, dest) in [
+                (&direct_link, &target),
+                (&parent_link, &target),
+                (&home_link, &fake_home),
+            ] {
+                let status = std::process::Command::new("cmd")
+                    .args([
+                        "/C",
+                        "mklink",
+                        "/J",
+                        &link.to_string_lossy(),
+                        &dest.to_string_lossy(),
+                    ])
+                    .status()
+                    .expect("mklink /J must run");
+                assert!(status.success(), "mklink /J failed for {}", link.display());
+            }
+        }
+
+        let host = HostDirs::from_home(fake_home, None, None);
+        let err_direct = validate_extra_read_only_dirs(&[direct_link], &host, None, None, &[])
+            .expect_err("direct symlink/junction must be refused");
+        assert!(
+            err_direct.contains("symlink") || err_direct.contains("junction"),
+            "{err_direct}"
+        );
+
+        let nested_under_link = parent_link.join("nested");
+        let err_parent =
+            validate_extra_read_only_dirs(&[nested_under_link], &host, None, None, &[])
+                .expect_err("ancestor symlink/junction inside home must be refused");
+        assert!(
+            err_parent.contains("symlink") || err_parent.contains("junction"),
+            "{err_parent}"
+        );
+
+        let nested_under_home_link = home_link.join("real_sub").join("py311");
+        let err_home_link =
+            validate_extra_read_only_dirs(&[nested_under_home_link], &host, None, None, &[])
+                .expect_err("ancestor symlink/junction pointing to user_home must be refused");
+        assert!(
+            err_home_link.contains("symlink") || err_home_link.contains("junction"),
+            "{err_home_link}"
         );
     }
 }

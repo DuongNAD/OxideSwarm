@@ -184,6 +184,11 @@ fn read_only_roots(host: &super::HostDirs) -> Vec<PathBuf> {
     for leaf in ["bin", "registry", "git", "config.toml", "config"] {
         roots.push(host.cargo_home.join(leaf));
     }
+    for extra in &host.extra_read_only_dirs {
+        if !extra.as_os_str().is_empty() {
+            roots.push(extra.clone());
+        }
+    }
     roots
 }
 
@@ -1202,5 +1207,27 @@ mod tests {
         assert!(!closed.contains(&rustup));
         assert!(closed.contains(&rustup.join("toolchains")));
         assert!(!closed.contains(&rustup.join("cluster.secret")));
+    }
+
+    #[test]
+    fn test_read_only_grants_include_extra_read_only_dirs_and_carve_protected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        let home = canonical_dir.join("home");
+        let extra = home.join(".pyenv").join("versions").join("3.11.8");
+        let bin = extra.join("bin");
+        let secret = extra.join("cluster.secret");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&secret, "s").unwrap();
+
+        let host = super::super::HostDirs::from_home(home, None, None)
+            .with_extra_read_only_dirs(vec![extra.clone()]);
+        let open = read_only_grants(&host, &[]);
+        assert!(open.contains(&extra), "{open:?}");
+
+        let carved = read_only_grants(&host, std::slice::from_ref(&secret));
+        assert!(!carved.contains(&extra), "{carved:?}");
+        assert!(carved.contains(&bin), "{carved:?}");
+        assert!(!carved.contains(&secret), "{carved:?}");
     }
 }
