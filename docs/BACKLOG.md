@@ -210,9 +210,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Planned |  |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Planned |  |
-| TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | PRNUM |
-| TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented | PRNUM |
-| TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | PRNUM |
+| TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
+| TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented | 276 |
+| TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
