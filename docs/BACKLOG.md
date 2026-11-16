@@ -143,7 +143,8 @@ Three items (TEST-24 to TEST-26) were added on 2026-11-14 from
 Eleven items (BUG-19, BUG-20, SEC-10 to SEC-15, AND-5, DOC-9 and DOC-10) were added on 2026-11-15
 from the audit of `c2462e3` (Phase 11). With FEAT-9a (pull request 232) the Index then held 77
 items Implemented, 8 Partial and 48 Planned. On 2026-11-16, after BUG-19, BUG-20, SEC-14, DOC-9
-and DOC-10, it holds 82 Implemented, 8 Partial and 43 Planned.
+and DOC-10, with SEC-10 and SEC-13, and with TEST-27 added, it holds 84 Implemented, 8 Partial and
+42 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -162,10 +163,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 |  | Implemented | 25 |
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
-| SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Planned | 238 (open) |
+| SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Implemented | 238 (design 0070) |
 | SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
 | SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
-| SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Planned | 239 (open) |
+| SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
 | SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
@@ -192,6 +193,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
+| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -241,7 +243,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230 (open), 231 (open), 242 (open) |
+| MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Partial | 211, 212, 230, 231, 242 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
@@ -851,6 +853,21 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** The cause is written in the status log, and the test passes 50 times in a row
   on Windows under CPU load. If production code changed, a regression test covers the cause.
 
+- **Note (2026-11-16):** The failed result narrows the search. The worker sets `exit_code` 1
+  only when a process that exited 0 misses a declared output, and it appends its note to the
+  process's own stderr (`crates/worker/src/runner.rs:1776-1786` and `append_note` at `0354b28`).
+  The result held that note and nothing else, and `error` held only the output message. So
+  PowerShell ran the whole script, exited 0 and printed nothing: no command in it failed. Either
+  `$env:OUT_FILE` was empty in that run, or `WriteAllText` wrote `out.txt` relative to a .NET
+  current directory other than the directory the worker read. 746 ms is short for a run that spans
+  PowerShell start-up, a master restart and a reconnect, and a second run of `t_run` that started
+  after the gate was written would fit it. Step 6 of the test cannot tell the two apart: adoption
+  and a new assignment to `w1` both show `Running` with `active_tasks == 1`. A failing run should
+  therefore also record the number of `run` lines in the marker file (two means a second run), the
+  worker log line "Task assigned again while its previous run is still active"
+  (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
+  `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
+
 ### TEST-24: Test large transfers between machines
 
 - **Evidence:** Read, on 2026-11-14 at `master` `f486885`. The largest file in the end-to-end
@@ -909,6 +926,26 @@ The full suite must pass on a clean machine before CI can require it.
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
+
+### TEST-27: Find why the `mesh_auth` slow-consumer test times out on macOS
+
+- **Evidence:** Reproduced once in CI. The `master` push of `6a88eff` on 2026-11-15 failed in
+  `workspace tests (macos-latest)` (run `43735264003`, job `132876345396`):
+  `test_slow_consumer_is_disconnected_instead_of_buffering_forever` in
+  `crates/agent_mesh/tests/mesh_auth.rs` printed "victim disconnected after 20 x 100 KiB sends",
+  then the `ping` to the healthy node, a `send_command` with a 3000 ms deadline, ended in
+  `Elapsed(())` (line 873). The runs of the next two pushes (`3413fb2`, `96ce571`) passed.
+- **Problem:** The test checks that a slow consumer does not hold up other peers. A timeout at this
+  line is either a busy runner or the delay the test exists to catch, and nothing in the output
+  tells the two apart.
+- **Do:**
+  1. Run the test 50 times on `macos-latest` and record how often it fails.
+  2. Print the time from the victim's removal to the healthy node's answer, so a failure shows
+     whether the time went to the flooder's socket, the hub's writer to the healthy node, or the
+     healthy node itself.
+  3. If the delay is in the hub, fix it there. If it is the runner, raise the deadline by the
+     measured margin, with a comment that names this item.
+- **Done when:** 50 runs in a row pass on `macos-latest`, and the test prints that latency.
 
 ### DOC-1: Correct false status claims
 
@@ -2909,3 +2946,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-15: DOC-9 implemented (pull request 234): statuses and statements corrected across `docs/BACKLOG.md`, `docs/ROADMAP.md`, `docs/README.md`, `CLAUDE.md`, `PROJECT.md`, `README.md`, designs 0031 and 0033, and two help texts in `crates/cli`. The Index counts are now 78 Implemented, 8 Partial and 47 Planned.
 - 2026-11-15: DOC-10 implemented (pull request 235): `docs/ROADMAP.md` is the only roadmap and describes `f4a4a74`, `PROJECT.md` section 5 links to it, and the untracked `docs/ROADMAP_AND_VISION.md` left the repository. The Index counts are now 79 Implemented, 8 Partial and 46 Planned.
 - 2026-11-16: Phase 11 brought up to date before merge: BUG-19 (pull request 236, design 0069), BUG-20 (pull request 241, design 0075) and SEC-14 (pull request 237, design 0071) were merged before this phase reached `master` and are Implemented; SEC-10, SEC-13, AND-5 and MAINT-1 name their open pull requests (238, 239, 240, 230, 231, 242); "Where the project stands" in `docs/ROADMAP.md` describes `96ce571`. The Index counts are now 82 Implemented, 8 Partial and 43 Planned.
+- 2026-11-16: TEST-27 added from a macOS CI failure of `mesh_auth` on `master` `6a88eff`, and a note on TEST-23 from the result of its failed run (the process exited 0 and printed nothing). SEC-13 is Implemented (pull request 239, [design 0072](design/0072-collect-outputs-without-following-links.md)) and SEC-10 is Implemented (pull request 238, [design 0070](design/0070-no-working-directory-config.md)), both merged 2026-11-16. MAINT-1 stays Partial after the splits of `client.rs`, `runner.rs` and `protocol.rs` (pull requests 230, 231, 242). The Index counts are now 84 Implemented, 8 Partial and 42 Planned.
