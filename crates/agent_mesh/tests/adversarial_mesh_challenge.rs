@@ -14,6 +14,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Polls until `client` has received at least `count` data payloads (30 s deadline), instead of
+/// guessing a fixed sleep that a slow runner can outlast.
+async fn wait_for_payloads(client: &AgentMeshClient, count: usize) -> Vec<AgentMeshEnvelope> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let received = client.received_data_payloads().await;
+        if received.len() >= count {
+            return received;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {count} data payloads (have {})",
+            received.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Helper to spin up a hub on an ephemeral port
 async fn spawn_test_hub() -> (AgentMeshHub, String) {
     let hub = AgentMeshHub::new();
@@ -451,7 +469,8 @@ async fn test_adv_rapid_message_burst() {
     assert_eq!(counter_rev.load(Ordering::SeqCst), 50);
 
     // Wait for delivery
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_payloads(&node3, 50).await;
+    wait_for_payloads(&node1, 50).await;
 
     let rec3 = node3.received_data_payloads().await;
     let rec1 = node1.received_data_payloads().await;
@@ -495,6 +514,7 @@ async fn test_adv_large_payload_boundaries() {
 
     let test_sizes = vec![0, 1024, 65536, 131072, 262144]; // 0B, 1KB, 64KB, 128KB, 256KB
 
+    let mut sent_count = 0;
     for size in test_sizes {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let expected_hash = compute_sha256(&payload);
@@ -505,9 +525,8 @@ async fn test_adv_large_payload_boundaries() {
             .expect("Payload send failed");
         assert_eq!(sent_hash, expected_hash);
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let received_list = receiver.received_data_payloads().await;
+        sent_count += 1;
+        let received_list = wait_for_payloads(&receiver, sent_count).await;
         let last_rec = received_list.last().expect("No payload received");
 
         if let AgentMeshEnvelope::DataPayload {
