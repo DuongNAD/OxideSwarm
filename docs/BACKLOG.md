@@ -165,7 +165,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
 | SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Implemented | 238 (design 0070) |
-| SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
+| SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Implemented | 256 (design 0078) |
 | SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Implemented | 257 (design 0033) |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
@@ -2458,6 +2458,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   and log the reason once. Keep `CreateProcessW` for a worker that is not elevated.
 - **Done when:** A Windows test that forces the LUA token to fail sees the task fail with a
   message naming the cause, and no task process starts.
+- **Implemented (2026-11-16, pull request 256, [design 0078](design/0078-no-elevated-token-fallback.md)):**
+  an elevated worker whose LUA token is missing, or whose `CreateProcessAsUserW` fails, fails the
+  spawn with the Win32 error and logs the reason once (`crates/worker/src/isolation.rs`). The
+  Windows tests `test_windows_elevated_worker_refuses_when_lua_token_is_missing` and
+  `test_windows_elevated_worker_refuses_when_create_process_as_user_fails` cover it.
 
 ### SEC-12: Test and narrow the macOS isolation profile
 
