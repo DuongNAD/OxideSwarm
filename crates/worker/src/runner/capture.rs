@@ -86,6 +86,25 @@ impl StreamCapture {
 
 type SharedCapture = Arc<Mutex<StreamCapture>>;
 
+/// Whether a failed metadata query means the declared output is simply not there.
+fn output_is_missing(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// The error for a declared output whose metadata could not be read. Only a file that is not
+/// there is "not produced"; any other error (access denied, a file being deleted, an invalid
+/// name) says what the system answered, because the file may well exist.
+fn output_stat_error_message(expected: &str, e: &std::io::Error) -> String {
+    if output_is_missing(e) {
+        format!("the task did not produce '{expected}'")
+    } else {
+        format!("could not examine '{expected}': {e}")
+    }
+}
+
 fn lock_capture(capture: &SharedCapture) -> std::sync::MutexGuard<'_, StreamCapture> {
     capture
         .lock()
@@ -410,11 +429,14 @@ impl TaskRunner {
             // Query symlink metadata without following links
             let meta = match tokio::fs::symlink_metadata(&target).await {
                 Ok(m) => m,
-                Err(_) => {
-                    if !process_failed {
-                        return Err(format!("the task did not produce '{expected}'"));
+                Err(e) => {
+                    if !output_is_missing(&e) {
+                        warn!(task_id = %task_id, path = %expected, error = %e, "Could not examine a declared output artifact");
                     }
-                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced by failed task");
+                    if !process_failed {
+                        return Err(output_stat_error_message(expected, &e));
+                    }
+                    debug!(task_id = %task_id, path = %expected, error = %e, "Declared output artifact was not produced by failed task");
                     continue;
                 }
             };
@@ -639,5 +661,65 @@ impl TaskRunner {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod output_stat_error_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_file_that_is_not_there_is_not_produced() {
+        for kind in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            let e = Error::from(kind);
+            assert!(output_is_missing(&e), "{kind:?}");
+            assert_eq!(
+                output_stat_error_message("out.txt", &e),
+                "the task did not produce 'out.txt'"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_error_names_what_the_system_answered() {
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidInput] {
+            let e = Error::new(kind, "the system said no");
+            assert!(!output_is_missing(&e), "{kind:?}");
+            let message = output_stat_error_message("out.txt", &e);
+            assert_eq!(message, "could not examine 'out.txt': the system said no");
+            assert!(
+                !message.contains("did not produce"),
+                "the file may exist: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_output_that_is_missing_still_fails_a_successful_task_only() {
+        use crate::runner::RunnerConfig;
+        use crate::sandbox::SandboxConfig;
+        use rusty_grid_core::capabilities::WorkerCapabilities;
+        use rusty_grid_core::task::TaskId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runner = TaskRunner::new(
+            uuid::Uuid::new_v4(),
+            WorkerCapabilities::default(),
+            RunnerConfig::new(SandboxConfig::new(dir.path().join("base"))),
+        );
+        let id = TaskId::from_uuid(uuid::Uuid::new_v4());
+        let wanted = vec!["out.txt".to_string()];
+
+        let err = runner
+            .harvest_output_artifacts_from_dir(dir.path(), &wanted, id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "the task did not produce 'out.txt'");
+        let none = runner
+            .harvest_output_artifacts_from_dir(dir.path(), &wanted, id, true)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 }
