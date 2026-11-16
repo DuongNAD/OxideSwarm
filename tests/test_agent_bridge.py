@@ -862,5 +862,121 @@ class IdentityFromEnvironment(BridgeCase):
         self.assertFalse(os.path.exists(os.path.join(self.nodes, f"{SELF}_state.json")))
 
 
+class Activity(BridgeCase):
+    def activity(self, *args, **kw):
+        return self.run_bridge("activity", "--agent-id", "agent-win", *args, **kw)
+
+    def path(self, short="win"):
+        return os.path.join(self.nodes, f"{short}_activity.json")
+
+    def load(self, short="win"):
+        with open(self.path(short), encoding="utf-8") as f:
+            return json.load(f)
+
+    def hand_write(self, short, state, age_minutes, task="old task", step="old step"):
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=age_minutes)
+        stamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {
+            "agent_id": f"agent-{short}",
+            "state": state,
+            "task": task,
+            "step": step,
+            "updated_at_utc": stamp,
+            "started_at_utc": stamp,
+        }
+        with open(self.path(short), "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+    def test_write_and_show_round_trip(self):
+        res = self.activity("--state", "active", "--task", "RC smoke test", "--step", "building", "--note", "n")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        record = self.load()
+        self.assertEqual(
+            (record["agent_id"], record["state"], record["task"], record["step"], record["note"]),
+            ("agent-win", "active", "RC smoke test", "building", "n"),
+        )
+        self.assertRegex(record["updated_at_utc"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(record["started_at_utc"], record["updated_at_utc"])
+        self.assertEqual([n for n in os.listdir(self.nodes) if n.endswith(".tmp")], [])
+        shown = self.run_bridge("activity", "--show").stdout.decode("utf-8")
+        for text in ("agent-win", "ACTIVE", "RC smoke test", "building", "(note: n)", "just now"):
+            self.assertIn(text, shown)
+        self.assertNotIn("STALE", shown)
+
+    def test_show_filters_by_agent_and_handles_none(self):
+        self.assertIn("No agent has reported", self.run_bridge("activity", "--show").stdout.decode("utf-8"))
+        self.hand_write("win", "idle", 1)
+        self.hand_write("mac", "done", 1)
+        only = self.run_bridge("activity", "--show", "--agent-id", "mac").stdout.decode("utf-8")
+        self.assertIn("agent-mac", only)
+        self.assertNotIn("agent-win", only)
+
+    def test_invalid_state_is_rejected(self):
+        res = self.activity("--state", "sleeping", "--task", "t")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertFalse(os.path.exists(self.path()))
+        self.assertNotEqual(self.activity("--task", "t").returncode, 0)
+
+    def test_newline_and_length_are_rejected(self):
+        for field, value in (("--task", "a\nb"), ("--step", "a\rb"), ("--note", "x" * 201)):
+            res = self.activity("--state", "active", field, value)
+            self.assertEqual(res.returncode, 2, field)
+            self.assertIn("[ACTIVITY ERROR]", res.stderr.decode("utf-8"))
+            self.assertFalse(os.path.exists(self.path()), field)
+        self.assertEqual(self.activity("--state", "active", "--task", "x" * 200).returncode, 0)
+
+    def test_started_at_is_kept_across_updates_and_reset_by_a_new_run(self):
+        self.activity("--state", "active", "--task", "t", "--step", "one")
+        first = self.load()
+        old = "2026-01-01T00:00:00Z"
+        first["started_at_utc"] = old
+        with open(self.path(), "w", encoding="utf-8") as f:
+            json.dump(first, f)
+        self.activity("--state", "active", "--step", "two")
+        second = self.load()
+        self.assertEqual((second["started_at_utc"], second["task"], second["step"]), (old, "t", "two"))
+        self.activity("--state", "blocked", "--note", "permission prompt")
+        self.assertEqual(self.load()["started_at_utc"], old)
+        self.activity("--state", "done")
+        self.assertEqual(self.load()["started_at_utc"], old)
+        self.activity("--state", "active", "--task", "next")
+        self.assertNotEqual(self.load()["started_at_utc"], old)
+
+    def test_active_and_blocked_go_stale_after_the_threshold_but_done_and_idle_do_not(self):
+        limit = bridge_module.ACTIVITY_STALE_MINUTES
+        self.assertEqual(limit, 20)
+        now = datetime.datetime(2026, 11, 16, 12, 0, 0)
+        for state, age, stale in (
+            ("active", limit - 1, False),
+            ("active", limit + 1, True),
+            ("blocked", limit + 1, True),
+            ("done", 600, False),
+            ("idle", 600, False),
+        ):
+            stamp = (now - datetime.timedelta(minutes=age)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            record = {"agent_id": "agent-x", "state": state, "task": "t", "step": "s", "updated_at_utc": stamp}
+            self.assertEqual(bridge_module.activity_is_stale(record, now), stale, (state, age))
+            line = bridge_module.describe_activity(record, now)
+            self.assertEqual("STALE" in line, stale, line)
+            if stale:
+                self.assertIn("permission prompt or stuck", line)
+
+    def test_show_marks_a_hand_written_old_active_agent_stale(self):
+        self.hand_write("win", "active", 45)
+        shown = self.run_bridge("activity", "--show").stdout.decode("utf-8")
+        self.assertIn("STALE", shown)
+        self.assertIn("45 min ago", shown)
+
+    def test_diagnose_and_peek_include_the_activity_line(self):
+        self.hand_write(PEER, "blocked", 2, task="RC smoke test", step="waiting")
+        diag = self.run_bridge("diagnose", "--peer-id", PEER).stdout.decode("utf-8")
+        self.assertIn(f"agent-{PEER}: BLOCKED - RC smoke test / waiting", diag)
+        self.assertIn("Unread Inbox", diag)
+        peek = self.run_bridge("peek", "--peer-id", PEER).stdout.decode("utf-8")
+        self.assertIn(f"Activity: agent-{PEER}: BLOCKED", peek)
+        # diagnose publishes this machine's state; peek writes nothing.
+        self.assertEqual(sorted(os.listdir(self.nodes)), sorted([f"{PEER}_activity.json", f"{SELF}_state.json"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
