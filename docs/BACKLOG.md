@@ -166,7 +166,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | 154 |
 | SEC-10 | Stop a working-directory config file from configuring `worker` and `submit` | P1 | S |  | D8 | Implemented | 238 (design 0070) |
 | SEC-11 | Refuse instead of falling back to the elevated token under Windows isolation | P2 | S | FEAT-3 |  | Planned |  |
-| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Planned |  |
+| SEC-12 | Test and narrow the macOS isolation profile | P2 | M | FEAT-3 |  | Implemented | 257 (design 0033) |
 | SEC-13 | Collect outputs through the descriptor that was checked | P2 | S |  |  | Implemented | 239 (design 0072) |
 | SEC-14 | Take the `agy` chat route out of the master dashboard | P2 | S |  | D9 | Implemented | 237 (design 0071) |
 | SEC-15 | Make the Agent Mesh launchers safe by default | P2 | S | SEC-6 |  | Planned |  |
@@ -2464,6 +2464,11 @@ confirm each item before you fix it (rule 5). On that commit `cargo clippy --wor
   3. Record the result and any remaining limit in design 0033 and `docs/SECURITY.md`.
 - **Done when:** The tests above pass on `macos-latest` in CI, and `cargo build` of a workspace
   still works under `--isolation fs` on macOS.
+- **Implemented (2026-11-16, pull request 257, [design 0033](design/0033-os-level-task-isolation.md)):**
+  the macOS profile denies `mach-lookup` and `job-creation`; the allowlist is empty because
+  `cargo`, `rustc`, `git`, `cc` and `ld` needed no service. `launchctl submit` was already refused
+  (`deny(1) job-creation`). Tests for `launchctl submit`, `open -a`, `osascript` and a hard link
+  to a secret were added. The profile is still a denylist inside `(allow default)`.
 
 ### SEC-13: Collect outputs through the descriptor that was checked
 
