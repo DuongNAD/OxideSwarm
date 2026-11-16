@@ -1616,6 +1616,187 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         false
     }
 
+    // ---- SEC-12: Mach/XPC lookups and hard links ------------------------------------------
+
+    /// Waits up to `secs` for `path` to exist.
+    async fn appears(path: &Path, secs: u64) -> bool {
+        for _ in 0..(secs * 5) {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        path.exists()
+    }
+
+    /// Runs `script` at `level` with `$T_MARK` set to a path in a directory outside the sandbox
+    /// that only an unconfined process can create. Returns whether the marker appeared.
+    async fn marker_appears(level: IsolationLevel, script: &str, wait: u64) -> bool {
+        let out = tempfile::tempdir().unwrap();
+        let mark = out.path().join("marker");
+        let bid = out
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        let result = run_at(
+            level,
+            script,
+            &[("T_MARK", mark.to_str().unwrap()), ("T_BID", &bid)],
+        )
+        .await;
+        eprintln!("[{level}] task output: {}", result.stdout_str().trim());
+        appears(&mark, wait).await
+    }
+
+    /// SEC-12: `launchctl submit` asks launchd to run a job outside the sandbox. The job would
+    /// create a marker file that a confined task cannot create itself.
+    #[tokio::test]
+    async fn test_launchctl_submit_cannot_start_a_job_outside_the_sandbox() {
+        let label = format!("dev.oxideswarm.feat3.sec12.{}", std::process::id());
+        let script = format!(
+            r#"/bin/launchctl submit -l {label} -- /usr/bin/touch "$T_MARK" 2>&1; echo "rc=$?""#
+        );
+        let remove = || {
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["remove", &label])
+                .output();
+        };
+        let control = marker_appears(IsolationLevel::Off, &script, 8).await;
+        remove();
+        if !control {
+            eprintln!("skipped: launchctl submit is not usable here (the control failed)");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let appeared = marker_appears(level, &script, 8).await;
+            let listed = std::process::Command::new("/bin/launchctl")
+                .args(["list", &label])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            remove();
+            assert!(!appeared, "{level}: launchd ran a job outside the sandbox");
+            assert!(!listed, "{level}: the task registered a launchd job");
+        }
+    }
+
+    /// SEC-12: `open -a <app>` starts a background app that launchd runs unconfined; the app
+    /// creates a marker outside the sandbox.
+    #[tokio::test]
+    async fn test_open_dash_a_cannot_start_an_unconfined_app() {
+        let script = r#"
+APP="$RUSTY_GRID_SANDBOX_DIR/Sec12.app"; mkdir -p "$APP/Contents/MacOS"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>run</string><key>CFBundleIdentifier</key><string>dev.oxideswarm.feat3.sec12.$T_BID</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><true/></dict></plist>
+PLIST
+printf '#!/bin/sh\n/usr/bin/touch "%s"\n' "$T_MARK" > "$APP/Contents/MacOS/run"
+chmod +x "$APP/Contents/MacOS/run"
+/usr/bin/open -g -j -a "$APP" 2>&1; echo "rc=$?"
+# The bundle must outlive the launch: the sandbox is removed when the task ends.
+sleep 4
+"#;
+        if !marker_appears(IsolationLevel::Off, script, 10).await {
+            eprintln!("skipped: open -a is not usable here (the control failed)");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert!(
+                !marker_appears(level, script, 6).await,
+                "{level}: open -a started a process outside the sandbox"
+            );
+        }
+    }
+
+    /// SEC-12: `osascript` sends Apple events to other applications. Finder creates a folder
+    /// outside the sandbox on its behalf; the task cannot create it itself.
+    #[tokio::test]
+    async fn test_osascript_cannot_drive_another_application() {
+        let script = r#"
+DIR=$(/usr/bin/dirname "$T_MARK"); NAME=$(/usr/bin/basename "$T_MARK")
+/usr/bin/osascript -e "tell application \"Finder\" to make new folder at (POSIX file \"$DIR\") with properties {name:\"$NAME\"}" 2>&1
+echo "rc=$?"
+"#;
+        let control = marker_appears(IsolationLevel::Off, script, 6).await;
+        if !control {
+            eprintln!("skipped: Apple events to Finder are not usable here (the control failed)");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            assert!(
+                !marker_appears(level, script, 4).await,
+                "{level}: osascript made another application act outside the sandbox"
+            );
+        }
+    }
+
+    /// SEC-12: a hard link to a file of the owner's home must not make its content readable
+    /// from the sandbox. The control (`off`) shows the link works without confinement.
+    #[tokio::test]
+    async fn test_a_hard_link_to_a_secret_does_not_expose_its_content() {
+        let script = r#"
+ln "$T_SECRET" "$RUSTY_GRID_SANDBOX_DIR/linked" 2>/dev/null && echo LINK_OK || echo LINK_DENIED
+cat "$RUSTY_GRID_SANDBOX_DIR/linked" 2>/dev/null
+echo END
+"#;
+        let control = run_at(IsolationLevel::Off, script, &[]).await;
+        assert!(
+            control.stdout_str().contains(SECRET),
+            "the control must read the linked secret: {}",
+            control.stdout_str()
+        );
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &[]).await;
+            eprintln!("[{level}] task output: {}", result.stdout_str().trim());
+            assert!(
+                !result.stdout_str().contains(SECRET),
+                "{level}: the hard-linked secret became readable: {}",
+                result.stdout_str()
+            );
+        }
+    }
+
+    /// SEC-12: with Mach lookups denied by default, the system C toolchain (`cc` compiling and
+    /// linking through `xcrun` and `ld`) and `git` (init, add, commit, log) still work under `fs`
+    /// and `fs+net`.
+    #[tokio::test]
+    async fn test_system_compiler_linker_and_git_work_under_fs() {
+        let script = r#"
+set -e
+echo 'int main(void){return 42;}' > t.c
+/usr/bin/cc t.c -o t
+./t || [ $? -eq 42 ] && echo CC_OK
+/usr/bin/git init -q repo
+cd repo
+echo a > a
+/usr/bin/git add a
+/usr/bin/git -c user.name=t -c user.email=t@example.invalid commit -q -m m
+/usr/bin/git log --oneline | /usr/bin/grep -q . && echo GIT_OK
+/usr/bin/git status --short
+echo DONE
+"#;
+        if !Path::new("/usr/bin/cc").exists() || !Path::new("/usr/bin/git").exists() {
+            eprintln!("skipped: no /usr/bin/cc or /usr/bin/git");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &[]).await;
+            eprintln!(
+                "[{level}] stdout: {} stderr: {}",
+                result.stdout_str().trim(),
+                result.stderr_str().trim()
+            );
+            assert!(
+                has(&result, "CC_OK") && has(&result, "GIT_OK") && has(&result, "DONE"),
+                "{level}: {} / {}",
+                result.stdout_str(),
+                result.stderr_str()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_self_check_accepts_both_levels_on_macos() {
         let base = tempfile::tempdir().unwrap();

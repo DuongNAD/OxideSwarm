@@ -1026,6 +1026,20 @@ mod macos {
         "/dev/tty",
     ];
 
+    /// Mach services a confined task may look up; every other lookup is denied (SEC-12).
+    ///
+    /// The list is empty on purpose: it was found empirically (denials read from the unified
+    /// log, `log show --predicate 'eventMessage CONTAINS "mach-lookup"'`) by running the macOS
+    /// isolation tests, a `cargo build --offline` of a crate with and without a cached
+    /// dependency, `cc` compile and link, `git init/add/commit/log`, `curl` over TLS and a DNS
+    /// lookup with all lookups denied, and none of `cargo`, `rustc`, `git`, `cc` or `ld` needed
+    /// one. What does stop working: user and group names (`id -un`, `whoami` print the numeric
+    /// uid: `com.apple.system.opendirectoryd.libinfo`), `confstr(_CS_DARWIN_USER_TEMP_DIR)`
+    /// (`com.apple.bsd.dirhelper`), and `os_log` (`com.apple.logd`), none of which a build needs
+    /// (`TMPDIR` points into the sandbox). Add a name here only with the reason, the test that
+    /// needs it, and what the service could do for a task.
+    const MACH_SERVICES: &[&str] = &[];
+
     /// The Seatbelt profile text. All paths arrive as `-D` parameters (`SANDBOX_DIR`,
     /// `EXTRA_WRITABLE_DIR`, `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`,
     /// `CARGO_HOME`, `CARGO_CRED`, `CARGO_CRED_TOML`, `EXTRA_READ_<n>` for `extra_read` entries,
@@ -1101,7 +1115,22 @@ mod macos {
         p.push_str("(deny user-preference-read user-preference-write)\n(allow user-preference-read (preference-domain \"kCFPreferencesAnyApplication\"))\n");
         // - Unix sockets of the desktop session (ssh-agent, gpg-agent, docker); DNS stays.
         p.push_str("(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
-        // - The clipboard.
+        // - Mach/XPC services (SEC-12): every lookup is denied, so a task cannot ask launchd or
+        //   another XPC service to start a process outside the sandbox. `MACH_SERVICES` lists
+        //   the exceptions.
+        p.push_str("(deny mach-lookup)\n");
+        if !MACH_SERVICES.is_empty() {
+            p.push_str("(allow mach-lookup\n");
+            for name in MACH_SERVICES {
+                p.push_str(&format!("    (global-name \"{name}\")\n"));
+            }
+            p.push_str(")\n");
+        }
+        // - Creating launchd jobs (`launchctl submit`, `SMJobSubmit`). Seatbelt already refuses
+        //   it under `(allow default)` (the log shows `deny(1) job-creation`); named so that the
+        //   refusal does not depend on that default.
+        p.push_str("(deny job-creation)\n");
+        // - The clipboard (stays denied even if an allowed prefix ever covered it).
         p.push_str("(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))\n");
         // - Keystroke injection into the controlling terminal (TIOCSTI).
         p.push_str("(deny file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n");

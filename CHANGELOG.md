@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Security
+- The macOS isolation profile (`--isolation fs|fs+net`) now denies every Mach/XPC service lookup and launchd job creation by default, with an empty allowlist because `cargo`, `rustc`, `git`, `cc` and `ld` need none, and new tests show that `launchctl submit`, `open -a`, `osascript` and a hard link to a secret have no effect outside the sandbox (`SEC-12`, [design 0033](docs/design/0033-os-level-task-isolation.md), `crates/worker/src/isolation.rs`). User names resolve to numeric uids inside a macOS-isolated task.
 - Working-directory `./rusty-grid.toml` and `./rusty-grid.json` files are no longer auto-loaded by any CLI command (`worker`, `submit`, `status`, `master`, `doctor`, `ox-mode`, etc.), matching `oxideswarm mcp` (`SEC-10`, [design 0070](docs/design/0070-no-working-directory-config.md)): when a working-directory config file is present and neither `--config <PATH>` nor `RUSTY_GRID_CONFIG` is set, the CLI skips it, prints a one-line notice to `stderr`, and falls back to `~/.oxideswarm/rusty-grid.toml` (upgrade note: users or scripts that relied on auto-loading `./rusty-grid.toml` or `./rusty-grid.json` from the current directory must now pass `--config <PATH>` or set `RUSTY_GRID_CONFIG`).
 
 ### Added
