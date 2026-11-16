@@ -302,7 +302,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
-| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0076) |
+| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
@@ -2741,7 +2741,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Evidence:** Read. Design 0076 D3.
 - **Problem:** Every added field moves `PROTOCOL_VERSION_MIN_COMPATIBLE`, because bincode is
   positional.
-- **Do:** Write a design record first. Then build the slot at the next wire change (Q65), in
+- **Do:** Write a design record first (done: [design 0082](design/0082-task-extension-slot.md), Draft, 2026-11-17). Then build the slot at the next wire change (Q65), in
   `crates/core/src/task.rs` and `crates/core/src/protocol.rs`.
 - **Done when:** An optional field can be added with no change to
   `PROTOCOL_VERSION_MIN_COMPATIBLE`.
