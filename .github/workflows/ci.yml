@@ -65,6 +65,18 @@ jobs:
       - name: master compiles without default features (dashboard, p2p)
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p rusty_grid_master --no-default-features --locked
+      - name: android bridge compiles for aarch64-linux-android
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add aarch64-linux-android
+          TOOLCHAIN="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          CLANG_BIN="${TOOLCHAIN}/bin/aarch64-linux-android24-clang"
+          AR_BIN="${TOOLCHAIN}/bin/llvm-ar"
+          export CC_aarch64_linux_android="${CLANG_BIN}"
+          export AR_aarch64_linux_android="${AR_BIN}"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CLANG_BIN}"
+          test -x "${CLANG_BIN}" && test -x "${AR_BIN}" || { echo "NDK toolchain not found under ${TOOLCHAIN}"; exit 1; }
+          cargo check -p rusty_grid_android_bridge --target aarch64-linux-android --locked
 
   gpu-wgpu:
     name: gpu-wgpu (${{ matrix.os }})
