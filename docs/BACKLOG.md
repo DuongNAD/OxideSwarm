@@ -210,6 +210,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Planned |  |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Planned |  |
+| TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
+| TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented | 276 |
+| TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2878,6 +2881,43 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The launcher returned 1 once in a while; the test does not print why.
 - **Do:** Print the launcher's output on failure, then find the cause.
 - **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
+
+### TEST-36: Remove the 50 ms bound from the symlink-chain manifest test
+
+- **Evidence:** Reproduced on the owner's Windows machine under CPU starvation (4 cores, then 2 cores
+  plus 4 CPU spinners; hub report `test_runs/win_test29_2026-11-17.md`):
+  `manifest_v2_symlinks_and_empty_dirs_round_trip_and_refuse_escapes` in `crates/core/src/blob.rs`
+  asserted that refusing the chained-link manifest takes under 50 ms and measured 52.19 ms and 78.52 ms.
+- **Problem:** The test wants to prove that validation is bounded (40 chained links and 1,000 compound
+  links must not expand exponentially), but a 50 ms limit also measures the runner's load.
+- **Do:** Keep the refusal assertion and bound the time at 10 s: the unbounded expansion never finishes,
+  so the bound still tells the two apart.
+- **Done when:** Implemented by this PR. The test passed 50 of 50 runs next to 12 `yes` processes on a
+  Mac, and 50 of 50 next to 48 (the old code also passed there: this Mac did not reproduce the failure).
+
+### TEST-37: Remove the 100 ms window from the port-file reader test
+
+- **Evidence:** Reproduced on the same Windows machine and report as TEST-36:
+  `test_atomic_port_file_publication_concurrent_client_reads` in `tests/m2_challenger_2_stress.rs` let
+  ten readers poll the port file for a fixed 100 ms and required at least one successful read.
+- **Problem:** Readers add their reads to the total only when they stop, and under starvation they may not
+  be scheduled inside 100 ms, so the total can be 0 although no read was ever corrupt.
+- **Do:** Count each successful read as it happens and wait (60 s deadline against a hang) until 50 reads
+  have been made before stopping the readers. Every read is still checked to be non-empty and a valid
+  port.
+- **Done when:** Implemented by this PR. 50 of 50 runs next to 12 `yes` processes and 50 of 50 next to 48.
+
+### TEST-38: Remove the 800 ms window from the re-dispatched task id test
+
+- **Evidence:** Reproduced on the same Windows machine and report as TEST-36:
+  `test_reassigned_task_id_stops_the_old_run_silently_and_the_new_run_owns_the_slot` in
+  `crates/worker/src/client/tests.rs` collected results for 800 ms after the re-dispatch and found none
+  when `echo second` had not run yet.
+- **Problem:** The wait for the new run's result was a fixed window, and the final 100 ms sleep decided
+  when the slots were free.
+- **Do:** Wait up to 60 s for the first result, then until the active table is empty, then drain the
+  channel and still require exactly one result; poll for the two slots instead of sleeping.
+- **Done when:** Implemented by this PR. 50 of 50 runs next to 12 `yes` processes and 50 of 50 next to 48.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
