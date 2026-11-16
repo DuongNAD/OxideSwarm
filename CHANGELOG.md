@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
+A minor release with breaking changes under `0.x`: protocol version 9 (task VRAM accounting, `FEAT-9a`), no auto-loading of working-directory config files (`SEC-10`), and removal of the dashboard chat route (`SEC-14`). It also adds the external read-only runtime directory allowlist (`FEAT-3e`), scheduler scale-out (`SCALE-2`) and several fixes.
+
+### Upgrading from 0.2.0
+
+- **Protocol version 9 (`PROTOCOL_VERSION_CURRENT = 9`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 9`):** every master, worker and client must run `0.3.0`; protocol 8 peers are refused. **Upgrade and restart the master first**, then workers and CLIs ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5; `FEAT-9a`, [design 0068](docs/design/0068-task-vram-accounting.md)). The master state store format advances from `2` to `3`: with `--state-dir`, stop the `0.2.x` master cleanly (`SIGINT` or `SIGTERM`) first, so its journal is compacted and carries over at startup (design 0068).
+- **`./rusty-grid.toml` and `./rusty-grid.json` are no longer auto-loaded** by any CLI command: pass `--config <PATH>` or set `RUSTY_GRID_CONFIG`, or move the file to `~/.oxideswarm/rusty-grid.toml`. The CLI prints a one-line notice to `stderr` when it skips a working-directory file (`SEC-10`, [design 0070](docs/design/0070-no-working-directory-config.md)).
+- **`POST /api/chat` and the dashboard chat UI are removed** (`SEC-14`, [design 0071](docs/design/0071-remove-dashboard-chat.md)).
+- **Windows relative task executables:** a relative staged executable path such as `./prog.exe` now resolves against the task's working directory inside the sandbox, and paths that escape the sandbox are refused (`BUG-21`, [design 0077](docs/design/0077-windows-relative-task-executables.md)).
+
 ### Security
 - Working-directory `./rusty-grid.toml` and `./rusty-grid.json` files are no longer auto-loaded by any CLI command (`worker`, `submit`, `status`, `master`, `doctor`, `ox-mode`, etc.), matching `oxideswarm mcp` (`SEC-10`, [design 0070](docs/design/0070-no-working-directory-config.md)): when a working-directory config file is present and neither `--config <PATH>` nor `RUSTY_GRID_CONFIG` is set, the CLI skips it, prints a one-line notice to `stderr`, and falls back to `~/.oxideswarm/rusty-grid.toml` (upgrade note: users or scripts that relied on auto-loading `./rusty-grid.toml` or `./rusty-grid.json` from the current directory must now pass `--config <PATH>` or set `RUSTY_GRID_CONFIG`).
 

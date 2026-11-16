@@ -93,7 +93,7 @@ see [docs/guides/add-a-machine.md](docs/guides/add-a-machine.md) and [packaging/
 The stick installs, verifies `SHA256SUMS`, joins and starts the worker with one double-click on
 macOS and Windows, or `bash install.sh` on Linux. With the master's P2P ticket, it also works on
 school or office Wi-Fi where the machines cannot reach each other. The kit scripts are in the
-repository and install release `0.2.0` or newer.
+repository and install release `0.3.0` or newer.
 
 A coding agent does step 5 through `oxideswarm mcp` ([guides/mcp-client-setup.md](docs/guides/mcp-client-setup.md)):
 its `submit` tool takes the same `workspace` and `tools` fields. The full walk-through, with the
@@ -104,7 +104,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.2.0`), or [build from source](#build-from-source).
+(the latest is `v0.3.0`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -115,19 +115,19 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.2.0-aarch64-apple-darwin.tar.gz
+tar -xzf oxideswarm-0.3.0-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.2.0-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.2.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.3.0-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.3.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.2.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.3.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.3.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.2.0-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.3.0-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
@@ -365,7 +365,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.2.0` covers the user story above. What it does not do yet:
+OxideSwarm `0.3.0` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
