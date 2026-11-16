@@ -208,8 +208,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
-| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Planned |  |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Planned |  |
+| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | PRNUM |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | PRNUM |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2868,6 +2868,17 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The runner prints no exception text, so the cause is unknown.
 - **Do:** Print the exception type, message and traceback for a failing suite; then find the cause.
 - **Done when:** The cause is written here and fixed, or the suite passes 50 runs on `macos-latest`.
+- **Implemented (2026-11-17, pull request PRNUM):** the runner now prints the type, `repr` and
+  traceback of a failing suite on stderr. With that, the failure reproduced locally on macOS (6 of
+  about 20 plain runs, while other jobs loaded the machine): `AssertionError` with no message at
+  `tests/test_agent_mesh_data_loss.py` Phase 4, `assert len(bytes_128k) == payload_size_128k`. The cause
+  is in the test, not in the Python reference hub: after sending a payload the test slept a fixed 0.1 s
+  and then read `received_data_payloads[-1]`; when the hub had not yet delivered the 128 KB frame, that
+  was the earlier 64 KB payload. The fixed sleeps of Phases 1 to 5 are now a bounded wait
+  (`wait_for_payload_count`, 10 s) for the expected count, and every count and every payload is still
+  asserted exactly (Phase 5 keeps a 0.1 s settle so a duplicate frame is still counted). After the fix:
+  50 runs of `tests/run_mesh_simulation_tests.py` and 50 with 12 `yes` CPU burners, all passed. The
+  `macos-latest` 50-run loop of "Done when" is not run.
 
 ### TEST-35: Make the `switch_role` launcher test stable on macOS
 
@@ -2878,6 +2889,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The launcher returned 1 once in a while; the test does not print why.
 - **Do:** Print the launcher's output on failure, then find the cause.
 - **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
+- **Partial (2026-11-17, pull request PRNUM):** diagnostics added, cause not found. A failing launcher
+  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
+  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
+  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
+  The launcher returns 1 only when the master port is in use, the master process is not recognised
+  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
+  race (a process still showing the launcher's command line just after the fork) was not seen in 300
+  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 

@@ -40,6 +40,18 @@ logging.basicConfig(
 logger = logging.getLogger("TestDataLoss")
 
 
+async def wait_for_payload_count(node, expected, timeout=10.0):
+    """Wait until `node` holds `expected` DataPayloads (delivery is asynchronous; a fixed sleep is not a wait).
+
+    Returns as soon as the count is reached; the caller asserts on the content. A timeout is
+    not an error here: the caller's own assertion then reports the shortfall.
+    """
+    deadline = time.monotonic() + timeout
+    while len(node.received_data_payloads) < expected and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    return len(node.received_data_payloads)
+
+
 async def run_data_loss_tests():
     """Execute complete bidirectional data loss and high-throughput burst test suite."""
     logger.info("==================================================================")
@@ -75,7 +87,7 @@ async def run_data_loss_tests():
         assert hash_fwd == expected_sha256_forward, "Sent hash must match pre-calculated SHA-256"
 
         # Wait for delivery
-        await asyncio.sleep(0.1)
+        await wait_for_payload_count(node3, 1)
 
         assert len(node3.received_data_payloads) >= 1, "Node 3 did not receive forward DataPayload"
         fwd_received = node3.received_data_payloads[-1]
@@ -102,7 +114,7 @@ async def run_data_loss_tests():
         corr_rev, hash_rev = await node3.send_data_payload("node-win-1", raw_bytes_reverse)
         assert hash_rev == expected_sha256_reverse, "Sent reverse hash must match pre-calculated SHA-256"
 
-        await asyncio.sleep(0.1)
+        await wait_for_payload_count(node1, 1)
 
         assert len(node1.received_data_payloads) >= 1, "Node 1 did not receive reverse DataPayload"
         rev_received = node1.received_data_payloads[-1]
@@ -128,7 +140,8 @@ async def run_data_loss_tests():
         _, empty_hash = await node1.send_data_payload("node-android-3", empty_bytes)
         assert empty_hash == expected_empty_sha256
 
-        await asyncio.sleep(0.05)
+        await wait_for_payload_count(node3, 2)
+        assert len(node3.received_data_payloads) == 2, "Node 3 did not receive the 0-byte DataPayload"
         empty_received = node3.received_data_payloads[-1]
         assert empty_received["data"] == "", "Expected empty data string"
         assert hashlib.sha256(empty_received["data"].encode("latin1")).hexdigest() == expected_empty_sha256
@@ -143,11 +156,14 @@ async def run_data_loss_tests():
         expected_sha256_128k = hashlib.sha256(raw_bytes_128k).hexdigest()
 
         _, hash_128k = await node3.send_data_payload("node-win-1", raw_bytes_128k)
-        await asyncio.sleep(0.1)
+        await wait_for_payload_count(node1, 2)
+        assert len(node1.received_data_payloads) == 2, "Node 1 did not receive the 128 KB DataPayload"
 
         received_128k = node1.received_data_payloads[-1]
         bytes_128k = received_128k["data"].encode("latin1")
-        assert len(bytes_128k) == payload_size_128k
+        assert len(bytes_128k) == payload_size_128k, (
+            f"128 KB length mismatch: expected {payload_size_128k}, got {len(bytes_128k)}"
+        )
         assert hashlib.sha256(bytes_128k).hexdigest() == expected_sha256_128k
         logger.info(f"✓ 128 KB extended boundary payload verified ({len(bytes_128k)} bytes)")
 
@@ -180,8 +196,11 @@ async def run_data_loss_tests():
             sent_hashes_rev.append((seq, rev_chunk, rev_h))
             await node3.send_data_payload("node-win-1", rev_chunk)
 
-        # Allow network event loop to process all frames
-        await asyncio.sleep(0.3)
+        # Wait until every frame has arrived (bounded), then let the loop settle briefly so that a
+        # duplicate or stray frame would still be counted by the exact-count assertions below.
+        await wait_for_payload_count(node3, start_count_node3 + burst_rounds)
+        await wait_for_payload_count(node1, start_count_node1 + burst_rounds)
+        await asyncio.sleep(0.1)
         duration = time.time() - start_time
 
         # Verify Node 3 received all 50 forward packets
