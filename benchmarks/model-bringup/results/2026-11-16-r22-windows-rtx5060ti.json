@@ -1,0 +1,451 @@
+{
+  "schema": 1,
+  "study": "model bring-up, session 8 (design 0067, spike R22)",
+  "started_utc": "2026-11-16T07:44:29Z",
+  "ended_utc": "2026-11-16T08:28:56Z",
+  "git": {
+    "commit": "b83a562"
+  },
+  "machine": {
+    "os": "Windows",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_memory_mib": 16311,
+    "driver": "621.24"
+  },
+  "server": {
+    "program": "llama-server",
+    "llama_cpp_build": "b12428",
+    "llama_cpp_commit": "b4c0e00a4",
+    "cuda": "13.5",
+    "args": "-m qwen2.5-coder-7b-instruct-q4_k_m.gguf --alias coder7b --host 127.0.0.1 --port 18080 -ngl all -fa on -c 131072 --parallel 32 --kv-unified --metrics",
+    "change_from_plan": "--port 18080 instead of 8080: another program held port 8080 on the machine"
+  },
+  "model": {
+    "repository": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+    "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+    "bytes": 4683073536,
+    "sha256": "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
+  },
+  "client": {
+    "program": "aiperf",
+    "version": "0.13.0",
+    "ran_on": "the GPU machine",
+    "endpoint_type": "chat",
+    "streaming": true,
+    "tokenizer": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "random_seed": 7,
+    "extra_inputs": {
+      "ignore_eos": true
+    }
+  },
+  "gpu_memory_mib": {
+    "before_server": 1717,
+    "server_idle": 13416,
+    "coding_c32_min": 13425,
+    "coding_c32_max": 13442
+  },
+  "smoke": {
+    "requests": 2,
+    "completed": 2,
+    "output_tokens_avg": 256.0,
+    "output_tok_per_s": 71.84,
+    "ttft_ms_avg": 303.19
+  },
+  "workloads": {
+    "chat": {
+      "input_tokens": 1000,
+      "output_tokens": 256,
+      "levels": [
+        {
+          "concurrency": 1,
+          "warmup_requests": 3,
+          "measured_requests": 10,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 73.72,
+          "per_user_tok_per_s_avg": 78.32,
+          "ttft_ms": {
+            "avg": 214.89,
+            "p90": 297.6,
+            "max": 300.77
+          },
+          "itl_ms": {
+            "avg": 12.77,
+            "p90": 12.93
+          },
+          "request_latency_s_avg": 3.47,
+          "output_tokens": {
+            "avg": 256.0,
+            "min": 256,
+            "max": 256
+          },
+          "benchmark_duration_s": 34.7,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 1,
+            "busy_slots_per_decode_level_mean": 1.0,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 38.4
+          }
+        },
+        {
+          "concurrency": 2,
+          "warmup_requests": 6,
+          "measured_requests": 20,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 132.92,
+          "per_user_tok_per_s_avg": 72.47,
+          "ttft_ms": {
+            "avg": 326.85,
+            "p90": 582.07,
+            "max": 589.67
+          },
+          "itl_ms": {
+            "avg": 13.87,
+            "p90": 13.73
+          },
+          "request_latency_s_avg": 3.8,
+          "output_tokens": {
+            "avg": 252.4,
+            "min": 185,
+            "max": 256
+          },
+          "benchmark_duration_s": 38.0,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 2,
+            "busy_slots_per_decode_level_mean": 2.0,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 61.5
+          }
+        },
+        {
+          "concurrency": 4,
+          "warmup_requests": 12,
+          "measured_requests": 40,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 229.85,
+          "per_user_tok_per_s_avg": 64.31,
+          "ttft_ms": {
+            "avg": 472.52,
+            "p90": 903.57,
+            "max": 1131.7
+          },
+          "itl_ms": {
+            "avg": 15.6,
+            "p90": 16.97
+          },
+          "request_latency_s_avg": 4.45,
+          "output_tokens": {
+            "avg": 256.0,
+            "min": 256,
+            "max": 256
+          },
+          "benchmark_duration_s": 44.5,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 4,
+            "busy_slots_per_decode_level_mean": 3.99,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 61.5
+          }
+        },
+        {
+          "concurrency": 8,
+          "warmup_requests": 24,
+          "measured_requests": 80,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 363.53,
+          "per_user_tok_per_s_avg": 52.13,
+          "ttft_ms": {
+            "avg": 641.87,
+            "p90": 1180.03,
+            "max": 2329.62
+          },
+          "itl_ms": {
+            "avg": 19.55,
+            "p90": 22.77
+          },
+          "request_latency_s_avg": 5.63,
+          "output_tokens": {
+            "avg": 255.99,
+            "min": 255,
+            "max": 256
+          },
+          "benchmark_duration_s": 56.3,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 8,
+            "busy_slots_per_decode_level_mean": 7.98,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 61.5
+          }
+        },
+        {
+          "concurrency": 16,
+          "warmup_requests": 48,
+          "measured_requests": 160,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 423.68,
+          "per_user_tok_per_s_avg": 31.88,
+          "ttft_ms": {
+            "avg": 1198.23,
+            "p90": 1896.7,
+            "max": 4864.96
+          },
+          "itl_ms": {
+            "avg": 33.18,
+            "p90": 38.61
+          },
+          "request_latency_s_avg": 9.64,
+          "output_tokens": {
+            "avg": 255.64,
+            "min": 205,
+            "max": 256
+          },
+          "benchmark_duration_s": 96.5,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 16,
+            "busy_slots_per_decode_level_mean": 15.96,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 38.4
+          }
+        },
+        {
+          "concurrency": 32,
+          "warmup_requests": 96,
+          "measured_requests": 320,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 379.84,
+          "per_user_tok_per_s_avg": 13.09,
+          "ttft_ms": {
+            "avg": 1609.78,
+            "p90": 2284.52,
+            "max": 10813.15
+          },
+          "itl_ms": {
+            "avg": 78.13,
+            "p90": 84.23
+          },
+          "request_latency_s_avg": 21.53,
+          "output_tokens": {
+            "avg": 255.99,
+            "min": 255,
+            "max": 256
+          },
+          "benchmark_duration_s": 215.7,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 32,
+            "busy_slots_per_decode_level_mean": 31.78,
+            "n_tokens_max_after": 1284,
+            "prompt_tokens_cached_pct": 12.4
+          }
+        }
+      ]
+    },
+    "coding": {
+      "input_tokens": 4000,
+      "output_tokens": 512,
+      "levels": [
+        {
+          "concurrency": 1,
+          "warmup_requests": 3,
+          "measured_requests": 10,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 68.71,
+          "per_user_tok_per_s_avg": 75.46,
+          "ttft_ms": {
+            "avg": 676.17,
+            "p90": 926.49,
+            "max": 926.56
+          },
+          "itl_ms": {
+            "avg": 13.25,
+            "p90": 13.43
+          },
+          "request_latency_s_avg": 7.45,
+          "output_tokens": {
+            "avg": 512.0,
+            "min": 512,
+            "max": 512
+          },
+          "benchmark_duration_s": 74.5,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 1,
+            "busy_slots_per_decode_level_mean": 1.0,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 42.6
+          }
+        },
+        {
+          "concurrency": 2,
+          "warmup_requests": 6,
+          "measured_requests": 20,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 117.92,
+          "per_user_tok_per_s_avg": 65.63,
+          "ttft_ms": {
+            "avg": 865.35,
+            "p90": 1759.56,
+            "max": 2286.52
+          },
+          "itl_ms": {
+            "avg": 15.29,
+            "p90": 16.61
+          },
+          "request_latency_s_avg": 8.68,
+          "output_tokens": {
+            "avg": 512.0,
+            "min": 512,
+            "max": 512
+          },
+          "benchmark_duration_s": 86.8,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 2,
+            "busy_slots_per_decode_level_mean": 2.0,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 61.5
+          }
+        },
+        {
+          "concurrency": 4,
+          "warmup_requests": 12,
+          "measured_requests": 40,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 165.09,
+          "per_user_tok_per_s_avg": 47.97,
+          "ttft_ms": {
+            "avg": 1549.23,
+            "p90": 1921.01,
+            "max": 4723.66
+          },
+          "itl_ms": {
+            "avg": 21.24,
+            "p90": 23.53
+          },
+          "request_latency_s_avg": 12.35,
+          "output_tokens": {
+            "avg": 510.25,
+            "min": 443,
+            "max": 512
+          },
+          "benchmark_duration_s": 123.6,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 4,
+            "busy_slots_per_decode_level_mean": 3.99,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 38.5
+          }
+        },
+        {
+          "concurrency": 8,
+          "warmup_requests": 24,
+          "measured_requests": 80,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 202.49,
+          "per_user_tok_per_s_avg": 28.95,
+          "ttft_ms": {
+            "avg": 2153.11,
+            "p90": 2780.28,
+            "max": 9171.09
+          },
+          "itl_ms": {
+            "avg": 35.34,
+            "p90": 38.29
+          },
+          "request_latency_s_avg": 20.21,
+          "output_tokens": {
+            "avg": 512.0,
+            "min": 512,
+            "max": 512
+          },
+          "benchmark_duration_s": 202.3,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 8,
+            "busy_slots_per_decode_level_mean": 7.98,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 22.1
+          }
+        },
+        {
+          "concurrency": 16,
+          "warmup_requests": 48,
+          "measured_requests": 160,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 193.67,
+          "per_user_tok_per_s_avg": 13.56,
+          "ttft_ms": {
+            "avg": 3606.86,
+            "p90": 3021.68,
+            "max": 25025.68
+          },
+          "itl_ms": {
+            "avg": 75.66,
+            "p90": 79.09
+          },
+          "request_latency_s_avg": 42.2,
+          "output_tokens": {
+            "avg": 511.29,
+            "min": 406,
+            "max": 512
+          },
+          "benchmark_duration_s": 422.4,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 16,
+            "busy_slots_per_decode_level_mean": 15.9,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 11.5
+          }
+        },
+        {
+          "concurrency": 32,
+          "warmup_requests": 96,
+          "measured_requests": 320,
+          "request_error_rate_pct": 0.0,
+          "output_tok_per_s": 33.69,
+          "per_user_tok_per_s_avg": 2.88,
+          "ttft_ms": {
+            "avg": 27641.64,
+            "p90": 54727.16,
+            "max": 63240.68
+          },
+          "itl_ms": {
+            "avg": 508.38,
+            "p90": 648.63
+          },
+          "request_latency_s_avg": 64.53,
+          "output_tokens": {
+            "avg": 68.0,
+            "min": 37,
+            "max": 99
+          },
+          "benchmark_duration_s": 645.7,
+          "server": {
+            "requests_deferred_max": 0,
+            "requests_processing_max": 32,
+            "busy_slots_per_decode_level_mean": 32.0,
+            "n_tokens_max_after": 4540,
+            "prompt_tokens_cached_pct": 7.9
+          }
+        }
+      ]
+    }
+  },
+  "notes": [
+    "busy_slots_per_decode_level_mean is the change of n_busy_slots_per_decode x n_decode_total over the change of n_decode_total during the level; the server publishes a mean since its start.",
+    "requests_deferred and requests_processing were read about once a second during each level.",
+    "prompt_tokens_cached_pct is prompt_tokens_cached_total over all prompt tokens of the level, warm-up included, from the server counters.",
+    "coding C=32: the shared 131072-token cache ran out; answers ended after 37 to 99 of 512 tokens, AIPerf reported no error and received no token usage for any request. The run report quotes 442 server-log lines \"Context size has been exceeded\"; the log was not kept.",
+    "One server process for all levels, run in order, none repeated."
+  ],
+  "knee": {
+    "chat": 16,
+    "coding": 8
+  }
+}

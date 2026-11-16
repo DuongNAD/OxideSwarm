@@ -268,7 +268,7 @@ owner decides `Q60` to `Q63`.
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| `R22` | Spike: measure the `C = 1..32` `Throughput vs. interactivity` curve and engine `/metrics` knee point across two machines (`D5`) | S | `APP-1` setup on the owner's Mac + GPU PC | `benchmarks/model-bringup/` | Dated record gives aggregate `tok/s`, per-user `tok/s`, TTFT, ITL, and saturation counters at `C = 1, 2, 4, 8, 16, 32` | Planned |
+| `R22` | Spike: measure the `C = 1..32` `Throughput vs. interactivity` curve and engine `/metrics` knee point across two machines (`D5`) | S | `APP-1` setup on the owner's Mac + GPU PC | `benchmarks/model-bringup/` | Dated record gives aggregate `tok/s`, per-user `tok/s`, TTFT, ITL, and saturation counters at `C = 1, 2, 4, 8, 16, 32` | One record, 2026-11-16 |
 | `LLM-14` | Knee-point admission control and `interactive` vs. `batch` priority bands for model tunnels/gateway (`D1`) | M | `R22`, `LLM-9` or `LLM-6` | `crates/master/src/`, `crates/worker/src/` | Under a `C = 32` burst in an integration test, worker in-flight count stays at `<= max_inflight`, zero requests are dropped, and an `interactive` request bypasses queued `batch` requests | Design only |
 
 ## Decisions for the owner
@@ -295,3 +295,11 @@ The right column is a recommended default, not a decision. Once accepted, these 
   `vllm:admission_rejections_total` instead of the legacy `vllm:num_requests_swapped`, and
   `vllm:request_queue_time_seconds` instead of its duplicate. D4 limits RDMA to Thunderbolt 5. The
   figures of the NVIDIA post were checked again against the page and are unchanged.
+- 2026-11-16: Spike `R22` ran once on the RTX 5060 Ti with `llama-server` and AIPerf, both on that
+  machine ([Session 8](../../benchmarks/model-bringup/README.md)). Output peaks at `C = 16` for
+  1000/256-token requests (423.7 tok/s, 10.3 % lower at `C = 32`) and at `C = 8` for
+  4000/512-token requests (202.5 tok/s). At `C = 32` the long requests filled the shared cache, and
+  the server ended the answers early (68 of 512 tokens on average) while
+  `llamacpp:requests_deferred` stayed 0. So on llama.cpp the `deferred_or_rejected` signal of D1
+  does not see this case, and an admission cap must also count prompt plus answer tokens against
+  the server's pool. `Q60` to `Q63` stay open.

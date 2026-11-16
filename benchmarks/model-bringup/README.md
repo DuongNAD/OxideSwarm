@@ -20,7 +20,7 @@ Spike R14 was numbered R11 on 2026-11-11. The record of that day carries the old
 | 5. The RPC server behind a relay (R16) | | Planned |
 | 6. A model built from memory with `llama_model_init_from_user` (R17) | | Planned |
 | 7. A split model with the head on the stronger machine (R18) | | Planned |
-| 8. The concurrency knee of a model server on the GPU machine (R22) | None: commands only | Planned |
+| 8. The concurrency knee of a model server on the GPU machine (R22) | None: commands only | One record, 2026-11-16 |
 
 ## Session 1: a small decision model on one machine
 
@@ -161,7 +161,8 @@ One run so far:
 
 ## Session 8: the concurrency knee of a model server on the GPU machine (R22)
 
-Status: Planned. This section is the plan of the run. It adds no script: every step is a command.
+Status: one record, 2026-11-16 (see "Records"). This section is the plan of the run. It adds no
+script: every step is a command.
 
 ### Goal
 
@@ -332,4 +333,76 @@ AIPerf's raw exports contain paths, so they stay outside the repository.
 
 ### Records
 
-None yet.
+One run so far:
+[the record of 2026-11-16](results/2026-11-16-r22-windows-rtx5060ti.json), on `master` at
+`b83a562`. The figures below were recomputed from AIPerf's `profile_export_aiperf.json` and the
+server's `/metrics` files of each level.
+
+| | 2026-11-16, GeForce RTX 5060 Ti (16 GiB), Windows, driver 621.24 |
+|---|---|
+| Server | llama.cpp build b12428 for Windows with CUDA 13.5. The command of step 3 with one change: `--port 18080`, because another program held port 8080 on that machine. Still on `127.0.0.1` |
+| Model | `qwen2.5-coder-7b-instruct-q4_k_m.gguf`, 4,683,073,536 bytes, SHA-256 `509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c` |
+| Client | AIPerf 0.13.0 on the GPU machine. The fallback through the Mac was not needed |
+| GPU memory | 1,717 MiB before the server started, 13,416 MiB with the server idle, at most 13,442 MiB during `coding` `C = 32`, of 16,311 MiB. The cache pool is reserved when the server starts |
+| Smoke check (step 5) | 2 of 2 requests, 256 output tokens each, 71.8 tok/s, TTFT 303 ms |
+
+**`chat`** (1000 input tokens, 256 output tokens):
+
+| C | Output, tok/s | Per user, tok/s | TTFT avg / p90, ms | ITL avg / p90, ms | Request latency, s | Busy slots per decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 73.7 | 78.3 | 215 / 298 | 12.8 / 12.9 | 3.47 | 1.00 |
+| 2 | 132.9 | 72.5 | 327 / 582 | 13.9 / 13.7 | 3.80 | 2.00 |
+| 4 | 229.9 | 64.3 | 473 / 904 | 15.6 / 17.0 | 4.45 | 3.99 |
+| 8 | 363.5 | 52.1 | 642 / 1180 | 19.6 / 22.8 | 5.63 | 7.98 |
+| 16 | **423.7** | 31.9 | 1198 / 1897 | 33.2 / 38.6 | 9.64 | 15.96 |
+| 32 | 379.8 | 13.1 | 1610 / 2285 | 78.1 / 84.2 | 21.53 | 31.78 |
+
+**`coding`** (4000 input tokens, 512 output tokens):
+
+| C | Output, tok/s | Per user, tok/s | TTFT avg / p90, ms | ITL avg / p90, ms | Request latency, s | Busy slots per decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 68.7 | 75.5 | 676 / 926 | 13.3 / 13.4 | 7.45 | 1.00 |
+| 2 | 117.9 | 65.6 | 865 / 1760 | 15.3 / 16.6 | 8.68 | 2.00 |
+| 4 | 165.1 | 48.0 | 1549 / 1921 | 21.2 / 23.5 | 12.35 | 3.99 |
+| 8 | **202.5** | 29.0 | 2153 / 2780 | 35.3 / 38.3 | 20.21 | 7.98 |
+| 16 | 193.7 | 13.6 | 3607 / 3022 | 75.7 / 79.1 | 42.20 | 15.90 |
+| 32 | 33.7 | 2.9 | 27642 / 54727 | 508.4 / 648.6 | 64.53 | 32.00 |
+
+"Busy slots per decode" is the mean of the level itself: the change of
+`n_busy_slots_per_decode x n_decode_total` over the change of `n_decode_total`. The server
+publishes a mean since its start, so the plain difference of the counter before and after a level
+is not that level's value. At every level of both workloads, `llamacpp:requests_deferred` was 0
+each time it was read (once a second), and `llamacpp:n_tokens_max` was 1284 for `chat` and 4540
+for `coding`.
+
+- **`chat` peaks at `C = 16` and falls after it.** Output rises 5.7 times from `C = 1` to
+  423.7 tok/s at `C = 16`, then falls 10.3 % to 379.8 tok/s at `C = 32`, while the inter-token
+  latency more than doubles (33.2 to 78.1 ms). The cache pool was far from full: 32 x 1284 =
+  41,088 of 131,072 tokens. The step from 16 to 32 cost NVIDIA's vLLM run 36.7 % (design 0067).
+- **`coding` peaks at `C = 8`.** At `C = 16` output is 4.4 % lower at twice the inter-token
+  latency, and a few requests wait long for their first token (average above p90, highest
+  25.0 s).
+- **At `coding` `C = 32` the shared cache ran out, and the server cut the answers short instead
+  of making requests wait.** All 32 slots were busy in every decode and `requests_deferred` stayed
+  0. AIPerf counted all 320 requests as completed and reported no error, yet the answers held 68
+  tokens on average (37 to 99) of the 512 asked for, none ended with the usage block of a finished
+  stream, and output fell to 33.7 tok/s. The sizes agree: 32 x (4,029 prompt tokens + 68) =
+  131,104 tokens, the size of the pool. The report of the run quotes 442 lines "Context size has
+  been exceeded" from the server log. That log is not among the files kept.
+- **Inter-token latency stays under 25 ms**, the interactive target of design 0067 D1, up to
+  `C = 8` for `chat` (22.8 ms at p90) and up to `C = 4` for `coding` (23.5 ms).
+- **The server reused cached prompt tokens at every level**: 22 to 62 % of prompt tokens at
+  `C <= 8`, 8 to 38 % at `C >= 16` (counter `llamacpp:prompt_tokens_cached_total`). AIPerf's
+  synthetic prompts share their beginnings, and a slot keeps its last prompt. TTFT, above all at
+  low `C`, is therefore lower than for prompts the server has never seen.
+- **One run, one server process.** The levels ran in order without a restart, and none was
+  repeated.
+
+**What this answers.** By the rule of the goal, the curve falls after a peak on both workloads:
+admission at the knee is worth building, with `C_opt` = 16 for `chat`-sized and 8 for
+`coding`-sized requests as first defaults. The run adds one condition: on llama.cpp with a shared
+pool, a count of requests is not enough. The requests admitted at once must also fit the pool
+(prompt plus the longest answer allowed, summed), because when the pool runs out the server
+neither defers nor refuses a request: it ends the answers early. `requests_deferred`, the
+llama.cpp signal named in design 0067 D1, stays 0 in that case. Whether to build `LLM-14` is
+decision `Q61`, which is the owner's.
