@@ -296,7 +296,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | (design 0054) |
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | (design 0054) |
-| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Planned | (design 0058) |
+| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Partial | (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
@@ -2281,6 +2281,12 @@ none needs a design record of its own.
   A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
   design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
   the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
+- **Status:** Partial (2026-11-17, pull request 270). Built: `fuzz/` with the targets `inbound_frame`,
+  `server_handshake` (v2 and v3) and `tree_manifest`, seed corpora, `fuzz/regressions/`, `fuzz/README.md`
+  with the one-hour record (no finding; 24.5 million, 7.7 million and 34.6 million executions) and the
+  `fuzz` CI job on a pinned nightly. Every function the targets call is public, so no `fuzzing`
+  feature was needed. The local runs used a stable toolchain with `-s none`. Open: the `fuzz` job has
+  not run yet on GitHub (Done when: the three targets build and run in CI); Implemented once it is green.
 
 ### LV-5: Supply chain: dependency policy, release provenance, outside checklist
 
@@ -3251,3 +3257,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
 - 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
+- 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.

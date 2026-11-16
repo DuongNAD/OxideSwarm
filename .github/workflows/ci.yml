@@ -6,7 +6,7 @@ on:
   pull_request:
   # Weekly run so that RustSec advisories published against an unchanged Cargo.lock still show up
   # and the ignored live Iroh DERP relay P2P tests run against the public relay network.
-  # Only the audit and p2p-wan-relay jobs run on the schedule.
+  # Only the audit, p2p-wan-relay and fuzz jobs run on the schedule.
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -334,3 +334,44 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo test -p rusty_grid_cli --test test_p2p_wan_fallback --locked -- --ignored
+
+  # LV-1: libFuzzer targets of fuzz/ (cargo-fuzz needs a nightly toolchain: dated, so that a new
+  # nightly cannot turn CI red on an unchanged tree). Pull requests and pushes: 60 s per target;
+  # the weekly schedule: 10 minutes per target. The inputs of fuzz/regressions/ run first.
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [inbound_frame, server_handshake, tree_manifest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: lock file is current
+        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: regression inputs
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} regressions/${{ matrix.target }} -- -runs=0
+      - name: fuzz
+        working-directory: fuzz
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=$FUZZ_SECONDS -max_len=4096
+      - name: upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
