@@ -208,8 +208,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
-| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | PRNUM |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | PRNUM |
+| TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2868,7 +2868,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The runner prints no exception text, so the cause is unknown.
 - **Do:** Print the exception type, message and traceback for a failing suite; then find the cause.
 - **Done when:** The cause is written here and fixed, or the suite passes 50 runs on `macos-latest`.
-- **Implemented (2026-11-17, pull request PRNUM):** the runner now prints the type, `repr` and
+- **Implemented (2026-11-17, pull request 277):** the runner now prints the type, `repr` and
   traceback of a failing suite on stderr. With that, the failure reproduced locally on macOS (6 of
   about 20 plain runs, while other jobs loaded the machine): `AssertionError` with no message at
   `tests/test_agent_mesh_data_loss.py` Phase 4, `assert len(bytes_128k) == payload_size_128k`. The cause
@@ -2889,7 +2889,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Problem:** The launcher returned 1 once in a while; the test does not print why.
 - **Do:** Print the launcher's output on failure, then find the cause.
 - **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
-- **Partial (2026-11-17, pull request PRNUM):** diagnostics added, cause not found. A failing launcher
+- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
   run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
   fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
   `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
