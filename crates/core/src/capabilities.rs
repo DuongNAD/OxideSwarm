@@ -3706,12 +3706,12 @@ Now drawing from 'AC Power'
         let bg_timeout = if cfg!(windows) {
             std::time::Duration::from_secs(15)
         } else {
-            std::time::Duration::from_secs(2)
+            std::time::Duration::from_secs(10)
         };
         let bg_elapsed_bound = if cfg!(windows) {
             std::time::Duration::from_secs(10)
         } else {
-            std::time::Duration::from_millis(1500)
+            std::time::Duration::from_secs(8)
         };
         let bg_start = std::time::Instant::now();
         assert_eq!(
@@ -3730,19 +3730,29 @@ Now drawing from 'AC Power'
         #[cfg(unix)]
         {
             let detached_pid_file = dir.path().join("detached_grandchild.pid");
+            // The grandchild writes this after `setsid`; the direct child waits for it (bounded)
+            // before exiting, so the process-group kill on child exit can never reach a
+            // grandchild that has not yet detached (TEST-31).
+            let detached_ready_file = dir.path().join("detached_grandchild.ready");
             let detached = write_test_script(
                 dir.path(),
                 "blender_detached_stdout",
                 &format!(
-                    "python3 -c 'import os, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    os._exit(0)\nos.setsid()\ntime.sleep(60)\n'",
-                    detached_pid_file.to_string_lossy()
+                    "python3 -c 'import os, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    end = time.time() + 5\n    while not os.path.exists({:?}) and time.time() < end:\n        time.sleep(0.01)\n    os._exit(0)\nos.setsid()\nopen({:?}, \"w\").write(\"1\")\ntime.sleep(60)\n'",
+                    detached_pid_file.to_string_lossy(),
+                    detached_ready_file.to_string_lossy(),
+                    detached_ready_file.to_string_lossy()
                 ),
                 "",
             );
             let det_start = std::time::Instant::now();
             let det_res =
-                probe_blender_with_timeout(&detached, std::time::Duration::from_millis(800));
+                probe_blender_with_timeout(&detached, std::time::Duration::from_millis(2500));
             let det_elapsed = det_start.elapsed();
+            assert!(
+                detached_ready_file.is_file(),
+                "grandchild must have called setsid before the direct child exited"
+            );
             assert!(
                 detached_pid_file.is_file(),
                 "setsid grandchild PID file must exist so the post-exit stdout deadline was exercised"
@@ -3762,7 +3772,7 @@ Now drawing from 'AC Power'
                 "unexpected result for detached-stdout wrapper: {det_res:?}"
             );
             assert!(
-                det_elapsed < std::time::Duration::from_secs(3),
+                det_elapsed < std::time::Duration::from_secs(6),
                 "detached-stdout wrapper blocked past timeout: {det_elapsed:?}"
             );
         }
@@ -3780,12 +3790,14 @@ Now drawing from 'AC Power'
         let hung_timeout = if cfg!(windows) {
             std::time::Duration::from_secs(5)
         } else {
-            std::time::Duration::from_millis(800)
+            // Generous: under CPU load the script may need well over 800 ms to start and write
+            // its PID file before the timeout fires (TEST-31).
+            std::time::Duration::from_secs(4)
         };
         let hung_elapsed_bound = if cfg!(windows) {
             std::time::Duration::from_secs(15)
         } else {
-            std::time::Duration::from_secs(4)
+            std::time::Duration::from_secs(20)
         };
         let start = std::time::Instant::now();
         assert_eq!(

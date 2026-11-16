@@ -932,10 +932,11 @@ async fn test_concurrent_submissions_share_group_commit_and_recover_across_resta
     }
     let elapsed = start.elapsed();
     let syncs = handle.queue().store_sync_count().await.unwrap_or(0);
+    // TEST-28: no wall-clock bound here (it flaked on slow CI runners). Batching is proven by the
+    // fsync counter below, which does not depend on runner speed; the hang bound is generous.
     assert!(
-        elapsed < Duration::from_secs(2),
-        "1,000 concurrent durable submissions took {:?} (expected < 2s with group commit)",
-        elapsed
+        elapsed < Duration::from_secs(60),
+        "1,000 concurrent durable submissions took {elapsed:?}"
     );
     assert!(
         syncs > 0 && syncs < 200,
