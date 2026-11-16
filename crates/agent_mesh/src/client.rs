@@ -23,6 +23,44 @@ use tokio_tungstenite::{
 };
 use tracing::{info, warn};
 
+/// Host part of a `ws://` hub URL, or `None` for any other scheme (`wss://` is encrypted).
+fn cleartext_ws_host(hub_url: &str) -> Option<String> {
+    let url = hub_url.trim();
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("ws") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// True when a node that holds a hub token would send it in clear text to a host that is not on
+/// loopback: the URL is `ws://` and the host is neither `localhost`, nor a loopback IP address.
+/// The token itself is never part of this check (SEC-15, design 0079).
+pub fn token_sent_in_clear_to_remote_host(hub_url: &str, has_token: bool) -> bool {
+    if !has_token {
+        return false;
+    }
+    match cleartext_ws_host(hub_url) {
+        None => false,
+        Some(host) => {
+            let loopback = host == "localhost"
+                || host.ends_with(".localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            !loopback
+        }
+    }
+}
+
 /// How long `connect` waits for the hub to accept or reject the registration before it carries on
 /// (a hub that never answers is treated like the pre-token hubs, which did not wait either).
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -272,6 +310,12 @@ impl AgentMeshClient {
     /// Establishes the WebSocket connection to the Hub and spawns the read/write message pump.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Connecting to OxideRelay Hub at {}...", self.hub_url);
+        if token_sent_in_clear_to_remote_host(&self.hub_url, self.token.is_some()) {
+            warn!(
+                hub_url = %self.hub_url,
+                "The hub token is sent over plain ws:// to a host that is not on loopback: anyone on the path can read it. Use wss:// behind a TLS proxy, a VPN or an SSH tunnel."
+            );
+        }
         let mut attempt = 0u32;
         let (ws_stream, _) = loop {
             let connector = self.build_tls_connector()?;
@@ -911,6 +955,27 @@ impl AgentMeshClient {
 mod tests {
     use super::*;
     use crate::hub::AgentMeshHub;
+
+    #[test]
+    fn test_cleartext_token_warning_predicate() {
+        let warns = |url: &str, tok: bool| token_sent_in_clear_to_remote_host(url, tok);
+        // Loopback hosts never warn.
+        assert!(!warns("ws://127.0.0.1:8088/ws", true));
+        assert!(!warns("ws://localhost:8088/ws", true));
+        assert!(!warns("ws://LOCALHOST/ws", true));
+        assert!(!warns("ws://[::1]:8088/ws", true));
+        assert!(!warns("ws://127.5.5.5:1/ws", true));
+        // No token, nothing to leak.
+        assert!(!warns("ws://192.0.2.1:8088/ws", false));
+        // wss:// is encrypted.
+        assert!(!warns("wss://hub.example.com/ws", true));
+        // A remote ws:// host with a token warns, userinfo tricks included.
+        assert!(warns("ws://192.0.2.1:8088/ws", true));
+        assert!(warns("ws://hub.example.com/ws", true));
+        assert!(warns("ws://[2001:db8::1]:8088/ws", true));
+        assert!(warns("ws://127.0.0.1@192.0.2.1:8088/ws", true));
+        assert!(warns("ws://localhost.example.com/ws", true));
+    }
 
     #[tokio::test]
     async fn test_client_connect_and_node_list() {
