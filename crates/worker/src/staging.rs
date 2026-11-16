@@ -259,16 +259,80 @@ fn collect_outputs_inner(
 
     if !not_produced.is_empty() && !process_failed {
         return Err(format!(
-            "the task did not produce {} (declared with --output; use a wildcard pattern for optional outputs)",
+            "the task did not produce {} (declared with --output; use a wildcard pattern for optional outputs).{}",
             not_produced
                 .iter()
                 .map(|p| format!("'{p}'"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            describe_sandbox_root(&root)
         ));
     }
 
     insert_found_outputs(found, cache, limits, allow_move, pin)
+}
+
+/// Most entries of the sandbox root read, and most names shown, by [`describe_sandbox_root`].
+const MAX_ROOT_ENTRIES_READ: usize = 1000;
+const MAX_ROOT_NAMES_SHOWN: usize = 20;
+const MAX_ROOT_NAME_CHARS: usize = 48;
+
+/// Says what the top level of the sandbox holds, for the error of a declared output that is not
+/// there. A missing output has several causes that look the same from outside (the script wrote
+/// nothing, wrote it under another name or in another directory, or something took the file
+/// away before it was collected, for example an earlier collection that moved it into the blob
+/// cache); the entries tell them apart. Names only, relative to the sandbox root: no host path
+/// leaves the worker.
+fn describe_sandbox_root(root: &Path) -> String {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => return format!(" The sandbox root could not be listed: {e}."),
+    };
+    let mut labels = Vec::new();
+    let mut read = 0usize;
+    let mut capped = false;
+    for entry in entries.flatten() {
+        if read == MAX_ROOT_ENTRIES_READ {
+            capped = true;
+            break;
+        }
+        read += 1;
+        let mut name: String = entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .take(MAX_ROOT_NAME_CHARS)
+            .collect();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => name.push('/'),
+            Ok(t) if t.is_symlink() => name.push_str(" (symbolic link)"),
+            Ok(_) => {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                name.push_str(&format!(" ({} B)", size));
+            }
+            Err(_) => {}
+        }
+        labels.push(name);
+    }
+    if read == 0 {
+        return " The sandbox root is empty.".to_string();
+    }
+    labels.sort();
+    let more = if labels.len() > MAX_ROOT_NAMES_SHOWN {
+        ", ..."
+    } else {
+        ""
+    };
+    labels.truncate(MAX_ROOT_NAMES_SHOWN);
+    format!(
+        " The sandbox root holds {}{} {}: {}{}.",
+        if capped { "at least " } else { "" },
+        read,
+        if read == 1 { "entry" } else { "entries" },
+        labels.join(", "),
+        more
+    )
 }
 
 fn check_output_limits(
@@ -715,6 +779,98 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[test]
+    fn a_missing_literal_output_says_what_the_sandbox_holds() {
+        let (dir, sandbox, cache) = setup();
+        let wanted = vec!["out.txt".to_string()];
+
+        // An empty sandbox is said to be empty.
+        let err =
+            collect_outputs(&sandbox, &wanted, &cache, OutputLimits::default(), false).unwrap_err();
+        assert!(err.contains("did not produce 'out.txt'"), "{err}");
+        assert!(err.contains("The sandbox root is empty."), "{err}");
+
+        // The wanted name under another name and in a sub-directory both show, at the top level
+        // only, sorted, with sizes of files and a slash after directories.
+        write(&sandbox, "out.txt.tmp", b"12345");
+        write(&sandbox, "sub/out.txt", b"nested");
+        let err =
+            collect_outputs(&sandbox, &wanted, &cache, OutputLimits::default(), false).unwrap_err();
+        assert!(err.contains("did not produce 'out.txt'"), "{err}");
+        assert!(
+            err.contains("The sandbox root holds 2 entries: out.txt.tmp (5 B), sub/."),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&*dir.path().to_string_lossy()),
+            "no host path may leave the worker: {err}"
+        );
+
+        // A task that failed is still not charged a second error, and nothing is listed.
+        assert!(
+            collect_outputs(&sandbox, &wanted, &cache, OutputLimits::default(), true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_sandbox_listing_is_bounded_and_sorted() {
+        let (_dir, sandbox, _cache) = setup();
+        for i in 0..25 {
+            write(&sandbox, &format!("f{i:02}"), b"");
+        }
+        let listing = describe_sandbox_root(&sandbox);
+        assert!(
+            listing.contains("holds 25 entries: f00 (0 B), f01 (0 B)"),
+            "{listing}"
+        );
+        assert!(listing.contains("f19 (0 B), ..."), "{listing}");
+        assert!(
+            !listing.contains("f20"),
+            "only 20 names are shown: {listing}"
+        );
+        assert!(listing.ends_with("."), "{listing}");
+
+        let single = tempfile::tempdir().unwrap();
+        write(single.path(), "only", b"abc");
+        assert_eq!(
+            describe_sandbox_root(single.path()),
+            " The sandbox root holds 1 entry: only (3 B)."
+        );
+
+        let long = tempfile::tempdir().unwrap();
+        write(long.path(), &"n".repeat(MAX_ROOT_NAME_CHARS + 30), b"");
+        let listing = describe_sandbox_root(long.path());
+        assert!(
+            listing.contains(&format!("{} (0 B)", "n".repeat(MAX_ROOT_NAME_CHARS))),
+            "names are cut at {MAX_ROOT_NAME_CHARS} characters: {listing}"
+        );
+        assert!(
+            !listing.contains(&"n".repeat(MAX_ROOT_NAME_CHARS + 1)),
+            "{listing}"
+        );
+    }
+
+    #[test]
+    fn an_unlistable_sandbox_root_is_said_so() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        assert!(
+            describe_sandbox_root(&missing).starts_with(" The sandbox root could not be listed: ")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_characters_in_names_cannot_break_the_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a\nb\tc", b"");
+        assert_eq!(
+            describe_sandbox_root(dir.path()),
+            " The sandbox root holds 1 entry: a?b?c (0 B)."
+        );
     }
 
     #[test]
