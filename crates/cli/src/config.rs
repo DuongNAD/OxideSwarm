@@ -92,6 +92,8 @@ pub struct MasterFileConfig {
     pub relay_url: Option<String>,
     pub wire_codec: Option<String>,
     pub dashboard_port: Option<u16>,
+    /// UDP port of the master's discovery beacon (`master --discovery-port`; `0` turns it off).
+    pub discovery_port: Option<u16>,
     pub dashboard_port_file: Option<String>,
     /// Finished tasks (with payload and output) the master keeps before evicting the oldest.
     pub max_retained_tasks: Option<usize>,

@@ -295,6 +295,14 @@ pub struct MasterArgs {
     pub dashboard_port: Option<u16>,
 
     #[arg(
+        long = "discovery-port",
+        value_name = "PORT",
+        help = "UDP port of the master's discovery beacon (default 8089; 0 turns the beacon off). \
+                A worker or client finds it only with the same port: --master auto:PORT"
+    )]
+    pub discovery_port: Option<u16>,
+
+    #[arg(
         long = "dashboard-port-file",
         value_name = "PATH",
         help = "File path where bound dashboard port number is written (useful for ephemeral port 0)"
