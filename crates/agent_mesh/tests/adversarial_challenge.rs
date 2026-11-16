@@ -10,6 +10,24 @@ use std::fs;
 use std::time::Duration;
 use sysinfo::{Pid, System};
 
+/// Polls until `client` has received at least `count` data payloads (30 s deadline), instead of
+/// guessing a fixed sleep that a slow runner can outlast.
+async fn wait_for_payloads(client: &AgentMeshClient, count: usize) -> Vec<AgentMeshEnvelope> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let received = client.received_data_payloads().await;
+        if received.len() >= count {
+            return received;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {count} data payloads (have {})",
+            received.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_rust_executor_non_zero_exit_and_stderr() {
     let temp_dir = tempfile::tempdir().expect("create temp dir for adversarial exit script");
@@ -195,9 +213,7 @@ async fn test_rust_bidirectional_burst_stress() {
         .expect("send forward");
     assert_eq!(fwd_hash, expected_fwd_hash);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let rec_node3 = node3.received_data_payloads().await;
+    let rec_node3 = wait_for_payloads(&node3, 1).await;
     assert_eq!(rec_node3.len(), 1);
     if let AgentMeshEnvelope::DataPayload {
         data,
@@ -224,9 +240,7 @@ async fn test_rust_bidirectional_burst_stress() {
         .expect("send reverse");
     assert_eq!(rev_hash, expected_rev_hash);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let rec_node1 = node1.received_data_payloads().await;
+    let rec_node1 = wait_for_payloads(&node1, 1).await;
     assert_eq!(rec_node1.len(), 1);
     if let AgentMeshEnvelope::DataPayload {
         data,
@@ -253,7 +267,8 @@ async fn test_rust_bidirectional_burst_stress() {
             .await;
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_payloads(&node3, 1 + 50).await;
+    wait_for_payloads(&node1, 1 + 50).await;
 
     let total_node3 = node3.received_data_payloads().await;
     let total_node1 = node1.received_data_payloads().await;

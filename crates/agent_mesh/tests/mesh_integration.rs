@@ -12,6 +12,24 @@
 use agent_mesh::{compute_sha256, verify_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use std::time::Duration;
 
+/// Polls until `client` has received at least `count` data payloads (30 s deadline), instead of
+/// guessing a fixed sleep that a slow runner can outlast.
+async fn wait_for_payloads(client: &AgentMeshClient, count: usize) -> Vec<AgentMeshEnvelope> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let received = client.received_data_payloads().await;
+        if received.len() >= count {
+            return received;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {count} data payloads (have {})",
+            received.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_three_node_simulation_and_routing() {
     // 1. Start Hub on ephemeral port
@@ -147,9 +165,7 @@ async fn test_bidirectional_data_payload_lossless() {
         .expect("Forward payload failed");
     assert_eq!(hash_1, expected_hash_1);
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    let rec_node3 = node3.received_data_payloads().await;
+    let rec_node3 = wait_for_payloads(&node3, 1).await;
     assert_eq!(rec_node3.len(), 1, "Node 3 did not receive payload");
 
     if let AgentMeshEnvelope::DataPayload {
@@ -179,9 +195,7 @@ async fn test_bidirectional_data_payload_lossless() {
         .expect("Reverse payload failed");
     assert_eq!(hash_2, expected_hash_2);
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    let rec_node1 = node1.received_data_payloads().await;
+    let rec_node1 = wait_for_payloads(&node1, 1).await;
     assert_eq!(rec_node1.len(), 1, "Node 1 did not receive reverse payload");
 
     if let AgentMeshEnvelope::DataPayload {
@@ -204,8 +218,7 @@ async fn test_bidirectional_data_payload_lossless() {
         let _ = node1.send_data_payload("data-node-3", &burst_data).await;
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let total_node3 = node3.received_data_payloads().await;
+    let total_node3 = wait_for_payloads(&node3, 1 + 50).await;
     assert_eq!(
         total_node3.len(),
         1 + 50,
