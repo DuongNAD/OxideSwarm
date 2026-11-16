@@ -362,12 +362,12 @@ jobs:
         run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
       - name: regression inputs
         working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} regressions/${{ matrix.target }} -- -runs=0
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} regressions/${{ matrix.target }} -- -runs=0
       - name: fuzz
         working-directory: fuzz
         env:
           FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=$FUZZ_SECONDS -max_len=4096
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=$FUZZ_SECONDS -max_len=4096
       - name: upload crash inputs
         if: failure()
         uses: actions/upload-artifact@v4
