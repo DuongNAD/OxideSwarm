@@ -142,6 +142,7 @@ draft that design 0039 replaced before it merged.
    environment variable or a default updates the `README.md` reference in the same change (commit,
    or pull request for a multi-commit branch), `CLAUDE.md` when the architecture map changes, and
    gets a design record when it changes behaviour.
+   A pull request that bumps `PROTOCOL_VERSION_CURRENT` says "wire change" in its description, and a release follows within 48 hours (design 0076 D1).
 
 ## Templates
 

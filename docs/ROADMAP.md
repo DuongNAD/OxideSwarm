@@ -114,6 +114,20 @@ Each row is a limit a user meets today, and the item that removes it.
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux | AND-1, AND-5 |
 | GPU work beyond the built-in benchmark is not yet documented as a user path | Tasks can ask for VRAM and the master does not overcommit a worker's VRAM (FEAT-9a, pull request 232). Running PyTorch, Blender or CUDA programs as command tasks, and ML runtimes inside the sandbox, are being recorded and built (spike R20 of design 0064; design 0074 is in review) | FEAT-9 (decision D6), R20 |
 
+## Next: 0.4.0
+
+The goal of 0.4.0 is to upgrade a cluster without stopping all of it, and to run it stably. REL-6
+(release `v0.3.0`, pull request 260) comes first. Then, in order (Phase 12 of
+[BACKLOG.md](BACKLOG.md)):
+
+- PROTO-1 (the release-train rule, done), the test fixes TEST-28 to TEST-32, and the findings of the Windows smoke test: SEC-16, BUG-22 and CLI-2.
+- PROTO-2 (a CI job that runs the newest release against the pull request's build).
+- PROTO-3 (an extension slot for optional wire fields; a design record first), then PROTO-4 (a
+  one-version window). Both are in [design 0076](design/0076-protocol-compatibility-and-release-train.md).
+- Alongside: TEST-23, TEST-24, TEST-25, TEST-26, TEST-27 and LV-1.
+
+0.5.0 is LLM serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)).
+
 ## Purpose
 
 ### The user story
