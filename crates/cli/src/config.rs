@@ -3,7 +3,7 @@
 //! Precedence order (highest to lowest):
 //! 1. CLI Arguments & Flags
 //! 2. Environment Variables (`RUSTY_GRID_*`)
-//! 3. Configuration File (`--config <path>`, `RUSTY_GRID_CONFIG`, or `./rusty-grid.{toml,json}`)
+//! 3. Configuration File (`--config <path>`, `RUSTY_GRID_CONFIG`, or `~/.oxideswarm/rusty-grid.toml`)
 //! 4. Hardcoded System Defaults
 //!
 //! The cluster secret is the one exception to the `RUSTY_GRID_*` prefix: it follows
@@ -446,60 +446,26 @@ pub fn default_oxideswarm_dir() -> Option<PathBuf> {
     }
 }
 
-/// Attempts to load configuration file from explicit path, environment variable, or standard locations.
+/// Attempts to load configuration file from `--config`, `RUSTY_GRID_CONFIG`, or
+/// `~/.oxideswarm/rusty-grid.toml` (or `$OXIDESWARM_HOME/rusty-grid.toml`).
+///
+/// Working-directory `./rusty-grid.toml` and `./rusty-grid.json` files are never auto-loaded;
+/// when one is present, a one-line notice is printed to `stderr` instructing the user to pass
+/// `--config <PATH>` or set `RUSTY_GRID_CONFIG`.
 pub fn load_config_file(explicit_path: Option<&Path>) -> GridResult<Option<ConfigFile>> {
-    load_config_file_with_options(explicit_path, true)
-}
-
-/// Attempts to load configuration file for `oxideswarm mcp` (`--config`, `RUSTY_GRID_CONFIG`,
-/// then `~/.oxideswarm/rusty-grid.toml`). Skips `./rusty-grid.toml` and `./rusty-grid.json`
-/// in the working directory and prints one line on stderr when a working-directory file is skipped.
-pub fn load_mcp_config_file(explicit_path: Option<&Path>) -> GridResult<Option<ConfigFile>> {
-    load_config_file_with_options(explicit_path, false)
-}
-
-fn is_same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => false,
+    let env_config = std::env::var_os("RUSTY_GRID_CONFIG");
+    let oxideswarm_dir = default_oxideswarm_dir();
+    let (path_to_load, skipped_cwd_candidate) = resolve_config_file_selection(
+        explicit_path,
+        env_config.as_deref(),
+        Path::new("."),
+        oxideswarm_dir.as_deref(),
+    );
+    if let Some(candidate) = skipped_cwd_candidate {
+        eprintln!(
+            "Skipping config file ./{candidate} in the working directory (pass --config <PATH> or RUSTY_GRID_CONFIG to load it)."
+        );
     }
-}
-
-fn load_config_file_with_options(
-    explicit_path: Option<&Path>,
-    allow_working_dir: bool,
-) -> GridResult<Option<ConfigFile>> {
-    let path_to_load = if let Some(p) = explicit_path {
-        Some(p.to_path_buf())
-    } else if let Ok(env_path) = std::env::var("RUSTY_GRID_CONFIG") {
-        Some(PathBuf::from(env_path))
-    } else if allow_working_dir && Path::new("rusty-grid.toml").exists() {
-        Some(PathBuf::from("rusty-grid.toml"))
-    } else if allow_working_dir && Path::new("rusty-grid.json").exists() {
-        Some(PathBuf::from("rusty-grid.json"))
-    } else {
-        let user_config = default_oxideswarm_dir()
-            .map(|d| d.join("rusty-grid.toml"))
-            .filter(|user_config| user_config.exists());
-        if !allow_working_dir {
-            for candidate in ["rusty-grid.toml", "rusty-grid.json"] {
-                let candidate_path = Path::new(candidate);
-                if candidate_path.exists() {
-                    let same_as_loaded = user_config
-                        .as_deref()
-                        .is_some_and(|loaded| is_same_file(candidate_path, loaded));
-                    if same_as_loaded {
-                        continue;
-                    }
-                    eprintln!(
-                        "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
-                    );
-                    break;
-                }
-            }
-        }
-        user_config
-    };
 
     let path = match path_to_load {
         Some(p) => p,
@@ -550,6 +516,47 @@ fn load_config_file_with_options(
                 ))),
             },
         }
+    }
+}
+
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Resolves which configuration file path to load (if any) and which working-directory candidate
+/// (`"rusty-grid.toml"` or `"rusty-grid.json"`) was skipped.
+pub(crate) fn resolve_config_file_selection(
+    explicit_path: Option<&Path>,
+    env_config: Option<&std::ffi::OsStr>,
+    working_dir: &Path,
+    oxideswarm_dir: Option<&Path>,
+) -> (Option<PathBuf>, Option<&'static str>) {
+    if let Some(p) = explicit_path {
+        (Some(p.to_path_buf()), None)
+    } else if let Some(env_path) = env_config {
+        (Some(PathBuf::from(env_path)), None)
+    } else {
+        let user_config = oxideswarm_dir
+            .map(|d| d.join("rusty-grid.toml"))
+            .filter(|user_config| user_config.exists());
+        let mut skipped = None;
+        for candidate in ["rusty-grid.toml", "rusty-grid.json"] {
+            let candidate_path = working_dir.join(candidate);
+            if candidate_path.exists() {
+                let same_as_loaded = user_config
+                    .as_deref()
+                    .is_some_and(|loaded| is_same_file(&candidate_path, loaded));
+                if same_as_loaded {
+                    continue;
+                }
+                skipped = Some(candidate);
+                break;
+            }
+        }
+        (user_config, skipped)
     }
 }
 
@@ -986,6 +993,77 @@ relay_url = "https://client.relay.example.com:8443"
             client_fallback.status_relay_url().as_deref(),
             Some("https://client.relay.example.com:8443")
         );
+    }
+
+    #[test]
+    fn test_resolve_config_file_selection_skips_working_directory_files() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let ox_home = tempfile::tempdir().expect("temp oxideswarm_dir");
+
+        let cwd_toml = cwd.path().join("rusty-grid.toml");
+        std::fs::write(&cwd_toml, "[worker]\nmaster = \"127.0.0.1:1\"\n").expect("write cwd toml");
+
+        // 1. Bare invocation skips ./rusty-grid.toml in the working directory and reports it.
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(None, None, cwd.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load, None);
+        assert_eq!(skipped, Some("rusty-grid.toml"));
+
+        // 2. When ~/.oxideswarm/rusty-grid.toml exists, it is selected while ./rusty-grid.toml is skipped.
+        let home_toml = ox_home.path().join("rusty-grid.toml");
+        std::fs::write(&home_toml, "[worker]\nmaster = \"127.0.0.1:9000\"\n")
+            .expect("write home toml");
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(None, None, cwd.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load.as_deref(), Some(home_toml.as_path()));
+        assert_eq!(skipped, Some("rusty-grid.toml"));
+
+        // 3. Explicit --config loads ./rusty-grid.toml with no skip notice.
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(Some(&cwd_toml), None, cwd.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load.as_deref(), Some(cwd_toml.as_path()));
+        assert_eq!(skipped, None);
+        let loaded = load_config_file(Some(&cwd_toml))
+            .expect("load explicit cwd toml")
+            .expect("config present");
+        assert_eq!(
+            loaded.worker.and_then(|w| w.master).as_deref(),
+            Some("127.0.0.1:1")
+        );
+
+        // 4. RUSTY_GRID_CONFIG loads the file with no skip notice.
+        let (path_to_load, skipped) = resolve_config_file_selection(
+            None,
+            Some(cwd_toml.as_os_str()),
+            cwd.path(),
+            Some(ox_home.path()),
+        );
+        assert_eq!(path_to_load.as_deref(), Some(cwd_toml.as_path()));
+        assert_eq!(skipped, None);
+
+        // 5. ./rusty-grid.json in the working directory is skipped too.
+        std::fs::remove_file(&cwd_toml).expect("remove cwd toml");
+        let cwd_json = cwd.path().join("rusty-grid.json");
+        std::fs::write(&cwd_json, r#"{"worker":{"master":"127.0.0.1:1"}}"#)
+            .expect("write cwd json");
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(None, None, cwd.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load.as_deref(), Some(home_toml.as_path()));
+        assert_eq!(skipped, Some("rusty-grid.json"));
+
+        // 6. When working directory IS ~/.oxideswarm, rusty-grid.toml is the user config (no skip notice),
+        //    but an extra rusty-grid.json in ~/.oxideswarm is reported as skipped.
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(None, None, ox_home.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load.as_deref(), Some(home_toml.as_path()));
+        assert_eq!(skipped, None);
+
+        let home_json = ox_home.path().join("rusty-grid.json");
+        std::fs::write(&home_json, "{}").expect("write home json");
+        let (path_to_load, skipped) =
+            resolve_config_file_selection(None, None, ox_home.path(), Some(ox_home.path()));
+        assert_eq!(path_to_load.as_deref(), Some(home_toml.as_path()));
+        assert_eq!(skipped, Some("rusty-grid.json"));
     }
 
     #[test]

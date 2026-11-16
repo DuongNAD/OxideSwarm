@@ -342,7 +342,7 @@ Start with `oxideswarm doctor --expect-workers <N>` on any machine that holds th
 | `Authentication required: ...` / `refusing to connect ... without a cluster secret` (exit code 6) | This machine has no (matching) secret. Copy `~/.oxideswarm/cluster.secret` from the master, or pass `--secret-file PATH`. `--insecure` skips the check and is only for networks you fully control. |
 | `Authentication failed` | The secrets differ, e.g. the master ran `secret generate --force`. Copy the master's file again and restart the worker. |
 | Worker logs `Connection refused` or times out | Wrong port (use the **cluster** port 8088, not the dashboard's 8080); the master listens on loopback only (the default; start it with `--listen 0.0.0.0:8088`); a firewall blocks 8088. |
-| A worker started without `--master` never registers and logs P2P or `Invalid P2P ticket` errors | A stale `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG`, `./rusty-grid.toml` or `./rusty-grid.json` — skipped by `mcp` — or `~/.oxideswarm/rusty-grid.toml`). Pass `--master HOST:8088` (which overrides `[worker].p2p_ticket`) or remove `p2p_ticket` from the config file. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
+| A worker started without `--master` never registers and logs P2P or `Invalid P2P ticket` errors | A stale `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG` or `~/.oxideswarm/rusty-grid.toml`). Pass `--master HOST:8088` (which overrides `[worker].p2p_ticket`) or remove `p2p_ticket` from the config file. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
 | `submit` fails with `Task queue is full (<N> queued or running tasks; wait, or raise --max-queue-size)` (exit code 1) | The master has `<N>` active (queued, scheduled, running, or retrying) tasks and reached `--max-queue-size`. Wait for running tasks to finish, or restart the master with a higher `--max-queue-size`. |
 | `--master auto` finds nothing | The UDP beacon (`:8089`) is not routed (Wi-Fi client isolation, another subnet, VPN) or the beacon's secret does not match. Use `HOST:8088`. |
 | Dashboard answers `401` or shows a login prompt | Paste the token from `oxideswarm secret show --dashboard-token` (on the master). A phone can only reach the dashboard if the master was started with `--web-ui-addr 0.0.0.0:8080` / `--dashboard-lan`. |
@@ -596,7 +596,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### Global Flags (`oxideswarm [GLOBAL_FLAGS] <SUBCOMMAND>`)
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `-c`, `--config <PATH>` | `RUSTY_GRID_CONFIG`, `./rusty-grid.{toml,json}`, `~/.oxideswarm/rusty-grid.toml` | Path to configuration file (`oxideswarm mcp` skips working-directory config files unless `--config` or `RUSTY_GRID_CONFIG` is set) |
+| `-c`, `--config <PATH>` | `RUSTY_GRID_CONFIG`, `~/.oxideswarm/rusty-grid.toml` | Path to configuration file (`./rusty-grid.toml` and `./rusty-grid.json` in the working directory are skipped with a `stderr` notice unless `--config <PATH>` or `RUSTY_GRID_CONFIG` is set) |
 | `-v`, `--verbose` | `RUST_LOG=debug` | Enable verbose debug logging |
 | `-q`, `--quiet` | `RUST_LOG=error` | Suppress informational output (errors only) |
 | `--secret-file <PATH>` | `OXIDESWARM_SECRET_FILE`, `secret_file`, `~/.oxideswarm/cluster.secret` | File containing the 64-hex-character cluster secret (mode `0600`) |
@@ -786,8 +786,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | **8086** | TCP (HTTP, removed) | Former Secret Bootstrap Helper | Previously used by the removed `agent_bridge.py serve-secret` plain-HTTP secret transfer helper (`SEC-4`). No component opens port 8086; cluster secrets must be copied over an authenticated channel (`scp`, `sftp`, `adb push`, or physical media). |
 ### Environment variables
 
-OxideSwarm resolves configuration through a 4-tier hierarchical engine:
-$$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (rusty-grid.toml)} > \text{Defaults}$$
+OxideSwarm resolves configuration through a 4-tier hierarchical engine (`--config <PATH>`, `RUSTY_GRID_CONFIG`, else `~/.oxideswarm/rusty-grid.toml`; working-directory `./rusty-grid.{toml,json}` files are skipped with a `stderr` notice unless explicitly requested):
+$$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\textasciitilde/.oxideswarm/rusty-grid.toml)} > \text{Defaults}$$
 
 #### Tier A: Core Authentication & Configuration Engine
 | Variable | Component | Purpose |

@@ -1213,7 +1213,6 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
                 .expect("static tracing directive is valid"),
         );
     }
-    let is_mcp = matches!(cli.command, Commands::Mcp(_));
     let info_to_stdout = matches!(
         cli.command,
         Commands::Master(_) | Commands::Worker(_) | Commands::Rendezvous(_) | Commands::Mode(_)
@@ -1248,11 +1247,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
     #[cfg(not(feature = "otel"))]
     init_default_fmt_subscriber(env_filter, info_to_stdout);
 
-    let config_file = match if is_mcp {
-        crate::config::load_mcp_config_file(cli.config.as_deref())
-    } else {
-        load_config_file(cli.config.as_deref())
-    } {
+    let config_file = match load_config_file(cli.config.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Configuration error: {e}");
