@@ -152,8 +152,8 @@ the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with it
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
 (TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 281 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
-TEST-46, BUG-23 and BUG-24 added): 164 items, 103 Implemented, 11 Partial and 50 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 286 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
+TEST-47, BUG-23 and BUG-24 added): 165 items, 105 Implemented, 13 Partial and 47 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -223,6 +223,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
+| TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3082,6 +3083,22 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   reaper timeout) and print the latency, or use a bound that a starved runner cannot reach.
 - **Done when:** The test passes 200 runs in a row under the same starvation.
 
+### TEST-47: Count only this test's handles in the capability-detection leak test
+
+- **Evidence:** `test_rapid_repeated_detection_sequential_leak_and_stability`
+  (`crates/core/tests/m1_3d_adversarial_stress.rs:696`) failed on `windows-latest` on 2026-11-17, in pull
+  request 286 at `c1238c6` (run `44027023301`, job `133849820395`): `File handle leak detected! Handle count
+  grew by 8 (initial: 144, final: 152)` after 200 detections in 257 ms. The rerun of the job passed. Pull
+  request 286 changes only `tests/m9_stress_challenge_1.rs` and docs.
+- **Problem:** The test compares the handle count of the whole test process before and after its loop, while
+  other tests of the same binary (for example `test_rapid_repeated_detection_concurrent_stress`) run on other
+  threads and open handles of their own. A likely cause, not verified: those tests, not a leak.
+- **Do:** Run the test alone in its process (a separate test binary, or a serial guard shared by the tests of
+  this file that open processes), or compare several rounds and fail only on growth that keeps rising. If a
+  real leak shows up alone, fix it in capability detection.
+- **Done when:** The cause is named here, and the test passes 200 runs in a row on Windows next to the other
+  tests of its binary.
+
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -3538,3 +3555,6 @@ Add one dated line per finished item, newest last.
   twice in pull request 282, the two tests ROADMAP.md "Stability" listed, the speed-aware batch test that
   failed in pull request 282, and two stress tests agent-win saw fail under CPU starvation. The Index counts
   are 103 Implemented, 11 Partial and 50 Planned (164 items).
+- 2026-11-17: Pull requests 282 (BUG-23), 283 (TEST-29 Partial), 284 (BUG-24) and 286 (TEST-33 Partial) merged;
+  TEST-47 added (Planned) for the handle-count test that failed in pull request 286. The Index counts are
+  105 Implemented, 13 Partial and 47 Planned (165 items).
