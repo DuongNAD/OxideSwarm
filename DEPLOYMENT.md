@@ -301,6 +301,10 @@ protocol versions automatically (`docs/design/0046-master-durability.md`); an un
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk
 format: moving from `0.3.0` to `0.4.0` still needs the clean stop. **Rolling back** a master after it ran as `0.4.0`
 needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open.
+Keep `--state-dir` on a file system with permissions (NTFS, APFS, ext4): on Windows a master whose state directory
+is on exFAT starts once and then refuses its own `members.json` (BUG-24). During the window, pin a task to an old or
+a new worker with an operator tag (`--tag` on the worker, `--require-tag` on `submit`) or with `--worker`:
+`--require-tag proto:9` is refused because `proto:` is a reserved prefix.
 Starting in protocol version 8 (`ENROLL-1a` / `ENROLL-1b`, `docs/design/0051-machine-identity-and-invites.md`), the
 master also writes `master_noise.key` and `members.json` under `--state-dir` (or `~/.oxideswarm/` when `--state-dir` is
 not set, once the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run)
