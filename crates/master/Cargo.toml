@@ -54,6 +54,7 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[test]]
 name = "m2_lifecycle"
