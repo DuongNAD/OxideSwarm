@@ -228,7 +228,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
-| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | PRNUM |
+| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | 308 |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
@@ -3149,7 +3149,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   after Worker 2's result (`Worker 2 is Some(Disconnected), task: state Queued, retries 2`). Worker 2 was a raw
   connection that sent no heartbeat, and the reaper timeout was 80 ms, so any 80 ms stall between its
   registration and its result was enough. The whole binary failed this test in 5 of 20 runs there.
-- **Status:** Implemented by pull request PRNUM. The reaper timeout is 2 s instead of 80 ms, and Worker 2
+- **Status:** Implemented by pull request 308. The reaper timeout is 2 s instead of 80 ms, and Worker 2
   sends a heartbeat every 50 ms from its own task (the transport is split; the reader skips `HeartbeatAck`)
   until the end of the test. Worker 1 is unchanged: it must still be reaped, end `Disconnected` with no
   active task, and the task must complete on Worker 2 with `retry_count` 1. The waits for the reap and for
