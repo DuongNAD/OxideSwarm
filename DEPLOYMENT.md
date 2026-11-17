@@ -295,14 +295,14 @@ submission, whereas a newer worker pointed at an un-upgraded v2 master registers
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
 When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
-or `SIGTERM`; on Windows Ctrl+C in its console, because `windows/oxctl.ps1 stop` uses `taskkill /F`, BUG-23) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from the release after 0.4.0, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk
 format: moving from `0.3.0` to `0.4.0` still needs the clean stop. **Rolling back** a master after it ran as `0.4.0`
-needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open.
-Keep `--state-dir` on a file system with permissions (NTFS, APFS, ext4): on Windows a master whose state directory
-is on exFAT starts once and then refuses its own `members.json` (BUG-24). During the window, pin a task to an old or
+needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open. On Windows the state directory must be on a volume that keeps file permissions (NTFS or ReFS): a master refuses one on exFAT or FAT32 at start-up, before it writes there (BUG-24).
+The `0.3.0` and `0.4.0` masters do not check this: on exFAT they start once and then refuse their own
+`members.json`. During the window, pin a task to an old or
 a new worker with an operator tag (`--tag` on the worker, `--require-tag` on `submit`) or with `--worker`:
 `--require-tag proto:9` is refused because `proto:` is a reserved prefix.
 Starting in protocol version 8 (`ENROLL-1a` / `ENROLL-1b`, `docs/design/0051-machine-identity-and-invites.md`), the

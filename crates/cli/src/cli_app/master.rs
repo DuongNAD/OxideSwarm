@@ -490,6 +490,15 @@ async fn run_master_inner(
         master_cfg.as_ref().and_then(|m| m.state_dir.as_deref()),
     );
     if let Some(ref dir) = state_dir {
+        // Before anything is written there (`master_noise.key` and `members.json` come next): a
+        // volume that keeps no file permissions (exFAT, FAT32) would expose the master's keys,
+        // and the next start would refuse `members.json` (BUG-24, design 0085).
+        if let Err(msg) =
+            rusty_grid_core::private_file::ensure_volume_keeps_permissions(dir, "state directory")
+        {
+            eprintln!("Refusing to start the master: {msg}");
+            return ExitCode::FAILURE;
+        }
         server_config = server_config.with_state_dir(dir);
     }
     let requested_hold_secs = resolve_u64(

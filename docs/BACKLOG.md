@@ -205,7 +205,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Partial | 263 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
-| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Planned |  |
+| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
@@ -314,8 +314,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
-| BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Planned |  |
-| BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Planned |  |
+| BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
+| BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
@@ -2815,6 +2815,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   running tests, or running the suite under the Windows agent. Then fix it.
 - **Done when:** The job finishes in its usual time on ten runs in a row, or the test that hung is
   fixed and named here.
+- **Partial (2026-11-17, pull request 283):** investigated on a Windows 11 machine with toolchain
+  1.96.0 (`OxideSwarm_Agent_Hub` `test_runs/win_test29_2026-11-17.md`). In both lost jobs steps 1 to 7
+  had succeeded and step 8 (`cargo test --workspace`) was still running. Three CI-like runs found no
+  hang and no memory or handle exhaustion, only three timing flakes under CPU starvation (TEST-36 to
+  TEST-38). The cause of the runner loss is not known. The workspace step now stops at
+  `timeout-minutes: 45`, prints a heartbeat line with the last output line once a minute
+  (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the
+  last 120 lines of the test output, so the next occurrence names the running test.
 
 ### TEST-30: Stop `test_agent_bridge.py` from depending on the host's open ports
 
@@ -3025,6 +3033,15 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   stopped.
 - **Done when:** `oxctl.ps1 stop` on a master with `--state-dir` leaves a compacted journal (`journal.bin`
   with 0 records), shown by a launcher test or a recorded Windows run.
+- **Implemented (2026-11-17, pull request 282, [design 0086](design/0086-graceful-windows-stop.md)):**
+  `Stop-Tracked` first sends a console Ctrl+C from a separate hidden `powershell` (`FreeConsole`,
+  `AttachConsole`, `SetConsoleCtrlHandler(NULL, TRUE)`, `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)`), waits up
+  to 15 s and only then runs `taskkill /F /T`, and prints which way the process stopped; the worker gets the
+  same stop (its clean stop cancels its tasks and ends their trees). Recorded run with the 0.4.0 binary and a
+  private state dir: before, `journal.bin` 2157 B and no `snapshot.bin`; after, `master stopped cleanly after
+  Ctrl+C in 0.7 s`, `journal.bin` 24 B, `snapshot.bin` 3331 B, and a restart lists the 3 tasks. A worker with a
+  running `Start-Sleep 60` task stopped cleanly in 0.7 s with no task process left. `WindowsOxctlStopTests` in
+  `tests/test_launcher_scripts.py` covers the clean path and the `taskkill` fallback on Windows.
 
 ### BUG-24: Let a master restart with `--state-dir` on a file system without permissions
 
@@ -3046,6 +3063,15 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test (or a recorded Windows run) shows that a master pointed at a `--state-dir` without
   permissions refuses at the first start with that message and writes nothing there, and that NTFS behaves as
   before.
+- **Implemented on Windows (2026-11-17, pull request 284, [design 0085](design/0085-state-dir-without-permissions.md)):**
+  the CLI master (right after the state directory is resolved) and `MasterServer::bind_full` read the volume flags
+  of the state directory, or of its nearest existing ancestor (`GetVolumeInformationByHandleW`, nothing created),
+  and refuse a volume without `FILE_PERSISTENT_ACLS` with `state directory '<dir>' is on a file system that keeps
+  no file permissions (exFAT), so every account on this machine could read or replace it; use a directory on an
+  NTFS drive instead`. `members.json` and the private-file warnings (cluster secret, `node.key`,
+  `master_noise.key`, the P2P key, the task store directory) use the same text on such a volume instead of the
+  `icacls` hint. Recorded run: exFAT refused at the first start with nothing created, an exFAT state directory
+  written by 0.4.0 refused and unchanged, NTFS start, stop and start as before. macOS and Linux are not covered.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 

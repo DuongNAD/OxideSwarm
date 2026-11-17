@@ -688,6 +688,17 @@ impl MasterServer {
             config.p2p_relay_url.as_deref(),
         )?;
 
+        // A state directory on a volume that keeps no file permissions (exFAT, FAT32) would hold the
+        // keys and the member list readable by every account, and a restart would refuse
+        // `members.json`: refuse it before anything is read or written there (BUG-24, design 0085).
+        if let Some(ref state_dir) = config.state_dir {
+            rusty_grid_core::private_file::ensure_volume_keeps_permissions(
+                state_dir,
+                "state directory",
+            )
+            .map_err(GridError::Config)?;
+        }
+
         if !config.members_explicit && config.auth_mode.allows_members() {
             if let Some(ref state_dir) = config.state_dir {
                 config.members = Arc::new(MemberStore::load_from_dir(Some(state_dir))?);

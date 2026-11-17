@@ -3034,6 +3034,153 @@ public class Program {
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class WindowsOxctlStopTests(unittest.TestCase):
+    """BUG-23: windows/oxctl.ps1 asks a tracked process to stop with a console Ctrl+C first.
+
+    A forced end (taskkill /F) skips the master's shutdown handler, so a master with --state-dir never
+    compacts its journal. The runtime test uses a fake oxideswarm.exe whose Ctrl+C handler leaves a marker
+    file; the marker is the proof that the clean path ran.
+    """
+
+    OXCTL = os.path.join(ROOT, "windows", "oxctl.ps1")
+
+    FAKE_CS = r"""
+using System;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string a0 = args.Length > 0 ? args[0] : "";
+        if (a0 == "--version") { Console.WriteLine("rusty-grid 9.9.9"); return 0; }
+        if (a0 == "secret") {
+            for (int i = 0; i + 1 < args.Length; i++) {
+                if (args[i] == "--out") {
+                    Directory.CreateDirectory(Path.GetDirectoryName(args[i + 1]));
+                    File.WriteAllText(args[i + 1], new string('a', 64) + "\n");
+                }
+            }
+            return 0;
+        }
+        if (a0 == "master" || a0 == "worker") {
+            string markerDir = Environment.GetEnvironmentVariable("FAKE_OX_MARKER_DIR");
+            bool ignore = Environment.GetEnvironmentVariable("FAKE_OX_IGNORE_CTRL_C") == "1";
+            string role = a0;
+            Console.CancelKeyPress += (sender, e) => {
+                e.Cancel = true;
+                if (!ignore) {
+                    File.WriteAllText(Path.Combine(markerDir, role + ".stopped"), e.SpecialKey.ToString());
+                    Environment.Exit(0);
+                }
+            };
+            Console.WriteLine(role == "master" ? "RustyGrid Master started on fake" : "Registration accepted; backoff counter reset");
+            Thread.Sleep(120000);
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+
+    def test_stop_tracked_sends_ctrl_c_before_taskkill(self):
+        text = read(self.OXCTL)
+        body = text[text.index("function Stop-Tracked"):text.index("function Start-Tracked")]
+        self.assertIn("Send-ConsoleCtrlC", body)
+        self.assertLess(body.index("Send-ConsoleCtrlC"), body.index("taskkill.exe /F /T /PID"))
+        helper = text[text.index("function Send-ConsoleCtrlC"):text.index("function Stop-Tracked")]
+        for call in ("FreeConsole", "AttachConsole", "SetConsoleCtrlHandler", "GenerateConsoleCtrlEvent(0, 0)"):
+            self.assertIn(call, helper)
+        # The guard against a recycled PID and the PID-file tracking stay; nothing is stopped by image name.
+        self.assertIn("Get-TrackedPid -Name $Name", body)
+        self.assertNotRegex(text, r"(?i)taskkill(\.exe)?\s+/IM|Stop-Process\s+-Name")
+
+    def _free_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _alive(self, pid):
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30).stdout
+        return re.search(rf"\b{pid}\b", out) is not None
+
+    def _oxctl(self, env, log, *args, timeout=90):
+        # oxctl starts long-lived processes with Start-Process, which inherit its handles: give it a
+        # file, never a pipe, or the call would wait for the fake binary to exit.
+        with open(log, "w", encoding="utf-8") as out:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", self.OXCTL, *args],
+                env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=timeout,
+            )
+        return res.returncode, read(log)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell runtime test")
+    def test_stop_ends_master_and_worker_with_ctrl_c_and_falls_back_to_taskkill(self):
+        if not shutil.which("powershell"):
+            self.skipTest("powershell is not available")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_oxctl_stop_"))
+        home = os.path.join(tmp, "home")
+        temp = os.path.join(tmp, "temp")
+        for d in (home, temp):
+            os.makedirs(d, exist_ok=True)
+        state = os.path.join(home, ".oxideswarm")
+        fake_exe = os.path.join(tmp, "oxideswarm.exe")
+        env = {k: v for k, v in os.environ.items()
+               if k.upper() not in ("PSMODULEPATH", "OX_EXTRA_ARGS", "OXIDESWARM_SECRET", "OXIDESWARM_SECRET_FILE")}
+        env.update(
+            USERPROFILE=home, HOME=home, OXIDESWARM_HOME=state, TEMP=temp, TMP=temp,
+            OXIDESWARM_BIN=fake_exe, FAKE_OX_MARKER_DIR=tmp,
+            OXIDESWARM_CLUSTER_PORT=str(self._free_port()), OXIDESWARM_DASHBOARD_PORT=str(self._free_port()),
+        )
+        pids = []
+        try:
+            cs_file = os.path.join(tmp, "FakeOx.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(self.FAKE_CS)
+            compiled = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                 f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication"],
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stdout)
+
+            def tracked(name):
+                return int(read(os.path.join(state, "run", f"{name}.pid")).strip())
+
+            # 1. Master and its local worker answer the Ctrl+C: both stop cleanly, no taskkill.
+            code, out = self._oxctl(env, os.path.join(tmp, "start1.log"), "start", "master")
+            self.assertEqual(code, 0, out)
+            master_pid, worker_pid = tracked("master"), tracked("worker")
+            pids += [master_pid, worker_pid]
+            code, out = self._oxctl(env, os.path.join(tmp, "stop1.log"), "stop", "all")
+            self.assertEqual(code, 0, out)
+            self.assertIn("[OK] master stopped cleanly after Ctrl+C", out)
+            self.assertIn("[OK] worker stopped cleanly after Ctrl+C", out)
+            self.assertNotIn("taskkill /F /T.", out)
+            for role, pid in (("master", master_pid), ("worker", worker_pid)):
+                self.assertTrue(os.path.exists(os.path.join(tmp, f"{role}.stopped")), out)
+                self.assertFalse(self._alive(pid), f"{role} PID {pid} still runs:\n{out}")
+                self.assertFalse(os.path.exists(os.path.join(state, "run", f"{role}.pid")))
+
+            # 2. A master that ignores the Ctrl+C is ended with taskkill /F /T after the grace period.
+            env["FAKE_OX_IGNORE_CTRL_C"] = "1"
+            code, out = self._oxctl(env, os.path.join(tmp, "start2.log"), "start", "master", "-NoWorker")
+            self.assertEqual(code, 0, out)
+            master_pid = tracked("master")
+            pids.append(master_pid)
+            code, out = self._oxctl(env, os.path.join(tmp, "stop2.log"), "stop", "master", timeout=120)
+            self.assertEqual(code, 0, out)
+            self.assertIn("did not exit within", out)
+            self.assertIn("[OK] master ended with taskkill /F /T", out)
+            self.assertFalse(self._alive(master_pid), out)
+        finally:
+            for pid in pids:
+                if self._alive(pid):
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class AgentNodeCleartextTokenWarningTests(unittest.TestCase):
     """SEC-15: scripts/agent_node.py warns when it sends a token over ws:// beyond loopback."""
 
