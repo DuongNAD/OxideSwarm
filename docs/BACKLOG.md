@@ -3180,7 +3180,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   handles (the ten `detect*` override tests and the two CLI end-to-end tests); the serde tests take no lock.
   Both counting tests run a warm-up detection before the first count. The limits (5 and 15) are unchanged.
   Afterwards the growth was 0 alone (149 to 149) and next to the other tests (154 to 154, 156 to 156), and
-  the binary takes about 37 s instead of 24 s. LOOPRESULT
+  the binary takes about 37 s instead of 24 s. The whole binary (all 21 tests, the default parallel
+  harness) passed 200 of 200 runs in a row on Windows, with a handle growth of 0 in every run of both tests.
 
 ### TEST-48: Give each Android bridge test its own worker state
 
