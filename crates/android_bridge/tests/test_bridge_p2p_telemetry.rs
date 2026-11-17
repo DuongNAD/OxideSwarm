@@ -1,8 +1,10 @@
 //! Integration tests for OxideSwarm Android Bridge: P2P Ticket & Mobile Telemetry.
 
+mod common;
+
 use oxideworker::{
     get_telemetry_impl, get_worker_status_impl, is_running_impl, set_sandbox_dir_impl,
-    start_worker_impl, stop_worker_impl, update_telemetry_impl,
+    start_worker_impl, update_telemetry_impl,
 };
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -18,7 +20,7 @@ fn test_p2p_ticket_and_worker_config() {
     }
     oxideworker::set_p2p_minimal_preset_for_testing(true);
     let _minimal_preset_guard = MinimalPresetGuard;
-    stop_worker_impl();
+    common::stop_and_settle();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
         tmp.path().to_string_lossy().into_owned()
@@ -47,7 +49,7 @@ fn test_p2p_ticket_and_worker_config() {
     );
 
     // Stop worker gracefully
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     assert!(!is_running_impl());
 }
 
