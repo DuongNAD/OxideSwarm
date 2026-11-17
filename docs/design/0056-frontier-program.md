@@ -1,7 +1,7 @@
 # 0056: Frontier program (bets after the core)
 
 Status: Draft (research and plan; builds nothing; decisions Q19 to Q26 and Q30 are open)
-Created: 2026-11-10    Updated: 2026-11-12
+Created: 2026-11-10    Updated: 2026-11-17
 
 ## Summary
 
@@ -518,6 +518,12 @@ every bump breaks older peers ([design 0040](0040-protocol-versioning.md)).
 | 3 | `0.5.0` | Models and classrooms | LLM-1, LLM-2, LLM-6, LLM-8, SCALE-3, LLM-7, EDU-1, EDU-2, WASM-3, WASM-4, GREEN-1, IMG-1, IMG-2 | L4, L2 | |
 | 4 | later | Commons | PROOF-4, NET-2, PROOF-5, NET-3, NET-4, GREEN-2, EDU-3, AX-6, NET-5, IMG-3, IMG-4 | L6. Stage checks of design 0054 | |
 
+Note of 2026-11-17: the release numbers in this table no longer hold. Release `0.3.0` shipped
+SCALE-2, FEAT-9a and the fixes of the audit of 2026-11-15, and `0.4.0` is the upgrade work of
+[design 0076](0076-protocol-compatibility-and-release-train.md). No release has shipped wave 1. The
+order of the waves stands. The section "Releases" of [ROADMAP.md](../ROADMAP.md) holds the release
+numbers, and its Q81 asks whether `0.6.0` carries wave 1.
+
 Lanes inside a wave, for the three implementing agents:
 
 - Wave 1: AX-1 then AX-2 (CLI and MCP); AX-3 wire and master; AX-3 MCP and CACHE-1.
@@ -726,3 +732,6 @@ second one, the classroom. Accepting Q25 accepts the second story.
 - 2026-11-13: [Design 0064](0064-research-of-2026-11-13-and-route.md) proposes a long-running
   MCP call for AX-3 that works without the tasks extension, because two coding agents do not
   support it yet (Q55). The text of AX-3 is unchanged.
+- 2026-11-17: D8 gained a note: releases `0.3.0` and `0.4.0` shipped other work than waves 1 and
+  2, so the release column of the wave table no longer holds. The order of the waves and the text
+  of every item are unchanged. ROADMAP Q81 asks whether `0.6.0` carries wave 1.

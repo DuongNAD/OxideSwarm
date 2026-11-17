@@ -1,7 +1,7 @@
 # 0076: Protocol compatibility and a release train
 
-Status: Draft (plan; PROTO-1 is built; Q64 to Q66 are decided, Q67 is open)
-Created: 2026-11-16    Updated: 2026-11-16
+Status: Implemented
+Created: 2026-11-16    Updated: 2026-11-17
 
 ## Summary
 
@@ -165,11 +165,11 @@ Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](..
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| REL-6 | Release `v0.3.0` at protocol 9 | S | Owner (a tag) | `CHANGELOG.md` | A release speaks the protocol of `master` | Planned (pull request 260) |
+| REL-6 | Release `v0.3.0` at protocol 9 | S | Owner (a tag) | `CHANGELOG.md` | A release speaks the protocol of `master` | Implemented (pull request 260; `v0.3.0` of 2026-11-16) |
 | PROTO-1 | The release train rule of D1 | S | Q64 | `CLAUDE.md`, `.github/pull_request_template.md` (new), `docs/README.md` | The rule is written where agents and contributors read it | Implemented by the pull request that plans 0.4.0 |
 | PROTO-2 | The skew job of D2 | M | PROTO-1 | `.github/workflows/ci.yml`, `scripts/release_skew.py` | Each pull request shows the release-to-build table | Implemented (pull request 269) |
-| PROTO-3 | The extension slot of D3 | L | Q65, a design record | `crates/core/src/task.rs`, `crates/core/src/protocol.rs` | An optional field can be added with no change to `PROTOCOL_VERSION_MIN_COMPATIBLE` | Planned |
-| PROTO-4 | The one-version window of D4 | L | Q66, PROTO-3 | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, design 0040 | A worker one version back registers and runs a task | Planned |
+| PROTO-3 | The extension slot of D3 | L | Q65, a design record | `crates/core/src/task.rs`, `crates/core/src/protocol.rs` | An optional field can be added with no change to `PROTOCOL_VERSION_MIN_COMPATIBLE` | Implemented (pull request 272, design 0082) |
+| PROTO-4 | The one-version window of D4 | L | Q66, PROTO-3 | `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, design 0040 | A worker one version back registers and runs a task | Implemented (pull request 274, design 0083) |
 
 ## Open decisions
 
@@ -191,3 +191,4 @@ Sizes are the backlog's S, M and L. The items are in Phase 12 of [BACKLOG.md](..
 - 2026-11-17: D3 built (PROTO-3, draft pull request 272, design 0082): protocol 10 with the extension slot. It holds until PROTO-4 and a release follows within 48 hours of the merge.
 - 2026-11-17: The design record for PROTO-4 (D4) is [0083](0083-one-version-window.md), Draft, based on draft pull request 272. It fixes how a v10 master serves v9 workers and clients, the range-enforcing layout test and the skew table, and asks Q73 to Q79.
 - 2026-11-17: D4 built (PROTO-4, draft pull request 274, design 0083): `PROTOCOL_VERSION_MIN_COMPATIBLE` is 9 at `PROTOCOL_VERSION_CURRENT` 10, so a master accepts the previous version. The skew job of D2 now derives the expected verdict of each pair from the two builds' protocol constants (`--release-protocol-rs`, `git show <tag>:crates/core/src/protocol.rs`): with the window open the release master refuses the pull request's peers, the pull request master works with the release's peers, and the pull request pair works; a pair that differs from its expected verdict fails the job. Run locally against the `v0.3.0` macOS archive (see the pull request description for the table).
+- 2026-11-17: Pull requests 272 and 274 merged into `master` at 03:58 UTC (`e25d0ce`). `v0.3.0` was cut at protocol 9 on 2026-11-16 (REL-6, pull request 260), which settles Q67. Every row of the work item table is Implemented, so the status is Implemented. PROTO-5 belongs to [design 0083](0083-one-version-window.md) and is Planned. By D1 release `0.4.0` is due by 2026-11-19 at 03:58 UTC; it is prepared in draft pull request 280.

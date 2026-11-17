@@ -6,7 +6,7 @@ design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of de
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
-Created: 2026-11-07    Updated: 2026-11-16
+Created: 2026-11-07    Updated: 2026-11-17
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -73,12 +73,17 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 are open.
+- Releases (2026-11-17): `0.3.0` is released. `0.4.0`, an upgrade without stopping the whole
+  cluster, is merged and waits for its tag. `0.5.0`, language model serving across machines, is
+  Design only. `0.6.0` has no content yet (Q81). The table is in [Releases](#releases).
 
 ## Where the project stands
 
-The state at `master` `96ce571` on 2026-11-16: release 0.2.0 plus SCALE-2, FEAT-9a (task VRAM,
-protocol 9) and the fixes BUG-19, BUG-20 and SEC-14 from the audit of 2026-11-15. The previous
-version of this section described `3ce2a65` of 2026-11-09. This is the only roadmap of the project
+The state at `master` `e25d0ce` on 2026-11-17: release 0.3.0 plus protocol 10, which has an
+extension slot for optional task fields (PROTO-3) and accepts peers at protocol 9 (PROTO-4). Release
+0.3.0 itself is release 0.2.0 plus SCALE-2, FEAT-9a (task VRAM, protocol 9), GPU command tasks
+under isolation (FEAT-3e) and the fixes of the audit of 2026-11-15. The previous version of this
+section described `96ce571` of 2026-11-16. This is the only roadmap of the project
 (DOC-10). [BACKLOG.md](BACKLOG.md) holds the items and their status, and section 5 of `PROJECT.md`
 links here.
 
@@ -89,15 +94,16 @@ links here.
 | Scheduling | Task state machine with retries, placement by OS, architecture, worker and tag, GPU gating, host CPU backpressure, requeue when a worker is lost. Speed-aware placement (SCHED-4a, SCHED-4b), a bitset worker index, fair share per submitter and cold results on disk (SCALE-2). Measured with 100 to 1000 simulated workers (SCALE-1) | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/speed.rs`, `crates/master/src/worker_index.rs`, `crates/master/src/fair_share.rs`, `crates/core/src/placement.rs`, [benchmarks](../benchmarks/grid/README.md) |
 | Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP. Per-machine keys (Noise `IK`, `master --auth secret\|members\|both`), invites, approval and `members revoke` (ENROLL-1a, ENROLL-1b) | `crates/core/src/cluster_auth.rs`, `crates/core/src/noise_auth.rs`, `crates/core/src/transport.rs`, `crates/master/src/members.rs` |
 | Adding a machine | One join token (`secret join-token`, `join`), an invite, a spoken short code on a LAN (`invite --code`, SPAKE2) or an encrypted USB setup kit (`usb create`, `join --invite-file`) | `crates/cli/src/join.rs`, `crates/cli/src/pair.rs`, `crates/cli/src/usb_kit.rs`, `packaging/usb/` |
-| Discovery | UDP beacon on a LAN, an authenticated HTTP probe, and a keyed rendezvous registry (`oxideswarm rendezvous`) for masters on other subnets | `crates/core/src/discovery.rs`, `crates/master/src/rendezvous.rs`, design 0066 |
+| Discovery | UDP beacon on a LAN, an authenticated HTTP probe, and a keyed rendezvous registry (`oxideswarm rendezvous`) for masters on other subnets. `master --discovery-port` moves the beacon or turns it off (CLI-2) | `crates/core/src/discovery.rs`, `crates/master/src/rendezvous.rs`, designs 0066 and 0084 |
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
 | Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
 | Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
 | Durability | `master --state-dir` keeps queued, running and finished tasks in a journal and replays it at start. A worker keeps its tasks across a short disconnect, and the master adopts them again (`ResumeSession`) | `crates/master/src/store.rs`, `crates/master/src/session.rs`, `tests/master_restart_recovery.rs` |
-| Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer, with `cargo` and workspaces on a worker that is not elevated, FEAT-3d). A task reads neither `cluster.secret` nor other sandboxes | `crates/worker/src/isolation.rs`, design 0033 |
+| Upgrades | A master at protocol 10 serves workers and clients at protocol 9, so a cluster is upgraded master first and then one machine at a time. An older peer is refused with a version error, and a master at protocol 9 refuses a peer at protocol 10. Optional task fields travel in an extension slot and need no new minimum version. A CI job runs the newest release against the build of each pull request | `crates/core/src/protocol.rs`, `crates/core/src/task/extension.rs`, `scripts/release_skew.py`, designs 0082 and 0083 |
+| Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`, Mach lookups denied by default since SEC-12), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer, with `cargo` and workspaces on a worker that is not elevated, FEAT-3d). A task reads neither `cluster.secret` nor other sandboxes. `--isolation-read-dir` lets a task read a runtime outside its sandbox, such as CUDA or a Python environment (FEAT-3e) | `crates/worker/src/isolation.rs`, designs 0033 and 0074 |
 | Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Symbolic links inside the tree and empty directories travel too (W11). Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
 | Operations | `oxideswarm doctor` (checks C1 to C8, link kind and blob throughput), the dashboard, Prometheus `GET /metrics` and OTLP trace export (`--features otel`), launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/metrics.rs`, `crates/master/src/otel.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
-| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows. Every job is a required check on `master`. A changed wire layout fails CI without a protocol version bump | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs` |
+| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows, and checks that the Android bridge compiles (AND-5). Every job except `release skew`, `fuzz` and `p2p wan relay` is a required check on `master`. A changed wire layout fails CI without a protocol version bump. Three fuzz targets run in CI (LV-1), and a size check caps the Rust source files (MAINT-1) | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs`, `fuzz/`, `scripts/rust-file-size-allowlist.txt` |
 
 ### What is missing
 
@@ -110,23 +116,88 @@ Each row is a limit a user meets today, and the item that removes it.
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | Revoking a member does not close its client connections or cancel its tasks | `members revoke` blocks new handshakes and disconnects the member's worker sessions only | ENROLL-1c, ENROLL-1d |
 | No run across two real networks is recorded | NAT traversal, the relay path and the USB kit on another network are tested on one network only | LINK-1, USB-1c, TEST-24 |
-| The audit of 2026-11-15 found security gaps that are still open | A `rusty-grid.toml` in the working directory configures `worker` and `submit`, an elevated Windows worker can fall back to its own token under isolation, the macOS profile starts from `(allow default)`, an output can be swapped for a link between its check and its upload, and the Agent Mesh launchers are not safe by default. BUG-19, BUG-20 and SEC-14 from the same audit are fixed (pull requests 236, 241, 237) | SEC-10 to SEC-13, SEC-15 |
-| The Android app does not compile | There is no Android worker app to install; phones join through Termux | AND-1, AND-5 |
-| GPU work beyond the built-in benchmark is not yet documented as a user path | Tasks can ask for VRAM and the master does not overcommit a worker's VRAM (FEAT-9a, pull request 232). Running PyTorch, Blender or CUDA programs as command tasks, and ML runtimes inside the sandbox, are being recorded and built (spike R20 of design 0064; design 0074 is in review) | FEAT-9 (decision D6), R20 |
+| Compatibility spans one protocol version | A peer more than one protocol version behind the master is refused until it is upgraded, and a rollback of the master needs the copy of `--state-dir` taken before the upgrade | By design ([design 0083](design/0083-one-version-window.md)). PROTO-5 keeps a test against the release one protocol back |
+| The Android app does not compile | There is no Android worker app to install; phones join through Termux. The bridge library compiles in CI (AND-5, pull request 240) | AND-1 |
+| GPU work is command tasks, with no user kernel | PyTorch, Blender and CUDA programs run as command tasks, with a guide ([guides/gpu-workloads.md](guides/gpu-workloads.md)), VRAM accounting (FEAT-9a) and a runtime allowlist under isolation (FEAT-3e). The built-in `GpuCompute` task is a benchmark (decision D6). No rule for a GPU inside the Linux sandbox is recorded, and the two-machine GPU run under `--isolation fs` is not recorded | FEAT-9, R20 (Linux) |
+| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only, Q60 to Q63) |
 
-## Next: 0.4.0
+## Releases
 
-The goal of 0.4.0 is to upgrade a cluster without stopping all of it, and to run it stably. REL-6
-(release `v0.3.0`, pull request 260) comes first. Then, in order (Phase 12 of
-[BACKLOG.md](BACKLOG.md)):
+The state on 2026-11-17. A release takes what is merged: a wire change ships within 48 hours of its
+merge ([design 0076](design/0076-protocol-compatibility-and-release-train.md), D1), so a release
+number does not fix its content in advance.
 
-- PROTO-1 (the release-train rule, done), the test fixes TEST-28 to TEST-32, and the findings of the Windows smoke test: SEC-16, BUG-22 and CLI-2.
-- PROTO-2 (a CI job that runs the newest release against the pull request's build).
-- PROTO-3 (an extension slot for optional wire fields; a design record first), then PROTO-4 (a
-  one-version window). Both are in [design 0076](design/0076-protocol-compatibility-and-release-train.md).
-- Alongside: TEST-23, TEST-24, TEST-25, TEST-26, TEST-27 and LV-1.
+| Release | Content | State | What the next step waits for |
+|---|---|---|---|
+| `0.3.0` | SCALE-2, FEAT-9a, GPU command tasks under isolation (FEAT-3e) and the fixes of the audit of 2026-11-15 | Released on 2026-11-16 at protocol 9 (pull request 260) | Nothing |
+| `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Merged on 2026-11-17 (PROTO-1 to PROTO-4; pull requests 272 and 274). Prepared in draft pull request 280. Not tagged | Green checks on pull request 280, then the owner's word for the tag. The 48 hours of D1 end on 2026-11-19 at 03:58 UTC |
+| After `0.4.0`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned | Q80, and the items under "Stability" |
+| `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The steps under "Before 0.5.0 has items" |
+| `0.6.0` | Not set | No document names it | Q81 |
 
-0.5.0 is LLM serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)).
+The wave table of [design 0056](design/0056-frontier-program.md) (D8) planned other content for
+`0.3.0` and `0.4.0`. Its order of waves stands, and its release numbers do not.
+
+### Stability
+
+Phase 12 has two goals. The first, the upgrade, is merged. The second, a cluster and a test suite
+that run stably, is not reached.
+
+- On 2026-11-16 (UTC) `master` had 40 CI runs for pushes. 18 passed, 10 failed and 12 ended as
+  cancelled, although the workflow never cancels a run for a push (`.github/workflows/ci.yml`,
+  `concurrency`). No record states who or what cancelled them.
+- Five of the ten failed runs had a failing test in `workspace tests`: four on `windows-latest` and
+  one on `ubuntu-latest`. The other five had no failed job and one or two cancelled macOS jobs.
+- `test_stress_high_volume_worker_churn` failed in three runs (`43899835358`, `43907656569`,
+  `43975125182`). It is TEST-33.
+- Two failing tests have no item: `test_reaper_accuracy_silent_worker_boundary_timing` in
+  `tests/m2_challenger_2_stress.rs` (run `43944560507`, `windows-latest`), and
+  `test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling` in
+  `tests/workflow_modes_test.rs` (run `43952618376`, `ubuntu-latest`). The cancelled macOS jobs
+  have no item either.
+- The Index holds the open work: TEST-23, TEST-29, TEST-32 and TEST-33 (failures that are flaky or
+  not explained), TEST-24 to TEST-26 (large transfers and a 24-hour run,
+  [design 0065](design/0065-large-transfer-and-long-run-tests.md)), PROTO-5, SEC-16 and BUG-22.
+  TEST-27, TEST-31, TEST-35 and LV-1 are Partial.
+- Pull request 280 adds BUG-23 and BUG-24 from the Windows smoke test of `0.4.0`. `windows/oxctl.ps1`
+  ends a master by force, which leaves a journal that the master of the next protocol version
+  refuses. A `--state-dir` on a file system without permissions, such as exFAT, lets the master
+  start once only.
+
+Release `0.4.0` ships the first goal. Its notes in pull request 280 describe the upgrade path and
+make no statement about stability.
+
+**Proposed exit check (Q80, not accepted):** every failing test above has an item, and each of those
+items is Implemented with its loop of runs recorded; TEST-24 and TEST-25 each have one dated record;
+and `master` has seven days of runs for pushes in which no test fails.
+
+### Before 0.5.0 has items
+
+Design 0067 is research and a plan. Its own work items are spike R22 and LLM-14. R22 has one record
+of 2026-11-16, with the model server and the load generator on the same GPU machine. LLM-14 is
+Design only. The items that would serve a model are in no Index: LLM-1
+([design 0038](design/0038-large-language-model-inference.md)), LLM-6 (design 0056), LLM-9
+([design 0061](design/0061-first-application-model-tunnel.md)) and FEAT-9b, the live GPU memory
+report that design 0067 names.
+
+In order:
+
+1. The owner answers Q60 to Q63 (design 0067), Q54
+   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41 (design 0061).
+2. Spike R21, a reading of what Mesh-LLM already does, has no record. Q54 recommends that no model
+   item is built before it has one.
+3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
+4. The items that the answers keep enter [BACKLOG.md](BACKLOG.md) as a phase of their own, each
+   with files and a check.
+
+Steps 2 and 3 build nothing in the product.
+
+### 0.6.0
+
+No record gives `0.6.0` a content. Q81 asks for one. The recommended default is bet A of design
+0056: AX-1, AX-2, AX-3 and CACHE-1. It serves the purpose of Q1, design 0056 planned it as the
+first wave, and no release has shipped it. AX-1 waits for the first round of the study of first
+use (ADOPT-1, Q37), and no session has run.
 
 ## Purpose
 
@@ -518,9 +589,9 @@ are open.
 | Area | Items | Why it waits | Plan |
 |---|---|---|---|
 | 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story | Frozen. Since FEAT-11 (pull request 127), `gen3d` and `autorig` build only with the opt-in Cargo feature `3d` |
-| Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C. The research of 2026-11-08 supports the layer split of D2 to D5 for home networks |
+| Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C. The research of 2026-11-08 supports the layer split of D2 to D5 for home networks. Release `0.5.0` is named for serving across machines (design 0067); [Releases](#releases) lists what comes before it has items |
 | Remote Execution API cache | REAPI-1 | It serves Bazel and Buck2 users rather than the user story, and adds a gRPC listener | After CACHE-1, cache-only. The `Execution` service is not planned |
-| GPU kernels | FEAT-9 | Decision D6 keeps GPU compute a benchmark | State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
+| GPU kernels | FEAT-9 | Decision D6 keeps the built-in `GpuCompute` task a benchmark. GPU programs run as command tasks instead (FEAT-9a, FEAT-3e, [guides/gpu-workloads.md](guides/gpu-workloads.md)) | A task type with a user kernel is not planned. State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
 | Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback, a security fix, landed in pull requests 114 and 132 |
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
 | Distributed training | TRAIN-1 to TRAIN-5 ([design 0045](design/0045-distributed-training.md)) | It does not serve the user story. Until FEAT-3 a training task can read the worker's `cluster.secret`, and long rounds need FEAT-1 and FEAT-5 | After the Phase D exit check (decision Q6). TRAIN-1, independent runs, comes first |
@@ -534,6 +605,12 @@ as TRAIN-1's independent runs, may also run in the open network of Phase H.
 The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q12 were open until the owner accepted their recommended defaults on 2026-11-09: the
 right column is a recommended default, not a decision, and no work depends on it until the owner
 answers.
+
+Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and join
+this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
+Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
+[design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
+[design 0083](design/0083-one-version-window.md).
 
 | ID | Question | Decision |
 |---|---|---|
@@ -595,6 +672,8 @@ answers.
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
+| Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Open. Recommended: yes. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
+| Q81 | What does `0.6.0` carry? | Open. Recommended: bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). It serves the purpose of Q1, and no release has shipped it |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -740,3 +819,10 @@ answers.
 - 2026-11-15: Owner approved `Q56`, implemented as `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md), pull request 232): `TaskRequirements::vram_mb` (protocol v9, store v3), CLI `--vram-mb`, MCP `vram_mb`, Web UI `vram_mb`, and master scheduler VRAM budget tracking with anti-starvation hold-back.
 - 2026-11-15: DOC-10. "Where the project stands" now describes `f4a4a74` (release 0.2.0 plus SCALE-2 and FEAT-9a): new rows for per-machine keys, adding a machine, discovery, scale work and observability, and the open limits found by the audit of 2026-11-15 (BUG-19, BUG-20, SEC-10 to SEC-15). This file is the only roadmap: section 5 of `PROJECT.md` links here, and the untracked `docs/ROADMAP_AND_VISION.md` draft of 2026-11-11 was moved out of the repository (its six sound points had already landed through pull request 206). No item, order or decision changed.
 - 2026-11-16: "Where the project stands" describes `96ce571`. BUG-19, BUG-20 and SEC-14 left the row of open audit findings (pull requests 236, 241, 237); SEC-10 to SEC-13 and SEC-15 stay.
+- 2026-11-17: "Where the project stands" describes `e25d0ce` (release 0.3.0 plus protocol 10). New row
+  "Upgrades" in "What works". The row of open audit findings left "What is missing": SEC-10 to SEC-13
+  and SEC-15 are Implemented (pull requests 238, 256, 257, 239 and 258), and AND-5 is too (pull request
+  240). New rows there for the one-version limit and for language model serving, and the GPU row says
+  what runs today. "Next: 0.4.0" became "Releases": a table from `0.3.0` to `0.6.0`, the CI record of
+  2026-11-16 under "Stability", and the steps before `0.5.0` has items. Q80 and Q81 are new and open.
+  No item, order or accepted decision changed.
