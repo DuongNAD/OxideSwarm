@@ -128,7 +128,7 @@ work. The guide forbids staging `.env` or any file with credentials as an input,
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid (D1; from design 0063) | `docs/design/0063-two-directions-in-parallel.md` "Trial records", or a record under `benchmarks/` | The record holds the checksums of one deterministic CPU run on each machine and the trials per hour on one and two workers | Planned |
-| VERIFY-1 | Run a task again on other workers and compare its outputs (D3) | `crates/cli/src/cli_app.rs` and its submit path, `crates/cli/src/mcp.rs`, a CLI test, `README.md` | The tests of D3 pass in CI | Planned |
+| VERIFY-1 | Run a task again on other workers and compare its outputs (D3) | `crates/cli/src/cli_app.rs` and its submit path, `crates/cli/src/mcp.rs`, a CLI test, `README.md` | The tests of D3 pass in CI | Implemented (pull request 296) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run (D5) | `docs/guides/anima-engine-sweeps.md` | The guide exists with a recorded sweep and links from `README.md` | Planned |
 
 AX-1 and AX-2 are in the backlog already (Phase 13); D2 names Anima Engine as their first user.
@@ -149,3 +149,5 @@ AX-1 and AX-2 are in the backlog already (Phase 13); D2 names Anima Engine as th
   took the recommended defaults of Q88 and Q89. Status Accepted. VERIFY-1 starts now; APP-4 needs a build of
   Anima Engine on each machine and is left to the owner or the Windows agent after the stability items, since a
   full backend build has hung the owner's development machine.
+- 2026-11-17: VERIFY-1 merged as pull request 296 (`38c30f9`): `submit --verify <N>` and `--verify-file`, and
+  `verify` / `verify_file` in the MCP `submit` tool, client side, protocol unchanged; exit code 4 on a mismatch.
