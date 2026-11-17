@@ -231,7 +231,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
-| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | PRNUM |
+| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3194,7 +3194,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Wait for the master's port file or for a successful connect with a bounded but generous limit
   (for example 30 s), as TEST-36 to TEST-38 did, and keep every assertion.
 - **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
-- **Implemented (2026-11-17, pull request PRNUM):** Cause as in the Problem: both in-process masters of the
+- **Implemented (2026-11-17, pull request 301):** Cause as in the Problem: both in-process masters of the
   test (the JSON-codec master and the round-robin master) were waited for with `for _ in 0..50` connects,
   20 ms apart, so one second to build the master's state and bind. Both waits now call
   `wait_for_master_bind`, a helper in `runtime_tests.rs` that retries the connect every 20 ms for up to 30 s
