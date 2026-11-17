@@ -230,7 +230,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
-| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
+| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | PRNUM |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
@@ -3183,6 +3183,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Serialise the tests of the binary that touch the global worker (one lock shared by them, or one
   test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
 - **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
+- **Implemented (2026-11-17, pull request PRNUM):** The cause is not another test's call. All tests of the
+  file already hold one `TEST_MUTEX`. `stop_worker_impl` returns while the worker still drains: it sets the
+  status `STOPPING` and a detached thread writes `STOPPED` after it has joined the worker thread. That late
+  write ran after the previous test released the lock, so it could land between this test's failing
+  `set_cluster_secret_impl` (which writes `ERROR: Invalid cluster secret: ...`) and its status read. The
+  tests now call `common::stop_and_settle()` (`crates/android_bridge/tests/common/mod.rs`), which stops the
+  worker and waits (30 s bound) until the status is no longer `STOPPING`; the four test files that read the
+  status use it. No change to the bridge, every assertion kept.
 
 ### TEST-49: Wait for the master by condition in the sched2 runtime test
 
