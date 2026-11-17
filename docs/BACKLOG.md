@@ -217,7 +217,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | NNN |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
@@ -3023,7 +3023,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   lost the result or dispatched the task again. Fix that cause. If the design allows a rerun in that window,
   say so beside the probe and in the guarantee it tests, and change the assertion with that reason.
 - **Done when:** The cause is named here, and the probe passes 200 runs in a row on Linux and on Windows.
-- **Partial (2026-11-17, pull request NNN):** not reproduced on macOS in 6,884 rounds of the probe (about 570 runs of
+- **Partial (2026-11-17, pull request 288):** not reproduced on macOS in 6,884 rounds of the probe (about 570 runs of
   12 rounds: single, 3 to 8 parallel copies, the whole test binary next to three copies of itself, 6 `yes` CPU spinners
   on 10 cores, `RV158_ZERO` with no delay after the task finished, and a variant that kept the task alive for up to
   450 ms after its done marker). No round ran the task twice. What reading the code ruled out: the journal cannot lose an
