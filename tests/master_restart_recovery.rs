@@ -936,13 +936,18 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
     // and never again in thousands of local rounds. Keep what the master and worker logged so a
     // repeat comes with the evidence (which side dropped the result or dispatched the task again).
     let sink = LogSink::default();
-    let _ = tracing_subscriber::fmt()
+    // Scoped to this test, not global: the other tests of this binary must not format debug logs
+    // (that would change their timing). This is a current-thread runtime, so the master and
+    // worker tasks it spawns log on this thread and are captured; `spawn_blocking` and std
+    // threads log elsewhere and are not.
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
             "rusty_grid_master=debug,rusty_grid_worker=debug",
         ))
         .with_ansi(false)
         .with_writer(sink.clone())
-        .try_init();
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
     // `RV158_ROUNDS` (default 12) and `RV158_ZERO` (shut down with no delay after the task
     // finished) are for local stress loops; CI runs the defaults.
     let rounds = std::env::var("RV158_ROUNDS")
@@ -952,7 +957,9 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
     let zero_delay = std::env::var_os("RV158_ZERO").is_some();
     let mut twice = 0usize;
     for round in 0..rounds {
-        let log_start = sink.0.lock().unwrap_or_else(|e| e.into_inner()).len();
+        // Only this probe writes to the sink, so each round starts from an empty one (this also
+        // keeps the size-capping drain from shifting any index).
+        sink.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("master-state");
         let marker_path = dir.path().join("p3.marker");
@@ -1071,7 +1078,7 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
                 "RV158 P3 round={round} ran twice (task {task_id}, worker {worker_id}); marker:\n{}",
                 std::fs::read_to_string(&marker_path).unwrap_or_default()
             );
-            for line in lines.iter().skip(log_start).filter(|l| {
+            for line in lines.iter().filter(|l| {
                 l.contains(&task_id)
                     || (!worker_id.is_empty() && l.contains(&worker_id))
                     || l.contains(" WARN ")

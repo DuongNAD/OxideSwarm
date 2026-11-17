@@ -908,6 +908,14 @@ The full suite must pass on a clean machine before CI can require it.
   (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
   `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
 
+- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
+  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
+  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
+  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
+  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
+  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
+
 ### TEST-24: Test large transfers between machines
 
 - **Evidence:** Read, on 2026-11-14 at `master` `f486885`. The largest file in the end-to-end
@@ -3038,13 +3046,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   the round began, and the round line shows `evacuation=` next to `retry=` and `failover=`. `RV158_ROUNDS` and
   `RV158_ZERO` let a local loop run more rounds and shut the master down with no delay. The assertion is unchanged.
   Next step: the next CI failure of this probe now carries the evidence; read which side sent `ResumeSession` without the
-  task (worker) or released the hold (master). Separate finding while looping the whole binary under load: its tests
-  `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` and
-  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` failed 9 and 1 times in 140 runs of
-  the binary under load ("blob transfer failed: the connection to the master ended" and "out.txt: No such file or
-  directory", the task sandbox gone; the probe itself never failed in those runs). A likely cause, not verified: the tests share
-  `<tmp>/rusty_grid-<uid>/sandboxes`, and a worker that starts sweeps a sandbox directory whose lock it can take
-  before the task that created it holds the lock. Not part of this item.
+  task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
+  under TEST-23.
 
 ### TEST-42: Make the reaper boundary test independent of scheduler delay
 
