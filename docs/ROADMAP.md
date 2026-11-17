@@ -5,7 +5,8 @@ Q8 to Q12 (Phases F and G) and Q13 (ecosystem model A) on 2026-11-09, Q27 to Q29
 design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of design 0059),
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
-Q48 (two directions are followed in parallel, design 0063) on 2026-11-12.
+Q48 (two directions are followed in parallel, design 0063) on 2026-11-12, and Q80 (a stability
+release before `0.5.0`) and Q81 (`0.6.0` carries bet A of design 0056) on 2026-11-17.
 Created: 2026-11-07    Updated: 2026-11-17
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -74,8 +75,9 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 are open.
 - Releases (2026-11-17): `0.3.0` is released. `0.4.0`, an upgrade without stopping the whole
-  cluster, is merged and waits for its tag. `0.5.0`, language model serving across machines, is
-  Design only. `0.6.0` has no content yet (Q81). The table is in [Releases](#releases).
+  cluster, is merged and waits for its tag. A stability release with no wire change follows it
+  (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
+  coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
 
 ## Where the project stands
 
@@ -130,10 +132,10 @@ number does not fix its content in advance.
 | Release | Content | State | What the next step waits for |
 |---|---|---|---|
 | `0.3.0` | SCALE-2, FEAT-9a, GPU command tasks under isolation (FEAT-3e) and the fixes of the audit of 2026-11-15 | Released on 2026-11-16 at protocol 9 (pull request 260) | Nothing |
-| `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Merged on 2026-11-17 (PROTO-1 to PROTO-4; pull requests 272 and 274). Prepared in draft pull request 280. Not tagged | Green checks on pull request 280, then the owner's word for the tag. The 48 hours of D1 end on 2026-11-19 at 03:58 UTC |
-| After `0.4.0`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned | Q80, and the items under "Stability" |
-| `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The steps under "Before 0.5.0 has items" |
-| `0.6.0` | Not set | No document names it | Q81 |
+| `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Merged on 2026-11-17 (PROTO-1 to PROTO-4; pull requests 272 and 274). Prepared in draft pull request 280. Not tagged | Green checks on pull request 280 and its merge. The owner agreed on 2026-11-17 to the tag on that merge commit. The 48 hours of D1 end on 2026-11-19 at 03:58 UTC |
+| `0.4.x`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned. It comes before any item of `0.5.0` is built (Q80) | The exit check under "Stability" |
+| `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The stability release, and the steps under "Before 0.5.0 has items" |
+| `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 is in the BACKLOG Index; AX-1 to AX-3 are not | The first round of ADOPT-1 (Q37), then the items enter BACKLOG |
 
 The wave table of [design 0056](design/0056-frontier-program.md) (D8) planned other content for
 `0.3.0` and `0.4.0`. Its order of waves stands, and its release numbers do not.
@@ -167,7 +169,7 @@ that run stably, is not reached.
 Release `0.4.0` ships the first goal. Its notes in pull request 280 describe the upgrade path and
 make no statement about stability.
 
-**Proposed exit check (Q80, not accepted):** every failing test above has an item, and each of those
+**Exit check (Q80):** every failing test above has an item, and each of those
 items is Implemented with its loop of runs recorded; TEST-24 and TEST-25 each have one dated record;
 and `master` has seven days of runs for pushes in which no test fails.
 
@@ -194,10 +196,12 @@ Steps 2 and 3 build nothing in the product.
 
 ### 0.6.0
 
-No record gives `0.6.0` a content. Q81 asks for one. The recommended default is bet A of design
-0056: AX-1, AX-2, AX-3 and CACHE-1. It serves the purpose of Q1, design 0056 planned it as the
-first wave, and no release has shipped it. AX-1 waits for the first round of the study of first
-use (ADOPT-1, Q37), and no session has run.
+Release `0.6.0` carries bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81). It serves the
+purpose of Q1, design 0056 planned it as the first wave, and no release has shipped it. AX-1 waits
+for the first round of the study of first use (ADOPT-1, Q37), and no session has run. The texts of
+AX-1 to AX-3 are in design 0056, and they enter [BACKLOG.md](BACKLOG.md) with files and a check
+before work starts. A wire change that merges earlier still ships within 48 hours (design 0076,
+D1), so the number can move while the order stays.
 
 ## Purpose
 
@@ -672,8 +676,8 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
-| Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Open. Recommended: yes. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
-| Q81 | What does `0.6.0` carry? | Open. Recommended: bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). It serves the purpose of Q1, and no release has shipped it |
+| Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
+| Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -826,3 +830,9 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
   what runs today. "Next: 0.4.0" became "Releases": a table from `0.3.0` to `0.6.0`, the CI record of
   2026-11-16 under "Stability", and the steps before `0.5.0` has items. Q80 and Q81 are new and open.
   No item, order or accepted decision changed.
+- 2026-11-17: Q80 and Q81 take their recommended defaults on the owner's go-ahead in chat ("do it
+  your way", after both were put to the owner the same day). A stability release with no wire change
+  comes after `0.4.0` and before any item of `0.5.0` is built, and it ends with the exit check under
+  "Stability". `0.6.0` carries bet A of design 0056, after the first round of ADOPT-1. The row of
+  `0.4.0` now says that the owner agreed to its tag once pull request 280 is merged. Nothing entered
+  the backlog.

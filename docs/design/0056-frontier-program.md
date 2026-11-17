@@ -522,7 +522,7 @@ Note of 2026-11-17: the release numbers in this table no longer hold. Release `0
 SCALE-2, FEAT-9a and the fixes of the audit of 2026-11-15, and `0.4.0` is the upgrade work of
 [design 0076](0076-protocol-compatibility-and-release-train.md). No release has shipped wave 1. The
 order of the waves stands. The section "Releases" of [ROADMAP.md](../ROADMAP.md) holds the release
-numbers, and its Q81 asks whether `0.6.0` carries wave 1.
+numbers, and its Q81 gives wave 1 to `0.6.0`.
 
 Lanes inside a wave, for the three implementing agents:
 
@@ -734,4 +734,5 @@ second one, the classroom. Accepting Q25 accepts the second story.
   support it yet (Q55). The text of AX-3 is unchanged.
 - 2026-11-17: D8 gained a note: releases `0.3.0` and `0.4.0` shipped other work than waves 1 and
   2, so the release column of the wave table no longer holds. The order of the waves and the text
-  of every item are unchanged. ROADMAP Q81 asks whether `0.6.0` carries wave 1.
+  of every item are unchanged. ROADMAP Q81, taken at its recommended default on the owner's go-ahead
+  of the same day, gives wave 1 (AX-1, AX-2, AX-3 and CACHE-1) to `0.6.0`. Q22 is not changed by it.
