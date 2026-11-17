@@ -684,9 +684,12 @@ async fn test_stress_high_volume_worker_churn() {
         ));
     }
 
+    // TEST-33: the bounds below are generous because they only cap a wait for a condition; a
+    // fast run leaves as soon as the condition holds (the drain took at most 2.4 s on one starved
+    // core here), and a slow CI runner must not fail a test whose assertions all hold.
     assert!(
         wait_for(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             Duration::from_millis(50),
             || async {
                 master
@@ -696,7 +699,8 @@ async fn test_stress_high_volume_worker_churn() {
                     .unwrap_or(false)
             }
         )
-        .await
+        .await,
+        "The 4 initial workers must register"
     );
 
     // Submit 30 tasks with varied durations (100ms to 300ms)
@@ -744,8 +748,9 @@ async fn test_stress_high_volume_worker_churn() {
     ));
 
     // Wait for all 30 tasks to reach Completed
+    let drain_started = Instant::now();
     let all_done = wait_for(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Duration::from_millis(50),
         || async {
             let mut completed = 0;
@@ -760,9 +765,35 @@ async fn test_stress_high_volume_worker_churn() {
         },
     )
     .await;
-    assert!(
-        all_done,
-        "All 30 tasks must complete despite rapid worker churn"
+    if !all_done {
+        // TEST-33: say which tasks did not complete and why, instead of only that they did not.
+        let mut pending = Vec::new();
+        for id in &task_ids {
+            match master.get_task_info(*id).await {
+                Ok(info) if info.state != TaskState::Completed => pending.push(format!(
+                    "  {id}: {:?} retries={} failovers={} evacuations={} worker={:?} error={:?}",
+                    info.state,
+                    info.retry_count,
+                    info.failover_count,
+                    info.evacuation_count,
+                    info.assigned_worker_id,
+                    info.error_message
+                )),
+                Ok(_) => {}
+                Err(e) => pending.push(format!("  {id}: get_task_info failed: {e}")),
+            }
+        }
+        let listed = master.list_workers().await.map(|w| w.len()).unwrap_or(0);
+        panic!(
+            "All 30 tasks must complete despite rapid worker churn; {} of 30 not completed {:?} after the churn, {listed} workers listed:\n{}",
+            pending.len(),
+            drain_started.elapsed(),
+            pending.join("\n")
+        );
+    }
+    eprintln!(
+        "TEST-33: all 30 tasks completed {:?} after the churn ended",
+        drain_started.elapsed()
     );
 
     // Assert zero task failures, zero orphaned tasks
