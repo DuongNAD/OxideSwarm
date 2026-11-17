@@ -5,8 +5,14 @@
 //! `require:worker=<id>` placement tag, and the outputs are compared by the BLAKE3 ids the
 //! results already carry, so no wire format changes. Only meaningful for deterministic tasks; a
 //! task whose outputs differ per run reports a mismatch.
+//!
+//! By default the replicas run only on workers with the operating system and CPU architecture of
+//! the worker that ran the first copy (design 0089 D6, VERIFY-2): the same deterministic program
+//! can give different results on two systems, which would be a false mismatch.
+//! `--verify-any-system` lets any matching worker run them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -14,7 +20,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::blob::BlobFile;
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, Placement, REQUIRE_PREFIX, STATE_TAG_PREFIX,
+    listed_worker_id, normalize_arch, normalize_os, tag_value, Placement, ARCH_TAG_PREFIX,
+    OS_TAG_PREFIX, REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult};
@@ -25,13 +32,102 @@ use rusty_grid_core::WorkerCapabilities;
 pub const MISMATCH_EXIT_CODE: u8 = 4;
 
 /// The help text of the CLI flag.
-pub const VERIFY_HELP: &str = "After the task completes, run it again on N other matching workers and compare the declared outputs (--output) by BLAKE3; prints 'verified' or 'mismatch' (exit 4). Only for deterministic tasks: a non-deterministic task will report a mismatch";
+pub const VERIFY_HELP: &str = "After the task completes, run it again on N other matching workers with the same operating system and CPU architecture as the first run (see --verify-any-system) and compare the declared outputs (--output) by BLAKE3; prints 'verified' or 'mismatch' (exit 4). Only for deterministic tasks: a non-deterministic task will report a mismatch";
+
+/// The help text of `--verify-any-system`.
+pub const VERIFY_ANY_SYSTEM_HELP: &str = "With --verify: let the replicas run on matching workers with another operating system or CPU architecture than the first run. By default they do not, because the same deterministic program can give different results on two systems";
+
+/// The operating system and CPU architecture a listed worker reports in its `os:` and `arch:`
+/// tags, normalized as placement does (`darwin` is `macos`, `arm64` is `aarch64`). `None` for a
+/// tag the worker does not carry (an older worker) or a worker that is not listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct System {
+    pub os: Option<String>,
+    pub arch: Option<String>,
+}
+
+impl System {
+    /// The system a listed worker reports.
+    pub fn of(caps: &WorkerCapabilities) -> Self {
+        Self {
+            os: tag_value(&caps.tags, OS_TAG_PREFIX).map(normalize_os),
+            arch: tag_value(&caps.tags, ARCH_TAG_PREFIX).map(normalize_arch),
+        }
+    }
+
+    /// The system of the listed worker with this id; empty when it is not listed.
+    pub fn of_listed(workers: &[WorkerCapabilities], id: Uuid) -> Self {
+        workers
+            .iter()
+            .find(|w| listed_worker_id(w) == Some(id))
+            .map(Self::of)
+            .unwrap_or_default()
+    }
+
+    /// Whether a worker on `other` runs this system. A part this one does not know is not
+    /// compared, so a first worker without an `os:` tag filters on its architecture only.
+    pub fn admits(&self, other: &System) -> bool {
+        let same =
+            |mine: &Option<String>, theirs: &Option<String>| mine.is_none() || mine == theirs;
+        same(&self.os, &other.os) && same(&self.arch, &other.arch)
+    }
+
+    /// What this system does not know, for the notice; `None` when both parts are known.
+    pub fn missing(&self) -> Option<&'static str> {
+        match (&self.os, &self.arch) {
+            (Some(_), Some(_)) => None,
+            (None, Some(_)) => Some("operating system (os: tag)"),
+            (Some(_), None) => Some("CPU architecture (arch: tag)"),
+            (None, None) => Some("operating system and CPU architecture (os: and arch: tags)"),
+        }
+    }
+
+    fn is_known(&self) -> bool {
+        self.os.is_some() || self.arch.is_some()
+    }
+}
+
+impl fmt::Display for System {
+    /// `macos/aarch64`: the known parts, or `unknown system` when neither is.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parts: Vec<&str> = [self.os.as_deref(), self.arch.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if parts.is_empty() {
+            f.write_str("unknown system")
+        } else {
+            f.write_str(&parts.join("/"))
+        }
+    }
+}
 
 /// A worker that ran (or will run) one copy of the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub id: Uuid,
     pub name: String,
+    pub system: System,
+}
+
+/// The workers' names with their systems: `a, b, all macos/aarch64` when they share one, else
+/// `a on macos/aarch64, b on windows/x86_64`.
+pub fn describe_workers(workers: &[Target]) -> String {
+    let names = || workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>();
+    match workers.first() {
+        Some(first) if workers.iter().all(|w| w.system == first.system) => {
+            if first.system.is_known() {
+                format!("{}, all {}", names().join(", "), first.system)
+            } else {
+                names().join(", ")
+            }
+        }
+        _ => workers
+            .iter()
+            .map(|w| format!("{} on {}", w.name, w.system))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// What one worker produced.
@@ -66,7 +162,12 @@ impl Report {
             "status": if self.verified() { "verified" } else { "mismatch" },
             "replicas": self.workers.len().saturating_sub(1),
             "workers": self.workers.iter()
-                .map(|w| json!({"id": w.id.to_string(), "name": w.name}))
+                .map(|w| json!({
+                    "id": w.id.to_string(),
+                    "name": w.name,
+                    "os": w.system.os,
+                    "arch": w.system.arch,
+                }))
                 .collect::<Vec<_>>(),
             "compared": self.compared,
             "differing": self.differing.iter().map(|d| json!({
@@ -80,21 +181,19 @@ impl Report {
 
     /// The lines the CLI prints.
     pub fn text(&self) -> String {
-        let names: Vec<&str> = self.workers.iter().map(|w| w.name.as_str()).collect();
+        let workers = describe_workers(&self.workers);
         if self.verified() {
             return format!(
-                "verified: {} file(s) identical on {} workers ({})",
+                "verified: {} file(s) identical on {} workers ({workers})",
                 self.compared.len(),
                 self.workers.len(),
-                names.join(", ")
             );
         }
         let mut out = format!(
-            "mismatch: {} of {} file(s) differ across {} workers ({})",
+            "mismatch: {} of {} file(s) differ across {} workers ({workers})",
             self.differing.len(),
             self.compared.len(),
             self.workers.len(),
-            names.join(", ")
         );
         for d in &self.differing {
             out.push_str(&format!("\n  - {}", d.path));
@@ -141,15 +240,19 @@ pub fn check_options(
 }
 
 /// Picks `n` connected workers other than `first` that fit the task's placement and resources.
-/// Idle workers come first.
+/// Unless `any_system`, only workers on the operating system and CPU architecture that `first`
+/// reports in `workers` count (a part it does not report is not compared). Idle workers come
+/// first.
 pub fn pick_targets(
     workers: &[WorkerCapabilities],
     placement: &Placement,
     requirements: &TaskRequirements,
     first: Uuid,
     n: usize,
+    any_system: bool,
 ) -> Result<Vec<Target>, String> {
     let vram = requirements.effective_vram_mb();
+    let wanted = (!any_system).then(|| System::of_listed(workers, first));
     let mut fits: Vec<(bool, Target)> = workers
         .iter()
         .filter(|w| tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected"))
@@ -159,22 +262,25 @@ pub fn pick_targets(
         .filter(|w| vram == 0 || w.vram_mb.is_some_and(|v| v >= vram))
         .filter_map(|w| {
             let id = listed_worker_id(w)?;
-            (id != first).then(|| {
-                let idle = tag_value(&w.tags, STATE_TAG_PREFIX) == Some("idle");
-                (
-                    !idle,
-                    Target {
-                        id,
-                        name: w.name.clone(),
-                    },
-                )
-            })
+            let system = System::of(w);
+            if id == first || wanted.as_ref().is_some_and(|s| !s.admits(&system)) {
+                return None;
+            }
+            let idle = tag_value(&w.tags, STATE_TAG_PREFIX) == Some("idle");
+            let name = w.name.clone();
+            Some((!idle, Target { id, name, system }))
         })
         .collect();
     fits.sort_by_key(|(busy, _)| *busy);
     if fits.len() < n {
+        let only = match wanted.filter(System::is_known) {
+            Some(system) => format!(
+                " (only workers on {system}, the system of the first run, count; --verify-any-system allows others)"
+            ),
+            None => String::new(),
+        };
         return Err(format!(
-            "--verify {n} needs {n} other workers that match the task, but only {} connected worker(s) besides the first one do",
+            "--verify {n} needs {n} other workers that match the task, but only {} connected worker(s) besides the first one do{only}",
             fits.len()
         ));
     }
@@ -266,6 +372,8 @@ pub struct Request<'a> {
     pub first_name: Option<String>,
     pub replicas: usize,
     pub file: Option<&'a str>,
+    /// `--verify-any-system`: replicas may run on another operating system or architecture.
+    pub any_system: bool,
 }
 
 /// Picks the workers, runs the replicas (one new connection from `connect` each) and compares
@@ -275,35 +383,43 @@ where
     C: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<MessageTransport<GridStream>, String>>,
 {
+    let first = Target {
+        id: req.first.worker_id,
+        name: req
+            .first_name
+            .unwrap_or_else(|| req.first.worker_id.to_string()),
+        system: System::of_listed(req.workers, req.first.worker_id),
+    };
+    if !req.any_system {
+        if let Some(missing) = first.system.missing() {
+            eprintln!(
+                "Note: worker {} that ran the first copy does not report its {missing}; the replicas are not filtered on it",
+                first.name
+            );
+        }
+    }
     let targets = pick_targets(
         req.workers,
         req.placement,
         &req.template.requirements,
         req.first.worker_id,
         req.replicas,
+        req.any_system,
     )?;
+    eprintln!(
+        "Verifying on {} other worker(s): {}",
+        targets.len(),
+        describe_workers(&targets)
+    );
     let mut jobs = Vec::new();
     for target in targets {
         let transport = connect().await?;
         let task = replica_task(req.template, target.id);
         jobs.push((target, transport, task));
     }
-    eprintln!(
-        "Verifying on {} other worker(s): {}",
-        jobs.len(),
-        jobs.iter()
-            .map(|(t, _, _)| t.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     let timeout = Duration::from_secs(req.template.requirements.timeout_secs.saturating_add(30));
     let mut runs = vec![Run {
-        worker: Target {
-            id: req.first.worker_id,
-            name: req
-                .first_name
-                .unwrap_or_else(|| req.first.worker_id.to_string()),
-        },
+        worker: first,
         outputs: req.first.outputs.clone(),
     }];
     runs.extend(run_replicas(jobs, timeout).await?);
@@ -367,6 +483,7 @@ mod tests {
             worker: Target {
                 id: Uuid::new_v4(),
                 name: name.into(),
+                system: System::default(),
             },
             outputs: files
                 .iter()
@@ -444,5 +561,144 @@ mod tests {
         let r = replica_task(&template, w);
         assert_ne!(r.id, template.id);
         assert!(r.tags.contains(&format!("require:worker={w}")));
+    }
+
+    /// A connected idle worker as `ListWorkers` reports it, with the master's `id:` tag and the
+    /// given system tags (`os:...`, `arch:...`).
+    fn listed(name: &str, system_tags: &[&str]) -> (Uuid, WorkerCapabilities) {
+        let id = Uuid::new_v4();
+        let mut tags = vec![format!("id:{id}"), "state:idle".to_string()];
+        tags.extend(system_tags.iter().map(|t| t.to_string()));
+        let caps = WorkerCapabilities {
+            name: name.into(),
+            cpu_cores: 4,
+            ram_mb: 8192,
+            tags,
+            ..WorkerCapabilities::default()
+        };
+        (id, caps)
+    }
+
+    fn pick(
+        workers: &[WorkerCapabilities],
+        first: Uuid,
+        n: usize,
+        any_system: bool,
+    ) -> Result<Vec<String>, String> {
+        let requirements = TaskRequirements::generic(1, 10);
+        pick_targets(
+            workers,
+            &Placement::default(),
+            &requirements,
+            first,
+            n,
+            any_system,
+        )
+        .map(|targets| targets.into_iter().map(|t| t.name).collect())
+    }
+
+    /// The first worker `mac1` (macOS arm64, tagged `darwin`/`arm64`, which normalize to
+    /// `macos`/`aarch64`), another Mac, a Windows x86_64 worker and a Linux arm64 worker.
+    fn mixed() -> (Uuid, Vec<WorkerCapabilities>) {
+        let (first, mac1) = listed("mac1", &["os:darwin", "arch:arm64"]);
+        let (_, mac2) = listed("mac2", &["os:macos", "arch:aarch64"]);
+        let (_, win) = listed("win", &["os:windows", "arch:x86_64"]);
+        let (_, linux) = listed("linux-arm", &["os:linux", "arch:aarch64"]);
+        (first, vec![mac1, mac2, win, linux])
+    }
+
+    #[test]
+    fn replicas_go_to_the_same_system_by_default() {
+        let (first, workers) = mixed();
+        assert_eq!(pick(&workers, first, 1, false).unwrap(), ["mac2"]);
+    }
+
+    #[test]
+    fn other_systems_are_refused_by_default_and_the_error_names_the_flag() {
+        let (first, workers) = mixed();
+        let err = pick(&workers, first, 2, false).unwrap_err();
+        assert!(err.contains("needs 2 other workers"), "{err}");
+        assert!(err.contains("only 1 connected worker(s)"), "{err}");
+        assert!(err.contains("macos/aarch64"), "{err}");
+        assert!(err.contains("--verify-any-system"), "{err}");
+    }
+
+    #[test]
+    fn any_system_allows_other_systems() {
+        let (first, workers) = mixed();
+        let mut picked = pick(&workers, first, 3, true).unwrap();
+        picked.sort();
+        assert_eq!(picked, ["linux-arm", "mac2", "win"]);
+        let err = pick(&workers, first, 4, true).unwrap_err();
+        assert!(!err.contains("--verify-any-system"), "{err}");
+    }
+
+    #[test]
+    fn a_first_worker_without_system_tags_falls_back_to_placement() {
+        let (first, old) = listed("old", &[]);
+        let (_, mac) = listed("mac", &["os:macos", "arch:aarch64"]);
+        let (_, win) = listed("win", &["os:windows", "arch:x86_64"]);
+        let workers = [old, mac, win];
+        let mut picked = pick(&workers, first, 2, false).unwrap();
+        picked.sort();
+        assert_eq!(picked, ["mac", "win"]);
+        let err = pick(&workers, first, 3, false).unwrap_err();
+        assert!(!err.contains("--verify-any-system"), "{err}");
+        assert_eq!(
+            System::of_listed(&workers, first).missing(),
+            Some("operating system and CPU architecture (os: and arch: tags)")
+        );
+    }
+
+    #[test]
+    fn a_missing_tag_on_the_first_worker_is_not_compared() {
+        let (first, arch_only) = listed("arm-only", &["arch:aarch64"]);
+        let (_, mac) = listed("mac", &["os:macos", "arch:aarch64"]);
+        let (_, linux) = listed("linux-arm", &["os:linux", "arch:aarch64"]);
+        let (_, win) = listed("win", &["os:windows", "arch:x86_64"]);
+        let (_, untagged) = listed("untagged", &[]);
+        let workers = [arch_only, mac, linux, win, untagged];
+        let mut picked = pick(&workers, first, 2, false).unwrap();
+        picked.sort();
+        assert_eq!(picked, ["linux-arm", "mac"]);
+        let err = pick(&workers, first, 3, false).unwrap_err();
+        assert!(err.contains("only workers on aarch64"), "{err}");
+        assert_eq!(
+            System::of_listed(&workers, first).missing(),
+            Some("operating system (os: tag)")
+        );
+    }
+
+    #[test]
+    fn the_report_names_the_systems() {
+        let mut runs = [run("a", &[("o", b"1")]), run("b", &[("o", b"1")])];
+        let mac = System {
+            os: Some("macos".into()),
+            arch: Some("aarch64".into()),
+        };
+        runs[0].worker.system = mac.clone();
+        runs[1].worker.system = mac;
+        let report = compare(&runs, None).unwrap();
+        assert!(
+            report.text().ends_with("(a, b, all macos/aarch64)"),
+            "{}",
+            report.text()
+        );
+        assert_eq!(report.to_json()["workers"][1]["os"], "macos");
+        runs[1].worker.system = System {
+            os: Some("windows".into()),
+            arch: Some("x86_64".into()),
+        };
+        let report = compare(&runs, None).unwrap();
+        assert!(
+            report
+                .text()
+                .ends_with("(a on macos/aarch64, b on windows/x86_64)"),
+            "{}",
+            report.text()
+        );
+        // Workers that report no system are listed by name only.
+        let plain = [run("a", &[("o", b"1")]), run("b", &[("o", b"1")])];
+        assert!(compare(&plain, None).unwrap().text().ends_with("(a, b)"));
     }
 }

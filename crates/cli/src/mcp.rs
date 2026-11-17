@@ -659,11 +659,15 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "verify": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Implies wait. After the task completes, run it again on this many other matching workers and compare the declared outputs by BLAKE3 (reply field 'verify': status verified|mismatch, workers, differing files; a mismatch is an error result). Needs 'outputs' or 'verify_file'; not with 'worker'. Only for deterministic tasks"
+                        "description": "Implies wait. After the task completes, run it again on this many other matching workers with the same operating system and CPU architecture as the first run (see 'verify_any_system') and compare the declared outputs by BLAKE3 (reply field 'verify': status verified|mismatch, workers with their os and arch, differing files; a mismatch is an error result). Needs 'outputs' or 'verify_file'; not with 'worker'. Only for deterministic tasks"
                     },
                     "verify_file": {
                         "type": "string",
                         "description": "With 'verify': compare only this sandbox file (e.g. checksums.sha256) byte for byte instead of every declared output"
+                    },
+                    "verify_any_system": {
+                        "type": "boolean",
+                        "description": "With 'verify': let the replicas run on matching workers with another operating system or CPU architecture than the first run (default false: the same deterministic program can give different results on two systems)"
                     },
                     "output_dir": {
                         "type": "string",
@@ -1092,8 +1096,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             check_opt_str(obj, "output_dir")?;
             check_opt_u64(obj, "max_output_bytes")?;
-            check_opt_u64(obj, "verify")?;
-            check_opt_str(obj, "verify_file")?;
+            VerifyArgs::check(obj)?;
             Ok(())
         }
         "task_result" => {
@@ -1983,7 +1986,7 @@ async fn format_completed_task_result(
 
 use submit_support::{
     attach_verify, attach_workspace_summary, check_matching_worker_warning, verify_completed,
-    WorkspaceSubmitMeta,
+    VerifyArgs, WorkspaceSubmitMeta,
 };
 
 async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) -> ToolCallResult {
@@ -1992,12 +1995,9 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         .and_then(Value::as_str)
         .unwrap_or("command")
         .to_lowercase();
-    let verify = args
-        .get("verify")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-    let verify_file = args.get("verify_file").and_then(Value::as_str);
-    let wait = verify.is_some() || args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+    let verify = VerifyArgs::parse(args);
+    let wait =
+        verify.replicas.is_some() || args.get("wait").and_then(Value::as_bool).unwrap_or(false);
 
     // Environment variables
     let mut env_map = HashMap::new();
@@ -2288,14 +2288,14 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         }
     }
 
-    if let Some(replicas) = verify {
+    if let Some(replicas) = verify.replicas {
         let pinned = placement.worker.is_some();
         if let Err(e) =
-            crate::verify::check_options(replicas, verify_file, !output_globs.is_empty(), pinned)
+            crate::verify::check_options(replicas, verify.file, !output_globs.is_empty(), pinned)
         {
             return ToolCallResult::error(e);
         }
-        if let Some(f) = verify_file.filter(|f| !output_globs.iter().any(|g| g == f)) {
+        if let Some(f) = verify.file.filter(|f| !output_globs.iter().any(|g| g == f)) {
             output_globs.push(f.to_string());
         }
     }
@@ -2379,7 +2379,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         task = task.with_output_globs(output_globs);
     }
     let task_id = task.id;
-    let verify_template = verify.map(|_| task.clone());
+    let verify_template = verify.replicas.map(|_| task.clone());
     *ctx.submitted_task_id.lock().await = Some(task_id);
 
     if ctx.is_cancelled() {
@@ -2569,10 +2569,10 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                     format!("Task {task_id} completed"),
                 );
                 let worker_id = result.worker_id;
-                let verify_outcome = match (verify, &verify_template) {
-                    (Some(n), Some(tpl)) if result.is_success() => Some(
-                        verify_completed(state, tpl, &placement, &result, n, verify_file).await,
-                    ),
+                let verify_outcome = match (verify.replicas, &verify_template) {
+                    (Some(n), Some(tpl)) if result.is_success() => {
+                        Some(verify_completed(state, tpl, &placement, &result, n, verify).await)
+                    }
                     _ => None,
                 };
                 let res = format_completed_task_result(state, &result, args, warning).await;
@@ -3996,6 +3996,27 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_tool_arguments("submit", &json!({"type": "gpu"})).is_ok());
+
+        // `verify` options: `verify_any_system` is a boolean (design 0089 D6).
+        let verify = |extra: Value| {
+            let mut args = json!({"command": "echo", "verify": 1, "outputs": ["o.txt"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            validate_tool_arguments("submit", &args)
+        };
+        assert!(verify(json!({})).is_ok());
+        assert!(verify(json!({"verify_any_system": true})).is_ok());
+        assert!(verify(json!({"verify_any_system": "yes"}))
+            .unwrap_err()
+            .contains("'verify_any_system' must be a boolean"));
+        assert!(verify(json!({"verify": "two"})).is_err());
+        let schema = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["verify_any_system"]["type"], "boolean");
 
         // Workspace validation in submit and workspaces tool
         assert!(validate_tool_arguments("workspaces", &json!({})).is_ok());

@@ -872,6 +872,13 @@ pub struct SubmitArgs {
     pub verify_file: Option<String>,
 
     #[arg(
+        long = "verify-any-system",
+        requires = "verify",
+        help = crate::verify::VERIFY_ANY_SYSTEM_HELP
+    )]
+    pub verify_any_system: bool,
+
+    #[arg(
         long = "output-dir",
         value_name = "DIR",
         help = "Local directory the output files are written to, at their sandbox paths (default: current directory)"
