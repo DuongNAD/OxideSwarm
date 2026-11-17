@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `windows\oxctl.ps1 stop` (and `stop_worker.cmd`, `switch_role.cmd`, and `start_master.cmd` before a restart) first sends the tracked master or worker a console Ctrl+C, waits up to 15 s, and only then uses `taskkill /F /T`, so a master with `--state-dir` compacts its journal and the next protocol version accepts it; it prints which way each process stopped (`BUG-23`, [design 0086](docs/design/0086-graceful-windows-stop.md)).
+
 ## [0.4.0] - 2026-11-17
 
 A minor release with one wire change under `0.x`: protocol version 10 adds an extension slot to tasks (`PROTO-3`) and, for the first time, a one-version compatibility window (`PROTO-4`), so a `0.4.0` master keeps serving `0.3.0` workers and clients while they are upgraded one at a time. It also adds `master --discovery-port` (`CLI-2`), a CI job that runs the newest release against each pull request (`PROTO-2`), the first fuzz targets (`LV-1`), and fixes for flaky tests (`TEST-27` to `TEST-40`).

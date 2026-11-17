@@ -115,9 +115,11 @@ log shows `Worker shutdown initiated; notifying Master ... reason=Graceful worke
 |---|---|---|---|---|
 | W1 | Ctrl+C helper and graceful `Stop-Tracked` | `windows/oxctl.ps1` | A master with `--state-dir` leaves a compacted journal after `stop` | Implemented |
 | W2 | Launcher test | `tests/test_launcher_scripts.py` | Clean and forced paths covered on Windows; fails on the previous script | Implemented |
-| W3 | Docs | `docs/BACKLOG.md`, `CHANGELOG.md`, `DEPLOYMENT.md` | BUG-23 Implemented; the Windows sentence of section 3.5 names the release | Planned |
+| W3 | Docs | `docs/BACKLOG.md`, `CHANGELOG.md`, `DEPLOYMENT.md` | BUG-23 Implemented; the Windows sentence of section 3.5 names the release | Implemented |
 
 ## Status log
 
 - 2026-11-17: Drafted and implemented with `BUG-23` (W1, W2). W3 waits until the 0.4.0 release
   pull request, which adds the BUG-23 entry and the section 3.5 sentence, is merged.
+- 2026-11-17: W3 done after the 0.4.0 release merged (`6eb5cb0`): BUG-23 Implemented with pull request
+  282, a CHANGELOG `[Unreleased]` line, and the Windows sentence of `DEPLOYMENT.md` section 3.5.
