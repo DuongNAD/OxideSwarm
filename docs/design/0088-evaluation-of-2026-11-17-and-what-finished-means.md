@@ -1,13 +1,13 @@
 # 0088: Evaluation of 2026-11-17 and what finished means
 
-Status: Draft (plan; builds nothing; Q82 and Q83 are open)
+Status: Accepted (plan; builds nothing; the owner decided Q82 and Q83 on 2026-11-17)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
 
 This record scores the project on ten criteria at `master` `16b2a38`, after release `0.4.0`. It
-then states one exit check per criterion. Together the ten checks are a proposal for what
-"finished" means for the purpose of Q1 in [ROADMAP.md](../ROADMAP.md). Most of the work that
+then states one exit check per criterion. Together the ten checks are what "finished" means for
+the purpose of Q1 in [ROADMAP.md](../ROADMAP.md) (Q82, decided on 2026-11-17). Most of the work that
 reaches them already has an item. Three new items are proposed, and nine items that exist only in
 other design records are named for the backlog. Eight of the ten checks need a step that only the
 owner can take. Nothing in the product changes in this record.
@@ -70,7 +70,8 @@ The 60 runs cover 2026-11-15 to 2026-11-17 at 09:45 UTC.
 
 ## Non-goals
 
-- This record adds no row to the BACKLOG Index. Items enter the backlog when the owner accepts Q82.
+- This record adds no row to the BACKLOG Index. The owner accepted Q82 on 2026-11-17, so the
+  items of D4 enter the backlog in a change of their own, each with files and a check.
 - It reopens no decision the owner has taken, and it moves no phase of the roadmap.
 - It is not a second roadmap ([ROADMAP.md](../ROADMAP.md) stays the only one, DOC-10). It orders
   only the items inside the stop line of D1.
@@ -104,7 +105,7 @@ failover is SCALE-4.
 | # | Criterion | Exit check | Items | Next step is held by |
 |---|---|---|---|---|
 | E1 | Architecture and design | Holds today. Kept by the rules that exist: a design record per change, and the wire layout tests (`crates/core/src/wire_layout_tests.rs`) | None | Nobody |
-| E2 | Documentation | `docs/BACKLOG.md` shows the open items inside the stop line first, and the text of Implemented items is in an archive file. No decision that an item inside the stop line needs is open | DOC-11 (new) | Agents, then the owner (Q82) |
+| E2 | Documentation | `docs/BACKLOG.md` shows the open items inside the stop line first, and the text of Implemented items is in an archive file. No decision that an item inside the stop line needs is open | DOC-11 (new) | Agents, then the owner (the decisions that those items need, such as Q57 and Q59) |
 | E3 | Tests and CI | The exit check of Q80 in the roadmap: every flaky test has an Implemented item with its loop of runs, TEST-24 and TEST-25 each have one dated record, and `master` has seven days of runs for pushes in which no test fails. In the same seven days no job is cancelled, or a record names what cancels them | TEST-23, TEST-29, TEST-32, TEST-41 to TEST-47, TEST-24, TEST-25, CI-1 (new) | Agents. The owner for TEST-24 and TEST-25 (Q57) |
 | E4 | Security | Every parser of untrusted bytes has a fuzz target in CI (measure M10 of [design 0058](0058-lasting-value.md)). Every `unsafe` site has a `SAFETY:` comment and the lint is a required check (M11). Release archives carry provenance that verifies (M12). `members revoke` closes every lane of a member (ENROLL-1c, [design 0051](0051-machine-identity-and-invites.md)). SEC-16 has a cause on record | LV-1, LV-4, LV-5, ENROLL-1c, SEC-16 | Agents. The owner for LV-5 and SEC-16 |
 | E5 | Releases and operations | One run across two real networks is recorded for the link report and for the USB kit | LINK-1, USB-1c ([design 0053](0053-usb-setup-kit.md)) | The owner (a second network) |
@@ -138,8 +139,8 @@ start now.
 7. LV-5, then LV-15 with a second person (E9), and the two-network run of E5.
 8. The second round of ADOPT-1 (E10).
 
-Release `0.5.0`, language model serving, is outside the stop line. Whether the items of step 5 may
-start before it ships is Q83.
+Release `0.5.0`, language model serving, is outside the stop line. The items of step 5 may start
+before it ships, as soon as the first round of ADOPT-1 is recorded (Q83, decided on 2026-11-17).
 
 ### D4 Work without an item
 
@@ -197,13 +198,17 @@ Each exit check of D2 names its own evidence: a record with a date, a file, or a
 | MAINT-2 | Bring the last three files under the size cap | `crates/worker/src/isolation.rs` (5,346 production lines), `crates/cli/src/mcp.rs` (3,692), `crates/cli/src/mode_cli.rs` (3,240), `scripts/rust-file-size-allowlist.txt` | The allowlist has no entry, `ox-mode test size` passes, and `crates/core/tests/data/wire_layout.txt` is unchanged | Planned |
 | DOC-11 | Make the backlog show open work first | `docs/BACKLOG.md`, a new archive file under `docs/` | The Index marks which open items are inside the stop line of D1. The text of every Implemented item is in the archive file, and each Index row still links to its text. Every relative link resolves (`ox-mode doc verify`) | Planned |
 
-## Open decisions
+## Decisions
 
-| ID | Question | Recommended |
+The owner decided both in chat on 2026-11-17, at the recommended default.
+
+| ID | Question | Decision |
 |---|---|---|
-| Q82 | Are the ten exit checks of D2 the meaning of "finished", so that the items of D4 enter the backlog and the work of D1 is not counted as open work for completion? | Yes |
-| Q83 | May AX-1 to AX-3 and CACHE-1 start as soon as the first round of ADOPT-1 is recorded, whether or not release `0.5.0` has shipped? | Yes. They serve the purpose of Q1, and no item of `0.5.0` is in the backlog yet. The release numbers follow what merges (design 0076, D1) |
+| Q82 | Are the ten exit checks of D2 the meaning of "finished", so that the items of D4 enter the backlog and the work of D1 is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17 |
+| Q83 | May AX-1 to AX-3 and CACHE-1 start as soon as the first round of ADOPT-1 is recorded, whether or not release `0.5.0` has shipped? | Yes, decided by the owner on 2026-11-17. They serve the purpose of Q1, and no item of `0.5.0` is in the backlog yet. The release numbers follow what merges (design 0076, D1) |
 
 ## Status log
 
 - 2026-11-17: Draft written from an evaluation of `master` `16b2a38`. No exit check beyond E1 holds.
+- 2026-11-17: The owner decided Q82 and Q83 at the recommended default. Status set to Accepted.
+  The items of D4 and the three new items are not in the BACKLOG Index yet.

@@ -6,7 +6,8 @@ design 0057) on 2026-11-10, and Q37 (the owner runs the study of first use of de
 Q40 (a trial comes before any build item of design 0061) and Q44 (model weights go into the
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12, and Q80 (a stability
-release before `0.5.0`) and Q81 (`0.6.0` carries bet A of design 0056) on 2026-11-17.
+release before `0.5.0`), Q81 (`0.6.0` carries bet A of design 0056), Q82 (the ten exit checks of
+design 0088 are what "finished" means) and Q83 (bet A may start before `0.5.0` ships) on 2026-11-17.
 Created: 2026-11-07    Updated: 2026-11-17
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -78,12 +79,12 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   cluster, is merged and waits for its tag. A stability release with no wire change follows it
   (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
   coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
-- What finished means (Draft, 2026-11-17): an evaluation on ten criteria, a stop line, and one exit
-  check per criterion. Scale out, the ecosystem, the open network, language models, the Android
+- What finished means (Accepted, 2026-11-17): an evaluation on ten criteria, a stop line, and one
+  exit check per criterion. The project is finished when the ten checks hold (Q82). Scale out, the ecosystem, the open network, language models, the Android
   app and 3D are outside the line. Eight of the ten checks wait for a step of the owner, and the
   first round of ADOPT-1 is the longest wait. The plan is in
-  [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md). Q82 and Q83 are
-  open.
+  [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md). The items of bet
+  A may start before release `0.5.0` ships (Q83).
 
 ## Where the project stands
 
@@ -216,7 +217,8 @@ purpose of Q1, design 0056 planned it as the first wave, and no release has ship
 for the first round of the study of first use (ADOPT-1, Q37), and no session has run. The texts of
 AX-1 to AX-3 are in design 0056, and they enter [BACKLOG.md](BACKLOG.md) with files and a check
 before work starts. A wire change that merges earlier still ships within 48 hours (design 0076,
-D1), so the number can move while the order stays.
+D1), so the number can move while the order stays. The items of bet A may start as soon as the
+first round of ADOPT-1 is recorded, whether or not `0.5.0` has shipped (Q83).
 
 ## Purpose
 
@@ -629,9 +631,7 @@ Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admi
 this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
 Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
 [design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
-[design 0083](design/0083-one-version-window.md). Q82 and Q83 are open in
-[design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) and join this table
-once the owner answers them.
+[design 0083](design/0083-one-version-window.md).
 
 | ID | Question | Decision |
 |---|---|---|
@@ -695,6 +695,8 @@ once the owner answers them.
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
+| Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are not in the backlog yet |
+| Q83 | May AX-1 to AX-3 and CACHE-1 start as soon as the first round of ADOPT-1 is recorded, whether or not release `0.5.0` has shipped? | Yes, decided by the owner on 2026-11-17. The release numbers follow what merges (design 0076, D1) |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -857,3 +859,6 @@ once the owner answers them.
   (Draft): an evaluation of `master` `16b2a38` on ten criteria, a stop line and ten exit checks as a
   proposal for what "finished" means. It proposes CI-1, MAINT-2 and DOC-11 and names nine items of
   designs 0056, 0058 and 0059 for the backlog. Q82 and Q83 are open. Nothing entered the backlog.
+- 2026-11-17: The owner decided Q82 and Q83 of design 0088 at the recommended default, and the
+  record is Accepted. The ten exit checks are what "finished" means, and the items of bet A may
+  start before release `0.5.0` ships. The items that design 0088 names are not in the backlog yet.
