@@ -20,7 +20,7 @@ use rusty_grid_core::task::{
     Bytes, BytesMut, CheckpointData, Task, TaskResult, TaskSpec, WorkspaceRef, WorkspaceSource,
 };
 
-use crate::sandbox::{sanitize_relative_path, set_permissions, Sandbox};
+use crate::sandbox::{sanitize_relative_path, set_permissions, Sandbox, SandboxError};
 use crate::workspace::WorkspaceError;
 
 #[cfg(feature = "3d")]
@@ -37,6 +37,25 @@ use super::supervise::{
 #[cfg(feature = "3d")]
 use super::EXIT_CODE_TIMEOUT;
 use super::{TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR};
+
+/// The refusal for a sandbox base that cannot be used: recognised by the master as a worker
+/// refusal (design 0090), instant and without output.
+pub(crate) fn base_refusal(
+    worker_id: uuid::Uuid,
+    task_id: rusty_grid_core::task::TaskId,
+    e: &SandboxError,
+) -> TaskResult {
+    let text = rusty_grid_core::sandbox_base_refusal(e);
+    TaskResult::failure(
+        worker_id,
+        task_id,
+        EXIT_CODE_GENERAL_ERROR,
+        "",
+        text.clone(),
+        0,
+        Some(text),
+    )
+}
 
 impl TaskRunner {
     /// Executes a `Command` or `ShellScript` task inside a persistent named workspace (`design 0039`).
@@ -374,6 +393,9 @@ impl TaskRunner {
 
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
+            Err(e) if e.is_create_refusal() => {
+                return base_refusal(self.worker_id, task.id, &e);
+            }
             Err(e) => {
                 return TaskResult::failure(
                     self.worker_id,
@@ -488,6 +510,9 @@ impl TaskRunner {
 
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
+            Err(e) if e.is_create_refusal() => {
+                return base_refusal(self.worker_id, task.id, &e);
+            }
             Err(e) => {
                 return TaskResult::failure(
                     self.worker_id,
@@ -640,6 +665,9 @@ impl TaskRunner {
 
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
+            Err(e) if e.is_create_refusal() => {
+                return base_refusal(self.worker_id, task.id, &e);
+            }
             Err(e) => {
                 return TaskResult::failure(
                     self.worker_id,
@@ -1061,6 +1089,9 @@ impl TaskRunner {
         // 3. Create isolated sandbox workspace
         let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
             Ok(s) => s,
+            Err(e) if e.is_create_refusal() => {
+                return base_refusal(self.worker_id, task.id, &e);
+            }
             Err(e) => {
                 return TaskResult::failure(
                     self.worker_id,

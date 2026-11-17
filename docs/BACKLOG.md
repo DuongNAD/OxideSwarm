@@ -206,11 +206,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented | 198 |
-| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Planned |  |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | 305 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
-| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Partial | 263 |
+| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
@@ -225,14 +225,14 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
-| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
+| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented | 304 |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
-| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
-| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
+| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
+| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -332,7 +332,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
-| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
+| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
@@ -949,6 +949,8 @@ The full suite must pass on a clean machine before CI can require it.
   tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
   takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
 
+- **Implemented (2026-11-17, pull request 305, [design 0091](design/0091-restart-recovery-races.md)), Partial:** On macOS, with eight copies of the tests in parallel and twenty busy loops, the unchanged code failed `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` 3 times in 192 runs ("the connection to the master ended"). The cause is not the shared sandbox base: when the connection ended during the upload of a finished task's outputs, the worker overwrote the buffered result with the failure of that upload, and the resume sent the failure. The worker now keeps the buffered result when the session ended (0 failures in 128 runs of the same two tests). Separately, a real race in the sandbox lock was found and fixed: `open_and_try_lock_task` could keep a lock on a lock file that a sweep had just unlinked, after which a second opener could lock a fresh file, so a sweep could remove the sandbox of a running task (`sandbox::tests::test_task_lock_taken_on_an_unlinked_file_is_not_kept` fails without the fix). That race was reproduced with a hook, not in the loops, so it is not shown to be the cause of the `out.txt` failure on Windows or of the one "sandbox gone" run seen in the lead. Looping the whole binary with the fix (48 runs, twelve busy loops) showed no `out.txt` or upload failure, only two 5-second `wait_for` timeouts in other steps under that load. TEST-23 stays open until the Windows job has passed 50 runs in a row; the Windows cause is still unknown.
+
 ### TEST-24: Test large transfers between machines
 
 - **Evidence:** Read, on 2026-11-14 at `master` `f486885`. The largest file in the end-to-end
@@ -1032,6 +1034,20 @@ The standard in `docs/README.md` requires "only what the code does". These items
   separate client with a 10 s deadline, the dead-peer NACK check has 30 s, and both latencies since
   the victim's removal are printed (at most about 8.7 ms under load). Step 1, 50 runs on
   `macos-latest`, is not done.
+- **Implemented (2026-11-17, pull request 303):** cause found, and it was a hub defect, not the
+  runner. The second failure (pull request 293, job `134020949727`) showed the healthy node answering
+  in 21 ms, so the hub was not stalled; the panic was on the flooder's own `send_command` ("channel
+  closed"). After the victim is removed, every 100 KiB message still in the flooder's socket gets a
+  NACK queued on the flooder's own outbound queue (8 messages in this test). The hub's read loop can
+  run through that backlog faster than its write pump drains the queue, the queue overflows, and the
+  hub kicks the flooder as a slow consumer although it reads its replies. Fix in
+  `crates/agent_mesh/src/hub.rs`: the connection loop waits for 2 free slots in the sender's own
+  queue before it handles a request frame (a peer that never drains is still dropped by the kick, a
+  closed writer or the idle timeout). New regression test
+  `test_burst_of_nacks_does_not_disconnect_a_healthy_sender` (60 messages to an unknown id with a
+  queue of 8) failed on the old code every time and passes now. Local loops of the old slow-consumer
+  test did not reproduce the CI failure (0 of 100 under 2 x CPU load before the fix), so the
+  regression test is the evidence; after the fix 0 of 100 under load and 0 of 50 plain fail.
 
 ### DOC-1: Correct false status claims
 
@@ -3106,6 +3122,19 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Measure the time that really passed before the check (or drive the reaper with a paused clock) and
   assert on that, as TEST-36 to TEST-38 did. If the reaper fired early, fix the reaper instead.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row under CPU starvation on Windows.
+- **Cause:** Confirmed on the owner's Windows desktop (1 core, 6 CPU spinners): the check meant for 100 ms
+  ran after the 200 ms timeout had really passed, and the reaper acted as designed. The old test also timed
+  from after the ack, later than the moment the master stamps the worker's last heartbeat, and bounded the
+  reap at 450 ms. The old test failed 22 of 100 runs there (all on that 450 ms bound; 3 of 100 on 2 cores with
+  4 spinners). The new version printed the boundary check running after the timeout in 71 of 200 runs, once
+  with the worker already Disconnected at `378.9 ms`, which is the failure of run `43944560507`; it saw the
+  reap at up to `1021 ms`.
+- **Status:** Implemented by pull request 302. Times are measured from just before the Register is sent, so
+  a correct reaper can never be seen Disconnected with less than the timeout elapsed: the boundary check
+  asserts "Connected, or the check came after the timeout" and the reap must be seen at or after the
+  timeout. The reap must be seen within 5 s (the configured 200 ms, not the 10 s default, and not never);
+  the time is printed. 200 of 200 runs passed in a row under 1 core and 6 spinners. Control: with the
+  reaper at a quarter of the timeout the test fails (3 of 3, Disconnected at about 110 ms).
 
 ### TEST-43: Show and fix the late dashboard port file of the in-process dev cluster test
 
@@ -3198,6 +3227,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Serialise the tests of the binary that touch the global worker (one lock shared by them, or one
   test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
 - **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
+- **Implemented (2026-11-17, pull request 300):** The cause is not another test's call. All tests of the
+  file already hold one `TEST_MUTEX`. `stop_worker_impl` returns while the worker still drains: it sets the
+  status `STOPPING` and a detached thread writes `STOPPED` after it has joined the worker thread. That late
+  write ran after the previous test released the lock, so it could land between this test's failing
+  `set_cluster_secret_impl` (which writes `ERROR: Invalid cluster secret: ...`) and its status read. The
+  tests now call `common::stop_and_settle()` (`crates/android_bridge/tests/common/mod.rs`), which stops the
+  worker and waits (30 s bound) until the status is no longer `STOPPING`; the four test files that read the
+  status use it. No change to the bridge, every assertion kept.
 
 ### TEST-49: Wait for the master by condition in the sched2 runtime test
 
@@ -3209,6 +3246,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Wait for the master's port file or for a successful connect with a bounded but generous limit
   (for example 30 s), as TEST-36 to TEST-38 did, and keep every assertion.
 - **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
+- **Implemented (2026-11-17, pull request 301):** Cause as in the Problem: both in-process masters of the
+  test (the JSON-codec master and the round-robin master) were waited for with `for _ in 0..50` connects,
+  20 ms apart, so one second to build the master's state and bind. Both waits now call
+  `wait_for_master_bind`, a helper in `runtime_tests.rs` that retries the connect every 20 ms for up to 30 s
+  and returns as soon as it succeeds. Every assertion is kept; no other fixed bind wait is left in the file.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -3312,6 +3354,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test removes (or makes unwritable) the base of one of two workers after it registered, submits
   tasks with `max_retries` above 0, and all complete on the other worker; `is_worker_rejection` has a unit test
   with the exact message.
+- **Implemented (2026-11-17, pull request 299):** The three refusals answer `Task rejected by worker: sandbox base
+  unusable: <reason>` (`rusty_grid_core::sandbox_base_refusal`), which the master already matches ("rejected by
+  worker") and now lists in full; no wire change, a 0.4.x master hands it back too. The assignment and input-fetch
+  re-checks repeat once after 250 ms; `Sandbox::create` refusals cover the base errors and I/O errors under the base.
+  The existing `avoid_workers` and `MAX_WORKER_REJECTIONS_PER_TASK` logic prevents a loop, so no new guard. Test:
+  `crates/master/tests/sandbox_base_hand_back.rs`; design 0090.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 

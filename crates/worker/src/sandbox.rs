@@ -695,6 +695,24 @@ pub enum SandboxError {
     },
 }
 
+impl SandboxError {
+    /// True when the failure is about the sandbox base itself (missing, not writable, not
+    /// private), which says nothing about the task: another worker may run it (design 0090).
+    pub fn is_base_failure(&self) -> bool {
+        matches!(
+            self,
+            SandboxError::BaseDirUnusable { .. } | SandboxError::BaseDirUnsafe { .. }
+        )
+    }
+
+    /// True when `Sandbox::create` failed in a way that is about the worker's base rather than the
+    /// task: the base refusals above, or an I/O error making the lock directory or the task
+    /// directory under it (a base whose parent is gone, a full or read-only disk).
+    pub fn is_create_refusal(&self) -> bool {
+        self.is_base_failure() || matches!(self, SandboxError::Io { .. })
+    }
+}
+
 /// Effective user id of the worker process.
 #[cfg(unix)]
 fn current_euid() -> u32 {
@@ -1306,6 +1324,16 @@ fn open_and_try_lock_task(
     base_dir: &Path,
     task_id: TaskId,
 ) -> std::io::Result<Option<(PathBuf, std::fs::File)>> {
+    open_and_try_lock_task_with(base_dir, task_id, &mut || {})
+}
+
+/// `open_and_try_lock_task` with a hook that runs after each open and before the lock attempt
+/// (the window of TEST-23; tests use it to play the other side of the race).
+fn open_and_try_lock_task_with(
+    base_dir: &Path,
+    task_id: TaskId,
+    after_open: &mut dyn FnMut(),
+) -> std::io::Result<Option<(PathBuf, std::fs::File)>> {
     let locks_dir = ensure_locks_dir(base_dir)?;
     let lock_path = locks_dir.join(format!("{task_id}.lock"));
 
@@ -1332,19 +1360,55 @@ fn open_and_try_lock_task(
         opts.custom_flags(0x0020_0000);
     }
 
-    let file = opts.open(&lock_path)?;
-    let file_meta = file.metadata()?;
-    if !is_real_owned_open_file(&file, &file_meta) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "opened sandbox lock descriptor is not a regular file owned by the current user",
-        ));
-    }
+    // A lock holder (the sweep of orphan locks, `Sandbox::destroy`) unlinks the lock file while it
+    // holds the lock. A second opener that opened the same file just before the unlink would then
+    // win the lock on a file that no longer has a name, and a later `try_lock` of the same task
+    // id would create a fresh file and also win: two owners. So after taking the lock the file
+    // must still be the one at `lock_path`; otherwise open again (TEST-23).
+    loop {
+        let file = opts.open(&lock_path)?;
+        let file_meta = file.metadata()?;
+        if !is_real_owned_open_file(&file, &file_meta) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "opened sandbox lock descriptor is not a regular file owned by the current user",
+            ));
+        }
 
-    match file.try_lock() {
-        Ok(()) => Ok(Some((lock_path, file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+        after_open();
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        if lock_file_is_still_named(&lock_path, &file, &file_meta) {
+            return Ok(Some((lock_path, file)));
+        }
+        drop(file);
+    }
+}
+
+/// True when `lock_path` still names the file that `file` (already locked) refers to.
+fn lock_file_is_still_named(
+    lock_path: &Path,
+    file: &std::fs::File,
+    file_meta: &std::fs::Metadata,
+) -> bool {
+    let _ = file;
+    let Ok(now) = std::fs::symlink_metadata(lock_path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        now.dev() == file_meta.dev() && now.ino() == file_meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: a file opened by the standard library can be unlinked while open; the path
+        // existing again as a regular file is the best identity available without extra APIs.
+        let _ = file_meta;
+        now.file_type().is_file()
     }
 }
 
@@ -1664,6 +1728,43 @@ pub(crate) fn try_create_test_symlink_file(original: &Path, link: &Path) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TEST-23, deterministic: the opener has the lock file open, a sweeper then takes the lock,
+    /// unlinks the file and lets go, and only now the opener tries to lock. It must not keep a
+    /// lock on the unnamed file: a later opener would create a new file, take that lock too, and
+    /// sweep the sandbox of a live task.
+    #[test]
+    fn test_task_lock_taken_on_an_unlinked_file_is_not_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+        SandboxConfig::new(&base_dir)
+            .ensure_private_root_blocking()
+            .unwrap();
+        let task_id = TaskId::new();
+
+        let mut raced = false;
+        let owner = open_and_try_lock_task_with(&base_dir, task_id, &mut || {
+            if !raced {
+                raced = true;
+                let (sweeper_path, sweeper_file) = open_and_try_lock_task(&base_dir, task_id)
+                    .unwrap()
+                    .expect("the sweeper takes the lock first");
+                std::fs::remove_file(&sweeper_path).unwrap();
+                drop(sweeper_file);
+            }
+        })
+        .unwrap()
+        .expect("the opener gets the lock");
+
+        assert!(owner.0.exists(), "the owner's lock file must have a name");
+        assert!(
+            open_and_try_lock_task(&base_dir, task_id)
+                .unwrap()
+                .is_none(),
+            "a second opener must see the lock as held"
+        );
+        drop(owner);
+    }
 
     #[tokio::test]
     async fn test_sandbox_creation_and_permissions() {

@@ -85,52 +85,63 @@ async fn test_reaper_accuracy_silent_worker_boundary_timing() {
         protocol_version: PROTOCOL_VERSION_CURRENT,
         features: ProtocolCapabilities::all_supported(),
     };
+    // TEST-42: every time below is measured from just before the Register is sent. The master
+    // stamps the worker's last heartbeat when it handles that Register, so no earlier, and a
+    // correct reaper never marks it Disconnected before `sent_at + timeout`. Seeing Disconnected
+    // with less than `timeout` elapsed (measured after the read) therefore proves an early reap,
+    // and no amount of load can make that check fail on a correct reaper. The old version timed
+    // from after the ack and checked "still Connected" at a nominal 100 ms, which a starved runner
+    // reached only after the timeout had really passed.
+    let sent_at = Instant::now();
     transport.send_msg(&reg_msg).await.expect("send register");
     let _ack: MasterMessage = transport.recv_msg().await.expect("recv").expect("ack");
 
-    let reg_time = Instant::now();
-
-    // 1. Boundary check: At t = 100ms (< 200ms timeout), worker MUST still be Connected!
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 1. Boundary check, half way into the timeout: still Connected, unless the check itself
+    //    came after the timeout (then it proves nothing, and step 2 decides).
+    tokio::time::sleep(timeout / 2).await;
     let info_mid = registry.get_worker(worker_id).await.expect("worker exists");
-    assert_eq!(
-        info_mid.status,
-        WorkerStatus::Connected,
-        "Reaper must NOT reap worker before timeout (at 100ms < 200ms)"
+    let mid_elapsed = sent_at.elapsed();
+    assert!(
+        info_mid.status == WorkerStatus::Connected || mid_elapsed >= timeout,
+        "Reaper must NOT reap worker before timeout: status {:?} {mid_elapsed:?} after the \
+         Register was sent, timeout {timeout:?}",
+        info_mid.status
     );
+    if mid_elapsed >= timeout {
+        println!(
+            "[REAPER TIMING] boundary check ran {mid_elapsed:?} after the Register (timeout \
+             {timeout:?}); status {:?}, not conclusive",
+            info_mid.status
+        );
+    }
 
-    // 2. Poll until reaped, recording detection time
-    let mut reaped_time: Option<Instant> = None;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // 2. Poll until reaped. The deadline only separates "reaps after the configured 200 ms" from
+    //    "never reaps" or "reaps after the 10 s default"; how late a starved runner sees it is
+    //    printed, not asserted.
+    let deadline = Duration::from_secs(5);
+    let mut elapsed_at_reap: Option<Duration> = None;
+    while sent_at.elapsed() < deadline {
         if let Some(info) = registry.get_worker(worker_id).await {
             if info.status == WorkerStatus::Disconnected {
-                reaped_time = Some(Instant::now());
+                elapsed_at_reap = Some(sent_at.elapsed());
                 break;
             }
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-
-    let detected_at = reaped_time.expect("Reaper must mark silent worker as Disconnected");
-    let elapsed = detected_at.duration_since(reg_time);
+    let elapsed = elapsed_at_reap.unwrap_or_else(|| {
+        panic!("Reaper must mark silent worker as Disconnected within {deadline:?} (timeout {timeout:?})")
+    });
 
     println!(
-        "[REAPER TIMING] Configured timeout: {:?}, Actual elapsed to Disconnected: {:?}",
+        "[REAPER TIMING] Configured timeout: {:?}, Disconnected seen {:?} after the Register was sent",
         timeout, elapsed
     );
 
-    // Accuracy validation:
-    // Reaper must trigger strictly after timeout (>= 200ms)
-    // and reasonably close to timeout + scan_interval (< 450ms including CI/scheduling slack)
+    // Accuracy validation: the reaper triggers strictly after the timeout.
     assert!(
         elapsed >= timeout,
         "Reaper marked worker Disconnected too early: elapsed={:?}, timeout={:?}",
-        elapsed,
-        timeout
-    );
-    assert!(
-        elapsed < timeout + Duration::from_millis(250),
-        "Reaper took too long to detect dead worker: elapsed={:?}, timeout={:?}",
         elapsed,
         timeout
     );

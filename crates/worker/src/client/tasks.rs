@@ -49,6 +49,23 @@ pub fn compute_effective_resume_grace(
 /// Maximum total bytes of task results buffered in the session-resume outbox (design 0046 D4).
 pub const MAX_RESUME_OUTBOX_BYTES: usize = 32 * 1024 * 1024;
 
+/// Pause before the one repeat of a failed sandbox base re-check: a base that is being removed
+/// (seen on Windows) is usually back, re-created by the re-check itself, a moment later.
+const BASE_RECHECK_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// The per-task sandbox base re-check, repeated once after a short pause when it fails.
+async fn recheck_base_once_more(
+    config: &crate::sandbox::SandboxConfig,
+) -> Result<(), crate::sandbox::SandboxError> {
+    match config.ensure_private_root_recheck().await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            tokio::time::sleep(BASE_RECHECK_RETRY_DELAY).await;
+            config.ensure_private_root_recheck().await
+        }
+    }
+}
+
 fn buffered_result_bytes(result: &TaskResult) -> usize {
     256usize
         .saturating_add(result.stdout.0.len())
@@ -513,23 +530,10 @@ impl WorkerClient {
         if !skip_sandbox_touch {
             // Nothing may touch the sandbox base (the reclaim below, the blob cache, the sandbox
             // itself) while another local user could have replaced its private root (design 0021).
-            if let Err(e) = self
-                .runner
-                .config()
-                .sandbox_config
-                .ensure_private_root_recheck()
-                .await
-            {
-                warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not safe");
-                let result = TaskResult::failure(
-                    worker_id,
-                    task_id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    "",
-                    e.to_string(),
-                    0,
-                    Some(format!("Sandbox base: {e}")),
-                );
+            if let Err(e) = recheck_base_once_more(&self.runner.config().sandbox_config).await {
+                warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not usable");
+                // A refusal the master hands to another worker (design 0090), not a task failure.
+                let result = crate::runner::base_refusal(worker_id, task_id, &e);
                 let _ = outbound_tx.send(WorkerMessage::from(result)).await;
                 return;
             }
@@ -642,19 +646,20 @@ impl WorkerClient {
                     .clone();
                 let fetch = async {
                     // Checked again: the task may have waited for a slot since it was assigned.
-                    runner
-                        .config()
-                        .sandbox_config
-                        .ensure_private_root_recheck()
+                    // A base that broke meanwhile is a refusal, not a failed input fetch.
+                    if let Err(e) = recheck_base_once_more(&runner.config().sandbox_config).await {
+                        return Err(Err(crate::runner::base_refusal(worker_id, task_id, &e)));
+                    }
+                    let cache = runner.ensure_blob_cache().await.map_err(Ok)?;
+                    fetch_task_inputs(&task, current_blob_client.as_deref(), &cache)
                         .await
-                        .map_err(|e| e.to_string())?;
-                    let cache = runner.ensure_blob_cache().await?;
-                    fetch_task_inputs(&task, current_blob_client.as_deref(), &cache).await
+                        .map_err(Ok)
                 };
                 let failure = tokio::select! {
                     fetched = fetch => match fetched {
                         Ok(pin) => Ok(pin),
-                        Err(e) => Err(TaskResult::failure(
+                        Err(Err(refusal)) => Err(refusal),
+                        Err(Ok(e)) => Err(TaskResult::failure(
                             worker_id,
                             task_id,
                             EXIT_CODE_GENERAL_ERROR,
@@ -807,7 +812,14 @@ impl WorkerClient {
                             result.error = Some(e);
                         }
                     }
-                    if resume_enabled && cancelled_reason.is_none() {
+                    // A session that ended while the upload ran made it fail only because the
+                    // connection went away: the buffered result still holds the outputs, and the
+                    // resume uploads them. Overwriting it with this failure would hand the client
+                    // a failed task for a task that ran fine (TEST-23).
+                    let session_ended = current_blob_client
+                        .as_ref()
+                        .is_some_and(|client| client.is_closed());
+                    if resume_enabled && cancelled_reason.is_none() && !session_ended {
                         buffered_token = pending_resume_outbox
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
