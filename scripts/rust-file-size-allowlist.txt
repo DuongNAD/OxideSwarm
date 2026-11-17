@@ -10,6 +10,6 @@
 #   - a listed file that shrank only gets a warning: lower its maximum, or delete the entry
 #     once the file is at or below 3,000 lines. Never raise a number or add an entry.
 
-crates/worker/src/isolation.rs 5377
+crates/worker/src/isolation.rs 5346
 crates/cli/src/mcp.rs 3692
 crates/cli/src/mode_cli.rs 3240

@@ -273,7 +273,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 
 ### 3.5 Upgrading a running grid (master and workers)
 `Task`, `TaskResult`, and message frames are encoded positionally with bincode. Workers, clients, and the master
-exchange `PROTOCOL_VERSION_CURRENT` (version 10 on `master`, 9 in release `0.3.0`). **A master accepts one version back**
+exchange `PROTOCOL_VERSION_CURRENT` (version 10 in release `0.4.0`, 9 in `0.3.0`). **A master accepts one version back**
 (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT - 1`, the window of `docs/design/0083-one-version-window.md`):
 a `0.4.0` (protocol 10) master serves `0.3.0` (protocol 9) workers and clients, which keep working unchanged while you
 upgrade them one at a time; a task copy sent to a protocol 9 worker has no extension lists (an extension a worker must
@@ -295,12 +295,16 @@ submission, whereas a newer worker pointed at an un-upgraded v2 master registers
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
 When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
-or `SIGTERM`) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+or `SIGTERM`; on Windows Ctrl+C in its console, because `windows/oxctl.ps1 stop` uses `taskkill /F`, BUG-23) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk
 format: moving from `0.3.0` to `0.4.0` still needs the clean stop. **Rolling back** a master after it ran as `0.4.0`
 needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open.
+Keep `--state-dir` on a file system with permissions (NTFS, APFS, ext4): on Windows a master whose state directory
+is on exFAT starts once and then refuses its own `members.json` (BUG-24). During the window, pin a task to an old or
+a new worker with an operator tag (`--tag` on the worker, `--require-tag` on `submit`) or with `--worker`:
+`--require-tag proto:9` is refused because `proto:` is a reserved prefix.
 Starting in protocol version 8 (`ENROLL-1a` / `ENROLL-1b`, `docs/design/0051-machine-identity-and-invites.md`), the
 master also writes `master_noise.key` and `members.json` under `--state-dir` (or `~/.oxideswarm/` when `--state-dir` is
 not set, once the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run)

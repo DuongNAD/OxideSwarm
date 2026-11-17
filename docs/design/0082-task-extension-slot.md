@@ -1,6 +1,6 @@
 # 0082: An extension slot for optional task fields
 
-Status: Implemented (PROTO-3 of design 0076 D3; draft pull request 272, which merges together with PROTO-4)
+Status: Implemented (PROTO-3 of design 0076 D3; pull request 272, merged on 2026-11-17 together with PROTO-4)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
