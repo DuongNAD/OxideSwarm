@@ -334,7 +334,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
-| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR TBD) |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Planned | (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | (design 0059) |
@@ -3379,7 +3379,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   twelve runs as cancelled by an account and six as holding a job that was never acquired. The
   two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
 
-- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (TBD); step 2 stays with the
+- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
   coordinator (no code).
   - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
   - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
