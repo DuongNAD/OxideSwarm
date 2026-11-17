@@ -227,7 +227,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
-| TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
+| TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented | 304 |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
@@ -3160,6 +3160,20 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Assert what design 0060 D2 decides (which worker ran each task, and that the slow worker was held
   back), and keep the timing as a printed measurement or as a much wider bound, as TEST-36 to TEST-38 did.
 - **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
+- **Status:** Implemented by pull request 304. The test, renamed
+  `sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_old_timing`, asserts placement:
+  every task of the measured batch runs on one of the two workers, and a task that ran on the slow worker
+  finished no earlier than twice the slow task time after the batch started (the wait cap of D2 step 5, at
+  least the slow worker's measured average, plus the task's own run). The slow worker now sleeps 10x instead
+  of 5x: D2 holds a task for a full fast worker while the slow average is at least `1.5 * (ready + fast
+  average)`, at worst three fast averages, and with 5x a run on 2 cores next to 4 spinning processes let D2
+  send a task to the slow worker at once (run 125 of the first loop: a slow task finished `1.31 s` after the
+  batch started). With 10x the fast tasks must stretch by 770 ms for that. With `speed_hold_factor = 0` the slow
+  worker must still get at least 4 tasks and the batch must last at least one slow task. Both batch times and
+  their ratios to the fast worker's own time are printed, not asserted. On the owner's Windows desktop, 2 cores
+  next to 4 spinning processes: 200 of 200 runs in a row passed (the D2 ratio reached `2.61x`, above the old
+  `1.5x` cap in 5 runs). Control: with D2 turned off for the measured batch the assertion fails (2 of 2).
+  Not run on Linux here.
 
 ### TEST-45: Keep the second worker of the reaper failover stress test alive
 
