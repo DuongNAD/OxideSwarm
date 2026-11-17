@@ -78,6 +78,12 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   cluster, is merged and waits for its tag. A stability release with no wire change follows it
   (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
   coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
+- What finished means (Draft, 2026-11-17): an evaluation on ten criteria, a stop line, and one exit
+  check per criterion. Scale out, the ecosystem, the open network, language models, the Android
+  app and 3D are outside the line. Eight of the ten checks wait for a step of the owner, and the
+  first round of ADOPT-1 is the longest wait. The plan is in
+  [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md). Q82 and Q83 are
+  open.
 
 ## Where the project stands
 
@@ -623,7 +629,9 @@ Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admi
 this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
 Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
 [design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
-[design 0083](design/0083-one-version-window.md).
+[design 0083](design/0083-one-version-window.md). Q82 and Q83 are open in
+[design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) and join this table
+once the owner answers them.
 
 | ID | Question | Decision |
 |---|---|---|
@@ -845,3 +853,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
   "Stability". `0.6.0` carries bet A of design 0056, after the first round of ADOPT-1. The row of
   `0.4.0` now says that the owner agreed to its tag once pull request 280 is merged. Nothing entered
   the backlog.
+- 2026-11-17: [Design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) added
+  (Draft): an evaluation of `master` `16b2a38` on ten criteria, a stop line and ten exit checks as a
+  proposal for what "finished" means. It proposes CI-1, MAINT-2 and DOC-11 and names nine items of
+  designs 0056, 0058 and 0059 for the backlog. Q82 and Q83 are open. Nothing entered the backlog.
