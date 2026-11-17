@@ -711,6 +711,12 @@ async fn test_stress_high_volume_worker_churn() {
         task_ids.push(master.submit_task(task).await.unwrap());
     }
 
+    // TEST-33: a retired worker keeps its sandbox base (its `TempDir`) until the end of the test.
+    // Dropping the `ManagedWorker` right after `abort()` / `graceful_disconnect()` deleted the
+    // directory while the worker could still be given a task, which then failed for good with
+    // "The sandbox base directory ... is not writable".
+    let mut retired: Vec<ManagedWorker> = Vec::new();
+
     // Churn workers actively while tasks are being processed
     for churn_step in 0..8 {
         tokio::time::sleep(Duration::from_millis(180)).await;
@@ -722,6 +728,7 @@ async fn test_stress_high_volume_worker_churn() {
             } else {
                 victim.abort();
             }
+            retired.push(victim);
         }
 
         // Spawn a new replacement worker

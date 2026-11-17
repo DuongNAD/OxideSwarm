@@ -209,7 +209,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
-| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Partial | 286 |
+| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
@@ -323,6 +323,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
+| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
@@ -2916,6 +2917,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   is not `Completed` with its state, counts, worker and error. The changed test passed 50 runs on 1 core with 6
   spinners and 50 without load. On 1 core two other tests of the file failed: `test_stress_reaper_detection_and_failover`
   (2 of 20, line 1151) and `test_stress_immediate_failover_latency_under_load` (1 of 20, `129.9476ms` against `<100ms`).
+- **Implemented (2026-11-17, pull request 289):** cause found in CI (pull request 288, run `44044328538`, job
+  `133906405213`, windows-latest, with the diagnostics of pull request 286): one of the 30 tasks was `Failed` with
+  `retries=1 failovers=1 evacuations=1` and `error: Sandbox base: The sandbox base directory '...\.tmpZk4loM' is
+  not writable: The system cannot find the file specified. (os error 2)`. The churn loop dropped each retired
+  `ManagedWorker` right after `graceful_disconnect()` or `abort()`, and a `ManagedWorker` owns the `TempDir` that is
+  the worker's `--sandbox-base-dir`; the directory was deleted while the worker could still be given a task, the
+  worker refused it (`client/tasks.rs`, `ensure_private_root_recheck`), and the master, which retries only the
+  refusals it recognises (see BUG-25), failed the task for good although `with_max_retries(10)`. The test now
+  keeps every retired worker in a `retired` list until the end, so no sandbox base disappears under a worker
+  that is still alive; every assertion is unchanged. The other tests of the file keep their workers in a vector
+  until the end and need no change. Loop: 50 runs of the exact test on macOS, 25 without load and 25 with four `yes` CPU burners, all passed, then the whole binary once (6 passed). The Windows 50-run loop of "Done when" is not run (the failure was seen only on windows-latest). This was a defect of the test; the product side (a worker
+  with an unusable base fails the task terminally instead of handing it back) is BUG-25.
 
 ### TEST-34: Show and fix the Agent Mesh simulation Suite 2 failure on macOS
 
@@ -3195,6 +3208,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `master_noise.key`, the P2P key, the task store directory) use the same text on such a volume instead of the
   `icacls` hint. Recorded run: exFAT refused at the first start with nothing created, an exFAT state directory
   written by 0.4.0 refused and unchanged, NTFS start, stop and start as before. macOS and Linux are not covered.
+
+### BUG-25: Hand a task back to the master when the worker's sandbox base is unusable at assignment
+
+- **Evidence:** Found while closing TEST-33 (pull request 288, run `44044328538`): a task with
+  `with_max_retries(10)` ended `Failed` after one failover with `error: Sandbox base: The sandbox base
+  directory '...' is not writable: ... (os error 2)`. A worker that cannot use its sandbox base at assignment
+  answers with a failed `TaskResult` (`crates/worker/src/client/tasks.rs`, around line 520: `ensure_private_root_recheck`
+  fails, `TaskResult::failure(.., exit code 1, "Sandbox base: {e}")`, run time 0). The master treats a result as
+  "the worker refused the task" only when its text holds one of the markers of `WORKER_REJECTION_MARKERS`
+  (`crates/master/src/queue.rs`: "rejected by worker", "exceed worker capabilities", "capabilities insufficient",
+  "lacks gpu capability"; `is_worker_rejection`). The sandbox message has none, so it is an execution failure,
+  and `RetryPolicy::retry_on_execution_failure` is `false` by default (`queue.rs`, `queue/lifecycle.rs`), so the
+  task becomes `Failed` with retries left. The same holds for the input-fetch check before the blob cache
+  and for `Sandbox::create` failing on the base.
+- **Problem:** The task is lost although another worker could run it, and the worker keeps looking idle, so it
+  can absorb further tasks the same way (the situation `is_worker_rejection` was written for). Scope: the base
+  is checked at start-up (`WorkerClient::run`, `ensure_usable`), so this needs a base that breaks while the worker
+  runs. The default base (`<temp>/rusty_grid-<euid>/sandboxes`) is re-created on the next task (the per-task
+  re-check recreates the private root, and `Sandbox::create` and the lock directory use `create_dir_all`), so a
+  temp cleaner that removes it is survived on Unix; on Windows the same re-check recreates the base, yet the CI
+  run above saw `os error 2` while the directory was being deleted. An explicit `--sandbox-base-dir` is checked
+  the same way on Windows (any base) and, on Unix, re-created by `create_dir_all` but not re-checked for safety.
+  What is not recreated: a base whose parent is gone and cannot be re-created, a full or read-only disk, or
+  changed permissions. In those cases every assigned task fails for good.
+- **Do:** Make a `BaseDirUnusable` or `BaseDirUnsafe` refusal at assignment, at the input fetch and in
+  `Sandbox::create` a worker refusal: add a marker the master recognises (for example "rejected by worker:
+  sandbox base") to the failure text, or a typed flag, keeping `execution_time_ms == 0`. Consider retrying the
+  re-check once after a short delay, since the Windows case looked like a removal in progress.
+- **Done when:** A test removes (or makes unwritable) the base of one of two workers after it registered, submits
+  tasks with `max_retries` above 0, and all complete on the other worker; `is_worker_rejection` has a unit test
+  with the exact message.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
