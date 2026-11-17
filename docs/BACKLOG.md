@@ -3942,6 +3942,9 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: Pull requests 282 (BUG-23), 283 (TEST-29 Partial), 284 (BUG-24) and 286 (TEST-33 Partial) merged;
   TEST-47 added (Planned) for the handle-count test that failed in pull request 286. The Index counts are
   105 Implemented, 13 Partial and 47 Planned (165 items).
+- 2026-11-17: Release `0.4.1` prepared (no wire change; BUG-23, BUG-24, TEST-29 diagnostics, TEST-33 and
+  TEST-41): versions, CHANGELOG with an "Upgrading from 0.4.0" note, README install lines, DEPLOYMENT section
+  3.5 and the ROADMAP release table. The Index counts are unchanged.
 - 2026-11-17: Phase 13 added from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),
   after the owner accepted Q82: CI-1, MAINT-2, DOC-11, ADOPT-1 to ADOPT-4, AX-1 to AX-3, LV-4 and LV-15, all
   Planned. CI-1 records what the job annotations say about 2026-11-16: twelve runs for pushes on `master` were
