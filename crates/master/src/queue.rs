@@ -666,6 +666,9 @@ const WORKER_REJECTION_MARKERS: &[&str] = &[
     "exceed worker capabilities",
     "capabilities insufficient",
     "lacks gpu capability",
+    // `rusty_grid_core::SANDBOX_BASE_REFUSAL_PREFIX`, lower case (design 0090); it also holds
+    // "rejected by worker", which is what an older master matches.
+    "rejected by worker: sandbox base unusable",
 ];
 
 /// True when `result` is a worker refusing to run a task at all (critically low battery,
