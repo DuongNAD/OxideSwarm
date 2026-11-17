@@ -225,7 +225,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
-| TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
+| TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented | PRNUM |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
@@ -3117,6 +3117,19 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Print the in-process master's output when the wait fails, find which of the two happened, then fix
   the start-up or wait on the condition with a bounded but generous limit.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row on Linux.
+- **Cause:** The dashboard did not start late and was not missing: the test gave the master one port for both
+  listeners. It picked the grid port and then the dashboard port by binding `127.0.0.1:0` twice, closing each
+  listener at once, so the second bind could be handed the port the first had just released. The master took
+  that port for its grid listener, logged `Web UI port binding failed; continuing master RPC without Web UI
+  ... (os error 10048) addr=127.0.0.1:51840`, and never wrote the port file. Seen on the owner's Windows
+  desktop in 1 of 30 runs of the whole test binary (4 cores, 4 spinning processes), with the master's log that
+  this item added. `test_dev_cluster_never_sends_token_when_web_ui_port_is_held` picked its ports the same way.
+- **Status:** Implemented by pull request PRNUM. The two tests keep the first listener open while they pick the
+  second port (`two_free_ports` in `tests/workflow_modes_test.rs`). `launch_local_dev_cluster_with_ports`
+  refuses the same port for both at once, with a message, and a new test covers that. The master's stdout and
+  stderr go to `.dev_cluster.master.log` in the workspace (covered by `.dev_cluster.*` in `.gitignore`), and a
+  failed wait quotes its last 40 lines. The 8 s wait stays. The helpers moved to `crates/cli/src/mode_cli/dev_launch.rs`
+  so that `mode_cli.rs` shrank (allowlist 3240 to 3213 lines). LOOPRESULT
 
 ### TEST-44: Remove the 1.5x wall-clock cap from the speed-aware batch test
 

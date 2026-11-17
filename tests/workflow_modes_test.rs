@@ -870,15 +870,16 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
         .save_file(&isolated_secret_dir.join("cluster.secret"), true)
         .expect("save secret in isolated home");
 
-    let free_master_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master port");
-        l.local_addr().expect("local_addr").port()
-    };
-
     let web_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind held web_ui_port listener");
     let held_web_port = web_listener.local_addr().expect("local_addr").port();
     let _ = web_listener.set_nonblocking(true);
+
+    // Picked while `web_listener` is held, so it cannot be the same port (TEST-43).
+    let free_master_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master port");
+        l.local_addr().expect("local_addr").port()
+    };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
@@ -1000,16 +1001,21 @@ async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
     );
 }
 
+/// Two different free loopback ports (TEST-43). Both listeners stay open until both ports are known:
+/// a port picked and closed one line earlier can be handed out again by the next bind, and then the
+/// master took that one port for its grid listener and could not bind its dashboard on it.
+fn two_free_ports() -> (u16, u16) {
+    let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first ephemeral port");
+    let second = std::net::TcpListener::bind("127.0.0.1:0").expect("bind second ephemeral port");
+    (
+        first.local_addr().expect("local_addr").port(),
+        second.local_addr().expect("local_addr").port(),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling() {
-    let master_tcp_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master tcp port");
-        l.local_addr().expect("local_addr").port()
-    };
-    let web_ui_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral web ui port");
-        l.local_addr().expect("local_addr").port()
-    };
+    let (master_tcp_port, web_ui_port) = two_free_ports();
 
     let temp = tempfile::tempdir().expect("tempdir");
     let launch_res =
@@ -1182,6 +1188,27 @@ fn test_dev_cluster_cross_process_launch_then_stop_via_ox_mode_cli() {
             && !temp.path().join(".dev_cluster.json").exists(),
         "tracking files must be removed after cross-process ox-mode dev stop"
     );
+}
+
+#[tokio::test]
+async fn test_dev_cluster_refuses_one_port_for_master_and_dashboard() {
+    // TEST-43: one port for both used to start a master without a dashboard and fail after 8 s.
+    let (port, _) = two_free_ports();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let res = launch_local_dev_cluster_with_ports(temp.path(), port, port).await;
+    assert!(
+        !res.success,
+        "the same port for master and dashboard must be refused"
+    );
+    assert_eq!(res.exit_code, Some(1));
+    // The message comes from the check before any child is spawned, not from the 8 s wait.
+    assert!(
+        res.stderr.contains("must differ"),
+        "expected the port clash in the message, got: {}",
+        res.stderr
+    );
+    assert!(!temp.path().join(".dev_cluster.pids").exists());
+    assert!(!temp.path().join(".dev_cluster.json").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
