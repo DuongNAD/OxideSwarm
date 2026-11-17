@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - A worker whose sandbox base became unusable (missing, not writable, not private) refuses the task with `Task rejected by worker: sandbox base unusable: ...`, which the master hands to another worker without charging a retry, instead of failing the task for good; no wire change (`BUG-25`, [design 0090](docs/design/0090-sandbox-base-refusal-hand-back.md)).
 - The Android bridge tests wait until a stopped worker has finished draining (`common::stop_and_settle`) before the next test starts; the detached `STOPPED` write of the previous test could overwrite the `ERROR: Invalid cluster secret` status the next one had just caused (`TEST-48`).
+- `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` waits up to 30 s, by condition, for each of its two in-process masters to accept connections (was 50 tries 20 ms apart, one second) (`TEST-49`).
 
 ## [0.4.1] - 2026-11-17
 
