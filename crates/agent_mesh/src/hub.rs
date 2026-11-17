@@ -58,6 +58,10 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+/// Free slots in a connection's own outbound queue the hub waits for before it handles the next
+/// request frame, so the replies to that frame (at most an ACK plus a response) always fit.
+const REPLY_HEADROOM: usize = 2;
+
 /// Default cap on messages queued for one connection before it is considered a slow consumer.
 pub const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1024;
 /// Default cap on bytes queued for one connection (see `DEFAULT_MAX_MESSAGE_BYTES`: it must hold
@@ -1222,6 +1226,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>, peer: Option<Soc
 
                 match msg {
                     Message::Text(raw_text) => {
+                        // TEST-27: the hub answers a request on this socket's own outbound queue
+                        // (ACK, NACK, ...). A burst of requests must slow the sender down, not
+                        // overflow that queue and get a sender that reads its replies kicked as
+                        // a slow consumer: wait for room before handling the frame. A peer that
+                        // never drains is still dropped (kick, closed writer or idle timeout).
+                        let room = REPLY_HEADROOM.min(config.max_queued_messages.max(1));
+                        tokio::select! {
+                            biased;
+                            _ = kick.cancelled() => {
+                                warn!("Hub: disconnecting {} (outbound queue overflow)", conn.peer);
+                                break;
+                            }
+                            reserved = outbox.tx.reserve_many(room) => {
+                                if reserved.is_err() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(config.idle_timeout) => {
+                                warn!(
+                                    "Hub: disconnecting {} ({:?}): not draining its replies for {:?}",
+                                    conn.peer, conn.owned, config.idle_timeout
+                                );
+                                break;
+                            }
+                        }
                         if let Flow::Close { graceful: g } = conn.handle_text(raw_text.to_string()).await {
                             graceful = g;
                             break;
