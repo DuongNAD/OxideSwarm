@@ -210,7 +210,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
-| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Partial | 263 |
+| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
@@ -1032,6 +1032,20 @@ The standard in `docs/README.md` requires "only what the code does". These items
   separate client with a 10 s deadline, the dead-peer NACK check has 30 s, and both latencies since
   the victim's removal are printed (at most about 8.7 ms under load). Step 1, 50 runs on
   `macos-latest`, is not done.
+- **Implemented (2026-11-17, pull request 303):** cause found, and it was a hub defect, not the
+  runner. The second failure (pull request 293, job `134020949727`) showed the healthy node answering
+  in 21 ms, so the hub was not stalled; the panic was on the flooder's own `send_command` ("channel
+  closed"). After the victim is removed, every 100 KiB message still in the flooder's socket gets a
+  NACK queued on the flooder's own outbound queue (8 messages in this test). The hub's read loop can
+  run through that backlog faster than its write pump drains the queue, the queue overflows, and the
+  hub kicks the flooder as a slow consumer although it reads its replies. Fix in
+  `crates/agent_mesh/src/hub.rs`: the connection loop waits for 2 free slots in the sender's own
+  queue before it handles a request frame (a peer that never drains is still dropped by the kick, a
+  closed writer or the idle timeout). New regression test
+  `test_burst_of_nacks_does_not_disconnect_a_healthy_sender` (60 messages to an unknown id with a
+  queue of 8) failed on the old code every time and passes now. Local loops of the old slow-consumer
+  test did not reproduce the CI failure (0 of 100 under 2 x CPU load before the fix), so the
+  regression test is the evidence; after the fix 0 of 100 under load and 0 of 50 plain fail.
 
 ### DOC-1: Correct false status claims
 
