@@ -152,8 +152,8 @@ the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with it
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
 (TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 279 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39,
-TEST-40, BUG-23 and BUG-24 added): 158 items, 103 Implemented, 11 Partial and 44 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 281 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
+TEST-46, BUG-23 and BUG-24 added): 164 items, 103 Implemented, 11 Partial and 50 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -217,6 +217,12 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Planned |  |
+| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
+| TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
+| TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
+| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
+| TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -2993,6 +2999,81 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** Implemented by pull request 278. The old test did not fail locally (30 of 30 under load),
   so the fix rests on the cause seen in CI.
 
+### TEST-41: Find why a task finished during master shutdown can run twice
+
+- **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
+  (`tests/master_restart_recovery.rs:1001`) failed on `ubuntu-latest` on 2026-11-17, in pull request 282 at
+  `7a17104` (run `44018512676`, job `133822123752`): `RV158 P3: rounds=12 ran_twice=1`, then
+  `task ran twice in 1/12 rounds`. Round 0 (`delay_ms=0`) ran the task twice; rounds 1 to 11 ran it once.
+  Pull request 282 changes only `windows/oxctl.ps1`, a Python launcher test and docs.
+- **Problem:** The probe (review item H2 of pull request 158) states that a task which finishes as the master
+  shuts down keeps its result in the worker's `pending_resume_outbox` until the restarted master acknowledges
+  it, so the task runs exactly once. One round in twelve ran it twice. Either the hand-over has a window at
+  delay 0, or the probe counts a rerun the design allows. A command task that runs twice is visible to users.
+- **Do:** Run the probe in a loop, also under CPU starvation as for TEST-36 to TEST-38, and find which side
+  lost the result or dispatched the task again. Fix that cause. If the design allows a rerun in that window,
+  say so beside the probe and in the guarantee it tests, and change the assertion with that reason.
+- **Done when:** The cause is named here, and the probe passes 200 runs in a row on Linux and on Windows.
+
+### TEST-42: Make the reaper boundary test independent of scheduler delay
+
+- **Evidence:** `test_reaper_accuracy_silent_worker_boundary_timing` (`tests/m2_challenger_2_stress.rs:96`)
+  failed on `windows-latest` on 2026-11-16 (run `43944560507`, job `133570626681`):
+  `Reaper must NOT reap worker before timeout (at 100ms < 200ms)`, `left: Disconnected`, `right: Connected`.
+  The same job failed the port-file reader test that TEST-37 fixed. ROADMAP.md "Stability" lists it.
+- **Problem:** The test checks the worker 100 ms into a 200 ms timeout. A likely cause, not verified: on a
+  starved runner more than 200 ms passed before the check, so the reaper acted as designed.
+- **Do:** Measure the time that really passed before the check (or drive the reaper with a paused clock) and
+  assert on that, as TEST-36 to TEST-38 did. If the reaper fired early, fix the reaper instead.
+- **Done when:** The cause is named here, and the test passes 200 runs in a row under CPU starvation on Windows.
+
+### TEST-43: Show and fix the late dashboard port file of the in-process dev cluster test
+
+- **Evidence:** `test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling`
+  (`tests/workflow_modes_test.rs:1017`) failed on `ubuntu-latest` on 2026-11-16 (run `43952618376`, job
+  `133598809232`): `Dashboard port file (<tmp>/.dev_cluster.dashboard_port) did not appear within 8s for
+  127.0.0.1:<port>`. ROADMAP.md "Stability" lists it.
+- **Problem:** `ox-mode dev` waits a fixed 8 s for the dashboard port file. The log does not say whether the
+  in-process dashboard started late or did not start.
+- **Do:** Print the in-process master's output when the wait fails, find which of the two happened, then fix
+  the start-up or wait on the condition with a bounded but generous limit.
+- **Done when:** The cause is named here, and the test passes 200 runs in a row on Linux.
+
+### TEST-44: Remove the 1.5x wall-clock cap from the speed-aware batch test
+
+- **Evidence:** `sched4_batch_finishes_within_1_5x_fast_worker_and_zero_factor_restores_old_timing`
+  (`tests/sched4_speed_aware.rs:194`) failed on `ubuntu-latest` on 2026-11-17, in pull request 282 at
+  `3783987` (run `44021280672`, job `133834113011`): `D2 batch elapsed 766.662836ms exceeded 1.5x fast
+  worker's own time (464.419518ms, cap=696.629277ms)`. Pull request 282 changes only `windows/oxctl.ps1`, a
+  Python launcher test and docs.
+- **Problem:** The test compares two wall-clock times of a few hundred milliseconds, so a loaded runner
+  can break the 1.5x ratio without any change in placement.
+- **Do:** Assert what design 0060 D2 decides (which worker ran each task, and that the slow worker was held
+  back), and keep the timing as a printed measurement or as a much wider bound, as TEST-36 to TEST-38 did.
+- **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
+
+### TEST-45: Keep the second worker of the reaper failover stress test alive
+
+- **Evidence:** Reported by agent-win with pull request 286 on 2026-11-17: on its Windows desktop with one
+  core and six spinning processes, `test_stress_reaper_detection_and_failover`
+  (`tests/m9_stress_challenge_1.rs:1151`, "Task must complete on Worker 2 after Worker 1 is reaped") failed
+  in 2 of 20 runs of the whole test binary. Not seen in CI yet.
+- **Problem:** The agent's reading, not proven: Worker 2 is a raw connection that sends no heartbeats while
+  the test's reaper timeout is short, so the reaper can take Worker 2 too before its `TaskResult` counts.
+- **Do:** Confirm the cause from the master's log in a failing run, then make Worker 2 send heartbeats (or
+  give it a timeout it cannot reach) without weakening the assertion about Worker 1.
+- **Done when:** The cause is named here, and the test passes 200 runs in a row under the same starvation.
+
+### TEST-46: Remove the 100 ms bound from the failover latency stress test
+
+- **Evidence:** Reported by agent-win with pull request 286 on 2026-11-17: under the same starvation,
+  `test_stress_immediate_failover_latency_under_load` (`tests/m9_stress_challenge_1.rs:637`) failed in 1 of
+  20 runs: `129.9476ms` measured against a strict `< 100ms`. Not seen in CI yet.
+- **Problem:** A wall-clock bound of 100 ms, like the ones TEST-36 to TEST-38 removed.
+- **Do:** Assert the order of events (the task was re-queued after the disconnect, without waiting for the
+  reaper timeout) and print the latency, or use a bound that a starved runner cannot reach.
+- **Done when:** The test passes 200 runs in a row under the same starvation.
+
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -3427,3 +3508,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).
 - 2026-11-17: TEST-39 and TEST-40 added and Implemented (pull request 278): two Agent Mesh tests wait for registration and for each payload instead of a fixed sleep; the Index gains two Implemented items. BUG-22 waits for the next wire change after 0.4.0.
 - 2026-11-17: Release `0.4.0` prepared (protocol 10 with the one-version window, PROTO-3 and PROTO-4): versions, CHANGELOG, README install lines and DEPLOYMENT section 3.5; the size allowlist of `crates/worker/src/isolation.rs` lowered to 5346. BUG-23 added (Planned), and BUG-24 from the Windows smoke test of 0.4.0 (Planned). The Index counts are 103 Implemented, 11 Partial and 44 Planned (158 items).
+- 2026-11-17: TEST-41 to TEST-46 added (Planned) for failing tests without an item: the probe that ran a task
+  twice in pull request 282, the two tests ROADMAP.md "Stability" listed, the speed-aware batch test that
+  failed in pull request 282, and two stress tests agent-win saw fail under CPU starvation. The Index counts
+  are 103 Implemented, 11 Partial and 50 Planned (164 items).
