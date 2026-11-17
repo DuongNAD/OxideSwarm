@@ -1,6 +1,6 @@
 # 0083: A one-version compatibility window
 
-Status: Implemented by draft pull request 274 (PROTO-4 of design 0076 D4; based on draft pull request 272, design 0082)
+Status: Implemented (PROTO-4 of design 0076 D4; pull request 274, merged on 2026-11-17 on top of pull request 272, design 0082)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
