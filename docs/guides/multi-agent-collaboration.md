@@ -160,6 +160,10 @@ python3 scripts/agent_bridge.py activity --overlap          # compare the record
 
 `--files-from-git` takes `git diff --name-only origin/master...HEAD` plus the uncommitted and untracked paths; `--files a,b,c` names them by hand. `--overlap` (also run when you start with `--state active` and give files) prints each path that another agent, active or blocked and not STALE, also reports, with its branch and pull request. `CHANGELOG.md`, `docs/BACKLOG.md`, `docs/README.md` and `Cargo.lock` print as "shared, expect a one-line merge". An agent whose record has no files prints as "files unknown". It never blocks and always exits 0. Without a hub, both commands print one notice and exit 0. Design record: 0087.
 
+### 7. Never cancel a run for a push on `master`
+
+No agent or session cancels a CI run for a push on `master`, by hand, with `gh run cancel` or through the API, even when a newer push makes it look superfluous. Leave it. Only runs for pull requests are cancelled, by the workflow itself (`concurrency` in `.github/workflows/ci.yml`). A cancelled run tests nothing for its commit and counts against the exit check of Q80. To see what a window of runs holds, run `python3 scripts/ci_push_runs.py --days 7`: it prints every run for a push on `master` that is not green with its class (failing test, job never acquired, cancelled by an account, other). A macOS job that was never acquired is rerun by the coordinator (`gh run rerun <RUN_ID> --failed`), not cancelled. Design record: 0088 (CI-1).
+
 ## Verify
 
 On either machine (repository root):
