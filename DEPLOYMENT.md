@@ -273,7 +273,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 
 ### 3.5 Upgrading a running grid (master and workers)
 `Task`, `TaskResult`, and message frames are encoded positionally with bincode. Workers, clients, and the master
-exchange `PROTOCOL_VERSION_CURRENT` (version 10 in release `0.4.0`, 9 in `0.3.0`). **A master accepts one version back**
+exchange `PROTOCOL_VERSION_CURRENT` (version 10 in releases `0.4.0` and `0.4.1`, 9 in `0.3.0`). **A master accepts one version back**
 (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT - 1`, the window of `docs/design/0083-one-version-window.md`):
 a `0.4.0` (protocol 10) master serves `0.3.0` (protocol 9) workers and clients, which keep working unchanged while you
 upgrade them one at a time; a task copy sent to a protocol 9 worker has no extension lists (an extension a worker must
@@ -295,7 +295,7 @@ submission, whereas a newer worker pointed at an un-upgraded v2 master registers
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
 When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
-or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from the release after 0.4.0, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from 0.4.1 on, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk

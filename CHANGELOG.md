@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-17
+
+A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` (and, like `0.4.0`, serves `0.3.0` workers and clients). It fixes the two defects the Windows smoke test of `0.4.0` found (`BUG-23`, `BUG-24`) and makes four flaky tests deterministic or self-describing (`TEST-29`, `TEST-33`, `TEST-41`).
+
+### Upgrading from 0.4.0
+
+- Replace the binaries in any order; no clean stop is needed for this upgrade. On Windows, replace `windows\oxctl.ps1` (and the `.cmd` launchers) too: from `0.4.1` on, `oxctl.ps1 stop` stops the master with Ctrl+C, so a master with `--state-dir` compacts its journal before the next protocol upgrade (`BUG-23`).
+- A master whose `--state-dir` is on exFAT or FAT32 now refuses to start, with a message that names the file system (`BUG-24`). Move the directory to an NTFS (or ReFS) drive first; with `0.4.0` such a master started once and then refused its own `members.json`.
+
 ### Changed
 - CI: the `cargo test --workspace` step of `workspace tests` stops at 45 minutes, prints a heartbeat line with the last output line once a minute (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the last 120 lines of the test output, so a hung or starved run names the running test instead of losing the runner without a log (`TEST-29`, Partial).
 
