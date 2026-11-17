@@ -152,8 +152,9 @@ the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with it
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
 (TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 286 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
-TEST-47, BUG-23 and BUG-24 added): 165 items, 105 Implemented, 13 Partial and 47 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 290 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
+TEST-48, BUG-23 to BUG-25 and LAUNCH-1 to LAUNCH-5 added): 172 items, 106 Implemented,
+13 Partial and 53 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -224,6 +225,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
+| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -325,6 +327,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
+| LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1 | Yes | Planned |  |
+| LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned |  |
+| LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
+| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
+| LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned |  |
 
 ## Phase 0: integrate open work
 
@@ -3137,6 +3144,21 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** The cause is named here, and the test passes 200 runs in a row on Windows next to the other
   tests of its binary.
 
+### TEST-48: Give each Android bridge test its own worker state
+
+- **Evidence:** `test_bridge_set_cluster_secret_hex_and_file_parsing`
+  (`crates/android_bridge/tests/cluster_auth_test.rs:40`) failed on `ubuntu-latest` on 2026-11-17, in pull
+  request 289 at `16313f5` (run `44050351817`, job `133926449804`): `Status must report error for invalid
+  secret: {... "status":"STOPPED" ...}`. The rerun passed. Pull request 289 changes only a test of the master
+  crate and docs.
+- **Problem:** The bridge keeps its worker in process-global state (`OnceLock<Arc<WorkerState>>`, see
+  `ANDROID_ARCHITECTURE.md`), and the tests of this binary run in parallel. A likely cause, not verified:
+  another test started or stopped the worker between this test's call and its status read, so the status no
+  longer shows the error this test caused.
+- **Do:** Serialise the tests of the binary that touch the global worker (one lock shared by them, or one
+  test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
+- **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
+
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -3252,6 +3274,87 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `[master].discovery_port`) moves the beacon and `0` turns it off; design 0084. A worker finds a moved
   beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
   once, one with the beacon off.
+
+## Phase 13: public launch
+
+The launch steps of [ROADMAP.md](ROADMAP.md) ("Launch") as items. They wait for the stability
+release: the exit check of Q80 (E3 of design 0088, pull request 291),
+the records of TEST-24 and TEST-25 (E7) and one run across two real networks (E5). Until then a
+release is for early users who accept its limits (ROADMAP.md, "What is missing").
+
+Order:
+
+1. LAUNCH-1, the gate. Agents hold the open test items; the owner holds TEST-24, TEST-25 and the
+   second network.
+2. LAUNCH-2, on the release that passes the gate.
+3. LAUNCH-3, then LAUNCH-4.
+4. LAUNCH-5.
+
+The second demo of ROADMAP.md (a language model larger than one machine) waits for 0.5.0 and is
+not part of this phase.
+
+### LAUNCH-1: Hold the public launch for the stability release and its records
+
+- **Evidence:** Read on 2026-11-17, after release `0.4.1`. The flaky tests TEST-23, TEST-29, TEST-41 to
+  TEST-48 and BUG-25 are open; TEST-24 and TEST-25 have no record; no run across two real networks is
+  recorded (LINK-1, USB-1c). A first visitor meets exactly these: a red CI, a task that runs twice or
+  loses its output after a restart, a link that does not cross their router.
+- **Problem:** A launch reaches most people once. If the first run fails, it does not get a second look.
+- **Do:** Keep a checklist in this section, updated as each part holds:
+  1. The exit check of Q80 holds: every flaky test has an Implemented item with its loop of runs, and
+     `master` has seven days of runs for pushes in which no test fails.
+  2. TEST-24 and TEST-25 each have one dated record.
+  3. One run across two real networks is recorded (LINK-1), with the USB kit if it is used (USB-1c).
+  4. The release that passes 1 to 3 is tagged (a `0.4.x` with no wire change).
+- **Done when:** All four lines hold, each with the record or run that shows it, and the owner names the
+  launch date.
+
+### LAUNCH-2: Install and run from the README alone on clean machines
+
+- **Evidence:** Read. The release archives were checked by the people who built them (smoke tests of
+  0.4.0 and 0.4.1); nobody has followed only the README on a machine that never had Rust or OxideSwarm.
+- **Problem:** Every step that needs knowledge outside the README stops a new user.
+- **Do:** On a clean macOS, Windows and Linux machine (a new user account is enough), follow only the
+  README's install and quick start with the release archive, up to one task that runs on the other
+  machine, then the MCP setup of [guides/mcp-client-setup.md](guides/mcp-client-setup.md) with one coding
+  agent. Note the time to the first finished task and every step where the text was not enough, and fix
+  the text.
+- **Done when:** A dated record lists the three systems, the times and the fixes, and a second pass on
+  one system needs no knowledge outside the README.
+
+### LAUNCH-3: Record the demo of the user story
+
+- **Evidence:** Step 1 of "Launch" in ROADMAP.md; the run of 2026-11-09 (Phase C) shows the story works
+  but is a log, not a demo.
+- **Problem:** The user story (an agent on one system runs `cargo test` on a machine with another, and the
+  second run is faster) is the reason to try the project, and it is not visible without a demo.
+- **Do:** Record a short screen capture (two minutes or less) of a coding agent on one machine that, over
+  MCP, runs `cargo test` of a real repository on a machine with another operating system, twice, with the
+  second run faster. Keep the run record (commands, versions, times) beside it, and use only numbers
+  from that record.
+- **Done when:** The video and its run record are published and linked from the record.
+
+### LAUNCH-4: Put the demo, the release and the benchmarks at the top of the README
+
+- **Evidence:** Step 2 of "Launch" in ROADMAP.md.
+- **Problem:** A visitor reads the top of the README and leaves.
+- **Do:** At the top of `README.md`: one sentence on what the project is, the demo (LAUNCH-3), the
+  latest release with its install line, and the BENCH-1 page. Every number links to its run record
+  (writing standard rule 6 of [docs/README.md](README.md)). Keep "What is missing" current, and say in
+  `docs/SECURITY.md` and the README that no independent security review has been published (LV-6,
+  design 0088).
+- **Done when:** The README top holds those parts, every link resolves (`ox-mode doc`), and the limits
+  match ROADMAP.md.
+
+### LAUNCH-5: Announce the release
+
+- **Evidence:** Step 3 of "Launch" in ROADMAP.md; the research of 2026-11-08 there on launch posts.
+- **Problem:** Without an announcement nobody finds the release.
+- **Do:** The owner posts a short announcement (for example a "Show HN"): what it is, the demo, how to
+  try it in five minutes, and the limits. Answer the first day's questions; turn each defect report into
+  an item.
+- **Done when:** The post is published and its link and date are in the status log, with the items it
+  produced.
 
 ## Status log
 
@@ -3630,3 +3733,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: Release `0.4.1` prepared (no wire change; BUG-23, BUG-24, TEST-29 diagnostics, TEST-33 and
   TEST-41): versions, CHANGELOG with an "Upgrading from 0.4.0" note, README install lines, DEPLOYMENT section
   3.5 and the ROADMAP release table. The Index counts are unchanged.
+- 2026-11-17: Phase 13 (public launch) added with LAUNCH-1 to LAUNCH-5, the launch steps of ROADMAP.md as items with
+  their gate (Q80, TEST-24, TEST-25, a two-network run); TEST-48 added for the Android bridge test that failed in
+  pull request 289. The Index counts are 106 Implemented, 13 Partial and 53 Planned (172 items).

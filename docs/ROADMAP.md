@@ -165,10 +165,13 @@ that run stably, is not reached.
   of `tests/m9_stress_challenge_1.rs` failed (agent-win, pull request 286), TEST-45 and TEST-46.
 - The capability-detection handle-count test failed once on `windows-latest` (pull request 286, run
   `44027023301`). It is TEST-47.
-- The Index holds the open work: TEST-23, TEST-29, TEST-32, TEST-33 and TEST-41 to TEST-47 (failures
-  that are flaky or not explained), TEST-24 to TEST-26 (large transfers and a 24-hour run,
-  [design 0065](design/0065-large-transfer-and-long-run-tests.md)), PROTO-5, SEC-16 and BUG-22.
-  TEST-27, TEST-29, TEST-31, TEST-33, TEST-35 and LV-1 are Partial.
+- An Android bridge test failed once on `ubuntu-latest` (pull request 289, run `44050351817`). It is
+  TEST-48.
+- The Index holds the open work: TEST-23, TEST-29, TEST-32 and TEST-41 to TEST-48 (failures that are
+  flaky or not explained; TEST-33 is fixed, pull request 289), TEST-24 to TEST-26 (large transfers and a
+  24-hour run, [design 0065](design/0065-large-transfer-and-long-run-tests.md)), PROTO-5, SEC-16, BUG-22
+  and BUG-25.
+  TEST-27, TEST-29, TEST-31, TEST-35, TEST-41 and LV-1 are Partial.
 - The Windows smoke test of `0.4.0` found BUG-23 and BUG-24; both are fixed on `master` after the
   release (pull requests 282 and 284): `windows/oxctl.ps1` now stops a master with Ctrl+C so its
   journal is compacted, and a master refuses a `--state-dir` on a file system without permissions
@@ -396,6 +399,11 @@ After the Phase D exit check, and not before it:
 4. A second demo, one language model larger than any single machine split over several of them,
    waits for LLM-2 and LLM-4 of design 0038 (decision Q4). LLM-1, which routes a prompt to the
    worker that holds a model, can be shown earlier.
+
+These steps are items LAUNCH-2 to LAUNCH-5 of Phase 13 in [BACKLOG.md](BACKLOG.md). The launch waits
+for LAUNCH-1: the first `0.4.x` release that passes the exit check of Q80, with dated records of
+TEST-24 and TEST-25 and one run across two real networks. Until then a release is for early
+users who accept the limits under "What is missing".
 
 ### Phase E: reach
 
