@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` waits up to 30 s, by condition, for each of its two in-process masters to accept connections (was 50 tries 20 ms apart, one second) (`TEST-49`).
 - The reaper boundary test (`TEST-42`) times everything from just before the Register is sent, so it fails only on a reaper that really fires before its timeout; a starved runner that reaches the 100 ms check after the timeout no longer fails it, and the reap is bounded at 5 s instead of 450 ms, with the time printed.
 - The Agent Mesh hub no longer disconnects a sender as a "slow consumer" because of the hub's own replies: it now waits for room in the sender's outbound queue before it handles the next request, so a burst of requests to an unknown node id (one NACK each) slows the sender down instead of overflowing its queue of 8 to 1024 messages. This was the cause of the intermittent `test_slow_consumer_is_disconnected_instead_of_buffering_forever` failures on macOS CI (`TEST-27`).
+- `ox-mode dev cluster` starts its master with `--discovery-port 0`, so the local dev cluster no longer binds the UDP discovery beacon on the default port 8089, which a real master on the same machine may use (`BUG-26`).
 
 ## [0.4.1] - 2026-11-17
 

@@ -2045,7 +2045,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--dashboard-port-file",
         ]);
         master_cmd.arg(&dash_port_file);
-        master_cmd.args(["--ephemeral-key", "--blob-dir"]);
+        master_cmd.args(["--ephemeral-key", "--discovery-port", "0", "--blob-dir"]); // BUG-26
         master_cmd.arg(&blob_dir);
     } else {
         master_cmd.args([
@@ -2057,7 +2057,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--dashboard-port-file",
         ]);
         master_cmd.arg(&dash_port_file);
-        master_cmd.arg("--ephemeral-key");
+        master_cmd.args(["--ephemeral-key", "--discovery-port", "0"]); // BUG-26
     }
     let master_res = master_cmd
         .current_dir(workspace_root)
