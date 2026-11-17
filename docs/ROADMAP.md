@@ -162,14 +162,18 @@ that run stably, is not reached.
 - Also on 2026-11-17: the speed-aware batch test missed its 1.5x wall-clock cap (pull request 282, run
   `44021280672`, `ubuntu-latest`), TEST-44; and under CPU starvation on a Windows desktop two stress tests
   of `tests/m9_stress_challenge_1.rs` failed (agent-win, pull request 286), TEST-45 and TEST-46.
-- The Index holds the open work: TEST-23, TEST-29, TEST-32, TEST-33 and TEST-41 to TEST-46 (failures
+- The capability-detection handle-count test failed once on `windows-latest` (pull request 286, run
+  `44027023301`). It is TEST-47.
+- The Index holds the open work: TEST-23, TEST-29, TEST-32, TEST-33 and TEST-41 to TEST-47 (failures
   that are flaky or not explained), TEST-24 to TEST-26 (large transfers and a 24-hour run,
   [design 0065](design/0065-large-transfer-and-long-run-tests.md)), PROTO-5, SEC-16 and BUG-22.
-  TEST-27, TEST-31, TEST-35 and LV-1 are Partial.
-- Pull request 280 adds BUG-23 and BUG-24 from the Windows smoke test of `0.4.0`. `windows/oxctl.ps1`
-  ends a master by force, which leaves a journal that the master of the next protocol version
-  refuses. A `--state-dir` on a file system without permissions, such as exFAT, lets the master
-  start once only.
+  TEST-27, TEST-29, TEST-31, TEST-33, TEST-35 and LV-1 are Partial.
+- The Windows smoke test of `0.4.0` found BUG-23 and BUG-24; both are fixed on `master` after the
+  release (pull requests 282 and 284): `windows/oxctl.ps1` now stops a master with Ctrl+C so its
+  journal is compacted, and a master refuses a `--state-dir` on a file system without permissions
+  (exFAT, FAT32) at its first start instead of starting once only. TEST-29 has CI diagnostics
+  (pull request 283) and TEST-33 longer, self-describing waits (pull request 286); their causes are
+  not known yet.
 
 Release `0.4.0` ships the first goal. Its notes in pull request 280 describe the upgrade path and
 make no statement about stability.
