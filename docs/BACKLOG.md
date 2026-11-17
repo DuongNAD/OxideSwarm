@@ -331,7 +331,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
-| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
+| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
@@ -3305,6 +3305,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test removes (or makes unwritable) the base of one of two workers after it registered, submits
   tasks with `max_retries` above 0, and all complete on the other worker; `is_worker_rejection` has a unit test
   with the exact message.
+- **Implemented (2026-11-17, pull request 299):** The three refusals answer `Task rejected by worker: sandbox base
+  unusable: <reason>` (`rusty_grid_core::sandbox_base_refusal`), which the master already matches ("rejected by
+  worker") and now lists in full; no wire change, a 0.4.x master hands it back too. The assignment and input-fetch
+  re-checks repeat once after 250 ms; `Sandbox::create` refusals cover the base errors and I/O errors under the base.
+  The existing `avoid_workers` and `MAX_WORKER_REJECTIONS_PER_TASK` logic prevents a loop, so no new guard. Test:
+  `crates/master/tests/sandbox_base_hand_back.rs`; design 0090.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
