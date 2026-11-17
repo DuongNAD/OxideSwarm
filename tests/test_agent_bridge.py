@@ -990,5 +990,349 @@ class Activity(BridgeCase):
         self.assertEqual(sorted(os.listdir(self.nodes)), sorted([f"{PEER}_activity.json", f"{SELF}_state.json"]))
 
 
+
+class CoordCase(BridgeCase):
+    """A fake repository with an origin/master and an origin/feat that is ahead of it, plus a temporary hub."""
+
+    ME = "mac-1"
+
+    def git(self, *args):
+        return (
+            subprocess.run(
+                ["git", *args],
+                cwd=self.repo,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            .stdout.decode("utf-8")
+            .strip()
+        )
+
+    def write_repo_file(self, rel, text):
+        path = os.path.join(self.repo, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
+    def commit_all(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@oxideswarm.invalid")
+        self.git("config", "user.name", "OxideSwarm Test")
+        self.write_repo_file("Cargo.toml", "[workspace]\nmembers = []\n")
+        self.write_repo_file("docs/design/0087-coordination.md", "# 0087\n")
+        self.write_repo_file("docs/ROADMAP.md", "Decision Q84 and Q70 are closed.\n")
+        self.write_repo_file("docs/BACKLOG.md", "## Phase 12\n\n| TEST-48 | a |\n| BUG-0 | b |\n")
+        self.commit_all("base")
+        self.git("update-ref", "refs/remotes/origin/master", "HEAD")
+        self.write_repo_file("docs/design/0090-ahead.md", "# 0090\n")
+        self.write_repo_file("docs/ROADMAP.md", "Decision Q84 and Q90 are closed.\n")
+        self.write_repo_file("docs/BACKLOG.md", "## Phase 12\n\n## Phase 13\n\n| TEST-50 | a |\n")
+        self.commit_all("ahead")
+        self.git("update-ref", "refs/remotes/origin/feat", "HEAD")
+        self.git("reset", "-q", "--hard", "origin/master")
+
+    def argv(self, *args, use_hub=True):
+        if "--repo" not in args:
+            args = ("--repo", self.repo, *args)
+        return super().argv(*args, use_hub=use_hub)
+
+    def claim(self, *args, who=None, **kw):
+        return self.run_bridge("claim", "--agent-id", who or self.ME, "--settle", "0", *args, **kw)
+
+    def out(self, result):
+        return result.stdout.decode("utf-8").strip()
+
+    def hand_claim(self, kind, value, agent, created_at, branch="", title="theirs"):
+        stamp = "".join(c for c in created_at if c.isdigit() or c in "TZ")
+        folder = os.path.join(self.hub, "claims", kind)
+        os.makedirs(folder, exist_ok=True)
+        name = f"{value}__{agent}__{stamp}.json"
+        record = {
+            "kind": kind,
+            "value": value,
+            "agent": agent,
+            "title": title,
+            "branch": branch,
+            "pr": None,
+            "created_at": created_at,
+        }
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        return name
+
+    def claim_files(self, kind):
+        folder = os.path.join(self.hub, "claims", kind)
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+
+class Claims(CoordCase):
+    def test_next_free_value_of_every_kind_counts_master_branches_and_hub_claims(self):
+        # design: 0087 on master, 0090 on origin/feat -> 0091; the claim itself then counts for the next agent.
+        first = self.claim("design", "--title", "first")
+        self.assertEqual((first.returncode, self.out(first)), (0, "0091"), first.stderr)
+        second = self.claim("design", "--title", "second", who="win")
+        self.assertEqual(self.out(second), "0092")
+        self.assertEqual(len(self.claim_files("design")), 2)
+        # q: Q84 on master, Q90 on a branch -> Q91.
+        self.assertEqual(self.out(self.claim("q", "--title", "q")), "Q91")
+        # phase: Phase 12 on master, Phase 13 on a branch -> 14.
+        self.assertEqual(self.out(self.claim("phase", "--title", "p")), "14")
+        # item: TEST-48 on master, TEST-50 on a branch -> TEST-51; another prefix is counted on its own.
+        self.assertEqual(self.out(self.claim("item", "--prefix", "TEST", "--title", "t")), "TEST-51")
+        self.assertEqual(self.out(self.claim("item", "--prefix", "BUG", "--title", "b")), "BUG-1")
+        self.assertEqual(self.out(self.claim("item", "--prefix", "NEW", "--title", "n")), "NEW-1")
+
+    def test_a_claim_record_holds_project_metadata_only(self):
+        self.claim("design", "--title", "A title", "--branch", "claude/x", "--pr", "#300")
+        name = self.claim_files("design")[0]
+        self.assertTrue(name.startswith(f"0091__{self.ME}__") and name.endswith(".json"), name)
+        with open(os.path.join(self.hub, "claims", "design", name), encoding="utf-8") as f:
+            record = json.load(f)
+        self.assertEqual(
+            sorted(record), ["agent", "branch", "created_at", "kind", "nonce", "pr", "title", "value"]
+        )
+        self.assertRegex(record["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$")
+        self.assertTrue(name.endswith(f"__{record['nonce']}.json"), name)
+        self.assertEqual((record["pr"], record["branch"], record["value"]), (300, "claude/x", "0091"))
+
+    def test_bad_input_is_refused(self):
+        self.assertEqual(self.claim("item", "--title", "t").returncode, 2)
+        self.assertEqual(self.claim("design").returncode, 2)
+        self.assertEqual(self.claim("design", "--title", "two\nlines").returncode, 2)
+        self.assertEqual(self.claim("design", "--title", "t", "--value", "Q4").returncode, 2)
+        self.assertEqual(self.claim_files("design"), [])
+
+    def test_the_later_claim_withdraws_and_takes_the_next_value(self):
+        self.hand_claim("design", "0091", "win", "2000-01-01T00:00:00Z")
+        result = self.claim("design", "--value", "0091", "--title", "late")
+        self.assertEqual((result.returncode, self.out(result)), (0, "0092"), result.stderr)
+        files = self.claim_files("design")
+        self.assertEqual(len([f for f in files if f.startswith("0091__")]), 1)
+        self.assertTrue(files[0].startswith("0091__win__"), files)
+        self.assertTrue(any(f.startswith(f"0092__{self.ME}__") for f in files), files)
+
+    def test_equal_timestamps_go_to_the_smaller_agent_id(self):
+        moment = "2026-11-17T10:00:00Z"
+        for me, other, expect_win in (("aaa", "zzz", True), ("zzz", "aaa", False)):
+            with self.subTest(me=me):
+                shutil.rmtree(os.path.join(self.hub, "claims", "design"), ignore_errors=True)
+                self.hand_claim("design", "0100", other, moment)
+                with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment):
+                    won, path = bridge_module.try_claim(self.hub, "design", "0100", me, "t", "", None, 0)
+                self.assertEqual(won, expect_win)
+                self.assertEqual(os.path.exists(path), expect_win)
+                self.assertEqual(len(self.claim_files("design")), 2 if expect_win else 1)
+
+    def test_two_sessions_of_one_agent_with_one_timestamp_do_not_both_win(self):
+        moment = "2026-11-17T10:00:00.500000Z"
+        for mine, rival, expect_win in (("aaaa0000", "bbbb0000", True), ("bbbb0000", "aaaa0000", False)):
+            with self.subTest(mine=mine):
+                shutil.rmtree(os.path.join(self.hub, "claims", "design"), ignore_errors=True)
+                folder = os.path.join(self.hub, "claims", "design")
+                os.makedirs(folder)
+                rival_name = f"0100__owner__20261117T100000500000Z__{rival}.json"
+                with open(os.path.join(folder, rival_name), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"kind": "design", "value": "0100", "agent": "owner", "title": "other session",
+                         "created_at": moment, "nonce": rival},
+                        f,
+                    )
+                with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment), mock.patch.object(
+                    bridge_module.secrets, "token_hex", return_value=mine
+                ):
+                    won, path = bridge_module.try_claim(self.hub, "design", "0100", "owner", "t", "", None, 0)
+                self.assertEqual(won, expect_win)
+                # Exactly one file holds the value, and the file names differ.
+                holders = [f for f in self.claim_files("design") if f.startswith("0100__")]
+                self.assertEqual(len(holders), 2 if expect_win else 1)
+                self.assertNotEqual(os.path.basename(path), rival_name)
+
+    def test_the_loser_of_a_same_agent_tie_takes_the_next_value(self):
+        moment = "2026-11-17T10:00:00.500000Z"
+        self.hand_claim("design", "0091", "owner", moment)
+        with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment), mock.patch.object(
+            bridge_module.secrets, "token_hex", return_value="ffffffff"
+        ):
+            result = self.claim("design", "--value", "0091", "--title", "t", "--session", "window 2", who="owner")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.out(result), "0092")
+
+    def test_old_claims_without_nonce_or_fraction_still_order_correctly(self):
+        older = {"created_at": "2026-11-17T10:00:00Z", "agent": "z"}
+        newer = {"created_at": "2026-11-17T10:00:00.250000Z", "agent": "a", "nonce": "x"}
+        self.assertLess(bridge_module.claim_sort_key(older), bridge_module.claim_sort_key(newer))
+
+    def test_three_lost_tries_exit_non_zero(self):
+        # An earlier rival claim appears after every scan, so each try loses.
+        real = bridge_module.try_claim
+
+        def losing(hub, kind, value, agent, title, branch, pr, settle, session=""):
+            self.hand_claim(kind, value, "win", "2000-01-01T00:00:00Z")
+            return real(hub, kind, value, agent, title, branch, pr, settle, session=session)
+
+        args = bridge_module.argparse.Namespace(
+            hub_dir=self.hub,
+            repo=self.repo,
+            sub_repo=None,
+            agent_id=None,
+            sub_agent_id=self.ME,
+            kind="design",
+            prefix=None,
+            title="t",
+            branch=None,
+            pr=None,
+            value=None,
+            settle=0.0,
+            list=False,
+            release=None,
+            session=None,
+        )
+        with mock.patch.object(bridge_module, "try_claim", losing), mock.patch("sys.stderr"):
+            self.assertEqual(bridge_module.cmd_claim(args), 1)
+        self.assertFalse([f for f in self.claim_files("design") if f"__{self.ME}__" in f])
+
+    def test_list_shows_in_use_open_and_stale(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old = (now - datetime.timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fresh = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.hand_claim("design", "0087", "win", fresh, title="already merged")
+        self.hand_claim("design", "0095", "win", fresh, title="fresh plan")
+        self.hand_claim("design", "0096", "win", old, branch="gone", title="dropped plan")
+        self.hand_claim("design", "0097", "win", old, branch="feat", title="old but on origin")
+        self.hand_claim("item", "TEST-50", "win", old, title="no branch named")
+        shown = self.out(self.run_bridge("claim", "--list", "--repo", self.repo))
+        lines = {line.split()[1]: line for line in shown.splitlines()}
+        self.assertIn("[in use]", lines["0087"])
+        self.assertIn("[open]", lines["0095"])
+        self.assertIn("[stale]", lines["0096"])
+        self.assertIn("[open]", lines["0097"])
+        self.assertIn("[stale]", lines["TEST-50"])
+        only = self.out(self.run_bridge("claim", "--list", "item", "--repo", self.repo))
+        self.assertEqual(len(only.splitlines()), 1)
+
+    def test_release_deletes_an_own_claim_and_refuses_another_agents(self):
+        mine = self.claim("design", "--title", "mine")
+        self.assertEqual(self.out(mine), "0091")
+        other = self.hand_claim("design", "0092", "win", "2026-11-17T10:00:00Z")
+        name = [f for f in self.claim_files("design") if f.startswith("0091__")][0]
+        refused = self.run_bridge("claim", "--release", other, "--agent-id", self.ME)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(other, self.claim_files("design"))
+        ok = self.run_bridge("claim", "--release", name, "--agent-id", self.ME)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertNotIn(name, self.claim_files("design"))
+        self.assertEqual(self.run_bridge("claim", "--release", "nope.json", "--agent-id", self.ME).returncode, 1)
+
+    def test_without_a_hub_claim_prints_a_notice_and_exits_zero(self):
+        result = self.run_bridge("claim", "design", "--title", "t", "--settle", "0", use_hub=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No hub found", self.out(result))
+
+
+class ActivityFilesAndOverlap(CoordCase):
+    def hand_write(self, short, state, age_minutes, files=None, branch=None, pr=None):
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=age_minutes)
+        stamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {"agent_id": f"agent-{short}", "state": state, "task": "t", "step": "s", "updated_at_utc": stamp}
+        if files is not None:
+            record["files"] = files
+        if branch:
+            record["branch"] = branch
+        if pr:
+            record["pr"] = pr
+        with open(os.path.join(self.nodes, f"{short}_activity.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+    def activity(self, *args):
+        return self.run_bridge("activity", "--agent-id", self.ME, *args)
+
+    def mine(self):
+        with open(os.path.join(self.nodes, f"{self.ME}_activity.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_files_branch_and_pr_are_stored_and_kept_by_a_later_report(self):
+        result = self.activity(
+            "--state",
+            "active",
+            "--task",
+            "x",
+            "--branch",
+            "claude/x",
+            "--pr",
+            "#12",
+            "--files",
+            "src/b.rs, src\\a.rs,./src/b.rs",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.mine()
+        self.assertEqual((record["branch"], record["pr"], record["files"]), ("claude/x", 12, ["src/a.rs", "src/b.rs"]))
+        self.activity("--state", "active", "--step", "later")
+        self.assertEqual(self.mine()["files"], ["src/a.rs", "src/b.rs"])
+        self.assertIn("branch claude/x, PR #12", self.out(self.run_bridge("activity", "--show")))
+
+    def test_bad_files_and_pr_are_refused(self):
+        for bad in ("/etc/passwd", "../x", "C:/x", "a/../../b"):
+            self.assertEqual(self.activity("--state", "active", "--files", bad).returncode, 2, bad)
+        self.assertEqual(self.activity("--state", "active", "--pr", "abc").returncode, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.nodes, f"{self.ME}_activity.json")))
+
+    def test_files_from_git_lists_branch_uncommitted_and_untracked_paths(self):
+        self.write_repo_file("src/committed.rs", "fn a() {}\n")
+        self.commit_all("work")
+        self.write_repo_file("docs/ROADMAP.md", "changed\n")
+        self.write_repo_file("src/new file.rs", "fn b() {}\n")
+        result = self.activity("--state", "active", "--files-from-git", "--branch", "claude/x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.mine()["files"], ["docs/ROADMAP.md", "src/committed.rs", "src/new file.rs"])
+
+    def test_overlap_names_shared_files_and_the_shared_by_design_class(self):
+        self.hand_write("win", "active", 2, ["src/a.rs", "CHANGELOG.md", "only/win.rs"], branch="claude/w", pr=5)
+        result = self.activity("--state", "active", "--files", "src/a.rs,CHANGELOG.md,only/mine.rs")
+        text = self.out(result)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[OVERLAP WARNING] src/a.rs: also changed by agent-win, branch claude/w, PR #5", text)
+        self.assertIn("CHANGELOG.md: shared, expect a one-line merge", text)
+        self.assertNotIn("WARNING] CHANGELOG.md", text)
+        self.assertNotIn("only/", text)
+
+    def test_overlap_ignores_stale_done_and_self_and_reports_unknown_files(self):
+        self.hand_write("old", "active", 45, ["src/a.rs"])
+        self.hand_write("fin", "done", 2, ["src/a.rs"])
+        self.hand_write("blank", "blocked", 2)
+        self.hand_write("blk", "blocked", 2, ["src/a.rs"], branch="b")
+        self.activity("--state", "active", "--files", "src/a.rs")
+        text = self.out(self.activity("--overlap"))
+        self.assertIn("agent-blk, branch b", text)
+        self.assertNotIn("agent-old", text)
+        self.assertNotIn("agent-fin", text)
+        self.assertNotIn("agent-mac-1", text)
+        self.assertIn("Files unknown for: agent-blank", text)
+
+    def test_overlap_alone_writes_nothing_and_never_blocks(self):
+        self.hand_write("win", "active", 2, ["src/a.rs"])
+        before = sorted(os.listdir(self.nodes))
+        result = self.activity("--overlap", "--files", "src/a.rs")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("WARNING] src/a.rs", self.out(result))
+        self.assertEqual(sorted(os.listdir(self.nodes)), before)
+        # No files known for this agent at all.
+        self.assertIn("No files recorded", self.out(self.activity("--overlap")))
+
+    def test_overlap_without_a_hub_exits_zero_with_a_notice(self):
+        result = self.run_bridge("activity", "--overlap", "--files", "a.rs", use_hub=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No hub found", self.out(result))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -136,6 +136,30 @@ python scripts/agent_bridge.py activity --show
 
 Values are one line of plain text, at most 200 characters; never put a secret in them. `--show` prints agent, state, task, step and age, and marks an agent STALE when it says `active` or `blocked` and has not reported for 20 minutes: it is probably waiting for a permission prompt or stuck. `diagnose` and `peek` show the same line. Design: [0081](../design/0081-agent-activity-status.md).
 
+### 6. Claim ids and report your files
+
+Several agents add design records, decisions, BACKLOG phases and items at the same time. Two agents that pick "the next number" by looking at the repository pick the same one. Claim the id on the hub first (run `git fetch origin` before, so the scan sees every branch):
+
+```bash
+python3 scripts/agent_bridge.py claim design --title "short name" --branch claude/x   # prints 0089
+python3 scripts/agent_bridge.py claim q --title "the question"                        # prints Q87
+python3 scripts/agent_bridge.py claim phase --title "the phase"                       # prints 14
+python3 scripts/agent_bridge.py claim item --prefix TEST --title "the item"           # prints TEST-52
+python3 scripts/agent_bridge.py claim --list [design|q|phase|item]                    # in use, open or stale
+python3 scripts/agent_bridge.py claim --release <claim file name>                     # drop a plan of your own
+```
+
+The next free value is one above the highest in `docs/` on `origin/master`, on every `origin/*` branch and in every claim on the hub. A claim is one new file `claims/<kind>/<value>__<agent>__<time>__<nonce>.json` that is never modified (the random nonce keeps two sessions of one agent apart; `--session` labels the window), so two hosts never write the same file. After writing it the command waits for the hub to sync (`--settle`, default 20 s), looks for another claim of the same value, and keeps it only if its own is the earliest (equal times: the smaller agent id, then the smaller nonce); otherwise it deletes its own file and tries the next value, at most three times (non-zero exit if none settles). Only the writer deletes a claim (`--release`). `--list` shows a claim as `in use` once the value exists on `origin/master`, `open` until then, and `stale` when it has been open for 14 days with no `origin` branch named in it. Claims hold ids, titles, branches and pull request numbers only; never a secret, host name or address.
+
+Report the files you change, so another agent sees a clash before the merge:
+
+```bash
+python3 scripts/agent_bridge.py activity --state active --task "..." --branch claude/x --pr 300 --files-from-git
+python3 scripts/agent_bridge.py activity --overlap          # compare the recorded files with the other agents
+```
+
+`--files-from-git` takes `git diff --name-only origin/master...HEAD` plus the uncommitted and untracked paths; `--files a,b,c` names them by hand. `--overlap` (also run when you start with `--state active` and give files) prints each path that another agent, active or blocked and not STALE, also reports, with its branch and pull request. `CHANGELOG.md`, `docs/BACKLOG.md`, `docs/README.md` and `Cargo.lock` print as "shared, expect a one-line merge". An agent whose record has no files prints as "files unknown". It never blocks and always exits 0. Without a hub, both commands print one notice and exit 0. Design record: 0087.
+
 ## Verify
 
 On either machine (repository root):

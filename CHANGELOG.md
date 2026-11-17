@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
+
 ## [0.4.1] - 2026-11-17
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` (and, like `0.4.0`, serves `0.3.0` workers and clients). It fixes the two defects the Windows smoke test of `0.4.0` found (`BUG-23`, `BUG-24`) and makes four flaky tests deterministic or self-describing (`TEST-29`, `TEST-33`, `TEST-41`).
