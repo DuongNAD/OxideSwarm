@@ -209,7 +209,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
-| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Planned |  |
+| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Partial | 286 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
@@ -2885,6 +2885,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Find the wait or backoff the test depends on, and wait for the condition (all tasks
   terminal) with a bound that does not depend on runner speed, or count requeues.
 - **Done when:** The test passes 50 times in a loop on Windows, one run with CPU load.
+- **Partial (2026-11-17, pull request 286):** not reproduced on Windows 11 in 125 runs (exact and whole binary, no load,
+  2 cores with 4 CPU spinners, 1 core with 6 spinners); the drain after the churn took at most 2.4 s against the
+  20 s bound, and the CI log of the failing job stops before this binary. An aborted worker cannot linger: `Drop for
+  Session` (`crates/worker/src/client/session.rs`) stops its lane tasks, so the socket closes. The drain wait is now
+  60 s and the registration wait 30 s (both end as soon as the condition holds), and a timeout lists every task that
+  is not `Completed` with its state, counts, worker and error. The changed test passed 50 runs on 1 core with 6
+  spinners and 50 without load. On 1 core two other tests of the file failed: `test_stress_reaper_detection_and_failover`
+  (2 of 20, line 1151) and `test_stress_immediate_failover_latency_under_load` (1 of 20, `129.9476ms` against `<100ms`).
 
 ### TEST-34: Show and fix the Agent Mesh simulation Suite 2 failure on macOS
 

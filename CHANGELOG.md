@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `test_stress_high_volume_worker_churn` waits up to 60 s for its 30 tasks (was 20 s) and 30 s for its workers (was 5 s), ending as soon as they are done, and a timeout now lists each task that did not complete with its state and counts (`TEST-33`, Partial: the CI failure was not reproduced).
+
 ## [0.4.0] - 2026-11-17
 
 A minor release with one wire change under `0.x`: protocol version 10 adds an extension slot to tasks (`PROTO-3`) and, for the first time, a one-version compatibility window (`PROTO-4`), so a `0.4.0` master keeps serving `0.3.0` workers and clients while they are upgraded one at a time. It also adds `master --discovery-port` (`CLI-2`), a CI job that runs the newest release against each pull request (`PROTO-2`), the first fuzz targets (`LV-1`), and fixes for flaky tests (`TEST-27` to `TEST-40`).
