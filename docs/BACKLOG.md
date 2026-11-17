@@ -224,7 +224,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
-| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
+| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | PRNUM |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
@@ -3105,6 +3105,19 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Measure the time that really passed before the check (or drive the reaper with a paused clock) and
   assert on that, as TEST-36 to TEST-38 did. If the reaper fired early, fix the reaper instead.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row under CPU starvation on Windows.
+- **Cause:** Confirmed on the owner's Windows desktop (1 core, 6 CPU spinners): the check meant for 100 ms
+  ran after the 200 ms timeout had really passed, and the reaper acted as designed. The old test also timed
+  from after the ack, later than the moment the master stamps the worker's last heartbeat, and bounded the
+  reap at 450 ms. The old test failed 22 of 100 runs there (all on that 450 ms bound; 3 of 100 on 2 cores with
+  4 spinners). The new version printed the boundary check running after the timeout in 71 of 200 runs, once
+  with the worker already Disconnected at `378.9 ms`, which is the failure of run `43944560507`; it saw the
+  reap at up to `1021 ms`.
+- **Status:** Implemented by pull request PRNUM. Times are measured from just before the Register is sent, so
+  a correct reaper can never be seen Disconnected with less than the timeout elapsed: the boundary check
+  asserts "Connected, or the check came after the timeout" and the reap must be seen at or after the
+  timeout. The reap must be seen within 5 s (the configured 200 ms, not the 10 s default, and not never);
+  the time is printed. 200 of 200 runs passed in a row under 1 core and 6 spinners. Control: with the
+  reaper at a quarter of the timeout the test fails (3 of 3, Disconnected at about 110 ms).
 
 ### TEST-43: Show and fix the late dashboard port file of the in-process dev cluster test
 
