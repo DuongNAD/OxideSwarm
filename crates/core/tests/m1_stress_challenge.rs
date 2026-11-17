@@ -585,6 +585,7 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
                 timeout_secs: u64::MAX,
                 max_retries: None,
                 vram_mb: None,
+                extensions: Vec::new(),
             },
             created_at_utc: u64::MAX,
             tags: vec!["tag1".into(), "unicode_🏷️".into(), "".into()],
@@ -594,6 +595,7 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
             inputs: Vec::new(),
             output_globs: Vec::new(),
             workspace: None,
+            extensions: Vec::new(),
         };
 
         let assign = MasterMessage::AssignTask { task };

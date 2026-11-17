@@ -588,6 +588,103 @@ async fn test_assign_task_that_was_cancelled_before_it_arrived_is_refused_not_ru
     }
 }
 
+/// design 0082: a worker advertises one `ext:<id>` tag for each extension it understands (the
+/// test registry here; none in a release build), and a user cannot set one.
+#[test]
+fn test_worker_advertises_ext_tags_for_the_extensions_it_understands() {
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9")
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    let tags = client.capabilities().tags.clone();
+    for id in [0x8001u16, 0x8002, 0x8004] {
+        assert!(tags.contains(&format!("ext:{id}")), "{tags:?}");
+    }
+    assert!(
+        !tags.contains(&"ext:32771".to_string()),
+        "the master-scope entry is not a worker need: {tags:?}"
+    );
+    // A user tag with the reserved prefix does not reach the advertised set.
+    let spoofed = advertised_tags(&["ext:777".to_string()], 4, IsolationLevel::Off, &[], false);
+    assert!(!spoofed.contains(&"ext:777".to_string()), "{spoofed:?}");
+}
+
+/// design 0082 D2.3: a worker refuses a task with a critical extension it does not know, or a
+/// malformed list, with a failed result naming the id; it runs one with an unknown non-critical
+/// extension.
+#[tokio::test]
+async fn test_assign_refuses_unknown_critical_extension_and_runs_unknown_non_critical() {
+    use rusty_grid_core::task::Extension;
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(4)
+            .with_no_battery(true),
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    let make = |ext: Extension| {
+        let mut task = Task::new(
+            rusty_grid_core::task::TaskSpec::command("true", vec![]),
+            TaskRequirements::generic(1, 30),
+        );
+        task.extensions = vec![ext];
+        task
+    };
+
+    let task = make(Extension {
+        id: 0x1234,
+        critical: true,
+        bytes: vec![1],
+    });
+    let task_id = task.id;
+    client.handle_assign_task(task, tx.clone()).await;
+    match rx.recv().await.expect("a refusal") {
+        WorkerMessage::TaskResult {
+            task_id: rid,
+            exit_code,
+            error,
+            ..
+        } => {
+            assert_eq!(rid, task_id);
+            assert_ne!(exit_code, 0);
+            let error = error.unwrap();
+            assert!(
+                error.contains("needs extension 4660, which this worker does not support"),
+                "{error}"
+            );
+        }
+        other => panic!("Expected a failed TaskResult, got {other:?}"),
+    }
+    assert!(client.active_task_table.read().await.is_empty());
+
+    // Over a limit: refused the same way.
+    let oversized = make(Extension {
+        id: 0x1234,
+        critical: false,
+        bytes: vec![0; rusty_grid_core::task::MAX_EXTENSION_BYTES + 1],
+    });
+    client.handle_assign_task(oversized, tx.clone()).await;
+    match rx.recv().await.expect("a refusal") {
+        WorkerMessage::TaskResult { error, .. } => {
+            assert!(error.unwrap().contains("limit is 65536"));
+        }
+        other => panic!("Expected a failed TaskResult, got {other:?}"),
+    }
+
+    // Unknown but not critical: ignored, the task runs.
+    let task = make(Extension {
+        id: 0x1234,
+        critical: false,
+        bytes: vec![1],
+    });
+    let task_id = task.id;
+    client.handle_assign_task(task, tx).await;
+    match rx.recv().await.expect("progress of the run") {
+        WorkerMessage::TaskProgress { task_id: pid, .. } => assert_eq!(pid, task_id),
+        other => panic!("Expected TaskProgress, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_worker_client_concurrency_bounded_by_cores() {
     let config = WorkerConfig::new("127.0.0.1:9999")
@@ -2404,6 +2501,7 @@ fn test_worker_advertises_system_tags_then_user_tags() {
         "iso:off".to_string(),
     ];
     expected.extend(rusty_grid_core::capabilities::detect_host_tools());
+    expected.extend(rusty_grid_core::task::worker_extension_tags());
     expected.push("laptop".to_string());
     assert_eq!(
             client.capabilities().tags,
@@ -3985,4 +4083,93 @@ fn test_worker_client_plumbs_and_validates_isolation_read_dirs() {
         Err(GridError::Config(msg)) => assert!(msg.contains("workspace_root"), "{msg}"),
         other => panic!("expected Config error, got {other:?}"),
     }
+}
+
+/// Design 0083 D5: with the compatibility window open the generic range check also lets the
+/// previous version through, but a worker takes only an echo of its own version from the master.
+/// A master that answers at the previous version is refused, so the upgrade order stays "master
+/// first".
+#[tokio::test]
+async fn test_worker_refuses_a_register_ack_stamped_with_the_previous_version() {
+    let (client_io, master_io) = tokio::io::duplex(4096);
+    let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+    let worker_id = client.worker_id();
+
+    tokio::spawn(async move {
+        let mut master_transport = MessageTransport::new(master_io);
+        let _ = master_transport
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        // A master of the previous version answers at its own version.
+        master_transport
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: true,
+                worker_id,
+                heartbeat_interval_secs: 3,
+                message: None,
+                protocol_version: PROTOCOL_VERSION_CURRENT - 1,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut client_transport = MessageTransport::new(client_io);
+    let err = client
+        .perform_handshake(&mut client_transport)
+        .await
+        .expect_err("worker must refuse a RegisterAck stamped with the previous version");
+    assert!(
+        err.to_string().contains(&format!(
+            "Incompatible protocol version {}",
+            PROTOCOL_VERSION_CURRENT - 1
+        )),
+        "{err}"
+    );
+}
+
+/// A master of the previous version refuses this worker's `Register` (version 10 is above its
+/// range); the worker reports the refusal text rather than a version mismatch of its own.
+#[tokio::test]
+async fn test_worker_reports_a_previous_version_master_refusing_its_register() {
+    let (client_io, master_io) = tokio::io::duplex(4096);
+    let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+    let worker_id = client.worker_id();
+
+    tokio::spawn(async move {
+        let mut master_transport = MessageTransport::new(master_io);
+        let _ = master_transport
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = format!(
+            "Incompatible protocol version {PROTOCOL_VERSION_CURRENT} from worker \
+             (supported: {0}..={0}; upgrade both master and worker to matching builds)",
+            PROTOCOL_VERSION_CURRENT - 1
+        );
+        master_transport
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id,
+                heartbeat_interval_secs: 0,
+                message: Some(reason),
+                protocol_version: PROTOCOL_VERSION_CURRENT - 1,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut client_transport = MessageTransport::new(client_io);
+    let err = client
+        .perform_handshake(&mut client_transport)
+        .await
+        .expect_err("a refused registration is an error");
+    assert!(
+        matches!(&err, GridError::RegistrationRejected(m) if m.contains("Incompatible protocol version")),
+        "{err:?}"
+    );
 }

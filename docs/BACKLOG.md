@@ -151,9 +151,9 @@ Phase 12 adds twelve items (PROTO-1 to PROTO-4, TEST-28 to TEST-32, SEC-16, BUG-
 the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with its pull request),
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
-(TEST-33 to TEST-35), it holds 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 277 (CLI-2 Implemented, TEST-36 to TEST-38 added): 153 items, 99 Implemented,
-11 Partial and 43 Planned.
+(TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 278 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5 added): 154 items,
+101 Implemented, 11 Partial and 42 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -309,8 +309,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented | (open), (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented | (design 0076) |
-| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Planned | (design 0082) |
-| PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Planned | (design 0076) |
+| PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented | (pull request 272), (design 0082) |
+| PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented | (pull request 274), (design 0083) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
@@ -2754,10 +2755,15 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Evidence:** Read. Design 0076 D3.
 - **Problem:** Every added field moves `PROTOCOL_VERSION_MIN_COMPATIBLE`, because bincode is
   positional.
-- **Do:** Write a design record first (done: [design 0082](design/0082-task-extension-slot.md), Draft, 2026-11-17). Then build the slot at the next wire change (Q65), in
+- **Do:** Write a design record first (done: [design 0082](design/0082-task-extension-slot.md), 2026-11-17). Then build the slot at the next wire change (Q65), in
   `crates/core/src/task.rs` and `crates/core/src/protocol.rs`.
 - **Done when:** An optional field can be added with no change to
   `PROTOCOL_VERSION_MIN_COMPATIBLE`.
+- **Status:** Implemented by pull request 272 (draft: it merges together with PROTO-4, one-version
+  window, by the release-train rule of design 0076 D1). Protocol 10, store format 4,
+  `Extension` and the empty registry in `crates/core/src/task.rs`, the `ext:` worker tag and the
+  scheduler check, and the frozen v9 `SubmitTask` decoder. Q68 to Q72 decided by the owner on
+  2026-11-17 (the recommended defaults).
 
 ### PROTO-4: A one-version compatibility window
 
@@ -2767,6 +2773,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** After PROTO-3 (Q66), make the master accept the previous version, update design 0040
   and `crates/core/src/wire_layout_tests.rs`.
 - **Done when:** A worker one version back registers and runs a task.
+- **Design:** [design 0083](design/0083-one-version-window.md) (2026-11-17, based on pull request 272): Q73 to Q79 decided by the owner in chat on 2026-11-17, all on the recommended defaults.
+- **Status:** Implemented by draft pull request 274 (it merges together with PROTO-3, pull request 272, and a release follows within 48 hours, design 0076 D1). `PROTOCOL_VERSION_MIN_COMPATIBLE` is 9 at protocol 10; the master reads each peer's version, encodes for it (`serialize_message_for_peer`, `Task::for_peer`), serves protocol 9 workers and clients, and tags them `proto:9`; the layout test is a range check with `wire_layout_previous.txt` (v0.3.0) as the oracle; the skew job derives its expected table. PROTO-3d (the cross-version tests of design 0082) is built with it.
+
+### PROTO-5: Keep a skew job against the release one protocol back
+
+- **Evidence:** Read. Review of pull request 274.
+- **Problem:** The skew job compares the pull request with the newest release only. After 0.4.0 that is
+  protocol 10, so the one-version window (protocol 10 accepts 9) is no longer exercised against a real
+  protocol 9 binary.
+- **Do:** Pin a second release (v0.3.0 while the window reaches back to 9) in the skew job, with its
+  `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
+- **Done when:** Each pull request shows a table row of a real release one protocol back.
 
 ### TEST-28: Make the group-commit timing test meaningful on slow runners
 
@@ -3351,6 +3369,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-16: SEC-11, SEC-12, SEC-15 and MAINT-1 are Implemented (pull requests 256, 257, 258 and 259). The Index counts, recounted from the status column, are 90 Implemented, 7 Partial and 38 Planned (135 items).
 - 2026-11-16: Phase 12 (0.4.0: upgrade without stopping the cluster, and stability) added at the owner's go-ahead in chat: PROTO-1 (Implemented by the pull request that adds this line), PROTO-2 to PROTO-4, TEST-28 to TEST-32, and SEC-16, BUG-22 and CLI-2 from the Windows smoke test of 0.3.0 (9 of 9 at `3ecc926`; macOS 10 of 10 at `9acc06e`). The Index counts are now 91 Implemented, 7 Partial and 49 Planned (the recount of the table before this phase gave 90, 7 and 38).
 - 2026-11-16: TEST-28 and TEST-30 Implemented (pull requests 265 and 263); TEST-27 and TEST-31 Partial (fixes in, the CI loop of each "Done when" not run); TEST-33 to TEST-35 added from flaky jobs seen while merging 260 to 265. The Index counts are now 93 Implemented, 9 Partial and 48 Planned.
+- 2026-11-17: PROTO-3 Implemented by draft pull request 272 ([design 0082](design/0082-task-extension-slot.md)): protocol 10, store format 4, the extension slot and the `ext:` worker tag; Q68 to Q72 decided by the owner. The pull request holds until PROTO-4 (design 0076 D1); PROTO-3d waits for PROTO-4.
+- 2026-11-17: PROTO-4 Implemented by draft pull request 274 ([design 0083](design/0083-one-version-window.md)): the one-version window (protocol 10 accepts 9), Q73 to Q79 decided by the owner; PROTO-3d built with it. The pull request merges together with PROTO-3 (pull request 272).
 - 2026-11-17: CLI-2 Implemented (pull request 275): `master --discovery-port`; design 0084. The Index counts are now 99 Implemented, 11 Partial and 43 Planned (153 items, recounted when pull request 277 merged master).
 - 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.
 - 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).

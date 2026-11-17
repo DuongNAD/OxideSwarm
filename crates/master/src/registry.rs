@@ -108,6 +108,8 @@ pub struct WorkerEntry {
     pub features: ProtocolCapabilities,
     /// Latest live mobile telemetry snapshot reported by the worker (or seeded from `capabilities.mobile`).
     pub mobile_status: Option<MobileLiveStatus>,
+    /// Wire protocol version the worker registered with (design 0083 D2). Fixed for the session.
+    pub peer_version: u32,
     /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
     /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
     pub preserved_thermal_until: Option<Instant>,
@@ -214,10 +216,18 @@ impl WorkerEntry {
                 status.thermal_tier = None;
             }
         }
+        // The master adds the protocol version the worker registered with as `proto:<n>`
+        // (design 0083 D4), next to the tags `listed_worker` adds for listings.
+        let mut capabilities = self.capabilities.clone();
+        capabilities.tags.push(format!(
+            "{}{}",
+            rusty_grid_core::placement::PROTO_TAG_PREFIX,
+            self.peer_version
+        ));
         WorkerInfo {
             worker_id: self.worker_id,
             session_id: self.session_id,
-            capabilities: self.capabilities.clone(),
+            capabilities,
             status: self.status,
             last_heartbeat_timestamp: self.last_heartbeat_timestamp,
             registered_timestamp: self.registered_timestamp,
@@ -613,6 +623,7 @@ impl WorkerRegistry {
                 excluded_until,
                 heartbeat_interval: hb_interval,
                 mobile_status,
+                peer_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
                 preserved_thermal_until: None,
             };
             inner.workers.insert(worker_id, entry);
@@ -729,6 +740,26 @@ impl WorkerRegistry {
             }
         });
         released
+    }
+
+    /// The protocol version `session_id`'s worker registered with, if that session is live.
+    pub async fn peer_version_of(&self, worker_id: &Uuid, session_id: u64) -> Option<u32> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .filter(|e| e.session_id == session_id)
+            .map(|e| e.peer_version)
+    }
+
+    /// Records the protocol version `session_id`'s worker registered with (design 0083 D2).
+    pub async fn set_peer_version(&self, worker_id: &Uuid, session_id: u64, version: u32) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id {
+                entry.peer_version = version;
+            }
+        }
     }
 
     /// Attaches the receive-side liveness clock of `session_id`'s connection.

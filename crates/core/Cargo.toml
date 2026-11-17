@@ -46,6 +46,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [features]
 default = ["p2p"]
 p2p = ["dep:iroh"]
+# Test-only extension registry entries (design 0082); enabled by dev-dependencies, never in a release.
+test-extensions = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

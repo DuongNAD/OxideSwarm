@@ -289,6 +289,91 @@ pub(super) struct LegacyV6ToV8Task {
     workspace: Option<crate::task::WorkspaceRef>,
 }
 
+/// Protocol v9 positional bincode layout of [`TaskRequirements`], which ended at `vram_mb`
+/// before `extensions` was appended in v10.
+#[derive(Serialize, Deserialize)]
+pub(super) struct LegacyV9TaskRequirements {
+    cpu_cores: usize,
+    ram_mb: u64,
+    gpu_required: bool,
+    timeout_secs: u64,
+    max_retries: Option<u32>,
+    vram_mb: Option<u64>,
+}
+
+/// Protocol v9 positional bincode layout of [`Task`], which ended at `workspace` before
+/// `extensions` was appended in v10 (design 0083). A v10 Master reads a v9 `SubmitTask` through it
+/// and writes `AssignTask` to a v9 worker with it; the frozen v0.3.0 layout file is its oracle.
+#[derive(Serialize, Deserialize)]
+pub(super) struct LegacyV9Task {
+    id: crate::task::TaskId,
+    spec: crate::task::TaskSpec,
+    requirements: LegacyV9TaskRequirements,
+    created_at_utc: u64,
+    tags: Vec<String>,
+    latest_checkpoint: Option<crate::task::CheckpointData>,
+    staged_files: Vec<crate::task::StagedFile>,
+    expected_outputs: Vec<String>,
+    inputs: Vec<crate::blob::TaskInput>,
+    output_globs: Vec<String>,
+    workspace: Option<crate::task::WorkspaceRef>,
+}
+
+impl From<LegacyV9Task> for Task {
+    /// Total: every field of the v9 layout exists in v10, and a v9 peer cannot send an extension,
+    /// so both extension lists are empty.
+    fn from(t: LegacyV9Task) -> Self {
+        Task {
+            id: t.id,
+            spec: t.spec,
+            requirements: crate::task::TaskRequirements {
+                cpu_cores: t.requirements.cpu_cores,
+                ram_mb: t.requirements.ram_mb,
+                gpu_required: t.requirements.gpu_required,
+                timeout_secs: t.requirements.timeout_secs,
+                max_retries: t.requirements.max_retries,
+                vram_mb: t.requirements.vram_mb,
+                extensions: Vec::new(),
+            },
+            created_at_utc: t.created_at_utc,
+            tags: t.tags,
+            latest_checkpoint: t.latest_checkpoint,
+            staged_files: t.staged_files,
+            expected_outputs: t.expected_outputs,
+            inputs: t.inputs,
+            output_globs: t.output_globs,
+            workspace: t.workspace,
+            extensions: Vec::new(),
+        }
+    }
+}
+
+impl From<Task> for LegacyV9Task {
+    /// Drops both extension lists; callers pass the task through `Task::for_peer(9)` first.
+    fn from(t: Task) -> Self {
+        LegacyV9Task {
+            id: t.id,
+            spec: t.spec,
+            requirements: LegacyV9TaskRequirements {
+                cpu_cores: t.requirements.cpu_cores,
+                ram_mb: t.requirements.ram_mb,
+                gpu_required: t.requirements.gpu_required,
+                timeout_secs: t.requirements.timeout_secs,
+                max_retries: t.requirements.max_retries,
+                vram_mb: t.requirements.vram_mb,
+            },
+            created_at_utc: t.created_at_utc,
+            tags: t.tags,
+            latest_checkpoint: t.latest_checkpoint,
+            staged_files: t.staged_files,
+            expected_outputs: t.expected_outputs,
+            inputs: t.inputs,
+            output_globs: t.output_globs,
+            workspace: t.workspace,
+        }
+    }
+}
+
 /// Protocol v3 to v5 positional bincode layout of [`ClientMessage`]: the same variants as v6
 /// except `Hello`, but `SubmitTask` carries a [`LegacyV5Task`]. Used only so a v6+ Master can
 /// refuse a v5 client frame with [`ProtocolError::IncompatibleVersion`] instead of an opaque
@@ -317,8 +402,21 @@ pub(super) enum LegacyV6ToV8BinaryClientMessage {
     },
 }
 
+/// Protocol v9 positional bincode layout of [`ClientMessage::SubmitTask`] carrying
+/// [`LegacyV9Task`]. A v10 Master decodes a v9 `SubmitTask` with it (design 0083 D4); it is
+/// `Serialize` too so tests can speak as a v9 client.
+#[derive(Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub(super) enum LegacyV9BinaryClientMessage {
+    SubmitTask {
+        task: LegacyV9Task,
+        wait: bool,
+        protocol_version: u32,
+    },
+}
+
 impl HumanClientMessage {
-    fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
+    pub(super) fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
         match msg {
             ClientMessage::SubmitTask { task, wait } => HumanClientMessage::SubmitTask {
                 task,
@@ -472,7 +570,7 @@ impl HumanClientMessage {
 }
 
 impl BinaryClientMessage {
-    fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
+    pub(super) fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
         match msg {
             ClientMessage::SubmitTask { task, wait } => BinaryClientMessage::SubmitTask {
                 task,
@@ -824,7 +922,7 @@ impl<'de> Deserialize<'de> for ClientMessage {
 /// Serializes a [`ClientMessage`] stamped with an explicit `protocol_version` (for version-skew
 /// tests). Normal callers use [`super::codec::serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
 #[cfg(test)]
-pub(super) fn serialize_client_message_with_version(
+pub(crate) fn serialize_client_message_with_version(
     msg: &ClientMessage,
     protocol_version: u32,
     codec: super::WireCodec,

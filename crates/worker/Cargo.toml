@@ -41,6 +41,7 @@ gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 3d = []
 
 [dev-dependencies]
+rusty_grid_core = { workspace = true, features = ["test-extensions"] }
 rusty_grid_master = { path = "../master" }
 tempfile = "3"
 

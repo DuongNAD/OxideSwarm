@@ -18,10 +18,17 @@ mod tests;
 #[cfg(test)]
 mod version_and_aead_tests;
 
+#[cfg(test)]
+pub(crate) use client_msg_mirrors::serialize_client_message_with_version;
+#[cfg(test)]
+pub(crate) use client_resp_mirrors::serialize_client_response_with_version;
 pub use codec::{
-    default_codec, derive_aead_keys, deserialize_message, serialize_message, AeadReaderSession,
-    AeadWriterSession, MessageReader, MessageTransport, MessageWriter, AEAD_RECORD_OVERHEAD,
+    default_codec, derive_aead_keys, deserialize_message, deserialize_message_with_version,
+    serialize_message, serialize_message_for_peer, AeadReaderSession, AeadWriterSession,
+    MessageReader, MessageTransport, MessageWriter, AEAD_RECORD_OVERHEAD,
 };
+#[cfg(any(test, feature = "test-extensions"))]
+pub use codec::{deserialize_message_as_v9, serialize_v9_client_message};
 
 /// Maximum allowable frame size in bytes (64 MB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -39,8 +46,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 9;
-/// Minimum wire protocol version compatible with this build.
+pub const PROTOCOL_VERSION_CURRENT: u32 = 10;
+/// Minimum wire protocol version compatible with this build. One version back while the window
+/// of design 0083 is open (`CURRENT - 1`); equal to `CURRENT` when a wire change closes it.
 pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 9;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
@@ -54,6 +62,13 @@ pub const fn default_protocol_version() -> u32 {
 /// [`PROTOCOL_VERSION_MIN_COMPATIBLE`]`..=`[`PROTOCOL_VERSION_CURRENT`].
 pub const fn is_protocol_version_compatible(peer_version: u32) -> bool {
     peer_version >= PROTOCOL_VERSION_MIN_COMPATIBLE && peer_version <= PROTOCOL_VERSION_CURRENT
+}
+
+/// Returns `true` when a worker or client accepts `master_version` as the master's echo: only its
+/// own version (design 0083 D5). The window protects a newer master from older peers, never the
+/// reverse, so a peer does not take a master that answers at an older version.
+pub const fn is_master_echo_acceptable(master_version: u32) -> bool {
+    master_version == PROTOCOL_VERSION_CURRENT
 }
 
 /// Formats a human-readable refusal message when a peer speaks an incompatible wire protocol

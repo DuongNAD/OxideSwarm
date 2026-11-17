@@ -1655,3 +1655,77 @@ async fn test_master_server_bind_enforces_max_queue_size_and_json_wire_codec() {
     assert!(matches!(data_msg, MasterMessage::AssignTask { .. }));
     mux_task2.abort();
 }
+
+/// design 0082 D2.3: a `SubmitTask` with an unknown critical extension, or over a limit, gets a
+/// `ClientResponse::Error` and nothing is queued; an unknown non-critical one is accepted.
+#[tokio::test]
+async fn test_submit_task_refuses_unknown_critical_and_oversized_extensions() {
+    use rusty_grid_core::task::{Extension, TaskRequirements, TaskSpec, MAX_EXTENSION_BYTES};
+    let server = MasterServer::bind(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        WorkerRegistry::new(),
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr;
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(server.run(stop_rx));
+
+    let submit = |extension: Extension| async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client = MessageTransport::with_codec(stream, WireCodec::Bincode);
+        let mut task = Task::new(
+            TaskSpec::command("echo", vec!["ext".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        task.extensions = vec![extension];
+        client
+            .send_msg(&ClientMessage::SubmitTask { task, wait: false })
+            .await
+            .unwrap();
+        client
+            .recv_msg_with_codec::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+    };
+
+    match submit(Extension {
+        id: 0x1234,
+        critical: true,
+        bytes: vec![1],
+    })
+    .await
+    {
+        ClientResponse::Error { message } => {
+            assert!(
+                message.contains("needs extension 4660, which this master does not support"),
+                "{message}"
+            );
+        }
+        other => panic!("expected an error for an unknown critical extension, got {other:?}"),
+    }
+    match submit(Extension {
+        id: 0x1234,
+        critical: false,
+        bytes: vec![0; MAX_EXTENSION_BYTES + 1],
+    })
+    .await
+    {
+        ClientResponse::Error { message } => {
+            assert!(message.contains("limit is 65536"), "{message}")
+        }
+        other => panic!("expected an error for an oversized extension, got {other:?}"),
+    }
+    assert!(matches!(
+        submit(Extension {
+            id: 0x1234,
+            critical: false,
+            bytes: vec![1],
+        })
+        .await,
+        ClientResponse::TaskSubmitted { .. }
+    ));
+    server_task.abort();
+}

@@ -174,6 +174,7 @@ fn test_task_spec_and_result_benchmark() {
             timeout_secs: 60,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         },
     );
     let assign_msg = MasterMessage::AssignTask { task };

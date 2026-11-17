@@ -470,6 +470,10 @@ pub struct TaskRequirements {
     /// Minimum GPU video memory required in MB. None omits any fixed VRAM threshold.
     #[serde(default)]
     pub vram_mb: Option<u64>,
+    /// Optional scheduler-facing fields of later features (design 0082). Appended last: protocol
+    /// version 10.
+    #[serde(default)]
+    pub extensions: Vec<Extension>,
 }
 
 impl Default for TaskRequirements {
@@ -481,6 +485,7 @@ impl Default for TaskRequirements {
             timeout_secs: 60,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         }
     }
 }
@@ -494,6 +499,7 @@ impl TaskRequirements {
             timeout_secs,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         }
     }
 
@@ -506,6 +512,7 @@ impl TaskRequirements {
             timeout_secs,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         }
     }
 
@@ -518,6 +525,7 @@ impl TaskRequirements {
             timeout_secs,
             max_retries: None,
             vram_mb: None,
+            extensions: Vec::new(),
         }
     }
 
@@ -1963,7 +1971,14 @@ pub struct Task {
     /// version 6.
     #[serde(default)]
     pub workspace: Option<WorkspaceRef>,
+    /// Optional fields of later features that the worker acts on (design 0082). Appended last:
+    /// protocol version 10.
+    #[serde(default)]
+    pub extensions: Vec<Extension>,
 }
+
+mod extension;
+pub use extension::*;
 
 /// Longest workspace name in bytes.
 pub const MAX_WORKSPACE_NAME_BYTES: usize = 64;
@@ -2094,6 +2109,7 @@ impl Task {
             inputs: Vec::new(),
             output_globs: Vec::new(),
             workspace: None,
+            extensions: Vec::new(),
         }
     }
 
@@ -2185,6 +2201,7 @@ impl Task {
         }
 
         self.placement()?;
+        self.validate_extensions("master")?;
 
         let mut total_staged: u64 = 0;
         for file in &self.staged_files {
@@ -3601,5 +3618,226 @@ mod tests {
         let mut bad = t;
         bad.workspace = Some(WorkspaceRef::new("ws").with_tree(crate::blob::BlobId([2; 32]), 0));
         assert!(bad.validate().is_err());
+    }
+
+    // --- Extension slot (design 0082) ---------------------------------------------------------
+
+    fn ext(id: u16, critical: bool, bytes: &[u8]) -> Extension {
+        Extension {
+            id,
+            critical,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn command_task() -> Task {
+        Task::new(
+            TaskSpec::new_command("echo", vec!["hi".into()]),
+            TaskRequirements::generic(1, 60),
+        )
+    }
+
+    #[test]
+    fn extensions_round_trip_in_bincode_and_json_and_default_to_empty() {
+        let mut task = command_task();
+        task.extensions = vec![ext(0x8001, false, &[0, 255]), ext(0x9999, true, &[])];
+        task.requirements.extensions = vec![ext(0x8004, true, &[7; 3])];
+        let bin = bincode::serialize(&task).unwrap();
+        assert_eq!(bincode::deserialize::<Task>(&bin).unwrap(), task);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""bytes":"00ff""#), "{json}");
+        assert_eq!(serde_json::from_str::<Task>(&json).unwrap(), task);
+
+        // An empty list is one u64 length per list: 16 bytes more than a task without any.
+        let plain = command_task();
+        let mut grown = plain.clone();
+        grown.extensions = vec![ext(1, false, &[1])];
+        let delta =
+            bincode::serialize(&grown).unwrap().len() - bincode::serialize(&plain).unwrap().len();
+        assert_eq!(
+            delta,
+            2 + 1 + 8 + 1,
+            "id + critical + length + bytes of one entry"
+        );
+    }
+
+    #[test]
+    fn an_unknown_non_critical_extension_is_accepted_and_kept() {
+        let mut task = command_task();
+        task.extensions = vec![ext(0x1234, false, b"future")];
+        assert_eq!(task.validate(), Ok(()));
+        let copy = task.clone();
+        assert_eq!(copy.extensions, task.extensions);
+        assert!(task.required_extension_ids().is_empty());
+        let mut stripped = task.clone();
+        stripped.strip_master_extensions();
+        assert_eq!(stripped.extensions, task.extensions);
+    }
+
+    #[test]
+    fn an_unknown_critical_extension_is_refused_naming_the_id() {
+        let mut task = command_task();
+        task.extensions = vec![ext(0x1234, true, b"limit")];
+        let err = task.validate().unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "Task {} needs extension 4660, which this master does not support",
+                task.id
+            )),
+            "{err}"
+        );
+        let err = task.validate_extensions("worker").unwrap_err();
+        assert!(err.contains("which this worker does not support"), "{err}");
+        // The requirements list counts too.
+        let mut task = command_task();
+        task.requirements.extensions = vec![ext(0x1235, true, b"")];
+        assert!(task.validate().unwrap_err().contains("4661"));
+    }
+
+    #[test]
+    fn known_extensions_follow_the_registry() {
+        let mut task = command_task();
+        // Known, right list, right critical bit, valid value.
+        task.extensions = vec![ext(0x8001, false, b"x"), ext(0x8002, true, b"y")];
+        task.requirements.extensions = vec![ext(0x8004, true, b"z")];
+        assert_eq!(task.validate(), Ok(()));
+        assert_eq!(task.required_extension_ids(), vec![0x8002, 0x8004]);
+
+        // The critical bit is fixed by the registry (D2.6).
+        let mut flipped = command_task();
+        flipped.extensions = vec![ext(0x8002, false, b"y")];
+        assert!(flipped
+            .validate()
+            .unwrap_err()
+            .contains("must have critical = true"));
+        flipped.extensions = vec![ext(0x8001, true, b"y")];
+        assert!(flipped
+            .validate()
+            .unwrap_err()
+            .contains("must have critical = false"));
+
+        // An id in the wrong list is malformed, not unknown.
+        let mut wrong = command_task();
+        wrong.requirements.extensions = vec![ext(0x8002, true, b"y")];
+        assert!(wrong
+            .validate()
+            .unwrap_err()
+            .contains("belongs in the Task list"));
+
+        // A value the decoder refuses.
+        let mut bad = command_task();
+        bad.extensions = vec![ext(0x8001, false, &[0xFF])];
+        assert!(bad.validate().unwrap_err().contains("is invalid"));
+    }
+
+    #[test]
+    fn duplicate_ids_and_id_zero_are_refused() {
+        let mut task = command_task();
+        task.extensions = vec![ext(0x4000, false, b"a"), ext(0x4000, false, b"b")];
+        assert!(task.validate().unwrap_err().contains("more than once"));
+        // The same id in the two lists is two lists, not a duplicate.
+        let mut two_lists = command_task();
+        two_lists.extensions = vec![ext(0x4000, false, b"a")];
+        two_lists.requirements.extensions = vec![ext(0x4000, false, b"b")];
+        assert_eq!(two_lists.validate(), Ok(()));
+        let mut zero = command_task();
+        zero.extensions = vec![ext(0, false, b"")];
+        assert!(zero.validate().unwrap_err().contains("id 0 is invalid"));
+    }
+
+    #[test]
+    fn extension_limits_are_enforced_on_count_size_and_total() {
+        let mut task = command_task();
+        task.extensions = (1..=MAX_EXTENSIONS_PER_LIST as u16)
+            .map(|id| ext(0x4000 + id, false, b""))
+            .collect();
+        assert_eq!(task.validate(), Ok(()));
+        task.extensions.push(ext(0x4100, false, b""));
+        assert!(task.validate().unwrap_err().contains("17 extensions"));
+
+        let mut one = command_task();
+        one.extensions = vec![ext(0x4000, false, &vec![1; MAX_EXTENSION_BYTES])];
+        assert_eq!(one.validate(), Ok(()));
+        one.extensions = vec![ext(0x4000, false, &vec![1; MAX_EXTENSION_BYTES + 1])];
+        assert!(one.validate().unwrap_err().contains("limit is 65536"));
+
+        // 4 x 64 KiB is exactly the task limit; one more byte is over.
+        let mut total = command_task();
+        total.extensions = (0..3)
+            .map(|i| ext(0x4000 + i, false, &vec![1; MAX_EXTENSION_BYTES]))
+            .collect();
+        total.requirements.extensions = vec![ext(0x4010, false, &vec![1; MAX_EXTENSION_BYTES])];
+        assert_eq!(total.validate(), Ok(()));
+        total.requirements.extensions.push(ext(0x4011, false, b"x"));
+        assert!(total
+            .validate()
+            .unwrap_err()
+            .contains("the limit is 262144"));
+    }
+
+    #[test]
+    fn master_scope_extensions_are_stripped_and_worker_scope_ones_need_tags() {
+        let mut task = command_task();
+        task.extensions = vec![
+            ext(0x8001, false, b"h"),
+            ext(0x8002, true, b"w"),
+            ext(0x8003, true, b"m"),
+        ];
+        task.requirements.extensions = vec![ext(0x8004, true, b"b")];
+        // Master-scope 0x8003 needs no worker tag.
+        assert_eq!(task.required_extension_ids(), vec![0x8002, 0x8004]);
+        let placement = task.scheduling_placement().unwrap();
+        assert_eq!(placement.extensions, vec![0x8002, 0x8004]);
+        let id = uuid::Uuid::nil();
+        let tags = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!placement.matches(id, "w", &tags(&["ext:32770"])));
+        assert!(placement.matches(id, "w", &tags(&["ext:32770", "ext:32772"])));
+
+        let mut sent = task.clone();
+        sent.strip_master_extensions();
+        let ids: Vec<u16> = sent.all_extensions().map(|e| e.id).collect();
+        assert_eq!(ids, vec![0x8001, 0x8002, 0x8004]);
+        assert_eq!(task.extensions.len(), 3, "the stored task keeps it");
+    }
+
+    #[test]
+    fn worker_advertises_an_ext_tag_per_understood_extension() {
+        let tags = worker_extension_tags();
+        // Worker and Both scope only; the master-scope test entry is not advertised.
+        assert_eq!(tags, vec!["ext:32769", "ext:32770", "ext:32772"]);
+        for tag in &tags {
+            assert!(crate::placement::validate_user_tag(tag).is_err());
+        }
+    }
+
+    #[test]
+    fn registry_ids_are_unique_nonzero_and_decoders_never_panic() {
+        let mut ids: Vec<u16> = EXTENSION_REGISTRY.iter().map(|e| e.id).collect();
+        ids.extend(TEST_EXTENSION_REGISTRY.iter().map(|e| e.id));
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate registry id");
+        assert!(ids.iter().all(|id| *id != 0));
+        assert!(
+            EXTENSION_REGISTRY
+                .iter()
+                .all(|e| e.id < EXPERIMENTAL_EXTENSION_ID_MIN),
+            "no release entry in the experimental range"
+        );
+        assert!(TEST_EXTENSION_REGISTRY
+            .iter()
+            .all(|e| e.id >= EXPERIMENTAL_EXTENSION_ID_MIN));
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..2_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (state >> 60) as usize;
+            let bytes: Vec<u8> = (0..len).map(|i| (state >> (i % 8 * 8)) as u8).collect();
+            for entry in EXTENSION_REGISTRY.iter().chain(TEST_EXTENSION_REGISTRY) {
+                let _ = (entry.decode)(&bytes);
+            }
+        }
     }
 }

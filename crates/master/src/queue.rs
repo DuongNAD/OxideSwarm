@@ -543,7 +543,7 @@ impl TaskView {
             ),
             required_features: required_features(task),
             avoid: Vec::new(),
-            placement: task.placement(),
+            placement: task.scheduling_placement(),
             workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
     }
@@ -894,8 +894,12 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
                 0
             }
     });
+    // Extension values count with the rest of the task (design 0082 D4); the 3 bytes are the id
+    // and the critical flag.
+    let extensions_bytes: usize = task.all_extensions().map(|e| 3 + e.bytes.len()).sum();
     RETAINED_ENTRY_OVERHEAD_BYTES
         + spec
+        + extensions_bytes
         + staged_files_bytes
         + expected_outputs_bytes
         + blob_refs_bytes

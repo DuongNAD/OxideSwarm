@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::placement::{
-    normalize_arch, normalize_os, IsolationLevel, ARCH_TAG_PREFIX, OS_TAG_PREFIX, TOOL_TAG_PREFIX,
+    normalize_arch, normalize_os, IsolationLevel, ARCH_TAG_PREFIX, EXT_TAG_PREFIX, OS_TAG_PREFIX,
+    TOOL_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::ProtocolCapabilities;
 use rusty_grid_core::task::TaskRequirements;
@@ -368,6 +369,15 @@ impl WorkerAttrIndex {
         }
         for tool in &placement.tools {
             let Some(m) = self.by_tool.get(tool) else {
+                return false;
+            };
+            mask.and_assign(m);
+            if mask.is_empty() {
+                return false;
+            }
+        }
+        for id in &placement.extensions {
+            let Some(m) = self.by_tag.get(&format!("{EXT_TAG_PREFIX}{id}")) else {
                 return false;
             };
             mask.and_assign(m);

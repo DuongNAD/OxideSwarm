@@ -23,9 +23,9 @@ use rusty_grid_core::noise_auth::{
     HandshakePurpose, NodeKeypair, PublicKey,
 };
 use rusty_grid_core::protocol::{
-    deserialize_message, format_incompatible_version_error, is_protocol_version_compatible,
-    ClientMessage, ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities,
-    ProtocolError, PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_JSON,
+    format_incompatible_version_error, is_protocol_version_compatible, ClientMessage,
+    ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities, ProtocolError,
+    PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::{
     GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
@@ -659,8 +659,15 @@ where
             ));
         }
 
-        match deserialize_message::<InboundMessage>(&raw_frame) {
-            Ok((first, codec)) => Ok((first, codec, None)),
+        match rusty_grid_core::protocol::deserialize_message_with_version::<InboundMessage>(
+            &raw_frame,
+        ) {
+            Ok((first, codec, version)) => {
+                if let Some(version) = version {
+                    transport.note_peer_version(version);
+                }
+                Ok((first, codec, None))
+            }
             Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
                 let message = format_incompatible_version_error("client", peer_version);
                 warn!(

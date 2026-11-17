@@ -839,6 +839,7 @@ impl SubmitTaskPayload {
             timeout_secs,
             max_retries: None,
             vram_mb,
+            extensions: Vec::new(),
         };
         Ok(Task::new(TaskSpec::new_shell_script(command), reqs))
     }

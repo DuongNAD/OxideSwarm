@@ -1,6 +1,6 @@
 # 0082: An extension slot for optional task fields
 
-Status: Draft (plan; builds nothing; PROTO-3 of design 0076 D3)
+Status: Implemented (PROTO-3 of design 0076 D3; draft pull request 272, which merges together with PROTO-4)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -143,7 +143,8 @@ This record builds no window. It states the rule PROTO-4 follows so the slot doe
 - **No code execution.** Decoders are plain data; each registry entry's decoder is bounded by its own size limit and returns an error, never panics (fuzzable, see Test plan).
 - **No secret or ticket in extensions.** Extensions are stored in the journal and shown in task listings; nothing sensitive goes in `bytes` unless its design record covers that, as for any task field.
 - **Resource use.** Journal and queue budgets already apply to the whole `Task`; at most 256 KiB per task is added.
-- The `ext:` worker tag is self-declared. A worker that lies about it can only receive tasks it is trusted with already (the same trust as the `tool:` and `iso:` tags).
+- **Known limit (review S1).** The extension limits are checked after the whole frame is decoded with bincode: a 64 MiB frame of empty extensions decodes to about 5.8 million `Extension` structs (about 190 MB transient) before `Task::validate` refuses it. It is the same class as the existing unbounded `Vec<String>` tags. A bounded decoder is a follow-up (status log).
+- The `ext:` worker tag is self-declared on protocol 10 workers (and the master drops it from workers below protocol 10, design 0083 M1). A worker that lies about it can only receive tasks it is trusted with already (the same trust as the `tool:` and `iso:` tags).
 
 ## Test plan
 
@@ -157,17 +158,17 @@ Unit tests in `crates/core/src/task.rs` and `crates/core/src/protocol/tests.rs`,
 6. Scheduler: a task with a known critical `Worker`-scope extension waits (`ClusterLacksCapability` names the id) when no worker has `ext:<id>`, and is placed when one has it; a `Master`-scope extension does not restrict workers and is absent from the copy sent to the worker; `Shape` differs between tasks with different required ids.
 7. A decoder fuzz-style test: random bytes for each registered decoder never panic.
 8. `crates/core/tests/data/wire_layout.txt`: regenerate under `UPDATE_WIRE_LAYOUT=1`. `sample_task()` (`crates/core/src/wire_layout_tests.rs:144`, `:173`) gets one non-critical and one critical extension in `Task` and one in `TaskRequirements`, so the bytes of the lists are recorded. The test still has to fail when the lists change without a version bump. The registry table is recorded in the same file (one `Extension::<id> <name> <list> <critical> <scope>` line per entry, sorted by id), so a changed or removed id is a visible diff.
-9. `legacy_v9_submit_task_is_refused_with_a_version_error` (D6, before PROTO-4); store test that a format-3 snapshot loads in format 4.
+9. `legacy_v9_submit_task_is_refused_with_a_version_error` (D6, before PROTO-4; replaced by `decode_v9_submit_task_is_accepted_and_has_empty_lists` when PROTO-4 opens the window); store test that a format-3 snapshot loads in format 4.
 10. **Cross-version (after PROTO-4):** the skew job of design 0076 D2 and an in-process test with a v9 peer: a v9 `SubmitTask` becomes a task with empty lists; a v10 task with a non-critical extension reaches a v9 worker without it and runs; a v10 task with a critical `Worker` extension never reaches a v9 worker.
 
 ## Work items
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| PROTO-3a | `Extension`, the two fields, `extension_bytes`, registry, bounds and `Task::validate` rules (D1 to D3) | `crates/core/src/task.rs` | Tests 1 to 5 and 7 pass | Planned |
-| PROTO-3b | Protocol 10: version constants, `LegacyV9Task` and wrapper, `wire_layout.txt`, `STORE_FORMAT_VERSION` 4 (D1, D6) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/store.rs`, `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md` | Test 8 and 9 pass; "wire change" pull request, release within 48 hours | Planned |
-| PROTO-3c | `ext:` worker tag, `TaskView::required_extensions`, scheduler check, worker refusal (D2.3, D4) | `crates/core/src/placement.rs`, `crates/worker/src/client.rs`, `crates/worker/src/client/tasks.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `CLAUDE.md` | Tests 3 and 6 pass | Planned |
-| PROTO-3d | Cross-version tests | `crates/master/tests/`, CI | Test 10 passes (needs PROTO-4) | Planned |
+| PROTO-3a | `Extension`, the two fields, `extension_bytes`, registry, bounds and `Task::validate` rules (D1 to D3) | `crates/core/src/task.rs` | Tests 1 to 5 and 7 pass | Implemented |
+| PROTO-3b | Protocol 10: version constants, `LegacyV9Task` and wrapper, `wire_layout.txt`, `STORE_FORMAT_VERSION` 4 (D1, D6) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/store.rs`, `docs/design/0040-protocol-versioning.md`, `DEPLOYMENT.md` | Test 8 and 9 pass; "wire change" pull request, release within 48 hours | Implemented (the release is pending) |
+| PROTO-3c | `ext:` worker tag, `TaskView::required_extensions`, scheduler check, worker refusal (D2.3, D4) | `crates/core/src/placement.rs`, `crates/worker/src/client.rs`, `crates/worker/src/client/tasks.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `CLAUDE.md` | Tests 3 and 6 pass | Implemented |
+| PROTO-3d | Cross-version tests | `tests/window_v9_peers.rs`, `crates/core/src/window_tests.rs`, `scripts/release_skew.py` | Test 10 passes (needs PROTO-4) | Implemented (pull request 274, design 0083) |
 
 The three first items fit one pull request (L, as in the backlog). They land at the next wire change (Q65).
 
@@ -184,3 +185,49 @@ The three first items fit one pull request (L, as in the backlog). They land at 
 ## Status log
 
 - 2026-11-17: Draft written for PROTO-3 (design 0076 D3, Q65). Statements about code were checked on `master` `619b609`. Builds nothing.
+- 2026-11-17: The owner decided Q68 to Q72 in chat, all on the recommended defaults: `workspace` and
+  `vram_mb` stay typed (Q68); workers advertise `ext:<id>` tags, a tenth reserved prefix (Q69); two
+  lists (Q70); limits 16 per list, 64 KiB per extension, 256 KiB per task (Q71); the registry fixes
+  `critical` per id (Q72).
+- 2026-11-17: Built by draft pull request 272 (PROTO-3a, PROTO-3b, PROTO-3c): protocol 10, store
+  format 4, `Extension` and the empty registry, the frozen v9 `SubmitTask` decoder, the `ext:` tag,
+  the scheduler check and the worker refusal. The pull request is a wire change and holds until
+  PROTO-4 (design 0076 D1). PROTO-3d (test 10, the cross-version tests with a v9 peer) waits for
+  PROTO-4; before it, the skew job (design 0076 D2) shows both cross pairs refused with the version
+  error and the pull request pair working. Deviations from this record, where the code forced or
+  allowed a different shape:
+  - **Test registry (D3).** The test entries sit in `TEST_EXTENSION_REGISTRY` behind the core
+    feature `test-extensions`, which only the dev-dependencies of `rusty_grid_master` and
+    `rusty_grid_worker` enable, so their tests can use known ids. A plain `#[cfg(test)]` entry is
+    invisible to the other crates. A release build has an empty registry and no test entry. The wire
+    layout file records `EXTENSION_REGISTRY` only (one `Extension::<id, 5 digits>` line per entry,
+    none today), so the file does not depend on the feature. As a consequence of the existing layout
+    test, adding or editing a registry id needs a `PROTOCOL_VERSION_CURRENT` bump with the
+    regeneration, and changing or removing one needs `MIN` too; that is stricter than D1's "may
+    move", and it is the visible diff D3 asked for.
+  - **Location (D1, D3).** The types, registry, limits and receiver rules sit in
+    `crates/core/src/task/extension.rs`, re-exported by `crates/core/src/task.rs` (so the path
+    `rusty_grid_core::task::Extension` is as written): `task.rs` would have passed the 3,000-line
+    check of design 0080.
+  - **`decode` (D3)** is `fn(&[u8]) -> Result<(), String>`: it checks the value. The typed value
+    arrives with the first real id, whose record fixes its type.
+  - **Placement (D4.3).** There is no `TaskView::required_extensions` and no new `Shape` field.
+    `Placement` gains `extensions: Vec<u16>`, which is not readable from `require:` tags;
+    `Task::scheduling_placement` adds the ids of the task's known critical `Worker`/`Both`
+    extensions to the placement, `TaskView::placement` carries it, the worker index matches it
+    against the `ext:<id>` tag, and `Shape` already contains the placement. The effect is the one D4
+    states, and the wait and unfulfillable message is "no worker matches the placement constraints
+    (ext=<id>)".
+  - **Stripping (D4.4)** removes every extension of scope `Master` from the worker's copy, critical
+    or not, in the one place that builds `AssignTask` (`WorkloadScheduler`); D4.4 spoke of critical
+    ones only. The stored task keeps all of them.
+  - **Messages.** Bound and registry errors read `Task <id>: ...`; the unknown critical one reads
+    `Task <id> needs extension <n>, which this master does not support` (`worker` at assignment).
+  - The worker's refusal is a plain failed `TaskResult`, not one of the `WORKER_REJECTION_MARKERS`
+    texts, so the master does not requeue the task onto another worker: no other worker would run
+    it either.
+  - `Task::validate` checks the extension lists after placement; the queue charges extension bytes
+    (`3 + bytes.len()` per entry) in `task_active_bytes`, with a test.
+  - Unverified here: Windows and Linux runs of the new tests, and test 10 (PROTO-3d).
+- 2026-11-17: PROTO-3d built with PROTO-4 (pull request 274, [design 0083](0083-one-version-window.md)): test 10 is `tests/window_v9_peers.rs` (a v9 worker registers and runs a task; a non-critical extension is dropped from its copy and a critical `Worker` extension never reaches it; a v9 client submits, polls and lists, in both codecs) plus the skew job. The D6 rule "a v10 master refuses a v9 `SubmitTask`" is replaced by the window: a v9 `SubmitTask` is read through `LegacyV9Task` (D2 of design 0083), and `legacy_v9_submit_task_is_refused_with_a_version_error` became `decode_v9_submit_task_is_accepted_and_has_empty_lists`.
+- 2026-11-17: Review follow-ups. S1: the extension limits are checked after a full bincode decode (known limit, Security section); a decoder that stops early is not built. M1 (a v9 worker forging `ext:`) is fixed in design 0083's status log.

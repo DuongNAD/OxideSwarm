@@ -272,18 +272,25 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`; note: the Gradle APK project in `packaging/android/app/` does not compile yet, see `AND-1` in [docs/BACKLOG.md](docs/BACKLOG.md)).
 
 ### 3.5 Upgrading a running grid (master and workers)
-All nodes in a cluster (`master`, `worker`, and CLI/MCP clients) must run one build: `Task`, `TaskResult`, and message
-frames are encoded positionally with bincode. Workers, clients, and the master exchange `PROTOCOL_VERSION_CURRENT`
-(version 9 on `master` and version 8 in release `0.2.0`, each with `PROTOCOL_VERSION_MIN_COMPATIBLE` equal to it; see `docs/design/0040-protocol-versioning.md`). Every
-protocol version bump breaks older peers (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT`), and each side
-refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (v8 refuses v7 and older peers).
+`Task`, `TaskResult`, and message frames are encoded positionally with bincode. Workers, clients, and the master
+exchange `PROTOCOL_VERSION_CURRENT` (version 10 on `master`, 9 in release `0.3.0`). **A master accepts one version back**
+(`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT - 1`, the window of `docs/design/0083-one-version-window.md`):
+a `0.4.0` (protocol 10) master serves `0.3.0` (protocol 9) workers and clients, which keep working unchanged while you
+upgrade them one at a time; a task copy sent to a protocol 9 worker has no extension lists (an extension a worker must
+understand is never placed on it), and `oxideswarm workers` lists such a worker with the tag `proto:9`. A worker or
+client takes from the master only an echo of its own version, so a newer worker or client is still refused by an older
+master (`10` refused by `9`): the window protects a newer master from older peers, never the reverse. A pull request
+that cannot be additive closes the window for its version (`MIN == CURRENT`); the release notes say so. When the master
+later moves to protocol 11, every worker still on 9 is refused: finish the worker upgrade first (`proto:<n>` shows who
+is behind; the master also logs a warning once per session). Each side refuses any peer outside its
+`PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`.
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`
 and `ClientResponse` (unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and
 `connect_master` runs a side-effect-free `Hello` version check before sending any state-changing request so a
 newer CLI never executes a task on an older master (a master older than version 6 cannot decode `Hello` and drops the
 connection; the CLI then reports a closed connection, an I/O error or an unreadable reply to the version check, and
 in each case prints the "older or newer build, upgrade both Master and CLI" hint). Always **upgrade and restart the master first**, then the workers
-and CLIs: an upgraded v8 master immediately refuses v7 (and older) workers and clients before registration or task
+and CLIs: an upgraded master refuses peers more than one version back before registration or task
 submission, whereas a newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`,
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
@@ -291,7 +298,9 @@ When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir
 or `SIGTERM`) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
-protocol version is refused at startup with a `GridError::Storage` message.
+protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk
+format: moving from `0.3.0` to `0.4.0` still needs the clean stop. **Rolling back** a master after it ran as `0.4.0`
+needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open.
 Starting in protocol version 8 (`ENROLL-1a` / `ENROLL-1b`, `docs/design/0051-machine-identity-and-invites.md`), the
 master also writes `master_noise.key` and `members.json` under `--state-dir` (or `~/.oxideswarm/` when `--state-dir` is
 not set, once the default `~/.oxideswarm/cluster.secret` exists, `--auth members` is used, or `oxideswarm invite` is run)

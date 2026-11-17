@@ -36,18 +36,27 @@ use crate::blob_transfer::{BlobReply, BlobRequest};
 use crate::capabilities::{BatteryTier, MobileCapabilities, ThermalTier, WorkerCapabilities};
 use crate::mapreduce::{MapFunctionSpec, MapReduceJobSpec, MapReduceResult, ReduceFunctionSpec};
 use crate::protocol::{
-    deserialize_message, serialize_message, ClientMessage, ClientResponse, InboundMessage,
-    MasterMessage, ProtocolCapabilities, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
-    PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
+    deserialize_message, serialize_client_message_with_version,
+    serialize_client_response_with_version, serialize_message, ClientMessage, ClientResponse,
+    InboundMessage, MasterMessage, ProtocolCapabilities, WireCodec, WorkerMessage,
+    PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE,
+    WIRE_FORMAT_JSON,
 };
 use crate::task::{
-    AutoRigSpec, Bytes, CheckpointData, Generative3DSpec, OutputArtifact, StagedFile, Task, TaskId,
-    TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity, WorkspaceRef,
-    WorkspaceSource,
+    AutoRigSpec, Bytes, CheckpointData, Extension, Generative3DSpec, OutputArtifact, StagedFile,
+    Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity,
+    WorkspaceRef, WorkspaceSource, EXTENSION_REGISTRY,
 };
 
 /// The recorded encodings, relative to the crate root.
 const WIRE_LAYOUT_FILE: &str = "tests/data/wire_layout.txt";
+/// The `wire_layout.txt` of the latest release that speaks `PROTOCOL_VERSION_CURRENT - 1`, copied
+/// from its tag (design 0083 D7). It exists exactly while the window is open
+/// (`PROTOCOL_VERSION_MIN_COMPATIBLE < PROTOCOL_VERSION_CURRENT`).
+pub(crate) const PREVIOUS_WIRE_LAYOUT_FILE: &str = "tests/data/wire_layout_previous.txt";
+/// The version stamp the recorded `ClientMessage` and `ClientResponse` entries carry, so a version
+/// bump does not rewrite them (design 0083 D1).
+pub(crate) const RECORDED_STAMP: u32 = 0;
 /// Set to `1` to rewrite [`WIRE_LAYOUT_FILE`] from the current encodings instead of comparing.
 const UPDATE_ENV: &str = "UPDATE_WIRE_LAYOUT";
 /// Optional git ref to compare [`WIRE_LAYOUT_FILE`] against in CI (`push` compares with
@@ -64,7 +73,11 @@ const HEADER: &str = "\
 # Bincode wire layout of the protocol messages (crates/core/src/protocol.rs): one canonical
 # instance per variant of WorkerMessage, MasterMessage, ClientMessage and ClientResponse, built in
 # crates/core/src/wire_layout_tests.rs, as `<Enum>::<Variant> <hex>` (the frame payload after the
-# 0x02 format byte), sorted by name. Read the test's failure message, then regenerate with
+# 0x02 format byte), sorted by name. ClientMessage and ClientResponse entries carry a fixed version
+# stamp of 0 (the real stamp is the last field), so a version bump does not rewrite them. The
+# extension registry of crates/core/src/task.rs (design
+# 0082) follows as `Extension::<id> <name> <list> critical=<bool> <scope>` lines (none while the
+# registry is empty). Read the test's failure message, then regenerate with
 #   UPDATE_WIRE_LAYOUT=1 cargo test -p rusty_grid_core --lib wire_layout
 #   $env:UPDATE_WIRE_LAYOUT=1; cargo test -p rusty_grid_core --lib wire_layout   (PowerShell)
 ";
@@ -116,7 +129,7 @@ fn features() -> ProtocolCapabilities {
 /// Capabilities `n` (0, 1 or 2). The mirrors carry its four bools side by side and a bool has two
 /// values only, so the three instances take turns: each bool is `true` in one of them (a field a
 /// mirror drops falls back to `false`), and every pair of bools differs in one of them.
-fn worker_capabilities(n: usize) -> WorkerCapabilities {
+pub(crate) fn worker_capabilities(n: usize) -> WorkerCapabilities {
     // [has_gpu, is_simulated_gpu, has_blender, has_cuda]
     const BOOLS: [[bool; 4]; 3] = [
         [true, true, true, true],
@@ -158,7 +171,7 @@ fn checkpoint(n: u8) -> CheckpointData {
 
 /// A task with every field set, `n` giving it its own id and checkpoint. Built literally:
 /// `Task::new` draws a random id and reads the clock.
-fn task(n: u8, spec: TaskSpec) -> Task {
+pub(crate) fn task(n: u8, spec: TaskSpec) -> Task {
     Task {
         id: TaskId(fixed_uuid(0x10 + n)),
         spec,
@@ -171,6 +184,12 @@ fn task(n: u8, spec: TaskSpec) -> Task {
             timeout_secs: 90,
             max_retries: Some(4),
             vram_mb: Some(6_144),
+            // A critical extension of the scheduler list (design 0082 D1).
+            extensions: vec![Extension {
+                id: 0x8004,
+                critical: true,
+                bytes: vec![0xab],
+            }],
         },
         created_at_utc: EPOCH_SECS,
         tags: vec!["require:os=linux".into(), "batch-7".into()],
@@ -208,6 +227,20 @@ fn task(n: u8, spec: TaskSpec) -> Task {
                 manifest_size: 2_048,
             }),
         }),
+        // One non-critical and one critical extension; a value that is not UTF-8 shows the hex
+        // form of the JSON codec as well (design 0082 D1).
+        extensions: vec![
+            Extension {
+                id: 0x8001,
+                critical: false,
+                bytes: vec![0x00, 0xff],
+            },
+            Extension {
+                id: 0x8002,
+                critical: true,
+                bytes: vec![0x01, 0x02, 0x03],
+            },
+        ],
     }
 }
 
@@ -367,7 +400,7 @@ fn map_reduce_result() -> MapReduceResult {
 // instance uses its last variant when that costs nothing (an index shift before it then shows).
 // ---------------------------------------------------------------------------------------------
 
-fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
+pub(crate) fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
     let all = vec![
         (
             "Register",
@@ -475,7 +508,7 @@ fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
     all
 }
 
-fn master_messages() -> Vec<(&'static str, MasterMessage)> {
+pub(crate) fn master_messages() -> Vec<(&'static str, MasterMessage)> {
     let all = vec![
         (
             "RegisterAck",
@@ -571,7 +604,7 @@ fn master_messages() -> Vec<(&'static str, MasterMessage)> {
     all
 }
 
-fn client_messages() -> Vec<(&'static str, ClientMessage)> {
+pub(crate) fn client_messages() -> Vec<(&'static str, ClientMessage)> {
     let all = vec![
         (
             "SubmitTask",
@@ -707,7 +740,7 @@ fn client_messages() -> Vec<(&'static str, ClientMessage)> {
     all
 }
 
-fn client_responses() -> Vec<(&'static str, ClientResponse)> {
+pub(crate) fn client_responses() -> Vec<(&'static str, ClientResponse)> {
     let all = vec![
         (
             "TaskSubmitted",
@@ -1207,7 +1240,7 @@ fn wire_layout_path() -> PathBuf {
 
 /// `<Enum>::<Variant>` -> hex of the bincode encoding (the frame after its 0x02 format byte) of
 /// every canonical instance of the four message enums.
-fn current_wire_layout() -> BTreeMap<String, String> {
+pub(crate) fn current_wire_layout() -> BTreeMap<String, String> {
     fn record<M: Serialize>(
         layout: &mut BTreeMap<String, String>,
         enum_name: &str,
@@ -1222,12 +1255,41 @@ fn current_wire_layout() -> BTreeMap<String, String> {
     let mut layout = BTreeMap::new();
     record(&mut layout, "WorkerMessage", worker_messages());
     record(&mut layout, "MasterMessage", master_messages());
-    record(&mut layout, "ClientMessage", client_messages());
-    record(&mut layout, "ClientResponse", client_responses());
+    // The version stamp is left out of the recorded bytes (design 0083 D1): a fixed stamp.
+    for (variant, msg) in client_messages() {
+        let key = format!("ClientMessage::{variant}");
+        let frame = serialize_client_message_with_version(&msg, RECORDED_STAMP, WireCodec::Bincode)
+            .unwrap_or_else(|e| panic!("{key}: bincode encoding failed: {e}"));
+        assert!(layout.insert(key, to_hex(&frame[1..])).is_none());
+    }
+    for (variant, msg) in client_responses() {
+        let key = format!("ClientResponse::{variant}");
+        let frame =
+            serialize_client_response_with_version(&msg, RECORDED_STAMP, WireCodec::Bincode)
+                .unwrap_or_else(|e| panic!("{key}: bincode encoding failed: {e}"));
+        assert!(layout.insert(key, to_hex(&frame[1..])).is_none());
+    }
+    // The extension registry (design 0082 D3), one line per id: a changed or removed id is a
+    // visible diff. Empty until the first feature that needs an extension.
+    for entry in EXTENSION_REGISTRY {
+        let key = format!("Extension::{:05}", entry.id);
+        let value = format!(
+            "{} {} critical={} {}",
+            entry.name,
+            entry.list.as_str(),
+            entry.critical,
+            entry.scope.as_str()
+        );
+        assert!(
+            layout.insert(key, value).is_none(),
+            "duplicate id {}",
+            entry.id
+        );
+    }
     layout
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(hex, "{byte:02x}");
@@ -1250,7 +1312,10 @@ fn render_wire_layout(layout: &BTreeMap<String, String>) -> String {
 
 /// Parses `# protocol_version: <N>` and `# protocol_version_min_compatible: <M>` from the header
 /// comments of `source`. Both header lines are mandatory.
-fn try_parse_wire_layout_versions_from(text: &str, source: &str) -> Result<(u32, u32), String> {
+pub(crate) fn try_parse_wire_layout_versions_from(
+    text: &str,
+    source: &str,
+) -> Result<(u32, u32), String> {
     let mut version: Option<u32> = None;
     let mut min_compatible: Option<u32> = None;
     for line in text.lines() {
@@ -1347,13 +1412,76 @@ fn verify_wire_layout_file_against_baseline(
     )
 }
 
+/// The window rule of design 0083 D1: `PROTOCOL_VERSION_MIN_COMPATIBLE` is `CURRENT - 1` while
+/// the window is open and `CURRENT` once a wire change closes it; nothing else.
+pub(crate) fn verify_window_range(
+    current_version: u32,
+    current_min_compatible: u32,
+) -> Result<(), String> {
+    if current_min_compatible > current_version {
+        return Err(format!(
+            "PROTOCOL_VERSION_MIN_COMPATIBLE ({current_min_compatible}) exceeds \
+             PROTOCOL_VERSION_CURRENT ({current_version})"
+        ));
+    }
+    if current_min_compatible + 1 < current_version {
+        return Err(format!(
+            "The compatibility window is exactly one version: PROTOCOL_VERSION_MIN_COMPATIBLE must \
+             be {} (window open) or {current_version} (window closed), got \
+             {current_min_compatible}. Bump PROTOCOL_VERSION_MIN_COMPATIBLE in \
+             crates/core/src/protocol.rs (design 0083 D1).",
+            current_version - 1
+        ));
+    }
+    Ok(())
+}
+
+/// The previous-layout file rule of design 0083 D1.4 / D7: while the window is open
+/// (`MIN < CURRENT`) `wire_layout_previous.txt` must exist and record protocol version `MIN`; once
+/// it is closed (`MIN == CURRENT`) the file must not exist.
+pub(crate) fn verify_previous_layout_file(
+    current_version: u32,
+    current_min_compatible: u32,
+    previous_text: Option<&str>,
+) -> Result<(), String> {
+    verify_window_range(current_version, current_min_compatible)?;
+    match (current_min_compatible < current_version, previous_text) {
+        (true, None) => Err(format!(
+            "PROTOCOL_VERSION_MIN_COMPATIBLE ({current_min_compatible}) is below \
+             PROTOCOL_VERSION_CURRENT ({current_version}), so the window is open and \
+             {PREVIOUS_WIRE_LAYOUT_FILE} must hold the wire_layout.txt of the release that speaks \
+             {current_min_compatible} (git show <tag>:crates/core/{WIRE_LAYOUT_FILE})"
+        )),
+        (true, Some(text)) => {
+            let (recorded, _) =
+                try_parse_wire_layout_versions_from(text, PREVIOUS_WIRE_LAYOUT_FILE)?;
+            if recorded != current_min_compatible {
+                return Err(format!(
+                    "{PREVIOUS_WIRE_LAYOUT_FILE} records protocol_version {recorded}, but the \
+                     window reaches back to {current_min_compatible}; copy the file of the \
+                     release that speaks {current_min_compatible}"
+                ));
+            }
+            Ok(())
+        }
+        (false, Some(_)) => Err(format!(
+            "PROTOCOL_VERSION_MIN_COMPATIBLE equals PROTOCOL_VERSION_CURRENT ({current_version}), \
+             so the window is closed and {PREVIOUS_WIRE_LAYOUT_FILE} must be deleted (design 0083 \
+             D1)"
+        )),
+        (false, None) => Ok(()),
+    }
+}
+
 /// Enforces that any wire layout change relative to `recorded_source` bumps
-/// `PROTOCOL_VERSION_CURRENT`, and bumps `PROTOCOL_VERSION_MIN_COMPATIBLE` to `current_version`
-/// whenever an existing variant's encoding changed or was removed.
+/// `PROTOCOL_VERSION_CURRENT`, and that the compatibility window stays exactly one version
+/// (design 0083 D1): a changed or removed entry is allowed with `MIN == CURRENT` (window closed)
+/// or `MIN == CURRENT - 1` (window open), where `window_tests.rs` proves the previous release's
+/// bytes are still carried.
 fn verify_version_bump_for_layout_change(
     recorded_source: &str,
     recorded_version: u32,
-    recorded_min_compatible: u32,
+    _recorded_min_compatible: u32,
     recorded: &BTreeMap<String, String>,
     current_version: u32,
     current_min_compatible: u32,
@@ -1367,13 +1495,7 @@ fn verify_version_bump_for_layout_change(
                  protocol_version ({recorded_version}) in {recorded_source}"
             ));
         }
-        if current_min_compatible > current_version {
-            return Err(format!(
-                "PROTOCOL_VERSION_MIN_COMPATIBLE ({current_min_compatible}) exceeds \
-                 PROTOCOL_VERSION_CURRENT ({current_version})"
-            ));
-        }
-        return Ok(());
+        return verify_window_range(current_version, current_min_compatible);
     }
 
     if current_version <= recorded_version {
@@ -1387,28 +1509,15 @@ fn verify_version_bump_for_layout_change(
         ));
     }
 
-    let existing_variant_changed_or_removed = recorded
-        .iter()
-        .any(|(key, before)| current.get(key) != Some(before));
-    if existing_variant_changed_or_removed
-        && (current_min_compatible <= recorded_min_compatible
-            || current_min_compatible < current_version)
-    {
-        return Err(format!(
-            "An existing canonical message encoding changed or was removed relative to \
-             {recorded_source} (recorded protocol_version {recorded_version}, \
-             min_compatible {recorded_min_compatible}), so older peers cannot decode the new \
-             wire layout. Bump PROTOCOL_VERSION_MIN_COMPATIBLE to {current_version} (got \
-             {current_min_compatible}) in crates/core/src/protocol.rs."
-        ));
-    }
-
-    Ok(())
+    // Either way out of a changed or removed entry (window closed: MIN == CURRENT; window open:
+    // MIN == CURRENT - 1 with the previous release's bytes carried, proven by `window_tests`) is
+    // a MIN inside the window; a MIN further back is refused.
+    verify_window_range(current_version, current_min_compatible)
 }
 
 /// Reads the recorded layout: blank lines and `#` comments are skipped, every other line is
 /// `<Enum>::<Variant> <hex>`, sorted and unique. CRLF line ends (a Windows checkout) are fine.
-fn parse_wire_layout_from(text: &str, source: &str) -> BTreeMap<String, String> {
+pub(crate) fn parse_wire_layout_from(text: &str, source: &str) -> BTreeMap<String, String> {
     let mut layout = BTreeMap::new();
     let mut previous: Option<&str> = None;
     for (index, line) in text.lines().enumerate() {
@@ -1438,7 +1547,7 @@ fn parse_wire_layout(text: &str) -> BTreeMap<String, String> {
 }
 
 /// One entry per variant whose recorded and current encodings differ.
-fn layout_differences(
+pub(crate) fn layout_differences(
     recorded: &BTreeMap<String, String>,
     current: &BTreeMap<String, String>,
 ) -> Vec<String> {
@@ -1633,6 +1742,18 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
         differences.len(),
         differences.join("\n    ")
     );
+    // The window needs the previous release's file exactly while it is open (design 0083 D1.4).
+    let previous = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(PREVIOUS_WIRE_LAYOUT_FILE),
+    )
+    .ok();
+    if let Err(reason) = verify_previous_layout_file(
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        previous.as_deref(),
+    ) {
+        panic!("{reason}");
+    }
     assert_eq!(
         (recorded_ver, recorded_min),
         (PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE),

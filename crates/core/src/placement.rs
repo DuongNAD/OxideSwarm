@@ -6,10 +6,11 @@
 //!
 //! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
-//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`
+//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`,
+//!   `proto:<n>` (the protocol version the worker registered with, design 0083)
 //!   and `feat:<feature>` (`feat:workspaces` when the worker negotiated `WORKSPACES`), and the
 //!   worker adds its task isolation level as `iso:<level>` ([`IsolationLevel`], design 0033)
-//!   and probed host tools as `tool:<name>` (design 0039). Those nine prefixes are
+//!   and probed host tools as `tool:<name>` (design 0039). Those eleven prefixes are
 //!   [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
@@ -43,10 +44,16 @@ pub const ISO_TAG_PREFIX: &str = "iso:";
 pub const TOOL_TAG_PREFIX: &str = "tool:";
 /// Prefix of a protocol-feature tag the master adds to worker listings (`feat:workspaces`).
 pub const FEAT_TAG_PREFIX: &str = "feat:";
+/// Prefix of an extension tag a worker adds itself, one per extension id it understands
+/// (`ext:32770`, design 0082 D4).
+pub const EXT_TAG_PREFIX: &str = "ext:";
+/// Prefix of the tag the master adds to a listed worker with the protocol version it registered
+/// with (`proto:9`, design 0083 D4).
+pub const PROTO_TAG_PREFIX: &str = "proto:";
 /// Tag the master adds to a listed worker when it negotiated `ProtocolCapabilities::WORKSPACES`.
 pub const FEAT_WORKSPACES_TAG: &str = "feat:workspaces";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 9] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 11] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
@@ -56,6 +63,8 @@ pub const RESERVED_TAG_PREFIXES: [&str; 9] = [
     ISO_TAG_PREFIX,
     TOOL_TAG_PREFIX,
     FEAT_TAG_PREFIX,
+    EXT_TAG_PREFIX,
+    PROTO_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;
@@ -257,6 +266,10 @@ pub struct Placement {
     pub tools: Vec<String>,
     /// User tags the worker must all carry, sorted and without duplicates.
     pub tags: Vec<String>,
+    /// Extension ids (`ext:<id>` worker tags, design 0082 D4) the worker must all advertise,
+    /// sorted and without duplicates. Not readable from `require:` task tags: the master derives
+    /// them from a task's critical extensions.
+    pub extensions: Vec<u16>,
 }
 
 impl Placement {
@@ -268,6 +281,14 @@ impl Placement {
             && self.isolation.is_none()
             && self.tools.is_empty()
             && self.tags.is_empty()
+            && self.extensions.is_empty()
+    }
+
+    /// Adds the extension ids a worker must advertise (`ext:<id>`), keeping the list sorted.
+    pub fn require_extensions(&mut self, ids: &[u16]) {
+        self.extensions.extend_from_slice(ids);
+        self.extensions.sort_unstable();
+        self.extensions.dedup();
     }
 
     /// Parses the `require:` entries of a task's tags; tags without that prefix are ignored.
@@ -403,6 +424,12 @@ impl Placement {
         {
             return false;
         }
+        if !self.extensions.iter().all(|id| {
+            let wanted = format!("{EXT_TAG_PREFIX}{id}");
+            worker_tags.contains(&wanted)
+        }) {
+            return false;
+        }
         self.tags.iter().all(|wanted| worker_tags.contains(wanted))
     }
 
@@ -437,6 +464,9 @@ impl fmt::Display for Placement {
         }
         for tag in &self.tags {
             parts.push(format!("tag={tag}"));
+        }
+        for id in &self.extensions {
+            parts.push(format!("ext={id}"));
         }
         f.write_str(&parts.join(", "))
     }
@@ -493,6 +523,7 @@ mod tests {
             "tool:rustc",
             "tool:git",
             "feat:workspaces",
+            "ext:32770",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }
@@ -691,6 +722,7 @@ mod tests {
             isolation: Some(IsolationLevel::FsNet),
             tools: tags(&["cargo", "git", "rustc"]),
             tags: tags(&["cpu", "office"]),
+            extensions: Vec::new(),
         };
         assert_eq!(Placement::from_task_tags(&p.to_task_tags()).unwrap(), p);
     }

@@ -2169,3 +2169,89 @@ async fn ready_views_fair_propagates_requires_tree_v2() {
         "v2 fair view must propagate TREE_V2"
     );
 }
+
+/// An extension id this build does not know travels through the queue and the journal unchanged
+/// (design 0082 D2.2), and a critical one is refused at submission (D2.3).
+#[tokio::test]
+async fn test_extensions_survive_the_queue_and_a_journal_replay_and_critical_unknown_is_refused() {
+    use rusty_grid_core::task::{Extension, MAX_EXTENSIONS_PER_LIST};
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = echo_task("with-extensions");
+    task.extensions = vec![
+        Extension {
+            id: 0x1234,
+            critical: false,
+            bytes: vec![0x00, 0xff, 0x7f],
+        },
+        // Known (test registry), worker scope.
+        Extension {
+            id: 0x8002,
+            critical: true,
+            bytes: vec![9],
+        },
+    ];
+    task.requirements.extensions = vec![Extension {
+        id: 0x4321,
+        critical: false,
+        bytes: vec![],
+    }];
+    let expected = task.clone();
+    let id = task.id;
+    {
+        let (store, recovered) = TaskStore::open(dir.path()).unwrap();
+        let queue = TaskQueue::new();
+        queue
+            .attach_store_and_replay(store, recovered, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(queue.submit(task).await.unwrap(), id);
+        assert_eq!(queue.get_task_spec(&id).await.unwrap(), expected);
+
+        // Unknown critical: refused, nothing queued or stored.
+        let mut critical = echo_task("critical-unknown");
+        critical.extensions = vec![Extension {
+            id: 0x1235,
+            critical: true,
+            bytes: vec![1],
+        }];
+        let critical_id = critical.id;
+        let err = queue.submit(critical).await.unwrap_err().to_string();
+        assert!(err.contains("needs extension 4661"), "{err}");
+        assert!(queue.get_task_spec(&critical_id).await.is_none());
+
+        // Over the count limit: refused.
+        let mut many = echo_task("too-many");
+        many.extensions = (1..=MAX_EXTENSIONS_PER_LIST as u16 + 1)
+            .map(|i| Extension {
+                id: 0x2000 + i,
+                critical: false,
+                bytes: vec![],
+            })
+            .collect();
+        assert!(queue.submit(many).await.is_err());
+    }
+
+    let (store2, recovered2) = TaskStore::open(dir.path()).unwrap();
+    let recovered_queue = TaskQueue::new();
+    recovered_queue
+        .attach_store_and_replay(store2, recovered2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(recovered_queue.get_task_spec(&id).await.unwrap(), expected);
+}
+
+/// Extension values are charged against the active byte budget with the rest of the task.
+#[test]
+fn test_extension_bytes_count_into_the_active_byte_charge() {
+    let plain = echo_task("budget");
+    let mut with = plain.clone();
+    with.extensions = vec![rusty_grid_core::task::Extension {
+        id: 0x4000,
+        critical: false,
+        bytes: vec![0; 10_000],
+    }];
+    assert_eq!(
+        crate::queue::task_active_bytes(&with) - crate::queue::task_active_bytes(&plain),
+        10_003
+    );
+}

@@ -397,9 +397,10 @@ trusted clusters, then a public pool with verified results. The draft is
   (`oxideswarm secret show --dashboard-token`).
 - `--insecure` turns off the secret requirement; use it only on a network you fully control. The
   current handshake (OXS-AUTH v2) has no forward secrecy.
-- Every machine of a cluster must run the same release: the oldest protocol version a peer accepts
-  is the current one. Upgrade and restart the master first, then the workers and clients
-  ([CHANGELOG](CHANGELOG.md), [DEPLOYMENT.md](DEPLOYMENT.md) section 3.5).
+- A master accepts workers and clients that run the previous protocol version (one version back,
+  [design 0083](docs/design/0083-one-version-window.md)), and refuses anything older; a newer worker or
+  client is refused by an older master. Upgrade and restart the master first, then the workers and
+  clients one at a time ([CHANGELOG](CHANGELOG.md), [DEPLOYMENT.md](DEPLOYMENT.md) section 3.5).
 - **Anyone who holds the secret can run commands on every worker.** Share it only with machines you
   trust. Run workers with `--isolation fs` where you can, and never run a worker as root or SYSTEM.
 

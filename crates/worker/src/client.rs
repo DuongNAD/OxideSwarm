@@ -872,7 +872,8 @@ impl Drop for WorkerClient {
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
 /// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
-/// level (`iso:<level>`), its probed host tools (`tool:<name>`), then the
+/// level (`iso:<level>`), its probed host tools (`tool:<name>`), the extensions it understands
+/// (`ext:<id>`, design 0082), then the
 /// configured user tags that are not among them.
 ///
 /// On Windows, when the worker process is elevated (`elevated_on_windows`) and `isolation` is
@@ -902,10 +903,17 @@ fn advertised_tags(
             tags.push(tag.clone());
         }
     }
+    // One `ext:<id>` tag per extension this build understands (design 0082 D4).
+    for tag in rusty_grid_core::task::worker_extension_tags() {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
     for tag in user_tags {
         if !tags.contains(tag)
             && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX)
             && !tag.starts_with(rusty_grid_core::placement::TOOL_TAG_PREFIX)
+            && !tag.starts_with(rusty_grid_core::placement::EXT_TAG_PREFIX)
         {
             tags.push(tag.clone());
         }

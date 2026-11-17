@@ -3,7 +3,7 @@ use super::*;
 use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
 use rusty_grid_core::protocol::{
     ClientMessage, ClientResponse, InboundMessage, ProtocolCapabilities, ProtocolError,
-    PROTOCOL_VERSION_CURRENT,
+    PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
 };
 use rusty_grid_core::task::Task;
 use rusty_grid_core::{MasterMessage, MessageTransport, WorkerCapabilities, WorkerMessage};
@@ -765,12 +765,12 @@ async fn test_client_and_worker_protocol_version_mismatch_refused_on_both_sides(
         .expect("spawn master");
     let addr = server.server_addr;
 
-    // 1. Worker with lower (2, current - 1) or higher (current + 1) protocol_version in both
+    // 1. Worker with lower (2, min compatible - 1) or higher (current + 1) protocol_version in both
     // Bincode and JSON is refused by Master with a clear RegisterAck message.
     for codec in [WireCodec::Bincode, WireCodec::Json] {
         for bad_worker_ver in [
             2u32,
-            PROTOCOL_VERSION_CURRENT - 1,
+            PROTOCOL_VERSION_MIN_COMPATIBLE - 1,
             PROTOCOL_VERSION_CURRENT + 1,
         ] {
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -817,14 +817,14 @@ async fn test_client_and_worker_protocol_version_mismatch_refused_on_both_sides(
         }
     }
 
-    // 2. Client with lower (2, current - 1) or higher (current + 1) protocol_version in both
+    // 2. Client with lower (2, min compatible - 1) or higher (current + 1) protocol_version in both
     // Bincode and JSON receives a clear ClientResponse::Error from the Master, and a client
     // reading a mismatched ClientResponse from a fake Master also refuses with
     // GridError::IncompatibleVersion.
     for codec in [WireCodec::Bincode, WireCodec::Json] {
         for bad_client_ver in [
             2u32,
-            PROTOCOL_VERSION_CURRENT - 1,
+            PROTOCOL_VERSION_MIN_COMPATIBLE - 1,
             PROTOCOL_VERSION_CURRENT + 1,
         ] {
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();

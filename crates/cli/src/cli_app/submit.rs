@@ -959,6 +959,7 @@ async fn run_submit_with_secret_inner(
         timeout_secs,
         max_retries: args.max_retries,
         vram_mb,
+        extensions: Vec::new(),
     };
 
     // Only the input blobs the master lacks are sent, on a connection of their own.

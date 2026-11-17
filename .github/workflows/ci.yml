@@ -266,8 +266,9 @@ jobs:
 
   release-skew:
     # PROTO-2, design 0076 D2: the newest release and the pull request's build, in three pairs on loopback.
-    # It does not demand compatibility. It fails only when a refused pair prints no version error, or when
-    # both speak the same protocol version and a pair does not work. Not a required check.
+    # The expected verdict of each pair follows from the two builds' protocol constants and the one-version
+    # window (design 0083); a pair that differs from it fails, as does a refusal that prints no version error.
+    # Not a required check.
     name: release skew (ubuntu-latest)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -306,8 +307,12 @@ jobs:
           gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
           (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
           tar -xzf "$dl/${name}.tar.gz" -C "$out"
+          # The release's protocol constants give the expected verdict of each pair (design 0083).
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/${GH_REPO}/contents/crates/core/src/protocol.rs?ref=${tag}" > "$dl/protocol.rs"
           echo "Release ${tag} against the pull request build"
-          python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm
+          python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm \
+            --release-protocol-rs "$dl/protocol.rs"
 
   audit:
     name: cargo audit

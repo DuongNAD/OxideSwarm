@@ -1263,10 +1263,10 @@ impl<'de> Deserialize<'de> for ClientResponse {
     }
 }
 
-/// Serializes a [`ClientResponse`] stamped with an explicit `protocol_version` (for version-skew
-/// tests). Normal callers use [`super::codec::serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
-#[cfg(test)]
-pub(super) fn serialize_client_response_with_version(
+/// Serializes a [`ClientResponse`] stamped with an explicit `protocol_version`: the reply to a peer
+/// of that version (design 0083 D3) and the version-skew tests. [`super::codec::serialize_message`]
+/// stamps [`PROTOCOL_VERSION_CURRENT`].
+pub(crate) fn serialize_client_response_with_version(
     msg: &ClientResponse,
     protocol_version: u32,
     codec: super::WireCodec,

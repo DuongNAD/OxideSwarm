@@ -35,13 +35,7 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
         .unwrap()
         .to_vec();
     let len = raw.len();
-    if version < 6 {
-        // A v5 client sent no `workspace` (a one-byte `None` before `wait` and the version).
-        assert_eq!(raw[len - 6], 0);
-        raw.remove(len - 6);
-    }
-    if version < 9 {
-        // Clients before v9 sent no `vram_mb` (a one-byte `None` at the end of `TaskRequirements`).
+    let vram_tag_offset = {
         let mut task_with_vram = task.clone();
         task_with_vram.requirements.vram_mb = Some(0x1122_3344_5566_7788);
         let with_vram = serialize_message(
@@ -52,11 +46,28 @@ fn submit_task_frame(version: u32) -> Vec<u8> {
             WireCodec::Bincode,
         )
         .unwrap();
-        let vram_tag_offset = raw
-            .iter()
+        raw.iter()
             .zip(with_vram.iter())
             .position(|(a, b)| a != b)
-            .expect("vram_mb byte offset");
+            .expect("vram_mb byte offset")
+    };
+    if version < 10 {
+        // Clients before v10 sent no `extensions` lists (an empty list is an 8-byte length):
+        // `Task::extensions` sits before `wait` and the version, `TaskRequirements::extensions`
+        // right after `vram_mb` (one byte, `None`).
+        assert_eq!(&raw[len - 13..len - 5], &[0u8; 8]);
+        raw.drain(len - 13..len - 5);
+        assert_eq!(&raw[vram_tag_offset + 1..vram_tag_offset + 9], &[0u8; 8]);
+        raw.drain(vram_tag_offset + 1..vram_tag_offset + 9);
+    }
+    let len = raw.len();
+    if version < 6 {
+        // A v5 client sent no `workspace` (a one-byte `None` before `wait` and the version).
+        assert_eq!(raw[len - 6], 0);
+        raw.remove(len - 6);
+    }
+    if version < 9 {
+        // Clients before v9 sent no `vram_mb` (a one-byte `None` in `TaskRequirements`).
         assert_eq!(raw[vram_tag_offset], 0);
         raw.remove(vram_tag_offset);
     }
@@ -320,4 +331,50 @@ async fn a_probe_reply_cut_off_mid_frame_is_a_closed_or_io_error() {
         matches!(err, GridError::ConnectionClosed | GridError::Io(_)),
         "got {err:?}"
     );
+}
+
+/// Design 0083 D2/D3: a `Hello` stamped with the previous version (what a v9 client sends) is
+/// answered by a v10 master, and the reply is stamped with the client's version so that the v9
+/// client's own range check accepts it. A v10 client would refuse that reply (it takes only an
+/// echo of its own version), which is what the next test shows from the other side.
+#[tokio::test]
+async fn a_previous_version_hello_is_answered_with_the_clients_own_stamp() {
+    let (server, addr) = spawn_master().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut t = MessageTransport::with_codec(stream, WireCodec::Bincode);
+    t.send_raw_frame(hello_frame(PROTOCOL_VERSION_CURRENT - 1).into())
+        .await
+        .unwrap();
+    let raw = t
+        .recv_raw_frame()
+        .await
+        .unwrap()
+        .expect("the master answers a previous-version Hello");
+    let len = raw.len();
+    assert_eq!(
+        raw[len - 4..],
+        (PROTOCOL_VERSION_CURRENT - 1).to_le_bytes(),
+        "the reply carries the client's version"
+    );
+    // The window's own bound: the number `Hello` reports.
+    assert_eq!(
+        raw[len - 8..len - 4],
+        PROTOCOL_VERSION_MIN_COMPATIBLE.to_le_bytes()
+    );
+    assert!(
+        rusty_grid_core::protocol::deserialize_message::<ClientResponse>(&raw).is_err(),
+        "a v10 reader takes only its own stamp"
+    );
+
+    // A client below the window is still refused with the version error.
+    let message =
+        send_raw_expect_error(addr, hello_frame(PROTOCOL_VERSION_MIN_COMPATIBLE - 1)).await;
+    assert!(
+        message.contains(&format!(
+            "Incompatible protocol version {}",
+            PROTOCOL_VERSION_MIN_COMPATIBLE - 1
+        )),
+        "{message}"
+    );
+    let _ = server.shutdown();
 }

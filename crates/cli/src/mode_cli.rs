@@ -1213,8 +1213,7 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
             ram_mb: 512,
             gpu_required: false,
             timeout_secs: 30,
-            max_retries: None,
-            vram_mb: None,
+            ..Default::default()
         },
     );
 
@@ -1364,8 +1363,7 @@ pub fn run_distributed_benchmark(_workspace_root: &Path) -> ModeExecutionResult 
             ram_mb: ram,
             gpu_required: gpu,
             timeout_secs: 60,
-            max_retries: None,
-            vram_mb: None,
+            ..Default::default()
         });
     }
 
