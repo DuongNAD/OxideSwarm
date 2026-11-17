@@ -228,7 +228,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
-| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
+| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | PRNUM |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
@@ -3143,6 +3143,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Confirm the cause from the master's log in a failing run, then make Worker 2 send heartbeats (or
   give it a timeout it cannot reach) without weakening the assertion about Worker 1.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row under the same starvation.
+- **Cause:** Confirmed: the reaper took Worker 2. With failure messages that name what the master holds, the
+  test alone failed 19 of 100 runs on 1 core next to 6 spinning processes: 18 times Worker 2 got no
+  `AssignTask` (`got None, Worker 2 is Some(Disconnected)`), once the master had already requeued the task
+  after Worker 2's result (`Worker 2 is Some(Disconnected), task: state Queued, retries 2`). Worker 2 was a raw
+  connection that sent no heartbeat, and the reaper timeout was 80 ms, so any 80 ms stall between its
+  registration and its result was enough. The whole binary failed this test in 5 of 20 runs there.
+- **Status:** Implemented by pull request PRNUM. The reaper timeout is 2 s instead of 80 ms, and Worker 2
+  sends a heartbeat every 50 ms from its own task (the transport is split; the reader skips `HeartbeatAck`)
+  until the end of the test. Worker 1 is unchanged: it must still be reaped, end `Disconnected` with no
+  active task, and the task must complete on Worker 2 with `retry_count` 1. The waits for the reap and for
+  the completion are liveness bounds (8 s and 15 s). Failures now print Worker 2's status and the task's
+  state. On 1 core next to 6 spinning processes the test passed 200 of 200 runs in a row.
 
 ### TEST-46: Remove the 100 ms bound from the failover latency stress test
 
