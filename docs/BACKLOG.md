@@ -349,7 +349,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
-| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
+| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3, BENCH-7 |  | Planned |  |
 | LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned |  |
 | COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
@@ -357,6 +357,12 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented | 296, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
+| BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Planned | (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | (design 0093) |
+| BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | (design 0093) |
+| BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | (design 0093) |
+| BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | (design 0093) |
+| BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -3855,6 +3861,71 @@ their first user (Q88), then APP-5.
 - **Do:** `docs/guides/anima-engine-sweeps.md` as design 0089 D5, with GPU and CPU variants and VERIFY-1.
 - **Done when:** The guide exists with a recorded sweep and is linked from `README.md`.
 
+## Phase 17: benchmarks worth showing
+
+From [design 0093](design/0093-benchmarks-worth-showing.md). The owner asked on 2026-11-18 whether the
+benchmarks are strong enough to show. The records are scripted and honest, but none of them measures a
+second machine against the fastest machine alone, offload against the laptop itself, or two machines on
+different networks. Every record follows the method of design 0093 D1: the plan is committed before the run,
+the baseline is the fastest machine alone, and efficiency is measured against the sum of what each machine
+does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 before LAUNCH-4.
+
+### BENCH-2: The method and the sweep harness for benchmark records
+
+- **Evidence:** Design 0093 D1. `benchmarks/grid/bench_grid.py` measures loopback only and has no local
+  baseline; DOC-2 shows a report that compared the cluster with its slowest machine.
+- **Do:** Add `benchmarks/sweep/bench_sweep.py` and the synthetic workload `benchmarks/sweep/workload_cpu.py`
+  (W1, standard library, work per task as a parameter), and `benchmarks/sweep/README.md` with the method of
+  D1. The harness runs a workload locally at 1, half and all logical cores, and through a cluster with
+  `submit --json`; it writes the record of D1 rule 5. Add `tests/test_bench_sweep.py` to the CI job
+  `agent-bridge`.
+- **Done when:** `bench_sweep.py --quick --no-write` runs W1 locally and through a loopback cluster, and the
+  helper tests pass in CI on Linux, macOS and Windows.
+
+### BENCH-3: Sweep scaling
+
+- **Evidence:** Design 0093 D2. No record runs real work on two machines against the fastest one alone.
+- **Do:** On the Mac and the Windows case machine, as D2: K trials on each machine alone, through the grid
+  on each worker, then on both; W1 at K = 200 and, by Q90, the Anima Engine runner (W2) at K = 60. A master
+  for the run has a private home, its own port and a secret made for the run. The W2 record also completes
+  step 3 of APP-4.
+- **Done when:** The records are committed under `benchmarks/sweep/results/` with speedup against the
+  fastest machine and efficiency against the sum of both.
+
+### BENCH-4: Offload against local work
+
+- **Evidence:** Design 0093 D3. BENCH-1 (c) never timed the same command on the Mac itself.
+- **Do:** Run `cargo test -p rusty_grid_core --lib --offline` and `cargo build --release --locked --bin
+  oxideswarm` locally on each machine and offloaded from the Mac, cold, warm and after a one-line edit, and
+  record the CPU seconds the Mac spends in each arm. The ssh arm runs only if Q92 is yes.
+- **Done when:** A record holds every arm of D3.
+
+### BENCH-5: Per-task overhead and the break-even task length
+
+- **Evidence:** Design 0093 D4. BENCH-1 (a) measures empty tasks on loopback only.
+- **Do:** On the LAN, W1 tasks of 0, 10 ms, 100 ms, 1 s and 10 s on the fastest machine alone and through the
+  grid on one and two workers, with one CLI process per task and with one long-lived client.
+- **Done when:** A record gives p50 and p95, throughput and efficiency per task length, and the shortest
+  length at which two workers beat the fastest machine alone.
+
+### BENCH-6: Two networks
+
+- **Evidence:** Design 0093 D5. No record measures two machines on different networks; design 0054 plans
+  clusters across the internet.
+- **Do:** With the Mac on a phone's hotspot (the owner switches it) and the Windows worker on the home LAN:
+  `doctor --json` (link kind, round-trip time, MB/s), 100 empty tasks, one 100 MiB input, and BENCH-3 with W1
+  at K = 50; then the same on the LAN the same day.
+- **Done when:** Both records are committed. A relayed link is recorded as it is.
+
+### BENCH-7: Benchmark headlines at the top of the README
+
+- **Evidence:** Design 0093 D6. `README.md` links the hand-typed interconnect report as the comparative
+  benchmark.
+- **Do:** Lead the "Measured" table of `README.md` with the headlines of BENCH-3 to BENCH-6, each linked to
+  its record. Handle the interconnect report by Q91 (default: unlink it from the README and keep the file
+  with its header).
+- **Done when:** The first "Measured" rows link to the records, and `ox-mode doc` passes.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -4248,3 +4319,5 @@ Add one dated line per finished item, newest last.
   first workload; Q88 and Q89 decided by the owner's delegation): APP-4, VERIFY-1 (pull request 296) and APP-5.
   Counted from the rows, the Index holds 191 items: 109 Implemented, 13 Partial and 69 Planned.
 - 2026-11-17: VERIFY-1 Implemented (pull request 296). The Index counts are 110 Implemented, 13 Partial and 68 Planned (191 items).
+- 2026-11-18: Phase 17 added from design 0093 (benchmarks worth showing; ids claimed on the hub):
+  BENCH-2 to BENCH-7, all Planned; LAUNCH-4 now also needs BENCH-7. Q90 to Q92 open.
