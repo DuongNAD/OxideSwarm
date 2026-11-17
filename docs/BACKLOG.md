@@ -210,7 +210,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
-| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented | 263, PRNUM |
+| TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
@@ -1032,7 +1032,7 @@ The standard in `docs/README.md` requires "only what the code does". These items
   separate client with a 10 s deadline, the dead-peer NACK check has 30 s, and both latencies since
   the victim's removal are printed (at most about 8.7 ms under load). Step 1, 50 runs on
   `macos-latest`, is not done.
-- **Implemented (2026-11-17, pull request PRNUM):** cause found, and it was a hub defect, not the
+- **Implemented (2026-11-17, pull request 303):** cause found, and it was a hub defect, not the
   runner. The second failure (pull request 293, job `134020949727`) showed the healthy node answering
   in 21 ms, so the hub was not stalled; the panic was on the flooder's own `send_command` ("channel
   closed"). After the victim is removed, every 100 KiB message still in the flooder's socket gets a
