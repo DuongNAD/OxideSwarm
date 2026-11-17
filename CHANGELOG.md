@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/ci_push_runs.py` prints each CI run for a push on `master` that is not green with its class (failing test, job never acquired, cancelled by an account, other) and whether the window has no run with a failing test; the `fuzz` job retries the nightly toolchain download; a rule that nobody cancels a run for a push on `master` (design 0088, `CI-1`).
 - `submit --verify <N>` (with `--verify-file`) runs a task again on N other matching workers and compares the declared outputs by BLAKE3, printing `verified` or `mismatch` (exit 4); the MCP `submit` tool takes `verify` and `verify_file`. Client side only, no wire change (design 0089 D3, `VERIFY-1`).
 - `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
 

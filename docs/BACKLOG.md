@@ -334,7 +334,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
-| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Planned | (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | (design 0059) |
@@ -3392,6 +3392,24 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   and Windows, and its output for 2026-11-16 names
   twelve runs as cancelled by an account and six as holding a job that was never acquired. The
   two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
+
+- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
+  coordinator (no code).
+  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
+  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
+    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
+  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
+    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
+    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
+    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
+    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
+    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
+    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
+  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
+    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
+    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
+    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
+    test, 1 never acquired. The exit check of Q80 is read from its last line.
 
 ### MAINT-2: Bring the last three files under the size cap
 
