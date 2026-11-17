@@ -230,7 +230,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
-| TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Implemented | PRNUM |
+| TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Implemented | 310 |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
@@ -3200,7 +3200,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   grew by exactly 2 in 5 of 5 runs (147 to 149): handles the first detections allocate once. Next to the
   other tests of its binary the starting count moved between 169 and 173 from run to run, so the count
   included other tests' handles. The `+8` of CI was not reproduced exactly here.
-- **Status:** Implemented by pull request PRNUM. A `tokio::sync::RwLock` in the test file
+- **Status:** Implemented by pull request 310. A `tokio::sync::RwLock` in the test file
   (`handle_count_lock`) is taken exclusively by the two tests that count handles
   (`test_rapid_repeated_detection_sequential_leak_and_stability` and
   `test_rapid_repeated_detection_concurrent_stress`) and shared by every other test of the file that opens
