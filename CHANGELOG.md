@@ -12,7 +12,7 @@ A minor release with one wire change under `0.x`: protocol version 10 adds an ex
 ### Upgrading from 0.3.0
 
 - **Protocol version 10 with a one-version window (`PROTOCOL_VERSION_CURRENT = 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 9`):** **upgrade and restart the master first**. A `0.4.0` master serves `0.3.0` workers and clients unchanged (`oxideswarm workers` tags them `proto:9`); a `0.4.0` worker or client is refused by a `0.3.0` master. The CI job `release skew (ubuntu-latest)` showed both results against the `v0.3.0` archives ([DEPLOYMENT.md](DEPLOYMENT.md) section 3.5, [design 0083](docs/design/0083-one-version-window.md)).
-- **Master state store format 4:** with `--state-dir`, stop the `0.3.0` master cleanly (`SIGINT` or `SIGTERM`) before replacing the binary. Rolling the master back to `0.3.0` needs a copy of `--state-dir` made before the upgrade.
+- **Master state store format 4:** with `--state-dir`, stop the `0.3.0` master cleanly (`SIGINT` or `SIGTERM`) before replacing the binary. Rolling the master back to `0.3.0` needs a copy of `--state-dir` made before the upgrade. On Windows, `windows/oxctl.ps1 stop` ends the master with `taskkill /F`, which skips that clean stop: start the `0.3.0` master in a console window on the same `--state-dir` and stop it with Ctrl+C before the upgrade (`BUG-23`).
 - **Reserved tag prefixes `ext:` and `proto:`:** the master adds them; a worker-supplied `ext:` tag from a protocol 9 worker and every worker-supplied `proto:` tag are dropped ([design 0082](docs/design/0082-task-extension-slot.md)).
 
 ### Changed
