@@ -205,7 +205,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Partial | 263 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented | 265 |
-| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Planned |  |
+| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
@@ -2813,6 +2813,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   running tests, or running the suite under the Windows agent. Then fix it.
 - **Done when:** The job finishes in its usual time on ten runs in a row, or the test that hung is
   fixed and named here.
+- **Partial (2026-11-17, pull request 283):** investigated on a Windows 11 machine with toolchain
+  1.96.0 (`OxideSwarm_Agent_Hub` `test_runs/win_test29_2026-11-17.md`). In both lost jobs steps 1 to 7
+  had succeeded and step 8 (`cargo test --workspace`) was still running. Three CI-like runs found no
+  hang and no memory or handle exhaustion, only three timing flakes under CPU starvation (TEST-36 to
+  TEST-38). The cause of the runner loss is not known. The workspace step now stops at
+  `timeout-minutes: 45`, prints a heartbeat line with the last output line once a minute
+  (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the
+  last 120 lines of the test output, so the next occurrence names the running test.
 
 ### TEST-30: Stop `test_agent_bridge.py` from depending on the host's open ports
 
