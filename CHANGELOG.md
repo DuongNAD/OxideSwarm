@@ -5,12 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-- A worker whose master went away while it uploaded a finished task's output files no longer buffers the task as failed for the resume, and a sandbox lock file unlinked by a sweep can no longer be locked by a second opener (design 0091, `TEST-23`).
-
 ### Added
 - `submit --verify <N>` (with `--verify-file`) runs a task again on N other matching workers and compares the declared outputs by BLAKE3, printing `verified` or `mismatch` (exit 4); the MCP `submit` tool takes `verify` and `verify_file`. Client side only, no wire change (design 0089 D3, `VERIFY-1`).
 - `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
+
+### Fixed
+- A worker whose sandbox base became unusable (missing, not writable, not private) refuses the task with `Task rejected by worker: sandbox base unusable: ...`, which the master hands to another worker without charging a retry, instead of failing the task for good; no wire change (`BUG-25`, [design 0090](docs/design/0090-sandbox-base-refusal-hand-back.md)).
+- The Android bridge tests wait until a stopped worker has finished draining (`common::stop_and_settle`) before the next test starts; the detached `STOPPED` write of the previous test could overwrite the `ERROR: Invalid cluster secret` status the next one had just caused (`TEST-48`).
+- `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` waits up to 30 s, by condition, for each of its two in-process masters to accept connections (was 50 tries 20 ms apart, one second) (`TEST-49`).
+- The reaper boundary test (`TEST-42`) times everything from just before the Register is sent, so it fails only on a reaper that really fires before its timeout; a starved runner that reaches the 100 ms check after the timeout no longer fails it, and the reap is bounded at 5 s instead of 450 ms, with the time printed.
+- The Agent Mesh hub no longer disconnects a sender as a "slow consumer" because of the hub's own replies: it now waits for room in the sender's outbound queue before it handles the next request, so a burst of requests to an unknown node id (one NACK each) slows the sender down instead of overflowing its queue of 8 to 1024 messages. This was the cause of the intermittent `test_slow_consumer_is_disconnected_instead_of_buffering_forever` failures on macOS CI (`TEST-27`).
+- A worker whose master went away while it uploaded a finished task's output files no longer buffers the task as failed for the resume, and a sandbox lock file unlinked by a sweep can no longer be locked by a second opener (design 0091, `TEST-23`).
 
 ## [0.4.1] - 2026-11-17
 

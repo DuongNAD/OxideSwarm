@@ -695,6 +695,24 @@ pub enum SandboxError {
     },
 }
 
+impl SandboxError {
+    /// True when the failure is about the sandbox base itself (missing, not writable, not
+    /// private), which says nothing about the task: another worker may run it (design 0090).
+    pub fn is_base_failure(&self) -> bool {
+        matches!(
+            self,
+            SandboxError::BaseDirUnusable { .. } | SandboxError::BaseDirUnsafe { .. }
+        )
+    }
+
+    /// True when `Sandbox::create` failed in a way that is about the worker's base rather than the
+    /// task: the base refusals above, or an I/O error making the lock directory or the task
+    /// directory under it (a base whose parent is gone, a full or read-only disk).
+    pub fn is_create_refusal(&self) -> bool {
+        self.is_base_failure() || matches!(self, SandboxError::Io { .. })
+    }
+}
+
 /// Effective user id of the worker process.
 #[cfg(unix)]
 fn current_euid() -> u32 {

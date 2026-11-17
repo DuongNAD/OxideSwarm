@@ -7,9 +7,11 @@
 
 use std::time::Duration;
 
+mod common;
+
 use oxideworker::{
     get_telemetry_impl, get_worker_status_impl, is_running_impl, set_sandbox_dir_impl,
-    start_worker_impl, stop_worker_impl, update_telemetry_detailed_impl, update_telemetry_impl,
+    start_worker_impl, update_telemetry_detailed_impl, update_telemetry_impl,
 };
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 
@@ -365,7 +367,7 @@ async fn test_adversarial_master_generated_ticket_compatibility() {
 fn test_adversarial_worker_p2p_ticket_sanitization_and_lan_fallback() {
     let _guard = ADVERSARIAL_TEST_LOCK.blocking_lock();
 
-    stop_worker_impl();
+    common::stop_and_settle();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
         tmp.path().to_string_lossy().into_owned()
@@ -385,7 +387,7 @@ fn test_adversarial_worker_p2p_ticket_sanitization_and_lan_fallback() {
     let status_json = get_worker_status_impl();
     assert!(status_json.contains("status"));
 
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     assert!(!is_running_impl());
 
     // 2. Completely malformed ticket
@@ -408,7 +410,7 @@ fn test_adversarial_worker_p2p_ticket_sanitization_and_lan_fallback() {
 
     // Worker supervisor must cleanly shut down without panic or hang
     assert!(
-        stop_worker_impl(),
+        common::stop_and_settle(),
         "Worker with malformed ticket must stop cleanly"
     );
     assert!(!is_running_impl());
@@ -422,7 +424,7 @@ fn test_adversarial_worker_p2p_ticket_sanitization_and_lan_fallback() {
 fn test_adversarial_worker_rapid_start_stop_cycles() {
     let _guard = ADVERSARIAL_TEST_LOCK.blocking_lock();
 
-    stop_worker_impl();
+    common::stop_and_settle();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
         tmp.path().to_string_lossy().into_owned()
@@ -442,7 +444,7 @@ fn test_adversarial_worker_rapid_start_stop_cycles() {
         assert!(started, "Cycle {i}: Worker failed to start");
         assert!(is_running_impl(), "Cycle {i}: Worker must report running");
 
-        let stopped = stop_worker_impl();
+        let stopped = common::stop_and_settle();
         assert!(stopped, "Cycle {i}: stop_worker_impl must succeed");
         assert!(!is_running_impl(), "Cycle {i}: Worker must report stopped");
     }
@@ -452,7 +454,7 @@ fn test_adversarial_worker_rapid_start_stop_cycles() {
 fn test_adversarial_double_start_and_double_stop_idempotency() {
     let _guard = ADVERSARIAL_TEST_LOCK.blocking_lock();
 
-    stop_worker_impl();
+    common::stop_and_settle();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
         tmp.path().to_string_lossy().into_owned()
@@ -481,9 +483,12 @@ fn test_adversarial_double_start_and_double_stop_idempotency() {
     assert!(is_running_impl());
 
     // 2. Double stop worker
-    assert!(stop_worker_impl(), "First stop_worker should return true");
     assert!(
-        stop_worker_impl(),
+        common::stop_and_settle(),
+        "First stop_worker should return true"
+    );
+    assert!(
+        common::stop_and_settle(),
         "Second stop_worker should be idempotent true"
     );
     assert!(!is_running_impl());
@@ -501,7 +506,7 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     oxideworker::set_p2p_minimal_preset_for_testing(true);
     let _minimal_preset_guard = MinimalPresetGuard;
 
-    stop_worker_impl();
+    common::stop_and_settle();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
         tmp.path().to_string_lossy().into_owned()
@@ -549,6 +554,6 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
         "Worker must successfully connect and register via master genuine P2P ticket, count: {worker_count}"
     );
 
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     let _ = master.shutdown();
 }
