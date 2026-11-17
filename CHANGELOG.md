@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `submit --verify <N>` (with `--verify-file`) runs a task again on N other matching workers and compares the declared outputs by BLAKE3, printing `verified` or `mismatch` (exit 4); the MCP `submit` tool takes `verify` and `verify_file`. Client side only, no wire change (design 0089 D3, `VERIFY-1`).
 - `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
 
+### Fixed
+- `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` waits up to 30 s, by condition, for each of its two in-process masters to accept connections (was 50 tries 20 ms apart, one second) (`TEST-49`).
+
 ## [0.4.1] - 2026-11-17
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` (and, like `0.4.0`, serves `0.3.0` workers and clients). It fixes the two defects the Windows smoke test of `0.4.0` found (`BUG-23`, `BUG-24`) and makes four flaky tests deterministic or self-describing (`TEST-29`, `TEST-33`, `TEST-41`).
