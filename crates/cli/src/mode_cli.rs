@@ -28,6 +28,13 @@ use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use crate::config::{load_config_file, SecretSection};
 use crate::secret_cmd::SecretOpts;
 
+mod dev_launch;
+#[cfg(windows)]
+use dev_launch::clear_current_process_stdio_inherit_flags;
+use dev_launch::{
+    cleanup_failed_cluster_launch, master_log_path, master_log_stdio, with_master_log_tail,
+};
+
 // ANSI terminal colors for CLI output
 const CLR_RESET: &str = "\x1b[0m";
 const CLR_BOLD: &str = "\x1b[1m";
@@ -1837,52 +1844,6 @@ fn write_cluster_tracking_files(
     fs::write(json_file, json_str)
 }
 
-fn cleanup_failed_cluster_launch(
-    children: &mut [&mut std::process::Child],
-    pid_file: &Path,
-    json_file: &Path,
-    dash_port_file: &Path,
-    isolated_home: Option<&Path>,
-) {
-    for child in children {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let _ = fs::remove_file(pid_file);
-    let _ = fs::remove_file(json_file);
-    let _ = fs::remove_file(dash_port_file);
-    if let Some(home) = isolated_home {
-        let _ = fs::remove_dir_all(home);
-    }
-}
-
-#[cfg(windows)]
-fn clear_current_process_stdio_inherit_flags() {
-    use std::os::windows::io::AsRawHandle;
-    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-    extern "system" {
-        fn SetHandleInformation(
-            h_object: *mut std::ffi::c_void,
-            dw_mask: u32,
-            dw_flags: u32,
-        ) -> i32;
-    }
-    for h in [
-        io::stdin().as_raw_handle(),
-        io::stdout().as_raw_handle(),
-        io::stderr().as_raw_handle(),
-    ] {
-        if !h.is_null() {
-            // SAFETY: `h` is a valid OS handle from `std::io::{stdin,stdout,stderr}`. Clearing
-            // `HANDLE_FLAG_INHERIT` stops `CreateProcessW(..., bInheritHandles=TRUE, ...)` from
-            // leaking `ox-mode`'s piped stdout/stderr handles into detached `rusty-grid` children.
-            unsafe {
-                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
-            }
-        }
-    }
-}
-
 /// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking,
 /// verifying that all children stay alive and both workers appear in `/api/status`.
 pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
@@ -1927,6 +1888,16 @@ pub async fn launch_local_dev_cluster_with_ports(
 ) -> ModeExecutionResult {
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
     let start = Instant::now();
+    if master_tcp_port == web_ui_port {
+        // TEST-43: the master would take the port for its grid listener, fail to bind its dashboard
+        // there, keep running without it, and the wait below would end after 8 s with no reason.
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "The master port and the dashboard port are both {web_ui_port}; they must differ"
+        );
+        return res;
+    }
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
@@ -2059,11 +2030,13 @@ pub async fn launch_local_dev_cluster_with_ports(
         master_cmd.arg(&dash_port_file);
         master_cmd.arg("--ephemeral-key");
     }
+    let master_log = master_log_path(workspace_root);
+    let (master_out, master_err) = master_log_stdio(&master_log);
     let master_res = master_cmd
         .current_dir(workspace_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(master_out)
+        .stderr(master_err)
         .spawn();
 
     let mut master_child = match master_res {
@@ -2383,7 +2356,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             res.duration_ms = start.elapsed().as_millis() as u64;
             res.success = false;
             res.exit_code = Some(1);
-            res.stderr = reason;
+            res.stderr = with_master_log_tail(reason, &master_log);
             return res;
         }
 
@@ -2436,7 +2409,7 @@ pub async fn launch_local_dev_cluster_with_ports(
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
-        res.stderr = failure_reason;
+        res.stderr = with_master_log_tail(failure_reason, &master_log);
         return res;
     }
 
