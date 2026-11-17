@@ -17,9 +17,11 @@
 //!    - Rogue worker with invalid secret is rejected by master handshake without crashing master
 //!    - Repeated rapid start/stop cycles operate cleanly without resource leak or deadlocks
 
+mod common;
+
 use oxideworker::{
     get_worker_status_impl, set_cluster_secret_impl, set_sandbox_dir_impl,
-    start_worker_with_secret_impl, stop_worker_impl,
+    start_worker_with_secret_impl,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -31,7 +33,7 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tokio::test]
 async fn test_adversarial_auth_bad_hex_characters() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let bad_hex_inputs = [
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789zzzzzz",
@@ -62,7 +64,7 @@ async fn test_adversarial_auth_bad_hex_characters() {
 #[tokio::test]
 async fn test_adversarial_auth_truncated_hex() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let truncated_inputs = [
         "a",                               // 1 char
@@ -90,7 +92,7 @@ async fn test_adversarial_auth_truncated_hex() {
 #[tokio::test]
 async fn test_adversarial_auth_65_char_hex() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     // Exactly 65 valid hex characters (odd length: 64 + 1 extra char)
     let hex_65 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
@@ -118,7 +120,7 @@ async fn test_adversarial_auth_65_char_hex() {
 #[tokio::test]
 async fn test_adversarial_auth_nonexistent_and_corrupt_file_paths() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let nonexistent_paths = [
         "nonexistent_cluster_secret_file_12345.secret",
@@ -185,7 +187,7 @@ async fn test_adversarial_auth_nonexistent_and_corrupt_file_paths() {
 #[tokio::test]
 async fn test_adversarial_auth_state_recovery_and_rotation() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     // 1. Start with invalid input
     assert!(!set_cluster_secret_impl("invalid_garbage_hex_12345"));
@@ -215,7 +217,7 @@ async fn test_adversarial_auth_state_recovery_and_rotation() {
 #[tokio::test]
 async fn test_adversarial_rapid_worker_connect_disconnect_against_authenticated_master() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let temp_dir = tempdir().unwrap();
     let sandbox_dir = temp_dir.path().join("sandboxes");
@@ -261,7 +263,7 @@ async fn test_adversarial_rapid_worker_connect_disconnect_against_authenticated_
         assert!(registered, "Worker must register in cycle {cycle}");
 
         // Stop worker immediately
-        assert!(stop_worker_impl(), "Stop worker in cycle {cycle}");
+        assert!(common::stop_and_settle(), "Stop worker in cycle {cycle}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -288,7 +290,7 @@ async fn test_adversarial_rapid_worker_connect_disconnect_against_authenticated_
             "Rogue worker with wrong secret must NEVER be admitted into registry"
         );
     }
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
 
     // 3. Clean master shutdown
     let _ = master.shutdown();
