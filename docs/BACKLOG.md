@@ -229,7 +229,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
-| TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
+| TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Implemented | PRNUM |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
@@ -3153,6 +3153,16 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Assert the order of events (the task was re-queued after the disconnect, without waiting for the
   reaper timeout) and print the latency, or use a bound that a starved runner cannot reach.
 - **Done when:** The test passes 200 runs in a row under the same starvation.
+- **Cause:** Two wall-clock windows, not one. On 1 core next to 6 spinning processes the whole test binary
+  failed this test in 12 of 20 runs: 9 times the evicted task was not yet reassigned when the 200 ms wait
+  ended, 3 times the latency was over 100 ms (`116.7 ms`, `152.7 ms`, `166.2 ms`). The same loop failed
+  `test_stress_tcp_rst_vs_graceful_disconnect` once on its 500 ms window for the same graceful failover.
+- **Status:** Implemented by pull request PRNUM. Both tests assert the order of events: after the graceful
+  disconnect the task is reassigned to the survivor within 5 s, which is half of the 10 s reaper timeout of
+  these masters (`ReaperConfig::default()`), so the reassignment came from the disconnect and not from the
+  reaper; the second test still requires `retry_count` and `failover_count` 0. The latency is printed. The
+  wait for the 4 tasks to complete is 30 s (was 8 s), a liveness bound. On 1 core next to 6 spinning
+  processes the two tests passed 200 of 200 runs in a row; the printed latency reached `99.4 ms`.
 
 ### TEST-47: Count only this test's handles in the capability-detection leak test
 
