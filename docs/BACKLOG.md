@@ -209,7 +209,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
-| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented | 286, @@PR@@ |
+| TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented | 276 |
@@ -2909,7 +2909,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   is not `Completed` with its state, counts, worker and error. The changed test passed 50 runs on 1 core with 6
   spinners and 50 without load. On 1 core two other tests of the file failed: `test_stress_reaper_detection_and_failover`
   (2 of 20, line 1151) and `test_stress_immediate_failover_latency_under_load` (1 of 20, `129.9476ms` against `<100ms`).
-- **Implemented (2026-11-17, pull request @@PR@@):** cause found in CI (pull request 288, run `44044328538`, job
+- **Implemented (2026-11-17, pull request 289):** cause found in CI (pull request 288, run `44044328538`, job
   `133906405213`, windows-latest, with the diagnostics of pull request 286): one of the 30 tasks was `Failed` with
   `retries=1 failovers=1 evacuations=1` and `error: Sandbox base: The sandbox base directory '...\.tmpZk4loM' is
   not writable: The system cannot find the file specified. (os error 2)`. The churn loop dropped each retired
