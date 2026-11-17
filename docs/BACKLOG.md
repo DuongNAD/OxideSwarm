@@ -327,7 +327,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
-| LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1 | Yes | Planned |  |
+| LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
 | LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
@@ -3275,7 +3275,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
   once, one with the beacon off.
 
-## Phase 13: public launch
+## Phase 14: public launch
 
 The launch steps of [ROADMAP.md](ROADMAP.md) ("Launch") as items. They wait for the stability
 release: the exit check of Q80 (E3 of design 0088, pull request 291),
@@ -3284,8 +3284,9 @@ release is for early users who accept its limits (ROADMAP.md, "What is missing")
 
 Order:
 
-1. LAUNCH-1, the gate. Agents hold the open test items; the owner holds TEST-24, TEST-25 and the
-   second network.
+1. LAUNCH-1, the gate. Agents hold the open test items; the owner holds TEST-24, TEST-25, the
+   second network and the first round of ADOPT-1. Phase 13 (the path to finished, design 0088) runs
+   beside it.
 2. LAUNCH-2, on the release that passes the gate.
 3. LAUNCH-3, then LAUNCH-4.
 4. LAUNCH-5.
@@ -3305,8 +3306,10 @@ not part of this phase.
      `master` has seven days of runs for pushes in which no test fails.
   2. TEST-24 and TEST-25 each have one dated record.
   3. One run across two real networks is recorded (LINK-1), with the USB kit if it is used (USB-1c).
-  4. The release that passes 1 to 3 is tagged (a `0.4.x` with no wire change).
-- **Done when:** All four lines hold, each with the record or run that shows it, and the owner names the
+  4. The first round of the study of first use (ADOPT-1, Q37) is recorded, and the defects it found that
+     stop a first run are fixed.
+  5. The release that passes 1 to 4 is tagged (a `0.4.x` with no wire change).
+- **Done when:** All five lines hold, each with the record or run that shows it, and the owner names the
   launch date.
 
 ### LAUNCH-2: Install and run from the README alone on clean machines
@@ -3317,8 +3320,9 @@ not part of this phase.
 - **Do:** On a clean macOS, Windows and Linux machine (a new user account is enough), follow only the
   README's install and quick start with the release archive, up to one task that runs on the other
   machine, then the MCP setup of [guides/mcp-client-setup.md](guides/mcp-client-setup.md) with one coding
-  agent. Note the time to the first finished task and every step where the text was not enough, and fix
-  the text.
+  agent, using the install scripts of ADOPT-3 where they exist. Note the time to the first finished task
+  and every step where the text was not enough, and fix the text. ADOPT-3 scripts the same measure (M15);
+  this item is the walk-through by a person on each system.
 - **Done when:** A dated record lists the three systems, the times and the fixes, and a second pass on
   one system needs no knowledge outside the README.
 
@@ -3733,6 +3737,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: Release `0.4.1` prepared (no wire change; BUG-23, BUG-24, TEST-29 diagnostics, TEST-33 and
   TEST-41): versions, CHANGELOG with an "Upgrading from 0.4.0" note, README install lines, DEPLOYMENT section
   3.5 and the ROADMAP release table. The Index counts are unchanged.
-- 2026-11-17: Phase 13 (public launch) added with LAUNCH-1 to LAUNCH-5, the launch steps of ROADMAP.md as items with
+- 2026-11-17: Phase 14 (public launch) added with LAUNCH-1 to LAUNCH-5, the launch steps of ROADMAP.md as items with
   their gate (Q80, TEST-24, TEST-25, a two-network run); TEST-48 added for the Android bridge test that failed in
   pull request 289. The Index counts are 106 Implemented, 13 Partial and 53 Planned (172 items).

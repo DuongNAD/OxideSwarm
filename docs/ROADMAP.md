@@ -400,10 +400,10 @@ After the Phase D exit check, and not before it:
    waits for LLM-2 and LLM-4 of design 0038 (decision Q4). LLM-1, which routes a prompt to the
    worker that holds a model, can be shown earlier.
 
-These steps are items LAUNCH-2 to LAUNCH-5 of Phase 13 in [BACKLOG.md](BACKLOG.md). The launch waits
+These steps are items LAUNCH-2 to LAUNCH-5 of Phase 14 in [BACKLOG.md](BACKLOG.md). The launch waits
 for LAUNCH-1: the first `0.4.x` release that passes the exit check of Q80, with dated records of
-TEST-24 and TEST-25 and one run across two real networks. Until then a release is for early
-users who accept the limits under "What is missing".
+TEST-24 and TEST-25, one run across two real networks and the first round of ADOPT-1. Until then
+a release is for early users who accept the limits under "What is missing".
 
 ### Phase E: reach
 
