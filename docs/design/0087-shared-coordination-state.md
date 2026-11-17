@@ -1,6 +1,6 @@
 # 0087: Shared coordination state for agents: id claims, a work board with files, shared lessons
 
-Status: Draft (plan; Q84 to Q86 are open)
+Status: Accepted (the owner decided Q84 to Q86 on 2026-11-17; COORD-3 Implemented)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -144,17 +144,22 @@ them (AGENT_RULES.md Rule 2). A claim cannot remove another agent's claim; delet
 |---|---|---|---|---|
 | COORD-1 | Id claims on the hub (D1) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md`, hub `AGENT_RULES.md` | The unit tests of D1 pass in CI, and the live run of two near-simultaneous claims is recorded | Planned |
 | COORD-2 | Files on the activity record and the overlap check (D2) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md` | The unit tests of D2 pass in CI, and `activity --overlap` names the shared file in a run with two agents | Planned |
-| COORD-3 | Shared lessons (D3) | Hub `AGENT_RULES.md`, `CLAUDE.md` | The "Lessons" section holds the coordinator's existing process lessons, each with its date, and `CLAUDE.md` names the claim and activity steps | Planned |
+| COORD-3 | Shared lessons (D3) | Hub `AGENT_RULES.md`, `CLAUDE.md` | The "Lessons" section holds the coordinator's existing process lessons, each with its date, and `CLAUDE.md` names the claim and activity steps | Implemented (pull request 294) |
 
 ## Decisions for the owner
 
 | ID | Question | Recommended default |
 |---|---|---|
-| Q84 | Do claims live on the hub (fast, single-writer files) rather than in a file in the repository (reviewed, but a pull request per claim)? | The hub. The repository already shows a duplicate late, as a merge conflict |
-| Q85 | Is claiming an id and reporting files with `activity` a rule for every agent, including the Claude Code sessions (a line in `CLAUDE.md` and a rule in `AGENT_RULES.md`)? | Yes. It costs two commands per change |
-| Q86 | May the coordinator copy its process lessons from its private Claude memory into `AGENT_RULES.md` and `CLAUDE.md` (COORD-3)? They contain no personal data, only rules about CI, the hub and processes | Yes |
+| Q84 | Do claims live on the hub (fast, single-writer files) rather than in a file in the repository (reviewed, but a pull request per claim)? | The hub. Decided by the owner on 2026-11-17 at this default |
+| Q85 | Is claiming an id and reporting files with `activity` a rule for every agent, including the Claude Code sessions (a line in `CLAUDE.md` and a rule in `AGENT_RULES.md`)? | Yes. Decided by the owner on 2026-11-17; the rule takes effect when COORD-1 and COORD-2 land |
+| Q86 | May the coordinator copy its process lessons from its private Claude memory into `AGENT_RULES.md` and `CLAUDE.md` (COORD-3)? They contain no personal data, only rules about CI, the hub and processes | Yes. Decided by the owner on 2026-11-17; done the same day |
 
 ## Status log
 
 - 2026-11-17: Drafted after the duplicate "Phase 13" of pull requests 292 and 293, at the owner's
   request. Q84 to Q86 are open; nothing enters the BACKLOG Index until the owner decides them.
+- 2026-11-17: The owner decided Q84 to Q86 at the recommended defaults ("Có, chốt theo đề xuất"). Status
+  Accepted. COORD-3 done: the hub's `AGENT_RULES.md` has a section 3 "Lessons" (fifteen lessons from the
+  coordinator's memory and from this day, each dated) that section 0 tells every agent to read, and `CLAUDE.md`
+  has the lessons that hold without the hub. COORD-1 and COORD-2 enter the backlog; the claim and activity rule
+  of Q85 takes effect when they land.
