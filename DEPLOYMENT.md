@@ -295,7 +295,7 @@ submission, whereas a newer worker pointed at an un-upgraded v2 master registers
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
 When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
-or `SIGTERM`; on Windows Ctrl+C in its console, because `windows/oxctl.ps1 stop` uses `taskkill /F`, BUG-23) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from the release after 0.4.0, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk

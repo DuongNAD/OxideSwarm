@@ -320,7 +320,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
-| BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Planned |  |
+| BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
@@ -3106,6 +3106,15 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   stopped.
 - **Done when:** `oxctl.ps1 stop` on a master with `--state-dir` leaves a compacted journal (`journal.bin`
   with 0 records), shown by a launcher test or a recorded Windows run.
+- **Implemented (2026-11-17, pull request 282, [design 0086](design/0086-graceful-windows-stop.md)):**
+  `Stop-Tracked` first sends a console Ctrl+C from a separate hidden `powershell` (`FreeConsole`,
+  `AttachConsole`, `SetConsoleCtrlHandler(NULL, TRUE)`, `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)`), waits up
+  to 15 s and only then runs `taskkill /F /T`, and prints which way the process stopped; the worker gets the
+  same stop (its clean stop cancels its tasks and ends their trees). Recorded run with the 0.4.0 binary and a
+  private state dir: before, `journal.bin` 2157 B and no `snapshot.bin`; after, `master stopped cleanly after
+  Ctrl+C in 0.7 s`, `journal.bin` 24 B, `snapshot.bin` 3331 B, and a restart lists the 3 tasks. A worker with a
+  running `Start-Sleep 60` task stopped cleanly in 0.7 s with no task process left. `WindowsOxctlStopTests` in
+  `tests/test_launcher_scripts.py` covers the clean path and the `taskkill` fallback on Windows.
 
 ### BUG-24: Let a master restart with `--state-dir` on a file system without permissions
 
