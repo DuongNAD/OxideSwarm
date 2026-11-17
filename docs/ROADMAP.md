@@ -86,6 +86,11 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   wait. The plan is in
   [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md). The items of bet
   A may start before release `0.5.0` ships (Q83).
+- Shared coordination state for agents (Implemented, 2026-11-17): id claims on the hub so that two agents
+  never take the same design number, Q id, phase or item id; changed files on the activity record
+  with an overlap check; and one shared place for process lessons. No new service. The plan is in
+  [design 0087](design/0087-shared-coordination-state.md), with items COORD-1 to COORD-3. Q84 to
+  Q86 were decided at the recommended defaults; all three items are done (pull requests 294 and 295).
 
 ## Where the project stands
 
@@ -708,6 +713,9 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |
 | Q83 | May AX-1 to AX-3 and CACHE-1 start as soon as the first round of ADOPT-1 is recorded, whether or not release `0.5.0` has shipped? | Yes, decided by the owner on 2026-11-17. The release numbers follow what merges (design 0076, D1) |
+| Q84 | Do agent id claims (design numbers, Q ids, phases, item ids) live on the hub rather than in a file in the repository ([design 0087](design/0087-shared-coordination-state.md))? | Decided by the owner on 2026-11-17: the hub |
+| Q85 | Is claiming an id and reporting changed files with `activity` a rule for every agent, including the Claude Code sessions (design 0087)? | Decided by the owner on 2026-11-17: yes, from when COORD-1 and COORD-2 land |
+| Q86 | May the coordinator copy its process lessons from its private Claude memory into `AGENT_RULES.md` and `CLAUDE.md` (design 0087, COORD-3)? | Decided by the owner on 2026-11-17: yes; done (COORD-3) |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks

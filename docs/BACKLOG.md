@@ -158,6 +158,7 @@ On 2026-11-17 the twelve items of Phase 13 were added from
 [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) (Q82). Counted from the rows, the table
 then holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
 Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184 items, 106 Implemented, 13 Partial and 65 Planned.
+Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -347,6 +348,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
 | LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
 | LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned |  |
+| COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
+| COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
+| COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
 
 ## Phase 0: integrate open work
 
@@ -3675,6 +3679,50 @@ not part of this phase.
 - **Done when:** The post is published and its link and date are in the status log, with the items it
   produced.
 
+## Phase 15: coordination between agents
+
+From [design 0087](design/0087-shared-coordination-state.md) (accepted on 2026-11-17, Q84 to Q86). Several
+agents and Claude Code sessions change this repository at once; these items keep them from taking the
+same id or changing the same lines unawares, and share what one of them learned. Nothing in the grid
+changes.
+
+### COORD-1: Claim design numbers, Q ids, phases and item ids on the hub
+
+- **Evidence:** On 2026-11-17 two Claude Code sessions each added `## Phase 13` (pull requests 292 and
+  293), and design numbers were reserved only in one session's private memory (design 0087, Context).
+- **Problem:** Nothing tells an agent which id another agent is about to use.
+- **Do:** As D1 of design 0087: `agent_bridge.py claim design|q|phase|item`, create-only claim files on
+  the hub with a settle check, `--list` and `--release`; the rule of Q85 in `CLAUDE.md` and `AGENT_RULES.md`.
+- **Done when:** The unit tests pass in CI, and two near-simultaneous claims on the real hub end with two
+  different values (a dated record).
+- **Implemented (2026-11-17, pull request 295):** `claim` with create-only files
+  (`<value>__<agent>__<time>__<nonce>.json`), a 20 s settle check and the order (time, agent, nonce);
+  `--list`, `--release`. Live on the real hub (`OxideSwarm_Agent_Hub` `test_runs/coord_live_2026-11-17.md`):
+  two claims 0.2 s apart as agent `owner` got `LIVETEST-1` and `LIVETEST-2`; the two-machine race is covered
+  by the unit tests.
+
+### COORD-2: Changed files on the activity record, with an overlap check
+
+- **Evidence:** Pull requests 282, 284 and 286 added lines at the same places in `CHANGELOG.md`,
+  `docs/BACKLOG.md` and `docs/README.md`; the conflicts showed only after the first merged.
+- **Problem:** An agent cannot see before it starts that another agent changes the same files.
+- **Do:** As D2 of design 0087: `activity --branch --pr --files --files-from-git` and
+  `activity --overlap`.
+- **Done when:** The unit tests pass in CI, and `activity --overlap` names a shared file in a run with
+  two agents on the real hub.
+- **Implemented (2026-11-17, pull request 295):** `activity --branch --pr --files --files-from-git` and
+  `activity --overlap`; live on the real hub it printed the shared-file line for `CHANGELOG.md` and a
+  warning for `scripts/agent_bridge.py` (same record).
+
+### COORD-3: One shared place for process lessons
+
+- **Evidence:** Process lessons lived in the coordinator's private Claude memory, which the Windows agents
+  cannot read (design 0087, Context).
+- **Do:** As D3 of design 0087.
+- **Implemented (2026-11-17, pull request 294):** the hub's `AGENT_RULES.md` has section 3 "Lessons"
+  (fifteen dated lessons; section 0 tells every agent to read it), and `CLAUDE.md` "Conventions and
+  pitfalls" has the lessons that hold without the hub.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -4061,3 +4109,6 @@ Add one dated line per finished item, newest last.
   their gate (Q80, TEST-24, TEST-25, a two-network run, the first round of ADOPT-1); TEST-48 added for the
   Android bridge test that failed in pull request 289. Counted from the rows, the Index holds 184 items:
   106 Implemented, 13 Partial and 65 Planned.
+- 2026-11-17: Phase 15 (coordination between agents) added from design 0087 after the owner decided Q84 to
+  Q86, and done the same day: COORD-1 and COORD-2 in pull request 295, COORD-3 in pull request 294. Counted
+  from the rows, the Index holds 187 items: 109 Implemented, 13 Partial and 65 Planned.
