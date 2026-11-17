@@ -3129,7 +3129,9 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   refuses the same port for both at once, with a message, and a new test covers that. The master's stdout and
   stderr go to `.dev_cluster.master.log` in the workspace (covered by `.dev_cluster.*` in `.gitignore`), and a
   failed wait quotes its last 40 lines. The 8 s wait stays. The helpers moved to `crates/cli/src/mode_cli/dev_launch.rs`
-  so that `mode_cli.rs` shrank (allowlist 3240 to 3213 lines). LOOPRESULT
+  so that `mode_cli.rs` shrank (allowlist 3240 to 3213 lines). On 4 cores next to 4 spinning processes,
+  the whole test binary (18 tests in parallel, `--test-threads=4`; the two tests that need `cargo test`'s
+  environment skipped) passed 200 of 200 runs in a row. Not run on Linux here.
 
 ### TEST-44: Remove the 1.5x wall-clock cap from the speed-aware batch test
 
