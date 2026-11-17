@@ -86,11 +86,11 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   wait. The plan is in
   [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md). The items of bet
   A may start before release `0.5.0` ships (Q83).
-- Shared coordination state for agents (Accepted, 2026-11-17): id claims on the hub so that two agents
+- Shared coordination state for agents (Implemented, 2026-11-17): id claims on the hub so that two agents
   never take the same design number, Q id, phase or item id; changed files on the activity record
   with an overlap check; and one shared place for process lessons. No new service. The plan is in
   [design 0087](design/0087-shared-coordination-state.md), with items COORD-1 to COORD-3. Q84 to
-  Q86 were decided at the recommended defaults; COORD-3 is done.
+  Q86 were decided at the recommended defaults; all three items are done (pull requests 294 and 295).
 
 ## Where the project stands
 

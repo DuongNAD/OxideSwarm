@@ -1,6 +1,6 @@
 # 0087: Shared coordination state for agents: id claims, a work board with files, shared lessons
 
-Status: Accepted (the owner decided Q84 to Q86 on 2026-11-17; COORD-3 Implemented)
+Status: Implemented (the owner decided Q84 to Q86 on 2026-11-17)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -142,8 +142,8 @@ them (AGENT_RULES.md Rule 2). A claim cannot remove another agent's claim; delet
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| COORD-1 | Id claims on the hub (D1) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md`, hub `AGENT_RULES.md` | The unit tests of D1 pass in CI, and the live run of two near-simultaneous claims is recorded | Planned |
-| COORD-2 | Files on the activity record and the overlap check (D2) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md` | The unit tests of D2 pass in CI, and `activity --overlap` names the shared file in a run with two agents | Planned |
+| COORD-1 | Id claims on the hub (D1) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md`, hub `AGENT_RULES.md` | The unit tests of D1 pass in CI, and the live run of two near-simultaneous claims is recorded | Implemented (pull request 295) |
+| COORD-2 | Files on the activity record and the overlap check (D2) | `scripts/agent_bridge.py`, `tests/test_agent_bridge.py`, `docs/guides/multi-agent-collaboration.md` | The unit tests of D2 pass in CI, and `activity --overlap` names the shared file in a run with two agents | Implemented (pull request 295) |
 | COORD-3 | Shared lessons (D3) | Hub `AGENT_RULES.md`, `CLAUDE.md` | The "Lessons" section holds the coordinator's existing process lessons, each with its date, and `CLAUDE.md` names the claim and activity steps | Implemented (pull request 294) |
 
 ## Decisions for the owner
@@ -163,3 +163,8 @@ them (AGENT_RULES.md Rule 2). A claim cannot remove another agent's claim; delet
   coordinator's memory and from this day, each dated) that section 0 tells every agent to read, and `CLAUDE.md`
   has the lessons that hold without the hub. COORD-1 and COORD-2 enter the backlog; the claim and activity rule
   of Q85 takes effect when they land.
+- 2026-11-17: COORD-1 and COORD-2 merged as pull request 295 (`bf3e287`); the hub's copy of
+  `agent_bridge.py` was updated. Live check on the real hub (`test_runs/coord_live_2026-11-17.md`): two claims
+  0.2 s apart got `LIVETEST-1` and `LIVETEST-2`, and `activity --overlap` printed the shared-file line for
+  `CHANGELOG.md` and a warning for `scripts/agent_bridge.py`. The race of two machines inside the Drive delay
+  is covered by unit tests only. Status Implemented.

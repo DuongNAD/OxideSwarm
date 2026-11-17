@@ -158,7 +158,7 @@ On 2026-11-17 the twelve items of Phase 13 were added from
 [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) (Q82). Counted from the rows, the table
 then holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
 Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184 items, 106 Implemented, 13 Partial and 65 Planned.
-Then Phase 15 (COORD-1 to COORD-3, design 0087) was added: 187 items, 107 Implemented, 13 Partial and 67 Planned.
+Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -348,8 +348,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
 | LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
 | LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned |  |
-| COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Planned | 295 (open), (design 0087) |
-| COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Planned | 295 (open), (design 0087) |
+| COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
+| COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
 
 ## Phase 0: integrate open work
@@ -3695,6 +3695,11 @@ changes.
   the hub with a settle check, `--list` and `--release`; the rule of Q85 in `CLAUDE.md` and `AGENT_RULES.md`.
 - **Done when:** The unit tests pass in CI, and two near-simultaneous claims on the real hub end with two
   different values (a dated record).
+- **Implemented (2026-11-17, pull request 295):** `claim` with create-only files
+  (`<value>__<agent>__<time>__<nonce>.json`), a 20 s settle check and the order (time, agent, nonce);
+  `--list`, `--release`. Live on the real hub (`OxideSwarm_Agent_Hub` `test_runs/coord_live_2026-11-17.md`):
+  two claims 0.2 s apart as agent `owner` got `LIVETEST-1` and `LIVETEST-2`; the two-machine race is covered
+  by the unit tests.
 
 ### COORD-2: Changed files on the activity record, with an overlap check
 
@@ -3705,6 +3710,9 @@ changes.
   `activity --overlap`.
 - **Done when:** The unit tests pass in CI, and `activity --overlap` names a shared file in a run with
   two agents on the real hub.
+- **Implemented (2026-11-17, pull request 295):** `activity --branch --pr --files --files-from-git` and
+  `activity --overlap`; live on the real hub it printed the shared-file line for `CHANGELOG.md` and a
+  warning for `scripts/agent_bridge.py` (same record).
 
 ### COORD-3: One shared place for process lessons
 
@@ -4102,5 +4110,5 @@ Add one dated line per finished item, newest last.
   Android bridge test that failed in pull request 289. Counted from the rows, the Index holds 184 items:
   106 Implemented, 13 Partial and 65 Planned.
 - 2026-11-17: Phase 15 (coordination between agents) added from design 0087 after the owner decided Q84 to
-  Q86: COORD-1 and COORD-2 are in pull request 295 (open), COORD-3 is Implemented in pull request 294. Counted
-  from the rows, the Index holds 187 items: 107 Implemented, 13 Partial and 67 Planned.
+  Q86, and done the same day: COORD-1 and COORD-2 in pull request 295, COORD-3 in pull request 294. Counted
+  from the rows, the Index holds 187 items: 109 Implemented, 13 Partial and 65 Planned.
