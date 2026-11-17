@@ -336,6 +336,33 @@ pub fn open_dir_acl_warning(path: &Path, offenders: &[String], user_sid: &str) -
     ))
 }
 
+/// `FILE_PERSISTENT_ACLS` in the file-system flags of `GetVolumeInformationW`: the volume keeps the
+/// permissions (ACLs) set on its files. NTFS and ReFS set it; FAT32 and exFAT do not.
+pub const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+
+/// Whether a volume whose file-system flags are `fs_flags` keeps file permissions (BUG-24, design
+/// 0085). On a volume without them every file grants full control to everyone, whatever a program
+/// sets, so a private file can never be private there.
+pub fn volume_keeps_permissions(fs_flags: u32) -> bool {
+    fs_flags & FILE_PERSISTENT_ACLS != 0
+}
+
+/// The message for a private file or directory (`what`, for example "state directory") on a volume
+/// that keeps no permissions. It names the file system and asks for an NTFS directory; it never
+/// suggests `icacls`, which cannot work there.
+pub fn no_permissions_volume_message(path: &Path, what: &str, fs_name: &str) -> String {
+    let fs = if fs_name.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        fs_name.trim().to_string()
+    };
+    format!(
+        "{what} '{path}' is on a file system that keeps no file permissions ({fs}), so every \
+         account on this machine could read or replace it; use a directory on an NTFS drive instead",
+        path = path.display(),
+    )
+}
+
 /// Records `path` in the process-wide warned-paths set and returns `true` the first time `path` is
 /// seen in this process (`false` on subsequent calls for the same path).
 pub fn claim_warning_for_path(path: &Path) -> bool {
@@ -365,16 +392,25 @@ pub fn claim_warning_for_path(path: &Path) -> bool {
 #[cfg(windows)]
 pub use win::{
     create_or_open_private_dir_all, create_or_open_private_dir_all_with_hooks,
-    create_private_dir_all, create_private_new, current_user_sid, inspect_dir_security_no_follow,
-    is_handle_trusted_owner, is_path_trusted_owner_no_follow, read_dacl,
-    warn_if_readable_by_others, write_private_replace, DirSecuritySnapshot, PrivateDirOutcome,
+    create_private_dir_all, create_private_new, current_user_sid, ensure_volume_keeps_permissions,
+    inspect_dir_security_no_follow, is_handle_trusted_owner, is_path_trusted_owner_no_follow,
+    open_acl_or_volume_message, read_dacl, volume_info, warn_if_readable_by_others,
+    write_private_replace, DirSecuritySnapshot, PrivateDirOutcome,
 };
+
+/// Refuses `path` when its volume keeps no file permissions (BUG-24). Unix: not checked (design
+/// 0085 lists it as not covered); always `Ok`.
+#[cfg(not(windows))]
+pub fn ensure_volume_keeps_permissions(_path: &Path, _what: &str) -> Result<(), String> {
+    Ok(())
+}
 
 #[cfg(windows)]
 mod win {
     use super::{
-        claim_warning_for_path, is_trusted_owner_sid, open_acl_warning, open_grants, private_sddl,
-        DaclAce,
+        claim_warning_for_path, is_trusted_owner_sid, no_permissions_volume_message,
+        open_acl_warning, open_grants, private_sddl, volume_keeps_permissions, DaclAce,
+        FILE_PERSISTENT_ACLS,
     };
     use std::ffi::c_void;
     use std::fs::File;
@@ -418,7 +454,6 @@ mod win {
     const ACE_INHERITED_OBJECT_TYPE_PRESENT: u32 = 0x0000_0002;
     const GUID_BYTES: usize = 16;
     const SID_MAX_SUB_AUTHORITIES: usize = 15;
-    const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
 
     /// `Everyone`: what a NULL DACL (no protection at all) amounts to.
     const FULL_ACCESS: u32 = 0x001F_01FF;
@@ -1229,6 +1264,104 @@ mod win {
             .unwrap_or(false)
     }
 
+    /// The file-system name (`"NTFS"`, `"exFAT"`, ...) and flags of the volume that holds `path`,
+    /// or of its nearest existing ancestor when `path` does not exist yet (a state directory before
+    /// the first start). Links are followed: the volume is the one the data would land on.
+    pub fn volume_info(path: &Path) -> io::Result<(String, u32)> {
+        let abs = std::path::absolute(path)?;
+        let existing = abs
+            .ancestors()
+            .find(|p| std::fs::metadata(p).is_ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no existing directory on the path '{}'", abs.display()),
+                )
+            })?;
+        let name = wide(existing)?;
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        // SAFETY: `name` is NUL-terminated; no security attributes or template handle.
+        let raw = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0,
+                share,
+                null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = OwnedHandle(raw);
+        let mut fs_flags = 0u32;
+        let mut fs_name = [0u16; 261]; // MAX_PATH + 1, as GetVolumeInformationByHandleW asks
+                                       // SAFETY: `handle` is valid; `fs_name` is writable for its whole length; the volume name
+                                       // and serial-number buffers are null with length 0.
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(
+                handle.0,
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                &mut fs_flags,
+                fs_name.as_mut_ptr(),
+                fs_name.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = fs_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(fs_name.len());
+        Ok((String::from_utf16_lossy(&fs_name[..len]), fs_flags))
+    }
+
+    /// Refuses `path` (with [`no_permissions_volume_message`]) when its volume keeps no file
+    /// permissions, such as exFAT or FAT32 (BUG-24). `Ok` when the volume keeps them, and when its
+    /// flags cannot be read (logged at debug level; the per-file checks still apply).
+    pub fn ensure_volume_keeps_permissions(path: &Path, what: &str) -> Result<(), String> {
+        match volume_info(path) {
+            Ok((fs_name, flags)) if !volume_keeps_permissions(flags) => {
+                Err(no_permissions_volume_message(path, what, &fs_name))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not read the volume flags of {what}"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The message for a private file whose DACL grants access to `offenders`: on a volume that
+    /// keeps no permissions, [`no_permissions_volume_message`] (no `icacls` command can fix that),
+    /// otherwise [`open_acl_warning`]. `None` when `offenders` is empty.
+    pub fn open_acl_or_volume_message(
+        path: &Path,
+        what: &str,
+        offenders: &[String],
+        user_sid: &str,
+    ) -> Option<String> {
+        if offenders.is_empty() {
+            return None;
+        }
+        match volume_info(path) {
+            Ok((fs_name, flags)) if !volume_keeps_permissions(flags) => {
+                Some(no_permissions_volume_message(path, what, &fs_name))
+            }
+            _ => open_acl_warning(path, what, offenders, user_sid),
+        }
+    }
+
     /// Logs a warning (at most once per path per process, never an error) when the DACL of the
     /// existing file `path` grants access to an account other than the current user, `SYSTEM` and
     /// `Administrators`, or when reading the DACL fails. `what` names the file in the message
@@ -1240,7 +1373,7 @@ mod win {
         });
         match checked {
             Ok((offenders, user_sid)) => {
-                if let Some(msg) = open_acl_warning(path, what, &offenders, &user_sid) {
+                if let Some(msg) = open_acl_or_volume_message(path, what, &offenders, &user_sid) {
                     if claim_warning_for_path(path) {
                         tracing::warn!("{msg}");
                     }
@@ -1284,6 +1417,31 @@ mod tests {
     const OTHER_LOCAL_USER: &str = "S-1-5-21-1-2-3-1002";
     const DOMAIN_USERS: &str = "S-1-5-21-1-2-3-513";
     const TOOLCHAIN_CAPABILITY: &str = "S-1-15-3-1024-111-222-333-444-555-666-777-888";
+
+    #[test]
+    fn a_volume_keeps_permissions_only_with_the_persistent_acls_flag() {
+        // Flags read on a Windows 11 machine: NTFS 0x03E7_2EFF, exFAT 0x0002_0206 (no 0x08).
+        assert!(volume_keeps_permissions(0x03E7_2EFF));
+        assert!(volume_keeps_permissions(FILE_PERSISTENT_ACLS));
+        assert!(!volume_keeps_permissions(0x0002_0206));
+        assert!(!volume_keeps_permissions(0));
+        assert!(!volume_keeps_permissions(!FILE_PERSISTENT_ACLS));
+    }
+
+    #[test]
+    fn the_no_permissions_message_names_the_file_system_and_never_suggests_icacls() {
+        let path = Path::new(r"E:\oxide-state");
+        let msg = no_permissions_volume_message(path, "state directory", "exFAT");
+        assert!(
+            msg.starts_with(r"state directory 'E:\oxide-state' is on a file system"),
+            "{msg}"
+        );
+        assert!(msg.contains("keeps no file permissions (exFAT)"), "{msg}");
+        assert!(msg.contains("NTFS"), "{msg}");
+        assert!(!msg.contains("icacls"), "{msg}");
+        let unknown = no_permissions_volume_message(path, "members file", " ");
+        assert!(unknown.contains("(unknown)"), "{unknown}");
+    }
 
     #[test]
     fn sddl_is_protected_and_has_three_entries() {
@@ -1538,6 +1696,45 @@ mod windows_tests {
     use std::collections::BTreeSet;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn the_temp_volume_keeps_permissions_and_a_missing_dir_uses_its_parent() {
+        // Test temp directories live on NTFS (CI runners and developer machines); BUG-24.
+        let dir = tempfile::tempdir().unwrap();
+        let (fs_name, flags) = volume_info(dir.path()).unwrap();
+        assert!(
+            volume_keeps_permissions(flags),
+            "{fs_name} flags {flags:#x}"
+        );
+        assert!(!fs_name.is_empty());
+        let missing = dir.path().join("not").join("created");
+        assert_eq!(volume_info(&missing).unwrap(), (fs_name, flags));
+        assert!(!missing.exists(), "volume_info must not create anything");
+        assert_eq!(
+            ensure_volume_keeps_permissions(&missing, "state directory"),
+            Ok(())
+        );
+    }
+
+    /// A directory on a volume without permissions, when the developer names one
+    /// (`OXIDESWARM_TEST_NO_ACL_DIR`, for example a folder on an exFAT USB stick). Skipped otherwise.
+    #[test]
+    fn a_no_acl_volume_is_refused_when_one_is_available() {
+        let Some(dir) = std::env::var_os("OXIDESWARM_TEST_NO_ACL_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (fs_name, flags) = volume_info(&dir).unwrap();
+        assert!(
+            !volume_keeps_permissions(flags),
+            "{fs_name} keeps permissions"
+        );
+        let target = dir.join("oxideswarm-state-never-created");
+        let err = ensure_volume_keeps_permissions(&target, "state directory").unwrap_err();
+        assert!(err.contains(&format!("({fs_name})")), "{err}");
+        assert!(!err.contains("icacls"), "{err}");
+        assert!(!target.exists());
+    }
 
     /// A temp directory whose DACL grants `Everyone` read with inheritance, like a home folder.
     fn open_parent() -> tempfile::TempDir {
