@@ -160,6 +160,7 @@ then holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
 Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184 items, 106 Implemented, 13 Partial and 65 Planned.
 Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
 Then TEST-49 and Phase 16 (APP-4, VERIFY-1, APP-5, design 0089) were added: 191 items, 109 Implemented, 13 Partial and 69 Planned.
+After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -354,7 +355,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
-| VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Planned | 296 (open), (design 0089) |
+| VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented | 296, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
 
 ## Phase 0: integrate open work
@@ -3778,6 +3779,10 @@ their first user (Q88), then APP-5.
 - **Do:** `submit --verify <N>` and `--verify-file`, and the same in the MCP `submit` tool, client side with
   no wire change (Q89).
 - **Done when:** The tests of design 0089 D3 pass in CI.
+- **Implemented (2026-11-17, pull request 296):** `submit --verify <N>` picks N other workers that fit the task,
+  submits it to each pinned with `require:worker=<id>`, and compares the BLAKE3 ids of the declared outputs (or one
+  `--verify-file`); `verified` or `mismatch` (exit 4), a `verify` object with `--json`, and the same in MCP `submit`.
+  `tests/verify_e2e.rs` (Unix) covers verified, mismatch, too few workers, `--verify-file`, the refusals and MCP.
 
 ### APP-5: Guide: Anima Engine sweeps on OxideSwarm, with a recorded run
 
@@ -4176,3 +4181,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: TEST-49 added (claimed on the hub) and Phase 16 added from design 0089 (Anima Engine as the
   first workload; Q88 and Q89 decided by the owner's delegation): APP-4, VERIFY-1 (pull request 296) and APP-5.
   Counted from the rows, the Index holds 191 items: 109 Implemented, 13 Partial and 69 Planned.
+- 2026-11-17: VERIFY-1 Implemented (pull request 296). The Index counts are 110 Implemented, 13 Partial and 68 Planned (191 items).
