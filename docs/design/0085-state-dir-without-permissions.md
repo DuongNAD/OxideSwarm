@@ -126,9 +126,11 @@ Private files checked:
 | W1 | Decision, message and volume query | `crates/core/src/private_file.rs` | Unit tests pass on every system; Windows tests pass | Implemented |
 | W2 | Start-up check in the CLI and in `bind_full` | `crates/cli/src/cli_app/master.rs`, `crates/master/src/server.rs` | A state directory on exFAT is refused before anything is written | Implemented |
 | W3 | Message for existing private files | `crates/master/src/members.rs`, `crates/core/src/private_file.rs` | No `icacls` hint on a volume without permissions | Implemented |
-| W4 | Docs | `docs/BACKLOG.md`, `CHANGELOG.md`, `DEPLOYMENT.md` | BUG-24 Implemented; section 3.5 says where a state directory may live | Planned |
+| W4 | Docs | `docs/BACKLOG.md`, `CHANGELOG.md`, `DEPLOYMENT.md` | BUG-24 Implemented; section 3.5 says where a state directory may live | Implemented |
 
 ## Status log
 
 - 2026-11-17: Drafted and implemented with `BUG-24` (W1 to W3). W4 waits until the 0.4.0 release pull
   request, which adds the BUG-24 entry, is merged.
+- 2026-11-17: W4 done after the 0.4.0 release merged (`6eb5cb0`): BUG-24 Implemented with pull request
+  284, a CHANGELOG `[Unreleased]` line, and a sentence in `DEPLOYMENT.md` section 3.5.

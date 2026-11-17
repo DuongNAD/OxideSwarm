@@ -315,7 +315,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Planned |  |
-| BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Planned |  |
+| BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
@@ -3038,6 +3038,15 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test (or a recorded Windows run) shows that a master pointed at a `--state-dir` without
   permissions refuses at the first start with that message and writes nothing there, and that NTFS behaves as
   before.
+- **Implemented on Windows (2026-11-17, pull request 284, [design 0085](design/0085-state-dir-without-permissions.md)):**
+  the CLI master (right after the state directory is resolved) and `MasterServer::bind_full` read the volume flags
+  of the state directory, or of its nearest existing ancestor (`GetVolumeInformationByHandleW`, nothing created),
+  and refuse a volume without `FILE_PERSISTENT_ACLS` with `state directory '<dir>' is on a file system that keeps
+  no file permissions (exFAT), so every account on this machine could read or replace it; use a directory on an
+  NTFS drive instead`. `members.json` and the private-file warnings (cluster secret, `node.key`,
+  `master_noise.key`, the P2P key, the task store directory) use the same text on such a volume instead of the
+  `icacls` hint. Recorded run: exFAT refused at the first start with nothing created, an exFAT state directory
+  written by 0.4.0 refused and unchanged, NTFS start, stop and start as before. macOS and Linux are not covered.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 

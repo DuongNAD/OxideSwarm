@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- A master refuses a `--state-dir` on a volume that keeps no file permissions (exFAT, FAT32) at start-up, before it writes anything there, with a message that names the file system and asks for an NTFS directory. Before, it started once and then refused every restart because `members.json` looked readable by everyone, with an `icacls` hint that cannot work there. The same message replaces that hint for private files on such a volume. Windows only (`BUG-24`, [design 0085](docs/design/0085-state-dir-without-permissions.md)).
+
 ## [0.4.0] - 2026-11-17
 
 A minor release with one wire change under `0.x`: protocol version 10 adds an extension slot to tasks (`PROTO-3`) and, for the first time, a one-version compatibility window (`PROTO-4`), so a `0.4.0` master keeps serving `0.3.0` workers and clients while they are upgraded one at a time. It also adds `master --discovery-port` (`CLI-2`), a CI job that runs the newest release against each pull request (`PROTO-2`), the first fuzz targets (`LV-1`), and fixes for flaky tests (`TEST-27` to `TEST-40`).

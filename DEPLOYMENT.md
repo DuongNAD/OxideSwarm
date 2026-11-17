@@ -300,7 +300,7 @@ self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which
 protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
 protocol version is refused at startup with a `GridError::Storage` message. The window does not apply to the disk
 format: moving from `0.3.0` to `0.4.0` still needs the clean stop. **Rolling back** a master after it ran as `0.4.0`
-needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open.
+needs a copy of `--state-dir` made before the upgrade: the `0.4.0` store has format 4, which `0.3.0` cannot open. On Windows the state directory must be on a volume that keeps file permissions (NTFS or ReFS): a master refuses one on exFAT or FAT32 at start-up, before it writes there (BUG-24).
 Keep `--state-dir` on a file system with permissions (NTFS, APFS, ext4): on Windows a master whose state directory
 is on exFAT starts once and then refuses its own `members.json` (BUG-24). During the window, pin a task to an old or
 a new worker with an operator tag (`--tag` on the worker, `--require-tag` on `submit`) or with `--worker`:
