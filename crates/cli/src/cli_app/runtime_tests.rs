@@ -25,6 +25,22 @@ use super::tests::{parse, submit_args};
 use super::worker::{resolve_isolation_read_dirs, resolve_worker_target, run_worker};
 use super::*;
 
+/// Waits until something accepts a TCP connection on `addr`, or 30 s have passed (TEST-49). An
+/// in-process master binds after `run_master` has built its state, which can take much longer
+/// than a second on a loaded runner.
+async fn wait_for_master_bind<A: tokio::net::ToSocketAddrs>(addr: &A) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Runs on its own thread with a 16 MiB stack: this test drives `run_master`, `run_worker`
 /// and the client commands in one future, which overflowed the default 2 MiB test-thread
 /// stack in Linux debug builds.
@@ -406,14 +422,7 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     };
     let master_task = tokio::spawn(run_master(master_args, None, secret_opts.clone()));
 
-    let mut bound = false;
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&master_addr).await.is_ok() {
-            bound = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let bound = wait_for_master_bind(&master_addr).await;
     assert!(bound, "master bound and accepted probe connection");
     // Clear `RUSTY_GRID_WIRE_CODEC` BEFORE connecting the client so the client speaks
     // `WireCodec::Bincode` (0x02). A master configured with `RUSTY_GRID_WIRE_CODEC=json`
@@ -875,14 +884,7 @@ speed_hold_factor = 2.25
         rr_secret_opts.clone(),
     ));
 
-    let mut rr_bound = false;
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&rr_addr).await.is_ok() {
-            rr_bound = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let rr_bound = wait_for_master_bind(&rr_addr).await;
     assert!(rr_bound, "round-robin master bound");
 
     // Connect two simulated workers over TCP to `rr_addr_str`:

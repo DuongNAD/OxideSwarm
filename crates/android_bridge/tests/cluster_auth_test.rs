@@ -1,8 +1,10 @@
 //! Integration tests verifying Android JNI bridge cluster authentication against live Master nodes.
 
+mod common;
+
 use oxideworker::{
     get_worker_status_impl, set_cluster_secret_impl, set_sandbox_dir_impl, start_worker_impl,
-    start_worker_with_secret_impl, stop_worker_impl,
+    start_worker_with_secret_impl,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -13,7 +15,7 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tokio::test]
 async fn test_bridge_set_cluster_secret_hex_and_file_parsing() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     // 1. Valid 64-char hex secret
     let raw_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -49,7 +51,7 @@ async fn test_bridge_set_cluster_secret_hex_and_file_parsing() {
 #[tokio::test]
 async fn test_bridge_worker_connects_to_authenticated_master() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let temp_dir = tempfile::tempdir().unwrap();
     let sandbox_dir = temp_dir.path().join("sandboxes");
@@ -102,7 +104,7 @@ async fn test_bridge_worker_connects_to_authenticated_master() {
     assert_eq!(workers[0].capabilities.name, "AuthAndroidWorker");
 
     // 5. Clean teardown
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     let _ = master.shutdown();
     assert!(set_cluster_secret_impl(""));
 }
@@ -110,7 +112,7 @@ async fn test_bridge_worker_connects_to_authenticated_master() {
 #[tokio::test]
 async fn test_bridge_worker_without_secret_rejected_by_authenticated_master() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let temp_dir = tempfile::tempdir().unwrap();
     let sandbox_dir = temp_dir.path().join("sandboxes");
@@ -150,14 +152,14 @@ async fn test_bridge_worker_without_secret_rejected_by_authenticated_master() {
     }
 
     // 5. Clean teardown
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     let _ = master.shutdown();
 }
 
 #[tokio::test]
 async fn test_bridge_worker_with_secret_impl_convenience_function() {
     let _guard = TEST_MUTEX.lock().await;
-    stop_worker_impl();
+    common::stop_and_settle();
 
     let temp_dir = tempfile::tempdir().unwrap();
     let sandbox_dir = temp_dir.path().join("sandboxes");
@@ -202,7 +204,7 @@ async fn test_bridge_worker_with_secret_impl_convenience_function() {
         "Direct-secret worker must register successfully"
     );
 
-    assert!(stop_worker_impl());
+    assert!(common::stop_and_settle());
     let _ = master.shutdown();
     assert!(set_cluster_secret_impl(""));
 }

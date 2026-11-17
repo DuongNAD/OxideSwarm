@@ -225,14 +225,14 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
-| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
+| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
-| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
-| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
+| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
+| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -332,7 +332,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
-| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
+| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
@@ -3120,6 +3120,19 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Measure the time that really passed before the check (or drive the reaper with a paused clock) and
   assert on that, as TEST-36 to TEST-38 did. If the reaper fired early, fix the reaper instead.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row under CPU starvation on Windows.
+- **Cause:** Confirmed on the owner's Windows desktop (1 core, 6 CPU spinners): the check meant for 100 ms
+  ran after the 200 ms timeout had really passed, and the reaper acted as designed. The old test also timed
+  from after the ack, later than the moment the master stamps the worker's last heartbeat, and bounded the
+  reap at 450 ms. The old test failed 22 of 100 runs there (all on that 450 ms bound; 3 of 100 on 2 cores with
+  4 spinners). The new version printed the boundary check running after the timeout in 71 of 200 runs, once
+  with the worker already Disconnected at `378.9 ms`, which is the failure of run `43944560507`; it saw the
+  reap at up to `1021 ms`.
+- **Status:** Implemented by pull request 302. Times are measured from just before the Register is sent, so
+  a correct reaper can never be seen Disconnected with less than the timeout elapsed: the boundary check
+  asserts "Connected, or the check came after the timeout" and the reap must be seen at or after the
+  timeout. The reap must be seen within 5 s (the configured 200 ms, not the 10 s default, and not never);
+  the time is printed. 200 of 200 runs passed in a row under 1 core and 6 spinners. Control: with the
+  reaper at a quarter of the timeout the test fails (3 of 3, Disconnected at about 110 ms).
 
 ### TEST-43: Show and fix the late dashboard port file of the in-process dev cluster test
 
@@ -3198,6 +3211,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Serialise the tests of the binary that touch the global worker (one lock shared by them, or one
   test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
 - **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
+- **Implemented (2026-11-17, pull request 300):** The cause is not another test's call. All tests of the
+  file already hold one `TEST_MUTEX`. `stop_worker_impl` returns while the worker still drains: it sets the
+  status `STOPPING` and a detached thread writes `STOPPED` after it has joined the worker thread. That late
+  write ran after the previous test released the lock, so it could land between this test's failing
+  `set_cluster_secret_impl` (which writes `ERROR: Invalid cluster secret: ...`) and its status read. The
+  tests now call `common::stop_and_settle()` (`crates/android_bridge/tests/common/mod.rs`), which stops the
+  worker and waits (30 s bound) until the status is no longer `STOPPING`; the four test files that read the
+  status use it. No change to the bridge, every assertion kept.
 
 ### TEST-49: Wait for the master by condition in the sched2 runtime test
 
@@ -3209,6 +3230,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Wait for the master's port file or for a successful connect with a bounded but generous limit
   (for example 30 s), as TEST-36 to TEST-38 did, and keep every assertion.
 - **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
+- **Implemented (2026-11-17, pull request 301):** Cause as in the Problem: both in-process masters of the
+  test (the JSON-codec master and the round-robin master) were waited for with `for _ in 0..50` connects,
+  20 ms apart, so one second to build the master's state and bind. Both waits now call
+  `wait_for_master_bind`, a helper in `runtime_tests.rs` that retries the connect every 20 ms for up to 30 s
+  and returns as soon as it succeeds. Every assertion is kept; no other fixed bind wait is left in the file.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -3312,6 +3338,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test removes (or makes unwritable) the base of one of two workers after it registered, submits
   tasks with `max_retries` above 0, and all complete on the other worker; `is_worker_rejection` has a unit test
   with the exact message.
+- **Implemented (2026-11-17, pull request 299):** The three refusals answer `Task rejected by worker: sandbox base
+  unusable: <reason>` (`rusty_grid_core::sandbox_base_refusal`), which the master already matches ("rejected by
+  worker") and now lists in full; no wire change, a 0.4.x master hands it back too. The assignment and input-fetch
+  re-checks repeat once after 250 ms; `Sandbox::create` refusals cover the base errors and I/O errors under the base.
+  The existing `avoid_workers` and `MAX_WORKER_REJECTIONS_PER_TASK` logic prevents a loop, so no new guard. Test:
+  `crates/master/tests/sandbox_base_hand_back.rs`; design 0090.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
