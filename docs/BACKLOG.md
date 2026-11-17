@@ -224,7 +224,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
-| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | PRNUM |
+| TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
@@ -3112,7 +3112,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   4 spinners). The new version printed the boundary check running after the timeout in 71 of 200 runs, once
   with the worker already Disconnected at `378.9 ms`, which is the failure of run `43944560507`; it saw the
   reap at up to `1021 ms`.
-- **Status:** Implemented by pull request PRNUM. Times are measured from just before the Register is sent, so
+- **Status:** Implemented by pull request 302. Times are measured from just before the Register is sent, so
   a correct reaper can never be seen Disconnected with less than the timeout elapsed: the boundary check
   asserts "Connected, or the check came after the timeout" and the reap must be seen at or after the
   timeout. The reap must be seen within 5 s (the configured 200 ms, not the 10 s default, and not never);
