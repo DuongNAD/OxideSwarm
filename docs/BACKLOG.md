@@ -217,7 +217,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Planned |  |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Planned |  |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Planned |  |
@@ -907,6 +907,14 @@ The full suite must pass on a clean machine before CI can require it.
   worker log line "Task assigned again while its previous run is still active"
   (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
   `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
+
+- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
+  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
+  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
+  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
+  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
+  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
 
 ### TEST-24: Test large transfers between machines
 
@@ -3023,6 +3031,23 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   lost the result or dispatched the task again. Fix that cause. If the design allows a rerun in that window,
   say so beside the probe and in the guarantee it tests, and change the assertion with that reason.
 - **Done when:** The cause is named here, and the probe passes 200 runs in a row on Linux and on Windows.
+- **Partial (2026-11-17, pull request 288):** not reproduced on macOS in 6,884 rounds of the probe (about 570 runs of
+  12 rounds: single, 3 to 8 parallel copies, the whole test binary next to three copies of itself, 6 `yes` CPU spinners
+  on 10 cores, `RV158_ZERO` with no delay after the task finished, and a variant that kept the task alive for up to
+  450 ms after its done marker). No round ran the task twice. What reading the code ruled out: the journal cannot lose an
+  acknowledged result (`store.rs`: the writer drains and syncs on drop, a snapshot is taken under the queue lock after
+  every enqueued append, and a result that arrives after `close_and_compact_store_sync` is refused with no
+  acknowledgment); the worker keeps a result in `pending_resume_outbox` and lists it in `ResumeSession` whether the task
+  is still in the active table or already in the outbox; a master-side rerun without a `ResumeSession` that names the task
+  needs `adopt_session_tasks` to release the hold (`recovery.rs`), which charges nothing, matching the `retry=0
+  failover=0` of the CI round. That is the one path that fits the evidence, and no test has shown the worker omitting
+  the id. The probe now keeps the debug log of the master and worker crates in memory and, when a round ran the task
+  twice, prints the marker file, the task and worker id, every line that names either, and every warning and error since
+  the round began, and the round line shows `evacuation=` next to `retry=` and `failover=`. `RV158_ROUNDS` and
+  `RV158_ZERO` let a local loop run more rounds and shut the master down with no delay. The assertion is unchanged.
+  Next step: the next CI failure of this probe now carries the evidence; read which side sent `ResumeSession` without the
+  task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
+  under TEST-23.
 
 ### TEST-42: Make the reaper boundary test independent of scheduler delay
 

@@ -11,6 +11,50 @@ use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_master::store::HEADER_LEN;
 use rusty_grid_worker::client::WorkerClient;
 
+/// In-memory log sink for the `rv158` probe: keeps the last lines the master and worker crates
+/// logged, so a round that ran its task twice can print what happened around that task (TEST-41).
+#[derive(Clone, Default)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+/// One log event being written; it lands in the sink when the formatter drops it.
+struct LogLine {
+    sink: LogSink,
+    buf: Vec<u8>,
+}
+
+const LOG_SINK_MAX_LINES: usize = 40_000;
+
+impl std::io::Write for LogLine {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LogLine {
+    fn drop(&mut self) {
+        let line = String::from_utf8_lossy(&self.buf).trim_end().to_string();
+        let mut lines = self.sink.0.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.len() >= LOG_SINK_MAX_LINES {
+            lines.drain(..LOG_SINK_MAX_LINES / 2);
+        }
+        lines.push(line);
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogLine;
+    fn make_writer(&'a self) -> LogLine {
+        LogLine {
+            sink: self.clone(),
+            buf: Vec::new(),
+        }
+    }
+}
+
 async fn wait_for<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -888,9 +932,34 @@ async fn test_worker_reconnecting_after_master_hold_expires_runs_task_only_once(
 /// restarted master adopts and records the result and the task runs **exactly once**.
 #[tokio::test]
 async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
+    // TEST-41: this probe once saw a task run twice on CI (round 0, no retry or failover charged)
+    // and never again in thousands of local rounds. Keep what the master and worker logged so a
+    // repeat comes with the evidence (which side dropped the result or dispatched the task again).
+    let sink = LogSink::default();
+    // Scoped to this test, not global: the other tests of this binary must not format debug logs
+    // (that would change their timing). This is a current-thread runtime, so the master and
+    // worker tasks it spawns log on this thread and are captured; `spawn_blocking` and std
+    // threads log elsewhere and are not.
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "rusty_grid_master=debug,rusty_grid_worker=debug",
+        ))
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+    // `RV158_ROUNDS` (default 12) and `RV158_ZERO` (shut down with no delay after the task
+    // finished) are for local stress loops; CI runs the defaults.
+    let rounds = std::env::var("RV158_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12u64);
+    let zero_delay = std::env::var_os("RV158_ZERO").is_some();
     let mut twice = 0usize;
-    let rounds = 12u64;
     for round in 0..rounds {
+        // Only this probe writes to the sink, so each round starts from an empty one (this also
+        // keeps the size-capping drain from shifting any index).
+        sink.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("master-state");
         let marker_path = dir.path().join("p3.marker");
@@ -952,11 +1021,19 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             )
             .await
         );
+        let worker_id = master1
+            .list_workers()
+            .await
+            .expect("list workers")
+            .first()
+            .map(|w| w.worker_id.to_string())
+            .unwrap_or_default();
         std::fs::write(&gate_path, b"go").unwrap();
         while !done_path.exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        tokio::time::sleep(Duration::from_millis(round % 6)).await;
+        let delay_ms = if zero_delay { 0 } else { round % 6 };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         master1.shutdown().expect("shutdown master1");
         drop(master1);
         assert!(
@@ -984,14 +1061,31 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             .unwrap_or(0);
         let info = master2.get_task_info(tid).await.expect("task info");
         eprintln!(
-            "RV158 P3 round={round} delay_ms={} runs={runs} state={:?} retry={} failover={}",
-            round % 6,
+            "RV158 P3 round={round} delay_ms={delay_ms} runs={runs} state={:?} retry={} failover={} evacuation={}",
             info.state,
             info.retry_count,
-            info.failover_count
+            info.failover_count,
+            info.evacuation_count
         );
         if runs > 1 {
             twice += 1;
+            // What the two crates logged since this round began that names the task or the
+            // worker, plus every warning and error (other tests of this binary log into the same
+            // sink, so everything else is left out).
+            let task_id = tid.to_string();
+            let lines = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!(
+                "RV158 P3 round={round} ran twice (task {task_id}, worker {worker_id}); marker:\n{}",
+                std::fs::read_to_string(&marker_path).unwrap_or_default()
+            );
+            for line in lines.iter().filter(|l| {
+                l.contains(&task_id)
+                    || (!worker_id.is_empty() && l.contains(&worker_id))
+                    || l.contains(" WARN ")
+                    || l.contains(" ERROR ")
+            }) {
+                eprintln!("RV158 P3 log: {line}");
+            }
         }
         let _ = w_tx.send(true);
         wh.abort();
