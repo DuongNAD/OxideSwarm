@@ -910,6 +910,42 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
     hub.stop().await;
 }
 
+/// TEST-27: a sender that is not slow must not be disconnected because the hub answers a burst of
+/// its messages with NACKs. Every message to an unknown id is answered with one NACK queued on the
+/// sender's own outbound queue; with the queue cap of 8 messages a burst of 60 used to overflow it
+/// whenever the hub's read loop outran its write pump, and the hub kicked the sender as a "slow
+/// consumer" (seen on macOS CI as "channel closed" on the flooder in the test above).
+#[tokio::test]
+async fn test_burst_of_nacks_does_not_disconnect_a_healthy_sender() {
+    let config = HubConfig {
+        max_queued_messages: 8,
+        ..Default::default()
+    };
+    let (hub, url, _) = start_hub(config).await;
+    let sender = client(&url, "burster");
+    sender.connect().await.unwrap();
+
+    for _ in 0..60 {
+        sender.send_data_payload("ghost", b"x").await.expect("send");
+    }
+    // Give the hub time to work through the burst.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        node_ids(&hub).await.contains(&"burster".to_string()),
+        "the hub disconnected a sender that reads its replies"
+    );
+    let res = sender
+        .send_command("ghost", "ping", Value::Null, Some(10_000))
+        .await
+        .expect("the sender's connection must still work");
+    assert!(
+        matches!(res, AgentMeshEnvelope::DeliveryNack { .. }),
+        "{res:?}"
+    );
+    sender.close().await;
+    hub.stop().await;
+}
+
 // =========================================================================
 // Bind policy (library + `agent-mesh hub` binary)
 // =========================================================================
