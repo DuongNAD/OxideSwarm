@@ -152,8 +152,8 @@ the table holds 147 items: 91 Implemented (PROTO-1 counts as Implemented with it
 7 Partial and 49 Planned.
 After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three new flaky tests
 (TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
-Recounted on 2026-11-17 after pull requests 267 to 278 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5 added): 154 items,
-101 Implemented, 11 Partial and 42 Planned.
+Recounted on 2026-11-17 after pull requests 267 to 279 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39,
+TEST-40, BUG-23 and BUG-24 added): 158 items, 103 Implemented, 11 Partial and 44 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -314,6 +314,8 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
+| BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Planned |  |
+| BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 
 ## Phase 0: integrate open work
@@ -3004,6 +3006,47 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   its own encoding of that response, and design 0076 allows one wire change per release, so BUG-22 waits
   for the next wire change after 0.4.0.
 
+### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
+
+- **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
+  `Start-Process -WindowStyle Hidden` and stops it with `taskkill.exe /F /T /PID` (line 135). A forced end
+  skips the master's Ctrl+C, Ctrl+Break and close handlers (`wait_for_worker_shutdown_signal` in
+  `crates/cli/src/cli_app.rs`), so a master with `--state-dir` never compacts `journal.bin`. Confirmed by
+  the Windows smoke test of 0.4.0 on 2026-11-17 (`OxideSwarm_Agent_Hub` `test_runs/win_smoke_0.4.0_118fd88.md`,
+  S1): after `taskkill /F /T /PID` the 0.4.0 master refuses the journal with the documented message. The way
+  out also works there (S2): the 0.3.0 master in a visible console, Ctrl+C, exit code 0, journal compacted,
+  and 0.4.0 then shows the 3 tasks.
+- **Problem:** Across a protocol bump the next master refuses an uncompacted journal (DEPLOYMENT.md
+  section 3.5), and a hidden master has no console to press Ctrl+C in. The launchers do not pass
+  `--state-dir`, so only a master whose `state_dir` was set by hand (flag, environment or config file) is
+  affected. `switch_role.sh` already sends SIGTERM and waits before SIGKILL.
+- **Do:** Ask the master to stop first (for example a console control event to its process group, or a
+  local stop request), wait a grace period, and use `taskkill /F /T` only after it; print which way it
+  stopped.
+- **Done when:** `oxctl.ps1 stop` on a master with `--state-dir` leaves a compacted journal (`journal.bin`
+  with 0 records), shown by a launcher test or a recorded Windows run.
+
+### BUG-24: Let a master restart with `--state-dir` on a file system without permissions
+
+- **Evidence:** Windows smoke test of 0.4.0 on 2026-11-17 (`OxideSwarm_Agent_Hub`
+  `test_runs/win_smoke_0.4.0_118fd88.md`, finding G1). With `--state-dir` on an exFAT drive the master writes
+  `members.json` and `master_noise.key` on its first start. On the next start `MemberStore::load_file`
+  (`crates/master/src/members.rs`) runs `check_members_file_permissions`, which reads the DACL; exFAT has no
+  ACLs, every account counts as having full control, and the master exits with code 1:
+  `members file '<state>\members.json' is accessible by other accounts (Everyone); to make it private run: icacls ...`.
+  The 0.3.0 and 0.4.0 masters behave the same, so it is not an upgrade regression. The 0.3.0 master also logged
+  the same warning for `node.key` in a private HOME on exFAT; 0.4.0 and the other files under the private-file
+  check were not tried. macOS and Linux (mode bits from the mount options) were not tried.
+- **Problem:** A master whose state lives on an exFAT or FAT stick or SSD works once and then never starts again,
+  and the message suggests an `icacls` command that cannot work on that file system.
+- **Do:** Detect a file system without permissions (Windows: `GetVolumeInformationW` flags without
+  `FILE_PERSISTENT_ACLS`; Unix: the mode cannot be narrowed) at the first start, before the master writes
+  anything there, and refuse with a message that names the file system and asks for a directory on NTFS, APFS
+  or ext4. Say the same instead of the `icacls` command when a later start finds it.
+- **Done when:** A test (or a recorded Windows run) shows that a master pointed at a `--state-dir` without
+  permissions refuses at the first start with that message and writes nothing there, and that NTFS behaves as
+  before.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
@@ -3383,3 +3426,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: LV-1 Partial (pull request 270): `fuzz/` with three targets, seeds, regression inputs, a one-hour run of each (no finding) and a `fuzz` CI job that has not run yet. The Index counts are unchanged.
 - 2026-11-17: TEST-34 Implemented and TEST-35 Partial (pull request 277): Suite 2 waits for the expected number of payloads instead of a fixed sleep; the `switch_role` launcher test prints its output and logs on failure (cause not reproduced). TEST-36 to TEST-38 Implemented (pull request 276). The Index counts are 99 Implemented, 11 Partial and 43 Planned (153 items).
 - 2026-11-17: TEST-39 and TEST-40 added and Implemented (pull request 278): two Agent Mesh tests wait for registration and for each payload instead of a fixed sleep; the Index gains two Implemented items. BUG-22 waits for the next wire change after 0.4.0.
+- 2026-11-17: Release `0.4.0` prepared (protocol 10 with the one-version window, PROTO-3 and PROTO-4): versions, CHANGELOG, README install lines and DEPLOYMENT section 3.5; the size allowlist of `crates/worker/src/isolation.rs` lowered to 5346. BUG-23 added (Planned), and BUG-24 from the Windows smoke test of 0.4.0 (Planned). The Index counts are 103 Implemented, 11 Partial and 44 Planned (158 items).

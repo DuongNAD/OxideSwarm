@@ -104,7 +104,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.3.0`), or [build from source](#build-from-source).
+(the latest is `v0.4.0`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -115,19 +115,19 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.3.0-aarch64-apple-darwin.tar.gz
+tar -xzf oxideswarm-0.4.0-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.3.0-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.3.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.0-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.3.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.3.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.4.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.3.0-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.0-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
@@ -365,7 +365,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.3.0` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.0` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
@@ -377,6 +377,7 @@ OxideSwarm `0.3.0` covers the user story above. What it does not do yet:
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
 | User GPU workloads run on macOS and Windows under `--isolation fs` via `--isolation-read-dir`; Linux isolation omits GPU devices | The built-in GPU task is a verified matrix-multiply benchmark. Command tasks run native Metal (Apple Silicon) and Vulkan/CUDA/OptiX (Windows NVIDIA) under `--isolation fs`, `--isolation-read-dir` exposes external Python/ML runtimes read-only ([gpu-workloads.md](docs/guides/gpu-workloads.md); cross-machine `--isolation off` baseline in [benchmarks/gpu-run](benchmarks/gpu-run/README.md)), and `--vram-mb` (FEAT-9a) reserves static VRAM on `master`; Linux Landlock lacks `/dev/nvidia*` and `/dev/dri/*` rules, and live per-process free VRAM polling is not built | `R20` (Linux), `FEAT-9` ([design 0074](docs/design/0074-external-runtime-allowlist-and-gpu-workloads.md)) |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
+| Compatibility spans one protocol version, newer master first | A `0.4.0` master serves `0.3.0` workers and clients, but an older master refuses newer peers, and a peer two versions behind is refused | PROTO-5 keeps a CI job against the release one version back |
 
 The plan and the order of the work are in [docs/ROADMAP.md](docs/ROADMAP.md). Every item, with its
 evidence and its "done when", is in [docs/BACKLOG.md](docs/BACKLOG.md).
