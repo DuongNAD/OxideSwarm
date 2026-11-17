@@ -1,6 +1,6 @@
 # 0089: Anima Engine as the first workload: sweeps, verified results and build offload
 
-Status: Draft (plan; Q88 and Q89 are open)
+Status: Accepted (plan; Q88 and Q89 decided on 2026-11-17 by the owner's delegation)
 Created: 2026-11-17    Updated: 2026-11-17
 
 ## Summary
@@ -137,11 +137,15 @@ AX-1 and AX-2 are in the backlog already (Phase 13); D2 names Anima Engine as th
 
 | ID | Question | Recommended default |
 |---|---|---|
-| Q88 | Do AX-1 and AX-2 start with Anima Engine as their first user once APP-4 has a record, instead of waiting for the first round of ADOPT-1 (Q83)? | Yes. Anima Engine is a real user with a real sweep today; ADOPT-1 still runs and may reorder later steps |
-| Q89 | Does VERIFY-1 ship in a `0.4.x` release, since it changes no wire format? | Yes |
+| Q88 | Do AX-1 and AX-2 start with Anima Engine as their first user once APP-4 has a record, instead of waiting for the first round of ADOPT-1 (Q83)? | Yes. Anima Engine is a real user with a real sweep today; ADOPT-1 still runs and may reorder later steps. Decided on 2026-11-17 (delegated) |
+| Q89 | Does VERIFY-1 ship in a `0.4.x` release, since it changes no wire format? | Yes. Decided on 2026-11-17 (delegated) |
 
 ## Status log
 
 - 2026-11-17: Drafted at the owner's request ("dự án này hỗ trợ tối đa cho dự án Anima-engine của tôi").
   Ids claimed on the hub with `agent_bridge.py claim` (design 0087): design 0089, Q88, Q89, phase 16,
   VERIFY-1, APP-5. Q88 and Q89 are open.
+- 2026-11-17: The owner delegated the open choices ("bạn cứ làm những thứ tốt nhất theo ý bạn"); the coordinator
+  took the recommended defaults of Q88 and Q89. Status Accepted. VERIFY-1 starts now; APP-4 needs a build of
+  Anima Engine on each machine and is left to the owner or the Windows agent after the stability items, since a
+  full backend build has hung the owner's development machine.

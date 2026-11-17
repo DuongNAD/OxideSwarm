@@ -142,7 +142,7 @@ Several agents add design records, decisions, BACKLOG phases and items at the sa
 
 ```bash
 python3 scripts/agent_bridge.py claim design --title "short name" --branch claude/x   # prints 0089
-python3 scripts/agent_bridge.py claim q --title "the question"                        # prints Q87
+python3 scripts/agent_bridge.py claim q --title "the question"                        # prints the next free Q id
 python3 scripts/agent_bridge.py claim phase --title "the phase"                       # prints 14
 python3 scripts/agent_bridge.py claim item --prefix TEST --title "the item"           # prints TEST-52
 python3 scripts/agent_bridge.py claim --list [design|q|phase|item]                    # in use, open or stale
