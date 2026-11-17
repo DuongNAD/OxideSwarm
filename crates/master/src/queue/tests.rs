@@ -920,6 +920,23 @@ fn test_worker_rejection_detection_matches_worker_messages_only() {
         "Worker lacks GPU capability"
     )));
 
+    // A sandbox base the worker cannot use (design 0090), exactly as the worker words it.
+    let refusal = rusty_grid_core::sandbox_base_refusal(
+        "The sandbox base directory '/x/base' is not writable: Not a directory (os error 20)",
+    );
+    assert!(is_worker_rejection(&worker_rejection(
+        w, t, &refusal, &refusal
+    )));
+    assert!(is_worker_rejection(&TaskResult::failure(
+        w,
+        t,
+        1,
+        "",
+        refusal.clone(),
+        0,
+        Some(refusal.clone())
+    )));
+
     // A task that genuinely ran and failed is not a rejection, however fast it was.
     assert!(!is_worker_rejection(&TaskResult::failure(
         w, t, 1, "", "boom", 0, None

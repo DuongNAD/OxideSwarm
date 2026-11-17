@@ -350,6 +350,17 @@ pub fn display_with_sources(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
+/// Text a worker puts at the start of the failure when it cannot use its sandbox base for a task
+/// (the base is missing, not writable or no longer private; design 0090). It contains the
+/// "rejected by worker" marker the master already treats as a worker refusal, so the task is handed
+/// to another worker without charging its retry budget, and an older master recognises it too.
+pub const SANDBOX_BASE_REFUSAL_PREFIX: &str = "Task rejected by worker: sandbox base unusable";
+
+/// The failure text for a worker refusing a task because of its sandbox base.
+pub fn sandbox_base_refusal(reason: impl std::fmt::Display) -> String {
+    format!("{SANDBOX_BASE_REFUSAL_PREFIX}: {reason}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
