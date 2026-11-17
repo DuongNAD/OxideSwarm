@@ -120,3 +120,8 @@ Behaviour before this change (`MODE-1` in `docs/BACKLOG.md`):
 ## Status log
 
 - 2026-11-04: Implemented `MODE-1` across `crates/core/src/mode.rs`, `crates/cli/src/mode_cli.rs`, `crates/cli/src/cli_app.rs`, `crates/master/src/dashboard.html`, and `tests/workflow_modes_test.rs`, and documented the design in 0027.
+- 2026-11-17: `ox-mode dev cluster` (pull request 307, TEST-43) writes the master's stdout and stderr to
+  `.dev_cluster.master.log` in the workspace and quotes its last 40 lines when the wait for the master or
+  dashboard port file fails; `launch_local_dev_cluster_with_ports` refuses a grid port equal to the dashboard
+  port at once. The test that found it picked both ports with two bind-0-and-close calls, which returned the
+  same port once. The helpers live in `crates/cli/src/mode_cli/dev_launch.rs`.
