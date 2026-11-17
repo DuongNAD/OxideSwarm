@@ -736,3 +736,8 @@ second one, the classroom. Accepting Q25 accepts the second story.
   2, so the release column of the wave table no longer holds. The order of the waves and the text
   of every item are unchanged. ROADMAP Q81, taken at its recommended default on the owner's go-ahead
   of the same day, gives wave 1 (AX-1, AX-2, AX-3 and CACHE-1) to `0.6.0`. Q22 is not changed by it.
+- 2026-11-17: AX-1, AX-2 and AX-3 entered [BACKLOG.md](../BACKLOG.md) as part of Phase 13, after the
+  owner accepted Q82 and Q83 of [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md).
+  They may start as soon as the first round of ADOPT-1 is recorded, whether or not `0.5.0` has
+  shipped. The file names in the backlog are those after the split of `cli_app.rs` (MAINT-1). The
+  other items of this record are not in the backlog.
