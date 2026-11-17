@@ -159,6 +159,7 @@ On 2026-11-17 the twelve items of Phase 13 were added from
 then holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
 Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184 items, 106 Implemented, 13 Partial and 65 Planned.
 Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
+Then TEST-49 and Phase 16 (APP-4, VERIFY-1, APP-5, design 0089) were added: 191 items, 109 Implemented, 13 Partial and 69 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -230,6 +231,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
+| TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -351,6 +353,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
+| APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
+| VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Planned | 296 (open), (design 0089) |
+| APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
 
 ## Phase 0: integrate open work
 
@@ -3179,6 +3184,17 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
 - **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
 
+### TEST-49: Wait for the master by condition in the sched2 runtime test
+
+- **Evidence:** `cli_app::runtime_tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket`
+  (`crates/cli/src/cli_app/runtime_tests.rs:886`, "round-robin master bound") failed in `gpu-wgpu (ubuntu-latest)`
+  on 2026-11-17, in pull request 294 at `c5dfc08` (run `44086935350`, job `134051751538`). The rerun passed.
+- **Problem:** The test tries to connect to the in-process master 50 times, 20 ms apart: one second. The
+  `gpu-wgpu` job builds and runs heavier code on the same runner, so the master can take longer to bind.
+- **Do:** Wait for the master's port file or for a successful connect with a bounded but generous limit
+  (for example 30 s), as TEST-36 to TEST-38 did, and keep every assertion.
+- **Done when:** The test passes 200 runs in a row under CPU starvation on Linux.
+
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -3723,6 +3739,37 @@ changes.
   (fifteen dated lessons; section 0 tells every agent to read it), and `CLAUDE.md` "Conventions and
   pitfalls" has the lessons that hold without the hub.
 
+## Phase 16: Anima Engine as the first workload
+
+From [design 0089](design/0089-anima-engine-first-workload.md). The owner asked on 2026-11-17 that
+OxideSwarm support the owner's simulation project, Anima Engine, as far as it can. Anima Engine runs sweeps
+of independent trials that each end in a checksum, and a Rust build too heavy for the owner's development
+machine. Order: APP-4 (needs nothing built), VERIFY-1, then AX-1 and AX-2 of Phase 13 with Anima Engine as
+their first user (Q88), then APP-5.
+
+### APP-4: Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid
+
+- **Evidence:** [Design 0063](design/0063-two-directions-in-parallel.md) D5 and design 0089 D1. Anima Engine
+  ran the E-SEL1 smoke sweeps of 2026-11-17 on one Mac.
+- **Do:** As design 0089 D1: build the headless runner on the Mac and the Windows case machine; run one
+  manifest and seed in deterministic mode on the CPU on both and compare checksums; run a sweep through
+  `submit` on one and then two workers. Never stage `.env`. A full backend build has hung the owner's
+  development machine: build with `-j 2` and only while someone watches.
+- **Done when:** A dated record holds the checksums of both machines and the trials per hour on one and two
+  workers.
+
+### VERIFY-1: Run a task again on other workers and compare its outputs
+
+- **Evidence:** Design 0089 D3. The grid has no way to check a result.
+- **Do:** `submit --verify <N>` and `--verify-file`, and the same in the MCP `submit` tool, client side with
+  no wire change (Q89).
+- **Done when:** The tests of design 0089 D3 pass in CI.
+
+### APP-5: Guide: Anima Engine sweeps on OxideSwarm, with a recorded run
+
+- **Do:** `docs/guides/anima-engine-sweeps.md` as design 0089 D5, with GPU and CPU variants and VERIFY-1.
+- **Done when:** The guide exists with a recorded sweep and is linked from `README.md`.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -4112,3 +4159,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: Phase 15 (coordination between agents) added from design 0087 after the owner decided Q84 to
   Q86, and done the same day: COORD-1 and COORD-2 in pull request 295, COORD-3 in pull request 294. Counted
   from the rows, the Index holds 187 items: 109 Implemented, 13 Partial and 65 Planned.
+- 2026-11-17: TEST-49 added (claimed on the hub) and Phase 16 added from design 0089 (Anima Engine as the
+  first workload; Q88 and Q89 decided by the owner's delegation): APP-4, VERIFY-1 (pull request 296) and APP-5.
+  Counted from the rows, the Index holds 191 items: 109 Implemented, 13 Partial and 69 Planned.

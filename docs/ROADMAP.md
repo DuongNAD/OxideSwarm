@@ -92,6 +92,12 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   [design 0087](design/0087-shared-coordination-state.md), with items COORD-1 to COORD-3. Q84 to
   Q86 were decided at the recommended defaults; all three items are done (pull requests 294 and 295).
 
+- Anima Engine as the first workload (Accepted, 2026-11-17): the owner's simulation project runs sweeps
+  of independent trials that each end in a checksum, and a heavy Rust build. A trial on two machines
+  (APP-4), a way to run a task again on other workers and compare its outputs (VERIFY-1), AX-1 and AX-2
+  with Anima Engine as their first user (Q88), and a guide (APP-5). The plan is in
+  [design 0089](design/0089-anima-engine-first-workload.md).
+
 ## Where the project stands
 
 The state at `master` `e25d0ce` on 2026-11-17: release 0.3.0 plus protocol 10, which has an
@@ -716,6 +722,8 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q84 | Do agent id claims (design numbers, Q ids, phases, item ids) live on the hub rather than in a file in the repository ([design 0087](design/0087-shared-coordination-state.md))? | Decided by the owner on 2026-11-17: the hub |
 | Q85 | Is claiming an id and reporting changed files with `activity` a rule for every agent, including the Claude Code sessions (design 0087)? | Decided by the owner on 2026-11-17: yes, from when COORD-1 and COORD-2 land |
 | Q86 | May the coordinator copy its process lessons from its private Claude memory into `AGENT_RULES.md` and `CLAUDE.md` (design 0087, COORD-3)? | Decided by the owner on 2026-11-17: yes; done (COORD-3) |
+| Q88 | Do AX-1 and AX-2 start with Anima Engine as their first user once APP-4 has a record, instead of waiting for the first round of ADOPT-1 (Q83, [design 0089](design/0089-anima-engine-first-workload.md))? | Yes. Decided on 2026-11-17 by the owner's delegation ("bạn cứ làm những thứ tốt nhất theo ý bạn") at the recommended default |
+| Q89 | Does VERIFY-1 (`submit --verify`, client side) ship in a `0.4.x` release (design 0089)? | Yes. Decided on 2026-11-17 by the owner's delegation |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
