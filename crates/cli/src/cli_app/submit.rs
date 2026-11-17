@@ -744,6 +744,44 @@ fn listed_worker_name(workers: &[WorkerCapabilities], worker_id: Uuid) -> Option
         .map(|w| w.name.clone())
 }
 
+/// `--verify`: runs the task again on `replicas` other workers and compares the outputs with the
+/// first run's (`first`).
+#[allow(clippy::too_many_arguments)]
+async fn verify_on_other_workers(
+    master_addr: &str,
+    secret: Option<&rusty_grid_core::cluster_auth::ClusterSecret>,
+    template: &Task,
+    placement: &Placement,
+    first: &rusty_grid_core::task::TaskResult,
+    first_name: Option<String>,
+    replicas: usize,
+    verify_file: Option<&str>,
+) -> Result<crate::verify::Report, String> {
+    let connect = || async {
+        connect_master(master_addr, secret)
+            .await
+            .map_err(|e| format!("could not connect to the master: {e}"))
+    };
+    let mut transport = connect().await?;
+    let workers = fetch_workers(&mut transport, master_addr, secret.is_some())
+        .await
+        .ok_or("could not list the workers")?;
+    drop(transport);
+    crate::verify::verify_on_workers(
+        crate::verify::Request {
+            workers: &workers,
+            template,
+            placement,
+            first,
+            first_name,
+            replicas,
+            file: verify_file,
+        },
+        connect,
+    )
+    .await
+}
+
 /// Public entry point for programmatic/test submission with default secret options.
 pub async fn run_submit(args: SubmitArgs, config_file: Option<ConfigFile>) -> ExitCode {
     run_submit_with_secret(args, config_file, SecretOpts::default()).await
@@ -852,7 +890,7 @@ async fn run_submit_with_secret_inner(
         }
     };
 
-    let output_globs = if !args.outputs.is_empty() {
+    let mut output_globs = if !args.outputs.is_empty() {
         if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&args.outputs) {
             eprintln!("--output: {e}");
             return ExitCode::FAILURE;
@@ -861,6 +899,22 @@ async fn run_submit_with_secret_inner(
     } else {
         Vec::new()
     };
+    if let Some(replicas) = args.verify {
+        if let Err(e) = crate::verify::check_options(
+            replicas,
+            args.verify_file.as_deref(),
+            !output_globs.is_empty(),
+            args.worker.is_some(),
+        ) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+        if let Some(file) = &args.verify_file {
+            if !output_globs.contains(file) {
+                output_globs.push(file.clone());
+            }
+        }
+    }
     if (!inputs.inputs.is_empty() || !output_globs.is_empty())
         && !matches!(
             spec,
@@ -1039,6 +1093,7 @@ async fn run_submit_with_secret_inner(
         task = task.with_workspace(ws);
     }
     let task_id = task.id;
+    let verify_template = args.verify.map(|_| task.clone());
     let wait = args.wait || args.output.is_some() || !output_globs.is_empty() || is_compile;
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
@@ -1199,6 +1254,22 @@ async fn run_submit_with_secret_inner(
                     }
                 }
             };
+            let verify_outcome = match (args.verify, &verify_template) {
+                (Some(replicas), Some(template)) if result.is_success() => Some(
+                    verify_on_other_workers(
+                        &master_addr,
+                        secret.as_ref(),
+                        template,
+                        &placement,
+                        &result,
+                        worker_name.clone(),
+                        replicas,
+                        args.verify_file.as_deref(),
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
             let mut artifact_save_error: Option<String> = None;
             let saved_artifacts = if !result.artifacts.is_empty() {
                 match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
@@ -1223,6 +1294,18 @@ async fn run_submit_with_secret_inner(
                     }
                     if let Some(ref err) = artifact_save_error {
                         obj.insert("artifact_save_error".to_string(), serde_json::json!(err));
+                    }
+                    match &verify_outcome {
+                        Some(Ok(report)) => {
+                            obj.insert("verify".to_string(), report.to_json());
+                        }
+                        Some(Err(e)) => {
+                            obj.insert(
+                                "verify".to_string(),
+                                serde_json::json!({"status": "error", "error": e}),
+                            );
+                        }
+                        None => {}
                     }
                     if let Some(ref saved) = saved_outputs {
                         let saved_strs: Vec<String> =
@@ -1287,6 +1370,12 @@ async fn run_submit_with_secret_inner(
                 if let Some(ref error) = result.error {
                     eprintln!("Error: {error}");
                 }
+                if let Some(Ok(report)) = &verify_outcome {
+                    println!("{}", report.text());
+                }
+            }
+            if let Some(Err(e)) = &verify_outcome {
+                eprintln!("Verification failed: {e}");
             }
             if let Some(err) = artifact_save_error {
                 eprintln!("Failed to save output artifacts: {err}");
@@ -1295,7 +1384,13 @@ async fn run_submit_with_secret_inner(
             if download_failed {
                 ExitCode::FAILURE
             } else if result.is_success() {
-                ExitCode::SUCCESS
+                match verify_outcome {
+                    Some(Ok(report)) if !report.verified() => {
+                        ExitCode::from(crate::verify::MISMATCH_EXIT_CODE)
+                    }
+                    Some(Err(_)) => ExitCode::FAILURE,
+                    _ => ExitCode::SUCCESS,
+                }
             } else if result.exit_code != 0 {
                 ExitCode::from(result.exit_code.min(255) as u8)
             } else {
