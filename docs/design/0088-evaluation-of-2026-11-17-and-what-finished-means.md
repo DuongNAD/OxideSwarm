@@ -192,11 +192,14 @@ Each exit check of D2 names its own evidence: a record with a date, a file, or a
 
 ## Work items
 
+The three items are in [BACKLOG.md](../BACKLOG.md) since 2026-11-17, as part of its Phase 13, with
+their full text. The backlog is the place where their status is kept.
+
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| CI-1 | Find what cancels macOS jobs in runs for pushes on `master`, and tell an infrastructure failure from a failing test | `.github/workflows/ci.yml`, [ROADMAP.md](../ROADMAP.md) | A status log line names the cause of the cancelled jobs of 2026-11-16 with the run IDs it was read from, or states what was checked and ruled out. The two failures of 2026-11-17 (runs `44036878952` and `44034218213`) each have a cause on record or a retry in the workflow | Planned |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | `.github/workflows/ci.yml`, `docs/guides/multi-agent-collaboration.md`, a new `scripts/ci_push_runs.py` | The "Done when" of CI-1 in [BACKLOG.md](../BACKLOG.md): a rule that no agent cancels a run for a push, a script that classes each run that is not green, and a cause or a retry for the two failures of 2026-11-17 (runs `44036878952` and `44034218213`) | Planned |
 | MAINT-2 | Bring the last three files under the size cap | `crates/worker/src/isolation.rs` (5,346 production lines), `crates/cli/src/mcp.rs` (3,692), `crates/cli/src/mode_cli.rs` (3,240), `scripts/rust-file-size-allowlist.txt` | The allowlist has no entry, `ox-mode test size` passes, and `crates/core/tests/data/wire_layout.txt` is unchanged | Planned |
-| DOC-11 | Make the backlog show open work first | `docs/BACKLOG.md`, a new archive file under `docs/` | The Index marks which open items are inside the stop line of D1. The text of every Implemented item is in the archive file, and each Index row still links to its text. Every relative link resolves (`ox-mode doc verify`) | Planned |
+| DOC-11 | Make the backlog show open work first | `docs/BACKLOG.md`, a new `docs/BACKLOG-ARCHIVE.md` | The Index marks which open items are inside the stop line of D1. The text of every Implemented item is in the archive file, and each Index row still links to its text. Every relative link resolves (`ox-mode doc verify`) | Planned |
 
 ## Decisions
 
@@ -212,3 +215,7 @@ The owner decided both in chat on 2026-11-17, at the recommended default.
 - 2026-11-17: Draft written from an evaluation of `master` `16b2a38`. No exit check beyond E1 holds.
 - 2026-11-17: The owner decided Q82 and Q83 at the recommended default. Status set to Accepted.
   The items of D4 and the three new items are not in the BACKLOG Index yet.
+- 2026-11-17: The twelve items of D4 entered [BACKLOG.md](../BACKLOG.md) as Phase 13, all Planned.
+  The cause of the cancelled runs of 2026-11-16 was read from the job annotations while CI-1 was
+  written: the owner's account cancelled twelve runs, and no hosted macOS runner acquired the jobs of
+  six others. CI-1 now asks for a rule and a script instead of the search.

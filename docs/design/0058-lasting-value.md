@@ -2,7 +2,7 @@
 
 Status: Draft (plan; builds nothing; Q32 is decided for the first items; Q31 and Q33 to Q35 are
 open)
-Created: 2026-11-10    Updated: 2026-11-10
+Created: 2026-11-10    Updated: 2026-11-17
 
 ## Summary
 
@@ -367,7 +367,9 @@ same pull request. LV-4 and LV-5 add CI jobs. They are required checks only afte
 
 "Needs" lists items of this record, of design 0056 and of the backlog. Sizes are the backlog's S,
 M and L. LV-1 (its first targets), LV-5, LV-10 and LV-14 are in [BACKLOG.md](../BACKLOG.md) since
-2026-11-10, with their files and checks. The other items enter it when the owner adds them.
+2026-11-10, with their files and checks. LV-4 and LV-15 are in it since 2026-11-17 (Phase 13,
+[design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md)). The other items enter it
+when the owner adds them.
 
 | ID | Item | Track | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|---|
@@ -427,3 +429,6 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q31 to Q35.
   LV-14, LV-16 and the risks now say so.
 - 2026-11-10: The owner asked for other funds. D10 lists the candidates that three research runs
   checked the same day, with each programme's rule on AI and the sources that are ruled out.
+- 2026-11-17: LV-4 and LV-15 entered [BACKLOG.md](../BACKLOG.md) as part of Phase 13, after the owner
+  accepted Q82 of [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md). The text of
+  the items is unchanged.

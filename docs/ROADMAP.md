@@ -142,7 +142,7 @@ number does not fix its content in advance.
 | `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Merged on 2026-11-17 (PROTO-1 to PROTO-4; pull requests 272 and 274). Prepared in draft pull request 280. Not tagged | Green checks on pull request 280 and its merge. The owner agreed on 2026-11-17 to the tag on that merge commit. The 48 hours of D1 end on 2026-11-19 at 03:58 UTC |
 | `0.4.x`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned. It comes before any item of `0.5.0` is built (Q80) | The exit check under "Stability" |
 | `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The stability release, and the steps under "Before 0.5.0 has items" |
-| `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 is in the BACKLOG Index; AX-1 to AX-3 are not | The first round of ADOPT-1 (Q37), then the items enter BACKLOG |
+| `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 and, since 2026-11-17, AX-1 to AX-3 are in the BACKLOG Index (Phase 13) | The first round of ADOPT-1 (Q37) |
 
 The wave table of [design 0056](design/0056-frontier-program.md) (D8) planned other content for
 `0.3.0` and `0.4.0`. Its order of waves stands, and its release numbers do not.
@@ -163,7 +163,8 @@ that run stably, is not reached.
   `43944560507`, `windows-latest`) is TEST-42, and
   `test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling` in
   `tests/workflow_modes_test.rs` (run `43952618376`, `ubuntu-latest`) is TEST-43. The cancelled macOS
-  jobs have no item.
+  jobs and the cancelled runs are CI-1: the job annotations say that no hosted macOS runner acquired
+  the jobs, and that the owner's account cancelled the twelve runs.
 - On 2026-11-17 `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` ran a task twice in
   one round of twelve (pull request 282, run `44018512676`, `ubuntu-latest`). It is TEST-41.
 - Also on 2026-11-17: the speed-aware batch test missed its 1.5x wall-clock cap (pull request 282, run
@@ -215,8 +216,8 @@ Steps 2 and 3 build nothing in the product.
 Release `0.6.0` carries bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81). It serves the
 purpose of Q1, design 0056 planned it as the first wave, and no release has shipped it. AX-1 waits
 for the first round of the study of first use (ADOPT-1, Q37), and no session has run. The texts of
-AX-1 to AX-3 are in design 0056, and they enter [BACKLOG.md](BACKLOG.md) with files and a check
-before work starts. A wire change that merges earlier still ships within 48 hours (design 0076,
+AX-1 to AX-3 are in design 0056, and since 2026-11-17 they are in [BACKLOG.md](BACKLOG.md) with
+files and a check (Phase 13). A wire change that merges earlier still ships within 48 hours (design 0076,
 D1), so the number can move while the order stays. The items of bet A may start as soon as the
 first round of ADOPT-1 is recorded, whether or not `0.5.0` has shipped (Q83).
 
@@ -574,8 +575,8 @@ run supports them.
 
 Order: a study of first use with three to five people (ADOPT-1), a run summary (ADOPT-2), AX-1,
 AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for common jobs
-(ADOPT-4), then LLM-1 and LLM-6. The study may reorder the later steps. No item of design 0059 is
-in [BACKLOG.md](BACKLOG.md).
+(ADOPT-4), then LLM-1 and LLM-6. The study may reorder the later steps. ADOPT-1 to ADOPT-4 are in
+[BACKLOG.md](BACKLOG.md) since 2026-11-17 (Phase 13).
 
 [Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
 row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
@@ -695,7 +696,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
-| Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are not in the backlog yet |
+| Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |
 | Q83 | May AX-1 to AX-3 and CACHE-1 start as soon as the first round of ADOPT-1 is recorded, whether or not release `0.5.0` has shipped? | Yes, decided by the owner on 2026-11-17. The release numbers follow what merges (design 0076, D1) |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
@@ -862,3 +863,6 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 - 2026-11-17: The owner decided Q82 and Q83 of design 0088 at the recommended default, and the
   record is Accepted. The ten exit checks are what "finished" means, and the items of bet A may
   start before release `0.5.0` ships. The items that design 0088 names are not in the backlog yet.
+- 2026-11-17: The twelve items that design 0088 names entered [BACKLOG.md](BACKLOG.md) as Phase 13:
+  CI-1, MAINT-2, DOC-11, ADOPT-1 to ADOPT-4, AX-1 to AX-3, LV-4 and LV-15, all Planned. CI-1 records
+  the cause of the cancelled runs and jobs of 2026-11-16 that "Stability" lists.

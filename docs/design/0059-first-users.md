@@ -2,7 +2,7 @@
 
 Status: Draft (plan; builds nothing; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are
 open)
-Created: 2026-11-10    Updated: 2026-11-12
+Created: 2026-11-10    Updated: 2026-11-17
 
 ## Summary
 
@@ -376,7 +376,8 @@ Measures M1 and M2 of design 0056 measure the gain itself and stay there.
 ## Work items
 
 "Needs" lists items of this record, of designs 0056 and 0058 and of the backlog. Sizes are the
-backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
+backlog's S, M and L. The four items are in [BACKLOG.md](../BACKLOG.md) since 2026-11-17 (Phase 13),
+and their status is kept there.
 
 | ID | Item | Audience | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|---|
@@ -438,3 +439,7 @@ None yet.
 - 2026-11-12: [Design 0063](0063-two-directions-in-parallel.md) adds a trial with fellow students
   that watches one lesson with the owner's study tools (APP-3). It can run in the same week as
   round one of ADOPT-1, and it asks another question. The text of ADOPT-1 is unchanged.
+- 2026-11-17: ADOPT-1 to ADOPT-4 entered [BACKLOG.md](../BACKLOG.md) as part of Phase 13, after the
+  owner accepted Q82 of [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md). A row
+  in the Index starts no item: ADOPT-3 and ADOPT-4 still wait for the first round of ADOPT-1, and Q36
+  and Q38 stay open. The text of the items is unchanged.

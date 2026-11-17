@@ -154,6 +154,9 @@ After TEST-28 and TEST-30 (Implemented), TEST-27 and TEST-31 (Partial) and three
 (TEST-33 to TEST-35), it held 150 items: 93 Implemented, 9 Partial and 48 Planned.
 Recounted on 2026-11-17 after pull requests 267 to 286 and PROTO-3 and PROTO-4 (pull request 274; PROTO-5, TEST-39 to
 TEST-47, BUG-23 and BUG-24 added): 165 items, 105 Implemented, 13 Partial and 47 Planned.
+On 2026-11-17 the twelve items of Phase 13 were added from
+[design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) (Q82). Counted from the rows, the table
+then holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -325,6 +328,18 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
+| MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
+| DOC-11 | Make the backlog show open work first | P2 | S |  |  | Planned | (design 0088) |
+| ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | (design 0059) |
+| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Planned | (design 0059) |
+| ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | (design 0059) |
+| ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | (design 0059) |
+| AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | (design 0056) |
+| AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | (design 0056) |
+| AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | (design 0056) |
+| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | (design 0058) |
+| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | (design 0058) |
 
 ## Phase 0: integrate open work
 
@@ -2260,8 +2275,9 @@ roadmap are open. Each item starts with a threat model of its own and an indepen
 
 Added on 2026-11-10 from [design 0058](design/0058-lasting-value.md), at the owner's word, for its
 first items. The record plans assurance, a written specification, citable evidence and stewardship,
-and adds no feature. Its other items (LV-2 to LV-4, LV-6 to LV-9, LV-11 to LV-13 and LV-15 to
-LV-17) stay in the design record until the owner adds them here. The four items below do not depend
+and adds no feature. Its other items (LV-2, LV-3, LV-6 to LV-9, LV-11 to LV-13, LV-16 and
+LV-17) stay in the design record until the owner adds them here. LV-4 and LV-15 are in Phase 13
+since 2026-11-17. The four items below do not depend
 on each other and can run in parallel. None changes the wire format, a CLI flag or a default, so
 none needs a design record of its own.
 
@@ -3253,6 +3269,305 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
   once, one with the beacon off.
 
+## Phase 13: the path to finished
+
+Added on 2026-11-17 from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),
+after the owner accepted Q82. That record states ten exit checks that together mean "finished" for
+the purpose of Q1. This phase holds the items those checks need that had no row in the Index. Nine
+of them have their full text in designs 0056, 0058 and 0059; the item here names the files as they
+are at `master` `16b2a38` and the check. Three are new: CI-1, MAINT-2 and DOC-11.
+
+A row in the Index starts no item:
+
+- ADOPT-1 is the owner's (Q37). AX-1 starts after its first round, and so do ADOPT-3 and ADOPT-4, as
+  Q38 recommends. Q36, Q38 and Q55 stay open.
+- AX-1 to AX-3 may start before release `0.5.0` ships (Q83).
+
+Order:
+
+1. CI-1, DOC-11 and ADOPT-1, beside the test items of Phase 12.
+2. ADOPT-2, LV-4 and MAINT-2. None of them waits for the study.
+3. AX-1, then AX-2, AX-3, ADOPT-3 and ADOPT-4.
+4. LV-15, after LV-5.
+
+Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it says otherwise.
+
+### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
+
+- **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
+  the job annotations (`gh api repos/<OWNER>/<REPO>/check-runs/<JOB_ID>/annotations`).
+  - Twelve runs of 2026-11-16 ended as cancelled (`43800093872` to `43889536272`). The annotation of
+    their jobs is "The run was canceled by" the owner's account. The workflow itself cancels only
+    runs for pull requests (`.github/workflows/ci.yml`, `concurrency`), so each was cancelled by
+    hand or by a session that uses the owner's `gh` login.
+  - Six runs of 2026-11-16 hold one or two cancelled macOS jobs (`43889143995`, `43894129643`,
+    `43914764615`, `43928207482`, `43952618376`, `43964491108`). The annotation is "The job was not
+    acquired by Runner of type hosted even after multiple attempts", beside a notice about capacity
+    for macOS arm64 runners. In the two runs read in detail (`43914764615`, `43964491108`) the jobs
+    waited 32 to 49 minutes and never got a runner. Five of the six runs count as failed with no
+    failed job.
+  - Two runs of 2026-11-17 failed with no failing test. In `44036878952` the job
+    `fuzz (tree_manifest)` could not download the pinned nightly toolchain. In `44034218213` the
+    test step of `workspace tests (windows-latest)` ended three minutes after the job started, with
+    exit code `-1073741502`.
+- **Problem:** The exit check of Q80 asks for seven days of runs for pushes in which no test fails.
+  A run that is red or cancelled for another reason has to be told apart by hand, and a cancelled
+  run tests nothing for its commit.
+- **Do:**
+  1. Add a rule to `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run
+     for a push on `master`. Say what to do instead when a newer push makes a run look
+     superfluous: leave it.
+  2. For a macOS job that was never acquired, rerun the failed jobs of that run on its current
+     head (`gh run rerun <RUN_ID> --failed`), and record the run in the status log. Do not change
+     the workflow for it.
+  3. In the `fuzz` job, make the toolchain step retry a failed download, with the options the
+     action offers or with a retry around the `rustup` call. Do not change the pinned date.
+  4. For exit code `-1073741502` in run `44034218213`, read the full log of the step and the
+     diagnostics step of TEST-29. Record what the first line with the code follows. If the step
+     never started `cargo`, it is a runner failure: say so and rerun. If a test binary returned
+     it, open an item for that test.
+  5. Add a script `scripts/ci_push_runs.py` (standard library and `gh` only) that prints, for the
+     last N days of runs for pushes on `master`, one line per run that is not green with its
+     class: failing test, job never acquired, cancelled by an account, or other. The exit check
+     of Q80 is then read from its output.
+- **Done when:** The guide has the rule of step 1. The script of step 5 has a test with recorded
+  JSON input (`tests/test_ci_push_runs.py`, standard library only) that CI runs on Linux, macOS
+  and Windows, and its output for 2026-11-16 names
+  twelve runs as cancelled by an account and six as holding a job that was never acquired. The
+  two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
+
+### MAINT-2: Bring the last three files under the size cap
+
+- **Evidence:** `scripts/rust-file-size-allowlist.txt` lists three files whose production part
+  (every line before the first `#[cfg(test)]`) exceeds 3,000 lines: `crates/worker/src/isolation.rs`
+  (5,346), `crates/cli/src/mcp.rs` (3,692) and `crates/cli/src/mode_cli.rs` (3,240). MAINT-1 split
+  six other files and left these at their size. `isolation.rs` holds the macOS code in an inline
+  `mod macos` and the Windows code in an inline `pub mod windows`. Only the Linux code is in a file
+  of its own (`crates/worker/src/isolation/linux.rs`). It also holds 125 of the 290 lines of `crates/*/src`
+  that contain `unsafe`.
+- **Problem:** The code that confines a task is the hardest file to review, and it is the largest
+  production file. Two platforms cannot be changed without a merge conflict in one file.
+- **Do:** One pull request per file. Move code, and change no behaviour, no public name and no
+  message text.
+  1. `isolation.rs`: move `mod macos` to `isolation/macos.rs` and `pub mod windows` to
+     `isolation/windows.rs`, beside `isolation/linux.rs`. Keep the shared types, the level
+     parsing and the start-up check in `isolation.rs`. Do LV-4 for these files in the same pull
+     request or the next one, so each `unsafe` site is read once.
+  2. `mcp.rs`: move each tool (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`,
+     `workspaces`) to a file under `crates/cli/src/mcp/`, and keep the JSON-RPC loop in `mcp.rs`.
+  3. `mode_cli.rs`: move each workflow mode (`test`, `dev`, `doc`, `research`) to a file under
+     `crates/cli/src/mode_cli/`.
+  4. After each split, delete the file's line from the allowlist.
+- **Done when:** The allowlist has no entry, `ox-mode test size` passes,
+  `cargo test -p rusty_grid_worker --test test_feat3_os_isolation` passes on Linux, macOS and
+  Windows, `cargo test -p rusty_grid_cli --test mcp_server_e2e` passes, and
+  `crates/core/tests/data/wire_layout.txt` is unchanged.
+
+### DOC-11: Make the backlog show open work first
+
+- **Evidence:** This file has more than 3,600 lines. Its Index has 178 rows after this phase, and
+  106 of them are Implemented. The text of every Implemented item stays in the phases below, so an
+  agent that looks for open work reads the finished work first. No column says whether an open
+  item is inside the stop line of design 0088 (D1).
+- **Problem:** The length hides the open work, and the Index counts growth work (Phases 7 to 9) as
+  open work for completion.
+- **Do:**
+  1. Add a column "Line" to the Index: "In" for an open item that an exit check of design 0088
+     (D2) names, "Out" for an open item that its D1 puts outside the stop line, and empty for an
+     Implemented item. An open item that neither names is "In" when it fixes a defect or a test
+     (BUG, SEC, TEST), and otherwise goes to the owner as a question in the pull request.
+  2. Move the text of every Implemented item to `docs/BACKLOG-ARCHIVE.md`, under the same phase
+     headings and in the same order. Keep the Index whole, and keep the status log here.
+  3. Add both files to the index of `docs/README.md`, and fix every link that pointed at a moved
+     heading.
+  4. Do this in one pull request, at a time when no other pull request that edits this file is
+     open, and say so on the agent hub first.
+- **Done when:** No item with status Implemented has its text in this file, every Index row of an
+  open item has "In" or "Out", `python3 tests/test_m1_challenger_hygiene.py` reports no broken
+  link, and a line count in the pull request shows that the two files together hold the item
+  texts unchanged.
+
+### ADOPT-1: A study of first use, in two rounds
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D4. The owner decided on 2026-11-11 to
+  run the first round with three to five people (Q37). The section "Study records" of that record
+  says "None yet". The repository has 6 stars and 0 forks, and no issue has been filed.
+- **Problem:** No person outside the project has installed the grid under observation. The order
+  of AX-1, ADOPT-3 and ADOPT-4 rests on reasoning about users. Exit checks E8 and E10 of design
+  0088 both start from this study, so it is the longest wait on the path.
+- **Do:** Owner. Follow D4 of design 0059 as written:
+  1. Ask 10 to 20 people the screening question, with no install, and record the answers as
+     counts per kind of job.
+  2. Run three to five sessions with people who named a job, on a cluster made for the study with
+     its own secret. Record per session the two operating systems, the minutes to the end of each
+     step, every point where the person stopped, and the job they chose.
+  3. After 14 days, ask each person whether they ran a task of their own again.
+  4. Write the dated table under "Study records" in design 0059. It holds no name, host name,
+     address, secret or ticket.
+  5. Apply the table "How the result changes the order" of D4, and record the outcome in the
+     status log here.
+  6. Run the second round after ADOPT-2, AX-1, AX-2, ADOPT-3 and ADOPT-4, with at least two
+     people the owner has not helped before.
+- **Done when:** "Study records" holds at least three sessions of the first round with measures
+  M15 to M17. The item is Partial from then until the second round is recorded.
+
+### ADOPT-2: Run summary in `submit --wait`, its JSON output and the MCP results
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D5. `submit --wait` prints
+  `Execution Time` per task (`crates/cli/src/cli_app/submit.rs`). No line or JSON field gives the
+  time the caller waited, the sum of the task times or the number of machines: a search for
+  `waited_ms` and `task_time_sum_ms` in `crates/cli/src` finds nothing.
+- **Problem:** A user cannot see what the grid cost or gained on a run without a stopwatch.
+- **Do:** As D5 of design 0059, for one task first:
+  1. After a waited run, print the two lines of D5 (`Tasks:` and `Waited:`) next to
+     `Execution Time`. `Waited` is measured on the client, and the sum adds
+     `TaskResult::execution_time_ms`.
+  2. Add `waited_ms`, `task_time_sum_ms` and `machines` to the JSON output of `submit` and to the
+     result of the MCP tools `submit` and `task_result` (`crates/cli/src/mcp.rs`).
+  3. Print no ratio and no percentage, and never call the sum the time on the user's machine.
+  4. Update `README.md` and `CHANGELOG.md`. The values come from fields that exist, so the wire
+     format does not change.
+- **Done when:** The ADOPT-2 tests of the test plan of design 0059 pass: the unit cases (no task,
+  one task, one failed task, two tasks on one worker), a waited run on loopback that prints both
+  lines and carries the three fields under `--json`, and `mcp_server_e2e` finds the fields while
+  standard output stays JSON-RPC only.
+
+### ADOPT-3: Install scripts and the scripted time to first result
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D6. `scripts/install.sh` and
+  `scripts/install.ps1` do not exist. `README.md` tells a user to download an archive, compare
+  `SHA256SUMS` and unpack by hand. No record gives the time from the release page to a first
+  result.
+- **Problem:** The install is the first thing a stranger does, and it is the step with the most
+  manual commands.
+- **Do:** As D6 of design 0059, with its rules: no `sudo`, no service, no start of a master or a
+  worker, a pinned release, a checksum comparison before unpacking, `--version`, `--dir` and
+  `--dry-run`, and no pipe into a shell in `README.md`. Verify the attestation of the archive
+  when LV-5 has landed and `gh` is present. Then write the scripted measure of M15, which times
+  the Quick start from an empty home directory, with its records in `benchmarks/grid/`.
+- **Done when:** The ADOPT-3 cases in `tests/test_launcher_scripts.py` pass (a matching checksum
+  installs, a mismatch refuses and leaves no file, an unknown architecture is named, `--dry-run`
+  writes nothing, a second run replaces the binaries), and M15 by script is recorded for macOS,
+  Windows and Linux.
+
+### ADOPT-4: Guides for common jobs, each with a recorded run
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D7. `docs/guides/` has one guide for a
+  job a user brings (`offload-cargo-test.md`) and one for GPU command tasks (`gpu-workloads.md`).
+  `HOST_PROBED_TOOLS` in `crates/core/src/capabilities.rs` probes `cargo`, `rustc` and `git` only.
+- **Problem:** A user with a job other than `cargo test` has no worked example to copy.
+- **Do:** As D7 of design 0059. The first round of ADOPT-1 chooses among its candidates. Each
+  guide follows the guide template of `docs/README.md`, uses tools the machine's owner installed,
+  shows no `--insecure`, uses `--isolation fs` where the system supports it, and names the
+  release of its last recorded run. The item may add a tool to `HOST_PROBED_TOOLS`.
+- **Done when:** Three guides each have a "Verify" block and a dated run record that names its
+  machines and release, and the index of `docs/README.md` lists them.
+
+### AX-1: Matrix fan-out in `submit` and in MCP
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A1. One `submit` call
+  places one task on one worker. `crates/cli/src/cli_app/submit.rs` has no `--matrix` flag (the
+  flag `--matrix-dim` belongs to the GPU benchmark task), and the MCP tool `submit` has no `matrix`
+  field (`crates/cli/src/mcp.rs`).
+- **Problem:** Checking one change on macOS, Windows and Linux takes three calls and three
+  results that the caller merges. This is the first job of the first audience of design 0059, and
+  the purpose of Q1.
+- **Do:** As part A1 of design 0056. The expansion happens in the client, so the wire format does
+  not change:
+  1. `submit --matrix os=macos,windows,linux -- <command>` submits one task per value with the
+     matching `require:` entry. `--matrix` may repeat for a product, up to a fixed cell limit.
+  2. With `--workspace`, the tree syncs to each chosen worker.
+  3. The client waits for every cell. `--json` prints one record per cell: cell, worker, exit
+     code, duration, and the head and tail of the output. The exit code is non-zero when any cell
+     fails.
+  4. A cell that no worker matches is reported as unplaced after a check against `ListWorkers`.
+     It does not hang.
+  5. The MCP tool `submit` takes the same `matrix` field and returns the array.
+  6. A design record, the `README.md` reference and `docs/guides/mcp-client-setup.md` land in the
+     same pull request.
+- **Done when:** An end-to-end test with three tagged workers returns three cell records from one
+  call, and a cell without a worker is reported unplaced. A live record shows one MCP call
+  testing a change on macOS, Windows and Linux. That record is exit check E8 of design 0088,
+  together with AX-2, AX-3 and CACHE-1 in a release.
+
+### AX-2: Sharded runs, with a build-once mode for Rust
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A2, and spike R2. The
+  CLI has no `shard` command, and no task gets `OX_SHARD_INDEX` or `OX_SHARD_TOTAL`. Spike R2
+  (how much wall time sharding saves on this repository's suite) has no record.
+- **Problem:** A slow test suite runs on one worker however many machines are idle.
+- **Do:** Run spike R2 first, with today's `submit`. The stop rule of design 0056 applies: if
+  sharding this repository's suite over three workers saves less than 30 % of the wall time,
+  AX-2 ships as a recipe in a guide only, without the build-once mode. Otherwise build part A2:
+  `oxideswarm shard --count <n> -- <command>`, the two environment variables, a guide with the
+  recipe per test runner, and the build-once mode with `cargo nextest archive`.
+- **Done when:** R2 has a dated record. Measure M1 of design 0056 is recorded for this repository
+  on three workers with its script in `benchmarks/grid/`, or the status log states that the stop
+  rule applied and the guide holds the recipe.
+
+### AX-3: Live output, `logs`, and MCP tasks
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A3. A client sees the
+  output of a task only in its final result. `MCP_PROTOCOL_VERSION` in `crates/cli/src/mcp.rs` is
+  `2024-11-05`. The CLI has no `--follow` flag and no `logs` command.
+- **Problem:** An agent waits for a long build to end before it learns that the first test
+  failed, and it cannot cancel early on what it sees.
+- **Do:** A design record first, because this is a wire change: new message variants (in the
+  public enum, both mirror enums and all four `From` impls), a `ProtocolCapabilities` bit and a
+  protocol version bump, so the release-train rule of design 0076 applies. Q55 is open and
+  decides whether a long-running MCP call works without the tasks extension. Then build part A3:
+  output chunks from the worker while a task runs (`crates/worker/src/runner.rs`), a bounded
+  buffer per task on the master (`crates/master/src/session.rs`), `submit --wait --follow`,
+  `oxideswarm logs <task>`, and an MCP server that speaks `2026-07-28` with the tasks extension
+  and keeps answering `2024-11-05` clients.
+- **Done when:** A client sees the first output line while the task runs. An MCP client polls a
+  running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
+  and the `release skew` job passes against the previous release.
+
+### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
+
+- **Evidence:** [Design 0058](design/0058-lasting-value.md), D2. A search for `unsafe {`,
+  `unsafe fn`, `unsafe impl` and `unsafe extern` in `crates/*/src` finds 285 sites: 176 in
+  `crates/worker`, 77 in `crates/core`, 29 in `crates/cli`, 2 in `crates/agent_mesh` and 1 in
+  `crates/master`. A search for `// SAFETY` finds 103 comments, 23 of them in `crates/worker`. No
+  crate sets `clippy::undocumented_unsafe_blocks`, `forbid(unsafe_code)` or `deny(unsafe_code)`,
+  and no workflow runs Miri.
+- **Problem:** Most `unsafe` sites are in the code that confines tasks and kills process trees. A
+  reviewer cannot tell which invariant each one relies on, and nothing stops a new site without a
+  comment.
+- **Do:**
+  1. Give every `unsafe` site a `SAFETY:` comment that states the invariant it relies on. Read
+     the site before writing the comment. Where the invariant does not hold, write the failing
+     test first, then the fix (rule 4), and use the private route of `docs/SECURITY.md` if a
+     remote peer can reach it.
+  2. Turn on `clippy::undocumented_unsafe_blocks` for the workspace, as an error.
+  3. Add `#![forbid(unsafe_code)]` to every crate and module that has no `unsafe` site.
+  4. Add a CI job on Linux that runs Miri on the unit tests it can run, and list in the job's
+     comment which tests it skips and why. Miri cannot run calls into the operating system.
+  5. Start with `crates/worker/src/isolation.rs`, together with MAINT-2.
+- **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
+  The clippy job fails on a site without one, and that job is a required check. The Miri job has
+  run once on `master`.
+
+### LV-15: Release runbook, secret inventory and a second releaser
+
+- **Evidence:** [Design 0058](design/0058-lasting-value.md), D5 and proof run V3. Six releases
+  were cut between 2026-11-09 and 2026-11-17. `docs/guides/` has no guide for a release. No file lists the secrets, accounts and
+  domains the project depends on. `git shortlog -sn` lists one human author.
+- **Problem:** If the owner is away, nobody can cut a release or knows which accounts one needs.
+- **Do:**
+  1. Write `docs/guides/cut-a-release.md` from the guide template: from the release pull request
+     (versions, `CHANGELOG.md`, `fuzz/Cargo.lock`) to the tag, the `release.yml` run, the check of
+     the archives against `SHA256SUMS` and, once LV-5 has landed, the attestation.
+  2. List every secret, account and domain the project depends on, and who holds each, in the
+     same guide. Name the kind of secret and its holder. Never write a value.
+  3. Owner: give a second person the rights to merge and to release.
+  4. That person cuts one release from the guide alone. Record the date, what was unclear and
+     whether the archives verified. This is proof run V3.
+- **Done when:** The guide exists and is in the index of `docs/README.md`. Proof run V3 is
+  recorded with its date in the status log of design 0058. Until a second person has cut a
+  release, the item is Partial.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -3627,3 +3942,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: Pull requests 282 (BUG-23), 283 (TEST-29 Partial), 284 (BUG-24) and 286 (TEST-33 Partial) merged;
   TEST-47 added (Planned) for the handle-count test that failed in pull request 286. The Index counts are
   105 Implemented, 13 Partial and 47 Planned (165 items).
+- 2026-11-17: Phase 13 added from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),
+  after the owner accepted Q82: CI-1, MAINT-2, DOC-11, ADOPT-1 to ADOPT-4, AX-1 to AX-3, LV-4 and LV-15, all
+  Planned. CI-1 records what the job annotations say about 2026-11-16: twelve runs for pushes on `master` were
+  cancelled by the owner's account, and six runs hold macOS jobs that no hosted runner acquired. Counted from
+  the rows, the Index holds 178 items: 106 Implemented, 13 Partial and 59 Planned.
