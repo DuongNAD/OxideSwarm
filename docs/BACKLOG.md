@@ -333,7 +333,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
-| BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented | PRNUM |
+| BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented | 311 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
@@ -3358,7 +3358,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   default port on the same machine.
 - **Do:** Start the dev cluster's master with `--discovery-port 0`, which turns the beacon off.
 - **Done when:** The dev cluster's master binds no UDP discovery port, and the dev cluster tests pass.
-- **Status:** Implemented by pull request PRNUM. Both branches of the launcher (isolated home and workspace)
+- **Status:** Implemented by pull request 311. Both branches of the launcher (isolated home and workspace)
   pass `--discovery-port 0`; the change adds no line to `mode_cli.rs`, which is at its allowlisted size.
   While the four dev cluster tests ran on Windows, a watcher listed the UDP endpoints of every `rusty-grid.exe`
   they started: none with this change; `master 127.0.0.1:8089` with the build before it.
