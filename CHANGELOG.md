@@ -5,7 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- CI: the `cargo test --workspace` step of `workspace tests` stops at 45 minutes, prints a heartbeat line with the last output line once a minute (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the last 120 lines of the test output, so a hung or starved run names the running test instead of losing the runner without a log (`TEST-29`, Partial).
+
 ### Fixed
+- `windows\oxctl.ps1 stop` (and `stop_worker.cmd`, `switch_role.cmd`, and `start_master.cmd` before a restart) first sends the tracked master or worker a console Ctrl+C, waits up to 15 s, and only then uses `taskkill /F /T`, so a master with `--state-dir` compacts its journal and the next protocol version accepts it; it prints which way each process stopped (`BUG-23`, [design 0086](docs/design/0086-graceful-windows-stop.md)).
 - A master refuses a `--state-dir` on a volume that keeps no file permissions (exFAT, FAT32) at start-up, before it writes anything there, with a message that names the file system and asks for an NTFS directory. Before, it started once and then refused every restart because `members.json` looked readable by everyone, with an `icacls` hint that cannot work there. The same message replaces that hint for private files on such a volume. Windows only (`BUG-24`, [design 0085](docs/design/0085-state-dir-without-permissions.md)).
 
 ## [0.4.0] - 2026-11-17

@@ -185,7 +185,43 @@ jobs:
       - name: Windows AppContainer isolation tests (--test-threads=1 --nocapture)
         if: matrix.os == 'windows-latest'
         run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --test-threads=1 --nocapture
-      - run: cargo test --workspace --locked --no-fail-fast
+      # TEST-29: windows-latest twice lost its runner at the 60-minute mark here, with no log left.
+      # The step stops at 45 minutes, so the job ends (and keeps its log) before that mark; the wrapper
+      # prints a heartbeat line with the last output line once a minute and keeps a copy of the output
+      # for the diagnostics step below. The command and what it tests are unchanged.
+      - name: cargo test --workspace --locked --no-fail-fast
+        timeout-minutes: 45
+        run: python scripts/ci_heartbeat.py --log "${{ runner.temp }}/workspace-tests.log" --interval 60 -- cargo test --workspace --locked --no-fail-fast
+      - name: Diagnostics after the workspace tests (process tree, memory, output tail)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "== processes, oldest first (PID, parent PID, working set MB, start, name, command line)"
+          Get-CimInstance Win32_Process | Sort-Object CreationDate | ForEach-Object {
+            $cmd = if ($_.CommandLine) { $_.CommandLine.Substring(0, [Math]::Min(220, $_.CommandLine.Length)) } else { '' }
+            '{0,7} {1,7} {2,6} {3:HH:mm:ss} {4,-28} {5}' -f $_.ProcessId, $_.ParentProcessId, [Math]::Round($_.WorkingSetSize / 1MB), $_.CreationDate, $_.Name, $cmd
+          }
+          Write-Host "== memory (MB)"
+          $os = Get-CimInstance Win32_OperatingSystem
+          'physical: {0} free of {1}; commit: {2} free of {3}' -f [Math]::Round($os.FreePhysicalMemory / 1KB), [Math]::Round($os.TotalVisibleMemorySize / 1KB), [Math]::Round($os.FreeVirtualMemory / 1KB), [Math]::Round($os.TotalVirtualMemorySize / 1KB)
+          Write-Host "== last 120 lines of the workspace test output"
+          $log = Join-Path $env:RUNNER_TEMP 'workspace-tests.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 120 } else { 'no output file (the step did not start)' }
+      - name: Diagnostics after the workspace tests (process tree, memory, output tail)
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "== processes (PID, parent PID, elapsed, RSS KiB, command)"
+          if [ "$RUNNER_OS" = Linux ]; then
+            ps -eo pid,ppid,etime,rss,args --forest | cut -c1-260
+          else
+            ps -axo pid,ppid,etime,rss,command | cut -c1-260
+          fi
+          echo "== memory"
+          if [ "$RUNNER_OS" = Linux ]; then free -m; else vm_stat; fi
+          uptime
+          echo "== last 120 lines of the workspace test output"
+          tail -n 120 "$RUNNER_TEMP/workspace-tests.log" 2>/dev/null || echo "no output file (the step did not start)"
       # Design 0033 (FEAT-3b): the workspace run above is the restricted-userns case of
       # `ubuntu-latest` (AppArmor lets `unshare` succeed without capabilities); this run has the
       # restriction off, so the private network namespace and its id map are exercised too.

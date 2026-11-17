@@ -127,14 +127,79 @@ function Get-TrackedPid {
     return $parsed
 }
 
+# Seconds a tracked process gets to exit after the Ctrl+C event before taskkill /F /T ends it. A master
+# compacts its --state-dir journal on that clean stop, and a worker cancels its tasks and ends their
+# process trees; both took about a second on a desktop (BUG-23, docs\design\0086-graceful-windows-stop.md).
+$StopGraceSeconds = 15
+
+# Sends a console Ctrl+C event to the process tracked as $TargetPid. Every process Start-Tracked starts
+# has its own (hidden) console, so the event goes to that console only. A separate hidden powershell
+# detaches from its own console, attaches to the target's, ignores the event itself and raises it;
+# the console this script runs in is never touched. Returns $true when the event was sent.
+function Send-ConsoleCtrlC {
+    param ([int]$TargetPid)
+    $helper = @"
+Add-Type -Namespace OxCtl -Name Console -MemberDefinition '
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint dwProcessId);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr handlerRoutine, bool add);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+'
+[void][OxCtl.Console]::FreeConsole()
+if (-not [OxCtl.Console]::AttachConsole($TargetPid)) { exit 2 }
+[void][OxCtl.Console]::SetConsoleCtrlHandler([System.IntPtr]::Zero, `$true)
+if (-not [OxCtl.Console]::GenerateConsoleCtrlEvent(0, 0)) { exit 3 }
+Start-Sleep -Milliseconds 200
+exit 0
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($helper))
+    try {
+        $sender = Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -PassThru `
+            -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    } catch {
+        return $false
+    }
+    $null = $sender.Handle   # keeps the exit code readable after the process ends
+    if (-not $sender.WaitForExit(20000)) {
+        Stop-Process -Id $sender.Id -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    return ($sender.ExitCode -eq 0)
+}
+
+# Stops a tracked process: first the console Ctrl+C its shutdown handler answers (a master compacts its
+# journal, a worker cancels its tasks), then, if it is still running after $StopGraceSeconds, taskkill /F /T.
+# Says which way it stopped.
 function Stop-Tracked {
     param ([string]$Name)
     $trackedPid = Get-TrackedPid -Name $Name
     if ($trackedPid) {
         Write-Host "[INFO] Stopping $Name (PID $trackedPid) and its task processes..."
-        & taskkill.exe /F /T /PID $trackedPid | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "taskkill reported exit code $LASTEXITCODE for PID $trackedPid (it may already have exited)."
+        $proc = Get-Process -Id $trackedPid -ErrorAction SilentlyContinue
+        $clean = $false
+        if ($proc) {
+            $null = $proc.Handle
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            if (Send-ConsoleCtrlC -TargetPid $trackedPid) {
+                if ($proc.WaitForExit($StopGraceSeconds * 1000)) {
+                    $clean = $true
+                    Write-Host ("[OK] {0} stopped cleanly after Ctrl+C in {1:N1} s." -f $Name, $sw.Elapsed.TotalSeconds)
+                } else {
+                    Write-Warning "$Name (PID $trackedPid) did not exit within $StopGraceSeconds s after Ctrl+C; ending it with taskkill /F /T."
+                }
+            } else {
+                Write-Warning "Could not send Ctrl+C to $Name (PID $trackedPid); ending it with taskkill /F /T."
+            }
+        }
+        if (-not $clean -and (Get-TrackedPid -Name $Name)) {
+            & taskkill.exe /F /T /PID $trackedPid | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "taskkill reported exit code $LASTEXITCODE for PID $trackedPid (it may already have exited)."
+            } elseif ($Name -eq "master") {
+                Write-Host "[OK] master ended with taskkill /F /T. With --state-dir its journal was not compacted: before a protocol upgrade, start it again and stop it with Ctrl+C in its console (DEPLOYMENT.md section 3.5)."
+            } else {
+                Write-Host "[OK] $Name ended with taskkill /F /T."
+            }
         }
     }
     Remove-Item -LiteralPath (Join-Path $RunDir "$Name.pid") -Force -ErrorAction SilentlyContinue
