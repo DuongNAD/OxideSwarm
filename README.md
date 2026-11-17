@@ -726,6 +726,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--workspace-max-mb <MB>` | `2048` | Maximum total megabytes scanned when syncing a `--workspace` source tree |
 | `--output <PATTERN>` (alias `--expected-output`) | Repeatable | Glob/path pattern of sandbox files to collect after execution (implies `--wait`) |
 | `--output-dir <DIR>` | Current directory | Local directory where collected `--output` files are written |
+| `--verify <N>` | — | After the task completes, run it again on `N` other connected workers that match its placement (each pinned with `require:worker=<id>`) and compare the declared outputs by BLAKE3. Prints `verified` or `mismatch` (the differing files and workers) and exits `4` on a mismatch; `--json` adds a `verify` object (`status`, `workers`, `differing`). Needs `--output` or `--verify-file`, not `--worker`; fewer than `N` matching workers or a failed replica is an error (exit 1). Client side only (no wire change; design 0089 D3). Only for deterministic tasks: a non-deterministic task will report a mismatch. The MCP `submit` tool takes `verify` and `verify_file` |
+| `--verify-file <PATH>` | — | With `--verify`: compare only this sandbox file (for example a `checksums.sha256` the task writes) byte for byte instead of every declared output; it is collected even without `--output` |
 | `--matrix-dim <N>` | `64` | GPU tasks: square matrix dimension $N \times N$ (up to `8192` on physical GPU, `2048` on simulated GPU) |
 | `--work-group-size <N>` | `16` | GPU tasks: compute shader workgroup tile edge length |
 | `--prompt <TEXT>` | — | 3D generation tasks: text prompt describing the mesh to synthesize |

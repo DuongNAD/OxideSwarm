@@ -222,4 +222,6 @@ path = "../../tests/rendezvous_discovery_e2e.rs"
 name = "cli_usb_kit_e2e"
 path = "../../tests/cli_usb_kit_e2e.rs"
 
-
+[[test]]
+name = "verify_e2e"
+path = "../../tests/verify_e2e.rs"

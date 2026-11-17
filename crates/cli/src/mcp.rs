@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::placement::{
-    listed_supports_workspaces, listed_worker_id, tag_value, IsolationLevel, Placement,
-    ARCH_TAG_PREFIX, OS_TAG_PREFIX, REQUIRE_PREFIX, STATE_TAG_PREFIX,
+    listed_worker_id, tag_value, IsolationLevel, Placement, ARCH_TAG_PREFIX, OS_TAG_PREFIX,
+    REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -55,6 +55,8 @@ use crate::connect::{
 };
 use crate::doctor::{run_doctor, DoctorOptions};
 use crate::secret_cmd::SecretOpts;
+
+mod submit_support;
 
 /// Protocol version advertised in initialize handshake.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -654,6 +656,15 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Declared output file paths or glob patterns to retrieve upon completion"
                     },
+                    "verify": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Implies wait. After the task completes, run it again on this many other matching workers and compare the declared outputs by BLAKE3 (reply field 'verify': status verified|mismatch, workers, differing files; a mismatch is an error result). Needs 'outputs' or 'verify_file'; not with 'worker'. Only for deterministic tasks"
+                    },
+                    "verify_file": {
+                        "type": "string",
+                        "description": "With 'verify': compare only this sandbox file (e.g. checksums.sha256) byte for byte instead of every declared output"
+                    },
                     "output_dir": {
                         "type": "string",
                         "description": "Local directory inside the working directory to download declared output files into when wait is true (symbolic links and paths outside the working directory are refused)"
@@ -1081,6 +1092,8 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             check_opt_str(obj, "output_dir")?;
             check_opt_u64(obj, "max_output_bytes")?;
+            check_opt_u64(obj, "verify")?;
+            check_opt_str(obj, "verify_file")?;
             Ok(())
         }
         "task_result" => {
@@ -1968,97 +1981,10 @@ async fn format_completed_task_result(
 // Tool: submit
 // ----------------------------------------------------------------------------
 
-struct WorkspaceSubmitMeta {
-    name: String,
-    spec: rusty_grid_core::task::WorkspaceRef,
-    files: usize,
-    uploaded_bytes: u64,
-    skipped: usize,
-    skipped_entries: Vec<String>,
-}
-
-fn attach_workspace_summary(
-    res: ToolCallResult,
-    ws_meta: Option<&WorkspaceSubmitMeta>,
-    worker: Option<Uuid>,
-) -> ToolCallResult {
-    let Some(meta) = ws_meta else {
-        return res;
-    };
-    if res.is_error {
-        return res;
-    }
-    let Some(ToolContent::Text { text }) = res.content.first() else {
-        return res;
-    };
-    let Ok(mut body) = serde_json::from_str::<Value>(text) else {
-        return res;
-    };
-    let mut ws_summary = json!({
-        "name": meta.name,
-        "worker": worker.filter(|w| !w.is_nil()).map(|w| w.to_string()),
-        "files": meta.files,
-        "uploaded_bytes": meta.uploaded_bytes,
-        "skipped": meta.skipped,
-    });
-    if !meta.skipped_entries.is_empty() {
-        ws_summary["skipped_entries"] = json!(meta.skipped_entries);
-    }
-    body["workspace"] = ws_summary;
-    ToolCallResult::ok_json(&body)
-}
-
-async fn check_matching_worker_warning(
-    state: &McpState,
-    placement: &Placement,
-    requirements: &TaskRequirements,
-    has_workspace: bool,
-    timeout: Duration,
-) -> Option<String> {
-    let Ok(ClientResponse::WorkerList { workers }) = state
-        .request_with_timeout(&ClientMessage::ListWorkers, timeout)
-        .await
-    else {
-        return None;
-    };
-
-    if has_workspace
-        && !workers.iter().any(|w| {
-            let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
-            connected && listed_supports_workspaces(w)
-        })
-    {
-        let msg =
-            "Warning: no connected worker supports workspaces yet; the task will wait".to_string();
-        eprintln!("[mcp] {msg}");
-        return Some(msg);
-    }
-
-    let req_vram = requirements.effective_vram_mb();
-    let any_matches = workers.iter().any(|w| {
-        let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
-        connected
-            && placement.matches_listed(w)
-            && (!requirements.requires_gpu_or_vram() || w.can_execute_gpu())
-            && w.cpu_cores >= requirements.cpu_cores
-            && w.ram_mb >= requirements.ram_mb
-            && (req_vram == 0 || w.vram_mb.is_some_and(|v| v >= req_vram))
-    });
-
-    if any_matches {
-        None
-    } else {
-        let msg = if !placement.is_empty() {
-            format!(
-                "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
-            )
-        } else {
-            "Warning: no connected worker matches the task resource requirements; the task waits in the queue until one does".to_string()
-        };
-        eprintln!("[mcp] {msg}");
-        Some(msg)
-    }
-}
+use submit_support::{
+    attach_verify, attach_workspace_summary, check_matching_worker_warning, verify_completed,
+    WorkspaceSubmitMeta,
+};
 
 async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) -> ToolCallResult {
     let task_type = args
@@ -2066,7 +1992,12 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         .and_then(Value::as_str)
         .unwrap_or("command")
         .to_lowercase();
-    let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+    let verify = args
+        .get("verify")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let verify_file = args.get("verify_file").and_then(Value::as_str);
+    let wait = verify.is_some() || args.get("wait").and_then(Value::as_bool).unwrap_or(false);
 
     // Environment variables
     let mut env_map = HashMap::new();
@@ -2357,6 +2288,18 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         }
     }
 
+    if let Some(replicas) = verify {
+        let pinned = placement.worker.is_some();
+        if let Err(e) =
+            crate::verify::check_options(replicas, verify_file, !output_globs.is_empty(), pinned)
+        {
+            return ToolCallResult::error(e);
+        }
+        if let Some(f) = verify_file.filter(|f| !output_globs.iter().any(|g| g == f)) {
+            output_globs.push(f.to_string());
+        }
+    }
+
     // Persistent workspace sync (mutually exclusive with `files`)
     let mut ws_meta: Option<WorkspaceSubmitMeta> = None;
     let mut ws_uploads: Option<crate::blobs::PreparedInputs> = None;
@@ -2436,6 +2379,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         task = task.with_output_globs(output_globs);
     }
     let task_id = task.id;
+    let verify_template = verify.map(|_| task.clone());
     *ctx.submitted_task_id.lock().await = Some(task_id);
 
     if ctx.is_cancelled() {
@@ -2625,7 +2569,14 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                     format!("Task {task_id} completed"),
                 );
                 let worker_id = result.worker_id;
+                let verify_outcome = match (verify, &verify_template) {
+                    (Some(n), Some(tpl)) if result.is_success() => Some(
+                        verify_completed(state, tpl, &placement, &result, n, verify_file).await,
+                    ),
+                    _ => None,
+                };
                 let res = format_completed_task_result(state, &result, args, warning).await;
+                let res = attach_verify(res, verify_outcome);
                 attach_workspace_summary(res, ws_meta.as_ref(), Some(worker_id))
             }
             Some(Ok(Some(ClientResponse::Error { message }))) => ToolCallResult::error(message),

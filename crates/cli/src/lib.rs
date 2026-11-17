@@ -14,6 +14,7 @@ pub mod rendezvous_cmd;
 pub mod secret_cmd;
 pub mod size_check;
 pub mod usb_kit;
+pub mod verify;
 pub mod wordlist;
 
 pub use cli_app::run_cli;

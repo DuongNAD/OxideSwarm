@@ -860,6 +860,17 @@ pub struct SubmitArgs {
     )]
     pub outputs: Vec<String>,
 
+    #[arg(long, value_name = "N", help = crate::verify::VERIFY_HELP)]
+    pub verify: Option<usize>,
+
+    #[arg(
+        long = "verify-file",
+        value_name = "PATH",
+        requires = "verify",
+        help = "With --verify: compare only this sandbox file (a checksum file the task writes, e.g. checksums.sha256) byte for byte instead of every declared output; it is fetched even without --output"
+    )]
+    pub verify_file: Option<String>,
+
     #[arg(
         long = "output-dir",
         value_name = "DIR",
