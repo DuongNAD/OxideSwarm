@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- CI: the `cargo test --workspace` step of `workspace tests` stops at 45 minutes, prints a heartbeat line with the last output line once a minute (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the last 120 lines of the test output, so a hung or starved run names the running test instead of losing the runner without a log (`TEST-29`, Partial).
+
 ## [0.4.0] - 2026-11-17
 
 A minor release with one wire change under `0.x`: protocol version 10 adds an extension slot to tasks (`PROTO-3`) and, for the first time, a one-version compatibility window (`PROTO-4`), so a `0.4.0` master keeps serving `0.3.0` workers and clients while they are upgraded one at a time. It also adds `master --discovery-port` (`CLI-2`), a CI job that runs the newest release against each pull request (`PROTO-2`), the first fuzz targets (`LV-1`), and fixes for flaky tests (`TEST-27` to `TEST-40`).
