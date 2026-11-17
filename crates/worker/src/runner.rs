@@ -78,6 +78,7 @@ use crate::workspace::{WorkspaceLimits, WorkspaceStore};
 mod capture;
 mod supervise;
 mod workloads;
+pub(crate) use workloads::base_refusal;
 
 pub use capture::read_bounded_stream;
 #[cfg(any(feature = "3d", test))]

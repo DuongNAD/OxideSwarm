@@ -292,6 +292,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install --disable-pip-version-check websockets
       - run: python tests/test_agent_bridge.py
+      - run: python tests/test_ci_push_runs.py
       - run: python tests/test_launcher_scripts.py
       - run: python tests/test_m1_challenger_hygiene.py
       - run: python tests/test_release_skew.py
@@ -389,6 +390,19 @@ jobs:
         target: [inbound_frame, server_handshake, tree_manifest]
     steps:
       - uses: actions/checkout@v7
+      # CI-1: the nightly download failed once (run 44036878952); try it up to four times first, so
+      # the action below finds the pinned toolchain installed. The date is unchanged.
+      - name: pinned nightly toolchain (retried download)
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4; do
+            if rustup toolchain install nightly-2026-11-10 --profile minimal --no-self-update; then
+              exit 0
+            fi
+            echo "toolchain download failed (attempt $attempt of 4)"
+            sleep $((attempt * 15))
+          done
+          exit 1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-11-10

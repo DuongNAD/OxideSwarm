@@ -231,7 +231,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | PRNUM |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
-| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Planned |  |
+| TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Planned |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
@@ -332,9 +332,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
-| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Planned |  |
+| BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
-| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Planned | (design 0088) |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Planned | (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | (design 0059) |
@@ -3196,6 +3196,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Serialise the tests of the binary that touch the global worker (one lock shared by them, or one
   test per process), or give the bridge a way to reset its state between tests. Keep every assertion.
 - **Done when:** The cause is named here, and the binary passes 200 runs in a row on Linux.
+- **Implemented (2026-11-17, pull request 300):** The cause is not another test's call. All tests of the
+  file already hold one `TEST_MUTEX`. `stop_worker_impl` returns while the worker still drains: it sets the
+  status `STOPPING` and a detached thread writes `STOPPED` after it has joined the worker thread. That late
+  write ran after the previous test released the lock, so it could land between this test's failing
+  `set_cluster_secret_impl` (which writes `ERROR: Invalid cluster secret: ...`) and its status read. The
+  tests now call `common::stop_and_settle()` (`crates/android_bridge/tests/common/mod.rs`), which stops the
+  worker and waits (30 s bound) until the status is no longer `STOPPING`; the four test files that read the
+  status use it. No change to the bridge, every assertion kept.
 
 ### TEST-49: Wait for the master by condition in the sched2 runtime test
 
@@ -3310,6 +3318,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** A test removes (or makes unwritable) the base of one of two workers after it registered, submits
   tasks with `max_retries` above 0, and all complete on the other worker; `is_worker_rejection` has a unit test
   with the exact message.
+- **Implemented (2026-11-17, pull request 299):** The three refusals answer `Task rejected by worker: sandbox base
+  unusable: <reason>` (`rusty_grid_core::sandbox_base_refusal`), which the master already matches ("rejected by
+  worker") and now lists in full; no wire change, a 0.4.x master hands it back too. The assignment and input-fetch
+  re-checks repeat once after 250 ms; `Sandbox::create` refusals cover the base errors and I/O errors under the base.
+  The existing `avoid_workers` and `MAX_WORKER_REJECTIONS_PER_TASK` logic prevents a loop, so no new guard. Test:
+  `crates/master/tests/sandbox_base_hand_back.rs`; design 0090.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
@@ -3390,6 +3404,24 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   and Windows, and its output for 2026-11-16 names
   twelve runs as cancelled by an account and six as holding a job that was never acquired. The
   two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
+
+- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
+  coordinator (no code).
+  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
+  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
+    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
+  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
+    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
+    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
+    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
+    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
+    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
+    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
+  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
+    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
+    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
+    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
+    test, 1 never acquired. The exit check of Q80 is read from its last line.
 
 ### MAINT-2: Bring the last three files under the size cap
 

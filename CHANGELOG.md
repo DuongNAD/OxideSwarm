@@ -6,10 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/ci_push_runs.py` prints each CI run for a push on `master` that is not green with its class (failing test, job never acquired, cancelled by an account, other) and whether the window has no run with a failing test; the `fuzz` job retries the nightly toolchain download; a rule that nobody cancels a run for a push on `master` (design 0088, `CI-1`).
 - `submit --verify <N>` (with `--verify-file`) runs a task again on N other matching workers and compares the declared outputs by BLAKE3, printing `verified` or `mismatch` (exit 4); the MCP `submit` tool takes `verify` and `verify_file`. Client side only, no wire change (design 0089 D3, `VERIFY-1`).
 - `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
 
 ### Fixed
+- A worker whose sandbox base became unusable (missing, not writable, not private) refuses the task with `Task rejected by worker: sandbox base unusable: ...`, which the master hands to another worker without charging a retry, instead of failing the task for good; no wire change (`BUG-25`, [design 0090](docs/design/0090-sandbox-base-refusal-hand-back.md)).
+- The Android bridge tests wait until a stopped worker has finished draining (`common::stop_and_settle`) before the next test starts; the detached `STOPPED` write of the previous test could overwrite the `ERROR: Invalid cluster secret` status the next one had just caused (`TEST-48`).
 - The reaper failover stress test (`TEST-45`) keeps its second worker alive with heartbeats and a 2 s reaper timeout (was 80 ms with no heartbeat, so a starved runner let the reaper take the second worker too), and its failures name the second worker's status and the task's state.
 
 ## [0.4.1] - 2026-11-17
