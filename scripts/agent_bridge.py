@@ -31,6 +31,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import select
 import shutil
 import socket
@@ -745,9 +746,25 @@ def print_overlap(hub_dir, self_short, files, now=None):
 # ---------------------------------------------------------------------------
 
 
-def claim_file_name(value, agent_short, created_at):
+def claim_now_iso():
+    """UTC time with microseconds: claims made in the same second still have an order."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def claim_file_name(value, agent_short, created_at, nonce):
+    """Unique per claim: two sessions of one agent claiming one value in the same instant differ by nonce."""
     stamp = re.sub(r"[^0-9TZ]", "", created_at)
-    return f"{value}__{agent_short}__{stamp}.json"
+    return f"{value}__{agent_short}__{stamp}__{nonce}.json"
+
+
+def claim_time_key(raw):
+    """Orders `...:00Z` (older claims) and `...:00.123456Z` correctly as strings."""
+    raw = str(raw or "")
+    if raw.endswith("Z"):
+        raw = raw[:-1]
+    if "." not in raw:
+        raw += ".000000"
+    return raw
 
 
 def read_claims(hub_dir, kind=None):
@@ -848,14 +865,16 @@ def highest_in_use(repo_dir, hub_dir, kind, prefix=None):
 
 
 def claim_sort_key(claim):
-    return (str(claim.get("created_at", "")), str(claim.get("agent", "")))
+    """Total order: time, then agent id, then nonce (claims from before the nonce have none: "")."""
+    return (claim_time_key(claim.get("created_at")), str(claim.get("agent", "")), str(claim.get("nonce", "")))
 
 
-def try_claim(hub_dir, kind, value, agent_short, title, branch, pr, settle):
+def try_claim(hub_dir, kind, value, agent_short, title, branch, pr, settle, session=""):
     """Writes one claim and waits for the hub to sync. Returns (won, path); a loser deletes its own file."""
-    created_at = utc_now_iso()
+    created_at = claim_now_iso()
+    nonce = secrets.token_hex(4)
     folder = os.path.join(hub_dir, "claims", kind)
-    path = os.path.join(folder, claim_file_name(value, agent_short, created_at))
+    path = os.path.join(folder, claim_file_name(value, agent_short, created_at, nonce))
     record = {
         "kind": kind,
         "value": value,
@@ -864,7 +883,10 @@ def try_claim(hub_dir, kind, value, agent_short, title, branch, pr, settle):
         "branch": branch or "",
         "pr": pr,
         "created_at": created_at,
+        "nonce": nonce,
     }
+    if session:
+        record["session"] = session
     if os.path.exists(path):
         return False, path
     atomic_write(path, json.dumps(record, indent=2, ensure_ascii=False) + "\n", agent_short)
@@ -903,7 +925,7 @@ def cmd_claim(args):
         print("[CLAIM ERROR] --prefix is required for item, e.g. --prefix TEST.", file=sys.stderr)
         return 2
     error = None if args.title else "--title is required"
-    for label, value in (("title", args.title or ""), ("branch", args.branch or "")):
+    for label, value in (("title", args.title or ""), ("branch", args.branch or ""), ("session", args.session or "")):
         error = error or validate_activity_text(label, value)
     pr = None
     if args.pr is not None:
@@ -933,7 +955,9 @@ def cmd_claim(args):
                 highest = max(highest, last_number)
             value = format_claim_value(kind, highest + 1, prefix)
         last_number = claim_number(kind, value, prefix)
-        won, path = try_claim(hub_dir, kind, value, self_short, args.title, args.branch, pr, args.settle)
+        won, path = try_claim(
+            hub_dir, kind, value, self_short, args.title, args.branch, pr, args.settle, session=args.session or ""
+        )
         if won:
             print(value)
             print(f"[CLAIM] {kind} {value} is yours: {os.path.relpath(path, hub_dir)}", file=sys.stderr)
@@ -968,7 +992,7 @@ def claim_state(repo_dir, claim, master_numbers, now):
     number = claim_number(kind, claim["value"], prefix)
     if number is not None and number in master_numbers.get((kind, prefix), set()):
         return "in use"
-    created = parse_utc_iso(claim.get("created_at"))
+    created = parse_utc_iso(re.sub(r"\.\d+Z$", "Z", str(claim.get("created_at") or "")))
     if created is not None and (now - created).total_seconds() > CLAIM_STALE_DAYS * 86400:
         branch = str(claim.get("branch") or "")
         on_origin = False
@@ -1774,6 +1798,7 @@ def main():
     p_claim.add_argument("--title", default=None, help="What the id is for (one line)")
     p_claim.add_argument("--branch", default=None, help="Branch that will carry it")
     p_claim.add_argument("--pr", default=None, help="Pull request number, when known")
+    p_claim.add_argument("--session", default=None, help="Label of the session or window that claims (one line)")
     p_claim.add_argument("--value", default=None, help="Claim this value instead of the next free one")
     p_claim.add_argument(
         "--settle",

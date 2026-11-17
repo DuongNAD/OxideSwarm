@@ -1095,10 +1095,14 @@ class Claims(CoordCase):
     def test_a_claim_record_holds_project_metadata_only(self):
         self.claim("design", "--title", "A title", "--branch", "claude/x", "--pr", "#300")
         name = self.claim_files("design")[0]
-        self.assertTrue(name.startswith(f"0091__{self.ME}__") and name.endswith("Z.json"), name)
+        self.assertTrue(name.startswith(f"0091__{self.ME}__") and name.endswith(".json"), name)
         with open(os.path.join(self.hub, "claims", "design", name), encoding="utf-8") as f:
             record = json.load(f)
-        self.assertEqual(sorted(record), ["agent", "branch", "created_at", "kind", "pr", "title", "value"])
+        self.assertEqual(
+            sorted(record), ["agent", "branch", "created_at", "kind", "nonce", "pr", "title", "value"]
+        )
+        self.assertRegex(record["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$")
+        self.assertTrue(name.endswith(f"__{record['nonce']}.json"), name)
         self.assertEqual((record["pr"], record["branch"], record["value"]), (300, "claude/x", "0091"))
 
     def test_bad_input_is_refused(self):
@@ -1123,19 +1127,58 @@ class Claims(CoordCase):
             with self.subTest(me=me):
                 shutil.rmtree(os.path.join(self.hub, "claims", "design"), ignore_errors=True)
                 self.hand_claim("design", "0100", other, moment)
-                with mock.patch.object(bridge_module, "utc_now_iso", return_value=moment):
+                with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment):
                     won, path = bridge_module.try_claim(self.hub, "design", "0100", me, "t", "", None, 0)
                 self.assertEqual(won, expect_win)
                 self.assertEqual(os.path.exists(path), expect_win)
                 self.assertEqual(len(self.claim_files("design")), 2 if expect_win else 1)
 
+    def test_two_sessions_of_one_agent_with_one_timestamp_do_not_both_win(self):
+        moment = "2026-11-17T10:00:00.500000Z"
+        for mine, rival, expect_win in (("aaaa0000", "bbbb0000", True), ("bbbb0000", "aaaa0000", False)):
+            with self.subTest(mine=mine):
+                shutil.rmtree(os.path.join(self.hub, "claims", "design"), ignore_errors=True)
+                folder = os.path.join(self.hub, "claims", "design")
+                os.makedirs(folder)
+                rival_name = f"0100__owner__20261117T100000500000Z__{rival}.json"
+                with open(os.path.join(folder, rival_name), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"kind": "design", "value": "0100", "agent": "owner", "title": "other session",
+                         "created_at": moment, "nonce": rival},
+                        f,
+                    )
+                with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment), mock.patch.object(
+                    bridge_module.secrets, "token_hex", return_value=mine
+                ):
+                    won, path = bridge_module.try_claim(self.hub, "design", "0100", "owner", "t", "", None, 0)
+                self.assertEqual(won, expect_win)
+                # Exactly one file holds the value, and the file names differ.
+                holders = [f for f in self.claim_files("design") if f.startswith("0100__")]
+                self.assertEqual(len(holders), 2 if expect_win else 1)
+                self.assertNotEqual(os.path.basename(path), rival_name)
+
+    def test_the_loser_of_a_same_agent_tie_takes_the_next_value(self):
+        moment = "2026-11-17T10:00:00.500000Z"
+        self.hand_claim("design", "0091", "owner", moment)
+        with mock.patch.object(bridge_module, "claim_now_iso", return_value=moment), mock.patch.object(
+            bridge_module.secrets, "token_hex", return_value="ffffffff"
+        ):
+            result = self.claim("design", "--value", "0091", "--title", "t", "--session", "window 2", who="owner")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.out(result), "0092")
+
+    def test_old_claims_without_nonce_or_fraction_still_order_correctly(self):
+        older = {"created_at": "2026-11-17T10:00:00Z", "agent": "z"}
+        newer = {"created_at": "2026-11-17T10:00:00.250000Z", "agent": "a", "nonce": "x"}
+        self.assertLess(bridge_module.claim_sort_key(older), bridge_module.claim_sort_key(newer))
+
     def test_three_lost_tries_exit_non_zero(self):
         # An earlier rival claim appears after every scan, so each try loses.
         real = bridge_module.try_claim
 
-        def losing(hub, kind, value, agent, title, branch, pr, settle):
+        def losing(hub, kind, value, agent, title, branch, pr, settle, session=""):
             self.hand_claim(kind, value, "win", "2000-01-01T00:00:00Z")
-            return real(hub, kind, value, agent, title, branch, pr, settle)
+            return real(hub, kind, value, agent, title, branch, pr, settle, session=session)
 
         args = bridge_module.argparse.Namespace(
             hub_dir=self.hub,
@@ -1152,6 +1195,7 @@ class Claims(CoordCase):
             settle=0.0,
             list=False,
             release=None,
+            session=None,
         )
         with mock.patch.object(bridge_module, "try_claim", losing), mock.patch("sys.stderr"):
             self.assertEqual(bridge_module.cmd_claim(args), 1)
