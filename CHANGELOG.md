@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - A worker whose sandbox base became unusable (missing, not writable, not private) refuses the task with `Task rejected by worker: sandbox base unusable: ...`, which the master hands to another worker without charging a retry, instead of failing the task for good; no wire change (`BUG-25`, [design 0090](docs/design/0090-sandbox-base-refusal-hand-back.md)).
 - The Android bridge tests wait until a stopped worker has finished draining (`common::stop_and_settle`) before the next test starts; the detached `STOPPED` write of the previous test could overwrite the `ERROR: Invalid cluster secret` status the next one had just caused (`TEST-48`).
+- The capability-detection handle-leak tests (`TEST-47`) count only their own handles: they run alone against the other tests of their file that open handles (a shared lock) and count from after a warm-up detection, so handles that the first detections allocate once, or that other tests hold, no longer fail them.
 
 ## [0.4.1] - 2026-11-17
 

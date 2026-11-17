@@ -53,12 +53,22 @@ fn get_current_process_handle_count() -> u32 {
     }
 }
 
+/// TEST-47: the two tests that count this process's handles take this lock exclusively, and every
+/// other test of this file that opens handles of its own (host probes in `detect*`, child processes,
+/// sockets) takes it shared, so a count never includes another test's handles. Without it the
+/// sequential count grew by exactly 8 twice on `windows-latest` while other tests ran beside it.
+fn handle_count_lock() -> &'static tokio::sync::RwLock<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::RwLock<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::RwLock::new(()))
+}
+
 // =========================================================================
 // PART 1: Conflicting Overrides — GPU, VRAM, and CUDA Strict Domination
 // =========================================================================
 
 #[test]
 fn test_adversarial_overrides_no_gpu_dominates_cuda() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         name: Some("node-no-gpu-cuda".into()),
         no_gpu: true,
@@ -94,6 +104,7 @@ fn test_adversarial_overrides_no_gpu_dominates_cuda() {
 
 #[test]
 fn test_adversarial_overrides_no_gpu_dominates_vram_mb() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         name: Some("node-no-gpu-vram".into()),
         no_gpu: true,
@@ -114,6 +125,7 @@ fn test_adversarial_overrides_no_gpu_dominates_vram_mb() {
 
 #[test]
 fn test_adversarial_overrides_no_gpu_dominates_all_gpu_flags_combined() {
+    let _handles = handle_count_lock().blocking_read();
     // Extreme conflict: user provides every single positive GPU flag alongside no_gpu: true
     let overrides = HardwareOverrides {
         name: Some("node-hostile-gpu-conflict".into()),
@@ -147,6 +159,7 @@ fn test_adversarial_overrides_no_gpu_dominates_all_gpu_flags_combined() {
 
 #[test]
 fn test_adversarial_overrides_no_gpu_dominates_environment_variables() {
+    let _handles = handle_count_lock().blocking_read();
     // Set host environment variables for CUDA and VRAM
     std::env::set_var("RUSTY_GRID_CUDA", "1");
     std::env::set_var("OXIDE_SWARM_CUDA", "true");
@@ -175,6 +188,7 @@ fn test_adversarial_overrides_no_gpu_dominates_environment_variables() {
 
 #[test]
 fn test_adversarial_overrides_no_cuda_dominates_cuda() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         gpu: Some(true),
         vram_mb: Some(8192),
@@ -198,6 +212,7 @@ fn test_adversarial_overrides_no_cuda_dominates_cuda() {
 
 #[test]
 fn test_adversarial_overrides_no_blender_dominates_blender_path() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         name: Some("node-no-blender-path".into()),
         no_blender: true,
@@ -219,6 +234,7 @@ fn test_adversarial_overrides_no_blender_dominates_blender_path() {
 
 #[test]
 fn test_adversarial_overrides_no_blender_dominates_all_blender_flags_combined() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         name: Some("node-hostile-blender-conflict".into()),
         no_blender: true,
@@ -241,6 +257,7 @@ fn test_adversarial_overrides_no_blender_dominates_all_blender_flags_combined() 
 
 #[test]
 fn test_adversarial_overrides_no_blender_dominates_environment_variables() {
+    let _handles = handle_count_lock().blocking_read();
     std::env::set_var("RUSTY_GRID_BLENDER_PATH", r"C:\Blender\blender.exe");
     std::env::set_var("OXIDE_SWARM_BLENDER_PATH", r"C:\Blender\blender.exe");
     std::env::set_var("BLENDER_PATH", r"C:\Blender\blender.exe");
@@ -261,6 +278,7 @@ fn test_adversarial_overrides_no_blender_dominates_environment_variables() {
 
 #[test]
 fn test_adversarial_overrides_blender_explicit_false() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         blender: Some(false),
         blender_path: Some(r"C:\Blender\blender.exe".into()),
@@ -275,6 +293,7 @@ fn test_adversarial_overrides_blender_explicit_false() {
 
 #[test]
 fn test_adversarial_overrides_blender_nonexistent_path_fails_gracefully() {
+    let _handles = handle_count_lock().blocking_read();
     let overrides = HardwareOverrides {
         no_blender: false,
         blender: None,
@@ -598,6 +617,18 @@ fn test_rapid_repeated_detection_sequential_leak_and_stability() {
         "\n=== Starting Rapid Repeated Capability Detection Stress ({ITERATIONS} iterations) ==="
     );
 
+    let _exclusive = handle_count_lock().blocking_write();
+    // Warm-up (TEST-47): the first detections allocate handles once (a thread pool, loaded DLLs);
+    // alone on Windows that was a constant +2. Count from after one call of each kind below.
+    let _ = WorkerCapabilities::detect(None, None, false);
+    let _ = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+        no_gpu: true,
+        ..Default::default()
+    });
+    let _ = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+        no_blender: true,
+        ..Default::default()
+    });
     let initial_handles = get_current_process_handle_count();
     let mut latencies: Vec<Duration> = Vec::with_capacity(ITERATIONS);
 
@@ -707,6 +738,9 @@ async fn test_rapid_repeated_detection_concurrent_stress() {
 
     println!("\n=== Starting Concurrent Capability Detection Stress ({total_calls} calls across {CONCURRENT_WORKERS} threads) ===");
 
+    let _exclusive = handle_count_lock().write().await;
+    // Warm-up (TEST-47), as in the sequential test.
+    let _ = WorkerCapabilities::detect(Some("warm-up".to_string()), Some(8), false);
     let initial_handles = get_current_process_handle_count();
     let t0 = Instant::now();
 
@@ -845,6 +879,7 @@ fn find_oxideswarm_binary() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
+    let _handles = handle_count_lock().read().await;
     // 1. Bind an ephemeral TCP listener representing MasterServer
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -943,6 +978,7 @@ async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
 
 #[tokio::test]
 async fn test_cli_e2e_conflicting_flags_no_blender_wire_domination() {
+    let _handles = handle_count_lock().read().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind ephemeral master listener");
