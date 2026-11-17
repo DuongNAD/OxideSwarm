@@ -807,7 +807,14 @@ impl WorkerClient {
                             result.error = Some(e);
                         }
                     }
-                    if resume_enabled && cancelled_reason.is_none() {
+                    // A session that ended while the upload ran made it fail only because the
+                    // connection went away: the buffered result still holds the outputs, and the
+                    // resume uploads them. Overwriting it with this failure would hand the client
+                    // a failed task for a task that ran fine (TEST-23).
+                    let session_ended = current_blob_client
+                        .as_ref()
+                        .is_some_and(|client| client.is_closed());
+                    if resume_enabled && cancelled_reason.is_none() && !session_ended {
                         buffered_token = pending_resume_outbox
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
