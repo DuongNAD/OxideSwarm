@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - `windows\oxctl.ps1 stop` (and `stop_worker.cmd`, `switch_role.cmd`, and `start_master.cmd` before a restart) first sends the tracked master or worker a console Ctrl+C, waits up to 15 s, and only then uses `taskkill /F /T`, so a master with `--state-dir` compacts its journal and the next protocol version accepts it; it prints which way each process stopped (`BUG-23`, [design 0086](docs/design/0086-graceful-windows-stop.md)).
 - A master refuses a `--state-dir` on a volume that keeps no file permissions (exFAT, FAT32) at start-up, before it writes anything there, with a message that names the file system and asks for an NTFS directory. Before, it started once and then refused every restart because `members.json` looked readable by everyone, with an `icacls` hint that cannot work there. The same message replaces that hint for private files on such a volume. Windows only (`BUG-24`, [design 0085](docs/design/0085-state-dir-without-permissions.md)).
+- `test_stress_high_volume_worker_churn` waits up to 60 s for its 30 tasks (was 20 s) and 30 s for its workers (was 5 s), ending as soon as they are done, and a timeout now lists each task that did not complete with its state and counts (`TEST-33`, Partial: the CI failure was not reproduced).
 
 ## [0.4.0] - 2026-11-17
 
