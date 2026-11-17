@@ -30,8 +30,12 @@ where
     false
 }
 
-/// How many times longer the slow worker of `TwoSpeedCluster` sleeps per task.
-const SLOW_SLEEP_MULTIPLIER: u32 = 5;
+/// How many times longer the slow worker of `TwoSpeedCluster` sleeps per task. 10 rather than 5
+/// (TEST-44): D2 holds an overflow task for a full fast worker whenever the slow average is at least
+/// `1.5 * (ready + fast average)`, at worst three fast averages. With 5x, a starved runner that
+/// stretched each fast task by more than 220 ms let D2 send a task to the slow worker at once (1 run
+/// in 125 on 2 cores next to 4 spinning processes); with 10x the fast tasks must stretch by 770 ms.
+const SLOW_SLEEP_MULTIPLIER: u32 = 10;
 
 fn sleep_spec(duration_ms: u64) -> TaskSpec {
     TaskSpec::BuiltinTest {
@@ -84,7 +88,7 @@ impl TwoSpeedCluster {
                 .with_no_gpu(true)
                 .with_max_concurrency(4)
                 .with_sandbox_base_dir(sandbox_dir.path().join("slow"));
-            // Test hook: sleep 5x longer per task than the fast worker.
+            // Test hook: sleep `SLOW_SLEEP_MULTIPLIER` times longer per task than the fast worker.
             let mut slow =
                 WorkerClient::new(slow_cfg).with_test_sleep_multiplier(SLOW_SLEEP_MULTIPLIER);
             let sid = slow.worker_id();
@@ -170,8 +174,8 @@ impl TwoSpeedCluster {
 /// `d2_elapsed <= 1.5 * fast_own_time` and `off_elapsed > 1.5 * fast_own_time` compared wall-clock
 /// times of a few hundred milliseconds measured at different moments, which a loaded runner breaks
 /// without any change in placement (`766 ms > 697 ms` on `ubuntu-latest`). With `speed_hold_factor = 0`
-/// the old timing is asserted by a bound load cannot break: a task on the 5x worker sleeps
-/// `5 * BASE_SLEEP_MS`, and the batch waits for it.
+/// the old timing is asserted by a bound load cannot break: a task on the slow worker sleeps
+/// `SLOW_SLEEP_MULTIPLIER * BASE_SLEEP_MS`, and the batch waits for it.
 #[tokio::test]
 async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_old_timing() {
     const BASE_SLEEP_MS: u64 = 220;
@@ -183,7 +187,7 @@ async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_o
     assert_eq!(solo_results.len(), BATCH_TASKS);
     solo.teardown().await;
 
-    // 2. Two in-process workers (`fast` at 1x and `slow` at 5x) under default `SchedulerConfig`.
+    // 2. Two in-process workers (`fast` at 1x and `slow` at 10x) under default `SchedulerConfig`.
     //    Run an 8-task concurrent warmup so both workers saturate slots and record >= 2 samples
     //    naturally in `SpeedBook` without depending on single-task CPU telemetry ordering.
     let d2_cluster = TwoSpeedCluster::spawn(SchedulerConfig::default(), true).await;
@@ -205,11 +209,11 @@ async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_o
     // Measured batch with D2 active. D2 holds overflow tasks for the fast worker (step 4) and lets a
     // task go to the slow worker only after it has waited `min_expected` (step 5), here the slow
     // worker's measured average, at least `slow_task_time`. So a task that ran on the slow worker
-    // after that wait cannot have finished before `2 * slow_task_time` (its wait plus its own 5x
+    // after that wait cannot have finished before `2 * slow_task_time` (its wait plus its own slow
     // sleep), however loaded the runner is. D2 would send a task to the slow worker without the wait
-    // only if the slow average fell below `1.5 * (ready + fast average)`, which with a 5x sleep needs
-    // more than about `BASE_SLEEP_MS` of extra time in every fast task. Without load every task runs
-    // on the fast worker.
+    // only if the slow average fell below `1.5 * (ready + fast average)`, which with a 10x sleep
+    // needs more than `(SLOW_SLEEP_MULTIPLIER - 3) * BASE_SLEEP_MS / 2` (770 ms) of extra time in
+    // every fast task. Without load every task runs on the fast worker.
     let slow_task_time = Duration::from_millis(u64::from(SLOW_SLEEP_MULTIPLIER) * BASE_SLEEP_MS);
     let (d2_elapsed, d2_results) = d2_cluster.run_batch(BATCH_TASKS, BASE_SLEEP_MS).await;
     let d2_fast_id = d2_cluster.fast_id;
@@ -232,7 +236,7 @@ async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_o
     for seen in &d2_spilled {
         assert!(
             *seen >= slow_task_time * 2,
-            "D2 must hold overflow tasks for the faster worker: a task reached the 5x slower worker \
+            "D2 must hold overflow tasks for the faster worker: a task reached the 10x slower worker \
              and finished {seen:?} after the batch started, before its wait cap plus its own run \
              ({:?})",
             slow_task_time * 2
@@ -240,7 +244,7 @@ async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_o
     }
 
     // 3. Same two workers and warmup, but `speed_hold_factor = 0.0`: D2 turns off and the old slow
-    //    timing returns (`slow` receives Wave 1 work, and the batch waits for its 5x tasks).
+    //    timing returns (`slow` receives Wave 1 work, and the batch waits for its slow tasks).
     let off_cluster =
         TwoSpeedCluster::spawn(SchedulerConfig::default().with_speed_hold_factor(0.0), true).await;
     let _ = off_cluster.run_batch(8, BASE_SLEEP_MS).await;
@@ -258,7 +262,7 @@ async fn sched4_d2_keeps_the_batch_on_the_fast_worker_and_zero_factor_restores_o
     );
     assert!(
         off_elapsed >= slow_task_time,
-        "with speed_hold_factor = 0, the batch must wait for a 5x task ({slow_task_time:?}), got {off_elapsed:?}"
+        "with speed_hold_factor = 0, the batch must wait for a slow task ({slow_task_time:?}), got {off_elapsed:?}"
     );
 
     eprintln!(

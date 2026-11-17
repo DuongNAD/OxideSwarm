@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `scripts/agent_bridge.py claim` (create-only id claims on the hub for design numbers, Q ids, BACKLOG phases and item ids) and `activity --branch/--pr/--files/--files-from-git/--overlap` (changed files on the activity record and an overlap check), so parallel agents stop reusing ids and see who edits the same files (design 0087, `COORD-1`, `COORD-2`).
 
 ### Fixed
-- The speed-aware batch test (`TEST-44`) asserts where design 0060 D2 places the tasks (no task reaches the 5x slower worker before its wait cap plus its own run) instead of a 1.5x ratio between two wall-clock times, which a loaded runner broke without any change in placement; the batch times are printed.
+- The speed-aware batch test (`TEST-44`) asserts where design 0060 D2 places the tasks (no task reaches the slow worker before its wait cap plus its own run, with the slow worker now 10x slower instead of 5x so load cannot erase the difference) instead of a 1.5x ratio between two wall-clock times, which a loaded runner broke without any change in placement; the batch times are printed.
 
 ## [0.4.1] - 2026-11-17
 
