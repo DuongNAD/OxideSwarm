@@ -1310,11 +1310,16 @@ fn live() -> MutexGuard<'static, Vec<imp::RawId>> {
 /// task futures kills their trees as well, but a process that is terminated by the default signal
 /// action never gets to drop anything.
 pub fn terminate_all_task_process_trees() -> usize {
-    let snapshot: Vec<imp::RawId> = live().clone();
-    for id in &snapshot {
+    // Kill while holding the lock. A tree removes its id from `LIVE` before it releases what the
+    // id names (the cgroup leaf descriptors on Linux, the Job Object handle on Windows), so every
+    // id seen here stays valid until this loop is done. A snapshot taken and released first could
+    // name descriptors that a tree torn down at the same moment had closed and the process had
+    // reused, and `kill_cgroup_leaf` would then write to and read PIDs from an unrelated file.
+    let live = live();
+    for id in live.iter() {
         imp::kill(*id);
     }
-    snapshot.len()
+    live.len()
 }
 
 struct TreeInner {
