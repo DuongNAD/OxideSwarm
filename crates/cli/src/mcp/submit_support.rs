@@ -106,14 +106,48 @@ pub(super) async fn check_matching_worker_warning(
     }
 }
 
-/// `submit` with `verify`: runs the completed task again on other workers (design 0089 D3).
+/// The `verify`, `verify_file` and `verify_any_system` arguments of `submit` (design 0089 D3, D6).
+#[derive(Clone, Copy)]
+pub(super) struct VerifyArgs<'a> {
+    /// The number of replicas; `None` when the task is not verified.
+    pub(super) replicas: Option<usize>,
+    pub(super) file: Option<&'a str>,
+    /// Replicas may run on another operating system or CPU architecture (default: they do not).
+    pub(super) any_system: bool,
+}
+
+impl<'a> VerifyArgs<'a> {
+    pub(super) fn parse(args: &'a Value) -> Self {
+        Self {
+            replicas: args
+                .get("verify")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+            file: args.get("verify_file").and_then(Value::as_str),
+            any_system: args
+                .get("verify_any_system")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Checks the types of the three arguments (part of the `submit` argument validation).
+    pub(super) fn check(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
+        super::check_opt_u64(obj, "verify")?;
+        super::check_opt_str(obj, "verify_file")?;
+        super::check_opt_bool(obj, "verify_any_system")
+    }
+}
+
+/// `submit` with `verify`: runs the completed task again on other workers (design 0089 D3), on
+/// the first worker's operating system and architecture unless `verify_any_system` (D6).
 pub(super) async fn verify_completed(
     state: &McpState,
     template: &rusty_grid_core::task::Task,
     placement: &Placement,
     first: &rusty_grid_core::task::TaskResult,
     replicas: usize,
-    file: Option<&str>,
+    args: VerifyArgs<'_>,
 ) -> Result<crate::verify::Report, String> {
     let timeout = Duration::from_secs(template.requirements.timeout_secs.saturating_add(30));
     let workers = match state
@@ -138,7 +172,8 @@ pub(super) async fn verify_completed(
             first,
             first_name,
             replicas,
-            file,
+            file: args.file,
+            any_system: args.any_system,
         },
         || state.connect_dedicated_with_timeout(timeout),
     )

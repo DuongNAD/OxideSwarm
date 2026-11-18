@@ -356,6 +356,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented | 296, (design 0089) |
+| VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented | 312 (open), (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
 
 ## Phase 0: integrate open work
@@ -3886,6 +3887,22 @@ their first user (Q88), then APP-5.
   submits it to each pinned with `require:worker=<id>`, and compares the BLAKE3 ids of the declared outputs (or one
   `--verify-file`); `verified` or `mismatch` (exit 4), a `verify` object with `--json`, and the same in MCP `submit`.
   `tests/verify_e2e.rs` (Unix) covers verified, mismatch, too few workers, `--verify-file`, the refusals and MCP.
+
+### VERIFY-2: Replicas of `submit --verify` on the same operating system and architecture by default
+
+- **Evidence:** Design 0089 D6. On 2026-11-17 APP-4 ran the same deterministic Anima Engine trial (same commit,
+  same rustc, byte-identical inputs, on the CPU) on Windows x86_64 and on macOS arm64: the final checksums differ
+  in all three arms (control: Windows 2546342991, macOS 1859816024), while five repeat runs on Windows agree. A
+  replica on the other system reports a false mismatch (exit 4).
+- **Do:** By default `submit --verify` picks replicas only among workers whose `os:` and `arch:` tags equal those of
+  the worker that ran the first copy (a tag that worker lacks is not compared, with one notice); the too-few error
+  names the system and `--verify-any-system`; `--verify-any-system` (MCP `verify_any_system`) allows any matching
+  worker. The report names each worker's system.
+- **Done when:** Unit tests of `pick_targets` with mixed `os:`/`arch:` tags pass and `tests/verify_e2e.rs` still
+  passes.
+- **Implemented (2026-11-18, pull request 312):** `crates/cli/src/verify.rs` (`System`, `pick_targets(.., any_system)`), the
+  `--verify-any-system` flag, `verify_any_system` in the MCP `submit` tool, and `os` / `arch` per worker in the
+  `verify` JSON object.
 
 ### APP-5: Guide: Anima Engine sweeps on OxideSwarm, with a recorded run
 

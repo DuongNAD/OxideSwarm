@@ -1,7 +1,7 @@
 # 0089: Anima Engine as the first workload: sweeps, verified results and build offload
 
 Status: Accepted (plan; Q88 and Q89 decided on 2026-11-17 by the owner's delegation)
-Created: 2026-11-17    Updated: 2026-11-17
+Created: 2026-11-17    Updated: 2026-11-18
 
 ## Summary
 
@@ -104,6 +104,25 @@ passes `-j 2` where the target machine needs it.
 GPU and CPU variants and VERIFY-1, and a recorded run (machines, versions, trials per hour), following
 the guides of ADOPT-4.
 
+### D6 Replicas on the same system (VERIFY-2)
+
+Step 2 of D1 gave its answer on 2026-11-17: the checksums differ between systems. The Anima smoke trial
+`n0-30_fa-50_fs-13` (seed 999971, 18000 ticks, Anima Engine commit `7a825cc`, the same rustc, byte-identical
+inputs, deterministic mode on the CPU) ended with different final checksums on Windows x86_64 and on macOS
+arm64 in all three arms (control: Windows 2546342991, macOS 1859816024, the macOS value from the committed
+smoke record), while five repeat runs on Windows gave identical checksums. A replica on the other system
+would therefore report a false mismatch (exit code 4).
+
+So, as D1 says for this case, `submit --verify <N>` runs its N replicas by default only on workers with the
+operating system and CPU architecture of the worker that ran the first copy: the `os:` and `arch:` tags that
+worker reports in `ListWorkers`, normalized as placement does. A part the first worker does not report (an
+older worker) is not compared, and one notice on stderr says so; a candidate worker without the tag the
+first one has is not counted. When too few workers are left, the error keeps its shape and adds that only
+workers on that system count and that `--verify-any-system` allows others. `--verify-any-system` (MCP
+`submit`: `verify_any_system: true`) restores the behaviour of VERIFY-1, any matching worker. The report
+names the system of each worker (`all macos/aarch64`, or each worker with its own), and the `--json` and
+MCP `verify` object gives `os` and `arch` per worker. Client side only, no wire change.
+
 ## Compatibility
 
 D1 and D4 use OxideSwarm 0.4.1 as it is. VERIFY-1 is client side and works against any master that runs
@@ -121,6 +140,10 @@ work. The guide forbids staging `.env` or any file with credentials as an input,
 - VERIFY-1: CLI tests on a loopback cluster with two workers: a deterministic task gives `verified`; a task
   whose output differs per worker gives `mismatch` and a non-zero exit; fewer matching workers than N gives
   a clear error. MCP test of the new option.
+- VERIFY-2: unit tests of the worker choice (`crates/cli/src/verify.rs`) with workers of mixed `os:` and `arch:`
+  tags: a worker on the first worker's system is chosen, others are refused by default and allowed with
+  `--verify-any-system`, the error for too few names the flag, and a first worker without the tags falls back to
+  placement only. The loopback workers of `tests/verify_e2e.rs` share the host's system, so it runs unchanged.
 - APP-5: the guide's commands run as written; its record is linked.
 
 ## Work items
@@ -129,6 +152,7 @@ work. The guide forbids staging `.env` or any file with credentials as an input,
 |---|---|---|---|---|
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid (D1; from design 0063) | `docs/design/0063-two-directions-in-parallel.md` "Trial records", or a record under `benchmarks/` | The record holds the checksums of one deterministic CPU run on each machine and the trials per hour on one and two workers | Planned |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (D3) | `crates/cli/src/cli_app.rs` and its submit path, `crates/cli/src/mcp.rs`, a CLI test, `README.md` | The tests of D3 pass in CI | Implemented (pull request 296) |
+| VERIFY-2 | Replicas of `submit --verify` on the first worker's operating system and architecture by default, `--verify-any-system` for any (D6) | `crates/cli/src/verify.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp/submit_support.rs`, `README.md` | Unit tests of the worker choice with mixed `os:`/`arch:` tags pass; `tests/verify_e2e.rs` still passes | Implemented (pull request 312) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run (D5) | `docs/guides/anima-engine-sweeps.md` | The guide exists with a recorded sweep and links from `README.md` | Planned |
 
 AX-1 and AX-2 are in the backlog already (Phase 13); D2 names Anima Engine as their first user.
@@ -151,3 +175,6 @@ AX-1 and AX-2 are in the backlog already (Phase 13); D2 names Anima Engine as th
   full backend build has hung the owner's development machine.
 - 2026-11-17: VERIFY-1 merged as pull request 296 (`38c30f9`): `submit --verify <N>` and `--verify-file`, and
   `verify` / `verify_file` in the MCP `submit` tool, client side, protocol unchanged; exit code 4 on a mismatch.
+- 2026-11-18: APP-4 step 2 on Windows: checksums differ from the macOS record in all three arms (D6). D6 added:
+  VERIFY-2 (pull request 312) makes the replicas of `submit --verify` run on the first worker's operating system and architecture
+  by default, with `--verify-any-system` (MCP `verify_any_system`) for any matching worker.
