@@ -31,5 +31,14 @@
     "The causes are not independent: the record states each step's efficiency and the shares; it does not force them to add up to the gap."
   ],
   "expected": "no prediction is made for (a) and (b); the controls are expected between 0.85 and 1.0 of each machine alone; every checksum equal",
-  "publish": "the records are committed whatever they show; BENCH-8 in docs/BACKLOG.md names the causes with their shares, or says which remain open"
+  "publish": "the records are committed whatever they show; BENCH-8 in docs/BACKLOG.md names the causes with their shares, or says which remain open",
+  "amendment_1": {
+    "written": "2026-11-18 16:25 UTC, after step 4 and before step 1, 1b or 4b ran",
+    "why": "Step 4 (the Mac worker alone through the grid, record 2026-11-18-w1-mac-worker-only-lan.json) reached 1.108 tasks/s against 1.412 for the Mac alone: 0.78. Workers run task processes at below-normal priority by default (nice 10 on Unix, BELOW_NORMAL_PRIORITY_CLASS on Windows; --task-priority), which the local sweep does not do; on machines with performance and efficiency cores that may change where the tasks run.",
+    "steps": [
+      "1b. Right after step 1, only if step 1's efficiency is below 0.9: the Windows worker restarted with --task-priority normal, the same sweep as step 1; slug w1-win-worker-only-normal-priority-lan",
+      "4b. After step 3, with the Windows worker stopped and the run master restarted: the Mac worker alone with --task-priority normal, the same sweep as step 4; slug w1-mac-worker-only-normal-priority-lan"
+    ],
+    "reading_rule": "If 4b (or 1b) gains at least 0.05 over step 4 (or step 1), the default task priority explains that share of the per-machine cost; the record says so and does not propose a change of the default here (that is a decision for the owner: the default protects the owner's own use of the machine)."
+  }
 }

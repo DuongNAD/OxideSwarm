@@ -1,0 +1,275 @@
+{
+  "benchmark": "BENCH-2 sweep (design 0093 D1)",
+  "record_format": 1,
+  "date_utc": "2026-11-18T16:07:14Z",
+  "plan": {
+    "item": "BENCH-8 (design 0093), workload W1",
+    "written": "2026-11-18, before any run of this plan, by the coordinator session",
+    "question": "BENCH-3 reached an efficiency of 0.73 on the Mac and the Windows case machine, against the 0.85 its plan expected. How much of the gap comes from the tail of a short sweep, from the harness never letting the master hold a queue, and from the cost of running a task through OxideSwarm on each machine?",
+    "baseline": "BENCH-3 record benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json: 120 tasks, client concurrency 30 (= the 30 slots), grid 2.233 tasks/s, efficiency 0.734; Windows took 60, 70 and 70 of 120 tasks; runs 2.481, 2.233 and 2.225 tasks/s",
+    "workload": {
+      "name": "W1 (benchmarks/sweep/workload_cpu.py, SHA-256 chain)",
+      "units_per_task": 16000000,
+      "seed_base": 0,
+      "runs": "one warm-up run, then 3 measured runs, for every step"
+    },
+    "machines": [
+      "Mac: Apple M5, 10 cores, macOS, AC power; runs the master for the run, the Mac worker (10 slots) and the harness",
+      "Windows case machine: i5-14600KF, 20 logical cores, Windows 11; runs one worker (20 slots)"
+    ],
+    "software": "OxideSwarm 0.4.3 release binaries on both machines, as in BENCH-3; Python 3 on both; the same master setup as BENCH-3 (private HOME, port 9088, a new secret made for this run, discovery beacon off)",
+    "local_baselines": "the two local records of BENCH-3 (Mac 1.412 tasks/s at 10 processes, Windows 1.631 tasks/s at 20 processes); no new local sweep",
+    "steps": [
+      "1. (c) Windows worker alone through the grid: the Mac worker stopped by PID; 120 tasks, client concurrency 20 (= its slots); --local-results <Windows local record> only, so the record's efficiency is grid alone / local alone; slug w1-win-worker-only-lan",
+      "2. (b) both workers, 120 tasks, --client-concurrency 120, so the master holds a queue of up to 90 tasks; --local-results both; slug w1-two-machines-lan-cc120",
+      "3. (a) both workers, 480 tasks, client concurrency 30 (= slots, as in BENCH-3); --local-results both; slug w1-two-machines-lan-480",
+      "4. (c) Mac worker alone through the grid: the Windows worker stopped; 120 tasks, client concurrency 10; --local-results <Mac local record> only; slug w1-mac-worker-only-lan",
+      "The order keeps the Windows worker's time short: it is not needed after the grid runs of step 3."
+    ],
+    "metrics": "tasks per second (median of 3); efficiency as the harness computes it; tasks per worker; checksums equal to a local run of the same seed",
+    "reading_rules": [
+      "Noise: BENCH-3's three runs spread from 2.225 to 2.481 tasks/s (about 10 %). A change in efficiency smaller than 0.05 against BENCH-3's 0.734 is reported as no effect.",
+      "Cause 3, per-task cost on each machine: the two controls give grid-alone / local-alone per machine. Their sum (Mac alone + Windows alone through the grid) is the most both workers can reach through this master; efficiency lost below that sum is lost by combining the two, the rest by running through the grid at all.",
+      "Cause 2, no queue: (b) against BENCH-3. If (b) gains at least 0.05 and the Windows share moves toward 64 of 120, the queue explains that share of the gap. 120 CLI processes waiting at once also load the Mac; if (b) is lower than BENCH-3, that load is named as a possible cause, not the queue.",
+      "Cause 1, few waves: (a) against BENCH-3. With four times the tasks the tail is a quarter of its share; if (a) gains at least 0.05, the tail explains that share.",
+      "The causes are not independent: the record states each step's efficiency and the shares; it does not force them to add up to the gap."
+    ],
+    "expected": "no prediction is made for (a) and (b); the controls are expected between 0.85 and 1.0 of each machine alone; every checksum equal",
+    "publish": "the records are committed whatever they show; BENCH-8 in docs/BACKLOG.md names the causes with their shares, or says which remain open"
+  },
+  "oxideswarm": {
+    "commit": "150469d6467201be7aca991b04037bad24ea38eb",
+    "dirty_tree": false,
+    "version": "rusty-grid 0.4.3",
+    "build_profile": "unknown"
+  },
+  "workload": {
+    "name": "W1",
+    "file": "benchmarks/sweep/workload_cpu.py",
+    "sha256": "4a4d69b962b3227c1e8509a08e870db6fb4de2f0f8dbfd7cbc37cbb29521ac65",
+    "commit": "150469d6467201be7aca991b04037bad24ea38eb",
+    "units_per_task": 16000000,
+    "tasks": 120,
+    "seeds": [
+      0,
+      119
+    ],
+    "task_seconds_target": null
+  },
+  "machine": {
+    "hardware": {
+      "cpu_model": "Apple M5",
+      "cores": 10,
+      "ram_bytes": 34359738368
+    },
+    "os": {
+      "system": "Darwin",
+      "release": "27.2.0",
+      "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+      "machine": "arm64"
+    },
+    "power": [
+      "Now drawing from 'AC Power'",
+      " -InternalBattery-0 (id=36700259)\t100%; charged; 0:00 remaining present: true"
+    ],
+    "python": "3.11.8"
+  },
+  "cluster": {
+    "mode": "existing master",
+    "workers": [
+      {
+        "label": "worker-1",
+        "os": "macos",
+        "arch": "aarch64",
+        "slots": 10,
+        "isolation": "off",
+        "link": "TCP/LAN",
+        "protocol": "10",
+        "cpu_cores": 10,
+        "ram_mb": 32768,
+        "has_gpu": false
+      }
+    ],
+    "total_slots": 10,
+    "client_concurrency": 10,
+    "doctor": {
+      "workers": [
+        {
+          "label": "worker-1",
+          "os": "macos",
+          "arch": "aarch64",
+          "cores": 10,
+          "ram_mb": 32768,
+          "isolation": "off",
+          "link": "TCP/LAN",
+          "link_kind": "tcp",
+          "link_rtt_ms": null
+        }
+      ],
+      "checks": [
+        {
+          "id": "C1",
+          "name": "Connect",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "connected and authenticated in 0 ms"
+        },
+        {
+          "id": "C2",
+          "name": "Workers",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "1 connected (at least 1 expected)"
+        },
+        {
+          "id": "C3",
+          "name": "In-process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "completed in 0 ms"
+        },
+        {
+          "id": "C4",
+          "name": "Process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "started a process and read its output in 5 ms [iso:off]"
+        },
+        {
+          "id": "C5",
+          "name": "GPU probe",
+          "outcome": "skip",
+          "worker": null,
+          "detail": "no worker advertises a GPU"
+        },
+        {
+          "id": "C6",
+          "name": "Spread",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "4 tasks of 500 ms finished in 511 ms on 1 worker(s): worker-1 4"
+        },
+        {
+          "id": "C7",
+          "name": "Links",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "no relayed link among 1 connected worker(s)"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "upload to the master: 8 MiB in 42 ms, 196.2 MB/s"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "fetch to the worker over tcp: 8 MiB in 61 ms, 136.5 MB/s (submit to result, includes scheduling and a 29 ms task)"
+        }
+      ]
+    }
+  },
+  "load_average_before": [
+    4.42,
+    3.67,
+    2.99
+  ],
+  "load_average_after": [
+    4.79,
+    11.19,
+    11.25
+  ],
+  "local": null,
+  "local_results_used": [
+    {
+      "source": "2026-11-18-w1-local-macos-aarch64.json",
+      "best_tasks_per_s": 1.4115,
+      "os": "Darwin",
+      "machine": "arm64",
+      "cpu_model": "Apple M5",
+      "cores": 10
+    }
+  ],
+  "grid": {
+    "warmup": {
+      "tasks": 120,
+      "wall_s": 100.7197,
+      "tasks_per_s": 1.1914,
+      "failed_tasks": 0,
+      "tasks_per_worker": {
+        "worker-1": 120
+      },
+      "submit_to_result_p50_s": 8.91005,
+      "submit_to_result_max_s": 9.5256
+    },
+    "runs": [
+      {
+        "tasks": 120,
+        "wall_s": 108.5799,
+        "tasks_per_s": 1.1052,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 9.0195,
+        "submit_to_result_max_s": 9.6475
+      },
+      {
+        "tasks": 120,
+        "wall_s": 107.8084,
+        "tasks_per_s": 1.1131,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 8.964400000000001,
+        "submit_to_result_max_s": 9.4342
+      },
+      {
+        "tasks": 120,
+        "wall_s": 108.336,
+        "tasks_per_s": 1.1077,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 8.96475,
+        "submit_to_result_max_s": 9.7462
+      }
+    ],
+    "tasks_per_s": {
+      "median": 1.1077,
+      "min": 1.1052,
+      "max": 1.1131,
+      "runs": 3
+    },
+    "wall_s": {
+      "median": 108.336,
+      "min": 107.8084,
+      "max": 108.5799,
+      "runs": 3
+    }
+  },
+  "scaling": {
+    "fastest_local_tasks_per_s": 1.4115,
+    "sum_local_tasks_per_s": 1.4115,
+    "speedup": 0.7847679773290824,
+    "efficiency": 0.7847679773290824,
+    "machines": 1
+  },
+  "checksums": {
+    "compared": 360,
+    "matched": 360,
+    "mismatched": 0,
+    "missing": 0,
+    "mismatches": [],
+    "missing_seeds": []
+  },
+  "failed_tasks": 0,
+  "quick": false,
+  "note": "BENCH-8 step 4 (plan benchmarks/sweep/plans/2026-11-18-bench-8-w1-efficiency-gap.json); Mac M5 worker 10 slots, Windows i5-14600KF worker 20 slots, home LAN, master on the Mac; release 0.4.3 binaries as in BENCH-3. Control (c): the Mac worker alone through the grid (run first, before the Windows worker had joined this master); efficiency = grid alone / Mac alone."
+}
