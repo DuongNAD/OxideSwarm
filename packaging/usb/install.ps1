@@ -806,6 +806,52 @@ if ($expected -ne $actual) { Fail "checksum mismatch for $($Archive.Name): the c
 Say "  archive: $($Archive.Name) (checksum OK)"
 Verify-OnlineSums $Archive.Name $expected
 
+# Task folders and the file cache (the worker's sandbox base): <install folder>\work, in %LOCALAPPDATA%
+# too since 2026-11-18 (design 0053 status log). Only an install in %LOCALAPPDATA% with -Isolation fs
+# keeps them in %TEMP%\oxideswarm-usb\sandboxes, which uninstall.ps1 removes: the isolated worker
+# takes no other folder inside the user profile (validate_sandbox_base_safe). An update keeps the
+# folder its launcher names while the worker can still use it.
+$SandboxBase = if ($PrivateRoot -and $Isolation -eq 'fs') { Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes' } else { Join-Path $InstallRoot 'work' }
+if ($Update -and $KitHasWorker) {
+    $oldBase = $null
+    $oldVbs = Join-Path $InstallRoot 'start-worker.vbs'
+    if ((Test-Path -LiteralPath $oldVbs) -and ((Get-Content -Raw -LiteralPath $oldVbs) -match 'RUSTY_GRID_SANDBOX_BASE_DIR"\)\s*=\s*"([^"]+)"')) { $oldBase = $Matches[1] }
+    if ($oldBase -and -not [string]::Equals($oldBase.TrimEnd('\'), $SandboxBase.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        $oldProblem = $null
+        if ($PrivateRoot -and $Isolation -eq 'fs') {
+            $oldProblem = "under -Isolation fs the worker takes task folders inside the user profile only from %TEMP%"
+        } else {
+            try { $p = Test-SandboxBase $oldBase; if ($p) { $oldProblem = Format-SandboxBaseProblem $p } } catch { $oldProblem = $null }
+        }
+        if ($oldProblem) { Say "  note:    task folders move from $oldBase to $SandboxBase ($oldProblem)" }
+        else { $SandboxBase = $oldBase }
+    }
+}
+# Check the folder the way the worker will, before anything is written, stopped or joined.
+if ($KitHasWorker) {
+    $baseProblem = $null
+    try { $baseProblem = Test-SandboxBase $SandboxBase } catch { Say "  note:    could not read the permissions on the way to ${SandboxBase}: $($_.Exception.Message)" }
+    if ($baseProblem) {
+        $why = Format-SandboxBaseProblem $baseProblem
+        Say "  The worker keeps its task folders in $SandboxBase and would refuse them: $why."
+        $fix = Get-SandboxBaseFix $baseProblem
+        if ($fix) {
+            Say "  To remove those grants, run this yourself in a Command Prompt (this installer never changes permissions):"
+            Say "    $fix"
+        }
+        if (@(@($baseProblem.holders) | Where-Object { $_.inherited }).Count -gt 0) {
+            Say "  Some of these entries are inherited from a folder above $($baseProblem.dir); remove them there."
+        }
+        if ($PrivateRoot -and $Isolation -eq 'fs') {
+            Say "  Or install without -Isolation fs (task folders then stay in $(Join-Path $InstallRoot 'work')), or on another drive with -InstallRoot."
+        } else {
+            Say "  Or choose a folder on another drive with -InstallRoot."
+        }
+        Fail "cannot start the worker: $why"
+    }
+    Write-Host "  tasks:   $SandboxBase"
+}
+
 # 2. Create the folder (limited to this user unless it is in %LOCALAPPDATA%) and unpack the binaries.
 if (-not $PrivateRoot) {
     $sec = Get-PrivateSecurity
@@ -916,51 +962,6 @@ Write-Host "  binary:  $version"
 
 # Every command below keeps its state in $State and runs from $InstallRoot.
 $GrantLog = Join-Path $State 'windows_acl_grants.txt'
-# Task folders and the file cache (the worker's sandbox base): <install folder>\work, in %LOCALAPPDATA%
-# too since 2026-11-18 (design 0053 status log). Only an install in %LOCALAPPDATA% with -Isolation fs
-# keeps them in %TEMP%\oxideswarm-usb\sandboxes, which uninstall.ps1 removes: the isolated worker
-# takes no other folder inside the user profile (validate_sandbox_base_safe). An update keeps the
-# folder its launcher names while the worker can still use it.
-$SandboxBase = if ($PrivateRoot -and $Isolation -eq 'fs') { Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes' } else { Join-Path $InstallRoot 'work' }
-if ($Update -and $KitHasWorker) {
-    $oldBase = $null
-    $oldVbs = Join-Path $InstallRoot 'start-worker.vbs'
-    if ((Test-Path -LiteralPath $oldVbs) -and ((Get-Content -Raw -LiteralPath $oldVbs) -match 'RUSTY_GRID_SANDBOX_BASE_DIR"\)\s*=\s*"([^"]+)"')) { $oldBase = $Matches[1] }
-    if ($oldBase -and -not [string]::Equals($oldBase.TrimEnd('\'), $SandboxBase.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
-        $oldProblem = $null
-        if ($PrivateRoot -and $Isolation -eq 'fs') {
-            $oldProblem = "under -Isolation fs the worker takes task folders inside the user profile only from %TEMP%"
-        } else {
-            try { $p = Test-SandboxBase $oldBase; if ($p) { $oldProblem = Format-SandboxBaseProblem $p } } catch { $oldProblem = $null }
-        }
-        if ($oldProblem) { Say "  note:    task folders move from $oldBase to $SandboxBase ($oldProblem)" }
-        else { $SandboxBase = $oldBase }
-    }
-}
-# Check the folder the way the worker will, before anything joins or starts.
-if ($KitHasWorker) {
-    $baseProblem = $null
-    try { $baseProblem = Test-SandboxBase $SandboxBase } catch { Say "  note:    could not read the permissions on the way to ${SandboxBase}: $($_.Exception.Message)" }
-    if ($baseProblem) {
-        $why = Format-SandboxBaseProblem $baseProblem
-        Say "  The worker keeps its task folders in $SandboxBase and would refuse them: $why."
-        $fix = Get-SandboxBaseFix $baseProblem
-        if ($fix) {
-            Say "  To remove those grants, run this yourself in a Command Prompt (this installer never changes permissions):"
-            Say "    $fix"
-        }
-        if (@(@($baseProblem.holders) | Where-Object { $_.inherited }).Count -gt 0) {
-            Say "  Some of these entries are inherited from a folder above $($baseProblem.dir); remove them there."
-        }
-        if ($PrivateRoot -and $Isolation -eq 'fs') {
-            Say "  Or install without -Isolation fs (task folders then stay in $(Join-Path $InstallRoot 'work')), or on another drive with -InstallRoot."
-        } else {
-            Say "  Or choose a folder on another drive with -InstallRoot."
-        }
-        Fail "cannot start the worker: $why"
-    }
-    Write-Host "  tasks:   $SandboxBase"
-}
 $RustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:OXIDESWARM_HOME = $State
