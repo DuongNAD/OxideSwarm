@@ -167,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     fn skip_serializing_if_is_kept_off_bincode_types() {
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut violations = Vec::new();

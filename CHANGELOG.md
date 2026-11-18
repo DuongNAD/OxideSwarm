@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- The clippy lint `undocumented_unsafe_blocks` is `deny` for the whole workspace (`[workspace.lints.clippy]`), so an `unsafe` block or `unsafe impl` without a `// SAFETY:` comment fails the required clippy jobs on Linux, macOS and Windows; a new CI job, `miri (rusty_grid_core)`, runs the unit tests of `rusty_grid_core` under Miri on Linux on the dated nightly of the fuzz jobs, with the 93 tests Miri cannot run (C code such as `ring`, processes, sockets, host queries, and seven too slow for it) marked `#[cfg_attr(miri, ignore = "...")]`; it is not a required check (design 0058 D2, `LV-4`). A normal build does not change.
+
 ## [0.4.3] - 2026-11-18
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.2`. Its main change is in member revocation: `oxideswarm members revoke` now closes every connection of the revoked member on every lane, requeues the tasks of its workers at once, and refuses a worker registration of that member that arrives after the revocation (`ENROLL-1c`, design 0051). It also adds fuzz targets for every parser of untrusted bytes (`LV-18`), documents every `unsafe` site with a `SAFETY:` comment (`LV-4`), fixes `BUG-27` and `BUG-28` and the launcher start race of `switch_role.sh` (`TEST-35`), and makes two more tests deterministic (`TEST-53`, `TEST-54`).
