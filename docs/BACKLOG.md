@@ -249,6 +249,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
+| TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -2331,3 +2332,7 @@ Add one dated line per finished item, newest last.
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
 - 2026-11-18: LV-15 Partial (pull request 351): guide and accounts skeleton; step 2 holders, steps 3 and 4 stay with the owner.
+- 2026-11-19: TEST-55 added and Implemented (pull request 356, open): `s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
+  in `crates/worker/src/sandbox.rs` uses `BUILTIN\Guests` (`S-1-5-32-546`) instead of
+  `BUILTIN\Remote Desktop Users` (`S-1-5-32-555`, absent on Windows Home), so `cargo test -p rusty_grid_worker --lib`
+  passes in full on Windows 11 Home; text in the archive.
