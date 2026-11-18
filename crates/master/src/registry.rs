@@ -3041,9 +3041,17 @@ mod tests {
     #[tokio::test]
     async fn test_release_non_live_worker_id_flushes_outside_registry_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let members = crate::server::members::MemberStore::load_from_dir(Some(dir.path()))
-            .unwrap()
-            .with_auth_mode(crate::server::members::AuthMode::Both);
+        // The v3 claim below belongs to an enrolled member: a reload drops non-members' claims.
+        let v3_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
+        let members = crate::server::members::MemberStore::from_entries(vec![
+            crate::server::members::MemberEntry::new(
+                "v3-worker",
+                *v3_kp.public_key(),
+                vec![crate::server::members::MemberRole::Worker],
+            ),
+        ])
+        .with_save_path(dir.path().join(crate::server::members::MEMBERS_FILE_NAME))
+        .with_auth_mode(crate::server::members::AuthMode::Both);
         let registry = WorkerRegistry::new();
         let wid = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(8);
@@ -3152,7 +3160,7 @@ mod tests {
         assert_eq!(members.persist_count(), 2);
 
         // Enrolled member can now claim `wid` immediately.
-        let v3_member_id = "0123456789abcdef".to_string();
+        let v3_member_id = v3_kp.member_id();
         registry
             .register_session_with_member_store(
                 wid,

@@ -4,7 +4,9 @@
 //! Both transports run the same sequence:
 //! 1. [`PreAuthSession`]: cluster-secret authentication and first-frame watchdog on the primary
 //!    stream, releasing `handshake_permit` immediately after authentication and draining refusal
-//!    frames on multiplexed connections (`BUG-17`).
+//!    frames on multiplexed connections (`BUG-17`). A connection that authenticated as an
+//!    OXS-AUTH v3 member then registers in `MemberConnections` and ends when its member is revoked
+//!    (design 0051 D5).
 //! 2. [`WorkerSession::register`]: `WorkerMessage::Register` validation, `ClaimMasterRole`
 //!    refusal, `WorkerRegistry::register_session`, `RxClock` attachment, superseded-session
 //!    failover (`BUG-18`), `P2pConnGuard` registration, and `RegisterAck` delivery.
@@ -29,6 +31,7 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::noise_auth::HandshakePurpose;
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, is_protocol_version_compatible, InboundMessage,
     MessageReader, ProtocolCapabilities, ProtocolError, PROTOCOL_VERSION_CURRENT,
@@ -39,6 +42,7 @@ use rusty_grid_core::{
 
 use crate::blob_store::BlobStore;
 use crate::liveness::{RxClock, StampedStream};
+use crate::member_connections::{MemberConnectionGuard, MemberLane};
 use crate::queue::TaskQueue;
 use crate::registry::{HeartbeatOutcome, WorkerRegistry};
 #[cfg(feature = "dashboard")]
@@ -50,8 +54,9 @@ use crate::server::{
     failover_superseded_session, feature_announcement, handle_client_connection,
     handle_oversized_master_message, handle_session_task_message,
     handle_worker_disconnect_with_broadcast, handle_worker_evacuate_with_broadcast,
-    reject_master_role_claim, resolve_terminal_waiters, send_refusal_and_drain,
-    serve_worker_blob_request, AbortOnDrop, BlobService, MasterAuthContext, WaiterMap,
+    handle_worker_revoked_with_broadcast, reject_master_role_claim, resolve_terminal_waiters,
+    send_refusal_and_drain, serve_worker_blob_request, AbortOnDrop, BlobService, MasterAuthContext,
+    WaiterMap,
 };
 
 /// Which inbound lane delivered a [`WorkerMessage`].
@@ -649,67 +654,125 @@ impl<
             }
         }
 
-        let worker_msg = match first_msg {
-            InboundMessage::Client(client_msg) => match pre_auth {
-                PreAuthSession::Single {
-                    transport,
-                    mapreduce_parallelism,
-                    #[cfg(feature = "p2p")]
-                        p2p_conn: _p2p_conn,
-                    #[cfg(feature = "p2p")]
-                    p2p_conns,
-                    ..
-                } => {
-                    return handle_client_connection(
-                        client_msg,
+        // Design 0051 D5, revocation step 1: a member connection registers itself, on whatever
+        // lane, before it serves anything, and only then re-checks that its key is still a member.
+        // `RevokeMember` removes the member first and closes the registry second, so a connection
+        // is either closed by the revocation or refused here.
+        let member_conn = match v3_peer.as_ref() {
+            Some(peer) if peer.purpose == HandshakePurpose::Member => {
+                #[cfg(feature = "p2p")]
+                let over_quic = pre_auth.is_multiplexed() || pre_auth.p2p_conn().is_some();
+                #[cfg(not(feature = "p2p"))]
+                let over_quic = pre_auth.is_multiplexed();
+                let lane =
+                    MemberLane::classify(matches!(first_msg, InboundMessage::Worker(_)), over_quic);
+                let guard = auth_ctx.member_connections.register(&peer.member_id, lane);
+                if !auth_ctx.members.contains(&peer.public_key) {
+                    warn!(
+                        member_id = %peer.member_id,
+                        lane = lane.as_str(),
+                        "Closing the connection of a member revoked while it authenticated"
+                    );
+                    return Err(GridError::AuthFailed("member is no longer enrolled".into()));
+                }
+                Some(guard)
+            }
+            _ => None,
+        };
+        #[cfg(feature = "p2p")]
+        let member_quic_conn = member_conn
+            .as_ref()
+            .and_then(|_| pre_auth.p2p_conn().cloned());
+        let member_conn_id = member_conn.as_ref().map(MemberConnectionGuard::id);
+
+        let serve = async move {
+            let worker_msg = match first_msg {
+                InboundMessage::Client(client_msg) => match pre_auth {
+                    PreAuthSession::Single {
                         transport,
-                        registry,
-                        queue,
-                        scheduler_notify,
-                        waiters,
                         mapreduce_parallelism,
-                        blob_store,
-                        auth_ctx,
-                        v3_peer,
-                        #[cfg(feature = "dashboard")]
-                        broadcast_tx,
+                        #[cfg(feature = "p2p")]
+                            p2p_conn: _p2p_conn,
                         #[cfg(feature = "p2p")]
                         p2p_conns,
-                    )
-                    .await;
-                }
-                PreAuthSession::Multiplexed { .. } => {
-                    return Err(GridError::HandshakeFailed(
-                        "Client connection not supported over multiplexed P2P worker transport"
-                            .into(),
-                    ));
-                }
-            },
-            InboundMessage::Worker(wm) => wm,
+                        ..
+                    } => {
+                        return handle_client_connection(
+                            client_msg,
+                            transport,
+                            registry,
+                            queue,
+                            scheduler_notify,
+                            waiters,
+                            mapreduce_parallelism,
+                            blob_store,
+                            auth_ctx,
+                            v3_peer,
+                            member_conn_id,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx,
+                            #[cfg(feature = "p2p")]
+                            p2p_conns,
+                        )
+                        .await;
+                    }
+                    PreAuthSession::Multiplexed { .. } => {
+                        return Err(GridError::HandshakeFailed(
+                            "Client connection not supported over multiplexed P2P worker transport"
+                                .into(),
+                        ));
+                    }
+                },
+                InboundMessage::Worker(wm) => wm,
+            };
+
+            let Some(mut session) = Self::register(
+                pre_auth,
+                worker_msg,
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                heartbeat_interval_secs,
+                shutdown_rx,
+                abort_handle,
+                blob_store,
+                &auth_ctx,
+                v3_peer.as_ref(),
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+
+            session.run().await
         };
 
-        let Some(mut session) = Self::register(
-            pre_auth,
-            worker_msg,
-            registry,
-            queue,
-            scheduler_notify,
-            waiters,
-            heartbeat_interval_secs,
-            shutdown_rx,
-            abort_handle,
-            blob_store,
-            &auth_ctx,
-            v3_peer.as_ref(),
-            #[cfg(feature = "dashboard")]
-            broadcast_tx,
-        )
-        .await?
-        else {
-            return Ok(());
+        let Some(member_conn) = member_conn else {
+            return serve.await;
         };
-
-        session.run().await
+        // Dropping `serve` ends the connection on every lane it has: the TCP stream, or both QUIC
+        // streams and the QUIC connection itself, closed explicitly so the peer learns at once. A
+        // worker session's registry entry and tasks are handled by `RevokeMember` itself
+        // (revocation step 3).
+        tokio::select! {
+            biased;
+            () = member_conn.closed() => {
+                info!(
+                    member_id = %member_conn.member_id(),
+                    lane = member_conn.lane().as_str(),
+                    "Closed the connection of a revoked member"
+                );
+                #[cfg(feature = "p2p")]
+                if let Some(conn) = member_quic_conn {
+                    conn.close(0u32.into(), b"member revoked");
+                }
+                Err(GridError::AuthFailed("member revoked".into()))
+            }
+            res = serve => res,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -866,6 +929,43 @@ impl<
             }
         };
         let session_id = registration.session_id;
+
+        // A `Register` whose handshake authenticated before its member was revoked (or its
+        // enrollment rolled back) can claim the worker id after that commit (design 0051 D5, known
+        // limit 5). The claim was taken under the registry lock, so either `RevokeMember` saw it
+        // and takes this worker down, or the member is already gone here: undo the registration
+        // and its claim, and refuse.
+        if let Some(peer) = v3_peer.filter(|p| !auth_ctx.members.contains(&p.public_key)) {
+            warn!(
+                worker_id = %worker_id,
+                member_id = %peer.member_id,
+                "Refusing Register from a member removed while it registered"
+            );
+            handle_worker_revoked_with_broadcast(
+                &registry,
+                &queue,
+                &scheduler_notify,
+                &waiters,
+                &worker_id,
+                "Member removed while its worker registered",
+                #[cfg(feature = "dashboard")]
+                broadcast_tx.as_ref(),
+            )
+            .await;
+            registry.release_worker_owner(&worker_id).await;
+            let members = Arc::clone(&auth_ctx.members);
+            let _ = tokio::task::spawn_blocking(move || members.prune_non_member_claims()).await;
+            let reject_ack = MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id,
+                heartbeat_interval_secs: 0,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+                message: Some("member is no longer enrolled".into()),
+            };
+            pre_auth.send_handshake_refusal(&reject_ack).await;
+            return Err(GridError::AuthFailed("member is no longer enrolled".into()));
+        }
 
         // The session speaks the version the worker registered with (design 0083 D2): the accepted
         // `RegisterAck`, every task and every later message are encoded for it.

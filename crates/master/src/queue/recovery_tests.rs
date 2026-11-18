@@ -2255,3 +2255,185 @@ fn test_extension_bytes_count_into_the_active_byte_charge() {
         10_003
     );
 }
+
+/// Design 0051 D5, revocation step 3: the tasks of a revoked member's worker are requeued at once,
+/// without the session-resume hold, and lose their checkpoints; a task held for that worker by an
+/// earlier disconnect is released too, and another worker's task is untouched.
+#[tokio::test]
+async fn test_handle_worker_revoked_requeues_at_once_and_drops_checkpoints() {
+    let queue = TaskQueue::with_config(
+        RetryPolicy {
+            retry_on_worker_disconnect: true,
+            initial_backoff_ms: 60_000,
+            ..RetryPolicy::default()
+        },
+        None,
+    );
+    queue
+        .set_session_resume_hold(Duration::from_secs(3_600))
+        .await;
+    let revoked = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    queue.set_worker_session_resume(revoked, true);
+    queue.set_worker_session_resume(kept, true);
+
+    // A task the revoked worker ran on its first session, held after that session dropped.
+    let held = queue.submit(echo_task("held")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(held, revoked, 1)])
+        .await;
+    queue
+        .mark_running_from(revoked, Some(1), &held)
+        .await
+        .unwrap();
+    assert!(queue
+        .record_checkpoint_from(
+            revoked,
+            Some(1),
+            held,
+            CheckpointData::new(1, b"h".to_vec())
+        )
+        .await
+        .unwrap());
+    queue
+        .handle_session_disconnected(&revoked, Some(1), "drop", false)
+        .await;
+    assert!(
+        queue.schedule_task(&held, kept).await.is_none(),
+        "the task is held for the revoked worker before the revocation"
+    );
+
+    // A task running on the revoked worker's current session, and one on another worker.
+    let running = queue.submit(echo_task("running")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(running, revoked, 2)])
+        .await;
+    queue
+        .mark_running_from(revoked, Some(2), &running)
+        .await
+        .unwrap();
+    assert!(queue
+        .record_checkpoint_from(
+            revoked,
+            Some(2),
+            running,
+            CheckpointData::new(7, b"r".to_vec())
+        )
+        .await
+        .unwrap());
+    let other = queue.submit(echo_task("other")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(other, kept, 5)])
+        .await;
+    queue
+        .mark_running_from(kept, Some(5), &other)
+        .await
+        .unwrap();
+    assert!(queue
+        .record_checkpoint_from(kept, Some(5), other, CheckpointData::new(2, b"k".to_vec()))
+        .await
+        .unwrap());
+
+    let affected: HashSet<TaskId> = queue
+        .handle_worker_revoked(&revoked, "member revoked")
+        .await
+        .into_iter()
+        .collect();
+    assert_eq!(affected, HashSet::from([held, running]));
+
+    for tid in [held, running] {
+        let info = queue.get_task(&tid).await.unwrap();
+        assert_eq!(
+            info.state,
+            TaskState::Queued,
+            "requeued at once, not delayed"
+        );
+        assert_eq!(info.assigned_worker_id, None);
+        assert_eq!(info.failover_count, 1, "charged as one failover");
+        assert!(
+            queue.get_checkpoint(&tid).await.is_none(),
+            "the revoked worker's checkpoint is dropped"
+        );
+    }
+    // The revoked worker cannot adopt or checkpoint them any more.
+    let outcome = queue
+        .adopt_session_tasks(revoked, 3, &[held, running])
+        .await;
+    assert!(outcome.adopted.is_empty());
+    assert!(!queue
+        .record_checkpoint_from(
+            revoked,
+            Some(2),
+            running,
+            CheckpointData::new(9, b"x".to_vec())
+        )
+        .await
+        .unwrap());
+    // No hold: another worker takes them now.
+    assert!(queue.schedule_task(&held, kept).await.is_some());
+    assert!(queue.schedule_task(&running, kept).await.is_some());
+
+    let other_info = queue.get_task(&other).await.unwrap();
+    assert_eq!(other_info.state, TaskState::Running);
+    assert_eq!(other_info.assigned_worker_id, Some(kept));
+    assert_eq!(
+        queue.get_checkpoint(&other).await.map(|cp| cp.sequence),
+        Some(2),
+        "another worker's checkpoint stays"
+    );
+}
+
+/// No journal record clears a checkpoint, so `handle_worker_revoked` compacts the store: a master
+/// that crashes right after the revocation must not bring the dropped checkpoint back on replay.
+#[tokio::test]
+async fn test_handle_worker_revoked_dropped_checkpoint_stays_dropped_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let revoked = Uuid::new_v4();
+    let (tid, kept_tid) = {
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        let q = TaskQueue::with_config(replay_policy(), None);
+        q.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+        let tid = q.submit(echo_task("revoked-cp")).await.unwrap();
+        let kept_tid = q.submit(echo_task("kept-cp")).await.unwrap();
+        let kept = Uuid::new_v4();
+        q.schedule_tasks_batch_in_sessions(&[(tid, revoked, 1), (kept_tid, kept, 2)])
+            .await;
+        q.mark_running_from(revoked, Some(1), &tid).await.unwrap();
+        q.mark_running_from(kept, Some(2), &kept_tid).await.unwrap();
+        q.record_checkpoint_from(revoked, Some(1), tid, CheckpointData::new(4, b"r".to_vec()))
+            .await
+            .unwrap();
+        q.record_checkpoint_from(
+            kept,
+            Some(2),
+            kept_tid,
+            CheckpointData::new(5, b"k".to_vec()),
+        )
+        .await
+        .unwrap();
+        q.handle_worker_revoked(&revoked, "member revoked").await;
+        assert!(q.get_checkpoint(&tid).await.is_none());
+        // A crash: no shutdown compaction.
+        drop(q);
+        (tid, kept_tid)
+    };
+
+    let (store, rec) = TaskStore::open(dir.path()).unwrap();
+    let q2 = TaskQueue::with_config(replay_policy(), None);
+    q2.attach_store_and_replay(store, rec, Duration::ZERO)
+        .await
+        .unwrap();
+    let info = q2.get_task(&tid).await.unwrap();
+    assert_eq!(info.state, TaskState::Queued);
+    assert!(
+        q2.get_checkpoint(&tid).await.is_none(),
+        "the revoked worker's checkpoint must not come back on replay"
+    );
+    assert_eq!(
+        q2.get_checkpoint(&kept_tid).await.map(|cp| cp.sequence),
+        Some(5),
+        "another worker's checkpoint survives the replay"
+    );
+}

@@ -60,7 +60,8 @@ pub(crate) use tasks_and_blobs::DashboardTx;
 pub(crate) use tasks_and_blobs::{
     admit_blob_task, apply_mobile_telemetry, cancel_task_and_notify, failover_superseded_session,
     feature_announcement, handle_oversized_master_message, handle_session_task_message,
-    prune_closed_waiters, resolve_terminal_waiters, serve_worker_blob_request, BlobService,
+    handle_worker_revoked_with_broadcast, prune_closed_waiters, resolve_terminal_waiters,
+    serve_worker_blob_request, BlobService,
 };
 pub use tasks_and_blobs::{
     handle_task_progress, handle_task_result, handle_worker_disconnect,
@@ -1710,6 +1711,7 @@ impl MasterServer {
             ephemeral_without_state_dir: self.config.ephemeral_key
                 && self.config.state_dir.is_none(),
             members: Arc::clone(&self.config.members),
+            member_connections: crate::member_connections::MemberConnections::default(),
             p2p_ticket: self.p2p_ticket.clone(),
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         };

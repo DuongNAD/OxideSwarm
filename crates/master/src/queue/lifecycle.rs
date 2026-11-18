@@ -1054,6 +1054,36 @@ impl TaskQueue {
         reason: &str,
         immediate_reschedule: bool,
     ) -> Vec<TaskId> {
+        self.sweep_worker_tasks(worker_id, session_id, reason, immediate_reschedule, false)
+            .await
+    }
+
+    /// Takes back every task of `worker_id`, whose member was revoked (design 0051 D5, revocation
+    /// step 3), and returns the affected task ids.
+    ///
+    /// Unlike [`handle_session_disconnected`](Self::handle_session_disconnected):
+    /// - the tasks are requeued at once, never held for a session resume (the member cannot come
+    ///   back), and tasks already held for this worker by an earlier disconnect or a master restart
+    ///   are released from their hold now;
+    /// - the checkpoint of each of these tasks is dropped, so no later attempt resumes from state
+    ///   the revoked machine wrote. The store has no record that clears a checkpoint, so when one
+    ///   was dropped the queue compacts its store, whose snapshot no longer holds it.
+    ///
+    /// Tasks whose failover budget is spent fail as on any disconnect.
+    pub async fn handle_worker_revoked(&self, worker_id: &Uuid, reason: &str) -> Vec<TaskId> {
+        self.set_worker_session_resume(*worker_id, false);
+        self.sweep_worker_tasks(worker_id, None, reason, true, true)
+            .await
+    }
+
+    async fn sweep_worker_tasks(
+        &self,
+        worker_id: &Uuid,
+        session_id: Option<u64>,
+        reason: &str,
+        immediate_reschedule: bool,
+        revoked: bool,
+    ) -> Vec<TaskId> {
         let (affected, had_terminal, acks) = {
             let mut guard = self.inner.write().await;
             let inner = &mut *guard;
@@ -1077,7 +1107,8 @@ impl TaskQueue {
             let now_instant = Instant::now();
             let now_epoch = Utc::now().timestamp() as u64;
             let policy = inner.retry_policy.clone();
-            let hold_for_resume = !inner.session_resume_hold.is_zero()
+            let hold_for_resume = !revoked
+                && !inner.session_resume_hold.is_zero()
                 && inner
                     .session_resume_workers
                     .lock()
@@ -1091,6 +1122,7 @@ impl TaskQueue {
             let mut holds_to_track = Vec::new();
             let mut terminal_to_track = Vec::new();
             let mut records = Vec::new();
+            let mut dropped_checkpoints = 0usize;
 
             for task_id in assigned {
                 let Some(entry) = inner.tasks.get_mut(&task_id) else {
@@ -1110,6 +1142,9 @@ impl TaskQueue {
                 }
 
                 affected.push(task_id);
+                if revoked && entry.task.latest_checkpoint.take().is_some() {
+                    dropped_checkpoints += 1;
+                }
                 if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
                     tasks.remove(&task_id);
                 }
@@ -1258,10 +1293,56 @@ impl TaskQueue {
             for tid in holds_to_track {
                 inner.track_adoption_hold(tid, true);
             }
-            let had_terminal = !terminal_to_track.is_empty();
+            let mut had_terminal = !terminal_to_track.is_empty();
             for tid in terminal_to_track {
                 inner.sync_workspace_active(tid);
                 inner.track_terminal_task(tid);
+            }
+            if revoked {
+                // Tasks an earlier disconnect or a master restart left held for this worker: the
+                // hold ends now, and so does their checkpoint.
+                let held: Vec<(TaskId, bool, bool)> = inner
+                    .held_tasks
+                    .iter()
+                    .filter_map(|tid| {
+                        let entry = inner.tasks.get(tid)?;
+                        (entry.state == TaskState::Queued
+                            && entry.adoptable_by.is_some_and(|(w, _)| w == *worker_id))
+                        .then_some((
+                            *tid,
+                            entry.fail_if_not_adopted,
+                            entry.pending_failover_charge,
+                        ))
+                    })
+                    .collect();
+                let mut released_any = false;
+                for (tid, fail_if_not_adopted, pending_failover_charge) in held {
+                    if let Some(entry) = inner.tasks.get_mut(&tid) {
+                        if entry.task.latest_checkpoint.take().is_some() {
+                            dropped_checkpoints += 1;
+                        }
+                    }
+                    let (record, failed, released) = Self::release_unadopted_task(
+                        inner,
+                        tid,
+                        Some(*worker_id),
+                        fail_if_not_adopted,
+                        pending_failover_charge,
+                        now_epoch,
+                    );
+                    records.extend(record);
+                    if released {
+                        inner.update_active_task(tid);
+                        released_any = true;
+                    }
+                    had_terminal |= failed;
+                    if released || failed {
+                        affected.push(tid);
+                    }
+                }
+                if released_any {
+                    inner.ready_epoch = inner.ready_epoch.wrapping_add(1);
+                }
             }
             if !inner.worker_assignments.contains_key(worker_id) {
                 let mut tracker = inner
@@ -1281,13 +1362,32 @@ impl TaskQueue {
             }
             inner.refresh_worker_resume_protection(*worker_id);
 
-            let mut acks = Vec::with_capacity(records.len());
+            let mut acks = Vec::with_capacity(records.len() + 1);
             for record in &records {
                 if let Some(ack) = inner.append_durable_warn(record) {
                     acks.push(ack);
                 }
             }
-            inner.maybe_trigger_compaction();
+            if dropped_checkpoints > 0 {
+                tracing::info!(
+                    worker_id = %worker_id,
+                    dropped_checkpoints,
+                    "Dropped the checkpoints of the tasks a revoked member's worker held"
+                );
+                // No journal record clears a checkpoint, so a replay would bring the dropped ones
+                // back: write a snapshot without them, after this sweep's own records.
+                if let Some(store) = inner.store.as_ref() {
+                    match store.compact(inner.snapshot_image()) {
+                        Ok(ack) => acks.push(ack),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "Failed to compact the task store after dropping checkpoints"
+                        ),
+                    }
+                }
+            } else {
+                inner.maybe_trigger_compaction();
+            }
 
             (affected, had_terminal, acks)
         };
