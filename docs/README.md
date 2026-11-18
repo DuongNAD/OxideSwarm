@@ -118,6 +118,7 @@ before adding or changing a document.
 | [design/0091-restart-recovery-races.md](design/0091-restart-recovery-races.md) | Implemented: two worker races found by looping `master_restart_recovery` (`TEST-23`): a result buffered as failed when the connection ended during an output upload, and a task lock won on an unlinked lock file. |
 | [design/0092-mesh-hub-reply-headroom.md](design/0092-mesh-hub-reply-headroom.md) | Implemented: the Agent Mesh hub waits for room for its replies in the sender's own outbound queue before it handles the next request, so a burst of requests slows the sender down instead of getting it disconnected as a slow consumer (TEST-27) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
+| [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md) | The text of every Implemented backlog item, under the phase headings of the backlog (DOC-11); the Index of BACKLOG.md lists every item | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
 Design record numbers 0035, 0037, 0041 and 0043 were never used. 0042 (remote workspaces) was a
