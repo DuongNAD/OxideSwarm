@@ -234,7 +234,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
-| TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  |
+| TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented | 318 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3357,7 +3357,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   condition (30 s bound) until the file holds a port, then wait by condition until `connect_master`
   succeeds; keep every assertion.
 - **Done when:** The lib test binary of `rusty_grid_cli` passes 50 runs in a row under CPU load.
-- **Implemented (2026-11-18, pull request pending):** Two helpers in `crates/cli/src/cli_app/tests.rs`, shared
+- **Implemented (2026-11-18, pull request 318):** Two helpers in `crates/cli/src/cli_app/tests.rs`, shared
   with `runtime_tests.rs`: `wait_for_master_port` polls the port file every 20 ms and fails with what it
   waited for when `run_master` ends first or `MASTER_START_BOUND` (30 s) passes, and
   `connect_master_within_bound` retries `connect_master` until it succeeds or the same bound passes, then
