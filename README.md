@@ -135,8 +135,8 @@ $user = [Environment]::GetEnvironmentVariable('Path', 'User')
 
 `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
 archive's signed build provenance. When it accepts, this exact archive was built on GitHub's runners by a
-workflow of this repository, and the output names the workflow and the commit it was built from. It does
-not prove that the source at that commit is safe or free of bugs. An archive with one changed byte is
+workflow of this repository; the output names that workflow and the git ref it ran on, and `--format json`
+adds the commit (`sourceRepositoryDigest`). It does not prove that the source at that commit is safe or free of bugs. An archive with one changed byte is
 refused. Manual and pull request runs of `release.yml` attest their archives too, so to accept only a
 release build add `--signer-workflow DuongNAD/OxideSwarm/.github/workflows/release.yml --source-ref refs/tags/v0.4.2`.
 Releases published before this check was added (LV-5) have no attestation and are refused; check those

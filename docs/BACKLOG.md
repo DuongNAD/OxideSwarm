@@ -1059,6 +1059,27 @@ none needs a design record of its own.
   attestation per archive, `gh attestation verify` accepts an archive of that run and refuses a
   copy with one changed byte, and both outputs are in the pull request. No `uses:` line in
   `.github/workflows/` names a tag or a branch. The Scorecard workflow has run once.
+- **Status (2026-11-18, Partial):** Steps 1 to 5 are in pull request PRNUM; step 6 stays with the owner.
+  - Step 1: `deny.toml` allows ten licences (`Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`,
+    `CDLA-Permissive-2.0`, `ISC`, `MIT`, `MPL-2.0`, `Unicode-3.0`, `Unlicense`, `Zlib`, each the only
+    choice of at least one crate) plus `NCSA` for `libfuzzer-sys` only, crates.io as the only source
+    (neither lock file has a git source), bans nothing and warns on duplicates. The CI job
+    `cargo deny` (cargo-deny 0.20.2, not a required check) checks the workspace and `fuzz/`; both
+    pass on macOS.
+  - Step 2: the `checksums` job of `release.yml` attests every archive with `actions/attest`;
+    `workflow_dispatch` takes `mode=attest-only` and never creates a release. Manual run
+    44284015567 on `597fa14`: one attestation for 8 archives, `gh attestation verify` accepts an
+    archive of that run and refuses a copy with one changed byte (HTTP 404, no attestation for the
+    new digest).
+  - Step 3: `README.md` (Install) has the verify command and what it proves; `docs/SECURITY.md`
+    points to it.
+  - Step 4: every `uses:` names a full commit with its tag in a comment; Dependabot already had the
+    `github-actions` ecosystem.
+  - Step 5: `.github/workflows/scorecard.yml` (weekly, pushes to `master`, SARIF to code scanning,
+    results published) and its badge. It runs on the default branch only, so it has not run yet:
+    its first run is the push of the merge.
+  - Owner (step 6): make `cargo deny` a required check once it is green on `master`, and fill in
+    the OpenSSF Best Practices questionnaire.
 
 ### LV-10: Citation file and a DOI per release
 
