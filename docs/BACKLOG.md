@@ -233,6 +233,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
+| TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3251,6 +3252,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   20 ms apart, so one second to build the master's state and bind. Both waits now call
   `wait_for_master_bind`, a helper in `runtime_tests.rs` that retries the connect every 20 ms for up to 30 s
   and returns as soon as it succeeds. Every assertion is kept; no other fixed bind wait is left in the file.
+
+### TEST-50: Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e
+
+- **Evidence:** `test_dev_mode_is_ignored_and_a_plain_http_warning_printed_for_a_non_loopback_dashboard`
+  (`tests/cli_dashboard_policy_e2e.rs:258`, `assert!(log.contains("WARNING"))`) failed in `workspace tests
+  (macos-latest)` on 2026-11-17, in pull request 309 (run `44192627449`, attempt 1, job `134425718401`). The
+  log in the panic message ends at `Embedded Dashboard available at http://0.0.0.0:50311`: it has the
+  master's tracing `WARN` about plain HTTP, but neither the banner line `Dashboard access: --dev /
+  OXIDE_DEV_MODE ignored ...` nor the `WARNING: the dashboard is listening on ...` line.
+- **Problem:** `run_master` (`crates/cli/src/cli_app/master.rs`) prints, after `MasterServer::spawn_with_config`
+  has published both port files, `RustyGrid Master started`, the v3 public key, `Embedded Dashboard
+  available`, the `dashboard_banner` lines (`println!`) and then the plain-HTTP `WARNING` (`eprintln!`), one
+  write per line. The test's `start_master` waited for the ports and then (without asserting) up to 5 s for
+  `Embedded Dashboard available`, and each test read the log once. On a slow runner that read can come
+  between two of those writes. A race in the test, not a product defect.
+- **Do:** In every test of the file that checks master log text, wait by condition (20 s bound) until every
+  line it checks is present, print the log on timeout, and keep every assertion.
+- **Done when:** The test binary passes 100 runs in a row under CPU load.
+- **Implemented (2026-11-18):** `Service::wait_for_log(&[needles])` polls the log until it holds every needle,
+  fails with the missing needles and the whole log after `LOG_WAIT` (20 s), and returns the log the test then
+  asserts on. Five tests use it: the bare loopback master (banner line), the explicit token (waits for the
+  `Dashboard access:` line before it checks that the open-access line is absent), the master on all
+  interfaces (dashboard address and `secret show --dashboard-token`), `--dev` on a non-loopback dashboard
+  (`WARNING`, `plain HTTP`, `--dev / OXIDE_DEV_MODE ignored`) and the non-loopback dashboard without `--dev`
+  (`plain HTTP`). The unasserted 5 s wait in `start_master` is gone; no fixed sleep is added. On an Apple
+  Silicon Mac (10 cores), two copies of the test binary at once, 100 runs each: 200 of 200 passed next to 12
+  spinning processes and 200 of 200 next to 40. The old file did not fail here either (200 of 200 at each
+  load), so the race was not reproduced locally; the CI log above is the evidence. No other test file reads
+  the master's banner lines once after start-up.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
