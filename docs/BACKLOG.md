@@ -229,7 +229,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented |  | 267 |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented |  | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented |  | 277 |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | In | 277 |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Implemented |  | 277, 338 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
@@ -351,6 +351,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented |  | 299 |
 | BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented |  | 311 |
 | BUG-27 | Compute the result acknowledgement token only when result resume is on | P3 | S |  |  | Implemented |  | 332 |
+| BUG-28 | Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint | P2 | S |  |  | Implemented |  | 334 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -1230,24 +1231,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** The cause is written here, and the owner has decided what to do with the entry.
   This needs the owner's machine.
 
-### TEST-35: Make the `switch_role` launcher test stable on macOS
-
-- **Evidence:** Reproduced twice: pull request 206 on 2026-11-12, and pull request 260 at `9d8b9cc` on
-  2026-11-16 (job `133322408476`, `launcher scripts (macos-latest)`):
-  `ShellLauncherTests.test_switch_role_master_flow_and_tracked_stop` failed with "AssertionError: 1 != 0"
-  on the launcher's return code. Reruns passed.
-- **Problem:** The launcher returned 1 once in a while; the test does not print why.
-- **Do:** Print the launcher's output on failure, then find the cause.
-- **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
-- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
-  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
-  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
-  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
-  The launcher returns 1 only when the master port is in use, the master process is not recognised
-  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
-  race (a process still showing the launcher's command line just after the fork) was not seen in 300
-  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
-
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
 - **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
@@ -1621,6 +1604,8 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
   request 324, 145 sites documented.
 - **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
+- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
+- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -2226,3 +2211,6 @@ Add one dated line per finished item, newest last.
   LV-18 Partial (pull request 326, the MCP reader is open); TEST-53 Implemented (pull request 327).
 - 2026-11-18: LV-18 Implemented (pull request 335: the target `mcp_request_line` for the JSON-RPC reader of
   `oxideswarm mcp`), its text moved to the archive.
+- 2026-11-18: Release `0.4.3` prepared (no wire change; ENROLL-1c revocation across every lane, LV-18, LV-4
+  comments, BUG-27, BUG-28, TEST-35, TEST-53, TEST-54): versions, CHANGELOG with an "Upgrading from 0.4.2"
+  note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.

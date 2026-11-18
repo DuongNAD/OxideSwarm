@@ -145,6 +145,8 @@ pub(super) fn profile(
 pub(super) fn account_home() -> Option<PathBuf> {
     use std::ffi::CStr;
     let mut buf = vec![0u8; 4096];
+    // SAFETY: `libc::passwd` holds only integers and raw pointers, for which all-zero bits (0
+    // and null) are a valid value; `getpwuid_r` overwrites it before a field is used.
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut out: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: the buffer outlives the call and `pwd`/`out` are valid for writes.

@@ -161,6 +161,8 @@ pub fn sweep_leftover_appcontainer_profiles_for_base(sandbox_base: &Path) -> usi
             continue;
         };
         let wide = to_wide(OsStr::new(prof_name));
+        // SAFETY: `wide` is a NUL-terminated UTF-16 `Vec<u16>` kept alive for the duration of
+        // `DeleteAppContainerProfile`.
         let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
         if hr >= 0 {
             deleted += 1;
@@ -194,6 +196,8 @@ pub struct WindowsAppContainerGuard {
 // SAFETY: WindowsAppContainerGuard owns its heap allocations and raw pointers are only read
 // synchronously during `CreateProcessW` before `spawn()` returns.
 unsafe impl Send for WindowsAppContainerGuard {}
+// SAFETY: `&self` methods on `WindowsAppContainerGuard` only read immutable fields (`security_capabilities`
+// and `desktop_name_wide`) during spawn without interior mutation.
 unsafe impl Sync for WindowsAppContainerGuard {}
 
 impl WindowsAppContainerGuard {
@@ -384,6 +388,9 @@ impl WindowsAppContainerGuard {
         let wide_display = to_wide(OsStr::new("OxideSwarm Task Sandbox"));
 
         let mut app_container_sid: PSID = std::ptr::null_mut();
+        // SAFETY: `wide_profile_name` and `wide_display` are NUL-terminated UTF-16 `Vec<u16>` buffers
+        // alive across the call; `&mut app_container_sid` receives an AppContainer SID freed via
+        // `FreeSid` on cleanup or setup failure below.
         let hr = unsafe {
             CreateAppContainerProfile(
                 wide_profile_name.as_ptr(),
@@ -395,6 +402,8 @@ impl WindowsAppContainerGuard {
             )
         };
         let hr = if hr == HRESULT_ALREADY_EXISTS {
+            // SAFETY: `wide_profile_name` is a NUL-terminated UTF-16 `Vec<u16>` alive for the
+            // call; `&mut app_container_sid` receives the derived SID freed via `FreeSid` below.
             unsafe {
                 DeriveAppContainerSidFromAppContainerName(
                     wide_profile_name.as_ptr(),
@@ -564,6 +573,9 @@ impl WindowsAppContainerGuard {
             match setup_res {
                 Ok(v) => v,
                 Err(e) => {
+                    // SAFETY: `app_container_sid` is a valid non-null SID from `CreateAppContainerProfile`
+                    // or `DeriveAppContainerSidFromAppContainerName` freed once here because no guard
+                    // is returned; `wide_profile_name` is a live NUL-terminated UTF-16 buffer.
                     unsafe {
                         FreeSid(app_container_sid);
                         let _ = DeleteAppContainerProfile(wide_profile_name.as_ptr());
@@ -663,6 +675,9 @@ impl WindowsAppContainerGuard {
                 }
             }
         }
+        // SAFETY: `desktop_handle` (`CloseDesktop`) and `app_container_sid` (`FreeSid`) are each
+        // non-null when freed once and nulled; `wide_profile_name` / moved `wide_name` remains a
+        // live NUL-terminated UTF-16 `Vec<u16>` across `DeleteAppContainerProfile`.
         unsafe {
             if !self.desktop_handle.is_null() {
                 let _ = CloseDesktop(self.desktop_handle);

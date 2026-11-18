@@ -214,7 +214,8 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
         ..Default::default()
     };
     let (addr_from_cfg, ticket_from_cfg) =
-        resolve_worker_target(None, None, Some(&cfg_with_bad_ticket));
+        resolve_worker_target(None, None, Some(&cfg_with_bad_ticket))
+            .expect("config master address should resolve");
     assert_eq!(addr_from_cfg, "198.51.100.9:8088");
     assert_eq!(
         ticket_from_cfg.as_deref(),
@@ -225,7 +226,8 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
         Some("127.0.0.1:18088".into()),
         None,
         Some(&cfg_with_bad_ticket),
-    );
+    )
+    .expect("explicit --master should resolve");
     assert_eq!(addr_from_cli, "127.0.0.1:18088");
     assert_eq!(
         ticket_when_cli_master, None,

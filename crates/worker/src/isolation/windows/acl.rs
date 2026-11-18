@@ -34,13 +34,16 @@ pub struct OwnedSid(Vec<u8>);
 
 impl OwnedSid {
     fn from_raw_psid(raw: PSID) -> io::Result<Self> {
+        // SAFETY: `raw` is checked non-null first and points to the caller's live SID allocation.
         if raw.is_null() || unsafe { IsValidSid(raw) } == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Windows SID pointer",
             ));
         }
+        // SAFETY: `IsValidSid(raw)` returned non-zero above, so `GetLengthSid` reads its valid SID header.
         let len = unsafe { GetLengthSid(raw) } as usize;
+        // SAFETY: `raw` points to a validated Win32 SID allocation of `len` readable bytes alive for this copy.
         let slice = unsafe { std::slice::from_raw_parts(raw as *const u8, len) };
         Ok(Self(slice.to_vec()))
     }
@@ -48,11 +51,14 @@ impl OwnedSid {
     pub fn from_sid_string(sid_str: &str) -> io::Result<Self> {
         let wide = to_wide(OsStr::new(sid_str));
         let mut raw_sid: PSID = std::ptr::null_mut();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 `Vec<u16>` alive for this call, and `&mut raw_sid`
+        // receives a `LocalAlloc` SID freed via `LocalFree` below.
         let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw_sid) };
         if ok == 0 || raw_sid.is_null() {
             return Err(io::Error::last_os_error());
         }
         let res = Self::from_raw_psid(raw_sid);
+        // SAFETY: `raw_sid` was allocated by `ConvertStringSidToSidW`, copied above, and freed once.
         unsafe {
             LocalFree(raw_sid as HLOCAL);
         }
@@ -62,6 +68,7 @@ impl OwnedSid {
     pub fn from_well_known(sid_type: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
         let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
         let mut size = buf.len() as u32;
+        // SAFETY: `buf` provides `SECURITY_MAX_SID_SIZE` writable bytes matching `size`.
         let ok = unsafe {
             CreateWellKnownSid(
                 sid_type,
@@ -79,14 +86,18 @@ impl OwnedSid {
 
     pub fn current_user() -> io::Result<Self> {
         let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess()` returns the current process pseudo-handle, and `&mut token`
+        // receives an owned token handle closed below.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut needed = 0u32;
+        // SAFETY: `token` is a valid handle from `OpenProcessToken`; null/0 performs the Win32 size query.
         unsafe {
             let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
         }
         let mut buf = vec![0u8; needed as usize];
+        // SAFETY: `buf` holds `needed` writable bytes matching the length parameter passed to `GetTokenInformation`.
         let ok = unsafe {
             GetTokenInformation(
                 token,
@@ -96,12 +107,15 @@ impl OwnedSid {
                 &mut needed,
             )
         };
+        // SAFETY: `token` was opened by `OpenProcessToken` above and is closed once here.
         unsafe {
             CloseHandle(token);
         }
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `GetTokenInformation(TokenUser)` succeeded, populating `TOKEN_USER` (and its trailing SID)
+        // inside the heap-allocated `buf`.
         let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
         Self::from_raw_psid(token_user.User.Sid)
     }
@@ -119,6 +133,8 @@ impl OwnedSid {
         let mut group_count: u32 = 0;
         let mut cap_sids: *mut PSID = std::ptr::null_mut();
         let mut cap_count: u32 = 0;
+        // SAFETY: `wide` is NUL-terminated UTF-16 alive for this call; `group_sids` and `cap_sids`
+        // receive `LocalAlloc` SID pointer arrays freed below.
         let ok = unsafe {
             DeriveCapabilitySidsFromName(
                 wide.as_ptr(),
@@ -132,6 +148,7 @@ impl OwnedSid {
             return Err(io::Error::last_os_error());
         }
         let result = if cap_count > 0 && !cap_sids.is_null() {
+            // SAFETY: `cap_sids` is non-null with `cap_count > 0`, so index 0 points to a live SID.
             let first = unsafe { *cap_sids };
             Self::from_raw_psid(first)
         } else {
@@ -139,6 +156,8 @@ impl OwnedSid {
                 "DeriveCapabilitySidsFromName returned zero capability SIDs",
             ))
         };
+        // SAFETY: `group_sids` and `cap_sids` (plus `group_count`/`cap_count` element SIDs) were
+        // allocated by `DeriveCapabilitySidsFromName` and are freed once here after copying.
         unsafe {
             if !group_sids.is_null() {
                 for i in 0..group_count as usize {
@@ -164,18 +183,23 @@ impl OwnedSid {
 
     pub fn to_sid_string(&self) -> io::Result<String> {
         let mut wide_ptr: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `self.as_psid()` points to this `OwnedSid`'s validated SID buffer, and `wide_ptr`
+        // receives a NUL-terminated `LocalAlloc` UTF-16 string freed via `LocalFree` below.
         let ok = unsafe { ConvertSidToStringSidW(self.as_psid(), &mut wide_ptr) };
         if ok == 0 || wide_ptr.is_null() {
             return Err(io::Error::last_os_error());
         }
         let mut len = 0usize;
+        // SAFETY: `ConvertSidToStringSidW` guarantees `wide_ptr` is NUL-terminated when it succeeds.
         unsafe {
             while *wide_ptr.add(len) != 0 {
                 len += 1;
             }
         }
+        // SAFETY: `wide_ptr` points to `len` initialized `u16` elements before its trailing NUL.
         let slice = unsafe { std::slice::from_raw_parts(wide_ptr, len) };
         let s = OsString::from_wide(slice).to_string_lossy().into_owned();
+        // SAFETY: `wide_ptr` was allocated by `ConvertSidToStringSidW` and is freed once after copying.
         unsafe {
             LocalFree(wide_ptr as HLOCAL);
         }
@@ -223,6 +247,8 @@ fn dacl_has_ace(
     let wide_path = to_wide(path.as_os_str());
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call; `dacl` points into `sd`,
+    // which owns the returned `LocalAlloc` descriptor freed below.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -237,6 +263,7 @@ fn dacl_has_ace(
     };
     if rc != ERROR_SUCCESS || dacl.is_null() {
         if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -245,6 +272,7 @@ fn dacl_has_ace(
     }
 
     let mut acl_info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: `dacl` is non-null inside still-live `sd`, and `acl_info` has `size_of::<ACL_SIZE_INFORMATION>()` writable bytes.
     let ok = unsafe {
         GetAclInformation(
             dacl,
@@ -257,14 +285,19 @@ fn dacl_has_ace(
     if ok != 0 {
         for idx in 0..acl_info.AceCount {
             let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `dacl` is backed by live `sd`, and `idx < acl_info.AceCount`.
             if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
+                // SAFETY: `GetAce` succeeded with non-null `ace_ptr` pointing to a DWORD-aligned ACE header inside `dacl`.
                 let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
                 if header.AceType as u32 == ace_type
                     && (header.AceFlags as u32 & INHERIT_ONLY_ACE) == 0
                     && (header.AceFlags as u32 & required_flags) == required_flags
                 {
+                    // SAFETY: `ace_type` is allow or deny (both start with the `ACCESS_ALLOWED_ACE` layout),
+                    // DWORD-aligned inside live `dacl`.
                     let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
                     let ace_sid = (&ace.SidStart as *const u32) as PSID;
+                    // SAFETY: `ace_sid` lies inside the live ACE and `target_sid` points to the caller's SID.
                     if unsafe { EqualSid(ace_sid, target_sid) } != 0
                         && (ace.Mask & required_mask) == required_mask
                     {
@@ -276,6 +309,8 @@ fn dacl_has_ace(
         }
     }
     if !sd.is_null() {
+        // SAFETY: `sd` is non-null, allocated by `GetNamedSecurityInfoW`, no longer borrowed by
+        // `dacl` after the loop, and freed once here.
         unsafe {
             LocalFree(sd as HLOCAL);
         }
@@ -315,6 +350,8 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
     let wide_path = to_wide(path.as_os_str());
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call; `old_dacl` borrows from `sd`,
+    // which owns the descriptor buffer freed via `LocalFree` below.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -329,6 +366,7 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -337,6 +375,9 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
     }
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries.as_ptr()` points to `entries.len()` initialized `EXPLICIT_ACCESS_W` values
+    // borrowing valid SIDs, `old_dacl` is null or inside still-live `sd`, and `new_dacl` receives
+    // an ACL freed via `LocalFree` below.
     let rc = unsafe {
         SetEntriesInAclW(
             entries.len() as u32,
@@ -347,6 +388,7 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` is freed once here on `SetEntriesInAclW` failure.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -354,6 +396,7 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
 
+    // SAFETY: `wide_path` is live NUL-terminated UTF-16 and `new_dacl` was allocated by `SetEntriesInAclW`.
     let set_rc = unsafe {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -365,6 +408,7 @@ pub(super) fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) 
             std::ptr::null(),
         )
     };
+    // SAFETY: `new_dacl` and `sd` are no longer referenced after `SetNamedSecurityInfoW` and are each freed once.
     unsafe {
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
@@ -392,6 +436,8 @@ pub(super) fn merge_entries_on_path_unprotected(
     let wide_path = to_wide(path.as_os_str());
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call; `old_dacl` borrows from `sd`,
+    // which is freed via `LocalFree` below.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -406,6 +452,7 @@ pub(super) fn merge_entries_on_path_unprotected(
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -414,6 +461,8 @@ pub(super) fn merge_entries_on_path_unprotected(
     }
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries.as_ptr()` points to `entries.len()` initialized `EXPLICIT_ACCESS_W` values,
+    // `old_dacl` is null or inside live `sd`, and `new_dacl` receives an ACL freed below.
     let rc = unsafe {
         SetEntriesInAclW(
             entries.len() as u32,
@@ -424,6 +473,7 @@ pub(super) fn merge_entries_on_path_unprotected(
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` is freed once here on `SetEntriesInAclW` failure.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -431,6 +481,7 @@ pub(super) fn merge_entries_on_path_unprotected(
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
 
+    // SAFETY: `wide_path` is live NUL-terminated UTF-16 and `new_dacl` was allocated by `SetEntriesInAclW`.
     let set_rc = unsafe {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -442,6 +493,7 @@ pub(super) fn merge_entries_on_path_unprotected(
             std::ptr::null(),
         )
     };
+    // SAFETY: `new_dacl` and `sd` are no longer needed after `SetNamedSecurityInfoW` and are each freed once.
     unsafe {
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
@@ -470,6 +522,8 @@ pub(super) fn set_protected_dacl_on_path(
     }
     let wide_path = to_wide(path.as_os_str());
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries.as_ptr()` points to `entries.len()` initialized `EXPLICIT_ACCESS_W` values
+    // with null existing ACL, and `new_dacl` receives a `LocalAlloc` ACL freed below.
     let rc = unsafe {
         SetEntriesInAclW(
             entries.len() as u32,
@@ -481,6 +535,8 @@ pub(super) fn set_protected_dacl_on_path(
     if rc != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call and `new_dacl` is a live ACL
+    // created by `SetEntriesInAclW`.
     let set_rc = unsafe {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -492,6 +548,7 @@ pub(super) fn set_protected_dacl_on_path(
             std::ptr::null(),
         )
     };
+    // SAFETY: `new_dacl` is no longer referenced after `SetNamedSecurityInfoW` and is freed once.
     unsafe {
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
@@ -509,6 +566,8 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
     let wide_path = to_wide(path.as_os_str());
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call; `sd` receives an owned
+    // `LocalAlloc` security descriptor freed via `LocalFree` below.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -523,6 +582,7 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -531,6 +591,8 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
     }
     let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
     let mut sddl_len: u32 = 0;
+    // SAFETY: `sd` is the live descriptor returned by `GetNamedSecurityInfoW`, and `sddl_ptr`
+    // receives a NUL-terminated `LocalAlloc` UTF-16 string freed via `LocalFree` below.
     let ok = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             sd,
@@ -540,6 +602,7 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
             &mut sddl_len,
         )
     };
+    // SAFETY: `sd` is no longer needed after conversion and is freed once here when non-null.
     unsafe {
         if !sd.is_null() {
             LocalFree(sd as HLOCAL);
@@ -549,13 +612,18 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     let mut len = 0usize;
+    // SAFETY: On success `ConvertSecurityDescriptorToStringSecurityDescriptorW` writes a
+    // NUL-terminated UTF-16 string at `sddl_ptr`.
     unsafe {
         while *sddl_ptr.add(len) != 0 {
             len += 1;
         }
     }
+    // SAFETY: `sddl_ptr` has at least `len` initialized `u16` elements before its trailing NUL.
     let slice = unsafe { std::slice::from_raw_parts(sddl_ptr, len) };
     let sddl = OsString::from_wide(slice).to_string_lossy().into_owned();
+    // SAFETY: `sddl_ptr` was allocated by `ConvertSecurityDescriptorToStringSecurityDescriptorW`
+    // and is freed once after copying.
     unsafe {
         LocalFree(sddl_ptr as HLOCAL);
     }
@@ -571,6 +639,8 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     let wide_sddl = to_wide(OsStr::new(sddl));
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut sd_size: u32 = 0;
+    // SAFETY: `wide_sddl` is a NUL-terminated UTF-16 string alive for this call; `sd` receives an
+    // owned self-relative descriptor freed via `LocalFree` below.
     let ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             wide_sddl.as_ptr(),
@@ -584,15 +654,20 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     }
     let mut control: u16 = 0;
     let mut revision: u32 = 0;
+    // SAFETY: `sd` is non-null from `ConvertStringSecurityDescriptorToSecurityDescriptorW` and
+    // `control`/`revision` are valid out-pointers.
     let _ = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
     let is_protected = (control & 0x1000) != 0 || sddl.starts_with("D:P");
 
     let mut dacl_present: i32 = 0;
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut dacl_defaulted: i32 = 0;
+    // SAFETY: `sd` is non-null and live, and `dacl` (when `dacl_present != 0`) points inside `sd`.
     let dacl_ok =
         unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
     if dacl_ok == 0 || dacl_present == 0 {
+        // SAFETY: `sd` is non-null from `ConvertStringSecurityDescriptorToSecurityDescriptorW` and
+        // is freed once here on failure.
         unsafe {
             LocalFree(sd as HLOCAL);
         }
@@ -604,6 +679,7 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     // Windows re-computes inherited ACEs cleanly from the parent without duplicating them.
     if !is_protected && !dacl.is_null() {
         let mut acl_info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` is a valid non-null ACL inside live `sd`, and `acl_info` has `size_of::<ACL_SIZE_INFORMATION>()` writable bytes.
         let info_ok = unsafe {
             GetAclInformation(
                 dacl,
@@ -615,9 +691,12 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
         if info_ok != 0 {
             for idx in (0..acl_info.AceCount).rev() {
                 let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: `dacl` is live inside `sd` and `idx < acl_info.AceCount` (iterating downward prevents index shift).
                 if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
+                    // SAFETY: `GetAce` returned a valid non-null ACE header inside `dacl`.
                     let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
                     if (header.AceFlags as u32 & INHERITED_ACE) != 0 {
+                        // SAFETY: `dacl` is a valid mutable ACL inside `sd` and `idx` is within bounds.
                         unsafe {
                             let _ = DeleteAce(dacl, idx);
                         }
@@ -634,6 +713,7 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
             UNPROTECTED_DACL_SECURITY_INFORMATION
         };
     let wide_path = to_wide(path.as_os_str());
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 and `dacl` (if non-null) stays live inside `sd`.
     let set_rc = unsafe {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -645,6 +725,7 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
             std::ptr::null(),
         )
     };
+    // SAFETY: `sd` is no longer borrowed by `dacl` after `SetNamedSecurityInfoW` and is freed once here.
     unsafe {
         LocalFree(sd as HLOCAL);
     }
@@ -658,6 +739,8 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     if get_path_dacl_sddl(path).ok().as_deref() != Some(sddl) {
         let mut raw_sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let mut raw_size: u32 = 0;
+        // SAFETY: `wide_sddl` is a live NUL-terminated UTF-16 buffer; `raw_sd` receives a `LocalAlloc`
+        // security descriptor freed below.
         let raw_ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 wide_sddl.as_ptr(),
@@ -667,6 +750,8 @@ pub fn restore_path_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
             )
         };
         if raw_ok != 0 && !raw_sd.is_null() {
+            // SAFETY: `wide_path` is live NUL-terminated UTF-16 and `raw_sd` is a valid security
+            // descriptor freed once via `LocalFree` after `SetFileSecurityW` returns.
             unsafe {
                 let _ = SetFileSecurityW(wide_path.as_ptr(), sec_info, raw_sd);
                 LocalFree(raw_sd as HLOCAL);
@@ -685,6 +770,8 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
     let wide_path = to_wide(path.as_os_str());
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call; `dacl` points into `sd`,
+    // which is freed via `LocalFree` below.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -699,6 +786,7 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
     };
     if rc != ERROR_SUCCESS {
         if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -707,6 +795,7 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
     }
     if dacl.is_null() {
         if !sd.is_null() {
+            // SAFETY: `sd` is freed once here before returning early.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
@@ -715,6 +804,7 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
     }
 
     let mut acl_info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: `dacl` is a non-null ACL inside live `sd`, and `acl_info` has `size_of::<ACL_SIZE_INFORMATION>()` writable bytes.
     let ok = unsafe {
         GetAclInformation(
             dacl,
@@ -727,13 +817,18 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
     if ok != 0 {
         for idx in (0..acl_info.AceCount).rev() {
             let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `dacl` is live inside `sd` and `idx < acl_info.AceCount` (iterating downward prevents index shift).
             if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
+                // SAFETY: `GetAce` returned a non-null DWORD-aligned `ACE_HEADER` inside `dacl`.
                 let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
                 let ace_type = header.AceType as u32;
                 if ace_type == ACCESS_ALLOWED_ACE_TYPE || ace_type == ACCESS_DENIED_ACE_TYPE {
+                    // SAFETY: Allow/deny ACEs share the `ACCESS_ALLOWED_ACE` header+SID prefix inside `dacl`.
                     let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
                     let ace_sid = (&ace.SidStart as *const u32) as PSID;
+                    // SAFETY: `ace_sid` is inside live `dacl` and callers pass a valid `target_sid` (`OwnedSid`).
                     if unsafe { EqualSid(ace_sid, target_sid) } != 0
+                        // SAFETY: `dacl` is a valid mutable ACL inside `sd` and `idx < acl_info.AceCount`.
                         && unsafe { DeleteAce(dacl, idx) } != 0
                     {
                         removed_any = true;
@@ -745,6 +840,7 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
 
     let mut set_rc = ERROR_SUCCESS;
     if removed_any {
+        // SAFETY: `wide_path` is NUL-terminated UTF-16 and `dacl` remains valid inside still-live `sd`.
         set_rc = unsafe {
             SetNamedSecurityInfoW(
                 wide_path.as_ptr(),
@@ -758,6 +854,7 @@ pub(super) fn remove_sid_aces_from_path(path: &Path, target_sid: PSID) -> io::Re
         };
     }
     if !sd.is_null() {
+        // SAFETY: `sd` is no longer needed after updating the DACL and is freed once here.
         unsafe {
             LocalFree(sd as HLOCAL);
         }
