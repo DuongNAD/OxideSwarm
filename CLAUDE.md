@@ -13,7 +13,7 @@ The Cargo workspace has no root package, and **package names differ from directo
 | Directory | Package (`-p`) | Notes |
 |---|---|---|
 | `crates/core` | `rusty_grid_core` | wire protocol, tasks, capabilities, discovery, workflow modes, `cluster_auth` (secret handshake), `placement` (task constraints, worker tags), `blob` / `blob_transfer` (content-addressed input and output files) |
-| `crates/master` | `rusty_grid_master` | features `p2p`, `dashboard` (both default), `otel` (opt-in OTLP/HTTP JSON trace export; `rusty_grid_cli` forwards it) |
+| `crates/master` | `rusty_grid_master` | features `p2p`, `dashboard` (both default), `otel` (opt-in OTLP/HTTP JSON trace export; `rusty_grid_cli` forwards it), `fuzzing` (off by default; only the `fuzz/` crate turns it on, for the in-memory journal and snapshot readers of `store.rs`) |
 | `crates/worker` | `rusty_grid_worker` | features `p2p` (default), `gpu-wgpu` (opt-in; `rusty_grid_cli` forwards it: `cargo build --release --bin oxideswarm --features gpu-wgpu` is the GPU-capable worker), `3d` (opt-in; compiles `gen3d` and `autorig`; `rusty_grid_cli`, `rusty_grid_master` and `agent_mesh` forward it) |
 | `crates/cli` | `rusty_grid_cli` | bins `oxideswarm`, `rusty-grid` (identical alias), `ox-mode`; modules `connect` (client plumbing), `blobs` (`submit --input/--output` files), `secret_cmd` (secrets), `join` (join token: `secret join-token` and `join`, design 0048), `doctor` (cluster check), `mcp` (MCP stdio server) |
 | `crates/android_bridge` | `rusty_grid_android_bridge` | cdylib `liboxideworker.so` + rlib |

@@ -247,6 +247,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented |  | 315 |
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  | 318 |
 | TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
+| TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -333,7 +334,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-6 | Distributed directory of offers over iroh | P3 | L | NET-2 |  | Planned | Out | (design 0054) |
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | Out | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
-| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Partial | In | (design 0058) |
+| LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | In | (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
@@ -361,6 +362,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
+| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Partial | In | 326, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | Out |  |
@@ -1014,55 +1016,6 @@ since 2026-11-17. The four items below do not depend
 on each other and can run in parallel. None changes the wire format, a CLI flag or a default, so
 none needs a design record of its own.
 
-### LV-1: Fuzz targets for the parsers of untrusted bytes (first targets)
-
-- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. The repository has no `fuzz/` directory
-  and no property-testing dependency. Bytes from another machine reach these parsers, the first two
-  before authentication completes: the frame reader and format dispatch of `MessageTransport`
-  (`crates/core/src/protocol.rs`: `recv_raw_frame_max`, `recv_msg_with_codec_max`, frames up to
-  `MAX_FRAME_SIZE`, 64 MiB), the handshake frames (`crates/core/src/cluster_auth.rs`,
-  `crates/core/src/noise_auth.rs`), and `TreeManifest::decode` (`crates/core/src/blob.rs`). The
-  `audit` job of CI reports `bincode` 1.x as unmaintained.
-- **Problem:** Nothing has fed these parsers malformed input at scale. A panic or an unbounded
-  allocation in one of them is a remote denial of service, and before the handshake it needs no
-  secret.
-- **Do:**
-  1. Add a `fuzz/` crate for `cargo fuzz` (libFuzzer), outside the workspace members (add it to
-     `exclude` in the root `Cargo.toml`), with a `Cargo.lock` of its own. List its dependencies for
-     the owner in the pull request.
-  2. Write three targets:
-     - `inbound_frame`: the input is a byte stream that a `MessageTransport` over an in-memory
-       stream reads as `InboundMessage`, once per `WireCodec`, with a small frame limit. The frame
-       reader, the format byte dispatch and both decoders are then in the path.
-     - `server_handshake`: the input is what a peer sends first. Run the server side of the
-       handshake against it over an in-memory stream, with a fixed test secret and a fixed test
-       key.
-     - `tree_manifest`: the input goes to `TreeManifest::decode`.
-
-     If a parser is only reachable through private functions, expose it behind a Cargo feature
-     `fuzzing` of `rusty_grid_core` that is off by default. Do not change a normal build.
-  3. Seed each target's corpus with valid encodings, for example the messages that
-     `crates/core/src/wire_layout_tests.rs` builds.
-  4. Run each target for one hour locally. Record the date, the machine, the number of executions
-     and every finding in `fuzz/README.md`. This is spike R12 of design 0058.
-  5. For each finding follow rule 4: a failing test first, then the fix. A finding that a remote
-     peer can trigger goes through the private route of `docs/SECURITY.md` before any public pull
-     request.
-  6. Add a CI job on Linux that builds the targets and runs each for 60 seconds on pull requests,
-     and for 10 minutes each on the weekly schedule. The job pins a dated nightly toolchain,
-     because `cargo fuzz` needs one. Keep crash inputs as files under `fuzz/regressions/`, and run
-     them in the same job.
-- **Done when:** The three targets build and run in CI. `fuzz/README.md` holds the one-hour record.
-  A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
-  design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
-  the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
-- **Status:** Partial (2026-11-17, pull request 270). Built: `fuzz/` with the targets `inbound_frame`,
-  `server_handshake` (v2 and v3) and `tree_manifest`, seed corpora, `fuzz/regressions/`, `fuzz/README.md`
-  with the one-hour record (no finding; 24.5 million, 7.7 million and 34.6 million executions) and the
-  `fuzz` CI job on a pinned nightly. Every function the targets call is public, so no `fuzzing`
-  feature was needed. The local runs used a stable toolchain with `-s none`. Open: the `fuzz` job has
-  not run yet on GitHub (Done when: the three targets build and run in CI); Implemented once it is green.
-
 ### LV-5: Supply chain: dependency policy, release provenance, outside checklist
 
 - **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. CI runs `cargo audit`
@@ -1154,6 +1107,48 @@ none needs a design record of its own.
 - **Done when:** The two files and the `README.md` section exist and are linked, the links test of
   `tests/test_m1_challenger_hygiene.py` passes, and the status log records what the repository
   page shows as the licence after step 3.
+
+### LV-18: Fuzz targets for the remaining parsers of untrusted bytes
+
+- **Evidence:** Read on 2026-11-18 at `master` `b486137`. `fuzz/` (LV-1, pull request 270) has three
+  targets (`inbound_frame`, `server_handshake`, `tree_manifest`), and `fuzz/README.md` lists the later
+  targets of design 0058 LV-1 as open: the encrypted record reader (`AeadReaderSession::decrypt_frame`
+  in `crates/core/src/protocol/codec.rs`), the join token and the invite (`JoinToken::decode` in
+  `crates/cli/src/join.rs`, `InviteToken::decode` in `crates/cli/src/members_cmd.rs`, the
+  `invite.oxs` file in `crates/cli/src/usb_kit.rs`), the journal reader of the master state store
+  (`read_journal` and `read_snapshot` in `crates/master/src/store.rs`, both private) and the JSON-RPC
+  reader of `oxideswarm mcp` (inline in `run_stdio_server`, `crates/cli/src/mcp.rs`). Exit check E4
+  of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) asks for a fuzz
+  target in CI for every parser of untrusted bytes.
+- **Problem:** These parsers read bytes that another machine or person wrote: every frame after the
+  handshake, a pasted token, a file on a USB stick, the state directory after a crash. Nothing has
+  fed them malformed input at scale. A Poly1305 tag guards the record layer and BLAKE3 hashes guard
+  the journal and the snapshot, so random bytes never reach the decoders behind them.
+- **Do:**
+  1. `aead_record`: the record layer with keys derived from a fixed test session key: a byte stream
+     of a peer without the key, and records sealed by the client side that the fuzzer keeps,
+     damages, drops, replays or cuts. The reader must accept exactly the intact records in order
+     before the first bad one, return each plaintext unchanged, and refuse everything after it.
+  2. `join_invite`: the text piped into `oxideswarm join`, join token and invite payloads with a valid
+     tag or checksum added by the target, and `invite.oxs` files (header, and decryption with a test
+     passphrase when the Argon2id cost is small). Decode, encode, decode gives the same value.
+  3. `store_journal`: the journal and snapshot readers on bytes in memory, raw or with the target
+     writing headers, lengths and hashes around the fuzzer's payloads. The readers are private, so
+     `rusty_grid_master` gets a Cargo feature `fuzzing`, off by default, with `store::fuzzing`;
+     `read_journal` and `read_snapshot` are split into a file read and a parse, with no change in
+     behaviour. The valid prefix must read again without a torn tail, and accepted records and
+     snapshots written again must read back equal.
+  4. The JSON-RPC reader of `oxideswarm mcp`, through a public function that takes one line.
+  5. Seeds, regression inputs, the three targets in the `fuzz` CI matrix (60 s on pull requests,
+     10 minutes weekly), a 5-minute local run of each recorded in `fuzz/README.md`.
+- **Done when:** The four targets build and run in the `fuzz` CI job, and `fuzz/README.md` holds a
+  local run of each with its findings.
+- **Status:** Partial (2026-11-18, pull request 326). Built: `aead_record`, `join_invite` and
+  `store_journal` (steps 1 to 3 and 5), with no finding in 5 minutes each. Open: step 4. No public
+  function takes one line of the MCP reader, and MAINT-2 is splitting `mcp.rs` into submodules now;
+  the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
+  JsonRpcResponse>` cut out of `run_stdio_server`. Also open until it runs: the `fuzz` CI job of the
+  three new targets.
 
 ## Phase 11: findings of the audit of 2026-11-15
 
@@ -2238,3 +2233,5 @@ Add one dated line per finished item, newest last.
   JOIN-1, SCHED-4, LV-10, PROTO-5, LAUNCH-1 to LAUNCH-5, APP-4, APP-5 and BENCH-3 to BENCH-7. They keep their
   priority. PROTO-1's pull request cell corrected to 262. Counted from the rows: 202 items, 127 Implemented,
   16 Partial and 59 Planned; 30 open items In, 45 Out.
+- 2026-11-18: LV-1 Implemented (its fuzz CI job is green on `master`), its text moved to the archive;
+  LV-18 Partial (pull request 326, the MCP reader is open); TEST-53 Implemented (pull request 327).

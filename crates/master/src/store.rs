@@ -1006,7 +1006,12 @@ fn read_snapshot(path: &Path) -> GridResult<Option<LoadedSnapshot>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(storage_io(path, "open", e)),
     }
-    let header = parse_header(path, SNAPSHOT_MAGIC, &bytes)?;
+    parse_snapshot(path, &bytes).map(Some)
+}
+
+/// Verifies and decodes the bytes of `snapshot.bin`; `path` only names the file in errors.
+fn parse_snapshot(path: &Path, bytes: &[u8]) -> GridResult<LoadedSnapshot> {
+    let header = parse_header(path, SNAPSHOT_MAGIC, bytes)?;
     let corrupt = |why: &str| GridError::Storage(format!("{} is corrupt: {why}", path.display()));
     let body = &bytes[HEADER_LEN..];
     if body.len() < SNAPSHOT_FRAME_HEADER_LEN {
@@ -1025,11 +1030,11 @@ fn read_snapshot(path: &Path) -> GridResult<Option<LoadedSnapshot>> {
     }
     let image = serde_json::from_slice(payload)
         .map_err(|e| corrupt(&format!("cannot decode the snapshot: {e}")))?;
-    Ok(Some(LoadedSnapshot {
+    Ok(LoadedSnapshot {
         image,
         version: header.protocol,
         generation: header.generation,
-    }))
+    })
 }
 
 struct LoadedJournal {
@@ -1104,6 +1109,12 @@ fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJourn
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(storage_io(path, "open", e)),
     }
+    parse_journal(path, &bytes, snapshot_generation)
+}
+
+/// Reads the bytes of `journal.bin` (empty when the file does not exist) next to a snapshot of
+/// generation `snapshot_generation`; `path` only names the file in errors and warnings.
+fn parse_journal(path: &Path, bytes: &[u8], snapshot_generation: u64) -> GridResult<LoadedJournal> {
     let mut out = LoadedJournal {
         records: Vec::new(),
         valid_len: HEADER_LEN as u64,
@@ -1130,7 +1141,7 @@ fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJourn
         out.reset = true;
         return Ok(out);
     }
-    let header = parse_header(path, JOURNAL_MAGIC, &bytes)?;
+    let header = parse_header(path, JOURNAL_MAGIC, bytes)?;
     if header.generation < snapshot_generation {
         warn!(
             "task store: {} (generation {}) predates the snapshot (generation {}); a compaction \
@@ -1203,7 +1214,7 @@ fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJourn
             }
         };
         if let Some((why, scan_from)) = bad {
-            let detail = match valid_frame_follows(&bytes, scan_from) {
+            let detail = match valid_frame_follows(bytes, scan_from) {
                 Scan::Nothing => None,
                 Scan::Found(later) => Some(format!("a valid frame follows at offset {later}")),
                 Scan::TooCostly => Some("the damaged tail is too large to classify".to_string()),
@@ -1238,6 +1249,9 @@ fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJourn
     }
     Ok(out)
 }
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 
 #[cfg(test)]
 mod tests {
