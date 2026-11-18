@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- The worker test of an oversized task result next to a running task (`test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish`) waits up to 60 s, by condition, for the connection, the Register and both results (was 5 s for both results), with the worker's dead-peer timeout and both task timeouts set past that bound; in the `test` profile the worker hashes the 70 MiB result with BLAKE3 for about 1.3 s on the test's single runtime thread, which a loaded machine stretched past 5 s. A failure now names what it waited for and the results so far (`TEST-53`).
+
 ## [0.4.2] - 2026-11-18
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` and `0.4.1`. It adds `submit --verify` (run a task again on other workers and compare its outputs, `VERIFY-1`), which by default compares only workers with the same operating system and CPU architecture (`VERIFY-2`). It fixes a worker that kept tasks while its sandbox base was unusable (`BUG-25`), the Agent Mesh hub disconnecting a healthy sender for the hub's own replies (`TEST-27`), two worker recovery races (`TEST-23`, partial), and the dev cluster binding the default discovery port (`BUG-26`), and makes eleven flaky tests deterministic (`TEST-42` to `TEST-52`).

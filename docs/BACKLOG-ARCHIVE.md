@@ -2170,6 +2170,47 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   ports), `crates/master/src/server/tests.rs` (the discovery UDP port), `tests/cluster_auth_e2e.rs` (the
   discovery UDP port) and `crates/worker/src/client/tests.rs` (the standby portal port).
 
+### TEST-53: Wait by condition in the oversized task result worker test
+
+- **Evidence:** `client::tests::test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish`
+  (`crates/worker/src/client/tests.rs`) failed once on the owner's Apple Silicon Mac on 2026-11-18, in a full
+  `cargo test --workspace --lib` while other builds ran, with `both tasks finish on the same session:
+  Elapsed(())`: its 5 s window for both task results ran out. It passed alone and on two reruns.
+- **Problem:** The test gave the worker 5 s to connect and then 5 s in all for both results. Most of that window is
+  CPU work on the test's single runtime thread: the worker's task runner computes
+  `master_features::result_ack_token` for every result, which hashes the oversized task's whole 70 MiB
+  `asset_bytes` with BLAKE3, unoptimized in the `test` profile. A `sample` of one run put 1,341 samples (about
+  1.3 s) in `result_ack_token`, during which the session loop, the lane writer and the sibling task wait; both
+  results then arrive within a millisecond of each other. A loaded machine stretches that past 5 s. The order of
+  the two results does not depend on the clock: the session loop handles the two assignments one after the other,
+  so the oversized task's 20 ms timer is set before the sibling's 200 ms one and its result enters the data lane
+  first. A wall-clock window in the test, not an ordering defect.
+- **Do:** Wait by condition (60 s bound) for the connection, the Register and both results; set the worker's
+  dead-peer timeout and both task timeouts past that bound, because the test master is silent after the
+  assignments and the default 20 s watchdog or the 10 s task timeouts would fail a slow run with another message;
+  on failure print what was waited for and the state reached; keep every assertion.
+- **Done when:** The test passes 100 runs in a row next to 6 spinning processes.
+- **Implemented (2026-11-18, pull request PRNUM):** `WAIT` (60 s) bounds the connection, the Register, both results
+  and the worker's stop at the end (so the sandbox base outlives the worker, TEST-33); every wait ends as soon as
+  its condition holds. The worker runs with `with_dead_peer_timeout(WAIT * 5)` and both tasks with a 300 s
+  timeout. When the results do not arrive, the panic says why (the bound ran out, the worker disconnected, or a
+  protocol error), after how long, which results arrived with their exit code and error, and which other messages
+  came; the test prints the times. The assertions are unchanged: the oversized task fails with `exceeds` and
+  `dropped asset_bytes` and keeps its engine stdout and stderr, the sibling exits 0, both on the one session in
+  that order, and the worker never disconnects. On an Apple Silicon Mac (10 cores) next to 6 spinning `yes`
+  processes: the old test passed 100 of 100 (1.45 s to 3.49 s per run), so the failure was not reproduced
+  locally; the new test passed 100 of 100 (1.42 s to 2.51 s per run, both results 0.96 s to 1.85 s after the
+  assignments). Not changed: `result_ack_token` is computed for every result, also when the session has no
+  resume window and the token is not used. Other tests of the file with a window of 5 s or less that decides the
+  verdict, on other helpers, were not changed: the lane writer tests (5 s and 2 s per frame), `wait_running` and
+  the cancel and leftover sandbox tests (5 s, 2 s), `messages_after_a_battery_change` (5 s, and a collection window of two
+  `MOBILE_TELEMETRY_CHECK_INTERVAL`s), the four `test_run_refuses_*` tests (5 s), the portal tests
+  (`portal_get` 5 s, a 1 s read, and `started.elapsed() < 2 s` in
+  `test_portal_request_reader_gives_up_on_a_silent_client`),
+  `test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks` (5 s, 5 s, 2 s),
+  `test_shutdown_requested_resolves_on_flag_or_dropped_sender_only` (2 s) and the Windows-only junk executable
+  test (5 s).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
