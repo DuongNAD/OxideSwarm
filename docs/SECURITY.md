@@ -4,6 +4,10 @@ This page says what OxideSwarm protects, what it deliberately does not, which po
 handle the shared cluster secret. It describes the code as it is in this repository; anything planned is
 marked "not implemented".
 
+To check that a release archive is intact and was built by this repository's workflow, and from which commit,
+compare it with `SHA256SUMS` and run `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm`
+([README, Install](../README.md#install)).
+
 ## 1. In one paragraph
 
 A master hands arbitrary commands (shell scripts, programs, compile jobs) to workers, and workers run them
@@ -107,6 +111,15 @@ Open the cluster port on your firewall only for the networks that should reach i
   and client, restart the master and the workers (a running process keeps the secret it started with; there is
   no hot reload). From that moment the old secret is useless and so is the dashboard token derived from it.
   Do this whenever a machine that had the secret is lost, sold or suspected of compromise.
+* **Enrolled machine.** `oxideswarm members revoke <ID>` (an admin) removes the member from `members.json`
+  and records its key as revoked, so its next OXS-AUTH v3 handshake is refused. At the same moment the master
+  closes every connection the member holds, on every lane: its worker sessions (TCP, or both QUIC lanes) and
+  its client connections over TCP or a P2P `STREAM_CLIENT` stream (CLI commands such as a waiting
+  `submit --wait`, blob connections, MCP). The tasks running on its workers go back to the queue at once,
+  without the session-resume hold and without their checkpoints. Tasks the member submitted keep running
+  (cancelling them is Planned, design 0051 D5 step 2). Under `--auth both` a revoked machine that also
+  holds the cluster secret can still connect over v2: rotate the secret as above or run the master with
+  `--auth members`.
 * **P2P identity.** The ticket of a P2P master is stable because `~/.oxideswarm/master_key.bin` persists. To
   invalidate every ticket ever shown, delete that file (or start with `--ephemeral-key`) and restart; the next
   start issues a new identity and ticket. The cluster secret is still what actually protects the master.

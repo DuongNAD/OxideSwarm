@@ -1988,6 +1988,7 @@ fn check_wire_layout_against_git_baseline(current_text: &str) {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: spawns a process")]
 fn wire_layout_file_bumps_version_when_body_differs_from_origin_master() {
     // In update mode (`UPDATE_WIRE_LAYOUT=1`), `bincode_encoding_matches_the_recorded_wire_layout`
     // rewrites `tests/data/wire_layout.txt` and then runs `check_wire_layout_against_git_baseline`

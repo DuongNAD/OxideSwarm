@@ -786,7 +786,8 @@ mod win {
         }
         // Copy into an 8-byte-aligned stack buffer (maximum valid SID is 68 bytes <= 72 bytes).
         let mut aligned = [0u64; 9];
-        // SAFETY: `aligned` is 72 bytes and `sid_len <= 68`.
+        // SAFETY: `aligned` is 72 bytes and `sid_len <= 68`; the source range
+        // `offset..offset + sid_len` lies inside `ace_bytes` (checked above).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 ace_bytes.as_ptr().add(offset),
@@ -797,6 +798,7 @@ mod win {
         let sid_ptr: PSID = aligned.as_mut_ptr().cast();
         // SAFETY: `sid_ptr` points to `sid_len` initialized bytes in `aligned`.
         if unsafe { IsValidSid(sid_ptr) } == 0
+            // SAFETY: `IsValidSid` accepted the SID at `sid_ptr`, inside the live `aligned`.
             || unsafe { GetLengthSid(sid_ptr) } as usize != sid_len
         {
             return Err(io::Error::new(
@@ -1921,8 +1923,12 @@ mod windows_tests {
         let mut acl_buf = vec![0u32; 256];
         let acl_ptr = acl_buf.as_mut_ptr().cast::<ACL>();
         let acl_bytes = (acl_buf.len() * 4) as u32;
+        // SAFETY: `acl_ptr` points to the live, DWORD-aligned 1024-byte `acl_buf`, and
+        // `acl_bytes` is exactly its size.
         assert_ne!(unsafe { InitializeAcl(acl_ptr, acl_bytes, 4) }, 0);
         assert_ne!(
+            // SAFETY: `acl_ptr` is the ACL just initialized in `acl_buf`; `all_raw` is a live
+            // buffer passed with its own length, which `AddAce` only reads.
             unsafe {
                 AddAce(
                     acl_ptr,
@@ -2005,8 +2011,12 @@ mod windows_tests {
 
         let mut aligned_acl = [0u32; 24]; // 96 bytes, DWORD-aligned for InitializeAcl / AddAce
         let aligned_ptr = aligned_acl.as_mut_ptr().cast::<ACL>();
+        // SAFETY: `aligned_ptr` points to the live, DWORD-aligned 96-byte `aligned_acl`, and 96
+        // is exactly its size.
         assert_ne!(unsafe { InitializeAcl(aligned_ptr, 96, 2) }, 0);
         assert_ne!(
+            // SAFETY: `aligned_ptr` is the ACL just initialized in `aligned_acl`; `two_aces` is a
+            // live buffer passed with its own length, which `AddAce` only reads.
             unsafe {
                 AddAce(
                     aligned_ptr,
@@ -2018,22 +2028,25 @@ mod windows_tests {
             },
             0
         );
-        // SAFETY: `aligned_ptr` points to the 96-byte `aligned_acl` initialized by `InitializeAcl`.
         assert_eq!(
+            // SAFETY: `aligned_ptr` points to the 96-byte `aligned_acl` initialized by
+            // `InitializeAcl`.
             unsafe { win::parse_dacl_aces(aligned_ptr) }.unwrap().len(),
             2
         );
 
         // Copy into a 1-byte-misaligned slice to verify unaligned `ACE_HEADER` reads + bounds checks.
         let mut unaligned_buf = [0u8; 128];
+        // SAFETY: `aligned_ptr` points to the 96 initialized bytes of `aligned_acl`, which is not
+        // written while this shared slice is in use (only by the `copy_from_slice` below).
         let aligned_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(aligned_ptr.cast::<u8>(), 96) };
         let acl_slice = &mut unaligned_buf[1..97];
         acl_slice.copy_from_slice(aligned_bytes);
         let unaligned_ptr = acl_slice.as_mut_ptr().cast::<ACL>();
         // 8-byte ACL header + two 20-byte ACEs = 48 bytes in use.
-        // SAFETY: `unaligned_ptr` points to the 96-byte `acl_slice` slice.
         assert_eq!(
+            // SAFETY: `unaligned_ptr` points to the 96-byte `acl_slice` slice.
             unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48) }
                 .unwrap()
                 .len(),
@@ -2044,8 +2057,9 @@ mod windows_tests {
         //    `AclBytesInUse` is 40 (`8 + 20 + 12`): `ace_size (24) <= bytes_in_use (40)` would
         //    pass a naive size-only check, whereas `off + ace_size = 28 + 24 = 52 > 40` catches it.
         acl_slice[30..32].copy_from_slice(&24u16.to_le_bytes());
-        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
+        let unaligned_ptr = acl_slice.as_mut_ptr().cast::<ACL>();
         assert!(
+            // SAFETY: `unaligned_ptr` was just re-derived from the 96-byte `acl_slice` slice after the write above.
             unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 40) }.is_err(),
             "ACE running past AclBytesInUse must be refused"
         );
@@ -2053,24 +2067,28 @@ mod windows_tests {
         // 2. Corrupt the second ACE's `AceSize` to 80 so `off + ace_size = 28 + 80 = 108 > AclSize (96)`
         //    on both the unaligned buffer and the aligned ACL passed to `parse_dacl_aces`.
         acl_slice[30..32].copy_from_slice(&80u16.to_le_bytes());
-        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
+        let unaligned_ptr = acl_slice.as_mut_ptr().cast::<ACL>();
         assert!(
+            // SAFETY: `unaligned_ptr` was just re-derived from the 96-byte `acl_slice` slice after the write above.
             unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 48) }.is_err(),
             "unaligned malformed ACL running past AclSize must be refused"
         );
+        // SAFETY: `aligned_ptr` points to the 96 bytes of `aligned_acl`, which nothing else
+        // accesses while this unique slice is in use; `aligned_bytes` is no longer used.
         let aligned_bytes_mut: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(aligned_ptr.cast::<u8>(), 96) };
         aligned_bytes_mut[30..32].copy_from_slice(&80u16.to_le_bytes());
-        // SAFETY: `aligned_ptr` points to 96 readable bytes (`(*aligned_ptr).AclSize == 96`).
         assert!(
+            // SAFETY: `aligned_ptr` points to 96 readable bytes (`(*aligned_ptr).AclSize == 96`).
             unsafe { win::parse_dacl_aces(aligned_ptr) }.is_err(),
             "malformed ACL running past AclSize must be refused without panicking"
         );
 
         // 3. `ACE_HEADER` itself extending past `AclBytesInUse` (`off = 28, bytes_in_use = 30`).
         acl_slice[30..32].copy_from_slice(&20u16.to_le_bytes());
-        // SAFETY: `unaligned_ptr` points to 96 readable bytes (`acl_size == 96`).
+        let unaligned_ptr = acl_slice.as_mut_ptr().cast::<ACL>();
         assert!(
+            // SAFETY: `unaligned_ptr` was just re-derived from the 96-byte `acl_slice` slice after the write above.
             unsafe { win::parse_dacl_aces_bounded(unaligned_ptr, 96, 2, 30) }.is_err(),
             "ACE header extending past AclBytesInUse must be refused"
         );

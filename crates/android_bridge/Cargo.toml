@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "JNI bridge that runs an OxideSwarm worker inside the Android app"
 
+[lints]
+workspace = true
+
 [lib]
 name = "oxideworker"
 crate-type = ["cdylib", "rlib"]

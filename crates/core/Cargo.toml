@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "Wire protocol, tasks, capabilities and discovery shared by every OxideSwarm component"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true, features = ["sync", "io-util", "macros", "process", "rt-multi-thread", "time", "net"] }
 tokio-util = { workspace = true, features = ["codec"] }

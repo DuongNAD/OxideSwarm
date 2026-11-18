@@ -1,0 +1,1 @@
+{"id":13,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"expect_workers":2,"skip_gpu":true,"skip_spread":true,"timeout_secs":30},"name":"doctor"}}

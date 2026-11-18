@@ -1,0 +1,49 @@
+# cargo-deny policy (LV-5, docs/BACKLOG.md). The CI job `cargo deny` runs, from the repository root,
+#   cargo deny --locked check licenses bans sources
+#   cargo deny --manifest-path fuzz/Cargo.toml --locked check licenses bans sources
+# (both read this file). Advisories stay with `cargo audit` (CI job `audit`). The workspace run
+# warns that the libfuzzer-sys exception below was not encountered: it is for the fuzz/ run.
+
+[graph]
+# Every optional feature (gpu-wgpu, 3d, otel, ...) and every target: the release ships gpu-wgpu
+# archives for Linux, macOS and Windows.
+all-features = true
+
+[licenses]
+# Exactly the licences that the dependency tree of 2026-11-18 needs: each one is the only choice
+# of at least one crate. A crate whose expression offers MIT or Apache-2.0 needs nothing more.
+# Adding a licence here is a decision for the owner.
+allow = [
+    "Apache-2.0",          # backon, sync_wrapper, wgpu's GL loaders, ...
+    "BSD-2-Clause",        # spez
+    "BSD-3-Clause",        # curve25519-dalek, ed25519-dalek, sha1_smol, matchit
+    "CDLA-Permissive-2.0", # webpki-roots, webpki-root-certs (Mozilla's root certificates)
+    "ISC",                 # ring, rustls-webpki, untrusted, libloading
+    "MIT",
+    "MPL-2.0",             # attohttpc
+    "Unicode-3.0",         # icu_*, unicode-ident
+    "Unlicense",           # async_io_stream, pharos, ws_stream_wasm
+    "Zlib",                # foldhash, slotmap
+]
+confidence-threshold = 0.93
+exceptions = [
+    # Only in the fuzz/ workspace: libFuzzer's own licence, "(MIT OR Apache-2.0) AND NCSA".
+    { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]
+
+[licenses.private]
+# The unpublished fuzz crate (`publish = false`) has no licence field.
+ignore = true
+
+[bans]
+# Nothing is banned. Duplicate versions are reported, not refused.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+# crates.io only. Cargo.lock (and fuzz/Cargo.lock) has no git source.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

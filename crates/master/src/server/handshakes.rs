@@ -32,6 +32,7 @@ use rusty_grid_core::{
 };
 
 use crate::blob_store::BlobStore;
+use crate::member_connections::MemberConnections;
 use crate::queue::TaskQueue;
 use crate::registry::WorkerRegistry;
 
@@ -47,6 +48,9 @@ pub(crate) struct MasterAuthContext {
     pub local_node_key_path: Option<PathBuf>,
     pub ephemeral_without_state_dir: bool,
     pub members: Arc<MemberStore>,
+    /// Live connections of each v3 member, closed together when the member is revoked (design
+    /// 0051 D5). One registry per master, shared by its TCP and QUIC accept loops.
+    pub member_connections: MemberConnections,
     pub p2p_ticket: Option<String>,
     pub enroll_confirm_timeout: Duration,
 }
@@ -60,6 +64,7 @@ impl Default for MasterAuthContext {
             local_node_key_path: None,
             ephemeral_without_state_dir: false,
             members: Arc::default(),
+            member_connections: MemberConnections::default(),
             p2p_ticket: None,
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
         }

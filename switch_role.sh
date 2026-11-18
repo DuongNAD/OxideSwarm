@@ -112,6 +112,24 @@ pid_is_ours() {
     return 1
 }
 
+# Right after start_tracked, the new process is a fork of this launcher until it has exec'd the
+# binary, and `ps` shows this script's own command line for it: pid_is_ours is false although
+# nothing failed (TEST-35). Waits up to $2 checks 0.2 s apart for the process in PID file $1 to run
+# one of our binaries; fails at once when the process is gone.
+wait_until_ours() {
+    local pidfile="$1" tries="$2" pid i
+    pid="$(read_pid "$pidfile")"
+    [[ -n "$pid" ]] || return 1
+    for i in $(seq 1 "$tries"); do
+        kill -0 "$pid" 2>/dev/null || return 1
+        if pid_is_ours "$pidfile"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 stop_tracked() {
     local label="$1" pidfile="$2" pid i
     if pid_is_ours "$pidfile"; then
@@ -277,13 +295,20 @@ do_master() {
     echo "[OK] Starting OxideSwarm Master: $(basename "$BIN") ${args[*]}"
     start_tracked "$MASTER_PID_FILE" "$MASTER_LOG" "$BIN" "${args[@]}"
 
-    local i started=false
+    local i started=false master_pid
+    master_pid="$(read_pid "$MASTER_PID_FILE")"
     for i in $(seq 1 50); do
-        if ! pid_is_ours "$MASTER_PID_FILE"; then
+        # Only a process that is gone ends the wait early: until the child has exec'd the binary,
+        # its command line is still this launcher's (see wait_until_ours).
+        if [[ -z "$master_pid" ]] || ! kill -0 "$master_pid" 2>/dev/null; then
             break
         fi
         if grep -q "RustyGrid Master started" "$MASTER_LOG" 2>/dev/null; then
-            started=true
+            # The binary wrote that line, so it has exec'd. A PID that is not ours now names
+            # another process: the master has exited and its number was reused.
+            if pid_is_ours "$MASTER_PID_FILE"; then
+                started=true
+            fi
             break
         fi
         sleep 0.2
@@ -304,7 +329,7 @@ do_master() {
         warn_config_ticket
         start_tracked "$WORKER_PID_FILE" "$WORKER_LOG" "$BIN" "${wargs[@]}"
         sleep 1
-        if ! pid_is_ours "$WORKER_PID_FILE"; then
+        if ! wait_until_ours "$WORKER_PID_FILE" 50; then
             worker_note="FAILED to start, see ${WORKER_LOG}"
             show_log_tail "$WORKER_LOG"
         elif wait_registered "$WORKER_LOG" 10; then
@@ -399,7 +424,7 @@ do_worker() {
     start_tracked "$WORKER_PID_FILE" "$WORKER_LOG" "$BIN" "${args[@]}"
     sleep 2
 
-    if ! pid_is_ours "$WORKER_PID_FILE"; then
+    if ! wait_until_ours "$WORKER_PID_FILE" 50; then
         echo "[ERROR] Worker exited immediately after startup (see log tail below)." >&2
         echo "        If the log reports a missing cluster secret: copy ~/.oxideswarm/cluster.secret from the Master" >&2
         echo "        (scp or USB), or pass --secret-file PATH. Only pass '-- --insecure' on a network you control." >&2

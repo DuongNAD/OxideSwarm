@@ -61,6 +61,8 @@ fn test_zero_copy_bytes_wrapper_ergonomics() {
     // 4. Zero-copy slice points to the same underlying buffer memory
     let slice = b.slice(6..15);
     assert_eq!(&*slice, "Zero-Copy");
+    // SAFETY: `raw` is a 22-byte static slice, so `raw.as_ptr() + 6` stays within its allocation;
+    // the resulting pointer is only compared.
     assert_eq!(slice.as_ptr(), unsafe { raw.as_ptr().add(6) });
 
     // 5. Zero-copy conversion to and from bytes::Bytes

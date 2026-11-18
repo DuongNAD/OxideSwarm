@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "OxideSwarm command line: master, worker, submit, doctor and MCP server"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 
@@ -209,6 +212,10 @@ path = "../../tests/enroll_v3_e2e.rs"
 [[test]]
 name = "cli_enroll_e2e"
 path = "../../tests/cli_enroll_e2e.rs"
+
+[[test]]
+name = "cli_revoke_e2e"
+path = "../../tests/cli_revoke_e2e.rs"
 
 [[test]]
 name = "cli_pair_e2e"

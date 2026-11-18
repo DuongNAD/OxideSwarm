@@ -89,6 +89,18 @@ fn buffered_result_bytes(result: &TaskResult) -> usize {
         )
 }
 
+/// The acknowledgement token of `result` when the session keeps finished results for resume
+/// (`resume_enabled`), else `None`. The token (`token`: `master_features::result_ack_token`
+/// outside tests) hashes the whole result, `asset_bytes` included, and only keys the resume
+/// outbox, so a session without a resume window never computes it (BUG-27).
+pub(super) fn resume_ack_token(
+    resume_enabled: bool,
+    result: &TaskResult,
+    token: impl FnOnce(&TaskResult) -> u64,
+) -> Option<u64> {
+    resume_enabled.then(|| token(result))
+}
+
 /// Completed task result buffered in the worker's session-resume outbox until acknowledged by the
 /// Master (`MasterMessage::CancelTask { reason: Some("oxs:result-ack:<token>") }`) or until the
 /// resume window expires. Holds `output_pin` (`Arc<CachePin>`) so output blobs stay pinned in
@@ -104,13 +116,15 @@ pub(super) struct BufferedTaskResult {
 }
 
 impl BufferedTaskResult {
+    /// `ack_token` is `master_features::result_ack_token(&result)`, computed by the caller
+    /// (once, and not under the outbox lock).
     pub(super) fn new(
         task: Task,
         result: TaskResult,
+        ack_token: u64,
         output_pin: Option<Arc<crate::blob_cache::CachePin>>,
         used_blobs: bool,
     ) -> Self {
-        let ack_token = master_features::result_ack_token(&result);
         let byte_size = buffered_result_bytes(&result);
         Self {
             task,
@@ -760,7 +774,9 @@ impl WorkerClient {
             let resume_enabled = grace_enabled
                 && (current_session_hold_secs.load(Ordering::Acquire) > 0
                     || resume_window_active.load(Ordering::Acquire));
-            let mut buffered_token = master_features::result_ack_token(&result);
+            // `Some` exactly when `resume_enabled`: only the resume outbox uses the token.
+            let mut buffered_token =
+                resume_ack_token(resume_enabled, &result, master_features::result_ack_token);
 
             if cancelled_reason.is_none() && !suppress.load(Ordering::Acquire) {
                 let (live_tx, evicted_used_blobs) = {
@@ -768,15 +784,15 @@ impl WorkerClient {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let tx = current_tx(&session_data_tx, &outbound_tx);
-                    let evicted = if resume_enabled {
-                        outbox.push_result(BufferedTaskResult::new(
+                    let evicted = match buffered_token {
+                        Some(ack_token) => outbox.push_result(BufferedTaskResult::new(
                             task.clone(),
                             result.clone(),
+                            ack_token,
                             output_pin.clone(),
                             used_blobs,
-                        ))
-                    } else {
-                        false
+                        )),
+                        None => false,
                     };
                     (tx, evicted)
                 };
@@ -819,11 +835,15 @@ impl WorkerClient {
                     let session_ended = current_blob_client
                         .as_ref()
                         .is_some_and(|client| client.is_closed());
-                    if resume_enabled && cancelled_reason.is_none() && !session_ended {
-                        buffered_token = pending_resume_outbox
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .update_result(task.id, buffered_token, result.clone());
+                    if cancelled_reason.is_none() && !session_ended {
+                        if let Some(prev_token) = buffered_token {
+                            buffered_token = Some(
+                                pending_resume_outbox
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .update_result(task.id, prev_token, result.clone()),
+                            );
+                        }
                     }
                 }
 
@@ -843,11 +863,13 @@ impl WorkerClient {
                 }
             }
 
-            if (cancelled_reason.is_some() || suppress.load(Ordering::Acquire)) && resume_enabled {
-                pending_resume_outbox
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .ack_result(task.id, Some(buffered_token));
+            if let Some(token) = buffered_token {
+                if cancelled_reason.is_some() || suppress.load(Ordering::Acquire) {
+                    pending_resume_outbox
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .ack_result(task.id, Some(token));
+                }
             }
 
             drop(output_pin);

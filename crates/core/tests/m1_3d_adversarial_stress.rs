@@ -32,6 +32,9 @@ fn get_current_process_handle_count() -> u32 {
         fn GetProcessHandleCount(hProcess: *mut std::ffi::c_void, pdwHandleCount: *mut u32) -> i32;
     }
     let mut count: u32 = 0;
+    // SAFETY: the `extern "system"` declarations above match `kernel32`'s `GetCurrentProcess` and
+    // `GetProcessHandleCount`; `GetCurrentProcess` returns a pseudo-handle valid for this process
+    // that needs no `CloseHandle`, and `count` is a live writable `u32`.
     unsafe {
         let h = GetCurrentProcess();
         let res = GetProcessHandleCount(h, &mut count);

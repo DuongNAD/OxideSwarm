@@ -1,0 +1,1 @@
+{"id":9,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"output_dir":"out","outputs":["target/release/*"],"source_files":{"src/main.rs":"fn main() {}\n"},"type":"compile"},"name":"submit"}}

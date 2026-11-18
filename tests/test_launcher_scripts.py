@@ -29,6 +29,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -50,6 +51,12 @@ IS_WINDOWS = os.name == "nt"
 # and then idles as a *bash* process so that `ps` still shows "rusty-grid" in its command line.
 FAKE_BINARY = """#!/bin/bash
 echo "$*" >> "${FAKE_ARGS_LOG:?}"
+if [ -n "${FAKE_EXEC_DIR:-}" ]; then
+  case "$1" in
+    master|worker) # see FAKE_PS: this process counts as exec'd only once FAKE_EXEC_DIR/<pid> exists
+      sleep "${FAKE_EXEC_DELAY:-0}"; : > "$FAKE_EXEC_DIR/$$" ;;
+  esac
+fi
 case "$1" in
   master) echo "RustyGrid Master started on fake" ;;
   worker) echo "Registration accepted; backoff counter reset" ;;
@@ -62,6 +69,20 @@ case "$1" in
 esac
 [ -n "$FAKE_ONESHOT" ] && exit 0   # connect_remote.sh execs the worker in the foreground: return at once
 while true; do sleep 1; done
+"""
+
+# A `ps` placed ahead of the real one on the launcher's PATH (TEST-35). Between the fork and the exec of
+# the binary, a process the launcher has just started still shows the launcher's own command line. The
+# fake binary above stretches that window: with FAKE_EXEC_DIR set, `ps -p PID -o command=` answers with
+# the launcher's command line until the binary has created FAKE_EXEC_DIR/PID (FAKE_EXEC_DELAY seconds
+# after it started). FAKE_PS_FOREIGN=1 answers with an unrelated program for every live PID, as `ps`
+# does for a PID that now names another process. Every other call goes to the real ps.
+FAKE_PS = """#!/bin/bash
+if [ "$1" = "-p" ] && [ "$3" = "-o" ] && [ "$4" = "command=" ] && kill -0 "$2" 2>/dev/null; then
+  if [ -n "${FAKE_PS_FOREIGN:-}" ]; then echo "/usr/libexec/unrelated-daemon --serve"; exit 0; fi
+  if [ -n "${FAKE_EXEC_DIR:-}" ] && [ ! -e "$FAKE_EXEC_DIR/$2" ]; then echo "bash ./switch_role.sh"; exit 0; fi
+fi
+exec %(real_ps)s "$@"
 """
 
 
@@ -346,6 +367,73 @@ class ShellLauncherTests(unittest.TestCase):
         self.assertEqual(stop.returncode, 0, self.launcher_failure(stop, state))
         self.assertTrue(wait_until(lambda: not pid_alive(master_pid) and not pid_alive(worker_pid)),
                         "stop must terminate the tracked master and worker")
+
+    def exec_race_env(self, **extra):
+        """Launcher environment whose `ps` is FAKE_PS, with FAKE_EXEC_DIR set (TEST-35)."""
+        shim = os.path.join(self.tmp, "ps-shim")
+        exec_dir = os.path.join(self.tmp, "exec-marks")
+        os.makedirs(shim)
+        os.makedirs(exec_dir)
+        real_ps = shutil.which("ps")
+        self.assertIsNotNone(real_ps, "the tests need ps")
+        path = os.path.join(shim, "ps")
+        with open(path, "w") as f:
+            f.write(FAKE_PS % {"real_ps": shlex.quote(real_ps)})
+        os.chmod(path, 0o755)
+        env = dict(PATH=shim + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), FAKE_EXEC_DIR=exec_dir)
+        env.update(extra)
+        return env
+
+    def test_switch_role_master_waits_until_the_new_process_runs_the_binary(self):
+        # TEST-35 (macos-latest, 2026-11-18): right after the fork the master's PID still showed the
+        # launcher's own command line, so the start loop gave up on its first pass with an empty log,
+        # and `stop_tracked` recognised the same PID as the master a moment later. Here that window
+        # lasts 3 s, for the master and for the local worker.
+        script = self.copy_script("switch_role.sh")
+        state = os.path.join(self.tmp, "state")
+        env = self.exec_race_env(OXIDESWARM_HOME=state, OXIDESWARM_CLUSTER_PORT=str(free_port()),
+                                 OXIDESWARM_DASHBOARD_PORT=str(free_port()), FAKE_EXEC_DELAY="3")
+        res = self.run_script(["bash", script, "master"], **env)
+        self.assertEqual(res.returncode, 0, self.launcher_failure(res, state))
+        self.assertIn("REGISTERED with Master", res.stdout, self.launcher_failure(res, state))
+        master_pid = int(read(os.path.join(state, "run", "master.pid")).strip())
+        worker_pid = int(read(os.path.join(state, "run", "worker.pid")).strip())
+        stop = self.run_script(["bash", script, "stop"], **env)
+        self.assertEqual(stop.returncode, 0, self.launcher_failure(stop, state))
+        self.assertTrue(wait_until(lambda: not pid_alive(master_pid) and not pid_alive(worker_pid)),
+                        "stop must terminate the tracked master and worker")
+
+    def test_switch_role_worker_waits_until_the_new_process_runs_the_binary(self):
+        # The worker role checks its process after `sleep 2`; here the binary replaces the launcher's
+        # command line only after 3 s (TEST-35).
+        script = self.copy_script("switch_role.sh")
+        state = os.path.join(self.tmp, "state")
+        env = self.exec_race_env(OXIDESWARM_HOME=state, OXIDESWARM_CLUSTER_PORT=str(free_port()),
+                                 FAKE_EXEC_DELAY="3")
+        res = self.run_script(["bash", script, "worker", "192.0.2.10:8088"], **env)
+        self.assertEqual(res.returncode, 0, self.launcher_failure(res, state))
+        self.assertIn("REGISTERED with Master", res.stdout, self.launcher_failure(res, state))
+        worker_pid = int(read(os.path.join(state, "run", "worker.pid")).strip())
+        stop = self.run_script(["bash", script, "stop"], **env)
+        self.assertEqual(stop.returncode, 0, self.launcher_failure(stop, state))
+        self.assertTrue(wait_until(lambda: not pid_alive(worker_pid)), "stop must terminate the tracked worker")
+
+    def test_switch_role_master_start_neither_accepts_nor_stops_a_foreign_pid(self):
+        # Once the master's log line is there, the start loop still checks the command line: a PID that
+        # now names another program (recycled) fails the start, and the launcher never signals it.
+        script = self.copy_script("switch_role.sh")
+        state = os.path.join(self.tmp, "state")
+        env = self.exec_race_env(OXIDESWARM_HOME=state, OXIDESWARM_CLUSTER_PORT=str(free_port()),
+                                 OXIDESWARM_DASHBOARD_PORT=str(free_port()), FAKE_PS_FOREIGN="1")
+        res = self.run_script(["bash", script, "master", "--no-worker"], **env)
+        self.assertEqual(res.returncode, 1, self.launcher_failure(res, state))
+        self.assertIn("Master failed to start", res.stdout)
+        self.assertNotIn("Stopping master", res.stdout, "a PID that is not ours must never be signalled")
+        binary = os.path.join(self.repo, "target", "release", "rusty-grid") + " master "
+        listing = subprocess.run(["ps", "-axo", "pid=,command="], stdout=subprocess.PIPE, text=True).stdout
+        pids = [int(line.split(None, 1)[0]) for line in listing.splitlines() if binary in line]
+        self.assertEqual(len(pids), 1, listing)
+        self.assertTrue(pid_alive(pids[0]), "the process behind the foreign PID must still run")
 
     def test_switch_role_never_kills_unrelated_processes(self):
         script = self.copy_script("switch_role.sh")

@@ -1229,6 +1229,8 @@ fn test_adversarial_zero_copy_huge_payload_slicing_and_cow() {
     // 1. Zero copy slicing: verify subslice memory address matches parent address + offset
     let sub = task_bytes.slice(1000..2000);
     assert_eq!(sub.len(), 1000);
+    // SAFETY: `raw` holds 5 MiB and stays alive past this check, so `raw.as_ptr() + 1000` stays
+    // within its allocation; the resulting pointer is only compared.
     assert_eq!(sub.as_ptr(), unsafe { raw.as_ptr().add(1000) });
 
     // 2. TaskResult Cow conversion without cloning the 5MB buffer

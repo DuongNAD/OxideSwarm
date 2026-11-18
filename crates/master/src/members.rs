@@ -42,6 +42,10 @@ pub const MAX_MEMBER_NAME_CHARS: usize = 64;
 /// `via_invite` tag used when the master auto-enrolls the host's own `node.key` as `admin`.
 pub const LOCAL_HOST_INVITE_TAG: &str = "local-host";
 
+/// Refusal of a worker `Register` (or a worker-id claim) from a key that is no longer an enrolled
+/// member, for example because it was revoked while its connection registered (design 0051 D5).
+pub const MEMBER_NO_LONGER_ENROLLED: &str = "member is no longer enrolled";
+
 /// Generic wire rejection message returned to any invalid/expired/revoked/unauthenticated `ENROLL`
 /// request (design 0051 D4 item 7).
 pub const GENERIC_ENROLL_REJECT_MESSAGE: &str =
@@ -341,6 +345,24 @@ impl PersistentMemberState {
                 entry
             }
         }
+    }
+
+    /// Drops the `worker_owners` claims (and their LRU sequence) whose owner is not an enrolled
+    /// member, returning the worker IDs it released (design 0051 D5, known limit 5).
+    fn prune_non_member_claims(&mut self) -> Vec<Uuid> {
+        let member_ids: HashSet<&str> = self.by_pubkey.values().map(|m| m.id.as_str()).collect();
+        let mut pruned = Vec::new();
+        self.worker_owners.retain(|wid, owner| {
+            let keep = member_ids.contains(owner.as_str());
+            if !keep {
+                pruned.push(*wid);
+            }
+            keep
+        });
+        for wid in &pruned {
+            self.worker_last_seq.remove(wid);
+        }
+        pruned
     }
 
     fn prune_inactive_invites(&mut self, now: u64, active_approval_invites: &HashMap<u64, String>) {
@@ -1098,6 +1120,15 @@ impl MemberStore {
             guard.state.next_worker_seq = seq;
             guard.state.worker_owners = parsed.worker_owners;
             guard.state.revoked_keys = parsed.revoked_keys.into_iter().collect();
+            // A claim whose owner is no member (left by a registration that landed right after a
+            // revocation in an older release) would lock its worker id for ever.
+            let orphans = guard.state.prune_non_member_claims();
+            if !orphans.is_empty() {
+                tracing::warn!(
+                    count = orphans.len(),
+                    "Dropped worker_id claims of non-members from members.json at load"
+                );
+            }
         }
         Ok(store)
     }
@@ -2157,6 +2188,7 @@ impl MemberStore {
                 for wid in &owned_workers {
                     staged.worker_last_seq.remove(wid);
                 }
+                staged.prune_non_member_claims();
                 Ok(AdminMutationPlan::Persist {
                     staged,
                     token: (pubkey, removed),
@@ -2180,6 +2212,13 @@ impl MemberStore {
                 });
                 for wid in &owned_workers {
                     guard.state.worker_last_seq.remove(wid);
+                }
+                let orphans = guard.state.prune_non_member_claims();
+                if !orphans.is_empty() {
+                    tracing::warn!(
+                        count = orphans.len(),
+                        "Dropped worker_id claims of earlier removed members on revoke"
+                    );
                 }
                 let next_gen = guard
                     .member_generations
@@ -2373,6 +2412,11 @@ impl MemberStore {
     /// ownership set changed (or an earlier `members.json` write left `dirty` set). Reconnects of
     /// an already-owned `worker_id` otherwise update the LRU sequence in memory only without
     /// touching disk.
+    ///
+    /// A `member_id` that is not an enrolled member is refused ([`MEMBER_NO_LONGER_ENROLLED`]) and
+    /// records nothing. The check runs under the store lock, so it is ordered against
+    /// [`revoke_member`](Self::revoke_member): a claim either lands before the revocation, which
+    /// then returns its worker id, or is refused (design 0051 D5, known limit 5).
     pub fn claim_worker_id_evicting_deferred<F>(
         &self,
         worker_id: Uuid,
@@ -2383,6 +2427,9 @@ impl MemberStore {
         F: Fn(&Uuid) -> bool,
     {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if !guard.state.by_pubkey.values().any(|m| m.id == member_id) {
+            return Err(GridError::AuthFailed(MEMBER_NO_LONGER_ENROLLED.to_string()));
+        }
         if guard.auth_mode.allows_secret() && guard.state.v2_worker_seq.contains_key(&worker_id) {
             return Err(GridError::AuthFailed(format!(
                 "worker_id {worker_id} is owned by another peer (v2 peer); member {member_id} cannot register it (an admin can release a stopped worker's ID with: oxideswarm members release-worker {worker_id})"
@@ -2568,6 +2615,32 @@ impl MemberStore {
             }
         }
         Ok(())
+    }
+
+    /// Drops every `worker_owners` claim whose owner is not an enrolled member and writes
+    /// `members.json` when one was dropped (design 0051 D5, known limit 5). Used when a worker
+    /// `Register` lands right after its member was revoked or rolled back. Returns the released
+    /// worker IDs.
+    pub fn prune_non_member_claims(&self) -> Vec<Uuid> {
+        let (pruned, pending) = {
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            let pruned = guard.state.prune_non_member_claims();
+            if pruned.is_empty() {
+                return pruned;
+            }
+            guard.state_generation = guard.state_generation.saturating_add(1);
+            let pending =
+                (guard.auth_mode.allows_members() && guard.save_path.is_some()).then(|| {
+                    PendingBookkeepingPersist {
+                        target_generation: guard.state_generation,
+                    }
+                });
+            (pruned, pending)
+        };
+        if let Some(pending) = pending {
+            self.flush_bookkeeping_persist(pending);
+        }
+        pruned
     }
 
     /// Returns the worker IDs currently owned by `member_id`.
@@ -2834,24 +2907,29 @@ mod tests {
 
     #[test]
     fn worker_id_ownership_prevents_takeover_and_enforces_per_member_bound() {
-        let store = MemberStore::new();
+        // Claims are refused for keys that are not enrolled, so both owners are members.
+        let kp_a = NodeKeypair::generate().unwrap();
+        let kp_b = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![
+            MemberEntry::new("a", *kp_a.public_key(), vec![MemberRole::Worker]),
+            MemberEntry::new("b", *kp_b.public_key(), vec![MemberRole::Worker]),
+        ]);
+        let (member_a, member_b) = (kp_a.member_id(), kp_b.member_id());
         let wid = Uuid::new_v4();
-        store.check_worker_id_claim(wid, Some("member_a")).unwrap();
-        store.claim_worker_id(wid, "member_a").unwrap();
-        store.claim_worker_id(wid, "member_a").unwrap();
-        let err = store.claim_worker_id(wid, "member_b").unwrap_err();
+        store.check_worker_id_claim(wid, Some(&member_a)).unwrap();
+        store.claim_worker_id(wid, &member_a).unwrap();
+        store.claim_worker_id(wid, &member_a).unwrap();
+        let err = store.claim_worker_id(wid, &member_b).unwrap_err();
         assert!(err.to_string().contains("owned by another member"));
-        assert!(store.check_worker_id_claim(wid, Some("member_b")).is_err());
+        assert!(store.check_worker_id_claim(wid, Some(&member_b)).is_err());
         assert!(store.check_worker_id_claim(wid, None).is_err());
 
         for _ in 1..MAX_WORKERS_PER_MEMBER {
-            store.claim_worker_id(Uuid::new_v4(), "member_a").unwrap();
+            store.claim_worker_id(Uuid::new_v4(), &member_a).unwrap();
         }
         let extra = Uuid::new_v4();
-        assert!(store
-            .check_worker_id_claim(extra, Some("member_a"))
-            .is_err());
-        let bound_err = store.claim_worker_id(extra, "member_a").unwrap_err();
+        assert!(store.check_worker_id_claim(extra, Some(&member_a)).is_err());
+        let bound_err = store.claim_worker_id(extra, &member_a).unwrap_err();
         assert!(bound_err.to_string().contains("maximum"));
     }
 
@@ -3281,8 +3359,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
-        let member_id = "8f14e45fceea167a";
+        // The claims belong to an enrolled member: a reload drops the claims of non-members.
+        let member_kp = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "unnamed-runs",
+            *member_kp.public_key(),
+            vec![MemberRole::Worker],
+        )])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        let member_id_owned = member_kp.member_id();
+        let member_id = member_id_owned.as_str();
 
         // 70 consecutive unnamed worker runs (only the current run's worker_id is live):
         // all 70 succeed, and the store retains the most recent 64 worker IDs.
@@ -3384,8 +3470,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let store = MemberStore::load_from_dir(Some(dir.path()))
-            .unwrap()
+        // v3 claims are refused for keys that are not enrolled, so the v3 owner is a member.
+        let v3_kp = NodeKeypair::generate().unwrap();
+        let v3_member = v3_kp.member_id();
+        let v3_entry = MemberEntry::new("v3", *v3_kp.public_key(), vec![MemberRole::Worker]);
+        let store = MemberStore::from_entries(vec![v3_entry.clone()])
+            .with_save_path(dir.path().join(MEMBERS_FILE_NAME))
             .with_auth_mode(AuthMode::Both);
         store
             .claim_v2_worker_id(v2_wid, true, |_| false)
@@ -3404,12 +3494,12 @@ mod tests {
 
         let v3_wid = Uuid::new_v4();
         store
-            .claim_worker_id_evicting(v3_wid, "0123456789abcdef", |_| false)
+            .claim_worker_id_evicting(v3_wid, &v3_member, |_| false)
             .expect("initial v3 claim must succeed");
         assert_eq!(store.persist_count(), 2);
         for _ in 0..25 {
             store
-                .claim_worker_id_evicting(v3_wid, "0123456789abcdef", |_| false)
+                .claim_worker_id_evicting(v3_wid, &v3_member, |_| false)
                 .expect("v3 reconnect must succeed");
         }
         assert_eq!(
@@ -3420,7 +3510,7 @@ mod tests {
 
         // 3. A failed bookkeeping write (e.g. non-writable parent directory) logs a warning and
         // does not refuse worker registration.
-        let unwritable_store = MemberStore::new()
+        let unwritable_store = MemberStore::from_entries(vec![v3_entry])
             .with_auth_mode(AuthMode::Both)
             .with_save_path(
                 dir.path()
@@ -3434,15 +3524,22 @@ mod tests {
             .expect("v2 worker registration must not fail when bookkeeping write fails");
         let new_v3 = Uuid::new_v4();
         unwritable_store
-            .claim_worker_id_evicting(new_v3, "0123456789abcdef", |_| false)
+            .claim_worker_id_evicting(new_v3, &v3_member, |_| false)
             .expect("v3 worker registration must not fail when bookkeeping write fails");
     }
 
     #[test]
     fn test_n2_v2_to_v3_worker_migration_in_members_and_both_modes() {
-        let store = MemberStore::new().with_auth_mode(AuthMode::Both);
+        let kp = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "migrating",
+            *kp.public_key(),
+            vec![MemberRole::Worker],
+        )])
+        .with_auth_mode(AuthMode::Both);
         let wid = Uuid::new_v4();
-        let mid = "0123456789abcdef";
+        let mid_owned = kp.member_id();
+        let mid = mid_owned.as_str();
 
         // 1. Named worker registers as v2 under --auth both.
         store.claim_v2_worker_id(wid, true, |_| false).unwrap();
@@ -4572,5 +4669,193 @@ mod tests {
         let reloaded_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path())).unwrap();
         assert!(!reloaded_nit2.contains(cand_nit2.public_key()));
         assert_eq!(reloaded_nit2.list_invites()[0].uses_remaining, 1);
+    }
+}
+
+#[cfg(test)]
+mod non_member_claim_tests {
+    //! Design 0051 D5, known limit 5: a worker-id claim for a non-member is refused, and
+    //! `worker_owners` claims whose owner is not an enrolled member (left by an older release) are
+    //! pruned at load, on revoke and on request.
+
+    use super::*;
+    use rusty_grid_core::noise_auth::NodeKeypair;
+
+    const NON_MEMBER: &str = "0123456789abcdef";
+
+    /// What a claim that landed right after its member's removal left behind before claims of
+    /// non-members were refused.
+    fn insert_orphan_claim(store: &MemberStore, worker_id: Uuid) {
+        let mut guard = store.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .state
+            .worker_owners
+            .insert(worker_id, NON_MEMBER.to_string());
+        guard.state.worker_last_seq.insert(worker_id, 0);
+    }
+
+    #[test]
+    fn a_claim_for_a_non_member_is_refused_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "m",
+            *member.public_key(),
+            vec![MemberRole::Worker],
+        )])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        let snapshot = |store: &MemberStore| {
+            let guard = store.inner.read().unwrap_or_else(|e| e.into_inner());
+            (
+                guard.state.worker_owners.clone(),
+                guard.state.worker_last_seq.clone(),
+                guard.state_generation,
+            )
+        };
+
+        // Never a member.
+        let before = snapshot(&store);
+        let err = store
+            .claim_worker_id_evicting_deferred(Uuid::new_v4(), NON_MEMBER, |_| false)
+            .unwrap_err();
+        assert!(
+            matches!(&err, GridError::AuthFailed(m) if m == MEMBER_NO_LONGER_ENROLLED),
+            "unexpected refusal: {err}"
+        );
+        assert_eq!(snapshot(&store), before, "a refused claim records nothing");
+        assert_eq!(store.persist_count(), 0, "and writes nothing");
+
+        // No longer a member: revoked after a first claim.
+        let first = Uuid::new_v4();
+        store.claim_worker_id(first, &member.member_id()).unwrap();
+        let (_, owned) = store.revoke_member(&member.member_id()).unwrap();
+        assert_eq!(owned, vec![first]);
+        let before = snapshot(&store);
+        let writes = store.persist_count();
+        for wid in [first, Uuid::new_v4()] {
+            let err = store.claim_worker_id(wid, &member.member_id()).unwrap_err();
+            assert!(
+                matches!(&err, GridError::AuthFailed(m) if m == MEMBER_NO_LONGER_ENROLLED),
+                "unexpected refusal: {err}"
+            );
+        }
+        assert_eq!(snapshot(&store), before);
+        assert_eq!(store.persist_count(), writes);
+        assert!(store.workers_owned_by(&member.member_id()).is_empty());
+    }
+
+    #[test]
+    fn non_member_claims_are_pruned_at_load() {
+        let member = NodeKeypair::generate().unwrap();
+        let member_wid = Uuid::new_v4();
+        let orphan_wid = Uuid::new_v4();
+        let mut file = MembersFile {
+            members: vec![MemberEntry::new(
+                "m",
+                *member.public_key(),
+                vec![MemberRole::Worker],
+            )],
+            ..MembersFile::default()
+        };
+        file.worker_owners.insert(member_wid, member.member_id());
+        file.worker_owners
+            .insert(orphan_wid, NON_MEMBER.to_string());
+        file.worker_last_seq.insert(member_wid, 1);
+        file.worker_last_seq.insert(orphan_wid, 2);
+        let raw = serde_json::to_string(&file).unwrap();
+
+        let store = MemberStore::from_json_str(&raw, Path::new(MEMBERS_FILE_NAME)).unwrap();
+        assert_eq!(
+            store.workers_owned_by(&member.member_id()),
+            vec![member_wid]
+        );
+        assert!(store.workers_owned_by(NON_MEMBER).is_empty());
+        let snapshot = store
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .to_members_file();
+        assert!(!snapshot.worker_owners.contains_key(&orphan_wid));
+        assert!(!snapshot.worker_last_seq.contains_key(&orphan_wid));
+        // The freed worker id can be claimed again.
+        store
+            .claim_worker_id(orphan_wid, &member.member_id())
+            .unwrap();
+    }
+
+    #[test]
+    fn revoke_prunes_claims_of_earlier_removed_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = NodeKeypair::generate().unwrap();
+        let revoked = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![
+            MemberEntry::new("kept", *kept.public_key(), vec![MemberRole::Worker]),
+            MemberEntry::new("revoked", *revoked.public_key(), vec![MemberRole::Worker]),
+        ])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        let kept_wid = Uuid::new_v4();
+        let revoked_wid = Uuid::new_v4();
+        let orphan_wid = Uuid::new_v4();
+        store.claim_worker_id(kept_wid, &kept.member_id()).unwrap();
+        store
+            .claim_worker_id(revoked_wid, &revoked.member_id())
+            .unwrap();
+        // What a Register landing right after an earlier revocation left behind.
+        insert_orphan_claim(&store, orphan_wid);
+
+        let (entry, owned) = store.revoke_member(&revoked.member_id()).unwrap();
+        assert_eq!(entry.id, revoked.member_id());
+        assert_eq!(
+            owned,
+            vec![revoked_wid],
+            "only the revoked member's own workers"
+        );
+        assert!(store.workers_owned_by(NON_MEMBER).is_empty());
+        assert_eq!(store.workers_owned_by(&kept.member_id()), vec![kept_wid]);
+
+        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        assert_eq!(reloaded.workers_owned_by(&kept.member_id()), vec![kept_wid]);
+        assert!(reloaded.workers_owned_by(&revoked.member_id()).is_empty());
+        assert!(reloaded.workers_owned_by(NON_MEMBER).is_empty());
+        let on_disk: MembersFile = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(MEMBERS_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk.worker_owners.keys().copied().collect::<Vec<_>>(),
+            vec![kept_wid],
+            "members.json keeps no claim of a non-member"
+        );
+    }
+
+    #[test]
+    fn prune_non_member_claims_releases_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = NodeKeypair::generate().unwrap();
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "m",
+            *member.public_key(),
+            vec![MemberRole::Worker],
+        )])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        let member_wid = Uuid::new_v4();
+        let orphan_wid = Uuid::new_v4();
+        store
+            .claim_worker_id(member_wid, &member.member_id())
+            .unwrap();
+        insert_orphan_claim(&store, orphan_wid);
+
+        assert_eq!(store.prune_non_member_claims(), vec![orphan_wid]);
+        assert!(store.prune_non_member_claims().is_empty(), "idempotent");
+        let on_disk: MembersFile = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(MEMBERS_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk.worker_owners.keys().copied().collect::<Vec<_>>(),
+            vec![member_wid]
+        );
+        assert!(!on_disk.worker_last_seq.contains_key(&orphan_wid));
     }
 }

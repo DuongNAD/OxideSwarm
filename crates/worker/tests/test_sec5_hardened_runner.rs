@@ -2087,8 +2087,11 @@ exit(0);
     );
     let perl_pid = pids[0] as libc::pid_t;
 
+    // SAFETY: `kill` with `sig == 0` sends no signal and touches no memory.
     let escaped = unsafe { libc::kill(perl_pid, 0) == 0 };
     // Clean up unconditionally so the test never leaves a stray `/usr/bin/perl` on the host.
+    // SAFETY: `kill` touches no memory, and `perl_pid` is the positive `$$` written by the forked
+    // `/usr/bin/perl` child above (never 0 or -1, so this cannot signal a process group).
     unsafe {
         let _ = libc::kill(perl_pid, libc::SIGKILL);
     }
@@ -2251,6 +2254,8 @@ async fn run_worker_sigkill_containment_test(task_count: usize) {
     common::assert_all_alive(&mut sys, &pids);
 
     #[cfg(unix)]
+    // SAFETY: `kill` touches no memory, and `worker_proc` has not been waited on yet (`wait` is
+    // below), so its positive `worker_pid` still names the helper child spawned by this test.
     unsafe {
         let rc = libc::kill(worker_pid as libc::pid_t, libc::SIGKILL);
         assert_eq!(rc, 0, "kill(worker_pid, SIGKILL) failed");

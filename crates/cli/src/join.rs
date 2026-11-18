@@ -226,6 +226,9 @@ mod unix_signals {
     const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
     struct Saved(UnsafeCell<MaybeUninit<libc::termios>>);
+    // `Guard::install` is reached only through `EchoOff::stdin`, whose two callers
+    // (`read_token_hidden` and `read_invite_passphrase`) are on separate branches of
+    // `oxideswarm join` and drop their guard before returning, so two guards never live at once.
     // SAFETY: written only while `FD` is -1 (before the handlers are installed) and read by the
     // handler only after `FD` was published with Release ordering.
     unsafe impl Sync for Saved {}
@@ -293,11 +296,15 @@ impl EchoOff {
     pub fn on_fd(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
         // SAFETY: `termios` is plain data; `tcgetattr` fills it or fails.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `saved` is a live, writable `termios` that `tcgetattr` only writes to. `fd` is
+        // passed by value: one that is not open or not a terminal makes the call fail.
         if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         let mut quiet = saved;
         quiet.c_lflag &= !libc::ECHO;
+        // SAFETY: `quiet` is a live copy of the attributes `tcgetattr` filled; `tcsetattr` only
+        // reads it.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -336,6 +343,13 @@ mod windows_ctrl {
 
     /// Restores the console mode and returns FALSE, so the next handler (by default: end the
     /// process) still runs.
+    ///
+    /// # Safety
+    ///
+    /// None for the caller: the function reads two atomics and passes plain values to
+    /// `SetConsoleMode`. It is an `unsafe extern "system" fn` only because that is the type
+    /// `SetConsoleCtrlHandler` takes (`PHANDLER_ROUTINE`); the system calls it on a thread of its
+    /// own.
     unsafe extern "system" fn restore(_ctrl_type: u32) -> i32 {
         let handle = HANDLE_VALUE.load(Ordering::Acquire);
         if handle != 0 {
@@ -420,10 +434,14 @@ pub fn read_token_hidden() -> GridResult<String> {
         .take(MAX_TOKEN_BYTES + 1)
         .read_line(&mut line);
     #[cfg(unix)]
+    // SAFETY: `tcflush` takes descriptor 0 (standard input) and a constant by value and touches
+    // no memory of this process; it fails harmlessly if standard input is not a terminal.
     unsafe {
         let _ = libc::tcflush(0, libc::TCIFLUSH);
     }
     #[cfg(windows)]
+    // SAFETY: `GetStdHandle` takes a constant and `FlushConsoleInputBuffer` takes the handle it
+    // returned by value; an invalid or non-console handle makes the flush fail, which is ignored.
     unsafe {
         use windows_sys::Win32::System::Console::{
             FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
@@ -1106,8 +1124,11 @@ fn open_confirmation_terminal(stdin_is_terminal: bool) -> GridResult<Confirmatio
         #[cfg(unix)]
         {
             use std::os::fd::FromRawFd;
+            // SAFETY: `dup` takes descriptor 0 by value and returns a new descriptor or -1.
             let dup_fd = unsafe { libc::dup(0) };
             if dup_fd >= 0 {
+                // SAFETY: `dup_fd` is the open descriptor `dup` just created; nothing else holds
+                // it, so the `File` becomes its only owner and closes it once.
                 let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
                 return Ok(ConfirmationTerminal::File(file));
             }
@@ -1151,10 +1172,14 @@ fn flush_confirmation_terminal(term: &ConfirmationTerminal) {
     match term {
         ConfirmationTerminal::Stdin => {
             #[cfg(unix)]
+            // SAFETY: `tcflush` takes descriptor 0 (standard input) and a constant by value and
+            // touches no memory of this process; it fails harmlessly on a non-terminal.
             unsafe {
                 let _ = libc::tcflush(0, libc::TCIFLUSH);
             }
             #[cfg(windows)]
+            // SAFETY: `GetStdHandle` takes a constant and `FlushConsoleInputBuffer` takes the
+            // handle it returned by value; an invalid or non-console handle makes the flush fail.
             unsafe {
                 use windows_sys::Win32::System::Console::{
                     FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
@@ -1168,6 +1193,8 @@ fn flush_confirmation_terminal(term: &ConfirmationTerminal) {
             #[cfg(unix)]
             {
                 use std::os::fd::AsRawFd;
+                // SAFETY: the descriptor belongs to `file`, which is borrowed, so open, for the
+                // whole call; `tcflush` takes it by value and touches no memory of this process.
                 unsafe {
                     let _ = libc::tcflush(file.as_raw_fd(), libc::TCIFLUSH);
                 }
@@ -1176,6 +1203,8 @@ fn flush_confirmation_terminal(term: &ConfirmationTerminal) {
             {
                 use std::os::windows::io::AsRawHandle;
                 use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+                // SAFETY: the handle belongs to `file`, which is borrowed, so open, for the whole
+                // call; `FlushConsoleInputBuffer` takes it by value.
                 unsafe {
                     let _ = FlushConsoleInputBuffer(file.as_raw_handle());
                 }
@@ -2239,7 +2268,9 @@ mod tests {
         };
         assert_eq!(rc, 0, "openpty");
         let echo = |fd| {
+            // SAFETY: `termios` is plain data, for which all-zero bytes are a valid value.
             let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `t` is a live, writable `termios` that `tcgetattr` only writes to.
             assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
             t.c_lflag & libc::ECHO != 0
         };
@@ -2254,6 +2285,8 @@ mod tests {
         let file = std::fs::File::create(dir.path().join("f")).unwrap();
         use std::os::fd::AsRawFd;
         assert!(EchoOff::on_fd(file.as_raw_fd()).is_err());
+        // SAFETY: `master` and `slave` are the descriptors `openpty` opened above; no Rust object
+        // owns them, the guard that borrowed `slave` is gone, and each is closed once here.
         unsafe {
             libc::close(master);
             libc::close(slave);

@@ -12,12 +12,18 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.3"
 edition = "2021"
 authors = ["The OxideSwarm Authors"]
 license = "MIT OR Apache-2.0"
 publish = false
 rust-version = "1.91"
+
+# LV-4 (design 0058 D2): every `unsafe` block and `unsafe impl` states the invariant it relies on
+# in a `// SAFETY:` comment. Each member crate opts in with `[lints] workspace = true`; the clippy
+# jobs of CI turn this into a failed check.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
 # Internal workspace crates

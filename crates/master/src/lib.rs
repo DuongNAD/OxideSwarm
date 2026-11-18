@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod fair_share;
 pub mod liveness;
 pub mod mapreduce;
+mod member_connections;
 pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;

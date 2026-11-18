@@ -611,8 +611,10 @@ async fn apply_task_result_inner(
     } else if outcome.disposition != ResultDisposition::Late {
         registry.clear_rejections(&worker_id).await;
     }
-    let send_ack = queue.session_resume_hold_secs() > 0;
-    let ack_token = rusty_grid_core::protocol::master_features::result_ack_token(&result);
+    // The acknowledgement token hashes the whole result, `asset_bytes` included, and is sent
+    // only when this master holds sessions for resume, so it is computed only then (BUG-27).
+    let ack_token = (queue.session_resume_hold_secs() > 0)
+        .then(|| rusty_grid_core::protocol::master_features::result_ack_token(&result));
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
     //    task (rejection, execution retry) will still produce its real result and keeps its
@@ -645,7 +647,7 @@ async fn apply_task_result_inner(
                             "Failed to sync TaskTerminal journal record for task result"
                         );
                     }
-                    if send_ack {
+                    if let Some(ack_token) = ack_token {
                         ack_registry
                             .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
@@ -661,7 +663,7 @@ async fn apply_task_result_inner(
                     cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
-                if send_ack {
+                if let Some(ack_token) = ack_token {
                     registry
                         .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
@@ -686,7 +688,7 @@ async fn apply_task_result_inner(
                     );
                 }
             }
-            if send_ack {
+            if let Some(ack_token) = ack_token {
                 registry
                     .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
@@ -701,7 +703,7 @@ async fn apply_task_result_inner(
             }
             queue.spawn_cold_maintenance().await;
         }
-    } else if send_ack {
+    } else if let Some(ack_token) = ack_token {
         if let Some(ack) = durable_ack {
             if let Err(err) = ack.await {
                 warn!(
@@ -1300,6 +1302,84 @@ async fn failover_session_tasks(
     let affected_tasks = queue
         .handle_session_disconnected(worker_id, session_id, reason, immediate_reschedule)
         .await;
+    publish_failover(
+        queue,
+        scheduler_notify,
+        waiters,
+        worker_id,
+        &affected_tasks,
+        #[cfg(feature = "dashboard")]
+        broadcast_tx,
+    )
+    .await;
+}
+
+/// Takes the workers of a member that can never come back (revoked, or an enrollment rolled
+/// back) out of service (design 0051 D5, revocation step 3).
+///
+/// Unregisters each worker (aborting its session handler if one is still live), then takes back
+/// every task they ran or were held for in one queue sweep: no session-resume hold, since these
+/// workers cannot resume them, and without the checkpoints those tasks carry
+/// (`TaskQueue::handle_workers_revoked`, which compacts the store once). Returns the number of
+/// workers that had a live session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_workers_revoked_with_broadcast(
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    worker_ids: &[Uuid],
+    reason: &str,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
+) -> usize {
+    let mut live = 0;
+    for worker_id in worker_ids {
+        if !registry.unregister(worker_id, None).await.unwrap_or(false) {
+            continue;
+        }
+        live += 1;
+        warn!(
+            worker_id = %worker_id,
+            reason = %reason,
+            "Worker of a revoked member disconnected; requeuing its tasks without the resume hold"
+        );
+        #[cfg(feature = "dashboard")]
+        if let Some(b_tx) = broadcast_tx {
+            if b_tx.receiver_count() > 0 {
+                let _ = b_tx.send(
+                    crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                        worker_id: *worker_id,
+                        reason: reason.to_string(),
+                    },
+                );
+            }
+        }
+    }
+    for (worker_id, affected_tasks) in queue.handle_workers_revoked(worker_ids, reason).await {
+        publish_failover(
+            queue,
+            scheduler_notify,
+            Some(waiters),
+            &worker_id,
+            &affected_tasks,
+            #[cfg(feature = "dashboard")]
+            broadcast_tx,
+        )
+        .await;
+    }
+    live
+}
+
+/// Reports the tasks a failover sweep took back: dashboard updates, waiters of the tasks that
+/// became terminal, and a scheduler wake-up.
+async fn publish_failover(
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: Option<&WaiterMap>,
+    worker_id: &Uuid,
+    affected_tasks: &[TaskId],
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
+) {
     if affected_tasks.is_empty() {
         return;
     }
@@ -1314,7 +1394,7 @@ async fn failover_session_tasks(
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
         if b_tx.receiver_count() > 0 {
-            for task_id in &affected_tasks {
+            for task_id in affected_tasks {
                 if let Some(info) = queue.get_task(task_id).await {
                     let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
                         info,
@@ -1329,7 +1409,7 @@ async fn failover_session_tasks(
 
     // Resolve waiters for any tasks that reached terminal state (e.g. retries exhausted)
     if let Some(waiters) = waiters {
-        resolve_terminal_waiters(queue, waiters, &affected_tasks, Some(*worker_id)).await;
+        resolve_terminal_waiters(queue, waiters, affected_tasks, Some(*worker_id)).await;
     }
 
     scheduler_notify.notify_one();

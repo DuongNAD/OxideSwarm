@@ -1134,6 +1134,7 @@ cargo build --offline 2>&1
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
         fn alive(pid: u32) -> bool {
+            // SAFETY: `kill` with `sig == 0` sends no signal and touches no memory.
             unsafe { libc::kill(pid as i32, 0) == 0 }
         }
 
@@ -1556,6 +1557,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
     #[tokio::test]
     async fn test_the_user_cache_directory_is_unreadable_to_a_task() {
         let mut buf = vec![0 as libc::c_char; 1024];
+        // SAFETY: `buf` is a live, writable buffer of `buf.len()` `c_char` bytes.
         let n =
             unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, buf.as_mut_ptr(), buf.len()) };
         if n == 0 || n > buf.len() {
@@ -1563,6 +1565,8 @@ sys.stdout.write(out.decode("utf-8", "replace"))
             return;
         }
         let dir = PathBuf::from(
+            // SAFETY: `0 < n <= buf.len()` above guarantees `confstr` wrote a NUL-terminated
+            // string inside `buf`, which outlives this temporary `CStr`.
             unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned(),
@@ -1608,6 +1612,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
 
     async fn wait_dead(pid: u32) -> bool {
         for _ in 0..100 {
+            // SAFETY: `kill` with `sig == 0` sends no signal and touches no memory.
             if unsafe { libc::kill(pid as i32, 0) } != 0 {
                 return true;
             }
@@ -2408,6 +2413,7 @@ except OSError as e:
                 })
         };
         let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        // SAFETY: `getuid` and `getgid` have no preconditions, touch no memory and cannot fail.
         let worker_ids = unsafe { (libc::getuid(), libc::getgid()) };
         let fs = run_at(IsolationLevel::Fs, script, &[("T_PY", py)]).await;
         assert_eq!(value(&fs, "NETNS"), worker_netns.to_string_lossy());
@@ -2481,9 +2487,16 @@ except OSError as e:
         }
         eprintln!("NETLINK_CONTROL_OK");
         let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
-        // SAFETY: only this and the other NETNS_ENV tests read it, and they hold the lock.
+        // LV-4 finding: `NETNS_ENV` only serialises the two `NETNS_ENV` tests, while other
+        // parallel tests in this binary call `getenv` (`require_landlock!`, `tempfile::tempdir`)
+        // and spawn children without holding `NETNS_ENV`, racing glibc `setenv`/`unsetenv` on
+        // `environ`. Left unchanged per LV-4 part 2 scope (Linux-only test code).
+        // SAFETY: `NETNS_ENV` serialises `RUSTY_GRID_ISOLATION_NO_USERNS` readers and writers; in
+        // Rust 2021 `set_var` is a safe fn, though POSIX `setenv` requires exclusive env access.
         unsafe { std::env::set_var("RUSTY_GRID_ISOLATION_NO_USERNS", "1") };
         let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        // SAFETY: paired with `set_var` above while still holding `NETNS_ENV` (same `unsetenv`
+        // caveat as above regarding concurrent `getenv` calls in other parallel tests).
         unsafe { std::env::remove_var("RUSTY_GRID_ISOLATION_NO_USERNS") };
         assert_eq!(
             value(&net, "NETNS"),
@@ -2841,6 +2854,7 @@ cargo build --offline 2>&1
                 .to_string()
         }
         fn alive(pid: u32) -> bool {
+            // SAFETY: `kill` with `sig == 0` sends no signal and touches no memory.
             unsafe { libc::kill(pid as i32, 0) == 0 }
         }
 
@@ -2917,6 +2931,7 @@ cargo build --offline 2>&1
 
     async fn wait_dead(pid: u32) -> bool {
         for _ in 0..100 {
+            // SAFETY: `kill` with `sig == 0` sends no signal and touches no memory.
             if unsafe { libc::kill(pid as i32, 0) } != 0 {
                 return true;
             }

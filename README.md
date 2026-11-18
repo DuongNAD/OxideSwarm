@@ -10,6 +10,7 @@ coding agents can send work to: `cargo test`, scripts, compile jobs, file proces
 
 [![Release](https://img.shields.io/github/v/release/DuongNAD/OxideSwarm?style=flat-square&label=release)](https://github.com/DuongNAD/OxideSwarm/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/DuongNAD/OxideSwarm/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/DuongNAD/OxideSwarm/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DuongNAD/OxideSwarm/badge)](https://scorecard.dev/viewer/?uri=github.com/DuongNAD/OxideSwarm)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg?style=flat-square)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg?style=flat-square)](#platform-support)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20server-8A2BE2.svg?style=flat-square)](docs/guides/mcp-client-setup.md)
@@ -104,7 +105,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.4.1`), or [build from source](#build-from-source).
+(the latest is `v0.4.3`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -115,20 +116,31 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.4.1-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.3-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
+tar -xzf oxideswarm-0.4.3-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.1-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.1-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.3-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.3-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.4.1-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.3-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.3-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.3-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.1-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.3-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
+
+`gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
+archive's signed build provenance. When it accepts, this exact archive was built on GitHub's runners by a
+workflow of this repository; the output names that workflow and the git ref it ran on, and `--format json`
+adds the commit (`sourceRepositoryDigest`). It does not prove that the source at that commit is safe or
+free of bugs. An archive with one changed byte is refused. Manual and pull request runs of `release.yml` attest their archives too, so to accept only a
+release build add `--signer-workflow DuongNAD/OxideSwarm/.github/workflows/release.yml --source-ref refs/tags/<TAG>`.
+Releases up to `v0.4.3` were published before this check was added (LV-5): they have no attestation and
+are refused, so check those with `SHA256SUMS` only.
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
 `scripts/` (`install_mac_daemon.sh --bin <PATH>`, `install_windows_service.ps1`) take the unpacked `rusty-grid` binary.
@@ -365,7 +377,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.1` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.3` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
@@ -653,7 +665,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery) |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`) |
 | `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](docs/design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |

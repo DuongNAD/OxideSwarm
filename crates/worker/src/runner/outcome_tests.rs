@@ -245,6 +245,7 @@ async fn test_read_output_file_fifo_returns_error_immediately() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let fifo_path = temp_dir.path().join("fifo_output.glb");
     let c_path = std::ffi::CString::new(fifo_path.to_str().expect("utf8 path")).expect("cstring");
+    // SAFETY: `c_path` is a NUL-terminated path in a private temp dir, live across the call.
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
     assert_eq!(rc, 0, "mkfifo failed");
 
