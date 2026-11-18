@@ -2190,3 +2190,6 @@ Add one dated line per finished item, newest last.
   LV-18 Partial (pull request 326, the MCP reader is open); TEST-53 Implemented (pull request 327).
 - 2026-11-18: LV-18 Implemented (pull request 335: the target `mcp_request_line` for the JSON-RPC reader of
   `oxideswarm mcp`), its text moved to the archive.
+- 2026-11-18: Release `0.4.3` prepared (no wire change; ENROLL-1c revocation across every lane, LV-18, LV-4
+  comments, BUG-27, BUG-28, TEST-35, TEST-53, TEST-54): versions, CHANGELOG with an "Upgrading from 0.4.2"
+  note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
