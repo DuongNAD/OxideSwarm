@@ -3677,6 +3677,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   `cargo test -p rusty_grid_worker --test test_feat3_os_isolation` passes on Linux, macOS and
   Windows, `cargo test -p rusty_grid_cli --test mcp_server_e2e` passes, and
   `crates/core/tests/data/wire_layout.txt` is unchanged.
+- **Progress:** step 2 (`mcp.rs`): pull request 323.
 
 ### DOC-11: Make the backlog show open work first
 
