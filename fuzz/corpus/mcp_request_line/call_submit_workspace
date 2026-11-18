@@ -1,0 +1,1 @@
+{"id":10,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"args":["build"],"command":"cargo","workspace":{"cwd":"crates/a","name":"demo","sync_dir":"."}},"name":"submit"}}

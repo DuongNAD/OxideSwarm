@@ -1436,6 +1436,56 @@ none needs a design record of its own.
 - **Implemented (2026-11-18):** the `fuzz` CI job runs the three targets green on `master`
   (first green run on `master` at `b486137`); the later targets are LV-18.
 
+### LV-18: Fuzz targets for the remaining parsers of untrusted bytes
+
+- **Evidence:** Read on 2026-11-18 at `master` `b486137`. `fuzz/` (LV-1, pull request 270) has three
+  targets (`inbound_frame`, `server_handshake`, `tree_manifest`), and `fuzz/README.md` lists the later
+  targets of design 0058 LV-1 as open: the encrypted record reader (`AeadReaderSession::decrypt_frame`
+  in `crates/core/src/protocol/codec.rs`), the join token and the invite (`JoinToken::decode` in
+  `crates/cli/src/join.rs`, `InviteToken::decode` in `crates/cli/src/members_cmd.rs`, the
+  `invite.oxs` file in `crates/cli/src/usb_kit.rs`), the journal reader of the master state store
+  (`read_journal` and `read_snapshot` in `crates/master/src/store.rs`, both private) and the JSON-RPC
+  reader of `oxideswarm mcp` (inline in `run_stdio_server`, `crates/cli/src/mcp.rs`). Exit check E4
+  of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) asks for a fuzz
+  target in CI for every parser of untrusted bytes.
+- **Problem:** These parsers read bytes that another machine or person wrote: every frame after the
+  handshake, a pasted token, a file on a USB stick, the state directory after a crash. Nothing has
+  fed them malformed input at scale. A Poly1305 tag guards the record layer and BLAKE3 hashes guard
+  the journal and the snapshot, so random bytes never reach the decoders behind them.
+- **Do:**
+  1. `aead_record`: the record layer with keys derived from a fixed test session key: a byte stream
+     of a peer without the key, and records sealed by the client side that the fuzzer keeps,
+     damages, drops, replays or cuts. The reader must accept exactly the intact records in order
+     before the first bad one, return each plaintext unchanged, and refuse everything after it.
+  2. `join_invite`: the text piped into `oxideswarm join`, join token and invite payloads with a valid
+     tag or checksum added by the target, and `invite.oxs` files (header, and decryption with a test
+     passphrase when the Argon2id cost is small). Decode, encode, decode gives the same value.
+  3. `store_journal`: the journal and snapshot readers on bytes in memory, raw or with the target
+     writing headers, lengths and hashes around the fuzzer's payloads. The readers are private, so
+     `rusty_grid_master` gets a Cargo feature `fuzzing`, off by default, with `store::fuzzing`;
+     `read_journal` and `read_snapshot` are split into a file read and a parse, with no change in
+     behaviour. The valid prefix must read again without a torn tail, and accepted records and
+     snapshots written again must read back equal.
+  4. The JSON-RPC reader of `oxideswarm mcp`, through a public function that takes one line.
+  5. Seeds, regression inputs, the three targets in the `fuzz` CI matrix (60 s on pull requests,
+     10 minutes weekly), a 5-minute local run of each recorded in `fuzz/README.md`.
+- **Done when:** The four targets build and run in the `fuzz` CI job, and `fuzz/README.md` holds a
+  local run of each with its findings.
+- **Status:** Partial (2026-11-18, pull request 326). Built: `aead_record`, `join_invite` and
+  `store_journal` (steps 1 to 3 and 5), with no finding in 5 minutes each. Open: step 4. No public
+  function takes one line of the MCP reader, and MAINT-2 is splitting `mcp.rs` into submodules now;
+  the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
+  JsonRpcResponse>` cut out of `run_stdio_server`. Also open until it runs: the `fuzz` CI job of the
+  three new targets.
+- **Implemented (2026-11-18, pull request PRNUM):** step 4. `run_stdio_server` now calls
+  `parse_request_line(line) -> Result<Option<JsonRpcRequest>, JsonRpcResponse>` (`Ok(None)`: a line
+  that gets no reply) and `parse_tool_call(id, params) -> Result<(String, Value), JsonRpcResponse>`
+  (the `tools/call` checks, `validate_tool_arguments` included), both `#[doc(hidden)] pub`; the
+  replies to 48 test lines are byte for byte those of `master` `3a0f7c5`. The target
+  `mcp_request_line` with seeds, regression inputs and its `fuzz` CI job; a 5-minute local run
+  (1,752,586 executions, no finding) is in `fuzz/README.md`. The `fuzz` job runs the four LV-18
+  targets on pull request PRNUM.
+
 ## Phase 11: findings of the audit of 2026-11-15
 
 These items come from a read-only audit of `master` at `c2462e3` (after 0.2.0 and SCALE-2). Line

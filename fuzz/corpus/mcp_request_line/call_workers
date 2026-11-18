@@ -1,0 +1,1 @@
+{"id":5,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"arch":"x86_64","connected_only":true,"gpu_only":false,"os":"linux"},"name":"workers"}}
