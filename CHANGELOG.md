@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The reaper failover stress test (`TEST-45`) keeps its second worker alive with heartbeats and a 2 s reaper timeout (was 80 ms with no heartbeat, so a starved runner let the reaper take the second worker too), and its failures name the second worker's status and the task's state.
 - The graceful failover stress tests (`TEST-46`) assert that the task is reassigned to the survivor without waiting for the reaper (within 5 s, half its 10 s timeout) instead of within 100 ms or 500 ms, which a starved runner missed; the latency is printed.
 - `ox-mode dev cluster` starts its master with `--discovery-port 0`, so the local dev cluster no longer binds the UDP discovery beacon on the default port 8089, which a real master on the same machine may use (`BUG-26`).
+- The capability-detection handle-leak tests (`TEST-47`) count only their own handles: they run alone against the other tests of their file that open handles (a shared lock) and count from after a warm-up detection, so handles that the first detections allocate once, or that other tests hold, no longer fail them.
 
 ## [0.4.1] - 2026-11-17
 
