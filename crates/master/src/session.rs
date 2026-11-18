@@ -45,6 +45,7 @@ use crate::liveness::{RxClock, StampedStream};
 use crate::member_connections::{MemberConnectionGuard, MemberLane};
 use crate::queue::TaskQueue;
 use crate::registry::{HeartbeatOutcome, WorkerRegistry};
+use crate::server::members::MEMBER_NO_LONGER_ENROLLED;
 #[cfg(feature = "dashboard")]
 use crate::server::DashboardTx;
 #[cfg(feature = "p2p")]
@@ -54,7 +55,7 @@ use crate::server::{
     failover_superseded_session, feature_announcement, handle_client_connection,
     handle_oversized_master_message, handle_session_task_message,
     handle_worker_disconnect_with_broadcast, handle_worker_evacuate_with_broadcast,
-    handle_worker_revoked_with_broadcast, reject_master_role_claim, resolve_terminal_waiters,
+    handle_workers_revoked_with_broadcast, reject_master_role_claim, resolve_terminal_waiters,
     send_refusal_and_drain, serve_worker_blob_request, AbortOnDrop, BlobService, MasterAuthContext,
     WaiterMap,
 };
@@ -657,7 +658,9 @@ impl<
         // Design 0051 D5, revocation step 1: a member connection registers itself, on whatever
         // lane, before it serves anything, and only then re-checks that its key is still a member.
         // `RevokeMember` removes the member first and closes the registry second, so a connection
-        // is either closed by the revocation or refused here.
+        // is either cancelled by the revocation or refused here. A cancelled handler stops at its
+        // next await, not at once; the worker-id claim in `register` therefore refuses a
+        // non-member by itself.
         let member_conn = match v3_peer.as_ref() {
             Some(peer) if peer.purpose == HandshakePurpose::Member => {
                 #[cfg(feature = "p2p")]
@@ -673,7 +676,7 @@ impl<
                         lane = lane.as_str(),
                         "Closing the connection of a member revoked while it authenticated"
                     );
-                    return Err(GridError::AuthFailed("member is no longer enrolled".into()));
+                    return Err(GridError::AuthFailed(MEMBER_NO_LONGER_ENROLLED.into()));
                 }
                 Some(guard)
             }
@@ -931,22 +934,24 @@ impl<
         let session_id = registration.session_id;
 
         // A `Register` whose handshake authenticated before its member was revoked (or its
-        // enrollment rolled back) can claim the worker id after that commit (design 0051 D5, known
-        // limit 5). The claim was taken under the registry lock, so either `RevokeMember` saw it
-        // and takes this worker down, or the member is already gone here: undo the registration
-        // and its claim, and refuse.
+        // enrollment rolled back) can reach the claim after that commit (design 0051 D5, known
+        // limit 5). The claim itself refuses a non-member under the member store lock, which orders
+        // it against the revocation: a claim taken before it is returned by `revoke_member`, and
+        // `RevokeMember` takes this worker down. This re-check is only a backstop, and it can be
+        // skipped: a revocation cancels this handler, which stops at its next await (the claim's
+        // flush above, for instance) without running it.
         if let Some(peer) = v3_peer.filter(|p| !auth_ctx.members.contains(&p.public_key)) {
             warn!(
                 worker_id = %worker_id,
                 member_id = %peer.member_id,
                 "Refusing Register from a member removed while it registered"
             );
-            handle_worker_revoked_with_broadcast(
+            handle_workers_revoked_with_broadcast(
                 &registry,
                 &queue,
                 &scheduler_notify,
                 &waiters,
-                &worker_id,
+                &[worker_id],
                 "Member removed while its worker registered",
                 #[cfg(feature = "dashboard")]
                 broadcast_tx.as_ref(),
@@ -961,10 +966,10 @@ impl<
                 heartbeat_interval_secs: 0,
                 protocol_version: PROTOCOL_VERSION_CURRENT,
                 features: ProtocolCapabilities::empty(),
-                message: Some("member is no longer enrolled".into()),
+                message: Some(MEMBER_NO_LONGER_ENROLLED.into()),
             };
             pre_auth.send_handshake_refusal(&reject_ack).await;
-            return Err(GridError::AuthFailed("member is no longer enrolled".into()));
+            return Err(GridError::AuthFailed(MEMBER_NO_LONGER_ENROLLED.into()));
         }
 
         // The session speaks the version the worker registered with (design 0083 D2): the accepted

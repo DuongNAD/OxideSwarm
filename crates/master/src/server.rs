@@ -60,7 +60,7 @@ pub(crate) use tasks_and_blobs::DashboardTx;
 pub(crate) use tasks_and_blobs::{
     admit_blob_task, apply_mobile_telemetry, cancel_task_and_notify, failover_superseded_session,
     feature_announcement, handle_oversized_master_message, handle_session_task_message,
-    handle_worker_revoked_with_broadcast, prune_closed_waiters, resolve_terminal_waiters,
+    handle_workers_revoked_with_broadcast, prune_closed_waiters, resolve_terminal_waiters,
     serve_worker_blob_request, BlobService,
 };
 pub use tasks_and_blobs::{

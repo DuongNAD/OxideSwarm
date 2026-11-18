@@ -2334,11 +2334,12 @@ async fn test_handle_worker_revoked_requeues_at_once_and_drops_checkpoints() {
         .await
         .unwrap());
 
-    let affected: HashSet<TaskId> = queue
-        .handle_worker_revoked(&revoked, "member revoked")
-        .await
-        .into_iter()
-        .collect();
+    let swept = queue
+        .handle_workers_revoked(&[revoked], "member revoked")
+        .await;
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept[0].0, revoked);
+    let affected: HashSet<TaskId> = swept[0].1.iter().copied().collect();
     assert_eq!(affected, HashSet::from([held, running]));
 
     for tid in [held, running] {
@@ -2413,7 +2414,7 @@ async fn test_handle_worker_revoked_dropped_checkpoint_stays_dropped_after_crash
         )
         .await
         .unwrap();
-        q.handle_worker_revoked(&revoked, "member revoked").await;
+        q.handle_workers_revoked(&[revoked], "member revoked").await;
         assert!(q.get_checkpoint(&tid).await.is_none());
         // A crash: no shutdown compaction.
         drop(q);
@@ -2435,5 +2436,93 @@ async fn test_handle_worker_revoked_dropped_checkpoint_stays_dropped_after_crash
         q2.get_checkpoint(&kept_tid).await.map(|cp| cp.sequence),
         Some(5),
         "another worker's checkpoint survives the replay"
+    );
+}
+
+/// A retrying task whose last failed attempt ran on a revoked worker loses the checkpoint it
+/// carries; one whose last failure was on another worker keeps it. Several workers of one member
+/// are swept in one call and reported per worker.
+#[tokio::test]
+async fn test_handle_workers_revoked_drops_checkpoints_of_tasks_last_failed_on_them() {
+    let queue = TaskQueue::with_config(
+        RetryPolicy {
+            retry_on_worker_disconnect: true,
+            initial_backoff_ms: 60_000,
+            ..RetryPolicy::default()
+        },
+        None,
+    );
+    let revoked = Uuid::new_v4();
+    let revoked_too = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+
+    // Each worker ran a task that checkpointed, then disconnected without a session resume.
+    let mut retrying = Vec::new();
+    for (session, worker) in [(1u64, revoked), (2u64, kept)] {
+        let tid = queue.submit(echo_task("retrying")).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(tid, worker, session)])
+            .await;
+        queue
+            .mark_running_from(worker, Some(session), &tid)
+            .await
+            .unwrap();
+        assert!(queue
+            .record_checkpoint_from(
+                worker,
+                Some(session),
+                tid,
+                CheckpointData::new(3, b"c".to_vec())
+            )
+            .await
+            .unwrap());
+        queue
+            .handle_session_disconnected(&worker, Some(session), "drop", false)
+            .await;
+        assert_eq!(
+            queue.get_task(&tid).await.unwrap().state,
+            TaskState::Retrying
+        );
+        retrying.push(tid);
+    }
+    let (last_failed_on_revoked, last_failed_on_kept) = (retrying[0], retrying[1]);
+
+    // The member's second worker runs a task when it is revoked.
+    let running = queue.submit(echo_task("running")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(running, revoked_too, 7)])
+        .await;
+    queue
+        .mark_running_from(revoked_too, Some(7), &running)
+        .await
+        .unwrap();
+
+    let swept = queue
+        .handle_workers_revoked(&[revoked, revoked_too], "member revoked")
+        .await;
+    assert_eq!(
+        swept,
+        vec![(revoked, Vec::new()), (revoked_too, vec![running])],
+        "the retrying task changes no state; the running one is requeued"
+    );
+    assert!(queue
+        .get_checkpoint(&last_failed_on_revoked)
+        .await
+        .is_none());
+    assert_eq!(
+        queue.get_task(&last_failed_on_revoked).await.unwrap().state,
+        TaskState::Retrying
+    );
+    assert_eq!(
+        queue
+            .get_checkpoint(&last_failed_on_kept)
+            .await
+            .map(|cp| cp.sequence),
+        Some(3),
+        "a task whose last failure was on another worker keeps its checkpoint"
+    );
+    assert_eq!(
+        queue.get_task(&running).await.unwrap().state,
+        TaskState::Queued
     );
 }

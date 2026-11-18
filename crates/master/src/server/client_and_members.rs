@@ -26,9 +26,8 @@ use crate::registry::{WorkerInfo, WorkerRegistry};
 use super::handshakes::{check_v3_client_message_role, MasterAuthContext, REFUSAL_DRAIN_TIMEOUT};
 use super::members::{self, MemberStore};
 use super::tasks_and_blobs::{
-    admit_blob_task, cancel_task_and_notify, handle_worker_disconnect_with_broadcast,
-    handle_worker_revoked_with_broadcast, prune_closed_waiters, send_client_response, BlobPipeline,
-    UploadOwner, NO_BLOB_STORE,
+    admit_blob_task, cancel_task_and_notify, handle_workers_revoked_with_broadcast,
+    prune_closed_waiters, send_client_response, BlobPipeline, UploadOwner, NO_BLOB_STORE,
 };
 use super::WaiterMap;
 
@@ -631,6 +630,8 @@ async fn rollback_enrollment_and_disconnect_workers(
         .get(&pubkey)
         .is_some_and(|m| m.has_worker_role());
     if !still_has_worker_role {
+        // Without the worker role these workers cannot register again, so their tasks take the
+        // revocation path: requeued at once, without the resume hold and their checkpoints.
         let mut wids = released_claims;
         for wid in registry.release_workers_owned_by(&member_id).await {
             if !wids.contains(&wid) {
@@ -639,20 +640,18 @@ async fn rollback_enrollment_and_disconnect_workers(
         }
         for wid in &wids {
             registry.release_worker_owner(wid).await;
-            let _ = handle_worker_disconnect_with_broadcast(
-                registry,
-                queue,
-                scheduler_notify,
-                Some(waiters),
-                wid,
-                None,
-                disconnect_reason,
-                true,
-                #[cfg(feature = "dashboard")]
-                broadcast_tx,
-            )
-            .await;
         }
+        handle_workers_revoked_with_broadcast(
+            registry,
+            queue,
+            scheduler_notify,
+            waiters,
+            &wids,
+            disconnect_reason,
+            #[cfg(feature = "dashboard")]
+            broadcast_tx,
+        )
+        .await;
     }
 }
 
@@ -1329,18 +1328,18 @@ where
                     }
                     for wid in &worker_ids {
                         registry.release_worker_owner(wid).await;
-                        handle_worker_revoked_with_broadcast(
-                            registry,
-                            queue,
-                            scheduler_notify,
-                            waiters,
-                            wid,
-                            "Member revoked by admin",
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx,
-                        )
-                        .await;
                     }
+                    handle_workers_revoked_with_broadcast(
+                        registry,
+                        queue,
+                        scheduler_notify,
+                        waiters,
+                        &worker_ids,
+                        "Member revoked by admin",
+                        #[cfg(feature = "dashboard")]
+                        broadcast_tx,
+                    )
+                    .await;
 
                     let disconnected_sessions = closed.len() + usize::from(own_conn.is_some());
                     info!(

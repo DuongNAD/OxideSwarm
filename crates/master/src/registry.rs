@@ -3184,13 +3184,21 @@ mod tests {
     #[tokio::test]
     async fn test_release_non_live_worker_id_propagates_write_error_and_restores_claim() {
         let dir = tempfile::tempdir().unwrap();
-        let members = crate::server::members::MemberStore::load_from_dir(Some(dir.path()))
-            .unwrap()
-            .with_auth_mode(crate::server::members::AuthMode::Both);
+        // v3 claims are refused for keys that are not enrolled, so the v3 owner is a member.
+        let v3_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
+        let members = crate::server::members::MemberStore::from_entries(vec![
+            crate::server::members::MemberEntry::new(
+                "v3-worker",
+                *v3_kp.public_key(),
+                vec![crate::server::members::MemberRole::Worker],
+            ),
+        ])
+        .with_save_path(dir.path().join(crate::server::members::MEMBERS_FILE_NAME))
+        .with_auth_mode(crate::server::members::AuthMode::Both);
         let registry = WorkerRegistry::new();
         let wid_v2 = Uuid::new_v4();
         let wid_v3 = Uuid::new_v4();
-        let v3_member_id = "fedcba9876543210".to_string();
+        let v3_member_id = v3_kp.member_id();
         let (tx, _rx) = mpsc::channel(8);
 
         let reg_v2 = registry

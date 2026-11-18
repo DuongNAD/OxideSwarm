@@ -1312,24 +1312,30 @@ async fn failover_session_tasks(
     .await;
 }
 
-/// Takes a revoked member's worker out of service (design 0051 D5, revocation step 3).
+/// Takes the workers of a member that can never come back (revoked, or an enrollment rolled
+/// back) out of service (design 0051 D5, revocation step 3).
 ///
-/// Unregisters the worker (aborting its session handler if one is still live) and takes back every
-/// task it ran or was held for at once: no session-resume hold, since the member can never
-/// resume them, and without the checkpoints its tasks carry (`TaskQueue::handle_worker_revoked`).
-/// Returns `true` if the worker had a live session.
+/// Unregisters each worker (aborting its session handler if one is still live), then takes back
+/// every task they ran or were held for in one queue sweep: no session-resume hold, since these
+/// workers cannot resume them, and without the checkpoints those tasks carry
+/// (`TaskQueue::handle_workers_revoked`, which compacts the store once). Returns the number of
+/// workers that had a live session.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_worker_revoked_with_broadcast(
+pub(crate) async fn handle_workers_revoked_with_broadcast(
     registry: &WorkerRegistry,
     queue: &TaskQueue,
     scheduler_notify: &tokio::sync::Notify,
     waiters: &WaiterMap,
-    worker_id: &Uuid,
+    worker_ids: &[Uuid],
     reason: &str,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
-) -> bool {
-    let was_live = registry.unregister(worker_id, None).await.unwrap_or(false);
-    if was_live {
+) -> usize {
+    let mut live = 0;
+    for worker_id in worker_ids {
+        if !registry.unregister(worker_id, None).await.unwrap_or(false) {
+            continue;
+        }
+        live += 1;
         warn!(
             worker_id = %worker_id,
             reason = %reason,
@@ -1347,18 +1353,19 @@ pub(crate) async fn handle_worker_revoked_with_broadcast(
             }
         }
     }
-    let affected_tasks = queue.handle_worker_revoked(worker_id, reason).await;
-    publish_failover(
-        queue,
-        scheduler_notify,
-        Some(waiters),
-        worker_id,
-        &affected_tasks,
-        #[cfg(feature = "dashboard")]
-        broadcast_tx,
-    )
-    .await;
-    was_live
+    for (worker_id, affected_tasks) in queue.handle_workers_revoked(worker_ids, reason).await {
+        publish_failover(
+            queue,
+            scheduler_notify,
+            Some(waiters),
+            &worker_id,
+            &affected_tasks,
+            #[cfg(feature = "dashboard")]
+            broadcast_tx,
+        )
+        .await;
+    }
+    live
 }
 
 /// Reports the tasks a failover sweep took back: dashboard updates, waiters of the tasks that

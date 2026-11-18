@@ -18,7 +18,12 @@
 //! member's removal and then calls [`MemberConnections::close_member`], while a connection first
 //! registers and then checks that its key is still a member. Both steps take the registry lock, so
 //! a connection registered after the close sees the removal, and one registered before it is
-//! closed.
+//! cancelled.
+//!
+//! Cancellation is cooperative: a cancelled handler stops at its next await, not at once, and may
+//! finish the step it is in. A worker registration is therefore guarded on its own: the worker-id
+//! claim refuses a key that is no longer a member, under the member store lock that orders it
+//! against the revocation (`MemberStore::claim_worker_id_evicting_deferred`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};

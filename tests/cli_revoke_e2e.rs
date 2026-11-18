@@ -115,12 +115,17 @@ impl Service {
     fn exit_status(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().expect("try_wait")
     }
+
+    /// Kills the process and waits for it to exit (a second call is harmless).
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -145,13 +150,26 @@ impl Member {
 }
 
 /// A master started on loopback with `members.json` listing `members` as `worker,client`.
+///
+/// Fields drop in declaration order, so the processes come before `home` (TEST-33): the master
+/// and its workers are stopped before the master's home is deleted, and `Drop` stops the workers
+/// before the master.
 struct Cluster {
-    home: TempDir,
+    workers: Vec<Service>,
     master: Service,
     addr: String,
     ticket: Option<String>,
     master_pub: PublicKey,
-    workers: Vec<Service>,
+    home: TempDir,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.stop();
+        }
+        self.master.stop();
+    }
 }
 
 impl Cluster {
@@ -219,12 +237,12 @@ impl Cluster {
                 .unwrap()
                 .public_key();
         Self {
-            home,
+            workers: Vec::new(),
             master,
             addr: format!("127.0.0.1:{}", port.unwrap()),
             ticket,
             master_pub,
-            workers: Vec::new(),
+            home,
         }
     }
 
