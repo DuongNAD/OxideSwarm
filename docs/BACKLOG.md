@@ -234,6 +234,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
+| TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3339,6 +3340,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   spinning processes and 200 of 200 next to 40. The old file did not fail here either (200 of 200 at each
   load), so the race was not reproduced locally; the CI log above is the evidence. No other test file reads
   the master's banner lines once after start-up.
+
+### TEST-51: Let the run_master unit tests pick their own port instead of bind-and-drop
+
+- **Evidence:** `cli_app::tests::test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes`
+  (`crates/cli/src/cli_app/tests.rs:792`, "run_master bound and accepted connection") failed in `unit tests
+  (ubuntu-latest)` on 2026-11-18, in the step `cargo test -p rusty_grid_cli --lib --features otel` of pull
+  request 317 (docs only; run `44209756700`, attempt 1, job `134484800892`). The test printed `Failed to start
+  master server: I/O error: Address already in use (os error 98)` before the panic.
+- **Problem:** The test picked the master's port by binding `127.0.0.1:0`, reading the port and dropping the
+  listener, and then started `run_master` on that port. The binary runs its 199 tests in parallel, and
+  another test can take the port in between. Its connect loop was also a one-second window (50 tries, 20 ms
+  apart). The sched2 runtime test (`crates/cli/src/cli_app/runtime_tests.rs`, TEST-49) picked the ports of
+  its two in-process masters the same way.
+- **Do:** Start each in-process master with `--listen 127.0.0.1:0 --port-file <tempdir>/master.port`, wait by
+  condition (30 s bound) until the file holds a port, then wait by condition until `connect_master`
+  succeeds; keep every assertion.
+- **Done when:** The lib test binary of `rusty_grid_cli` passes 50 runs in a row under CPU load.
+- **Implemented (2026-11-18, pull request pending):** Two helpers in `crates/cli/src/cli_app/tests.rs`, shared
+  with `runtime_tests.rs`: `wait_for_master_port` polls the port file every 20 ms and fails with what it
+  waited for when `run_master` ends first or `MASTER_START_BOUND` (30 s) passes, and
+  `connect_master_within_bound` retries `connect_master` until it succeeds or the same bound passes, then
+  fails with the last error. The `--max-active-mb` test and both masters of the sched2 test use them;
+  TEST-49's `wait_for_master_bind` is replaced. Every assertion is kept. On an Apple Silicon Mac (10 cores),
+  the lib test binary of `rusty_grid_cli` (199 tests, default parallel harness) passed 50 of 50 runs in a row
+  next to 4 spinning `yes` processes. The old code was not looped, so the race was not reproduced locally;
+  the CI log above is the evidence. Other tests that pick a port by bind-and-drop and then start a master, a
+  worker or its portal on it were not changed:
+  `crates/cli/tests/discovery_port_e2e.rs` (`free_tcp_port`, `free_udp_port`), `tests/workflow_modes_test.rs`
+  (`two_free_ports`, `free_master_port`, `free_web_port`), `tests/m1_challenger_2_stress.rs` (two dashboard
+  ports), `crates/master/src/server/tests.rs` (the discovery UDP port), `tests/cluster_auth_e2e.rs` (the
+  discovery UDP port) and `crates/worker/src/client/tests.rs` (the standby portal port).
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
