@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - `fuzz/`: three more `cargo fuzz` targets for parsers of untrusted bytes (`LV-18`): `aead_record` (the encrypted record layer, format byte `0x04`, that carries every frame after the handshake), `join_invite` (join tokens, invites and `invite.oxs` files) and `store_journal` (the journal and snapshot readers of `master --state-dir`, through `store::fuzzing` behind a new `fuzzing` Cargo feature of `rusty_grid_master`, off by default), with seeds, regression inputs and three more `fuzz` CI jobs; the JSON-RPC reader of `oxideswarm mcp` is still open. A normal build does not change.
+- The worker test of an oversized task result next to a running task (`test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish`) waits up to 60 s, by condition, for the connection, the Register and both results (was 5 s for both results), with the worker's dead-peer timeout and both task timeouts set past that bound; in the `test` profile the worker hashes the 70 MiB result with BLAKE3 for about 1.3 s on the test's single runtime thread, which a loaded machine stretched past 5 s. A failure now names what it waited for and the results so far (`TEST-53`).
 
 ## [0.4.2] - 2026-11-18
 

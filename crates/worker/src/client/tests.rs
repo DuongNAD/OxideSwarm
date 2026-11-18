@@ -1972,6 +1972,16 @@ async fn test_encrypted_lane_writer_accounts_for_full_25_byte_aead_overhead() {
 
 #[tokio::test]
 async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish() {
+    // Every wait below ends as soon as its condition holds; `WAIT` only turns a hang into a
+    // failure, so it is generous for a starved runner (TEST-53: a 5 s window for both results
+    // ran out under a full `cargo test --workspace --lib`; in the `test` profile the worker
+    // spends about 1.3 s of CPU on this runtime thread hashing the 70 MiB result with BLAKE3 for
+    // `result_ack_token`). The test master is silent after the assignments, so the worker's
+    // dead-peer watchdog (4 heartbeat intervals, 20 s here) and the tasks' own timeouts are set
+    // past `WAIT`: a slow run must not fail through them either.
+    const WAIT: Duration = Duration::from_secs(60);
+    let past_wait = WAIT * 5;
+    let test_started = std::time::Instant::now();
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1981,21 +1991,26 @@ async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_wor
             .with_cores(2)
             .with_sandbox_base_dir(dir.path())
             .with_redirection_portal(false)
-            .with_no_battery(true),
+            .with_no_battery(true)
+            .with_dead_peer_timeout(past_wait),
     );
     let (stop_tx, stop_rx) = watch::channel(false);
     let worker = tokio::spawn(async move { client.run(stop_rx).await });
 
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
         .await
-        .expect("worker connects")
+        .unwrap_or_else(|_| panic!("the worker did not connect within {WAIT:?}"))
         .unwrap();
     let mut master = MessageTransport::new(stream);
     let Some(WorkerMessage::Register { worker_id, .. }) =
-        master.recv_msg::<WorkerMessage>().await.unwrap()
+        tokio::time::timeout(WAIT, master.recv_msg::<WorkerMessage>())
+            .await
+            .unwrap_or_else(|_| panic!("no Register within {WAIT:?} of the connection"))
+            .unwrap()
     else {
         panic!("expected Register");
     };
+    println!("registered after {:?}", test_started.elapsed());
     master
         .send_msg(&MasterMessage::RegisterAck {
             accepted: true,
@@ -2016,7 +2031,7 @@ async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_wor
             should_fail: false,
             require_gpu: false,
         },
-        TaskRequirements::generic(1, 10),
+        TaskRequirements::generic(1, past_wait.as_secs()),
     );
     let oversized_id = oversized_task.id;
 
@@ -2028,7 +2043,7 @@ async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_wor
             should_fail: false,
             require_gpu: false,
         },
-        TaskRequirements::generic(1, 10),
+        TaskRequirements::generic(1, past_wait.as_secs()),
     );
     let sibling_id = sibling_task.id;
 
@@ -2043,41 +2058,74 @@ async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_wor
         .await
         .unwrap();
 
+    // The order does not depend on the clock: the session loop handles the two assignments one
+    // after the other, so the oversized task's 20 ms timer is set before the sibling's 200 ms one
+    // and its result enters the data lane first.
     let mut arrival_order = Vec::new();
+    let mut arrivals = Vec::new();
+    let mut other_messages = Vec::new();
     let mut oversized_outcome = None;
     let mut sibling_outcome = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let waiting_since = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + WAIT;
     while oversized_outcome.is_none() || sibling_outcome.is_none() {
-        match tokio::time::timeout_at(deadline, master.recv_msg::<WorkerMessage>())
-            .await
-            .expect("both tasks finish on the same session")
-            .expect("stream stays open without protocol error")
-        {
-            Some(WorkerMessage::TaskResult {
-                task_id,
-                exit_code,
-                stdout,
-                stderr,
-                error,
-                asset_bytes,
-                ..
-            }) => {
-                arrival_order.push(task_id);
-                if task_id == oversized_id {
-                    oversized_outcome = Some((exit_code, stdout, stderr, error, asset_bytes));
-                } else if task_id == sibling_id {
-                    sibling_outcome = Some((exit_code, error));
+        let stopped =
+            match tokio::time::timeout_at(deadline, master.recv_msg::<WorkerMessage>()).await {
+                Ok(Ok(Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    error,
+                    asset_bytes,
+                    ..
+                }))) => {
+                    let which = if task_id == oversized_id {
+                        "oversized"
+                    } else if task_id == sibling_id {
+                        "sibling"
+                    } else {
+                        "unknown"
+                    };
+                    arrivals.push(format!(
+                        "{which} task {task_id} after {:?}: exit code {exit_code}, error {error:?}",
+                        waiting_since.elapsed()
+                    ));
+                    arrival_order.push(task_id);
+                    if task_id == oversized_id {
+                        oversized_outcome = Some((exit_code, stdout, stderr, error, asset_bytes));
+                    } else if task_id == sibling_id {
+                        sibling_outcome = Some((exit_code, error));
+                    }
+                    continue;
                 }
-            }
-            Some(_) => {}
-            None => panic!("worker disconnected instead of keeping the session alive"),
-        }
+                Ok(Ok(Some(other))) => {
+                    other_messages.push(other.variant_name());
+                    continue;
+                }
+                Ok(Ok(None)) => {
+                    "the worker disconnected instead of keeping the session alive".to_string()
+                }
+                Ok(Err(e)) => format!("the stream failed with a protocol error ({e})"),
+                Err(_) => format!("the bound of {WAIT:?} ran out"),
+            };
+        panic!(
+            "waited for the results of the oversized task {oversized_id} and the sibling task \
+             {sibling_id} on one session, but {stopped} after {:?}; results so far: {arrivals:?}; \
+             other messages: {other_messages:?}",
+            waiting_since.elapsed()
+        );
     }
+    println!(
+        "both results after {:?} ({:?} since the test started): {arrivals:?}",
+        waiting_since.elapsed(),
+        test_started.elapsed()
+    );
 
     assert_eq!(
         arrival_order,
         vec![oversized_id, sibling_id],
-        "oversized result must arrive first before the slower sibling task finishes"
+        "oversized result must arrive first before the slower sibling task finishes: {arrivals:?}"
     );
 
     let (oversized_code, oversized_stdout, oversized_stderr, oversized_err, oversized_asset) =
@@ -2106,8 +2154,13 @@ async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_wor
         "sibling task on the same worker must finish successfully (err: {sibling_err:?})"
     );
 
+    // The sandbox base (`dir`) stays alive until the worker has stopped (TEST-33).
     let _ = stop_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    let stopped = tokio::time::timeout(WAIT, worker).await.is_ok();
+    println!(
+        "worker stopped: {stopped}, {:?} after the test started",
+        test_started.elapsed()
+    );
 }
 
 // ------------------------------------------------------------------------------------------
