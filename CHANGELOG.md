@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The graceful failover stress tests (`TEST-46`) assert that the task is reassigned to the survivor without waiting for the reaper (within 5 s, half its 10 s timeout) instead of within 100 ms or 500 ms, which a starved runner missed; the latency is printed.
 - `ox-mode dev cluster` starts its master with `--discovery-port 0`, so the local dev cluster no longer binds the UDP discovery beacon on the default port 8089, which a real master on the same machine may use (`BUG-26`).
 - The capability-detection handle-leak tests (`TEST-47`) count only their own handles: they run alone against the other tests of their file that open handles (a shared lock) and count from after a warm-up detection, so handles that the first detections allocate once, or that other tests hold, no longer fail them.
+- The dashboard policy tests (`tests/cli_dashboard_policy_e2e.rs`) wait up to 20 s, by condition, for every master log line they check (the dashboard banner and the plain-HTTP warning, which the master prints after it has published its ports) instead of reading the log once right after start-up, which on a slow runner could stop before those lines (`TEST-50`).
 
 ## [0.4.1] - 2026-11-17
 
