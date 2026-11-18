@@ -1,9 +1,16 @@
 name: Release
 
 # On a `v*` tag this builds release archives for Linux, macOS and Windows (with and without
-# `gpu-wgpu`), writes SHA256SUMS and creates the GitHub release. On a pull request that touches this
-# file or the dependency manifests it runs the same build and packaging and keeps the files as
-# workflow artifacts only: no tag, no release.
+# `gpu-wgpu`), writes SHA256SUMS, attests the build provenance of every archive and creates the
+# GitHub release. On a pull request that touches this file or the dependency manifests it runs the
+# same build and packaging and keeps the files as workflow artifacts only: no tag, no release.
+#
+# A manual run (`gh workflow run release.yml --ref <branch> -f mode=attest-only`) builds, writes
+# SHA256SUMS and attests, and creates no release: the publish job runs only for a pushed `v*` tag,
+# and `attest-only` is the only mode. It checks the attestation step without a tag (LV-5). Its
+# attestations stay in the repository and name the branch and commit of the run.
+#
+# Verify an archive: `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` (README, Install).
 
 on:
   push:
@@ -13,6 +20,14 @@ on:
       - '.github/workflows/release.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'attest-only: build, write SHA256SUMS and attest the archives; never create a release'
+        type: choice
+        options: [attest-only]
+        default: attest-only
+        required: true
 
 permissions:
   contents: read
@@ -46,11 +61,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@3cfd829add0beb9cf7406e52147d74ad3db19d01 # 1.96.0
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}-${{ matrix.gpu }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -106,20 +121,27 @@ jobs:
           ls -l dist/out
           echo "archive=${name}.${ext}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.pkg.outputs.archive }}
           path: dist/out/${{ steps.pkg.outputs.archive }}
           if-no-files-found: error
           retention-days: 14
 
+  # Holds the final archives: writes SHA256SUMS and attests the build provenance of every archive
+  # (LV-5). The two write permissions below are the only ones in this workflow besides the publish
+  # job's `contents: write`: `id-token` for the Sigstore signing certificate, `attestations` to store
+  # the attestation in the repository.
   checksums:
     name: SHA256SUMS
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: archives
           merge-multiple: true
@@ -129,7 +151,14 @@ jobs:
           sha256sum oxideswarm-* > SHA256SUMS
           cat SHA256SUMS
           sha256sum -c SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      # One signed SLSA build provenance attestation whose subjects are all archives. A pull request
+      # from a fork gets no id-token, so the step is skipped there.
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: 'archives/oxideswarm-*'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: SHA256SUMS
           path: archives/SHA256SUMS
@@ -145,7 +174,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           merge-multiple: true

@@ -10,6 +10,7 @@ coding agents can send work to: `cargo test`, scripts, compile jobs, file proces
 
 [![Release](https://img.shields.io/github/v/release/DuongNAD/OxideSwarm?style=flat-square&label=release)](https://github.com/DuongNAD/OxideSwarm/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/DuongNAD/OxideSwarm/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/DuongNAD/OxideSwarm/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DuongNAD/OxideSwarm/badge)](https://scorecard.dev/viewer/?uri=github.com/DuongNAD/OxideSwarm)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg?style=flat-square)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg?style=flat-square)](#platform-support)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20server-8A2BE2.svg?style=flat-square)](docs/guides/mcp-client-setup.md)
@@ -115,6 +116,7 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify oxideswarm-0.4.2-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
 tar -xzf oxideswarm-0.4.2-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
 xattr -dr com.apple.quarantine oxideswarm-0.4.2-aarch64-apple-darwin      # macOS only
@@ -125,10 +127,20 @@ oxideswarm --help
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
 (Get-FileHash .\oxideswarm-0.4.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.2-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
 Expand-Archive .\oxideswarm-0.4.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
 [Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.2-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
+
+`gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
+archive's signed build provenance. When it accepts, this exact archive was built on GitHub's runners by a
+workflow of this repository, and the output names the workflow and the commit it was built from. It does
+not prove that the source at that commit is safe or free of bugs. An archive with one changed byte is
+refused. Manual and pull request runs of `release.yml` attest their archives too, so to accept only a
+release build add `--signer-workflow DuongNAD/OxideSwarm/.github/workflows/release.yml --source-ref refs/tags/v0.4.2`.
+Releases published before this check was added (LV-5) have no attestation and are refused; check those
+with `SHA256SUMS` only.
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
 `scripts/` (`install_mac_daemon.sh --bin <PATH>`, `install_windows_service.ps1`) take the unpacked `rusty-grid` binary.
