@@ -48,6 +48,9 @@ fn log_elevated_token_refusal_once(message: &str) {
 
 /// Returns `true` if the current worker process token is elevated (`TokenElevation != 0`).
 pub fn is_process_elevated() -> bool {
+    // SAFETY: `GetCurrentProcess()` returns the current process pseudo-handle;
+    // `OpenProcessToken` yields an owned handle closed once below when non-null, and
+    // `GetTokenInformation` writes `size_of::<TOKEN_ELEVATION>()` bytes into `elev`.
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
@@ -70,6 +73,11 @@ pub fn is_process_elevated() -> bool {
 /// Sets `TokenOwner = user_sid` and merges an explicit `CurrentUser:(GENERIC_ALL | FILE_ALL_ACCESS)`
 /// (`0x101F_01FF`, `NO_INHERITANCE`) allow ACE into `token`'s `TokenDefaultDacl` (never adding
 /// `BUILTIN\Users` or `Everyone`).
+///
+/// # Safety
+/// - `token` must be null (no-op) or a live handle to an opened process/restricted token with
+///   `TOKEN_QUERY` and `TOKEN_ADJUST_DEFAULT` access.
+/// - `user_sid` must point to a valid Win32 `SID` buffer that remains live for this call.
 unsafe fn apply_current_user_owner_and_default_dacl(token: HANDLE, user_sid: PSID) {
     if token.is_null() {
         return;
@@ -157,6 +165,9 @@ fn get_or_init_worker_lua_token() -> Option<HANDLE> {
             }
             ensure_process_token_default_dacl_grants_current_user();
             let user_sid = OwnedSid::current_user().ok()?;
+            // SAFETY: `proc_token` and `restricted_token` are closed once via `CloseHandle`; `user_sid`
+            // borrows a live `OwnedSid` across `apply_current_user_owner_and_default_dacl`; and
+            // `primary_token` stays open for the worker's lifetime in `WORKER_LUA_TOKEN`.
             unsafe {
                 let mut proc_token: HANDLE = std::ptr::null_mut();
                 if OpenProcessToken(
@@ -218,6 +229,9 @@ fn get_or_init_worker_lua_token() -> Option<HANDLE> {
 /// elevated.
 pub(super) fn ensure_process_token_default_dacl_grants_current_user() {
     static DONE: OnceLock<()> = OnceLock::new();
+    // SAFETY: `GetCurrentProcess()` returns the current process pseudo-handle; `token` is
+    // closed once via `CloseHandle`; and `user_sid` borrows a live `OwnedSid` during
+    // `apply_current_user_owner_and_default_dacl`.
     DONE.get_or_init(|| unsafe {
         if !is_process_elevated() {
             return;
@@ -240,12 +254,17 @@ pub(super) fn ensure_process_token_default_dacl_grants_current_user() {
 }
 
 struct WinProcessHandle(HANDLE);
+// SAFETY: `WinProcessHandle` solely owns an OS process handle that is safe to transfer
+// across threads and only closed once in `Drop`.
 unsafe impl Send for WinProcessHandle {}
+// SAFETY: `&WinProcessHandle` only exposes the raw handle for synchronized Win32 waits and
+// termination (`WaitForSingleObject`, `GetExitCodeProcess`, `TerminateProcess`).
 unsafe impl Sync for WinProcessHandle {}
 
 impl Drop for WinProcessHandle {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: `self.0` is an owned non-null child process handle closed once on drop.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -283,6 +302,7 @@ impl AppContainerChild {
 
     pub fn start_kill(&mut self) -> io::Result<()> {
         if !self.exited {
+            // SAFETY: While `!self.exited`, `self.process` retains an open process handle (`self.0`).
             unsafe {
                 let _ = TerminateProcess(self.process.0, 1);
             }
@@ -293,6 +313,8 @@ impl AppContainerChild {
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         drop(self.stdin.take());
         let proc_handle = Arc::clone(&self.process);
+        // SAFETY: `proc_handle` holds an `Arc<WinProcessHandle>` keeping `proc_handle.0` open
+        // across blocking `WaitForSingleObject` and `GetExitCodeProcess(&mut code)`.
         let status = tokio::task::spawn_blocking(move || unsafe {
             let wait_rc = WaitForSingleObject(proc_handle.0, INFINITE);
             if wait_rc != WAIT_OBJECT_0 {
@@ -314,6 +336,7 @@ impl AppContainerChild {
 impl Drop for AppContainerChild {
     fn drop(&mut self) {
         if !self.exited {
+            // SAFETY: `self.process` still keeps the OS process handle open before drop cleanup.
             unsafe {
                 let _ = TerminateProcess(self.process.0, 1);
             }
@@ -440,6 +463,8 @@ fn create_non_inheritable_pipe_pair() -> io::Result<(HANDLE, HANDLE)> {
     };
     let mut read_pipe: HANDLE = std::ptr::null_mut();
     let mut write_pipe: HANDLE = std::ptr::null_mut();
+    // SAFETY: `sa.nLength` equals `size_of::<SECURITY_ATTRIBUTES>()`, `lpSecurityDescriptor` is
+    // null, and `read_pipe`/`write_pipe` receive newly created handles closed or wrapped by callers.
     let ok = unsafe { CreatePipe(&mut read_pipe, &mut write_pipe, &sa, 0) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
@@ -474,6 +499,7 @@ pub(super) fn spawn_with_security_capabilities(
     let (stdout_read, stdout_write) = match create_non_inheritable_pipe_pair() {
         Ok(p) => p,
         Err(e) => {
+            // SAFETY: `stdin_read` and `stdin_write` are newly opened pipe handles closed once here.
             unsafe {
                 CloseHandle(stdin_read);
                 CloseHandle(stdin_write);
@@ -484,6 +510,7 @@ pub(super) fn spawn_with_security_capabilities(
     let (stderr_read, stderr_write) = match create_non_inheritable_pipe_pair() {
         Ok(p) => p,
         Err(e) => {
+            // SAFETY: All four pipe handles created above are still open and closed once here.
             unsafe {
                 CloseHandle(stdin_read);
                 CloseHandle(stdin_write);
@@ -524,6 +551,7 @@ pub(super) fn spawn_with_security_capabilities(
     let cwd_wide = std_cmd.get_current_dir().map(|p| to_wide(p.as_os_str()));
     let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
 
+    // SAFETY: `PROCESS_INFORMATION` is a plain Win32 C struct for which zero-initialization is valid.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = creation_flags
         | EXTENDED_STARTUPINFO_PRESENT
@@ -541,6 +569,7 @@ pub(super) fn spawn_with_security_capabilities(
         let mut inherited_handles: [HANDLE; 3] = [stdin_read, stdout_write, stderr_write];
         let mut inherit_ok = true;
         for &h in &inherited_handles {
+            // SAFETY: Each `h` in `inherited_handles` is a live pipe handle created above and not yet closed.
             if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
                 inherit_ok = false;
                 break;
@@ -551,15 +580,20 @@ pub(super) fn spawn_with_security_capabilities(
             Some(io::Error::last_os_error())
         } else {
             let mut attr_size: usize = 0;
+            // SAFETY: Win32 size query with null list pointer writes required byte count into `attr_size`.
             unsafe {
                 let _ =
                     InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attr_size);
             }
             let mut attr_buf = vec![0u8; attr_size.max(64)];
             let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            // SAFETY: `attr_buf` allocates `attr_size.max(64)` writable bytes (aligned by the system
+            // allocator) matching `attr_size`, and `attr_list` is freed via `DeleteProcThreadAttributeList`.
             if unsafe { InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size) } == 0 {
                 Some(io::Error::last_os_error())
             } else {
+                // SAFETY: `attr_list` was initialized above, and `sc` (size `size_of::<SECURITY_CAPABILITIES>()`
+                // plus its inner capability arrays) borrows from `WindowsAppContainerGuard` across launch.
                 let sc_ok = unsafe {
                     UpdateProcThreadAttribute(
                         attr_list,
@@ -572,6 +606,8 @@ pub(super) fn spawn_with_security_capabilities(
                     )
                 };
                 let hl_ok = if sc_ok != 0 {
+                    // SAFETY: `attr_list` was initialized above and `inherited_handles` stays live until
+                    // `CreateProcessW`/`CreateProcessAsUserW` returns (`3 * size_of::<HANDLE>()` bytes).
                     unsafe {
                         UpdateProcThreadAttribute(
                             attr_list,
@@ -591,6 +627,7 @@ pub(super) fn spawn_with_security_capabilities(
                     Some(io::Error::last_os_error())
                 } else {
                     let mut desktop_wide = desktop_name_wide.to_vec();
+                    // SAFETY: `STARTUPINFOEXW` is a plain Win32 C struct for which all-zero bytes are valid.
                     let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
                     si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
                     si_ex.StartupInfo.lpDesktop = desktop_wide.as_mut_ptr();
@@ -604,6 +641,7 @@ pub(super) fn spawn_with_security_capabilities(
                     // SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX = 0x8003`) so a child
                     // initialization failure exits immediately with a non-zero status instead
                     // of blocking inside `csrss.exe` waiting for an interactive "OK" click.
+                    // SAFETY: `SetErrorMode` takes a bitmask of valid `SEM_*` flags (`0x8003`).
                     unsafe {
                         let _ = SetErrorMode(0x8003);
                     }
@@ -632,6 +670,9 @@ pub(super) fn spawn_with_security_capabilities(
                     #[cfg(not(test))]
                     let lua_token = get_or_init_worker_lua_token();
                     let mut refusal: Option<io::Error> = None;
+                    // SAFETY: Under `WINDOWS_SPAWN_LOCK`, `app_name_wide`, `cmdline`/`lua_cmdline`,
+                    // double-NUL `env_block`, `cwd_wide`, `desktop_wide`, `si_ex` (`attr_list` + `sc` +
+                    // `inherited_handles`), `&mut pi`, and `lua_token` stay live through launch.
                     let spawned = unsafe {
                         match crate::isolation::plan_token_spawn(elevated, lua_token.is_some()) {
                             crate::isolation::TokenSpawnPlan::Lua => {
@@ -713,6 +754,8 @@ pub(super) fn spawn_with_security_capabilities(
                         None
                     }
                 };
+                // SAFETY: `attr_list` was initialized by `InitializeProcThreadAttributeList` above
+                // while `attr_buf` is still live, is no longer referenced, and is destroyed once here.
                 unsafe {
                     DeleteProcThreadAttributeList(attr_list);
                 }
@@ -720,6 +763,8 @@ pub(super) fn spawn_with_security_capabilities(
             }
         };
 
+        // SAFETY: The three child pipe ends are owned solely by this function and closed once in
+        // the parent while `WINDOWS_SPAWN_LOCK` is held.
         unsafe {
             CloseHandle(stdin_read);
             CloseHandle(stdout_write);
@@ -730,6 +775,8 @@ pub(super) fn spawn_with_security_capabilities(
     };
 
     if let Some(err) = spawn_err {
+        // SAFETY: On spawn failure the three parent pipe ends are not wrapped into `File`s and
+        // are closed once here.
         unsafe {
             CloseHandle(stdin_write);
             CloseHandle(stdout_read);
@@ -738,14 +785,19 @@ pub(super) fn spawn_with_security_capabilities(
         return Err(err);
     }
 
+    // SAFETY: Spawn succeeded, so `pi.hThread` is a valid thread handle closed once here.
     unsafe {
         CloseHandle(pi.hThread);
     }
 
+    // SAFETY: On success `stdin_write` is a live parent pipe handle whose sole ownership
+    // transfers to `std::fs::File` here.
     let stdin_file =
         unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stdin_write as _)) };
+    // SAFETY: `stdout_read` is an open parent pipe handle whose sole ownership transfers here.
     let stdout_file =
         unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stdout_read as _)) };
+    // SAFETY: `stderr_read` is an open parent pipe handle whose sole ownership transfers here.
     let stderr_file =
         unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stderr_read as _)) };
 
