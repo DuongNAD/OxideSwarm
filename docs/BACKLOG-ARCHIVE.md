@@ -1937,7 +1937,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
   race (a process still showing the launcher's command line just after the fork) was not seen in 300
   tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
-- **Implemented (2026-11-18, pull request PRNUM):** the cause is the race that pull request 277 suspected.
+- **Implemented (2026-11-18, pull request 338):** the cause is the race that pull request 277 suspected.
   The diagnostics caught it on `macos-latest` on 2026-11-18 (pull request 337, `launcher scripts
   (macos-latest)`): `switch_role.sh master` printed "[ERROR] Master failed to start" with an empty log
   tail, then "[INFO] Stopping master (PID 1431)...", and `master.log` held "RustyGrid Master started on

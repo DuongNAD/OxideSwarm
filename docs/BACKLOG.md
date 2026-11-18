@@ -229,7 +229,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented |  | 267 |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented |  | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented |  | 277 |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Implemented |  | 277, PRNUM |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Implemented |  | 277, 338 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
