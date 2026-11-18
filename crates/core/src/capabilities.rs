@@ -2637,6 +2637,7 @@ mod tests {
     use crate::task::TaskRequirements;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_detect_default() {
         let caps = WorkerCapabilities::detect(None, None, false);
         assert!(!caps.name.is_empty(), "Worker name should not be empty");
@@ -2698,6 +2699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_detect_system_ram_matches_sysinfo_total_memory() {
         // This is the code path Windows relies on (no /proc, no sysctl): the figure must be the
         // OS-reported total, not the old hard-coded 8192 MB fallback.
@@ -2711,6 +2713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_detect_cores_override() {
         let caps = WorkerCapabilities::detect(Some("worker-test".into()), Some(16), false);
         assert_eq!(caps.name, "worker-test");
@@ -2718,6 +2721,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_detect_simulate_gpu() {
         let caps = WorkerCapabilities::detect(Some("gpu-worker".into()), Some(4), true);
         assert_eq!(caps.name, "gpu-worker");
@@ -2728,6 +2732,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn test_capabilities_hardware_overrides() {
         let overrides = HardwareOverrides {
             name: Some("custom-node".into()),
@@ -3172,6 +3177,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_detect_with_blender_overrides() {
         let overrides = HardwareOverrides {
             blender: Some(true),
@@ -3194,6 +3200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_detect_with_vram_and_cuda_overrides() {
         let overrides = HardwareOverrides {
             gpu: Some(true),
@@ -3218,6 +3225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_capabilities_no_gpu_dominates_vram_and_cuda() {
         let overrides = HardwareOverrides {
             no_gpu: true,
@@ -3232,6 +3240,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn test_detect_blender_non_panicking() {
         let (has_blender, ver) = detect_blender(None);
         if has_blender {
@@ -3240,6 +3249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
     fn test_stale_blender_override_returns_none_and_false_without_fallthrough() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("stale_missing_blender_404.exe");
@@ -3672,6 +3682,7 @@ Now drawing from 'AC Power'
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let simple_probe_timeout = if cfg!(windows) {
@@ -3838,6 +3849,7 @@ Now drawing from 'AC Power'
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn test_hung_blender_probe_via_override_times_out_and_reports_no_blender() {
         let dir = tempfile::tempdir().expect("tempdir");
         #[cfg(unix)]
@@ -3890,6 +3902,7 @@ Now drawing from 'AC Power'
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn test_probe_tool_with_timeout_and_host_tool_tags() {
         let dir = tempfile::tempdir().expect("tempdir");
         let simple_timeout = if cfg!(windows) {

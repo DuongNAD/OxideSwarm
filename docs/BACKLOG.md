@@ -363,7 +363,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | In | (design 0056) |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
-| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
+| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340 (open), (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
@@ -1606,6 +1606,12 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
 - **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
 - **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
+- **Note (2026-11-18):** Do steps 2 and 4: pull request 340. `clippy::undocumented_unsafe_blocks`
+  is `deny` in `[workspace.lints.clippy]`, and every crate has `[lints] workspace = true`; the clippy
+  jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
+  rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
+  `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
+  Do step 3 (`#![forbid(unsafe_code)]` in modules without `unsafe`) is not done.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 

@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "OxideSwarm worker: task runner, sandbox, blob cache and optional GPU compute"
 
+[lints]
+workspace = true
+
 [dependencies]
 rusty_grid_core = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

@@ -152,6 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_master_lease_ticket_signing_and_verification() {
         let secret = ClusterSecret::generate().unwrap();
         let cluster_id = Uuid::new_v4();

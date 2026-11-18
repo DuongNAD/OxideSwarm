@@ -6,7 +6,7 @@ on:
   pull_request:
   # Weekly run so that RustSec advisories published against an unchanged Cargo.lock still show up
   # and the ignored live Iroh DERP relay P2P tests run against the public relay network.
-  # Only the audit, p2p-wan-relay and fuzz jobs run on the schedule.
+  # Only the audit, p2p-wan-relay, fuzz and miri jobs run on the schedule.
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -457,3 +457,52 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
+
+  # LV-4 (design 0058 D2): Miri runs the unit tests of rusty_grid_core and reports undefined
+  # behaviour in them, in the `unsafe` code they reach and in the dependencies they call. It uses
+  # the dated nightly of the fuzz job. Not a required check: the owner decides that (LV-4).
+  # MIRIFLAGS=-Zmiri-disable-isolation: a task carries its creation time (chrono::Utc::now), and
+  # the wire layout and window tests read their recorded files; Miri refuses both under isolation.
+  # Skipped, with #[cfg_attr(miri, ignore = "Miri: <reason>")] on each test, because Miri cannot
+  # run C code or most calls into the operating system:
+  #   - "ring detects CPU features in C and assembly": every test that computes an HMAC, an AEAD
+  #     record or a cluster secret (most of cluster_auth, the MAC'd beacons of discovery,
+  #     arbitrage, the AEAD tests of protocol, the Noise key files);
+  #   - "sysinfo queries the host system": capability detection;
+  #   - "opens a network socket": TCP transport and discovery probes;
+  #   - "spawns a process": tool and Blender probes, the `git` check of the wire layout;
+  #   - "creates and opens a FIFO": libc::mkfifo and O_NONBLOCK;
+  #   - "too slow under the interpreter" and "asserts a wall-clock bound": BLAKE3 and manifest
+  #     budgets over large inputs, multi-chunk blob transfer, the source scan of lib.rs.
+  # Linux only: Miri has no kqueue, so on macOS every Tokio test stops at the runtime.
+  miri:
+    name: miri (rusty_grid_core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same retry as the fuzz job (CI-1).
+      - name: pinned nightly toolchain with Miri (retried download)
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4; do
+            if rustup toolchain install nightly-2026-11-10 --profile minimal --component miri,rust-src --no-self-update; then
+              exit 0
+            fi
+            echo "toolchain download failed (attempt $attempt of 4)"
+            sleep $((attempt * 15))
+          done
+          exit 1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly-2026-11-10
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+      - run: cargo miri setup
+      - name: cargo miri test -p rusty_grid_core --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test -p rusty_grid_core --lib --locked

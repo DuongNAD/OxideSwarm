@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "OxideSwarm master: task queue, scheduler, worker registry and dashboard"
 
+[lints]
+workspace = true
+
 [dependencies]
 rusty_grid_core = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
