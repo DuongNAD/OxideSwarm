@@ -1,0 +1,1 @@
+{"id":16,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"task_id":"not-a-uuid"},"name":"cancel"}}

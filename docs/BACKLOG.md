@@ -229,7 +229,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented |  | 267 |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented |  | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented |  | 277 |
-| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | In | 277 |
+| TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Implemented |  | 277, 338 |
 | TEST-36 | Remove the 50 ms bound from the symlink-chain manifest test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-37 | Remove the 100 ms window from the port-file reader test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
@@ -248,6 +248,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  | 318 |
 | TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
+| TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -349,6 +350,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented |  | 299 |
 | BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented |  | 311 |
+| BUG-27 | Compute the result acknowledgement token only when result resume is on | P3 | S |  |  | Implemented |  | 332 |
+| BUG-28 | Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint | P2 | S |  |  | Implemented |  | 334 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -362,7 +365,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
-| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Partial | In | 326, (design 0058) |
+| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | Out |  |
@@ -1114,48 +1117,6 @@ none needs a design record of its own.
   `tests/test_m1_challenger_hygiene.py` passes, and the status log records what the repository
   page shows as the licence after step 3.
 
-### LV-18: Fuzz targets for the remaining parsers of untrusted bytes
-
-- **Evidence:** Read on 2026-11-18 at `master` `b486137`. `fuzz/` (LV-1, pull request 270) has three
-  targets (`inbound_frame`, `server_handshake`, `tree_manifest`), and `fuzz/README.md` lists the later
-  targets of design 0058 LV-1 as open: the encrypted record reader (`AeadReaderSession::decrypt_frame`
-  in `crates/core/src/protocol/codec.rs`), the join token and the invite (`JoinToken::decode` in
-  `crates/cli/src/join.rs`, `InviteToken::decode` in `crates/cli/src/members_cmd.rs`, the
-  `invite.oxs` file in `crates/cli/src/usb_kit.rs`), the journal reader of the master state store
-  (`read_journal` and `read_snapshot` in `crates/master/src/store.rs`, both private) and the JSON-RPC
-  reader of `oxideswarm mcp` (inline in `run_stdio_server`, `crates/cli/src/mcp.rs`). Exit check E4
-  of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) asks for a fuzz
-  target in CI for every parser of untrusted bytes.
-- **Problem:** These parsers read bytes that another machine or person wrote: every frame after the
-  handshake, a pasted token, a file on a USB stick, the state directory after a crash. Nothing has
-  fed them malformed input at scale. A Poly1305 tag guards the record layer and BLAKE3 hashes guard
-  the journal and the snapshot, so random bytes never reach the decoders behind them.
-- **Do:**
-  1. `aead_record`: the record layer with keys derived from a fixed test session key: a byte stream
-     of a peer without the key, and records sealed by the client side that the fuzzer keeps,
-     damages, drops, replays or cuts. The reader must accept exactly the intact records in order
-     before the first bad one, return each plaintext unchanged, and refuse everything after it.
-  2. `join_invite`: the text piped into `oxideswarm join`, join token and invite payloads with a valid
-     tag or checksum added by the target, and `invite.oxs` files (header, and decryption with a test
-     passphrase when the Argon2id cost is small). Decode, encode, decode gives the same value.
-  3. `store_journal`: the journal and snapshot readers on bytes in memory, raw or with the target
-     writing headers, lengths and hashes around the fuzzer's payloads. The readers are private, so
-     `rusty_grid_master` gets a Cargo feature `fuzzing`, off by default, with `store::fuzzing`;
-     `read_journal` and `read_snapshot` are split into a file read and a parse, with no change in
-     behaviour. The valid prefix must read again without a torn tail, and accepted records and
-     snapshots written again must read back equal.
-  4. The JSON-RPC reader of `oxideswarm mcp`, through a public function that takes one line.
-  5. Seeds, regression inputs, the three targets in the `fuzz` CI matrix (60 s on pull requests,
-     10 minutes weekly), a 5-minute local run of each recorded in `fuzz/README.md`.
-- **Done when:** The four targets build and run in the `fuzz` CI job, and `fuzz/README.md` holds a
-  local run of each with its findings.
-- **Status:** Partial (2026-11-18, pull request 326). Built: `aead_record`, `join_invite` and
-  `store_journal` (steps 1 to 3 and 5), with no finding in 5 minutes each. Open: step 4. No public
-  function takes one line of the MCP reader, and MAINT-2 is splitting `mcp.rs` into submodules now;
-  the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
-  JsonRpcResponse>` cut out of `run_stdio_server`. Also open until it runs: the `fuzz` CI job of the
-  three new targets.
-
 ## Phase 11: findings of the audit of 2026-11-15
 
 These items come from a read-only audit of `master` at `c2462e3` (after 0.2.0 and SCALE-2). Line
@@ -1248,24 +1209,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   2. Decide whether the worker's error message should suggest a fix.
 - **Done when:** The cause is written here, and the owner has decided what to do with the entry.
   This needs the owner's machine.
-
-### TEST-35: Make the `switch_role` launcher test stable on macOS
-
-- **Evidence:** Reproduced twice: pull request 206 on 2026-11-12, and pull request 260 at `9d8b9cc` on
-  2026-11-16 (job `133322408476`, `launcher scripts (macos-latest)`):
-  `ShellLauncherTests.test_switch_role_master_flow_and_tracked_stop` failed with "AssertionError: 1 != 0"
-  on the launcher's return code. Reruns passed.
-- **Problem:** The launcher returned 1 once in a while; the test does not print why.
-- **Do:** Print the launcher's output on failure, then find the cause.
-- **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
-- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
-  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
-  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
-  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
-  The launcher returns 1 only when the master port is in use, the master process is not recognised
-  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
-  race (a process still showing the launcher's command line just after the fork) was not seen in 300
-  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
 
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
@@ -1640,6 +1583,8 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
   request 324, 145 sites documented.
 - **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
+- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
+- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -2243,3 +2188,8 @@ Add one dated line per finished item, newest last.
   16 Partial and 59 Planned; 30 open items In, 45 Out.
 - 2026-11-18: LV-1 Implemented (its fuzz CI job is green on `master`), its text moved to the archive;
   LV-18 Partial (pull request 326, the MCP reader is open); TEST-53 Implemented (pull request 327).
+- 2026-11-18: LV-18 Implemented (pull request 335: the target `mcp_request_line` for the JSON-RPC reader of
+  `oxideswarm mcp`), its text moved to the archive.
+- 2026-11-18: Release `0.4.3` prepared (no wire change; ENROLL-1c revocation across every lane, LV-18, LV-4
+  comments, BUG-27, BUG-28, TEST-35, TEST-53, TEST-54): versions, CHANGELOG with an "Upgrading from 0.4.2"
+  note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.

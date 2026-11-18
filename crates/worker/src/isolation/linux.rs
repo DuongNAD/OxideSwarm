@@ -559,7 +559,8 @@ mod sys {
     }
 
     fn is_dir(fd: &OwnedFd) -> bool {
-        // SAFETY: `st` is valid for writes and `fd` is open.
+        // SAFETY: an all-zero `libc::stat` is a valid value (it holds integers only); `st` is
+        // valid for writes and `fd` is open, because the `&OwnedFd` borrow keeps it open.
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
             libc::fstat(fd.as_raw_fd(), &mut st) == 0
@@ -690,6 +691,10 @@ mod sys {
 
         /// Confines the calling process. Runs between `fork` and `exec`: raw system calls only.
         fn apply(&self) -> io::Result<()> {
+            // `apply` has one caller, the hook that `into_hook` returns, so this is the forked,
+            // single-threaded task leader before `execve`, the context the `# Safety` sections
+            // of `enter_namespaces`, `landlock` and `seccomp` ask for. An error is `errno`
+            // wrapped by `io::Error::last_os_error`, which does not allocate.
             // SAFETY: only raw system calls on data prepared before the fork; no allocation.
             unsafe {
                 if libc::prctl(
@@ -711,6 +716,16 @@ mod sys {
         }
 
         /// Best effort: an empty network namespace, with the task's ids mapped to themselves.
+        ///
+        /// # Safety
+        ///
+        /// Only for [`Confinement::apply`] in the forked task leader before `execve`: the
+        /// namespaces must be the task's, not the worker's, and `CLONE_NEWUSER` needs a
+        /// single-threaded caller (in the multi-threaded worker `unshare` fails with `EINVAL`).
+        /// No pointer precondition: `self.uid_map` and `self.gid_map` were built before the
+        /// fork and are only read. It is an `unsafe fn` so the body can call libc directly; it
+        /// keeps to `unshare` and [`write_proc`] and allocates nothing, so the forked leader may
+        /// call it.
         unsafe fn enter_namespaces(&self) {
             if libc::unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0 {
                 return;
@@ -720,6 +735,19 @@ mod sys {
             write_proc(c"/proc/self/gid_map", &self.gid_map);
         }
 
+        /// Creates the Landlock ruleset, fills it and restricts the calling thread with it.
+        ///
+        /// # Safety
+        ///
+        /// Only for [`Confinement::apply`] in the forked task leader before `execve`:
+        /// `landlock_restrict_self` confines the calling thread for good. No pointer
+        /// precondition: the kernel reads `self.attr_size` bytes of `attr`, a local, and
+        /// [`attr_size`] returns 8, 16 or 24, never more than the 24 bytes of [`RulesetAttr`]
+        /// (`#[repr(C)]`, the layout of `struct landlock_ruleset_attr`). The ruleset descriptor
+        /// is created here and closed here on every path. It is an `unsafe fn` so the body can
+        /// call libc directly; it keeps to `syscall`, `close` and
+        /// [`Confinement::fill_and_restrict`] and allocates nothing, so the forked leader may
+        /// call it.
         unsafe fn landlock(&self) -> io::Result<()> {
             let attr = RulesetAttr {
                 handled_access_fs: self.handled_fs,
@@ -741,6 +769,20 @@ mod sys {
             outcome
         }
 
+        /// Adds the policy's rules and the leader's own `/proc/self` entries to `ruleset`, then
+        /// restricts the calling thread with it.
+        ///
+        /// # Safety
+        ///
+        /// `ruleset` must be an open Landlock ruleset descriptor that the caller owns and closes
+        /// after the call ([`Confinement::landlock`]). Only for the forked task leader before
+        /// `execve`, as for `landlock`. Every other descriptor is open for the call: those of
+        /// `self.rules` are `OwnedFd`s that `self` owns (the forked child holds copies of them),
+        /// and each `/proc/self` descriptor is opened here and closed here before `?` can return.
+        /// An all-zero `libc::stat` is a valid value (integers only), and `fstat` writes into
+        /// that local. It is an `unsafe fn` so the body can call libc directly; it keeps to
+        /// `open`, `fstat`, `close`, `syscall` and [`add_rule`] and allocates nothing, so the
+        /// forked leader may call it.
         unsafe fn fill_and_restrict(&self, ruleset: libc::c_int) -> io::Result<()> {
             for rule in &self.rules {
                 add_rule(ruleset, rule.access, rule.fd.as_raw_fd())?;
@@ -777,6 +819,21 @@ mod sys {
             Ok(())
         }
 
+        /// Installs the seccomp filter `self.filter` on the calling thread.
+        ///
+        /// # Safety
+        ///
+        /// Only for [`Confinement::apply`] in the forked task leader before `execve` (after
+        /// `PR_SET_NO_NEW_PRIVS`, without which `prctl` fails with `EACCES`): the filter binds
+        /// the calling thread for good. No pointer precondition: `program.filter` points at
+        /// `self.filter`, which the `&self` borrow keeps alive for the whole `prctl` call, and
+        /// the kernel copies the program before `prctl` returns, so nothing has to live longer.
+        /// `program.len` is `self.filter.len()` cast to `u16`, never more than the vector holds
+        /// (`build_filter` emits about twenty instructions), and the kernel checks the program
+        /// before it installs it. [`SockFprog`] and [`SockFilter`] are `#[repr(C)]` with the
+        /// layouts of `struct sock_fprog` and `struct sock_filter`. It is an `unsafe fn` so the
+        /// body can call libc directly; it keeps to `prctl` and allocates nothing, so the forked
+        /// leader may call it.
         unsafe fn seccomp(&self) -> io::Result<()> {
             let program = SockFprog {
                 len: self.filter.len() as u16,
@@ -796,6 +853,16 @@ mod sys {
         }
     }
 
+    /// Adds a `LANDLOCK_RULE_PATH_BENEATH` rule granting `access` beneath `fd` to `ruleset`.
+    ///
+    /// # Safety
+    ///
+    /// `ruleset` must be an open Landlock ruleset descriptor and `fd` an open descriptor (an
+    /// `O_PATH` one is enough), both owned or borrowed by the caller for the whole call. The
+    /// kernel reads the 12 bytes of `attr`, a local: [`PathBeneathAttr`] is
+    /// `#[repr(C, packed)]`, the layout of the packed `struct landlock_path_beneath_attr`. It is
+    /// an `unsafe fn` so the body can call libc directly; it keeps to `syscall` and allocates
+    /// nothing, so the forked task leader may call it.
     unsafe fn add_rule(ruleset: libc::c_int, access: u64, fd: libc::c_int) -> io::Result<()> {
         let attr = PathBeneathAttr {
             allowed_access: access,
@@ -815,6 +882,13 @@ mod sys {
     }
 
     /// Writes `data` to a `/proc/self` file, ignoring every failure.
+    ///
+    /// # Safety
+    ///
+    /// No pointer precondition: `path` is NUL-terminated and `data` is valid for `data.len()`
+    /// bytes by their types, and the descriptor opened here is closed here. It is an `unsafe fn`
+    /// so the body can call libc directly; it keeps to `open`, `write` and `close` and allocates
+    /// nothing, so the forked task leader may call it ([`Confinement::enter_namespaces`]).
     unsafe fn write_proc(path: &std::ffi::CStr, data: &[u8]) {
         let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
         if fd >= 0 {

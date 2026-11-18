@@ -76,8 +76,9 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 are open.
 - Releases (2026-11-18): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
-  released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, and `0.4.2` adds
-  `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes. Stability releases with no wire change
+  released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, `0.4.2` adds
+  `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes, and `0.4.3` closes every lane of a
+  revoked member (ENROLL-1c). Stability releases with no wire change
   continue as `0.4.x` (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
   coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
 - What finished means (Accepted, 2026-11-17): an evaluation on ten criteria, a stop line, and one
@@ -125,7 +126,7 @@ links here.
 | Isolation | `--isolation off\|fs\|fs+net` on macOS (`sandbox-exec`, Mach lookups denied by default since SEC-12), Linux (Landlock, seccomp, namespaces) and Windows (AppContainer, with `cargo` and workspaces on a worker that is not elevated, FEAT-3d). A task reads neither `cluster.secret` nor other sandboxes. `--isolation-read-dir` lets a task read a runtime outside its sandbox, such as CUDA or a Python environment (FEAT-3e) | `crates/worker/src/isolation.rs`, designs 0033 and 0074 |
 | Workspaces | `submit --workspace` and the MCP `workspace` field sync a source tree that follows `.gitignore` into a named workspace on a worker, which keeps `target/` between runs. Symbolic links inside the tree and empty directories travel too (W11). Clients reach a master over TCP or a P2P ticket | `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs`, design 0039, [guide](guides/offload-cargo-test.md) |
 | Operations | `oxideswarm doctor` (checks C1 to C8, link kind and blob throughput), the dashboard, Prometheus `GET /metrics` and OTLP trace export (`--features otel`), launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/metrics.rs`, `crates/master/src/otel.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
-| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows, and checks that the Android bridge compiles (AND-5). Every job except `release skew`, `fuzz` and `p2p wan relay` is a required check on `master`. A changed wire layout fails CI without a protocol version bump. Six fuzz targets run in CI (LV-1, LV-18), and a size check caps the Rust source files (MAINT-1) | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs`, `fuzz/`, `scripts/rust-file-size-allowlist.txt` |
+| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows, and checks that the Android bridge compiles (AND-5). Every job except `release skew`, `fuzz` and `p2p wan relay` is a required check on `master`. A changed wire layout fails CI without a protocol version bump. Seven fuzz targets run in CI (LV-1, LV-18), and a size check caps the Rust source files (MAINT-1) | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs`, `fuzz/`, `scripts/rust-file-size-allowlist.txt` |
 
 ### What is missing
 
@@ -155,6 +156,7 @@ number does not fix its content in advance.
 | `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Released on 2026-11-17 at protocol 10 (pull request 280; PROTO-1 to PROTO-4 in pull requests 272 and 274) | Nothing |
 | `0.4.1` | BUG-23 (`oxctl.ps1` stops a master with Ctrl+C) and BUG-24 (a `--state-dir` without file permissions is refused), CI diagnostics (TEST-29) and test fixes (TEST-33, TEST-41) | Released on 2026-11-17, no wire change | Nothing |
 | `0.4.2` | `submit --verify` on the same system by default (VERIFY-1, VERIFY-2, Q89), BUG-25 (a worker hands back a task when its sandbox base is unusable), BUG-26, the mesh hub fix of TEST-27, two worker recovery races (TEST-23, partial) and test fixes (TEST-42 to TEST-52) | Released on 2026-11-18, no wire change | Nothing |
+| `0.4.3` | Revocation closes every connection lane of a member (ENROLL-1c), fuzz targets for every untrusted parser (LV-1, LV-18), SAFETY comments for every `unsafe` site (LV-4), BUG-27, BUG-28, the launcher start race (TEST-35) and test fixes (TEST-50 to TEST-54) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.x`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned. It comes before any item of `0.5.0` is built (Q80) | The exit check under "Stability" |
 | `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The stability release, and the steps under "Before 0.5.0 has items" |
 | `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 and, since 2026-11-17, AX-1 to AX-3 are in the BACKLOG Index (Phase 13) | The first round of ADOPT-1 (Q37) |

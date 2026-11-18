@@ -1199,6 +1199,164 @@ fn send_response_line(out_tx: &mpsc::UnboundedSender<String>, response: &JsonRpc
     }
 }
 
+/// An error response of the line reader, boxed: `JsonRpcResponse` is too large for an `Err`
+/// variant (`clippy::result_large_err`).
+fn error_reply(id: Option<Value>, code: i64, message: impl Into<String>) -> Box<JsonRpcResponse> {
+    Box::new(JsonRpcResponse::error(id, code, message, None))
+}
+
+/// Reads one line of standard input as `run_stdio_server` does before it dispatches (public for
+/// the `mcp_request_line` fuzz target, LV-18).
+///
+/// - `Ok(Some(request))`: a request, or a notification when `request.id` is `None` (the line has
+///   no `id` member; `"id": null` gives `Some(Value::Null)`, a request answered with `"id":
+///   null`). `jsonrpc` is `"2.0"`, `method` is not empty, and `params` is absent, null, an object
+///   or an array.
+/// - `Ok(None)`: no reply: a blank line, or a notification with a wrong `jsonrpc` or `params`.
+/// - `Err(response)`: the error response the server writes.
+#[doc(hidden)]
+pub fn parse_request_line(line: &str) -> Result<Option<JsonRpcRequest>, Box<JsonRpcResponse>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let raw_val: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => return Err(error_reply(None, PARSE_ERROR, format!("Invalid JSON: {e}"))),
+    };
+
+    let Value::Object(mut map) = raw_val else {
+        return Err(error_reply(
+            None,
+            INVALID_REQUEST,
+            "JSON-RPC request must be a JSON object",
+        ));
+    };
+
+    let has_id = map.contains_key("id");
+    let id = map.get("id").cloned();
+    if has_id
+        && !id
+            .as_ref()
+            .is_some_and(|v| v.is_string() || v.is_number() || v.is_null())
+    {
+        return Err(error_reply(
+            None,
+            INVALID_REQUEST,
+            "Request 'id' must be a string, number, or null",
+        ));
+    }
+
+    let method_opt = map
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    let valid_version = map.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let valid_params = map
+        .get("params")
+        .is_none_or(|p| p.is_null() || p.is_object() || p.is_array());
+
+    if !has_id {
+        let Some(method) = method_opt else {
+            return Err(error_reply(
+                None,
+                INVALID_REQUEST,
+                "Missing or invalid 'method' field",
+            ));
+        };
+        if !(valid_version && valid_params) {
+            // Drop messages without an id silently (JSON-RPC 2.0 notifications).
+            return Ok(None);
+        }
+        return Ok(Some(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method,
+            params: map.remove("params"),
+        }));
+    }
+
+    if !valid_version {
+        return Err(error_reply(
+            id,
+            INVALID_REQUEST,
+            "Protocol version must be '2.0'",
+        ));
+    }
+
+    let Some(method) = method_opt else {
+        return Err(error_reply(
+            id,
+            INVALID_REQUEST,
+            "Missing or invalid 'method' field",
+        ));
+    };
+
+    if !valid_params {
+        return Err(error_reply(
+            id,
+            INVALID_REQUEST,
+            "Request 'params' must be an object or array",
+        ));
+    }
+
+    Ok(Some(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id,
+        method,
+        params: map.remove("params"),
+    }))
+}
+
+/// The checks `run_stdio_server` applies to the `params` of a `tools/call` request (`id` is the
+/// request's id) before it dispatches the call: the tool name, the arguments (absent or null is
+/// `{}`) and [`validate_tool_arguments`]. `Ok` is the tool name and its arguments; `Err` is the
+/// error response the server writes. Public for the `mcp_request_line` fuzz target (LV-18).
+#[doc(hidden)]
+pub fn parse_tool_call(
+    id: &Option<Value>,
+    params: &Value,
+) -> Result<(String, Value), Box<JsonRpcResponse>> {
+    let Some(params_obj) = params.as_object() else {
+        return Err(error_reply(
+            id.clone(),
+            INVALID_PARAMS,
+            "tools/call 'params' must be a JSON object",
+        ));
+    };
+    let Some(name) = params_obj
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return Err(error_reply(
+            id.clone(),
+            INVALID_PARAMS,
+            "Missing or invalid 'name' in tools/call parameters",
+        ));
+    };
+
+    let arguments = match params_obj.get("arguments") {
+        None | Some(Value::Null) => json!({}),
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => {
+            return Err(error_reply(
+                id.clone(),
+                INVALID_PARAMS,
+                "Tool 'arguments' must be a JSON object",
+            ));
+        }
+    };
+
+    if let Err(err_msg) = validate_tool_arguments(&name, &arguments) {
+        return Err(error_reply(id.clone(), INVALID_PARAMS, err_msg));
+    }
+    Ok((name, arguments))
+}
+
 /// Runs the MCP server in stdio mode, using a reader loop, a dedicated writer task, and one
 /// spawned task per `tools/call`.
 pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
@@ -1243,169 +1401,83 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
             }
         };
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let raw_val: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let err_resp =
-                    JsonRpcResponse::error(None, PARSE_ERROR, format!("Invalid JSON: {e}"), None);
+        let JsonRpcRequest {
+            id, method, params, ..
+        } = match parse_request_line(&line) {
+            Ok(Some(request)) => request,
+            Ok(None) => continue,
+            Err(err_resp) => {
                 send_response_line(&out_tx, &err_resp);
                 continue;
             }
         };
 
-        let Some(map) = raw_val.as_object() else {
-            let err_resp = JsonRpcResponse::error(
-                None,
-                INVALID_REQUEST,
-                "JSON-RPC request must be a JSON object",
-                None,
-            );
-            send_response_line(&out_tx, &err_resp);
-            continue;
-        };
-
-        let has_id = map.contains_key("id");
-        let id = map.get("id").cloned();
-        if has_id
-            && !id
-                .as_ref()
-                .is_some_and(|v| v.is_string() || v.is_number() || v.is_null())
-        {
-            let err_resp = JsonRpcResponse::error(
-                None,
-                INVALID_REQUEST,
-                "Request 'id' must be a string, number, or null",
-                None,
-            );
-            send_response_line(&out_tx, &err_resp);
-            continue;
-        }
-
-        let method_opt = map
-            .get("method")
-            .and_then(Value::as_str)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
-        let valid_version = map.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-        let valid_params = map
-            .get("params")
-            .is_none_or(|p| p.is_null() || p.is_object() || p.is_array());
-
-        if !has_id {
-            if let Some(ref method) = method_opt {
-                if valid_version && valid_params {
-                    match method.as_str() {
-                        "notifications/initialized" => {
-                            eprintln!(
-                                "[mcp] Client handshake completed: notifications/initialized received"
-                            );
-                        }
-                        "notifications/cancelled" => {
-                            let params = map.get("params").cloned().unwrap_or(Value::Null);
-                            if let Some(req_id) =
-                                params.get("requestId").or_else(|| params.get("id"))
-                            {
-                                if let Some(key) = request_id_key(req_id) {
-                                    let maybe_tid = {
-                                        let guard = in_flight.lock().await;
-                                        if let Some(call) = guard.get(&key) {
-                                            call.client_cancelled
-                                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                                            let _ = call.cancel_tx.send(true);
-                                            Some(Arc::clone(&call.submitted_task_id))
-                                        } else {
-                                            None
-                                        }
-                                    };
-                                    let (task_to_cancel, was_in_flight) =
-                                        if let Some(tid_mutex) = maybe_tid {
-                                            (*tid_mutex.lock().await, true)
-                                        } else {
-                                            let mut guard = completed_submits.lock().await;
-                                            let tid = guard
-                                                .iter()
-                                                .rposition(|(k, _)| k == &key)
-                                                .and_then(|pos| guard.remove(pos))
-                                                .map(|(_, tid)| tid);
-                                            (tid, false)
-                                        };
-                                    if let Some(task_id) = task_to_cancel {
-                                        let state_clone = Arc::clone(&state);
-                                        tokio::spawn(async move {
-                                            if !was_in_flight {
-                                                // Post-reply cancel (design 0030): only cancel if the task is
-                                                // still non-terminal on the master.
-                                                let is_active = matches!(
-                                                    state_clone
-                                                        .request(&ClientMessage::GetTaskStatus {
-                                                            task_id
-                                                        })
-                                                        .await,
-                                                    Ok(ClientResponse::TaskStatusInfo {
-                                                        status,
-                                                        ..
-                                                    }) if !status.is_terminal()
-                                                );
-                                                if !is_active {
-                                                    return;
-                                                }
-                                            }
-                                            let _ = state_clone
-                                                .request(&ClientMessage::CancelTask { task_id })
-                                                .await;
-                                        });
-                                    }
+        if id.is_none() {
+            match method.as_str() {
+                "notifications/initialized" => {
+                    eprintln!(
+                        "[mcp] Client handshake completed: notifications/initialized received"
+                    );
+                }
+                "notifications/cancelled" => {
+                    let params = params.unwrap_or(Value::Null);
+                    if let Some(req_id) = params.get("requestId").or_else(|| params.get("id")) {
+                        if let Some(key) = request_id_key(req_id) {
+                            let maybe_tid = {
+                                let guard = in_flight.lock().await;
+                                if let Some(call) = guard.get(&key) {
+                                    call.client_cancelled
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    let _ = call.cancel_tx.send(true);
+                                    Some(Arc::clone(&call.submitted_task_id))
+                                } else {
+                                    None
                                 }
+                            };
+                            let (task_to_cancel, was_in_flight) = if let Some(tid_mutex) = maybe_tid
+                            {
+                                (*tid_mutex.lock().await, true)
+                            } else {
+                                let mut guard = completed_submits.lock().await;
+                                let tid = guard
+                                    .iter()
+                                    .rposition(|(k, _)| k == &key)
+                                    .and_then(|pos| guard.remove(pos))
+                                    .map(|(_, tid)| tid);
+                                (tid, false)
+                            };
+                            if let Some(task_id) = task_to_cancel {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if !was_in_flight {
+                                        // Post-reply cancel (design 0030): only cancel if the task is
+                                        // still non-terminal on the master.
+                                        let is_active = matches!(
+                                            state_clone
+                                                .request(&ClientMessage::GetTaskStatus {
+                                                    task_id
+                                                })
+                                                .await,
+                                            Ok(ClientResponse::TaskStatusInfo {
+                                                status,
+                                                ..
+                                            }) if !status.is_terminal()
+                                        );
+                                        if !is_active {
+                                            return;
+                                        }
+                                    }
+                                    let _ = state_clone
+                                        .request(&ClientMessage::CancelTask { task_id })
+                                        .await;
+                                });
                             }
                         }
-                        _ => {}
                     }
                 }
-                // Drop messages without an id silently (JSON-RPC 2.0 notifications).
-                continue;
-            } else {
-                let err_resp = JsonRpcResponse::error(
-                    None,
-                    INVALID_REQUEST,
-                    "Missing or invalid 'method' field",
-                    None,
-                );
-                send_response_line(&out_tx, &err_resp);
-                continue;
+                _ => {}
             }
-        }
-
-        if !valid_version {
-            let err_resp =
-                JsonRpcResponse::error(id, INVALID_REQUEST, "Protocol version must be '2.0'", None);
-            send_response_line(&out_tx, &err_resp);
-            continue;
-        }
-
-        let Some(method) = method_opt else {
-            let err_resp = JsonRpcResponse::error(
-                id,
-                INVALID_REQUEST,
-                "Missing or invalid 'method' field",
-                None,
-            );
-            send_response_line(&out_tx, &err_resp);
-            continue;
-        };
-
-        if !valid_params {
-            let err_resp = JsonRpcResponse::error(
-                id,
-                INVALID_REQUEST,
-                "Request 'params' must be an object or array",
-                None,
-            );
-            send_response_line(&out_tx, &err_resp);
+            // Drop messages without an id silently (JSON-RPC 2.0 notifications).
             continue;
         }
 
@@ -1442,53 +1514,14 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                 send_response_line(&out_tx, &resp);
             }
             "tools/call" => {
-                let params = map.get("params").cloned().unwrap_or(Value::Null);
-                let Some(params_obj) = params.as_object() else {
-                    let resp = JsonRpcResponse::error(
-                        id,
-                        INVALID_PARAMS,
-                        "tools/call 'params' must be a JSON object",
-                        None,
-                    );
-                    send_response_line(&out_tx, &resp);
-                    continue;
-                };
-                let Some(name) = params_obj
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                else {
-                    let resp = JsonRpcResponse::error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing or invalid 'name' in tools/call parameters",
-                        None,
-                    );
-                    send_response_line(&out_tx, &resp);
-                    continue;
-                };
-
-                let arguments = match params_obj.get("arguments") {
-                    None | Some(Value::Null) => json!({}),
-                    Some(v) if v.is_object() => v.clone(),
-                    Some(_) => {
-                        let resp = JsonRpcResponse::error(
-                            id,
-                            INVALID_PARAMS,
-                            "Tool 'arguments' must be a JSON object",
-                            None,
-                        );
+                let params = params.unwrap_or(Value::Null);
+                let (name, arguments) = match parse_tool_call(&id, &params) {
+                    Ok(call) => call,
+                    Err(resp) => {
                         send_response_line(&out_tx, &resp);
                         continue;
                     }
                 };
-
-                if let Err(err_msg) = validate_tool_arguments(&name, &arguments) {
-                    let resp = JsonRpcResponse::error(id, INVALID_PARAMS, err_msg, None);
-                    send_response_line(&out_tx, &resp);
-                    continue;
-                }
 
                 let id_key = id.as_ref().and_then(request_id_key);
                 if let Some(ref key) = id_key {
@@ -1678,6 +1711,99 @@ mod tests {
     use super::submit::{format_completed_task_result, WORKER_TRUNCATION_NOTICE};
     use super::*;
     use clap::Parser;
+
+    /// The reply line the server writes for `line`, or `None` when it writes nothing.
+    fn reply_to(line: &str) -> Result<Option<JsonRpcRequest>, String> {
+        parse_request_line(line).map_err(|resp| serde_json::to_string(&resp).expect("serialize"))
+    }
+
+    // LV-18: the expected lines are the replies of `oxideswarm mcp` built from `master` at
+    // `3a0f7c5`, before `parse_request_line` was cut out of `run_stdio_server`.
+    #[test]
+    fn test_parse_request_line_matches_the_server_before_the_cut() {
+        let request = reply_to(
+            r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        )
+        .expect("a valid request")
+        .expect("not dropped");
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.id, Some(json!(3)));
+        assert_eq!(request.method, "initialize");
+        assert_eq!(
+            request.params,
+            Some(json!({"protocolVersion": "2024-11-05"}))
+        );
+
+        assert_eq!(
+            reply_to("not json").unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON: expected ident at line 1 column 2"}}"#
+        );
+        assert_eq!(
+            reply_to(r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#).unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Protocol version must be '2.0'"}}"#
+        );
+        assert_eq!(
+            reply_to(r#"{"jsonrpc":"2.0","id":"a","method":"ping","params":5}"#).unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":"a","error":{"code":-32600,"message":"Request 'params' must be an object or array"}}"#
+        );
+        assert_eq!(
+            reply_to(r#"{"jsonrpc":"2.0","id":true,"method":"ping"}"#).unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Request 'id' must be a string, number, or null"}}"#
+        );
+        assert_eq!(
+            reply_to(r#"{"jsonrpc":"2.0","method":5}"#).unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Missing or invalid 'method' field"}}"#
+        );
+
+        // No reply: a blank line, and a notification with a wrong version or params.
+        assert!(reply_to("   ").unwrap().is_none());
+        assert!(
+            reply_to(r#"{"jsonrpc":"1.0","method":"notifications/initialized"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(reply_to(r#"{"jsonrpc":"2.0","method":"x","params":"s"}"#)
+            .unwrap()
+            .is_none());
+
+        // A notification has no id; `"id": null` is a request answered with `"id": null`.
+        let note = reply_to(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.id, None);
+        let null_id = reply_to(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(null_id.id, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_parse_tool_call_matches_the_server_before_the_cut() {
+        let id = Some(json!(13));
+        let reply = |params: Value| {
+            parse_tool_call(&id, &params)
+                .map_err(|resp| serde_json::to_string(&resp).expect("serialize"))
+        };
+        assert_eq!(
+            reply(json!({"name": "status", "arguments": {"workers": true}})).unwrap(),
+            ("status".to_string(), json!({"workers": true}))
+        );
+        assert_eq!(
+            reply(json!({"name": "workspaces", "arguments": null})).unwrap(),
+            ("workspaces".to_string(), json!({}))
+        );
+        assert_eq!(
+            reply(Value::Null).unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":13,"error":{"code":-32602,"message":"tools/call 'params' must be a JSON object"}}"#
+        );
+        assert_eq!(
+            reply(
+                json!({"name": "submit", "arguments": {"isolation": "bogus", "command": "echo"}})
+            )
+            .unwrap_err(),
+            r#"{"jsonrpc":"2.0","id":13,"error":{"code":-32602,"message":"Invalid placement constraints: unknown isolation level 'bogus' (expected off, fs or fs+net)"}}"#
+        );
+    }
 
     #[test]
     fn test_submit_isolation_argument_is_a_minimum_level_placement() {

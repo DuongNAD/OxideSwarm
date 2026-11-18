@@ -3458,7 +3458,7 @@ async fn test_outbox_retains_result_across_aborted_flush_until_result_ack() {
     let token = master_features::result_ack_token(&res);
     {
         let mut outbox = client.pending_resume_outbox.lock().unwrap();
-        outbox.push_result(BufferedTaskResult::new(task, res, None, false));
+        outbox.push_result(BufferedTaskResult::new(task, res, token, None, false));
     }
     assert_eq!(client.resumable_task_ids().await, vec![task_id]);
 
@@ -3511,6 +3511,7 @@ async fn test_stale_attempt_result_ack_preserves_retry_outbox_and_output_pins() 
         outbox.push_result(BufferedTaskResult::new(
             task.clone(),
             attempt2_res,
+            token2,
             None,
             true,
         ));
@@ -3558,7 +3559,8 @@ fn test_pending_resume_outbox_enforces_byte_budget() {
         ids.push(task.id);
         let payload = format!("chunk-{i}-{}", "x".repeat(600));
         let res = TaskResult::success(worker_id, task.id, payload, 1, false);
-        outbox.push_result(BufferedTaskResult::new(task, res, None, false));
+        let token = master_features::result_ack_token(&res);
+        outbox.push_result(BufferedTaskResult::new(task, res, token, None, false));
     }
 
     assert!(
@@ -3569,6 +3571,34 @@ fn test_pending_resume_outbox_enforces_byte_budget() {
     );
     assert!(outbox.results.len() < 5);
     assert_eq!(outbox.results.last().unwrap().result.task_id, ids[4]);
+}
+
+/// BUG-27: the result acknowledgement token hashes the whole result, `asset_bytes` included,
+/// and only keys the resume outbox. A session without a resume window must not compute it; a
+/// session with one gets exactly `master_features::result_ack_token`, computed once.
+#[test]
+fn test_result_ack_token_is_computed_only_when_resume_is_on() {
+    let task = Task::new(
+        rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
+        TaskRequirements::generic(1, 32),
+    );
+    let mut res = TaskResult::success(Uuid::new_v4(), task.id, "ok", 1, false);
+    res.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![7u8; 64 * 1024]));
+    let calls = std::cell::Cell::new(0u32);
+    let counting_token = |r: &TaskResult| {
+        calls.set(calls.get() + 1);
+        master_features::result_ack_token(r)
+    };
+
+    assert_eq!(resume_ack_token(false, &res, counting_token), None);
+    assert_eq!(calls.get(), 0, "resume off: the token must not be computed");
+
+    assert_eq!(
+        resume_ack_token(true, &res, counting_token),
+        Some(master_features::result_ack_token(&res)),
+        "resume on: the same token as before"
+    );
+    assert_eq!(calls.get(), 1, "resume on: the token is computed once");
 }
 
 #[tokio::test]

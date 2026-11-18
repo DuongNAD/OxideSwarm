@@ -1,0 +1,1 @@
+{"id":8,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"gpu":true,"matrix_dim":256,"type":"gpu","vram_mb":1024,"work_group_size":16},"name":"submit"}}

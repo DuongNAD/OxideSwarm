@@ -1436,6 +1436,57 @@ none needs a design record of its own.
 - **Implemented (2026-11-18):** the `fuzz` CI job runs the three targets green on `master`
   (first green run on `master` at `b486137`); the later targets are LV-18.
 
+### LV-18: Fuzz targets for the remaining parsers of untrusted bytes
+
+- **Evidence:** Read on 2026-11-18 at `master` `b486137`. `fuzz/` (LV-1, pull request 270) has three
+  targets (`inbound_frame`, `server_handshake`, `tree_manifest`), and `fuzz/README.md` lists the later
+  targets of design 0058 LV-1 as open: the encrypted record reader (`AeadReaderSession::decrypt_frame`
+  in `crates/core/src/protocol/codec.rs`), the join token and the invite (`JoinToken::decode` in
+  `crates/cli/src/join.rs`, `InviteToken::decode` in `crates/cli/src/members_cmd.rs`, the
+  `invite.oxs` file in `crates/cli/src/usb_kit.rs`), the journal reader of the master state store
+  (`read_journal` and `read_snapshot` in `crates/master/src/store.rs`, both private) and the JSON-RPC
+  reader of `oxideswarm mcp` (inline in `run_stdio_server`, `crates/cli/src/mcp.rs`). Exit check E4
+  of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) asks for a fuzz
+  target in CI for every parser of untrusted bytes.
+- **Problem:** These parsers read bytes that another machine or person wrote: every frame after the
+  handshake, a pasted token, a file on a USB stick, the state directory after a crash. Nothing has
+  fed them malformed input at scale. A Poly1305 tag guards the record layer and BLAKE3 hashes guard
+  the journal and the snapshot, so random bytes never reach the decoders behind them.
+- **Do:**
+  1. `aead_record`: the record layer with keys derived from a fixed test session key: a byte stream
+     of a peer without the key, and records sealed by the client side that the fuzzer keeps,
+     damages, drops, replays or cuts. The reader must accept exactly the intact records in order
+     before the first bad one, return each plaintext unchanged, and refuse everything after it.
+  2. `join_invite`: the text piped into `oxideswarm join`, join token and invite payloads with a valid
+     tag or checksum added by the target, and `invite.oxs` files (header, and decryption with a test
+     passphrase when the Argon2id cost is small). Decode, encode, decode gives the same value.
+  3. `store_journal`: the journal and snapshot readers on bytes in memory, raw or with the target
+     writing headers, lengths and hashes around the fuzzer's payloads. The readers are private, so
+     `rusty_grid_master` gets a Cargo feature `fuzzing`, off by default, with `store::fuzzing`;
+     `read_journal` and `read_snapshot` are split into a file read and a parse, with no change in
+     behaviour. The valid prefix must read again without a torn tail, and accepted records and
+     snapshots written again must read back equal.
+  4. The JSON-RPC reader of `oxideswarm mcp`, through a public function that takes one line.
+  5. Seeds, regression inputs, the three targets in the `fuzz` CI matrix (60 s on pull requests,
+     10 minutes weekly), a 5-minute local run of each recorded in `fuzz/README.md`.
+- **Done when:** The four targets build and run in the `fuzz` CI job, and `fuzz/README.md` holds a
+  local run of each with its findings.
+- **Status:** Partial (2026-11-18, pull request 326). Built: `aead_record`, `join_invite` and
+  `store_journal` (steps 1 to 3 and 5), with no finding in 5 minutes each. Open: step 4. No public
+  function takes one line of the MCP reader, and MAINT-2 is splitting `mcp.rs` into submodules now;
+  the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
+  JsonRpcResponse>` cut out of `run_stdio_server`. Also open until it runs: the `fuzz` CI job of the
+  three new targets.
+- **Implemented (2026-11-18, pull request 335):** step 4. `run_stdio_server` now calls
+  `parse_request_line(line) -> Result<Option<JsonRpcRequest>, Box<JsonRpcResponse>>` (`Ok(None)`: a
+  line that gets no reply) and `parse_tool_call(id, params) -> Result<(String, Value),
+  Box<JsonRpcResponse>>` (the `tools/call` checks, `validate_tool_arguments` included), both
+  `#[doc(hidden)] pub`; the
+  replies to 48 test lines are byte for byte those of `master` `3a0f7c5`. The target
+  `mcp_request_line` with seeds, regression inputs and its `fuzz` CI job; a 5-minute local run
+  (1,752,586 executions, no finding) is in `fuzz/README.md`. The `fuzz` job runs the four LV-18
+  targets on pull request 335.
+
 ## Phase 11: findings of the audit of 2026-11-15
 
 These items come from a read-only audit of `master` at `c2462e3` (after 0.2.0 and SCALE-2). Line
@@ -1920,6 +1971,45 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   50 runs of `tests/run_mesh_simulation_tests.py` and 50 with 12 `yes` CPU burners, all passed. The
   `macos-latest` 50-run loop of "Done when" is not run.
 
+### TEST-35: Make the `switch_role` launcher test stable on macOS
+
+- **Evidence:** Reproduced twice: pull request 206 on 2026-11-12, and pull request 260 at `9d8b9cc` on
+  2026-11-16 (job `133322408476`, `launcher scripts (macos-latest)`):
+  `ShellLauncherTests.test_switch_role_master_flow_and_tracked_stop` failed with "AssertionError: 1 != 0"
+  on the launcher's return code. Reruns passed.
+- **Problem:** The launcher returned 1 once in a while; the test does not print why.
+- **Do:** Print the launcher's output on failure, then find the cause.
+- **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
+- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
+  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
+  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
+  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
+  The launcher returns 1 only when the master port is in use, the master process is not recognised
+  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
+  race (a process still showing the launcher's command line just after the fork) was not seen in 300
+  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
+- **Implemented (2026-11-18, pull request 338):** the cause is the race that pull request 277 suspected.
+  The diagnostics caught it on `macos-latest` on 2026-11-18 (pull request 337, `launcher scripts
+  (macos-latest)`): `switch_role.sh master` printed "[ERROR] Master failed to start" with an empty log
+  tail, then "[INFO] Stopping master (PID 1431)...", and `master.log` held "RustyGrid Master started on
+  fake". `start_tracked` writes the PID right after the fork. Until the child has exec'd the binary, `ps -p
+  PID -o command=` shows the launcher's own command line, so `pid_is_ours` was false and the start loop
+  gave up on its first pass, before the binary had written anything; a moment later `stop_tracked` found
+  the binary under the same PID. The master start loop now ends early only when the process is gone
+  (`kill -0`) and confirms the PID with `pid_is_ours` once the log line is there, so a reused PID still
+  fails the start. The worker checks after `sleep 1` (the master's local worker) and `sleep 2` (the
+  worker role) use the new `wait_until_ours`, which waits within the same 10 s budget (50 checks 0.2 s
+  apart) and fails at once when the process is gone. `pid_is_ours`, used by `stop` and `status`, is
+  unchanged. Three tests in `tests/test_launcher_scripts.py` put a `ps` on the launcher's `PATH` that shows
+  the launcher's command line until the fake binary has run for 3 s: the master and worker tests failed on
+  the old launcher with the CI symptom and pass now; the third checks that a PID whose command line names
+  another program fails the start and is not signalled. With 8 `yes` CPU burners and `PATH="/bin:$PATH"`
+  (bash 3.2.57), `test_switch_role_master_flow_and_tracked_stop` passed 30 of 30 runs with the fix; the
+  old launcher passed 30 of 30 there too, as in the tries of pull request 277, so the window is shown by
+  the `ps` shim, not by load. The `macos-latest` 50-run loop of "Done when" is not run. No other shell
+  launcher checks a command line right after starting a process (`packaging/usb/install.sh` checks only
+  `kill -0` after `sleep 4`).
+
 ### TEST-36: Remove the 50 ms bound from the symlink-chain manifest test
 
 - **Evidence:** Reproduced on the owner's Windows machine under CPU starvation (4 cores, then 2 cores
@@ -2272,6 +2362,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `test_shutdown_requested_resolves_on_flag_or_dropped_sender_only` (2 s) and the Windows-only junk executable
   test (5 s).
 
+### TEST-54: Wait by condition in the mapreduce parallelism test
+
+- **Evidence:** `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure`
+  (`tests/master_limits_and_scheduling.rs`, `rusty_grid_master`) failed twice under heavy load on the owner's
+  Apple Silicon Mac on 2026-11-18 with a 60 s mapper timeout, then passed 8 of 8 runs.
+- **Problem:** The test waited up to 10 s for the worker to register and gave each `MapReduceJobSpec` a 60 s
+  `timeout_secs`, with no outer condition wait. Under heavy CPU contention on the same machine, spawning `sh` and
+  scheduling three sequential 1 s map tasks stalled past the 60 s mapper timeout, failing inside the MapReduce
+  engine without queue diagnostics.
+- **Do:** Replace each wait with a condition wait with a generous bound (`180 s`) that returns as soon as the
+  condition holds, raise the job mapper timeouts strictly above that bound (`540 s`), keep every assertion
+  (including the sequential execution lower bound and error message checks), and stop and join the worker before
+  its sandbox `TempDir` drops.
+- **Done when:** `master_limits_and_scheduling` passes and 50 runs in a row of
+  `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure` pass next to 6 `yes > /dev/null`
+  CPU burners.
+- **Implemented (2026-11-18, pull request 333):** `WAIT` (`180 s`) bounds `wait_for_worker_count_within`, the
+  `"serial"` `execute_mapreduce` call, the `"failing"` `execute_mapreduce` call, and worker shutdown before
+  `TempDir` drop (`TEST-33`); every wait ends as soon as its condition holds. Both `MapReduceJobSpec` jobs pass
+  `mapper_timeout_secs = 540` (`WAIT * 3`), and a timed-out `WAIT` prints `master.queue_stats()`. Every assertion
+  stays intact, and the test prints registration and job timings. Verification on an Apple Silicon Mac (10 cores):
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, full
+  `master_limits_and_scheduling` (5 passed in 4.55 s), and 50 of 50 runs of
+  `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure` next to 6 `yes > /dev/null`
+  processes (`min=3.72s`, `max=27.73s`). Not changed in `tests/master_limits_and_scheduling.rs`:
+  `wait_for_worker_count` (10 s default kept for the other tests), `closed_by_server` (`2 s` / `100–300 ms`
+  probes in connection-budget tests), `wait_task` (`15 s` in GPU backlog test), and
+  `test_mapreduce_tasks_run_on_all_workers_at_once` (`60 s` mapper timeout and `elapsed < 7 s`).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
@@ -2384,6 +2503,66 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   pass `--discovery-port 0`; the change adds no line to `mode_cli.rs`, which is at its allowlisted size.
   While the four dev cluster tests ran on Windows, a watcher listed the UDP endpoints of every `rusty-grid.exe`
   they started: none with this change; `master 127.0.0.1:8089` with the build before it.
+
+### BUG-28: Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint
+
+- **Evidence:** Starting `oxideswarm worker --master <ticket>` with an iroh P2P ticket left `p2p_ticket`
+  unset and logged plain TCP `TcpStream::connect` `"invalid port value"` errors, while `--p2p-ticket <ticket>`
+  worked. `README.md` (`worker --master <ADDR|auto>`) and `worker --help` document only `HOST:8088`, bare `HOST`,
+  and `auto` for `--master`, with `--p2p-ticket <TICKET>` as the worker's P2P ticket flag.
+- **Problem:** `resolve_worker_target` (`crates/cli/src/cli_app/worker.rs`) called `normalize_master_addr`,
+  which returns `is_p2p_ticket` strings verbatim, and cleared `p2p_ticket` whenever an explicit master string
+  was supplied, so the ticket flowed into `WorkerConfig::master_addr` and `WorkerClient::establish_tcp` tried to
+  dial it over TCP.
+- **Do:** Reject P2P tickets (`is_p2p_ticket`) upfront in `resolve_worker_target_from` (`--master`,
+  `RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) with a clear error pointing to `--p2p-ticket`
+  without echoing the raw ticket, write a failing unit test first generating a fresh ticket from `iroh::SecretKey`
+  at runtime, and document the hint in `worker --master` help and `README.md`.
+- **Done when:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  and `cargo test -p rusty_grid_cli --locked --lib` pass, with the new ticket unit tests confirmed failing
+  before the fix.
+- **Implemented (2026-11-18, pull request 334):** `resolve_worker_target_from` checks `is_p2p_ticket` on the
+  selected target source before calling `normalize_master_addr` and returns
+  `"this looks like a P2P ticket; use --p2p-ticket ..."` without interpolating the ticket; `run_worker` exits with
+  `ExitCode::FAILURE` before credential resolution or networking. Both `worker::tests` tests (testing `--master`,
+  `RUSTY_GRID_MASTER_ADDR`, `[worker].master`, `--p2p-ticket`, and `run_worker` with an `EndpointAddr` JSON ticket
+  generated at runtime from `iroh::SecretKey::generate()`) failed before the fix and pass after (`201 passed; 0
+  failed` in `rusty_grid_cli --lib`). Added the hint to `WorkerArgs::master` in `crates/cli/src/cli_app.rs` and
+  `README.md`.
+
+### BUG-27: Compute the result acknowledgement token only when result resume is on
+
+- **Evidence:** Found in TEST-53 (pull request 327): a `sample` of
+  `test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish` put about 1.3 s (1,341
+  samples) of the test's single runtime thread in `master_features::result_ack_token`, which hashes the 70 MiB
+  `asset_bytes` of the oversized result with BLAKE3, unoptimized in the `test` profile. That test's worker has no
+  resume window, so the token it computed was never used.
+- **Problem:** The worker's task runner (`crates/worker/src/client/tasks.rs`) computed the token for every
+  result. Only the session-resume outbox uses it (`PendingResumeOutbox`: the push, `update_result` after an output
+  upload, and `ack_result`), and all three calls already ran only when the session has a resume window
+  (`resume_enabled`: the master announced `session-resume=<secs>` and the worker's grace cap is not 0), so
+  without one the hash was thrown away. With one, `BufferedTaskResult::new` hashed the same result a second time,
+  under the outbox's mutex. The master (`crates/master/src/server/tasks_and_blobs.rs`) also computed the token for
+  every result and sent it (`CancelTask` with `oxs:result-ack:<token>`) only when its session-resume hold is above 0.
+  The worker sends its `TaskResult` the same way with or without the token; the token is never on the wire in it.
+- **Do:** Compute the token on the worker only when the session has a resume window, once, and hand it to
+  `BufferedTaskResult::new`; compute it on the master only when the hold is above 0. Keep the token bytes and
+  every message unchanged.
+- **Done when:** A unit test shows that the token is not computed when resume is off, and that it is the same
+  token, computed once, when resume is on; the worker unit tests and the result resume integration tests pass.
+- **Implemented (2026-11-18, pull request 332):** `resume_ack_token(resume_enabled, &result, token)` in
+  `tasks.rs` returns `None` without calling `token` when resume is off; the runner keeps the token as an
+  `Option<u64>` that is `Some` exactly when `resume_enabled`, and the three outbox calls take it from there.
+  `BufferedTaskResult::new` takes the token from its caller instead of hashing again. The master's `ack_token` is
+  an `Option` computed under the same `session_resume_hold_secs() > 0` test that decided whether to send it. No
+  wire change. Test: `client::tests::test_result_ack_token_is_computed_only_when_resume_is_on` (a counting
+  closure: no call with resume off; one call, returning `master_features::result_ack_token`, with resume on).
+  Not changed: with resume on the hash still runs on the async runtime thread, once after the run, again in
+  `update_result` after an output upload and in the session's resume flush (`session.rs`), both under the
+  outbox's mutex, and once on the master. Moving it to `spawn_blocking` would add an await between the end of the
+  run and the outbox push and would touch all four places, so it is left out. A `master` started from the CLI
+  holds sessions for 30 s by default (`--session-resume-hold-secs`), so resume is on there unless the hold is set
+  to 0; `ServerConfig` (library and tests) defaults to 0.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 

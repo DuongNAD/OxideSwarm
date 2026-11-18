@@ -390,7 +390,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [inbound_frame, server_handshake, tree_manifest, aead_record, join_invite, store_journal]
+        target: [inbound_frame, server_handshake, tree_manifest, aead_record, join_invite, store_journal, mcp_request_line]
     steps:
       - uses: actions/checkout@v7
       # CI-1: the nightly download failed once (run 44036878952); try it up to four times first, so

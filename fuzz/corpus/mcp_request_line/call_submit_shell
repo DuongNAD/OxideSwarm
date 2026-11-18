@@ -1,0 +1,1 @@
+{"id":7,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"interpreter":"sh","script":"echo hi | wc -c","type":"shell"},"name":"submit"}}
