@@ -1453,6 +1453,20 @@ class UsbKitTests(unittest.TestCase):
         check = text.index("Test-SandboxBase $SandboxBase")
         self.assertLess(check, text.index("& $Exe join --no-doctor"), "check the folder before joining")
 
+    def test_windows_installer_refuses_custom_profile_workspace_root_under_isolation_fs(self):
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in (
+            "$allowedProfileWs1 = Join-Path $UserProfileFull 'AppData\\Local\\OxideSwarm-USB\\workspaces'",
+            "$allowedProfileWs2 = Join-Path $UserProfileFull 'AppData\\Local\\OxideSwarm\\usb-kit\\workspaces'",
+            "with -Isolation fs and workspaces:",
+        ):
+            self.assertIn(needle, text)
+        self.assertLess(
+            text.index("$allowedProfileWs1"),
+            text.index("# 2. Create the folder"),
+            "must refuse disallowed profile workspace roots before creating InstallRoot",
+        )
+
     def test_make_kit_and_install_support_isolation_option_and_reject_invalid_values(self):
         bad_kit = self.make_kit(extra=["--isolation", "bogus"])
         self.assertNotEqual(bad_kit.returncode, 0)
@@ -3398,6 +3412,29 @@ public class Program {
             self.assertIn("can rename or change", refused[0])
             self.assertFalse(re.match(r"^\s*\d+\)", refused[0]), "a refused folder must not be offered as a choice")
             self.assertFalse(os.path.exists(default_root), "listing the folders must install nothing")
+
+            # BUG-32: under -Isolation fs and workspaces, install.ps1 stops before creating
+            # InstallRoot when -InstallRoot puts <install>\workspaces inside %USERPROFILE% at any
+            # path other than the two allowlisted USB-kit workspace roots.
+            custom_local_root = os.path.join(tmp_localappdata, "custom-kit")
+            bad_local_res = powershell(
+                install_ps1, "-InstallRoot", custom_local_root, "-Name", "win-bug32a",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart",
+            )
+            self.assertNotEqual(bad_local_res.returncode, 0, bad_local_res.stdout)
+            self.assertIn("with -Isolation fs and workspaces", bad_local_res.stdout)
+            self.assertIn("OxideSwarm-USB", bad_local_res.stdout)
+            self.assertIn("outside", bad_local_res.stdout)
+            self.assertFalse(os.path.exists(custom_local_root), bad_local_res.stdout)
+
+            custom_profile_root = os.path.join(tmp_home, "custom-in-profile")
+            bad_profile_res = powershell(
+                install_ps1, "-InstallRoot", custom_profile_root, "-Name", "win-bug32b",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart",
+            )
+            self.assertNotEqual(bad_profile_res.returncode, 0, bad_profile_res.stdout)
+            self.assertIn("with -Isolation fs and workspaces", bad_profile_res.stdout)
+            self.assertFalse(os.path.exists(custom_profile_root), bad_profile_res.stdout)
 
             # BUG-31: a worker that stops 5 s after its start is reported as stopped with its exit
             # code, the end of its log is printed, and the rollback keeps the log the error names.

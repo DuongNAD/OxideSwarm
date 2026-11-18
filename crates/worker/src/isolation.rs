@@ -1533,6 +1533,145 @@ mod tests {
         windows::validate_workspace_root_safe(&temp_ws_root, &host).expect(
             "BUG-32: USB kit .oxideswarm-usb-workspaces marker inside workspace root must be accepted",
         );
+
+        let legacy_usb_ws = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm")
+            .join("usb-kit")
+            .join("workspaces");
+        std::fs::create_dir_all(&legacy_usb_ws).unwrap();
+        std::fs::write(
+            legacy_usb_ws.join(".oxideswarm-usb-workspaces"),
+            "Created by an OxideSwarm USB kit install.\n",
+        )
+        .unwrap();
+        windows::validate_workspace_root_safe(&legacy_usb_ws, &host).expect(
+            "BUG-32: legacy USB kit AppData\\Local\\OxideSwarm\\usb-kit\\workspaces must be accepted",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_bug32_refuses_usb_kit_install_root_and_sibling_under_localappdata() {
+        let fake_profile = tempfile::tempdir().unwrap();
+        let usb_root = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB");
+        let usb_sibling = usb_root.join("other");
+        let legacy_usb_root = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm")
+            .join("usb-kit");
+        let legacy_usb_sibling = legacy_usb_root.join("other");
+        for dir in [&usb_sibling, &legacy_usb_sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let host = HostDirs::from_home(fake_profile.path().to_path_buf(), None, None);
+        for bad in [
+            &usb_root,
+            &usb_sibling,
+            &legacy_usb_root,
+            &legacy_usb_sibling,
+        ] {
+            let err = windows::validate_workspace_root_safe(bad, &host).expect_err(&format!(
+                "must refuse non-allowlisted user-profile folder {}",
+                bad.display()
+            ));
+            assert!(
+                err.contains("refusing to rewrite the DACL of user folder"),
+                "{err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_bug32_refuses_usb_workspaces_marker_as_directory() {
+        let fake_profile = tempfile::tempdir().unwrap();
+        let ws_root = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        std::fs::create_dir_all(ws_root.join(".oxideswarm-usb-workspaces")).unwrap();
+
+        let host = HostDirs::from_home(fake_profile.path().to_path_buf(), None, None);
+        let err = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("must refuse .oxideswarm-usb-workspaces when it is a directory");
+        assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction() {
+        let fake_profile = tempfile::tempdir().unwrap();
+        let ws_root = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        let target_dir = fake_profile.path().join("outside_target_dir");
+        let target_file = fake_profile.path().join("outside_target_file.txt");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(&target_file, "target\n").unwrap();
+
+        let host = HostDirs::from_home(fake_profile.path().to_path_buf(), None, None);
+        let marker = ws_root.join(".oxideswarm-usb-workspaces");
+        let mut tested_any = false;
+
+        let junction_status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &marker.to_string_lossy(),
+                &target_dir.to_string_lossy(),
+            ])
+            .status();
+        match junction_status {
+            Ok(status) if status.success() => {
+                tested_any = true;
+                let err = windows::validate_workspace_root_safe(&ws_root, &host)
+                    .expect_err("must refuse .oxideswarm-usb-workspaces when it is a junction");
+                assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
+                std::fs::remove_dir(&marker).unwrap();
+            }
+            Ok(status) => {
+                eprintln!("note: mklink /J unavailable ({status})");
+            }
+            Err(e) => {
+                eprintln!("note: mklink /J failed to launch ({e})");
+            }
+        }
+
+        match std::os::windows::fs::symlink_file(&target_file, &marker) {
+            Ok(()) => {
+                tested_any = true;
+                let err = windows::validate_workspace_root_safe(&ws_root, &host)
+                    .expect_err("must refuse .oxideswarm-usb-workspaces when it is a file symlink");
+                assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
+                std::fs::remove_file(&marker).unwrap();
+            }
+            Err(e) => {
+                eprintln!("note: file symlink creation skipped ({e})");
+            }
+        }
+
+        if !tested_any {
+            eprintln!(
+                "skipping test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction: host cannot create junctions or file symlinks"
+            );
+        }
     }
 
     #[test]

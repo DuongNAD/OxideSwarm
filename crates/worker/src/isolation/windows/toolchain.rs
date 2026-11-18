@@ -13,6 +13,7 @@ use super::spawn::ensure_process_token_default_dacl_grants_current_user;
 use super::PREPARE_LOCK;
 use crate::isolation::{acl_grant_manifest_path, HostDirs};
 use std::io;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use windows_sys::Win32::Security::Authorization::{DENY_ACCESS, GRANT_ACCESS, SET_ACCESS};
 use windows_sys::Win32::Security::{
@@ -21,8 +22,8 @@ use windows_sys::Win32::Security::{
     NO_INHERITANCE, OBJECT_INHERIT_ACE, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
+    FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
 };
 
 fn grant_rx_non_inherited(path: &Path, sid: PSID, manifest_path: Option<&Path>) -> io::Result<()> {
@@ -506,6 +507,17 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
             .join("Local")
             .join("oxideswarm")
             .join("workspaces");
+        let allowed_usb = home
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        let allowed_usb_legacy = home
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm")
+            .join("usb-kit")
+            .join("workspaces");
         let allowed_home_temp = home.join("AppData").join("Local").join("Temp");
         let in_home_temp = path_starts_with_ci(ws_root, &allowed_home_temp)
             && !path_starts_with_ci(&allowed_home_temp, ws_root);
@@ -518,6 +530,8 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
         path_starts_with_ci(ws_root, &allowed1)
             || path_starts_with_ci(ws_root, &allowed2)
             || path_starts_with_ci(ws_root, &allowed3)
+            || path_starts_with_ci(ws_root, &allowed_usb)
+            || path_starts_with_ci(ws_root, &allowed_usb_legacy)
             || in_home_temp
             || in_env_temp
     };
@@ -546,8 +560,15 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
+                let entry_path = entry.path();
+                let is_usb_ws_marker = s == ".oxideswarm-usb-workspaces"
+                    && std::fs::symlink_metadata(&entry_path).is_ok_and(|m| {
+                        m.file_type().is_file()
+                            && (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                    });
                 let is_ws_entry = s == "store.lock"
                     || s == ".locks"
+                    || is_usb_ws_marker
                     || rusty_grid_core::task::validate_workspace_name(&s).is_ok();
                 if !is_ws_entry {
                     return Err(format!(
@@ -556,8 +577,11 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
                         s
                     ));
                 }
-                let entry_path = entry.path();
-                if s != "store.lock" && s != ".locks" && entry_path.is_dir() {
+                if s != "store.lock"
+                    && s != ".locks"
+                    && s != ".oxideswarm-usb-workspaces"
+                    && entry_path.is_dir()
+                {
                     if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
                         for sub in sub_entries.flatten() {
                             let sub_name = sub.file_name();
