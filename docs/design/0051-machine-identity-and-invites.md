@@ -225,9 +225,15 @@ oxideswarm invite [--roles worker[,client]] [--uses N] [--expires 24h] [--no-app
        specific member;
     5. a worker `Register` whose handshake authenticated before a `revoke_member` or
        `rollback_approved_enrollment` commit can land right after that commit. **Implemented**
-       (`ENROLL-1c`): the session re-checks membership right after its claim and, if the member is
-       gone, unregisters, prunes the claim and refuses the `Register`; `MemberStore` prunes
-       `worker_owners` claims of non-members at load and on every revoke
+       (`ENROLL-1c`): the worker-id claim (`MemberStore::claim_worker_id_evicting_deferred`)
+       refuses a key that is not an enrolled member and records nothing. It runs under the member
+       store lock, nested in the registry write lock, so it is ordered against the revocation: a
+       claim taken before the commit is returned by `revoke_member` and taken down by
+       `RevokeMember`, and one after it is refused. As a backstop, the session re-checks membership
+       right after its claim and, if the member is gone, unregisters, prunes the claim and refuses
+       the `Register`; a revocation that cancels the handler first skips this re-check, which is
+       why the claim refuses on its own. `MemberStore` also prunes `worker_owners` claims of
+       non-members left by an older release, at load and on every revoke
        (`MemberStore::prune_non_member_claims`);
     6. `RevokeMember` used to disconnect only the worker sessions whose `worker_id` was in
        `worker_owners` when `revoke_member` committed. **Implemented** (`ENROLL-1c`): it now closes
@@ -239,23 +245,28 @@ oxideswarm invite [--roles worker[,client]] [--uses N] [--expires 24h] [--no-app
      as a member registers itself in `MemberConnections` (`crates/master/src/member_connections.rs`)
      with its member id and a cancellation token right after the handshake, then re-checks that its
      key is still a member; `RevokeMember` commits the removal first and then cancels every token
-     of the member at once, so a connection is either closed by the revocation or refused by its
+     of the member at once, so a connection is either cancelled by the revocation or refused by its
      own check. The connection handler selects on its token, drops its streams and closes the QUIC
-     connection. An admin that revokes its own key gets the answer before its connection closes.
-     `members revoke` reports the number of closed connections, all lanes together. A rolled-back
-     enrollment closes the connections of its key the same way;
+     connection. Cancellation is cooperative: a cancelled handler stops at its next await and may
+     finish the step it is in, which is why a worker registration is also guarded by the claim's
+     own refusal (known limit 5). An admin that revokes its own key gets the answer before its
+     connection closes. `members revoke` reports the number of closed connections, all lanes
+     together. A rolled-back enrollment closes the connections of its key the same way;
   2. cancels the tasks the member submitted, whether queued or running. The master records the
      submitting member of each task in its queue and journal; this needs no wire change.
      **Planned**: the queue and the journal do not record the submitter yet, and adding it changes
      the store format (`STORE_FORMAT_VERSION`), which the owner decides;
   3. requeues the tasks running on the member's workers at once, skipping the session-resume hold
      and dropping checkpoints those workers wrote. **Implemented** (`ENROLL-1c`,
-     `TaskQueue::handle_worker_revoked`) for every worker id the member's claims and the registry
-     name: the tasks assigned to those workers, and the tasks an earlier disconnect or a master
-     restart left held for them, are requeued at once and lose their checkpoint. The store keeps no
-     record of who wrote a checkpoint, so these tasks lose theirs whoever wrote it, and a checkpoint
-     the worker wrote for a task that had already moved on is not found. No journal record clears a
-     checkpoint, so the queue compacts its store right after dropping one;
+     `TaskQueue::handle_workers_revoked`) for every worker id the member's claims and the registry
+     name, in one queue sweep: the tasks assigned to those workers, and the tasks an earlier
+     disconnect or a master restart left held for them, are requeued at once and lose their
+     checkpoint, and a queued or retrying task whose last failed attempt ran on one of them loses
+     its checkpoint too. The store keeps no record of who wrote a checkpoint, so these tasks lose
+     theirs whoever wrote it, and a checkpoint the worker wrote for a task that has since been
+     dispatched to another worker is not found. No journal record clears a checkpoint, so the queue
+     compacts its store once, under the same lock, when it dropped one. A rolled-back enrollment
+     whose key loses the worker role takes the same path for its workers;
   4. refuses the member's key at its next handshake (**Implemented** since `ENROLL-1b`).
 
   Under `--auth both`, a revoked machine that also holds the cluster secret can come back through
@@ -352,10 +363,12 @@ joins through iroh, through the owner's relay if one is set (`--relay-url`,
   run on another member's worker while the master holds disconnected tasks for 3,600 s; the P2P
   test closes a QUIC worker and a `STREAM_CLIENT` connection; both check that the revoked key is
   refused and that the other member's connections stay up. The unit tests cover the registry
-  (`member_connections.rs`), the requeue and the checkpoint that stays dropped after a crash
-  (`queue/recovery_tests.rs`) and the pruning of claims (`members.rs`). The MCP server's pooled and
-  dedicated connections and its `BlobConnection`s are client connections opened by `connect_master`,
-  so the client lanes above cover them; no test drives `oxideswarm mcp` itself.
+  (`member_connections.rs`), the requeue, the checkpoint that stays dropped after a crash and the
+  checkpoint of a task whose last failure was on a revoked worker (`queue/recovery_tests.rs`), and
+  the refusal of a claim for a non-member and the pruning of claims (`members.rs`). The MCP
+  server's pooled and dedicated connections and its `BlobConnection`s are client connections
+  opened by `connect_master`, so the client lanes above cover them; no test drives
+  `oxideswarm mcp` itself.
 - **P2P:** the join flow over an iroh ticket with the minimal test preset.
 - **Live:** a machine on another network joins through `--p2p` with an invite sent by chat. The run
   is recorded with its date in the add-a-machine guide.
@@ -390,3 +403,4 @@ joins through iroh, through the owner's relay if one is set (`--relay-url`,
 - 2026-11-11: `ENROLL-1b` round-5 review fixes (`R5-1` + nits): restore invite uses unconditionally on the compare-and-swap tracker rollback path so declined role upgrades and rolled-back concurrent approvals do not burn invite uses, keeping the non-member guard only on the fallback no-tracker path (`R5-1`); decouple `MemberStore` disk writes onto a dedicated write mutex with state-generation coalescing, offload `members.json` persistence onto `spawn_blocking`, and release non-live `worker_id` claims in memory under the `WorkerRegistry` write lock before flushing (`NIT 2..4`); commit in-memory rollback state atomically before writing `members.json` so a failed rollback write cannot leave an unconfirmed member enrolled in memory or leak tracker ops (`NIT 5`); and align D5 `WorkerIdReleased` fields, `AuthFailed` refusal wording, `MAX_PERSISTED_V2_WORKERS`, and the first-register-wins limit after `release-worker` (`NIT 1`, `NIT 6`).
 - 2026-11-11: `ENROLL-1b` round-6 review fixes (`M1`, `S1`, `NIT 1..5`): propagate `members.json` write errors on `release-worker` via `flush_bookkeeping_persist_checked` and restore the released claim in memory unless concurrently reclaimed (`M1`); track failed rollback, resync, and bookkeeping writes with `MemberStore::dirty` (`flush_dirty`), retrying on subsequent flushes, periodically in `MasterServer::run`, and on shutdown (`S1`, `NIT 2`); run `confirm_approved_enrollment` inside `run_member_store_blocking` (`NIT 1`); and align D4 step 6 rollback prose, D5 `Known limits` (`Planned` orphan-claim pruning and full session teardown), and the round-5 status log (`NIT 3`, `NIT 5`).
 - 2026-11-18: `ENROLL-1c`, first part: revocation steps 1 and 3 and known limits 5 and 6 are Implemented (`crates/master/src/member_connections.rs`, `crates/master/src/session.rs`, `crates/master/src/server/client_and_members.rs`, `crates/master/src/server/tasks_and_blobs.rs`, `crates/master/src/queue/lifecycle.rs`, `crates/master/src/members.rs`, `tests/cli_revoke_e2e.rs`). `members revoke` closes every connection of the member at once (TCP and QUIC worker sessions, TCP and P2P `STREAM_CLIENT` client connections, which include `BlobConnection` and MCP), requeues the tasks of its workers without the session-resume hold and without their checkpoints, and claims of non-members are pruned at load, on revoke and after a `Register` that lands after its member was removed. No wire change and no store format change. Step 2 (cancel the tasks the member submitted) stays Planned: it needs the submitter in the queue and the journal, a store format change for the owner to decide. `ENROLL-1c` stays Partial.
+- 2026-11-18: `ENROLL-1c` review fixes (pull request 328): the worker-id claim refuses a key that is not an enrolled member, under the member store lock that orders it against `revoke_member`, and the post-claim re-check stays as a backstop (a revocation that cancels the handler can skip it); revocation and a rolled-back enrollment sweep all of the key's workers in one queue call (`TaskQueue::handle_workers_revoked`) that compacts the store once; a queued or retrying task whose last failed attempt ran on a revoked worker also loses its checkpoint.
