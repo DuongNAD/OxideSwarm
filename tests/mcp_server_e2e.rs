@@ -351,6 +351,18 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
         .as_str()
         .unwrap()
         .contains("VERIFIED_MCP_PAYLOAD"));
+    assert!(
+        submit_val["waited_ms"].is_u64(),
+        "MCP submit must return waited_ms: {submit_val}"
+    );
+    assert_eq!(
+        submit_val["task_time_sum_ms"], submit_val["duration_ms"],
+        "MCP submit task_time_sum_ms mismatch: {submit_val}"
+    );
+    assert_eq!(
+        submit_val["machines"], 1,
+        "MCP submit must return machines == 1: {submit_val}"
+    );
 
     // 8. Call tool: submit (async wait: false) followed by task_result with wait: true
     mcp.send_line(
@@ -409,6 +421,18 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
         .as_str()
         .unwrap()
         .contains("ASYNC_POLL_VERIFIED"));
+    assert!(
+        task_res_val["waited_ms"].is_u64(),
+        "MCP task_result must return waited_ms: {task_res_val}"
+    );
+    assert_eq!(
+        task_res_val["task_time_sum_ms"], task_res_val["duration_ms"],
+        "MCP task_result task_time_sum_ms mismatch: {task_res_val}"
+    );
+    assert_eq!(
+        task_res_val["machines"], 1,
+        "MCP task_result must return machines == 1: {task_res_val}"
+    );
 
     // 9. Call tool: doctor
     mcp.send_line(

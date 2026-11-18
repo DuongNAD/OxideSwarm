@@ -8,7 +8,7 @@ use uuid::Uuid;
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
 use rusty_grid_core::task::TaskId;
 
-use super::submit::{format_completed_task_result, prepare_mcp_output_dir_in_dir};
+use super::submit::{format_completed_task_result_with_start, prepare_mcp_output_dir_in_dir};
 use super::{McpState, ToolCallContext, ToolCallResult};
 
 pub(super) async fn tool_task_result(
@@ -16,6 +16,7 @@ pub(super) async fn tool_task_result(
     args: &Value,
     ctx: &mut ToolCallContext,
 ) -> ToolCallResult {
+    let call_started = std::time::Instant::now();
     let task_id_str = match args.get("task_id").and_then(Value::as_str) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required property 'task_id'"),
@@ -135,7 +136,11 @@ pub(super) async fn tool_task_result(
                         Some(step + 1),
                         format!("Task {task_id} completed"),
                     );
-                    return format_completed_task_result(state, &result, args, None).await;
+                    let started_at = state.submitted_at(task_id).await.unwrap_or(call_started);
+                    return format_completed_task_result_with_start(
+                        state, &result, args, None, started_at,
+                    )
+                    .await;
                 }
                 Ok(Some(ClientResponse::TaskStatusInfo {
                     task_id: tid,
@@ -200,7 +205,9 @@ pub(super) async fn tool_task_result(
             .await
         {
             Ok(ClientResponse::TaskCompleted { result, .. }) => {
-                format_completed_task_result(state, &result, args, None).await
+                let started_at = state.submitted_at(task_id).await.unwrap_or(call_started);
+                format_completed_task_result_with_start(state, &result, args, None, started_at)
+                    .await
             }
             Ok(ClientResponse::TaskStatusInfo {
                 task_id,
