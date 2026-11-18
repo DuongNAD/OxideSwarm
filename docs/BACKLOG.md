@@ -361,7 +361,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
-| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Partial | In | (open), (design 0058) |
+| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Partial | In | 326, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | Out |  |
@@ -1191,7 +1191,7 @@ none needs a design record of its own.
      10 minutes weekly), a 5-minute local run of each recorded in `fuzz/README.md`.
 - **Done when:** The four targets build and run in the `fuzz` CI job, and `fuzz/README.md` holds a
   local run of each with its findings.
-- **Status:** Partial (2026-11-18, pull request (open)). Built: `aead_record`, `join_invite` and
+- **Status:** Partial (2026-11-18, pull request 326). Built: `aead_record`, `join_invite` and
   `store_journal` (steps 1 to 3 and 5), with no finding in 5 minutes each. Open: step 4. No public
   function takes one line of the MCP reader, and MAINT-2 is splitting `mcp.rs` into submodules now;
   the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
