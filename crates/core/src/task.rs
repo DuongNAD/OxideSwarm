@@ -3408,31 +3408,33 @@ mod tests {
 
     #[test]
     fn test_task_result_zero_copy_subslice_integrity() {
-        // 1 MB binary payload
-        let raw_payload: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+        // 1 MB binary payload; 64 KiB under Miri, which needs minutes for the larger one.
+        let size: usize = if cfg!(miri) { 64 * 1024 } else { 1_000_000 };
+        let raw_payload: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
         let original_bytes = Bytes::copy_from_slice(&raw_payload);
 
         let res = TaskResult::success(Uuid::new_v4(), TaskId::new(), "", 10, false)
             .with_asset_bytes(original_bytes.clone());
 
         let asset = res.asset_bytes.as_ref().unwrap();
-        assert_eq!(asset.len(), 1_000_000);
+        assert_eq!(asset.len(), size);
 
         // Subslice first 12 bytes (glTF header)
         let header = asset.slice(0..12);
         assert_eq!(header.len(), 12);
         assert_eq!(header.as_bytes(), &raw_payload[0..12]);
 
-        // Subslice body (offset 12 to 1MB)
+        // Subslice body (offset 12 to the end)
         let body = asset.slice(12..);
-        assert_eq!(body.len(), 999_988);
+        assert_eq!(body.len(), size - 12);
         assert_eq!(body.as_bytes(), &raw_payload[12..]);
 
         // Zero copy verification: memory pointers point into the same allocation
         let base_ptr = asset.as_bytes().as_ptr();
         let body_ptr = body.as_bytes().as_ptr();
-        // SAFETY: `asset` holds 1,000,000 bytes, so `base_ptr + 12` stays inside the allocation
-        // `base_ptr` points into, as `pointer::add` requires; the result is only compared.
+        // SAFETY: `asset` holds `size` bytes (at least 64 KiB), so `base_ptr + 12` stays inside
+        // the allocation `base_ptr` points into, as `pointer::add` requires; the result is only
+        // compared.
         assert_eq!(unsafe { base_ptr.add(12) }, body_ptr);
     }
 
@@ -3588,6 +3590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_workspace_task_spec_and_files_rules() {
         // Only Command and ShellScript.
         let mut t = workspace_task("ws");

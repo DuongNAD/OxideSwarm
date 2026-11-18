@@ -1463,12 +1463,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     fn test_local_ip_detection() {
         let ip = get_local_ip_or_loopback();
         assert!(!ip.is_unspecified());
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     async fn test_udp_discovery_query_response() {
         // Bind an ephemeral UDP socket as a mock Master responder
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -1520,6 +1522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_beacon_mac_sign_and_verify() {
         let secret = test_secret(1);
         let nonce = [7u8; DISCOVERY_PROBE_NONCE_LEN];
@@ -1564,6 +1567,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_beacon_json_compat_with_and_without_mac() {
         // A beacon without a MAC serialises exactly as before (no "mac" key)...
         let plain = sample_beacon();
@@ -1617,6 +1621,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_beacon_reply_signs_only_authenticated_probes_with_a_secret() {
         let secret = test_secret(1);
         let nonce = [5u8; DISCOVERY_PROBE_NONCE_LEN];
@@ -1745,6 +1750,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn test_authenticated_discovery_accepts_signed_beacon_and_keeps_the_signed_address() {
         let secret = test_secret(1);
         let master_secret = secret.clone();
@@ -1771,6 +1777,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_verified_beacon_keeps_the_signed_address_whoever_relays_it() {
         // A genuine beacon for a victim's nonce, forwarded by a different LAN host: the victim
         // must still be pointed at the master's signed address, never at the relaying host.
@@ -1826,6 +1833,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn test_authenticated_discovery_rejects_wrong_secret_unsigned_and_replayed_beacons() {
         let ours = test_secret(1);
 
@@ -1896,6 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn test_unauthenticated_discovery_still_accepts_signed_and_unsigned_beacons() {
         // A client without a secret sends the legacy probe and accepts whatever answers.
         let secret = test_secret(1);
@@ -1916,6 +1925,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     async fn test_probe_http_candidate_active_master() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -1988,6 +1998,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     async fn test_secret_holder_never_accepts_the_unauthenticated_http_fallback() {
         let web_port = spawn_status_server(serde_json::json!({
             "master": {"host": "ImpostorMaster", "role": "MASTER"},
@@ -2142,6 +2153,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     async fn test_http_probe_does_not_follow_hostile_portal_redirects() {
         for redirect in [
             "javascript:alert(1)",
@@ -2190,6 +2202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_rendezvous_lease_signing_verification_and_tampering() {
         let secret = ClusterSecret::generate().unwrap();
         let other_secret = ClusterSecret::generate().unwrap();
@@ -2297,6 +2310,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn test_rendezvous_read_auth_sign_and_verify() {
         let secret = ClusterSecret::generate().unwrap();
         let other = ClusterSecret::generate().unwrap();

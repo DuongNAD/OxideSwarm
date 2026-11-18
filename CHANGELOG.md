@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- The clippy lint `undocumented_unsafe_blocks` is `deny` for the whole workspace (`[workspace.lints.clippy]`), so an `unsafe` block or `unsafe impl` without a `// SAFETY:` comment fails the required clippy jobs on Linux, macOS and Windows; a new CI job, `miri (rusty_grid_core)`, runs the unit tests of `rusty_grid_core` under Miri on Linux on the dated nightly of the fuzz jobs, with the 93 tests Miri cannot run (C code such as `ring`, processes, sockets, host queries, and seven too slow for it) marked `#[cfg_attr(miri, ignore = "...")]`; it is not a required check (design 0058 D2, `LV-4`). A normal build does not change.
+
 ### Fixed
 - USB kit, Windows: the folder menu of `install.ps1` offered a drive whose root the install then refused ("another account ... can delete or re-permission folders at the root of E:\"). It now runs the install's own folder check on each drive and lists a refused drive without a number, as `not usable`, with the reason; the default folder stays first (`BUG-29`).
 - USB kit, Windows: `uninstall.ps1` refused an install from a kit older than the `.oxideswarm-usb-workspaces` marker. Such a `workspaces` folder is now removed when the install folder carries the installer's `.oxideswarm-usb-install` marker, the folder has no link inside, no running worker or service uses it, and it is not a non-USB worker's default workspace root; every other case is refused as before (`BUG-30`).

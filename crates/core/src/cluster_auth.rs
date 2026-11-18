@@ -915,6 +915,7 @@ mod tests {
     // --- ClusterSecret ---------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn secret_hex_roundtrip_and_validation() {
         let s = ClusterSecret::generate().unwrap();
         let hex = s.to_hex();
@@ -949,6 +950,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn secret_debug_is_redacted_and_generation_is_random() {
         let s = ClusterSecret::generate().unwrap();
         let dbg = format!("{s:?}");
@@ -958,6 +960,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn derive_is_hmac_of_label_and_label_separated() {
         let s = secret(9);
         let key = hmac::Key::new(hmac::HMAC_SHA256, &[9u8; 32]);
@@ -975,6 +978,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn secret_file_roundtrip_permissions_and_overwrite_rules() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("cluster.secret");
@@ -1016,6 +1020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn secret_file_parsing_and_load_or_generate() {
         let dir = tempfile::tempdir().unwrap();
         let s = ClusterSecret::generate().unwrap();
@@ -1048,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn resolve_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let explicit = secret(1);
@@ -1116,6 +1122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn resolve_treats_a_blank_source_as_a_configuration_error() {
         // An empty expansion (`--secret "$MISSING"`, a vault that injected nothing) must never
         // silently turn authentication off, nor fall through to a weaker source.
@@ -1173,6 +1180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn resolve_never_falls_through_from_a_broken_source() {
         let dir = tempfile::tempdir().unwrap();
         let good = secret(6);
@@ -1214,6 +1222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn verify_mac_is_exact_and_rejects_every_single_bit_flip() {
         // verify_mac delegates to ring::hmac::verify (constant time); check its accept/reject
         // surface: only the exact tag passes, whatever the position of the difference.
@@ -1252,6 +1261,7 @@ mod tests {
     // --- Handshake -------------------------------------------------------------------------
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn handshake_succeeds_and_normal_protocol_continues() {
         let s = secret(1);
         let (mut client, mut server) = pair();
@@ -1280,6 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn v1_hello_is_refused_with_an_upgrade_hint() {
         let s = secret(1);
         let (mut client, mut server) = pair();
@@ -1307,6 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn challenge_made_with_version_1_labels_is_not_accepted() {
         // The labels bind the version: a master that answered with the old MAC (or a relay that
         // rewrote our HELLO to version 1 for an old master) cannot complete a v2 handshake.
@@ -1337,6 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn session_keys_differ_per_connection() {
         let s = secret(1);
         let mut keys = Vec::new();
@@ -1352,6 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn client_with_wrong_secret_rejects_server_and_server_sees_close() {
         let (mut client, mut server) = pair();
         let good = secret(1);
@@ -1365,6 +1379,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn server_rejects_proof_computed_with_wrong_secret() {
         // A client that skips the server check and answers with a PROOF from another secret.
         let (mut client, mut server) = pair();
@@ -1393,6 +1408,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn reflected_server_mac_is_not_a_valid_proof() {
         // Direction labels: the server's own MAC must not be accepted as the client's PROOF.
         let (mut client, mut server) = pair();
@@ -1416,6 +1432,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn client_without_secret_is_told_authentication_is_required() {
         let (mut client, mut server) = pair();
         let s = secret(1);
@@ -1437,6 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn reject_reason_for_secretless_client_is_generic() {
         let (mut client, mut server) = pair();
         let s = secret(1);
@@ -1447,6 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn client_with_secret_against_server_without_secret() {
         let (mut client, mut server) = pair();
         let s = secret(1);
@@ -1471,6 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn client_handshake_fails_cleanly_when_peer_closes_or_is_not_auth_aware() {
         let s = secret(1);
         // Peer closes immediately (e.g. an old master that cannot decode the HELLO).
@@ -1500,6 +1520,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn rogue_server_with_wrong_secret_is_rejected_before_any_proof() {
         let (mut client, mut rogue) = pair();
         let ours = secret(1);
@@ -1532,6 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn replayed_challenge_from_an_earlier_session_is_rejected() {
         let s = secret(1);
         // Record a genuine CHALLENGE (valid MAC) for client nonce A.
@@ -1558,6 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn replayed_proof_from_an_earlier_session_is_rejected() {
         let s = secret(1);
         let nonce = [0x11u8; NONCE_LEN];
@@ -1597,6 +1620,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn version_mismatch_is_rejected_on_both_sides() {
         let s = secret(1);
 
@@ -1628,6 +1652,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn malformed_first_frames_are_rejected_without_panics() {
         let s = secret(1);
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -1686,6 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn malformed_proof_frames_are_rejected() {
         let s = secret(1);
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -1729,6 +1755,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn malformed_challenges_make_the_client_fail() {
         let s = secret(1);
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -1765,6 +1792,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn reject_text_from_the_peer_is_sanitised() {
         let s = secret(1);
         let (mut client, mut server) = pair();
@@ -1789,6 +1817,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn oversized_pre_auth_frame_is_rejected_without_buffering_it() {
         let s = secret(1);
         let (mut raw, b) = tokio::io::duplex(64 * 1024);
@@ -1821,6 +1850,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn oversized_frame_just_above_the_cap_is_rejected_and_at_the_cap_is_parsed() {
         let s = secret(1);
         // PRE_AUTH_MAX_FRAME + 1 bytes of otherwise valid-looking prefix.
@@ -1845,6 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn truncated_streams_end_the_handshake_with_connection_closed() {
         let s = secret(1);
 
@@ -1885,6 +1916,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn failed_handshake_is_delayed_to_blunt_brute_force() {
         let s = secret(1);
         let (mut client, mut server) = pair();
@@ -1902,6 +1934,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn concurrent_handshakes_do_not_interfere() {
         let s = secret(4);
         let mut tasks = Vec::new();

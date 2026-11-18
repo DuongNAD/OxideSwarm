@@ -776,6 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     async fn test_configure_tcp_stream_sets_nodelay_and_keepalive() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -828,6 +829,7 @@ mod tests {
 
     #[cfg(feature = "p2p")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     fn test_ticket_serialization_roundtrip() {
         use iroh::endpoint::presets::Minimal;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -850,6 +852,7 @@ mod tests {
     /// belongs to no interface of this machine) sits in its source and must reach the message.
     #[cfg(feature = "p2p")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     fn test_bind_error_message_keeps_the_os_reason() {
         use iroh::endpoint::presets::Minimal;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -873,6 +876,7 @@ mod tests {
 
     #[cfg(feature = "p2p")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: opens a network socket")]
     fn test_bistream_into_split_preserves_p2p_guard_and_closes_outside_runtime() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (read_half, write_half, server_ep, server_task) = rt.block_on(async {

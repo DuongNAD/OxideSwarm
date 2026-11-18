@@ -8,6 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 description = "OxideSwarm command line: master, worker, submit, doctor and MCP server"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 
