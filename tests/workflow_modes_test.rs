@@ -200,12 +200,12 @@ fn test_research_mode_profile_and_bench() {
     );
 
     let root = find_workspace_root();
-    let mode_cli_src = std::fs::read_to_string(root.join("crates/cli/src/mode_cli.rs"))
-        .expect("read crates/cli/src/mode_cli.rs");
+    let mode_cli_src = std::fs::read_to_string(root.join("crates/cli/src/mode_cli/research.rs"))
+        .expect("read crates/cli/src/mode_cli/research.rs");
     let fn_start = mode_cli_src
         .find("pub fn run_micro_benchmarks()")
         .expect("find run_micro_benchmarks");
-    let fn_body = &mode_cli_src[fn_start..fn_start + 4000];
+    let fn_body = &mode_cli_src[fn_start..(fn_start + 4000).min(mode_cli_src.len())];
     let t2_start_pos = fn_body
         .find("let t2_start = Instant::now();")
         .expect("find t2_start timer");
