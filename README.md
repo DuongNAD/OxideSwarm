@@ -104,7 +104,7 @@ expected output, the MCP calls and troubleshooting, is
 ## Install
 
 Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.4.2`), or [build from source](#build-from-source).
+(the latest is `v0.4.3`), or [build from source](#build-from-source).
 
 Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
@@ -115,19 +115,19 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf oxideswarm-0.4.2-aarch64-apple-darwin.tar.gz
+tar -xzf oxideswarm-0.4.3-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.2-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.2-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.3-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.3-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-Expand-Archive .\oxideswarm-0.4.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.3-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.4.3-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.2-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.3-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 Then continue with the [Quick start](#quick-start) or [Set up a cluster](#set-up-a-cluster). The background-service installers in
@@ -365,7 +365,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.2` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.3` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
@@ -653,7 +653,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery) |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`) |
 | `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](docs/design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
