@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - The worker's shutdown net (`terminate_all_task_process_trees`) kills the registered task process trees while it holds the registry lock, instead of from a copy taken before. A tree torn down at the same moment could close its cgroup leaf descriptors (Linux, delegated cgroup v2) or its Job Object handle (Windows) in between, so the sweep could write to, and read PIDs to kill from, a descriptor number the worker had already reused for another file (`LV-4`).
+- The result acknowledgement token (`master_features::result_ack_token`, a BLAKE3 hash of the whole task result, `asset_bytes` included) is computed only when result resume is on: by the worker when its session has a resume window, and then once instead of twice, and by the master when its session-resume hold is above 0. Both computed it for every result before and threw it away without resume; a 70 MiB result spent about 1.3 s of the runtime thread on it in the `test` profile (TEST-53). The token and every message are unchanged (`BUG-27`).
 - `oxideswarm members revoke` closes every connection of the member at once, on every lane (worker sessions over TCP and QUIC, client connections over TCP and P2P, blob and MCP connections), and requeues the tasks of its workers at once, without the session-resume hold and without their checkpoints; `worker_id` claims of non-members are pruned. No wire change and no store format change (design 0051 D5, `ENROLL-1c`).
 
 ### Added

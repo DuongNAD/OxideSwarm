@@ -611,8 +611,10 @@ async fn apply_task_result_inner(
     } else if outcome.disposition != ResultDisposition::Late {
         registry.clear_rejections(&worker_id).await;
     }
-    let send_ack = queue.session_resume_hold_secs() > 0;
-    let ack_token = rusty_grid_core::protocol::master_features::result_ack_token(&result);
+    // The acknowledgement token hashes the whole result, `asset_bytes` included, and is sent
+    // only when this master holds sessions for resume, so it is computed only then (BUG-27).
+    let ack_token = (queue.session_resume_hold_secs() > 0)
+        .then(|| rusty_grid_core::protocol::master_features::result_ack_token(&result));
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
     //    task (rejection, execution retry) will still produce its real result and keeps its
@@ -645,7 +647,7 @@ async fn apply_task_result_inner(
                             "Failed to sync TaskTerminal journal record for task result"
                         );
                     }
-                    if send_ack {
+                    if let Some(ack_token) = ack_token {
                         ack_registry
                             .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
@@ -661,7 +663,7 @@ async fn apply_task_result_inner(
                     cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
-                if send_ack {
+                if let Some(ack_token) = ack_token {
                     registry
                         .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
@@ -686,7 +688,7 @@ async fn apply_task_result_inner(
                     );
                 }
             }
-            if send_ack {
+            if let Some(ack_token) = ack_token {
                 registry
                     .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
@@ -701,7 +703,7 @@ async fn apply_task_result_inner(
             }
             queue.spawn_cold_maintenance().await;
         }
-    } else if send_ack {
+    } else if let Some(ack_token) = ack_token {
         if let Some(ack) = durable_ack {
             if let Err(err) = ack.await {
                 warn!(

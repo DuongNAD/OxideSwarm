@@ -2385,6 +2385,40 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   While the four dev cluster tests ran on Windows, a watcher listed the UDP endpoints of every `rusty-grid.exe`
   they started: none with this change; `master 127.0.0.1:8089` with the build before it.
 
+### BUG-27: Compute the result acknowledgement token only when result resume is on
+
+- **Evidence:** Found in TEST-53 (pull request 327): a `sample` of
+  `test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish` put about 1.3 s (1,341
+  samples) of the test's single runtime thread in `master_features::result_ack_token`, which hashes the 70 MiB
+  `asset_bytes` of the oversized result with BLAKE3, unoptimized in the `test` profile. That test's worker has no
+  resume window, so the token it computed was never used.
+- **Problem:** The worker's task runner (`crates/worker/src/client/tasks.rs`) computed the token for every
+  result. Only the session-resume outbox uses it (`PendingResumeOutbox`: the push, `update_result` after an output
+  upload, and `ack_result`), and all three calls already ran only when the session has a resume window
+  (`resume_enabled`: the master announced `session-resume=<secs>` and the worker's grace cap is not 0), so
+  without one the hash was thrown away. With one, `BufferedTaskResult::new` hashed the same result a second time,
+  under the outbox's mutex. The master (`crates/master/src/server/tasks_and_blobs.rs`) also computed the token for
+  every result and sent it (`CancelTask` with `oxs:result-ack:<token>`) only when its session-resume hold is above 0.
+  The worker sends its `TaskResult` the same way with or without the token; the token is never on the wire in it.
+- **Do:** Compute the token on the worker only when the session has a resume window, once, and hand it to
+  `BufferedTaskResult::new`; compute it on the master only when the hold is above 0. Keep the token bytes and
+  every message unchanged.
+- **Done when:** A unit test shows that the token is not computed when resume is off, and that it is the same
+  token, computed once, when resume is on; the worker unit tests and the result resume integration tests pass.
+- **Implemented (2026-11-18, pull request 332):** `resume_ack_token(resume_enabled, &result, token)` in
+  `tasks.rs` returns `None` without calling `token` when resume is off; the runner keeps the token as an
+  `Option<u64>` that is `Some` exactly when `resume_enabled`, and the three outbox calls take it from there.
+  `BufferedTaskResult::new` takes the token from its caller instead of hashing again. The master's `ack_token` is
+  an `Option` computed under the same `session_resume_hold_secs() > 0` test that decided whether to send it. No
+  wire change. Test: `client::tests::test_result_ack_token_is_computed_only_when_resume_is_on` (a counting
+  closure: no call with resume off; one call, returning `master_features::result_ack_token`, with resume on).
+  Not changed: with resume on the hash still runs on the async runtime thread, once after the run, again in
+  `update_result` after an output upload and in the session's resume flush (`session.rs`), both under the
+  outbox's mutex, and once on the master. Moving it to `spawn_blocking` would add an await between the end of the
+  run and the outbox push and would touch all four places, so it is left out. A `master` started from the CLI
+  holds sessions for 30 s by default (`--session-resume-hold-secs`), so resume is on there unless the hold is set
+  to 0; `ServerConfig` (library and tests) defaults to 0.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
