@@ -226,10 +226,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented | 278 |
 | TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | 288 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented | 302 |
-| TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Planned |  |
+| TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented | 304 |
-| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Planned |  |
-| TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Planned |  |
+| TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | 308 |
+| TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Implemented | 309 |
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
@@ -3147,6 +3147,21 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Print the in-process master's output when the wait fails, find which of the two happened, then fix
   the start-up or wait on the condition with a bounded but generous limit.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row on Linux.
+- **Cause:** The dashboard did not start late and was not missing: the test gave the master one port for both
+  listeners. It picked the grid port and then the dashboard port by binding `127.0.0.1:0` twice, closing each
+  listener at once, so the second bind could be handed the port the first had just released. The master took
+  that port for its grid listener, logged `Web UI port binding failed; continuing master RPC without Web UI
+  ... (os error 10048) addr=127.0.0.1:51840`, and never wrote the port file. Seen on the owner's Windows
+  desktop in 1 of 30 runs of the whole test binary (4 cores, 4 spinning processes), with the master's log that
+  this item added. `test_dev_cluster_never_sends_token_when_web_ui_port_is_held` picked its ports the same way.
+- **Status:** Implemented by pull request 307. The two tests keep the first listener open while they pick the
+  second port (`two_free_ports` in `tests/workflow_modes_test.rs`). `launch_local_dev_cluster_with_ports`
+  refuses the same port for both at once, with a message, and a new test covers that. The master's stdout and
+  stderr go to `.dev_cluster.master.log` in the workspace (covered by `.dev_cluster.*` in `.gitignore`), and a
+  failed wait quotes its last 40 lines. The 8 s wait stays. The helpers moved to `crates/cli/src/mode_cli/dev_launch.rs`
+  so that `mode_cli.rs` shrank (allowlist 3240 to 3213 lines). On 4 cores next to 4 spinning processes,
+  the whole test binary (18 tests in parallel, `--test-threads=4`; the two tests that need `cargo test`'s
+  environment skipped) passed 200 of 200 runs in a row. Not run on Linux here.
 
 ### TEST-44: Remove the 1.5x wall-clock cap from the speed-aware batch test
 
@@ -3186,6 +3201,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Confirm the cause from the master's log in a failing run, then make Worker 2 send heartbeats (or
   give it a timeout it cannot reach) without weakening the assertion about Worker 1.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row under the same starvation.
+- **Cause:** Confirmed: the reaper took Worker 2. With failure messages that name what the master holds, the
+  test alone failed 19 of 100 runs on 1 core next to 6 spinning processes: 18 times Worker 2 got no
+  `AssignTask` (`got None, Worker 2 is Some(Disconnected)`), once the master had already requeued the task
+  after Worker 2's result (`Worker 2 is Some(Disconnected), task: state Queued, retries 2`). Worker 2 was a raw
+  connection that sent no heartbeat, and the reaper timeout was 80 ms, so any 80 ms stall between its
+  registration and its result was enough. The whole binary failed this test in 5 of 20 runs there.
+- **Status:** Implemented by pull request 308. The reaper timeout is 2 s instead of 80 ms, and Worker 2
+  sends a heartbeat every 50 ms from its own task (the transport is split; the reader skips `HeartbeatAck`)
+  until the end of the test. Worker 1 is unchanged: it must still be reaped, end `Disconnected` with no
+  active task, and the task must complete on Worker 2 with `retry_count` 1. The waits for the reap and for
+  the completion are liveness bounds (8 s and 15 s). Failures now print Worker 2's status and the task's
+  state. On 1 core next to 6 spinning processes the test passed 200 of 200 runs in a row.
 
 ### TEST-46: Remove the 100 ms bound from the failover latency stress test
 
@@ -3196,6 +3223,16 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Assert the order of events (the task was re-queued after the disconnect, without waiting for the
   reaper timeout) and print the latency, or use a bound that a starved runner cannot reach.
 - **Done when:** The test passes 200 runs in a row under the same starvation.
+- **Cause:** Two wall-clock windows, not one. On 1 core next to 6 spinning processes the whole test binary
+  failed this test in 12 of 20 runs: 9 times the evicted task was not yet reassigned when the 200 ms wait
+  ended, 3 times the latency was over 100 ms (`116.7 ms`, `152.7 ms`, `166.2 ms`). The same loop failed
+  `test_stress_tcp_rst_vs_graceful_disconnect` once on its 500 ms window for the same graceful failover.
+- **Status:** Implemented by pull request 309. Both tests assert the order of events: after the graceful
+  disconnect the task is reassigned to the survivor within 5 s, which is half of the 10 s reaper timeout of
+  these masters (`ReaperConfig::default()`), so the reassignment came from the disconnect and not from the
+  reaper; the second test still requires `retry_count` and `failover_count` 0. The latency is printed. The
+  wait for the 4 tasks to complete is 30 s (was 8 s), a liveness bound. On 1 core next to 6 spinning
+  processes the two tests passed 200 of 200 runs in a row; the printed latency reached `99.4 ms`.
 
 ### TEST-47: Count only this test's handles in the capability-detection leak test
 
