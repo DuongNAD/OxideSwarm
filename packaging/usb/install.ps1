@@ -670,6 +670,18 @@ if (-not $Update -and (
 }
 if ($NoWorkspaces) { $useWorkspaces = $false }
 elseif ($Workspaces) { $useWorkspaces = $true }
+$UserProfileFull = if ($env:USERPROFILE) { [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\') } else { '' }
+$archivePredatesIsolatedWs = ($kitVersion -and $kitVersion -match '\b0\.1\.[01](\b|-)') -or ($Archive.Name -match '^oxideswarm-0\.1\.[01](-|\.)')
+if ($KitHasWorker -and $Isolation -eq 'fs' -and $useWorkspaces -and (-not $archivePredatesIsolatedWs) -and ($Workspaces -or [bool](Get-Command cargo -ErrorAction SilentlyContinue)) -and $UserProfileFull) {
+    $plannedWsRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
+    $inUserProfile = [string]::Equals($plannedWsRoot, $UserProfileFull, [StringComparison]::OrdinalIgnoreCase) -or $plannedWsRoot.StartsWith($UserProfileFull + '\', [StringComparison]::OrdinalIgnoreCase)
+    $allowedProfileWs1 = Join-Path $UserProfileFull 'AppData\Local\OxideSwarm-USB\workspaces'
+    $allowedProfileWs2 = Join-Path $UserProfileFull 'AppData\Local\OxideSwarm\usb-kit\workspaces'
+    $allowedInProfile = [string]::Equals($plannedWsRoot, $allowedProfileWs1, [StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($plannedWsRoot, $allowedProfileWs2, [StringComparison]::OrdinalIgnoreCase)
+    if ($inUserProfile -and -not $allowedInProfile) {
+        Fail "cannot use ${InstallRoot} with -Isolation fs and workspaces: under -Isolation fs the worker accepts a workspace folder inside the user profile only in $DefaultRoot (or an updated legacy install in $LegacyDefaultRoot); omit -InstallRoot to use $DefaultRoot, or choose a folder outside $UserProfileFull"
+    }
+}
 $script:PreexistingRoot = Test-Path -LiteralPath $InstallRoot
 $freshInstall = (-not $Update) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'bin\oxideswarm.exe'))) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'home\node.key'))) -and (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'home\cluster.secret')))
 $PrivateRoot = $InstallRoot.StartsWith($LocalAppDataFull + '\', [StringComparison]::OrdinalIgnoreCase)

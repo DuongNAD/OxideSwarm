@@ -333,3 +333,9 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   likewise refuses `<folder>\workspaces` inside the user profile, so a worker installed under
   `%LOCALAPPDATA%` with `-Isolation fs` and `--workspaces` would refuse its first workspace task.
   Not changed here.
+- 2026-11-19: Closed the open workspace-root note above (`BUG-32`, pull request 352):
+  `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces`
+  and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts `.oxideswarm-usb-workspaces` when
+  `symlink_metadata` confirms a regular non-reparse file ([design 0033](0033-os-level-task-isolation.md)), and
+  `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces
+  targets any other path under `%USERPROFILE%`.

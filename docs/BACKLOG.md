@@ -356,6 +356,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 (open) |
 | BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 (open) |
 | BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 (open) |
+| BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -1330,6 +1331,40 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   which is a wire change. Under the one-version window (design 0083) a protocol 9 client would also need
   its own encoding of that response, and design 0076 allows one wire change per release, so BUG-22 waits
   for the next wire change after 0.4.0.
+
+### BUG-32: Allow the USB kit's workspace root under -Isolation fs
+
+- **Evidence:** Reproduced live on 2026-11-18 on a Windows 11 laptop (`win2/bug-32-workspace-root-fs`
+  over `origin/master` `d90e1e5`): a worker started with `--isolation fs --workspaces` and
+  `--workspace-root <profile>\AppData\Local\OxideSwarm-USB\workspaces` exited at startup with
+  `refusing to rewrite the DACL of user folder '...' as workspace_root`, and passing a
+  `%TEMP%\...\workspaces` root holding `.oxideswarm-usb-workspaces` also exited at startup with
+  `containing non-workspace entry '.oxideswarm-usb-workspaces'` (`validate_workspace_root_safe`,
+  `crates/worker/src/isolation/windows/toolchain.rs`).
+- **Problem:** Under `-Isolation fs` with `--workspaces`, `packaging/usb/install.ps1` passes
+  `--workspace-root <install>\workspaces` (or `<install>\usb-kit\workspaces` when updating a
+  legacy `%LOCALAPPDATA%\OxideSwarm` install) and creates `.oxideswarm-usb-workspaces` inside it.
+  The worker's `validate_workspace_root_safe` rejected both the USB kit paths under `%LOCALAPPDATA%`
+  and the marker file.
+- **Do:** Statically allow `<home>\AppData\Local\OxideSwarm-USB\workspaces` and
+  `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` in `is_allowed_under_home`, accept
+  `.oxideswarm-usb-workspaces` only when `std::fs::symlink_metadata` confirms a regular non-reparse
+  file, refuse custom `-InstallRoot` paths inside `%USERPROFILE%` under `-Isolation fs` with
+  workspaces before installing in `packaging/usb/install.ps1`, and cover both in tests.
+- **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction/upper-case-name
+  markers and sibling/`workspaces-evil`/`..`-escape user-profile paths are refused, `install.ps1` refuses
+  custom profile roots before creating directories and installs cleanly in `<LOCALAPPDATA>\OxideSwarm-USB`
+  under `-Isolation fs` with workspaces, `uninstall.ps1` requires `.oxideswarm-usb-workspaces` to be a
+  regular file (`-PathType Leaf`), and the worker/isolation/launcher checks pass on Windows (with known
+  unrelated host caveats recorded separately).
+- **Implemented (2026-11-19, pull request 352, open):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
+  and `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` to `is_allowed_under_home` and accepted
+  regular non-reparse lowercase `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
+  `validate_workspace_root_safe` (`crates/worker/src/isolation/windows/toolchain.rs`); added unit
+  tests in `crates/worker/src/isolation.rs` (including `workspaces-evil`, `workspaces\..\other`, and
+  `.OXIDESWARM-USB-WORKSPACES`); added the pre-install profile check in `packaging/usb/install.ps1`
+  and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
+  `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
 
 ## Phase 13: the path to finished
 
@@ -2341,5 +2376,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
+- 2026-11-19: BUG-32 added and Implemented (pull request 352, open): `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces` and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts regular non-reparse `.oxideswarm-usb-workspaces` files ([design 0033](design/0033-os-level-task-isolation.md)), and `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces targets any other path under `%USERPROFILE%`.
 - 2026-11-18: ADOPT-2 Implemented (pull request 350, open): D5 run summary in `submit --wait`, `--json`, and MCP `submit` / `task_result`, with `waited_ms: null` when the MCP submission timestamp is unknown.
 - 2026-11-18: LV-15 Partial (pull request 351): guide and accounts skeleton; step 2 holders, steps 3 and 4 stay with the owner.

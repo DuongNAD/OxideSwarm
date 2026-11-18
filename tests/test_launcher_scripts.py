@@ -1453,6 +1453,20 @@ class UsbKitTests(unittest.TestCase):
         check = text.index("Test-SandboxBase $SandboxBase")
         self.assertLess(check, text.index("& $Exe join --no-doctor"), "check the folder before joining")
 
+    def test_windows_installer_refuses_custom_profile_workspace_root_under_isolation_fs(self):
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in (
+            "$allowedProfileWs1 = Join-Path $UserProfileFull 'AppData\\Local\\OxideSwarm-USB\\workspaces'",
+            "$allowedProfileWs2 = Join-Path $UserProfileFull 'AppData\\Local\\OxideSwarm\\usb-kit\\workspaces'",
+            "with -Isolation fs and workspaces:",
+        ):
+            self.assertIn(needle, text)
+        self.assertLess(
+            text.index("$allowedProfileWs1"),
+            text.index("# 2. Create the folder"),
+            "must refuse disallowed profile workspace roots before creating InstallRoot",
+        )
+
     def test_make_kit_and_install_support_isolation_option_and_reject_invalid_values(self):
         bad_kit = self.make_kit(extra=["--isolation", "bogus"])
         self.assertNotEqual(bad_kit.returncode, 0)
@@ -1956,8 +1970,9 @@ public class Program {
 
                 # 2a. Install using baked isolation=fs from kit\isolation, then uninstall (revoking manifest).
                 # Under %LOCALAPPDATA%, where a double-clicked install goes: a folder elsewhere on the
-                # kit's own drive is refused (a CI runner has only one drive).
-                inst_root_fs = os.path.join(tmp_localappdata, "installed-fs")
+                # kit's own drive is refused (a CI runner has only one drive), and under -Isolation fs
+                # + workspaces the worker only accepts the default OxideSwarm-USB path inside the profile.
+                inst_root_fs = os.path.join(tmp_localappdata, "OxideSwarm-USB")
                 inst_fs = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1973,6 +1988,11 @@ public class Program {
                 self.assertIn("--isolation fs", vbs_text)
                 self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", vbs_text)
                 self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", vbs_text)
+                if shutil.which("cargo"):
+                    self.assertIn("--workspaces --workspace-root", vbs_text)
+                    self.assertTrue(
+                        os.path.isfile(os.path.join(inst_root_fs, "workspaces", ".oxideswarm-usb-workspaces"))
+                    )
                 manifest_fs = os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")
                 self.assertTrue(os.path.isfile(manifest_fs))
 
@@ -2104,7 +2124,7 @@ public class Program {
             finally:
                 for pid_candidate in (
                     pids_log,
-                    os.path.join(tmp_localappdata, "installed-fs", "run", "worker.pid"),
+                    os.path.join(tmp_localappdata, "OxideSwarm-USB", "run", "worker.pid"),
                     os.path.join(tmp_localappdata, "installed-off", "run", "worker.pid"),
                 ):
                     if os.path.isfile(pid_candidate):
@@ -3399,6 +3419,48 @@ public class Program {
             self.assertFalse(re.match(r"^\s*\d+\)", refused[0]), "a refused folder must not be offered as a choice")
             self.assertFalse(os.path.exists(default_root), "listing the folders must install nothing")
 
+            # BUG-32: under -Isolation fs and workspaces, install.ps1 stops before creating
+            # InstallRoot when -InstallRoot puts <install>\workspaces inside %USERPROFILE% at any
+            # path other than the two allowlisted USB-kit workspace roots.
+            custom_local_root = os.path.join(tmp_localappdata, "custom-kit")
+            bad_local_res = powershell(
+                install_ps1, "-InstallRoot", custom_local_root, "-Name", "win-bug32a",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart",
+            )
+            self.assertNotEqual(bad_local_res.returncode, 0, bad_local_res.stdout)
+            self.assertIn("with -Isolation fs and workspaces", bad_local_res.stdout)
+            self.assertIn("OxideSwarm-USB", bad_local_res.stdout)
+            self.assertIn("outside", bad_local_res.stdout)
+            self.assertFalse(os.path.exists(custom_local_root), bad_local_res.stdout)
+
+            custom_profile_root = os.path.join(tmp_home, "custom-in-profile")
+            bad_profile_res = powershell(
+                install_ps1, "-InstallRoot", custom_profile_root, "-Name", "win-bug32b",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart",
+            )
+            self.assertNotEqual(bad_profile_res.returncode, 0, bad_profile_res.stdout)
+            self.assertIn("with -Isolation fs and workspaces", bad_profile_res.stdout)
+            self.assertFalse(os.path.exists(custom_profile_root), bad_profile_res.stdout)
+
+            # ... while the default %LOCALAPPDATA%\OxideSwarm-USB root succeeds under -Isolation fs
+            # with workspaces and writes the .oxideswarm-usb-workspaces marker.
+            ok_fs_res = powershell(
+                install_ps1, "-InstallRoot", default_root, "-Name", "win-kit-test",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart", timeout=120,
+            )
+            self.assertEqual(ok_fs_res.returncode, 0, ok_fs_res.stdout)
+            self.assertIn("connected (isolation: fs)", ok_fs_res.stdout)
+            ok_fs_vbs = read(os.path.join(default_root, "start-worker.vbs"))
+            self.assertIn("--isolation fs", ok_fs_vbs)
+            if shutil.which("cargo"):
+                self.assertIn("--workspaces --workspace-root", ok_fs_vbs)
+                self.assertTrue(
+                    os.path.isfile(os.path.join(default_root, "workspaces", ".oxideswarm-usb-workspaces"))
+                )
+            un_ok_fs = powershell(uninstall_ps1, "-InstallRoot", default_root, "-Yes")
+            self.assertEqual(un_ok_fs.returncode, 0, un_ok_fs.stdout)
+            self.assertFalse(os.path.exists(default_root))
+
             # BUG-31: a worker that stops 5 s after its start is reported as stopped with its exit
             # code, the end of its log is printed, and the rollback keeps the log the error names.
             stop_root = os.path.join(tmp_localappdata, "stop-root")
@@ -3469,6 +3531,13 @@ public class Program {
             self.assertNotEqual(unmarked.returncode, 0, unmarked.stdout)
             self.assertIn(".oxideswarm-usb-install", unmarked.stdout)
             self.assertTrue(os.path.isdir(os.path.join(unmarked_root, "workspaces")))
+
+            # ... and so is a directory masquerading as the .oxideswarm-usb-workspaces marker.
+            dir_marker_root = old_install("dir-marker-kit")
+            os.makedirs(os.path.join(dir_marker_root, "workspaces", ".oxideswarm-usb-workspaces"))
+            dir_marker_res = powershell(uninstall_ps1, "-InstallRoot", dir_marker_root, "-Yes")
+            self.assertNotEqual(dir_marker_res.returncode, 0, dir_marker_res.stdout)
+            self.assertTrue(os.path.isdir(os.path.join(dir_marker_root, "workspaces")))
         finally:
             if other_proc is not None and other_proc.poll() is None:
                 other_proc.kill()
