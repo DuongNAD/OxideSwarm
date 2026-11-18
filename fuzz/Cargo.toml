@@ -16,7 +16,8 @@ libfuzzer-sys = "0.4"
 rusty_grid_core = { path = "../crates/core", default-features = false }
 # `store_journal`: the task store readers, exposed by the `fuzzing` feature (LV-18).
 rusty_grid_master = { path = "../crates/master", default-features = false, features = ["fuzzing"] }
-# `join_invite`: the join token, invite and `invite.oxs` parsers (all public).
+# `join_invite`: the join token, invite and `invite.oxs` parsers (all public); `mcp_request_line`:
+# the MCP line reader (`#[doc(hidden)] pub`).
 rusty_grid_cli = { path = "../crates/cli" }
 tokio = { version = "1.40", features = ["rt", "time", "io-util", "test-util"] }
 bytes = "1.10"
@@ -67,6 +68,13 @@ bench = false
 [[bin]]
 name = "store_journal"
 path = "fuzz_targets/store_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_request_line"
+path = "fuzz_targets/mcp_request_line.rs"
 test = false
 doc = false
 bench = false
