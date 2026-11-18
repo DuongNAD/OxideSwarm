@@ -165,12 +165,15 @@ After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68
 Recounted on 2026-11-18 after pull requests 299 to 318 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
 TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
 pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
+Then TEST-52 (pull request 320, Partial) and DOC-11 (pull request 322): 202 items, 127 Implemented, 16 Partial and
+59 Planned; 30 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
 [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md): "In" when an exit check of
 its D2 names the item, or when the item fixes a defect or a test (BUG, SEC, TEST); "Out" when its D1 puts
-the item outside; "?" while the owner decides. An Implemented item has no value there.
+the item outside, or when the owner placed it there (JOIN-1, SCHED-4, LV-10, PROTO-5, LAUNCH-1 to LAUNCH-5,
+APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item has no value there.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Line | Pull requests |
 |---|---|---|---|---|---|---|---|---|
@@ -298,7 +301,7 @@ the item outside; "?" while the owner decides. An Implemented item has no value 
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned | Out |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented |  | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented |  | 75 |
-| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | ? | 163 |
+| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | Out | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | In | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented |  | 162, 175, 187, 189 |
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051), 190, 201 |
@@ -309,7 +312,7 @@ the item outside; "?" while the owner decides. An Implemented item has no value 
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented |  | 209, 207, 210 |
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented |  | 222, (design 0050) |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented |  | 227, (design 0050) |
-| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | ? | 214, (design 0060) |
+| SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | Out | 214, (design 0060) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned | Out |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned | Out |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned | Out |  |
@@ -332,13 +335,13 @@ the item outside; "?" while the owner decides. An Implemented item has no value 
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Partial | In | (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | In | (design 0058) |
-| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | ? | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
-| PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | (open), (design 0076) |
+| PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented |  | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
-| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | ? | (design 0083) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned | In |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
@@ -358,24 +361,24 @@ the item outside; "?" while the owner decides. An Implemented item has no value 
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
-| LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | ? |  |
-| LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | ? |  |
-| LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | ? |  |
-| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3, BENCH-7 |  | Planned | ? |  |
-| LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned | ? |  |
+| LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
+| LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
+| LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | Out |  |
+| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3, BENCH-7 |  | Planned | Out |  |
+| LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned | Out |  |
 | COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented |  | 295, (design 0087) |
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented |  | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented |  | 294, (design 0087) |
-| APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Partial | ? | (design 0063), (design 0089) |
+| APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Partial | Out | (design 0063), (design 0089) |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented |  | 296, (design 0089) |
 | VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented |  | 312, (design 0089) |
-| APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | ? | (design 0089) |
+| APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | Out | (design 0089) |
 | BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Implemented |  | 314, (design 0093) |
-| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | ? | (design 0093) |
-| BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | ? | (design 0093) |
-| BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | ? | (design 0093) |
-| BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | ? | (design 0093) |
-| BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | ? | (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | Out | (design 0093) |
+| BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | Out | (design 0093) |
+| BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
+| BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
+| BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -2227,3 +2230,7 @@ Add one dated line per finished item, newest last.
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table. The Index counts are
   unchanged.
 - 2026-11-18: DOC-11: Implemented items' text moved to BACKLOG-ARCHIVE.md; Index column Line added (In/Out per design 0088).
+- 2026-11-18: The owner placed the 16 open items that design 0088 does not name outside the stop line ("Out"):
+  JOIN-1, SCHED-4, LV-10, PROTO-5, LAUNCH-1 to LAUNCH-5, APP-4, APP-5 and BENCH-3 to BENCH-7. They keep their
+  priority. PROTO-1's pull request cell corrected to 262. Counted from the rows: 202 items, 127 Implemented,
+  16 Partial and 59 Planned; 30 open items In, 45 Out.
