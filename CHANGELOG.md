@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-18
+
+A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` and `0.4.1`. It adds `submit --verify` (run a task again on other workers and compare its outputs, `VERIFY-1`), which by default compares only workers with the same operating system and CPU architecture (`VERIFY-2`). It fixes a worker that kept tasks while its sandbox base was unusable (`BUG-25`), the Agent Mesh hub disconnecting a healthy sender for the hub's own replies (`TEST-27`), two worker recovery races (`TEST-23`, partial), and the dev cluster binding the default discovery port (`BUG-26`), and makes eleven flaky tests deterministic (`TEST-42` to `TEST-52`).
+
+### Upgrading from 0.4.1
+
+- Replace the binaries in any order; no clean stop is needed for this upgrade. `submit --verify` is client side and works against a `0.4.x` master; a `0.4.x` master also hands back a task that a `0.4.2` worker refuses for an unusable sandbox base, because the refusal says `rejected by worker` (design 0090 D1).
+- Agent Mesh hub operators: replace `agent-mesh` to get the fix for senders that were disconnected as slow consumers after a burst of requests to unknown nodes (design 0092).
+
 ### Added
 - `scripts/ci_push_runs.py` prints each CI run for a push on `master` that is not green with its class (failing test, job never acquired, cancelled by an account, other) and whether the window has no run with a failing test; the `fuzz` job retries the nightly toolchain download; a rule that nobody cancels a run for a push on `master` (design 0088, `CI-1`).
 - `submit --verify <N>` (with `--verify-file`) runs a task again on N other matching workers and compares the declared outputs by BLAKE3, printing `verified` or `mismatch` (exit 4); the MCP `submit` tool takes `verify` and `verify_file`. Client side only, no wire change (design 0089 D3, `VERIFY-1`).

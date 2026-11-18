@@ -75,9 +75,10 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 are open.
-- Releases (2026-11-17): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
-  released, and `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found. Stability
-  releases with no wire change continue as `0.4.x` (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
+- Releases (2026-11-18): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
+  released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, and `0.4.2` adds
+  `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes. Stability releases with no wire change
+  continue as `0.4.x` (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
   coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
 - What finished means (Accepted, 2026-11-17): an evaluation on ten criteria, a stop line, and one
   exit check per criterion. The project is finished when the ten checks hold (Q82). Scale out, the
@@ -153,6 +154,7 @@ number does not fix its content in advance.
 | `0.3.0` | SCALE-2, FEAT-9a, GPU command tasks under isolation (FEAT-3e) and the fixes of the audit of 2026-11-15 | Released on 2026-11-16 at protocol 9 (pull request 260) | Nothing |
 | `0.4.0` | Upgrade a cluster without stopping all of it: protocol 10, the extension slot and the one-version window | Released on 2026-11-17 at protocol 10 (pull request 280; PROTO-1 to PROTO-4 in pull requests 272 and 274) | Nothing |
 | `0.4.1` | BUG-23 (`oxctl.ps1` stops a master with Ctrl+C) and BUG-24 (a `--state-dir` without file permissions is refused), CI diagnostics (TEST-29) and test fixes (TEST-33, TEST-41) | Released on 2026-11-17, no wire change | Nothing |
+| `0.4.2` | `submit --verify` on the same system by default (VERIFY-1, VERIFY-2, Q89), BUG-25 (a worker hands back a task when its sandbox base is unusable), BUG-26, the mesh hub fix of TEST-27, two worker recovery races (TEST-23, partial) and test fixes (TEST-42 to TEST-52) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.x`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned. It comes before any item of `0.5.0` is built (Q80) | The exit check under "Stability" |
 | `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The stability release, and the steps under "Before 0.5.0 has items" |
 | `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 and, since 2026-11-17, AX-1 to AX-3 are in the BACKLOG Index (Phase 13) | The first round of ADOPT-1 (Q37) |

@@ -4535,3 +4535,7 @@ Add one dated line per finished item, newest last.
   through the integration pull request 316, and 317 with TEST-51 (pull request 318)): TEST-32 corrected to Implemented (pull request 267), VERIFY-2 and
   BENCH-2 Implemented, APP-4 Partial (the Windows half). Counted from the rows, the Index holds 201 items: 126
   Implemented, 15 Partial and 60 Planned.
+- 2026-11-18: Release `0.4.2` prepared (no wire change; VERIFY-1, VERIFY-2, BUG-25, BUG-26, the mesh hub
+  fix of TEST-27, TEST-23 partial, TEST-42 to TEST-52): versions, CHANGELOG with an "Upgrading from 0.4.1"
+  note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table. The Index counts are
+  unchanged.
