@@ -764,6 +764,12 @@ then JOIN-2 and USB-1 in parallel.
   its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
   machine on another network joins through `--p2p` with an invite sent by chat, and the run is
   recorded with its date.
+- **Status (2026-11-18, Partial):** ENROLL-1c, first part: a revoked member loses every connection
+  at once (worker sessions over TCP and QUIC, client connections over TCP and P2P, blob and MCP
+  connections), and the tasks on its workers are requeued at once without the resume hold and
+  without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. Open: cancelling the
+  member's submitted tasks (design 0051 D5 step 2, a store format change for the owner) and
+  ENROLL-1d.
 
 ### USB-1: Set up machines from a USB stick
 
