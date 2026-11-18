@@ -480,6 +480,7 @@ mod imp {
         let mut fds: [libc::c_int; 2] = [-1, -1];
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            // SAFETY: `fds` is a live array of two `c_int`, exactly what `pipe2` writes.
             let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -487,16 +488,22 @@ mod imp {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
+            // SAFETY: `fds` is a live array of two `c_int`, exactly what `pipe` writes.
             let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             for &fd in &fds {
+                // SAFETY: `fd` is one of the two descriptors `pipe` just opened, which this
+                // function alone holds; `F_GETFD` takes no pointer.
                 let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
                 if flags < 0
+                    // SAFETY: as above; `F_SETFD` takes an integer flag set, no pointer.
                     || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
                 {
                     let err = std::io::Error::last_os_error();
+                    // SAFETY: both descriptors are open, owned by nothing else (they are not
+                    // wrapped in `OwnedFd` yet) and closed once, as the function returns here.
                     unsafe {
                         let _ = libc::close(fds[0]);
                         let _ = libc::close(fds[1]);
@@ -505,7 +512,10 @@ mod imp {
                 }
             }
         }
+        // SAFETY: the pipe call succeeded, so `fds[0]` and `fds[1]` are two distinct open
+        // descriptors that nothing else owns; each gets exactly one `OwnedFd`.
         let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: see `read_fd`.
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         Ok((read_fd, write_fd))
     }
@@ -528,6 +538,7 @@ mod imp {
             if !base.join("cgroup.procs").exists() {
                 return None;
             }
+            // SAFETY: `getpid` has no preconditions and cannot fail.
             let probe = base.join(format!("oxideswarm-probe-{}", unsafe { libc::getpid() }));
             std::fs::create_dir(&probe).ok()?;
             let writable = std::fs::OpenOptions::new()
@@ -582,6 +593,15 @@ mod imp {
         })
     }
 
+    /// Removes the cgroup leaf directory `path_cstr`, retrying a few times while the kernel still
+    /// reports it busy (`EBUSY`). Does nothing for an all-zero buffer (no leaf).
+    ///
+    /// # Safety
+    ///
+    /// `path_cstr` must contain a NUL byte, so `rmdir` never reads past the array:
+    /// `prepare_cgroup_leaf` copies a path of at most `CGROUP_PATH_CAP - 1` bytes, with no NUL in
+    /// it, into a zeroed buffer. The function calls only `rmdir` and `nanosleep` and allocates
+    /// nothing, so the forked lifeline supervisor may call it.
     #[cfg(target_os = "linux")]
     unsafe fn rmdir_cgroup_leaf_with_retry(path_cstr: &[u8; CGROUP_PATH_CAP]) {
         if path_cstr[0] == 0 {
@@ -606,6 +626,18 @@ mod imp {
         }
     }
 
+    /// Kills every process in the cgroup leaf (`1` to `cgroup.kill`, then `SIGKILL` to each PID
+    /// listed in `cgroup.procs`) and removes the leaf directory.
+    ///
+    /// # Safety
+    ///
+    /// `kill_fd` and `procs_fd` must each be -1 or an open descriptor of this leaf's
+    /// `cgroup.kill` and `cgroup.procs` for the whole call, so the `CgroupLeaf` that owns them
+    /// must not have been dropped yet (in the forked supervisor they are its inherited copies). A
+    /// closed number that the process had reused would make this write to, and SIGKILL PIDs read
+    /// from, an unrelated file. `path_cstr` as for [`rmdir_cgroup_leaf_with_retry`]. Only `write`,
+    /// `lseek`, `read`, `kill`, `rmdir` and `nanosleep` are called and nothing is allocated, so
+    /// the forked supervisor may call it.
     #[cfg(target_os = "linux")]
     unsafe fn kill_cgroup_leaf(
         kill_fd: libc::c_int,
@@ -646,6 +678,16 @@ mod imp {
         rmdir_cgroup_leaf_with_retry(path_cstr);
     }
 
+    /// Closes every descriptor of the calling process except those in `keep`.
+    ///
+    /// # Safety
+    ///
+    /// Only for the freshly forked, single-threaded lifeline supervisor, which never returns into
+    /// Rust code that owns descriptors (it ends with `_exit`). The function closes descriptors
+    /// that `OwnedFd`, `File` and the runtime own, so in any other process those owners would
+    /// later use or close a number that is closed or reused. `max_nofile` bounds the fallback
+    /// loop. Only `close` (and the raw `close_range` system call on Linux) is used and nothing is
+    /// allocated.
     unsafe fn close_fds_except(keep: &[libc::c_int], max_nofile: libc::c_int) {
         let mut max_keep: libc::c_int = -1;
         for &fd in keep {
@@ -689,6 +731,19 @@ mod imp {
         }
     }
 
+    /// SIGKILLs every process of this user whose environment holds `needle` (the per-attempt
+    /// `RUSTY_GRID_RUN_TOKEN=<uuid>` entry), found by reading `/proc/<pid>/environ`, and returns
+    /// how many it killed. PIDs 0 and 1, this process, the worker and the task's group leader are
+    /// skipped.
+    ///
+    /// # Safety
+    ///
+    /// No pointer precondition: every buffer handed to the kernel is a local array passed with
+    /// its own length, and every descriptor opened here is closed here. It is an `unsafe fn` so
+    /// the body can call libc directly; it keeps to `open`, `getdents64`, `fstat`, `read`,
+    /// `close`, `kill`, `getpid` and `geteuid` and allocates nothing, so the forked lifeline
+    /// supervisor may call it. `needle` must name one task attempt only (`build_task_env_needle`),
+    /// because every match is killed; an all-zero needle kills nothing.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe fn kill_escaped_by_env(
         task_pgid: libc::pid_t,
@@ -811,6 +866,20 @@ mod imp {
         killed
     }
 
+    /// The macOS form of the sweep: lists PIDs with `proc_listallpids`, keeps the processes of
+    /// this user started no earlier than `spawn_tvsec`, reads each one's arguments and
+    /// environment with `sysctl(KERN_PROCARGS2)` and SIGKILLs those that hold `needle`. Returns
+    /// how many it killed.
+    ///
+    /// # Safety
+    ///
+    /// No pointer precondition: every buffer handed to the kernel is a local array or the one
+    /// anonymous mapping made here, each passed with its own length, and the mapping is unmapped
+    /// before returning. It is an `unsafe fn` so the body can call libc directly; it keeps to
+    /// system-call wrappers (`proc_listallpids`, `proc_pidinfo`, `sysctl`, `mmap`, `munmap`,
+    /// `kill`, `getpid`, `geteuid`) and allocates nothing on the heap, so the forked lifeline
+    /// supervisor may call it. `needle` must name one task attempt only, because every match is
+    /// killed.
     #[cfg(target_os = "macos")]
     unsafe fn kill_escaped_by_env(
         task_pgid: libc::pid_t,
@@ -920,6 +989,11 @@ mod imp {
         killed
     }
 
+    /// No process-table sweep on the other Unix systems: kills nothing.
+    ///
+    /// # Safety
+    ///
+    /// None: the function does nothing; it is an `unsafe fn` only to match the other forms.
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     unsafe fn kill_escaped_by_env(
         _task_pgid: libc::pid_t,
@@ -935,12 +1009,15 @@ mod imp {
     ) -> PreparedUnix {
         cmd.process_group(0);
         let nice = priority.unix_nice();
+        // SAFETY: `getpid` has no preconditions and cannot fail.
         let worker_pid = unsafe { libc::getpid() };
         let run_token = uuid::Uuid::new_v4();
         cmd.env("RUSTY_GRID_RUN_TOKEN", run_token.to_string());
         let needle = build_task_env_needle(run_token);
 
         #[cfg(target_os = "macos")]
+        // SAFETY: `tv` is a live `timeval` that `gettimeofday` writes; the time zone argument is
+        // null, which it accepts.
         let spawn_tvsec: u64 = unsafe {
             let mut tv = libc::timeval {
                 tv_sec: 0,
@@ -953,6 +1030,7 @@ mod imp {
             }
         };
 
+        // SAFETY: `rlim` is a live `rlimit` that `getrlimit` writes.
         let max_nofile: libc::c_int = unsafe {
             let mut rlim = libc::rlimit {
                 rlim_cur: 0,
@@ -994,6 +1072,20 @@ mod imp {
             .as_ref()
             .map_or([0u8; CGROUP_PATH_CAP], |leaf| leaf.path_cstr);
 
+        // `pre_exec` runs the closure in the child between `fork` and `exec`, where other
+        // threads' locks may be held, so it must not allocate or lock. The closure captures only
+        // `Copy` integers and arrays, allocates nothing, and calls only system-call wrappers
+        // (`getpid`, `setpgid`, `setpriority`, `fork`, `setsid`, `read`, `write`, `close`,
+        // `killpg`, `nanosleep`, `waitpid`, `_exit`) and `close_fds_except`, `kill_cgroup_leaf`
+        // and `kill_escaped_by_env`, whose `# Safety` sections allow this context. The raw
+        // descriptors it names are open at that `fork`: `PreparedUnix` holds the lifeline ends and
+        // `CgroupLeaf` the cgroup files until `ConfiguredCommand::spawn` returns, and `cmd` is
+        // spawned only there, once (the caller drops it right after). In the task process the
+        // closure closes only its own copies of those descriptors, which no Rust object there
+        // closes again (the child execs or exits); the supervisor grandchild closes every other
+        // descriptor too, which `close_fds_except` allows because it ends with `_exit`.
+        // SAFETY: the closure keeps to what is allowed between `fork` and `exec`, and every
+        // descriptor it uses is open in the child, as set out above.
         unsafe {
             cmd.pre_exec(move || {
                 let task_pgid = libc::getpid();
@@ -1212,6 +1304,12 @@ mod imp {
             return;
         }
         signal(id.pgid, libc::SIGKILL);
+        // `TreeInner::kill_and_release_once` drops the `CgroupLeaf` behind `id` only after this
+        // returns, and `terminate_all_task_process_trees` passes only ids still in `LIVE`, under
+        // the lock a tree takes to leave `LIVE` before it drops its leaf (Linux).
+        // SAFETY: so the leaf's descriptors are -1 or still open, and `cgroup_path_cstr` is
+        // NUL-terminated (`prepare_cgroup_leaf`, or all zero). `kill_escaped_by_env` has no
+        // pointer precondition, and `needle` is this tree's own.
         unsafe {
             #[cfg(target_os = "linux")]
             kill_cgroup_leaf(id.cgroup_kill_fd, id.cgroup_procs_fd, &id.cgroup_path_cstr);
@@ -1233,6 +1331,8 @@ mod imp {
 
     pub(super) fn release(id: RawId) {
         #[cfg(target_os = "linux")]
+        // SAFETY: `cgroup_path_cstr` is NUL-terminated: `prepare_cgroup_leaf` copies at most
+        // `CGROUP_PATH_CAP - 1` bytes into a zeroed buffer, or the buffer is all zero (no leaf).
         unsafe {
             rmdir_cgroup_leaf_with_retry(&id.cgroup_path_cstr);
         }
@@ -1377,6 +1477,8 @@ impl TreeInner {
         if let Ok(mut lifeline) = self.lifeline_write.lock() {
             if let Some(w) = lifeline.take() {
                 use std::os::unix::io::AsRawFd;
+                // SAFETY: `w` owns the open write end of the lifeline pipe and lives across the
+                // call; the buffer is a 1-byte static string and the length is 1.
                 unsafe {
                     let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
                 }
@@ -1655,6 +1757,8 @@ mod tests {
 
         let (read_fd, write_fd) = imp::create_lifeline_pipe().expect("create lifeline pipe");
         for fd in [read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
+            // SAFETY: `fd` belongs to `read_fd` or `write_fd`, which live to the end of the test;
+            // `F_GETFD` takes no pointer.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(flags >= 0, "fcntl(F_GETFD) failed on fd {fd}");
             assert_ne!(
