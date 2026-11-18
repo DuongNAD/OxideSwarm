@@ -26,6 +26,11 @@ use rusty_grid_core::protocol::{
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 
+/// The bound on how long a test waits for a master's Web UI to accept a connection or for its port
+/// to come free again (TEST-52). It is a limit, not a window: each wait ends as soon as its
+/// condition holds.
+const WEB_UI_WAIT: Duration = Duration::from_secs(30);
+
 /// Helper polling predicate until condition is met or timeout elapses.
 async fn poll_until<F, Fut>(timeout: Duration, step: Duration, mut predicate: F) -> bool
 where
@@ -275,54 +280,51 @@ async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() 
 
 #[tokio::test]
 async fn test_web_ui_port_release_and_reuse_after_shutdown() {
-    // Find an available port by binding and immediately dropping
-    let test_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let web_addr: SocketAddr = format!("127.0.0.1:{test_port}").parse().unwrap();
-
-    // 1. Spawn Master 1 on that Web UI port
+    // 1. Master 1 picks its own Web UI port (TEST-52): a port the test bound, dropped and then
+    //    handed to the master could be taken by another test in between.
     let config1 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_web_ui(true)
-        .with_web_ui_addr(web_addr);
+        .with_web_ui_addr("127.0.0.1:0".parse().unwrap());
     let master1 = MasterServer::spawn(config1).await.unwrap();
+    let web_addr: SocketAddr = master1
+        .dashboard_addr()
+        .expect("Master 1 must bind its Web UI on an ephemeral port");
+    let test_port = web_addr.port();
 
     // Verify port is bound by connecting to it
-    let connected = poll_until(
-        Duration::from_secs(3),
-        Duration::from_millis(20),
-        || async { TcpStream::connect(web_addr).await.is_ok() },
-    )
+    let connected = poll_until(WEB_UI_WAIT, Duration::from_millis(20), || async {
+        TcpStream::connect(web_addr).await.is_ok()
+    })
     .await;
     assert!(connected, "Web UI 1 must be reachable on port {test_port}");
 
     // 2. Shut down Master 1
     master1.shutdown().unwrap();
 
-    // Wait for port release
-    let released = poll_until(
-        Duration::from_secs(3),
-        Duration::from_millis(20),
-        || async { tokio::net::TcpListener::bind(web_addr).await.is_ok() },
-    )
-    .await;
-    assert!(
-        released,
-        "Web UI port {test_port} must be freed upon master shutdown"
-    );
+    // 3. Spawn Master 2 on the exact same Web UI port, again until it binds it. The port has come
+    //    free once Master 2 holds it, and no probe listener is bound and dropped in between
+    //    (TEST-52). A master whose Web UI cannot bind runs on without it, so a miss is shut down.
+    let deadline = Instant::now() + WEB_UI_WAIT;
+    let master2 = loop {
+        let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(true)
+            .with_web_ui_addr(web_addr);
+        let master2 = MasterServer::spawn(config2).await.unwrap();
+        if master2.dashboard_addr() == Some(web_addr) {
+            break master2;
+        }
+        let _ = master2.shutdown();
+        assert!(
+            Instant::now() < deadline,
+            "Web UI port {test_port} must be freed upon master shutdown (Master 2 could not bind it within {} s)",
+            WEB_UI_WAIT.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
 
-    // 3. Spawn Master 2 on the exact same Web UI port
-    let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_web_ui(true)
-        .with_web_ui_addr(web_addr);
-    let master2 = MasterServer::spawn(config2).await.unwrap();
-
-    let reconnected = poll_until(
-        Duration::from_secs(3),
-        Duration::from_millis(20),
-        || async { TcpStream::connect(web_addr).await.is_ok() },
-    )
+    let reconnected = poll_until(WEB_UI_WAIT, Duration::from_millis(20), || async {
+        TcpStream::connect(web_addr).await.is_ok()
+    })
     .await;
     assert!(
         reconnected,
@@ -573,19 +575,17 @@ async fn test_server_config_environment_variable_override_matrix() {
 async fn test_web_ui_http_api_endpoints_under_ephemeral_multi_master() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Find an ephemeral port for Web UI
-    let web_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let web_addr: SocketAddr = format!("127.0.0.1:{web_port}").parse().unwrap();
-
-    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    // The master picks its own Web UI port (TEST-52), and the test reads it back. The dashboard
+    // denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_web_ui(true)
-        .with_web_ui_addr(web_addr)
+        .with_web_ui_addr("127.0.0.1:0".parse().unwrap())
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
     let master = MasterServer::spawn(config).await.unwrap();
+    let web_addr: SocketAddr = master
+        .dashboard_addr()
+        .expect("the master must bind its Web UI on an ephemeral port");
+    let web_port = web_addr.port();
 
     // Register a worker to the master so /api/status has data
     let wid = Uuid::new_v4();
@@ -606,11 +606,9 @@ async fn test_web_ui_http_api_endpoints_under_ephemeral_multi_master() {
     let _: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
 
     // Wait for Web UI to be reachable
-    let reachable = poll_until(
-        Duration::from_secs(3),
-        Duration::from_millis(20),
-        || async { TcpStream::connect(web_addr).await.is_ok() },
-    )
+    let reachable = poll_until(WEB_UI_WAIT, Duration::from_millis(20), || async {
+        TcpStream::connect(web_addr).await.is_ok()
+    })
     .await;
     assert!(reachable, "Web UI must be reachable on port {web_port}");
 

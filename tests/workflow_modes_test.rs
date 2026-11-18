@@ -876,6 +876,7 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
     let _ = web_listener.set_nonblocking(true);
 
     // Picked while `web_listener` is held, so it cannot be the same port (TEST-43).
+    // Bind-and-drop kept (TEST-52): `launch_local_dev_cluster_with_ports` cannot take port 0.
     let free_master_port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master port");
         l.local_addr().expect("local_addr").port()
@@ -1004,6 +1005,7 @@ async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
 /// Two different free loopback ports (TEST-43). Both listeners stay open until both ports are known:
 /// a port picked and closed one line earlier can be handed out again by the next bind, and then the
 /// master took that one port for its grid listener and could not bind its dashboard on it.
+/// Bind-and-drop kept (TEST-52): `launch_local_dev_cluster_with_ports` cannot take port 0.
 fn two_free_ports() -> (u16, u16) {
     let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first ephemeral port");
     let second = std::net::TcpListener::bind("127.0.0.1:0").expect("bind second ephemeral port");
@@ -1216,6 +1218,7 @@ async fn test_dev_cluster_fails_when_port_is_held() {
     let held_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind held tcp port for master");
     let held_port = held_listener.local_addr().expect("local_addr").port();
+    // Never bound (TEST-52): the master fails on the held grid port before it binds the dashboard.
     let free_web_port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral web port");
         l.local_addr().expect("local_addr").port()

@@ -561,6 +561,7 @@ fn test_server_config_debug_does_not_leak_the_secret() {
 #[tokio::test]
 async fn test_discovery_beacon_is_signed_only_for_authenticated_probes() {
     let secret = secret(12);
+    // Bind-and-drop kept (TEST-52): the master never publishes the UDP port its beacon binds.
     let udp_port = std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

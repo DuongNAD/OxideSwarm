@@ -21,6 +21,7 @@ impl Drop for Master {
     }
 }
 
+// Bind-and-drop kept (TEST-52): `--listen 127.0.0.1:0` turns the beacon off (`ServerConfig::new`).
 fn free_tcp_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -29,6 +30,7 @@ fn free_tcp_port() -> u16 {
         .port()
 }
 
+// Bind-and-drop kept (TEST-52): `--discovery-port 0` turns the beacon off; no port is published.
 fn free_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
         .unwrap()
