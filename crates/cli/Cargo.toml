@@ -211,6 +211,10 @@ name = "cli_enroll_e2e"
 path = "../../tests/cli_enroll_e2e.rs"
 
 [[test]]
+name = "cli_revoke_e2e"
+path = "../../tests/cli_revoke_e2e.rs"
+
+[[test]]
 name = "cli_pair_e2e"
 path = "../../tests/cli_pair_e2e.rs"
 
