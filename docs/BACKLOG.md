@@ -352,6 +352,9 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented |  | 311 |
 | BUG-27 | Compute the result acknowledgement token only when result resume is on | P3 | S |  |  | Implemented |  | 332 |
 | BUG-28 | Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint | P2 | S |  |  | Implemented |  | 334 |
+| BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 (open) |
+| BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 (open) |
+| BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -364,7 +367,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340 (open), (design 0058) |
-| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
+| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351 (open), (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
@@ -1633,6 +1636,12 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** The guide exists and is in the index of `docs/README.md`. Proof run V3 is
   recorded with its date in the status log of design 0058. Until a second person has cut a
   release, the item is Partial.
+- **Note (2026-11-18):** Pull request 351 (open) adds `docs/guides/cut-a-release.md`
+  (covering wire-change rules, release PR preparation, owner merge and `v*` tag push, `SHA256SUMS`
+  and `gh attestation verify` checks, isolated macOS and Windows loopback smoke checks, and the step
+  2 accounts and workflow-permissions skeleton table) and adds it to `docs/README.md`. Confirming
+  holders in step 2, granting a second person merge/release rights (step 3), and proof run V3
+  (step 4) stay with the owner.
 
 ## Phase 14: public launch
 
@@ -2318,3 +2327,7 @@ Add one dated line per finished item, newest last.
   tail and the missing queue are below 0.05; the gap is the cost of running through the grid on each machine
   (about 0.78 of each machine alone): on Windows the master on another machine over the LAN (0.16), on the Mac
   the default task priority (0.05) and 0.16 still open. BENCH-9 added (Planned, Out); Q93 open.
+- 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
+  menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
+  laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
+- 2026-11-18: LV-15 Partial (pull request 351): guide and accounts skeleton; step 2 holders, steps 3 and 4 stay with the owner.

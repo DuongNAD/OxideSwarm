@@ -742,10 +742,29 @@ case "$1" in
     esac ;;
   worker)
     shift
-    while [ $# -gt 0 ]; do [ "$1" = "--name" ] && echo "$2" > "$OXIDESWARM_HOME/fake_worker_name"; shift; done
+    iso=""
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--name" ] && echo "$2" > "$OXIDESWARM_HOME/fake_worker_name"
+      [ "$1" = "--isolation" ] && iso=$2
+      shift
+    done
     echo $$ > "$OXIDESWARM_HOME/fake_worker_pid"
+    # FAKE_WORKER_STOP_WITH_ISOLATION=fs: stop at once under that isolation (a kernel without it).
+    if [ -n "${FAKE_WORKER_STOP_WITH_ISOLATION:-}" ] && [ "$iso" = "$FAKE_WORKER_STOP_WITH_ISOLATION" ]; then
+      echo "fake worker: isolation $iso is not available here"
+      exit 4
+    fi
+    # FAKE_WORKER_EXIT_AFTER=N: write 40 log lines, run N seconds, then stop with FAKE_WORKER_EXIT_CODE.
+    if [ -n "${FAKE_WORKER_EXIT_AFTER:-}" ]; then
+      n=1
+      while [ $n -le 40 ]; do printf 'fake-log-line-%02d\\n' "$n"; n=$((n + 1)); done
+      sleep "$FAKE_WORKER_EXIT_AFTER"
+      echo "fake worker: FAKE-STOP-MARKER the sandbox base is refused"
+      exit "${FAKE_WORKER_EXIT_CODE:-1}"
+    fi
     while true; do sleep 1; done ;;
   workers)
+    if [ -n "${FAKE_WORKERS_EMPTY:-}" ]; then echo "[]"; exit 0; fi
     pid=$(cat "$OXIDESWARM_HOME/fake_worker_pid" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       printf '[\\n  {\\n    "name": "%s",\\n    "tags": [\\n      "state:connected"\\n    ]\\n  }\\n]\\n' "$(cat "$OXIDESWARM_HOME/fake_worker_name")"
@@ -1219,7 +1238,9 @@ class UsbKitTests(unittest.TestCase):
         # and hold nothing another account may change, the folders on the way to it must not be
         # renamable by others, the result is verified, and an update runs the same checks.
         text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
-        self.assertNotIn("icacls", text)
+        # The installer never runs icacls (it may print a command for the user, see BUG-31).
+        self.assertNotRegex(text, r"(?mi)^\s*(&\s*)?['\"]?icacls(\.exe)?['\"]?\s")
+        self.assertNotRegex(text, r"(?i)Start-Process[^\n]*icacls")
         for needle in ("SetAccessRuleProtection($true, $false)", "$sec.SetOwner($UserSid)",
                        "[IO.Directory]::CreateDirectory($InstallRoot, $sec)", "function Test-RootSafety",
                        "belongs to another account", "can rename or change", "$RenameRights",
@@ -1298,7 +1319,8 @@ class UsbKitTests(unittest.TestCase):
         for needle in ("[IO.DriveInfo]::GetDrives()", "@('NTFS', 'ReFS')", "$drive.DriveType -ne 'Fixed'",
                        "it is on the drive this kit runs from", "not the root of a drive",
                        "already holds other files", "[Security.Principal.WindowsIdentity]::GetCurrent().User",
-                       "SetAccessRuleProtection($true, $false)", "$SandboxBase = if ($PrivateRoot)", "--workspace-root",
+                       "SetAccessRuleProtection($true, $false)", "$SandboxBase = if ($PrivateRoot -and $Isolation -eq 'fs')",
+                       "--workspace-root",
                        "AssocClass=Win32_LogicalDiskToPartition", "$disk.InterfaceType -eq 'USB'",
                        "'HKCU:\\Software\\OxideSwarm\\UsbKit'"):
             self.assertIn(needle, text)
@@ -1325,6 +1347,111 @@ class UsbKitTests(unittest.TestCase):
         self.assertIn("checksum mismatch", res.stdout)
         self.assertFalse(os.path.exists(os.path.join(root, "bin", "oxideswarm")))
         self.assertEqual([c for c in read(self.args_log).splitlines() if c.strip()], [])
+
+    def test_a_worker_that_stops_after_the_start_is_reported_with_its_log(self):
+        # BUG-31 (2026-11-18, a Windows 11 laptop): the worker exited about 6 s after its start, after
+        # the installer's one liveness check, so the installer waited for the listing and then said "the
+        # worker runs but the master does not list it yet; see .../worker.log". The rollback had already
+        # deleted that log. The installer now checks the worker every second while it waits, prints the
+        # end of its log before the rollback, and keeps the log.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        env = dict(self.env(), FAKE_WORKER_EXIT_AFTER="5", FAKE_WORKER_EXIT_CODE="3", FAKE_WORKERS_EMPTY="1")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root, "--isolation", "off",
+                              "--no-autostart", "--name", "kit-stops"],
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=120)
+        out = res.stdout
+        self.assertNotEqual(res.returncode, 0, out)
+        log = os.path.join(root, "logs", "worker.log")
+        self.assertIn("the worker stopped", out)
+        self.assertIn("exit code 3", out)
+        self.assertNotIn("does not list it", out)
+        # The last 30 lines of the log, under a header, before the error and the rollback.
+        self.assertIn("last 30 lines of " + log, out)
+        self.assertIn("FAKE-STOP-MARKER", out)
+        self.assertIn("fake-log-line-40", out)
+        self.assertNotIn("fake-log-line-01", out)
+        self.assertLess(out.index("FAKE-STOP-MARKER"), out.index("ERROR:"))
+        # The rollback removed the install but kept the log, and the error names a file that exists.
+        self.assertFalse(os.path.exists(os.path.join(root, "bin")))
+        self.assertFalse(os.path.exists(os.path.join(root, "home")))
+        self.assertTrue(os.path.isfile(log), out)
+        self.assertIn("FAKE-STOP-MARKER", read(log))
+        error_line = [line for line in out.splitlines() if line.startswith("ERROR:")][-1]
+        self.assertIn(log, error_line)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(log)).st_mode) & 0o077, 0,
+                         "the kept log folder must be private to this user")
+
+    def test_install_falls_back_to_isolation_off_when_the_isolated_worker_stops(self):
+        # The isolation fallback of design 0055 D2 survives the liveness rewrite of BUG-31: a worker
+        # that stops under the default --isolation fs is started again with --isolation off.
+        self.assertEqual(self.make_kit().returncode, 0)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        root = os.path.join(self.tmp, "install-root")
+        env = dict(self.env(), FAKE_WORKER_STOP_WITH_ISOLATION="fs")
+        res = subprocess.run(["bash", os.path.join(kit, "install.sh"), "--install-root", root,
+                              "--no-autostart", "--name", "kit-fallback"],
+                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=120)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("trying --isolation off", res.stdout)
+        self.assertIn("connected (isolation: off)", res.stdout)
+        self.assertIn("isolation=off\n", read(os.path.join(root, "kit-install.conf")))
+
+    def test_windows_drive_menu_offers_only_folders_the_install_accepts(self):
+        # BUG-29 (2026-11-18): the folder menu offered E:\\OxideSwarm-USB, and the install then refused
+        # it because another account could delete or re-permission folders at the root of E:\\. The menu
+        # now runs the install's own root check on each drive and lists a refused one as not usable,
+        # with the reason and without a number. Static text here; the run is in the Windows job.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        menu = text[text.index("$explicitRoot ="):text.index('Read-Host "Choose [1]"')]
+        self.assertIn("$choices = @($DefaultRoot)", menu)
+        self.assertIn("Test-RootSafety $candidate", menu)
+        self.assertIn("not usable", menu)
+        self.assertLess(menu.index("$choices = @($DefaultRoot)"), menu.index("Test-RootSafety $candidate"))
+        for hook in ("OXIDESWARM_USB_DRIVE_CHOICES", "OXIDESWARM_USB_LIST_FOLDERS"):
+            self.assertIn(hook, menu)
+
+    def test_windows_uninstaller_removes_an_install_from_an_older_kit(self):
+        # BUG-30 (2026-11-18): an install from a kit older than the .oxideswarm-usb-workspaces marker
+        # could not be removed. Its workspaces folder is accepted when the install folder carries the
+        # installer's marker, the folder is a real one with no link inside, and nothing else uses it.
+        text = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        block = text[text.index("$WorkspacesDir = Join-Path $InstallRoot 'workspaces'"):text.index("if (-not $Yes)")]
+        for needle in ("'.oxideswarm-usb-install'", "ReparsePoint", "$foreignUsers.Count -eq 0",
+                       "an install from an older kit", "$DefaultWorkerWorkspaceRoot"):
+            self.assertIn(needle, block)
+
+    def test_windows_installer_watches_the_worker_and_keeps_its_log(self):
+        # BUG-31 in install.ps1: the worker is checked every second while the installer waits for the
+        # listing, the end of its log is printed before the rollback, and the rollback keeps the log.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("last 30 lines of", "-Tail 30", "HasExited", "ExitCode", "the worker stopped",
+                       "BeginInvoke()", "$script:KeepLogs = $true"):
+            self.assertIn(needle, text)
+        self.assertNotIn("the worker stopped right away", text)
+        rollback = text[text.index("function Rollback-FreshInstall"):text.index("function Fail(")]
+        self.assertIn("$script:KeepLogs", rollback)
+        start = text.index("Start-Process -FilePath 'wscript.exe'")
+        self.assertLess(text.index("$script:KeepLogs = $true"), start)
+
+    def test_windows_task_folders_stay_in_the_install_folder_unless_isolation_needs_temp(self):
+        # Sandbox base (design 0053 status log, 2026-11-18): a default install kept its task folders in
+        # %TEMP%\\oxideswarm-usb\\sandboxes, which the worker refused on a laptop whose Temp folder let
+        # three leftover accounts change it. They now stay in <install folder>\\work, as on another drive;
+        # only -Isolation fs in %LOCALAPPDATA% keeps %TEMP%, because the isolated worker accepts no other
+        # folder inside the user profile. The installer checks the folder first and prints, but never
+        # runs, the icacls command that removes the grants.
+        text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in ("function Test-SandboxBase", "your Temp folder", "lets these accounts change it",
+                       "/remove:g", "$PrivateRoot -and $Isolation -eq 'fs'", "RUSTY_GRID_SANDBOX_BASE_DIR"):
+            self.assertIn(needle, text)
+        self.assertNotRegex(text, r"(?mi)^\s*(&\s*)?['\"]?icacls(\.exe)?['\"]?\s")
+        self.assertNotRegex(text, r"(?i)Start-Process[^\n]*icacls")
+        check = text.index("Test-SandboxBase $SandboxBase")
+        self.assertLess(check, text.index("& $Exe join --no-doctor"), "check the folder before joining")
 
     def test_make_kit_and_install_support_isolation_option_and_reject_invalid_values(self):
         bad_kit = self.make_kit(extra=["--isolation", "bogus"])
@@ -3118,6 +3245,252 @@ public class Program {
                     f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
                 ],
                 env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB kit test")
+    def test_windows_usb_drive_menu_old_install_uninstall_and_failed_start(self):
+        # BUG-29, BUG-30 and BUG-31 of 2026-11-18, run against install.ps1 and uninstall.ps1.
+        if not shutil.which("powershell"):
+            self.skipTest("powershell is not available")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_usb29_"))
+        tmp_home = os.path.join(tmp, "userprofile")
+        tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
+        tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
+        tmp_temp = os.path.join(tmp_localappdata, "Temp")
+        for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        test_run_val = f"OxideSwarmUsb29Test_{os.getpid()}"
+        test_pointer_key = f"HKCU:\\Software\\OxideSwarm\\UsbKitUsb29Test_{os.getpid()}"
+        pids_log = os.path.join(tmp, "spawned_workers.pids")
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME")
+        }
+        ps_env.update(
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+        )
+
+        def powershell(script, *args, env=None, timeout=90):
+            return subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] + list(args),
+                env=env or ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=timeout,
+            )
+
+        other_proc = None
+        try:
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(
+                os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"),
+                os.path.join(kit_dir, "revoke-isolation-acls.ps1"),
+            )
+            with open(os.path.join(kit_dir, "join.token"), "w", encoding="utf-8") as f:
+                f.write(KIT_TOKEN + "\n")
+            with open(os.path.join(kit_dir, "no-autostart"), "w", encoding="utf-8") as f:
+                f.write("trial\n")
+            with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                f.write("off\n")
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            Console.In.ReadToEnd();
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            string exitAfter = Environment.GetEnvironmentVariable("FAKE_WORKER_EXIT_AFTER_MS");
+            if (!string.IsNullOrEmpty(exitAfter)) {
+                for (int i = 1; i <= 40; i++) Console.WriteLine("fake-log-line-" + i.ToString("00"));
+                Thread.Sleep(int.Parse(exitAfter));
+                Console.WriteLine("fake worker: FAKE-STOP-MARKER the sandbox base is refused");
+                string code = Environment.GetEnvironmentVariable("FAKE_WORKER_EXIT_CODE");
+                return string.IsNullOrEmpty(code) ? 1 : int.Parse(code);
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("FAKE_WORKERS_EMPTY"))) {
+                Console.WriteLine("[]");
+                return 0;
+            }
+            Console.WriteLine("[{\"name\":\"win-kit-test\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            cs_file = os.path.join(tmp, "FakeOxide.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            compile_res = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+            with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                f.write(f"{zip_sha}  {zip_name}\n")
+            install_ps1 = os.path.join(kit_dir, "install.ps1")
+            uninstall_ps1 = os.path.join(kit_dir, "uninstall.ps1")
+            default_root = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+
+            # BUG-29: a folder whose way another account can change (here Authenticated Users may
+            # modify a folder above it, as on the root of the laptop's E:) is listed as not usable,
+            # without a number; the default stays first.
+            shared = os.path.join(tmp, "shared-drive")
+            os.makedirs(shared)
+            grant = subprocess.run(["icacls", shared, "/grant", "*S-1-5-11:(OI)(CI)M"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, timeout=30)
+            self.assertEqual(grant.returncode, 0, grant.stdout)
+            refused_choice = os.path.join(shared, "OxideSwarm-USB")
+            menu = powershell(install_ps1, "-Name", "win-menu",
+                              env=dict(ps_env, OXIDESWARM_USB_DRIVE_CHOICES=refused_choice,
+                                       OXIDESWARM_USB_LIST_FOLDERS="1"))
+            self.assertEqual(menu.returncode, 0, menu.stdout)
+            lines = menu.stdout.splitlines()
+            first = [l for l in lines if l.strip().startswith("1)")]
+            self.assertTrue(first and "(default)" in first[0] and "OxideSwarm-USB" in first[0], menu.stdout)
+            refused = [l for l in lines if "shared-drive" in l]
+            self.assertEqual(len(refused), 1, menu.stdout)
+            self.assertIn("not usable", refused[0])
+            self.assertIn("can rename or change", refused[0])
+            self.assertFalse(re.match(r"^\s*\d+\)", refused[0]), "a refused folder must not be offered as a choice")
+            self.assertFalse(os.path.exists(default_root), "listing the folders must install nothing")
+
+            # BUG-31: a worker that stops 5 s after its start is reported as stopped with its exit
+            # code, the end of its log is printed, and the rollback keeps the log the error names.
+            stop_root = os.path.join(tmp_localappdata, "stop-root")
+            stop_env = dict(ps_env, FAKE_WORKER_EXIT_AFTER_MS="5000", FAKE_WORKER_EXIT_CODE="3",
+                            FAKE_WORKERS_EMPTY="1")
+            stopped = powershell(install_ps1, "-InstallRoot", stop_root, "-Name", "win-stops",
+                                 "-Isolation", "off", "-NoAutostart", env=stop_env, timeout=120)
+            out = stopped.stdout
+            self.assertNotEqual(stopped.returncode, 0, out)
+            self.assertIn("the worker stopped", out)
+            self.assertIn("exit code 3", out)
+            self.assertNotIn("does not list it", out)
+            self.assertIn("last 30 lines of", out)
+            self.assertIn("FAKE-STOP-MARKER", out)
+            self.assertIn("fake-log-line-40", out)
+            self.assertNotIn("fake-log-line-01", out)
+            stop_log = os.path.join(stop_root, "logs", "worker.log")
+            self.assertTrue(os.path.isfile(stop_log), out)
+            self.assertFalse(os.path.exists(os.path.join(stop_root, "bin")), out)
+            error_line = [l for l in out.splitlines() if l.startswith("ERROR:")][-1]
+            self.assertIn("worker.log", error_line)
+            # The default install keeps its task folders in <install folder>\work (isolation off).
+            self.assertIn(os.path.join("stop-root", "work"), out)
+
+            # BUG-30: an install from a kit older than the workspaces marker is removed.
+            def old_install(name):
+                root = os.path.join(tmp, name, "OxideSwarm")
+                os.makedirs(os.path.join(root, "bin"))
+                os.makedirs(os.path.join(root, "home"))
+                os.makedirs(os.path.join(root, "workspaces", "proj", "tree"))
+                shutil.copyfile(fake_exe, os.path.join(root, "bin", "oxideswarm.exe"))
+                open(os.path.join(root, ".oxideswarm-usb-install"), "w").close()
+                with open(os.path.join(root, "workspaces", "proj", "tree", "a.txt"), "w", encoding="utf-8") as f:
+                    f.write("old workspace\n")
+                return root
+
+            old_root = old_install("old-kit")
+            removed = powershell(uninstall_ps1, "-InstallRoot", old_root, "-Yes")
+            self.assertEqual(removed.returncode, 0, removed.stdout)
+            self.assertIn("an install from an older kit", removed.stdout)
+            self.assertFalse(os.path.exists(old_root))
+
+            # ... but a workspaces folder another worker uses is still refused,
+            busy_root = old_install("busy-kit")
+            busy_ws = os.path.join(busy_root, "workspaces")
+            other_dir = os.path.join(tmp, "other-worker")
+            os.makedirs(other_dir)
+            other_exe = os.path.join(other_dir, "oxideswarm.exe")
+            shutil.copyfile(fake_exe, other_exe)
+            other_proc = subprocess.Popen(
+                [other_exe, "worker", "--name", "other-worker", "--workspaces", "--workspace-root", busy_ws],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.assertTrue(wait_until(lambda: os.path.isfile(pids_log) and str(other_proc.pid) in read(pids_log),
+                                       timeout=30))
+            busy = powershell(uninstall_ps1, "-InstallRoot", busy_root, "-Yes")
+            self.assertNotEqual(busy.returncode, 0, busy.stdout)
+            self.assertIn("other-worker", busy.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(busy_ws, "proj", "tree", "a.txt")))
+            other_proc.kill()
+            other_proc.wait(timeout=30)
+            other_proc = None
+
+            # ... and so is a folder without the installer's marker.
+            unmarked_root = old_install("unmarked-kit")
+            os.remove(os.path.join(unmarked_root, ".oxideswarm-usb-install"))
+            unmarked = powershell(uninstall_ps1, "-InstallRoot", unmarked_root, "-Yes")
+            self.assertNotEqual(unmarked.returncode, 0, unmarked.stdout)
+            self.assertIn(".oxideswarm-usb-install", unmarked.stdout)
+            self.assertTrue(os.path.isdir(os.path.join(unmarked_root, "workspaces")))
+        finally:
+            if other_proc is not None and other_proc.poll() is None:
+                other_proc.kill()
+                try:
+                    other_proc.wait(timeout=30)
+                except Exception:
+                    pass
+            if os.path.isfile(pids_log):
+                for line in read(pids_log).splitlines():
+                    if line.strip().isdigit():
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             f"Stop-Process -Id {line.strip()} -Force -ErrorAction SilentlyContinue"],
+                            env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=30,
+                        )
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
             )
             shutil.rmtree(tmp, ignore_errors=True)
 
