@@ -1640,6 +1640,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
   request 324, 145 sites documented.
 - **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
+- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
