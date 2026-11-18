@@ -355,7 +355,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 (open) |
 | BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 (open) |
 | BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 (open) |
-| BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | TBD (open) |
+| BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -1351,7 +1351,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction
   markers and sibling user-profile paths are refused, `install.ps1` refuses custom profile roots
   before creating directories, and the worker/isolation/launcher checks pass on Windows.
-- **Implemented (2026-11-19, pull request TBD, open):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
+- **Implemented (2026-11-19, pull request 352, open):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
   and `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` to `is_allowed_under_home` and accepted
   regular non-reparse `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
   `validate_workspace_root_safe` (`crates/worker/src/isolation/windows/toolchain.rs`); added unit
@@ -2256,4 +2256,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
-- 2026-11-19: BUG-32 added and Implemented (pull request TBD, open): `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces` and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts regular non-reparse `.oxideswarm-usb-workspaces` files ([design 0033](design/0033-os-level-task-isolation.md)), and `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces targets any other path under `%USERPROFILE%`.
+- 2026-11-19: BUG-32 added and Implemented (pull request 352, open): `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces` and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts regular non-reparse `.oxideswarm-usb-workspaces` files ([design 0033](design/0033-os-level-task-isolation.md)), and `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces targets any other path under `%USERPROFILE%`.
