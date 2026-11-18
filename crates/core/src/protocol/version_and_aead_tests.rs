@@ -25,6 +25,7 @@ fn server_reader(session_key: &[u8; 32]) -> AeadReaderSession {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_sessions_roundtrip_in_both_directions() {
     let session_key = [42u8; 32];
     let (mut client_writer, mut client_reader) =
@@ -51,6 +52,7 @@ fn test_aead_sessions_roundtrip_in_both_directions() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_record_with_any_flipped_bit_is_refused_and_closes_the_session() {
     let session_key = [7u8; 32];
     let (mut writer, _) = derive_aead_keys(&session_key, EndpointRole::Client);
@@ -85,6 +87,7 @@ fn test_aead_record_with_any_flipped_bit_is_refused_and_closes_the_session() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_replayed_reordered_and_dropped_records_are_refused() {
     let session_key = [9u8; 32];
     let (mut writer, _) = derive_aead_keys(&session_key, EndpointRole::Client);
@@ -127,6 +130,7 @@ fn test_aead_replayed_reordered_and_dropped_records_are_refused() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_reflected_and_foreign_records_are_refused() {
     let session_key = [11u8; 32];
     let (mut client_w, mut client_r) = derive_aead_keys(&session_key, EndpointRole::Client);
@@ -167,6 +171,7 @@ fn test_aead_reflected_and_foreign_records_are_refused() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_sequence_counter_never_wraps() {
     let key = [13u8; 32];
     let mut writer = AeadWriterSession::starting_at(&key, u64::MAX - 1);
@@ -190,6 +195,7 @@ fn test_aead_sequence_counter_never_wraps() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_oversized_frame_is_refused_without_using_a_sequence_number() {
     let key = [14u8; 32];
     let mut writer = AeadWriterSession::new(&key);
@@ -216,6 +222,7 @@ fn test_aead_oversized_frame_is_refused_without_using_a_sequence_number() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 fn test_aead_reader_refuses_truncated_and_unencrypted_frames() {
     let key = [15u8; 32];
     let header = [vec![WIRE_FORMAT_ENCRYPTED], 0u64.to_be_bytes().to_vec()].concat();
@@ -257,6 +264,7 @@ fn test_aead_reader_refuses_truncated_and_unencrypted_frames() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 async fn test_encrypted_transport_duplex_and_rejection() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let mut client = MessageTransport::new(client_io);
@@ -292,6 +300,7 @@ async fn test_encrypted_transport_duplex_and_rejection() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 async fn test_encrypted_transport_drops_a_tampered_frame_for_good() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let mut client = MessageTransport::new(client_io);
@@ -335,6 +344,7 @@ async fn test_encrypted_transport_drops_a_tampered_frame_for_good() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
 async fn test_encrypted_split_reader_refuses_an_injected_plaintext_assignment() {
     // An on-path host injects a well-formed plaintext `AssignTask` into an encrypted
     // master -> worker connection (the worker reads through the split reader half).

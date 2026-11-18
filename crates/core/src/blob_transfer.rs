@@ -387,6 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     async fn upload_then_download_round_trips_multi_chunk_blobs() {
         let master = MemoryMaster::default();
         for len in [
@@ -415,6 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     async fn uploading_a_blob_the_master_has_stops_after_one_chunk() {
         let master = MemoryMaster::default();
         let data = sample(3 * BLOB_CHUNK_BYTES, 9);

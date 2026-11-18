@@ -645,6 +645,7 @@ fn test_get_task_result_roundtrip_both_codecs() {
 /// `MobileTelemetry` is appended after `Disconnecting`: every earlier `WorkerMessage` keeps its
 /// positional (bincode) index and the new variant takes the next free one.
 #[test]
+#[cfg_attr(miri, ignore = "Miri: sysinfo queries the host system")]
 fn test_mobile_telemetry_is_appended_last_and_keeps_existing_bincode_indices() {
     fn variant_index(msg: &WorkerMessage) -> u32 {
         let bytes = serialize_message(msg, WireCodec::Bincode).expect("serialize");

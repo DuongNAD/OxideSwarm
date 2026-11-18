@@ -1293,6 +1293,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn keypair_debug_redacts_private_key_and_computes_member_id_and_fingerprint() {
         let kp = keypair(7);
         let priv_hex = kp.private_hex();
@@ -1314,6 +1315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn keypair_file_save_and_load_preserves_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("node.key");
@@ -1333,6 +1335,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn v3_round_trip_and_record_layer_works_both_directions_after_split() {
         let master_kp = keypair(1);
         let worker_kp = keypair(2);
@@ -1387,6 +1390,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn replayed_ik_message_1_never_becomes_an_authenticated_session() {
         let master_kp = keypair(10);
         let worker_kp = keypair(11);
@@ -1608,6 +1612,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn non_member_is_refused() {
         let master_kp = keypair(30);
         let enrolled_kp = keypair(31);
@@ -1730,6 +1735,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn oversized_first_record_after_valid_or_replayed_msg1_is_refused_without_allocation() {
         use tokio::io::AsyncWriteExt;
 
@@ -1846,6 +1852,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     async fn enroll_purpose_derives_matching_handshake_hash_proof_and_1kib_first_record_cap() {
         let master_kp = keypair(70);
         let candidate_kp = keypair(71);

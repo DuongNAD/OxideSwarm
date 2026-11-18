@@ -1554,6 +1554,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     fn streaming_hash_matches_one_shot_hash() {
         let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
         let (id, len) = hash_reader(std::io::Cursor::new(&data)).unwrap();
@@ -1693,6 +1694,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: asserts a wall-clock bound")]
     fn manifest_v2_symlinks_and_empty_dirs_round_trip_and_refuse_escapes() {
         let m = TreeManifest::with_entries(
             vec![file("src/lib.rs", b"pub fn f() {}")],
@@ -1968,6 +1970,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     fn manifest_v2_unicode_case_fold_pairs_and_deep_prefix_trie_performance() {
         for (a, b) in [
             ("s", "\u{017f}"),
@@ -2065,6 +2068,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: too slow under the interpreter")]
     fn manifest_v2_unshared_deep_symlinks_and_files_and_budgets() {
         assert_eq!(std::mem::size_of::<SymlinkTrieNode>(), 16);
 
@@ -2162,6 +2166,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: creates and opens a FIFO")]
     fn open_regular_file_nofollow_refuses_symlinks_and_fifos_without_blocking() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
