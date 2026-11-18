@@ -69,7 +69,7 @@ async fn spawn_test_cluster() -> (
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_submit_wait_prints_summary_lines_and_json_fields() {
-    let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_test_cluster().await;
+    let (master, master_addr, shutdown_tx, mut worker_handle, temp) = spawn_test_cluster().await;
     let home = temp.path();
 
     // 1. Human `submit --wait` prints the two D5 summary lines immediately after Execution Time.
@@ -227,7 +227,13 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     );
 
     let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    if tokio::time::timeout(Duration::from_secs(30), &mut worker_handle)
+        .await
+        .is_err()
+    {
+        worker_handle.abort();
+        let _ = worker_handle.await;
+    }
     let _ = master.shutdown();
     drop(temp);
 }

@@ -364,6 +364,41 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
         "MCP submit must return machines == 1: {submit_val}"
     );
 
+    // Verify a follow-up task_result on the same session retains submit_started for wait=true submits.
+    let sync_task_id = submit_val["task_id"].as_str().unwrap();
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "tools/call",
+            "params": {
+                "name": "task_result",
+                "arguments": {
+                    "task_id": sync_task_id,
+                    "wait": false
+                }
+            }
+        })
+        .to_string(),
+    );
+    let sync_tr_resp = mcp.read_json_response();
+    assert_eq!(sync_tr_resp["id"], 61);
+    assert_eq!(sync_tr_resp["result"]["isError"], false);
+    let sync_tr_val: Value = serde_json::from_str(
+        sync_tr_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let sync_submit_waited_ms = submit_val["waited_ms"].as_u64().unwrap();
+    let sync_tr_waited_ms = sync_tr_val["waited_ms"].as_u64().unwrap_or_else(|| {
+        panic!("same-session task_result after wait=true must return waited_ms: {sync_tr_val}")
+    });
+    assert!(
+        sync_tr_waited_ms >= sync_submit_waited_ms,
+        "expected follow-up waited_ms ({sync_tr_waited_ms}) >= initial ({sync_submit_waited_ms})"
+    );
+
     // 8. Call tool: submit (async wait: false) followed by task_result with wait: true
     mcp.send_line(
         &json!({

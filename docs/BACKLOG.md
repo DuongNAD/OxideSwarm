@@ -1492,7 +1492,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   (with the four unit cases of design 0059 plus a two-worker case), prints the two D5 summary lines
   after `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines`
   to `submit --json` and the MCP `submit` and `task_result` tools (covering the submitted task only,
-  before `--verify` replicas; for async `submit` or a `submit` wait timeout in the same MCP
+  before `--verify` replicas; for a task submitted in the same MCP
   session, `task_result` measures `waited_ms` from `submit` to the `task_result` reply so it
   includes caller time between calls and increases on repeat queries, and returns `null` when that
   session did not record the submission), covers loopback CLI and MCP runs in

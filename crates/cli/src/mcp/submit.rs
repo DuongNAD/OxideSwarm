@@ -1202,6 +1202,7 @@ pub(super) async fn tool_submit(
             };
         }
 
+        state.record_submitted(task_id, submit_started).await;
         ctx.send_progress(
             0,
             None,
@@ -1294,7 +1295,6 @@ pub(super) async fn tool_submit(
             }
             Some(Err(e)) => ToolCallResult::error(format!("Communication error: {e}")),
             None => {
-                state.record_submitted(task_id, submit_started).await;
                 drop(transport);
                 let (status_str, state_name) = match state
                     .request_with_timeout(

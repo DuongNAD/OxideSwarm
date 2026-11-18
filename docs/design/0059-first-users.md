@@ -238,7 +238,7 @@ Waited: <W> s    Sum of task times: <S> s
 - The JSON output of `submit` and the MCP results carry the same values as `waited_ms`,
   `task_time_sum_ms` and `machines`. When `--verify` (`submit`) or `verify` (MCP) runs replicas,
   the summary covers the first submitted task only and stops before the replicas start. In the MCP
-  server, `task_result` after an asynchronous `submit` or a `submit` wait timeout measures `waited_ms`
+  server, `task_result` for a task submitted in the same session measures `waited_ms`
   from that session's `submit` call to the `task_result` reply (which includes caller time between
   calls and grows on repeat queries), and returns `"waited_ms": null` when that MCP session does not
   have the submission timestamp (such as after an MCP server restart, from another client, or after
