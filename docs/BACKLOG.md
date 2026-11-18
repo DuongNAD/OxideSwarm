@@ -236,7 +236,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented |  | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented |  | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288 |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359 (open) |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented |  | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented |  | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented |  | 304 |
@@ -1271,6 +1271,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Next step: the next CI failure of this probe now carries the evidence; read which side sent `ResumeSession` without the
   task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
   under TEST-23.
+- **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
 
 ### TEST-52: Let the remaining tests pick ports through the process that binds them, not bind-and-drop
 
