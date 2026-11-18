@@ -168,6 +168,7 @@ pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 
 Then TEST-52 (pull request 320, Partial) and DOC-11 (pull request 322): 202 items, 127 Implemented, 16 Partial and
 59 Planned; 30 open items are In and 45 are Out.
 Recounted on 2026-11-18 with ADOPT-2 Implemented (pull request 350, open; its `Line` value `In` stays until merged) after BUG-29 to BUG-31 (pull request 341), LV-1, LV-18, TEST-53, ENROLL-1c, BUG-27, BUG-28, TEST-35, LV-4, and LV-5: 210 items, 138 Implemented, 16 Partial and 56 Planned; 27 remaining open items are In and 45 are Out.
+Recounted on 2026-11-19 after BUG-32, BENCH-8, TEST-55, and BENCH-9 Partial (pull request 354, open): 214 items, 141 Implemented, 19 Partial and 54 Planned; 27 remaining open items are In and 46 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -391,7 +392,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355 (open), (design 0093) |
-| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Planned | Out | (design 0093) |
+| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354 (open), (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -1954,6 +1955,12 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
 - **Done when:** The records split the per-machine cost into process time and idle time on both machines,
   and this section names the cause of the LAN cost on Windows and of the open 0.16 on the Mac, or the change
   that closes them.
+- **Partial (2026-11-18, pull request 354, open):** Step 1 implemented (`benchmarks/sweep/bench_sweep.py`,
+  record format 2): grid runs record `task_time_sum_s`, `task_time_missing`, `slot_seconds`, `utilization`, and
+  per-worker `tasks`, `mean_s`, and `median_s` (over succeeded tasks); local runs record `task_time_mean_s` and
+  `task_time_median_s` per run and level; and a low-rate sampler watches for `cargo` / `rustc` during each run
+  (`competing_processes`). Steps 2 and 3 (the live runs on Windows and Mac under a committed plan, and debug-log
+  round-trip breakdown if idle slots remain) are next once PR 354 merges.
 
 ## Status log
 
@@ -2386,3 +2393,4 @@ Add one dated line per finished item, newest last.
   in `crates/worker/src/sandbox.rs` uses `BUILTIN\Guests` (`S-1-5-32-546`) instead of
   `BUILTIN\Remote Desktop Users` (`S-1-5-32-555`, absent on Windows Home), so `cargo test -p rusty_grid_worker --lib`
   passes in full on Windows 11 Home; text in the archive.
+- 2026-11-18: BENCH-9 Partial (pull request 354, open): `bench_sweep.py` record format 2 adds task process timing, slot utilization, `task_time_missing`, succeeded per-worker means/medians, and `cargo`/`rustc` process sampling (step 1); live runs of steps 2 and 3 remain.

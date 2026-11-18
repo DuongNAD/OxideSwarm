@@ -24,6 +24,7 @@ benchmarks/sweep/README.md for the method and for what a number does not show.
 
 import argparse
 import concurrent.futures
+import csv
 import datetime
 import hashlib
 import json
@@ -35,15 +36,17 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 WORKLOAD = os.path.join(HERE, "workload_cpu.py")
 IS_WINDOWS = os.name == "nt"
-RECORD_FORMAT = 1
+RECORD_FORMAT = 2
 W1_RE = re.compile(r"W1 seed=(\d+) units=(\d+) checksum=([0-9a-f]{64})")
 IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+WATCHED_PROCESSES = ("cargo", "rustc")
 
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
@@ -80,6 +83,217 @@ def tasks_per_second(tasks, wall_s):
     if wall_s <= 0:
         raise ValueError("wall clock must be positive")
     return tasks / wall_s
+
+
+def summarize_task_times(times_s):
+    """Count, mean and median (seconds) of a list of task durations, or None when empty."""
+    if not times_s:
+        return {"tasks": 0, "mean_s": None, "median_s": None}
+    return {
+        "tasks": len(times_s),
+        "mean_s": round(statistics.mean(times_s), 4),
+        "median_s": round(statistics.median(times_s), 4),
+    }
+
+
+def summarize_local_run(results, parallelism, wall_s):
+    """Summarize one local batch: keep D1 counts/rates and add mean and median task process time."""
+    if not results:
+        raise ValueError("local run has no results")
+    failed = sum(1 for r in results if r.get("checksum") is None)
+    times = [
+        float(r["task_time_s"])
+        for r in results
+        if r.get("checksum") is not None
+        and isinstance(r.get("task_time_s"), (int, float))
+        and not isinstance(r.get("task_time_s"), bool)
+    ]
+    stats = summarize_task_times(times)
+    return {
+        "parallelism": parallelism,
+        "tasks": len(results),
+        "wall_s": round(wall_s, 4),
+        "tasks_per_s": round(tasks_per_second(len(results), wall_s), 4),
+        "task_time_mean_s": stats["mean_s"],
+        "task_time_median_s": stats["median_s"],
+        "failed_tasks": failed,
+    }
+
+
+def summarize_worker_times(rows):
+    """Per worker label: total task count and mean/median execution time over succeeded tasks."""
+    counts, times = {}, {}
+    for r in rows:
+        label = r.get("worker") or "none"
+        counts[label] = counts.get(label, 0) + 1
+        ms = r.get("execution_time_ms")
+        if (
+            r.get("checksum") is not None
+            and isinstance(ms, (int, float))
+            and not isinstance(ms, bool)
+        ):
+            times.setdefault(label, []).append(float(ms) / 1000.0)
+    out = {}
+    for label in sorted(counts):
+        stats = summarize_task_times(times.get(label, []))
+        out[label] = {
+            "tasks": counts[label],
+            "mean_s": stats["mean_s"],
+            "median_s": stats["median_s"],
+        }
+    return out
+
+
+def summarize_grid_run(rows, wall_s, total_slots):
+    """Summarize one grid batch: keep format-1 fields and add task process time and slot utilization."""
+    if not rows:
+        raise ValueError("grid run has no rows")
+    if wall_s <= 0:
+        raise ValueError("wall clock must be positive")
+    if total_slots is None or isinstance(total_slots, bool) or int(total_slots) < 1:
+        raise ValueError("total_slots must be at least 1")
+    slots = int(total_slots)
+    failed = sum(1 for r in rows if r.get("checksum") is None)
+    per_worker = {}
+    for r in rows:
+        label = r.get("worker") or "none"
+        per_worker[label] = per_worker.get(label, 0) + 1
+    lat = sorted(r["submit_to_result_s"] for r in rows)
+    timed_ms = [
+        float(r["execution_time_ms"])
+        for r in rows
+        if isinstance(r.get("execution_time_ms"), (int, float))
+        and not isinstance(r.get("execution_time_ms"), bool)
+    ]
+    task_time_missing = len(rows) - len(timed_ms)
+    task_time_sum_s = sum(ms / 1000.0 for ms in timed_ms)
+    slot_seconds = slots * wall_s
+    utilization = round(task_time_sum_s / slot_seconds, 4) if timed_ms else None
+    return {
+        "tasks": len(rows),
+        "wall_s": round(wall_s, 4),
+        "tasks_per_s": round(tasks_per_second(len(rows), wall_s), 4),
+        "failed_tasks": failed,
+        "tasks_per_worker": per_worker,
+        "submit_to_result_p50_s": statistics.median(lat),
+        "submit_to_result_max_s": lat[-1],
+        "task_time_sum_s": round(task_time_sum_s, 4),
+        "task_time_missing": task_time_missing,
+        "slot_seconds": round(slot_seconds, 4),
+        "utilization": utilization,
+        "per_worker": summarize_worker_times(rows),
+    }
+
+
+def parse_watched_processes(raw_output, is_windows=False, watched=WATCHED_PROCESSES):
+    """Return sorted watched base names found in `ps -eo comm=` (Unix) or `tasklist /FO CSV /NH` (Windows)."""
+    wanted = {w.lower() for w in watched}
+    found = set()
+    if is_windows:
+        for row in csv.reader((raw_output or "").splitlines()):
+            if not row:
+                continue
+            name = os.path.basename(row[0].strip().replace("\\", "/")).lower()
+            if name.endswith(".exe"):
+                name = name[:-4]
+            if name in wanted:
+                found.add(name)
+    else:
+        for line in (raw_output or "").splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            name = os.path.basename(name.replace("\\", "/")).lower()
+            if name.endswith(".exe"):
+                name = name[:-4]
+            if name in wanted:
+                found.add(name)
+    return sorted(found)
+
+
+def list_watched_processes():
+    """Probe local OS process names (without paths, arguments, PIDs or users); None if probe fails."""
+    try:
+        if IS_WINDOWS:
+            kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+            r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=5, **kw)
+        else:
+            r = subprocess.run(["ps", "-eo", "comm="], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=5)
+        if r.returncode != 0:
+            return None
+        return parse_watched_processes(r.stdout, is_windows=IS_WINDOWS)
+    except Exception:
+        return None
+
+
+class ProcessSampler:
+    """Low-rate background sampler watching for `cargo` / `rustc` during a run (BENCH-9)."""
+
+    def __init__(self, interval_s=2.0, probe_fn=list_watched_processes, now_fn=None):
+        self._interval_s = float(interval_s)
+        self._probe_fn = probe_fn
+        self._now_fn = now_fn or (lambda: datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self.samples = 0
+        self.detections = 0
+        self.sightings = []
+
+    def _poll_once(self):
+        if self._probe_fn is None:
+            return
+        names = self._probe_fn()
+        with self._lock:
+            self.samples += 1
+            if names:
+                self.detections += 1
+                if len(self.sightings) < 200:
+                    self.sightings.append({"utc": self._now_fn(), "processes": list(names)})
+
+    def _run(self):
+        self._poll_once()
+        while not self._stop.wait(self._interval_s):
+            self._poll_once()
+
+    def __enter__(self):
+        if self._probe_fn is not None:
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="bench-proc-sampler", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def summary(self):
+        with self._lock:
+            return {
+                "watched": list(WATCHED_PROCESSES),
+                "interval_s": self._interval_s,
+                "samples": self.samples,
+                "detections": self.detections,
+                "sightings": list(self.sightings),
+            }
+
+
+def format_grid_detail_line(grid):
+    """Second summary line showing slot utilization and mean task time per worker."""
+    util = (grid.get("utilization") or {}).get("median")
+    runs = (grid.get("utilization") or {}).get("runs") or 0
+    util_pct = ("%.1f %%" % (100.0 * util)) if util is not None else "n/a"
+    per_worker = grid.get("per_worker") or {}
+    parts = []
+    for label in sorted(per_worker):
+        mean_s = (per_worker[label] or {}).get("mean_s")
+        parts.append("%s %.3f s" % (label, mean_s) if mean_s is not None else "%s n/a" % label)
+    worker_text = ", ".join(parts) if parts else "none"
+    return "slot utilization %s (median of %d); mean task time: %s" % (util_pct, runs, worker_text)
 
 
 def best_level(levels):
@@ -191,7 +405,7 @@ def sanitize_doctor(doc, labels):
 
 
 def load_local_record(path, units, workload_sha256):
-    """The best local throughput of another machine's record of the same workload and task size."""
+    """The best local throughput (and optional task process times) of another machine's record."""
     with open(path, encoding="utf-8") as f:
         rec = json.load(f)
     wl = rec.get("workload") or {}
@@ -199,11 +413,15 @@ def load_local_record(path, units, workload_sha256):
         raise ValueError("%s: %s units per task, this run uses %s" % (path, wl.get("units_per_task"), units))
     if wl.get("sha256") != workload_sha256:
         raise ValueError("%s: another version of workload_cpu.py" % path)
-    best = ((rec.get("local") or {}).get("best") or {}).get("tasks_per_s", {}).get("median")
+    best_lvl = (rec.get("local") or {}).get("best") or {}
+    best = (best_lvl.get("tasks_per_s") or {}).get("median")
     if not best:
         raise ValueError("%s holds no local result" % path)
     m = rec.get("machine") or {}
     return {"source": os.path.basename(path), "best_tasks_per_s": best,
+            "best_parallelism": best_lvl.get("parallelism"),
+            "best_task_time_mean_s": best_lvl.get("task_time_mean_s"),
+            "best_task_time_median_s": best_lvl.get("task_time_median_s"),
             "os": (m.get("os") or {}).get("system"), "machine": (m.get("os") or {}).get("machine"),
             "cpu_model": (m.get("hardware") or {}).get("cpu_model"),
             "cores": (m.get("hardware") or {}).get("cores")}
@@ -320,21 +538,25 @@ def build_profile(binary):
 # ---------------------------------------------------------------- local runs
 
 def run_local_task(python, seed, units, cwd):
+    t0 = time.perf_counter()
     r = subprocess.run([python, WORKLOAD, "--seed", str(seed), "--units", str(units)],
                        capture_output=True, text=True, cwd=cwd, timeout=3600)
+    dt = time.perf_counter() - t0
     parsed = parse_w1_line(r.stdout) if r.returncode == 0 else None
-    return {"seed": seed, "exit_code": r.returncode, "checksum": parsed["checksum"] if parsed else None}
+    return {"seed": seed, "exit_code": r.returncode, "task_time_s": round(dt, 4),
+            "checksum": parsed["checksum"] if parsed else None}
 
 
 def run_local_batch(python, seeds, units, parallelism, cwd):
     """Run every seed as its own process, `parallelism` at a time; return wall clock and results."""
     t0 = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(parallelism) as ex:
-        results = list(ex.map(lambda s: run_local_task(python, s, units, cwd), seeds))
+    with ProcessSampler() as sampler:
+        with concurrent.futures.ThreadPoolExecutor(parallelism) as ex:
+            results = list(ex.map(lambda s: run_local_task(python, s, units, cwd), seeds))
     wall = time.perf_counter() - t0
-    failed = sum(1 for r in results if r["checksum"] is None)
-    return {"parallelism": parallelism, "tasks": len(seeds), "wall_s": round(wall, 4),
-            "tasks_per_s": round(tasks_per_second(len(seeds), wall), 4), "failed_tasks": failed}, results
+    row = summarize_local_run(results, parallelism, wall)
+    row["competing_processes"] = sampler.summary()
+    return row, results
 
 
 def measure_local(python, seeds, units, levels, runs, cwd, log):
@@ -342,7 +564,7 @@ def measure_local(python, seeds, units, levels, runs, cwd, log):
     for p in levels:
         log("[local] parallelism %d: warm-up" % p)
         warm, _ = run_local_batch(python, seeds, units, p, cwd)
-        measured = []
+        measured, measured_times = [], []
         for i in range(runs):
             log("[local] parallelism %d: run %d/%d" % (p, i + 1, runs))
             row, results = run_local_batch(python, seeds, units, p, cwd)
@@ -351,9 +573,14 @@ def measure_local(python, seeds, units, levels, runs, cwd, log):
             for r in results:
                 if r["checksum"] is not None:
                     checksums.setdefault(r["seed"], r["checksum"])
+                    if isinstance(r.get("task_time_s"), (int, float)) and not isinstance(r.get("task_time_s"), bool):
+                        measured_times.append(float(r["task_time_s"]))
+        level_stats = summarize_task_times(measured_times)
         out.append({"parallelism": p, "warmup": warm, "runs": measured,
                     "tasks_per_s": summarize([r["tasks_per_s"] for r in measured]),
-                    "wall_s": summarize([r["wall_s"] for r in measured])})
+                    "wall_s": summarize([r["wall_s"] for r in measured]),
+                    "task_time_mean_s": level_stats["mean_s"],
+                    "task_time_median_s": level_stats["median_s"]})
     return {"levels": out, "best": best_level(out), "failed_tasks": failed}, checksums
 
 
@@ -494,20 +721,16 @@ def submit_task(cluster, worker_python, seed, units, timeout_secs, labels):
     return row
 
 
-def run_grid_batch(cluster, worker_python, seeds, units, concurrency, timeout_secs, labels):
+def run_grid_batch(cluster, worker_python, seeds, units, concurrency, timeout_secs, labels, total_slots=None):
     t0 = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(concurrency) as ex:
-        rows = list(ex.map(lambda s: submit_task(cluster, worker_python, s, units, timeout_secs, labels), seeds))
+    with ProcessSampler() as sampler:
+        with concurrent.futures.ThreadPoolExecutor(concurrency) as ex:
+            rows = list(ex.map(lambda s: submit_task(cluster, worker_python, s, units, timeout_secs, labels), seeds))
     wall = time.perf_counter() - t0
-    failed = sum(1 for r in rows if r["checksum"] is None)
-    per_worker = {}
-    for r in rows:
-        per_worker[r["worker"] or "none"] = per_worker.get(r["worker"] or "none", 0) + 1
-    lat = sorted(r["submit_to_result_s"] for r in rows)
-    return {"tasks": len(seeds), "wall_s": round(wall, 4),
-            "tasks_per_s": round(tasks_per_second(len(seeds), wall), 4), "failed_tasks": failed,
-            "tasks_per_worker": per_worker, "submit_to_result_p50_s": statistics.median(lat),
-            "submit_to_result_max_s": lat[-1]}, rows
+    slots = total_slots if total_slots is not None else concurrency
+    row = summarize_grid_run(rows, wall, slots)
+    row["competing_processes"] = sampler.summary()
+    return row, rows
 
 
 def list_workers(cluster):
@@ -614,11 +837,12 @@ def main(argv=None):
             concurrency = args.client_concurrency or total_slots
             doc = None if args.skip_doctor else doctor(cluster, len(raw_workers), labels)
             log("[grid] warm-up: %d tasks, %d in flight" % (len(seeds), concurrency))
-            warm, _ = run_grid_batch(cluster, worker_python, seeds, units, concurrency, args.timeout_secs, labels)
+            warm, _ = run_grid_batch(cluster, worker_python, seeds, units, concurrency, args.timeout_secs,
+                                     labels, total_slots=total_slots)
             for i in range(args.runs):
                 log("[grid] run %d/%d" % (i + 1, args.runs))
                 row, rows = run_grid_batch(cluster, worker_python, seeds, units, concurrency,
-                                           args.timeout_secs, labels)
+                                           args.timeout_secs, labels, total_slots=total_slots)
                 grid_runs.append(row)
                 grid_rows.extend(rows)
     finally:
@@ -627,9 +851,11 @@ def main(argv=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
     bests = ([local["best"]["tasks_per_s"]["median"]] if local else []) + [o["best_tasks_per_s"] for o in others]
-    grid_tp, checks, scale = None, None, None
+    grid_tp, checks, scale, grid_util = None, None, None, None
     if grid_runs:
         grid_tp = summarize([r["tasks_per_s"] for r in grid_runs])
+        util_vals = [r["utilization"] for r in grid_runs if r.get("utilization") is not None]
+        grid_util = summarize(util_vals) if util_vals else None
         scale = scaling(grid_tp["median"], bests)
         if local_sums:
             checks = compare_checksums(local_sums, grid_rows)
@@ -658,7 +884,9 @@ def main(argv=None):
         "local": local,
         "local_results_used": others,
         "grid": ({"warmup": warm, "runs": grid_runs, "tasks_per_s": grid_tp,
-                  "wall_s": summarize([r["wall_s"] for r in grid_runs])} if grid_runs else None),
+                  "wall_s": summarize([r["wall_s"] for r in grid_runs]),
+                  "utilization": grid_util,
+                  "per_worker": summarize_worker_times(grid_rows)} if grid_runs else None),
         "scaling": scale,
         "checksums": checks,
         "failed_tasks": failed,
@@ -668,10 +896,10 @@ def main(argv=None):
     text = json.dumps(record, indent=2)
     if scale:
         summary = ("W1 %d tasks x %d units: grid %.3f tasks/s (median of %d), fastest local %.3f tasks/s, "
-                   "speedup %.2fx, efficiency %.0f %% over %d machine(s); checksums %d/%d matched, %d failed task(s)"
+                   "speedup %.2fx, efficiency %.0f %% over %d machine(s); checksums %d/%d matched, %d failed task(s)\n%s"
                    % (len(seeds), units, grid_tp["median"], grid_tp["runs"], scale["fastest_local_tasks_per_s"],
                       scale["speedup"], 100 * scale["efficiency"], scale["machines"], checks["matched"],
-                      checks["compared"], failed))
+                      checks["compared"], failed, format_grid_detail_line(record["grid"])))
     else:
         summary = ("W1 %d tasks x %d units, local only: best %.3f tasks/s at parallelism %d; %d failed task(s)"
                    % (len(seeds), units, local["best"]["tasks_per_s"]["median"], local["best"]["parallelism"],
