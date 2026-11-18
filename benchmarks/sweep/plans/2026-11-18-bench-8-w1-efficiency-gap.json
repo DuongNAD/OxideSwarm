@@ -40,5 +40,18 @@
       "4b. After step 3, with the Windows worker stopped and the run master restarted: the Mac worker alone with --task-priority normal, the same sweep as step 4; slug w1-mac-worker-only-normal-priority-lan"
     ],
     "reading_rule": "If 4b (or 1b) gains at least 0.05 over step 4 (or step 1), the default task priority explains that share of the per-machine cost; the record says so and does not propose a change of the default here (that is a decision for the owner: the default protects the owner's own use of the machine)."
+  },
+  "amendment_2": {
+    "written": "2026-11-18 18:35 UTC, after steps 1 to 4 and before 4b, 1c or 1d ran",
+    "what_happened": [
+      "Step 1b, first attempt (17:16 to 17:24 UTC), is void: the Windows worker was restarted at 17:21 UTC during its runs (master log). Its record is not committed.",
+      "Step 1b, second attempt: the Windows worker came back with --task-priority normal at 18:24 UTC, but the harness refused to start because a cargo test of another project (started 18:19 UTC by an agent on the Mac, not part of this run) was running on the Mac. Step 4b was refused for the same reason. The run's secret was then rotated and deleted, so step 1b over the LAN needs a new secret carried by hand and is not run in this item.",
+      "Steps 2 and 3 ended their grid runs before 18:19 UTC (step 3: 17:40:10 plus 813 s), so they are not affected."
+    ],
+    "steps": [
+      "4b (unchanged): the Mac worker alone with --task-priority normal, against a master on the same Mac (the Mac worker reached the master over 127.0.0.1 in step 4 too); run when no cargo or rustc process has run on the Mac for 2 minutes; a cargo or rustc process seen during the grid runs makes the attempt void, and it is repeated.",
+      "1c and 1d replace 1b: on the Windows case machine alone, a master and one worker (20 slots) on 127.0.0.1 with a private HOME and no secret (loopback), the harness given --master 127.0.0.1:<port> --skip-local --local-results <Windows local record> --client-concurrency 20, 120 tasks; 1c with the worker's default priority (slug w1-win-loopback-default-priority), 1d with --task-priority normal (slug w1-win-loopback-normal-priority). 1c against 1d isolates the task priority on Windows; 1c against step 1 shows what the LAN and a master on another machine cost."
+    ],
+    "reading_rule": "As in amendment 1: a difference of at least 0.05 in efficiency counts; smaller is no effect."
   }
 }
