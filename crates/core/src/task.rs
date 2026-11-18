@@ -3431,6 +3431,8 @@ mod tests {
         // Zero copy verification: memory pointers point into the same allocation
         let base_ptr = asset.as_bytes().as_ptr();
         let body_ptr = body.as_bytes().as_ptr();
+        // SAFETY: `asset` holds 1,000,000 bytes, so `base_ptr + 12` stays inside the allocation
+        // `base_ptr` points into, as `pointer::add` requires; the result is only compared.
         assert_eq!(unsafe { base_ptr.add(12) }, body_ptr);
     }
 

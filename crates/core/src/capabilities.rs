@@ -1315,8 +1315,11 @@ enum ProbeExecOutcome {
 fn kill_probe_group(pid: u32) {
     if let Ok(pgid) = libc::pid_t::try_from(pid) {
         if pgid > 1 {
-            // SAFETY: `pgid` is the leader PID of the process group created by
-            // `cmd.process_group(0)` for this probe subprocess.
+            // `pgid` (never 0 or 1, which would name our own group or init's) is the group that
+            // `cmd.process_group(0)` created for this probe: its leader is not reaped yet when
+            // `reap_probe_child_detached` calls, and when `try_wait` has reaped it, the id stays
+            // reserved while any member of the group lives (otherwise the call fails with ESRCH).
+            // SAFETY: `killpg` takes two integers and touches no memory of this process.
             unsafe {
                 let _ = libc::killpg(pgid, libc::SIGKILL);
             }
@@ -1376,7 +1379,16 @@ pub fn attach_suspended_process_to_kill_on_close_job(
     };
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
+    /// Resumes every thread of the suspended `process` through `ntdll!NtResumeProcess`.
+    ///
+    /// # Safety
+    ///
+    /// `process` must be an open process handle with `PROCESS_SUSPEND_RESUME` access that stays
+    /// open for the call (the caller's handle of the child it just created suspended).
     unsafe fn resume_process(process: HANDLE) {
+        // SAFETY: this is the ABI of the `ntdll.dll` export `NTSTATUS NTAPI
+        // NtResumeProcess(HANDLE ProcessHandle)`: one handle argument, `NTSTATUS` (`i32`) result,
+        // `stdcall` (`"system"`), so the `transmute` below calls it with the right signature.
         type NtResumeProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
         let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
         if !ntdll.is_null() {
@@ -1392,6 +1404,11 @@ pub fn attach_suspended_process_to_kill_on_close_job(
     if process.is_null() {
         return None;
     }
+    // Both callers pass the handle of a `Child` they borrow (`ProbeJobGuard::attach`,
+    // `process_tree::imp::attach`), which `CreateProcess` opened with full access, as
+    // `resume_process` needs; a handle value that is not open only makes the calls fail. `info`
+    // is plain data (all-zero is valid) and lives across `SetInformationJobObject`, which is
+    // given its exact size.
     // SAFETY: Win32 calls on a newly created job handle and the caller's live process handle;
     // the job handle is closed on every failure path and returned to the caller on success.
     unsafe {
@@ -1423,8 +1440,11 @@ pub fn attach_suspended_process_to_kill_on_close_job(
 pub fn terminate_job_object(job: isize) {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+    // `ProbeJobGuard` and `process_tree::TreeInner` call this before their single
+    // `close_job_object`, and `terminate_all_task_process_trees` only for ids still registered,
+    // under the registry lock that a tree takes to unregister before it closes the handle.
     // SAFETY: `job` is a live Job Object handle created by
-    // `attach_suspended_process_to_kill_on_close_job`.
+    // `attach_suspended_process_to_kill_on_close_job`, passed by value.
     unsafe {
         TerminateJobObject(job as HANDLE, 1);
     }
@@ -1436,7 +1456,9 @@ pub fn terminate_job_object(job: isize) {
 #[cfg(windows)]
 pub fn close_job_object(job: isize) {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    // SAFETY: last use of the Job Object handle.
+    // SAFETY: last use of the Job Object handle, closed once: `ProbeJobGuard` takes it out of its
+    // `Option` first, and `process_tree::TreeInner` closes it in `kill_and_release_once`, which
+    // runs its body once (`done`, under `kill_lock`) after unregistering the id.
     unsafe {
         CloseHandle(job as HANDLE);
     }
@@ -3760,6 +3782,9 @@ Now drawing from 'AC Power'
             if let Ok(raw) = std::fs::read_to_string(&detached_pid_file) {
                 if let Ok(pid) = raw.trim().parse::<libc::pid_t>() {
                     if pid > 1 {
+                        // SAFETY: `kill` takes two integers and touches no memory of this
+                        // process. `pid` (> 1) is the `setsid` grandchild this test started,
+                        // which sleeps for 60 s, so it is still alive and its PID is not reused.
                         unsafe {
                             let _ = libc::kill(pid, libc::SIGKILL);
                         }

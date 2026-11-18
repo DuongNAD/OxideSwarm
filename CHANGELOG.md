@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- The worker's shutdown net (`terminate_all_task_process_trees`) kills the registered task process trees while it holds the registry lock, instead of from a copy taken before. A tree torn down at the same moment could close its cgroup leaf descriptors (Linux, delegated cgroup v2) or its Job Object handle (Windows) in between, so the sweep could write to, and read PIDs to kill from, a descriptor number the worker had already reused for another file (`LV-4`).
+
 ## [0.4.2] - 2026-11-18
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` and `0.4.1`. It adds `submit --verify` (run a task again on other workers and compare its outputs, `VERIFY-1`), which by default compares only workers with the same operating system and CPU architecture (`VERIFY-2`). It fixes a worker that kept tasks while its sandbox base was unusable (`BUG-25`), the Agent Mesh hub disconnecting a healthy sender for the hub's own replies (`TEST-27`), two worker recovery races (`TEST-23`, partial), and the dev cluster binding the default discovery port (`BUG-26`), and makes eleven flaky tests deterministic (`TEST-42` to `TEST-52`).
