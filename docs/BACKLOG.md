@@ -161,9 +161,9 @@ Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184
 Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
 Then TEST-49 and Phase 16 (APP-4, VERIFY-1, APP-5, design 0089) were added: 191 items, 109 Implemented, 13 Partial and 69 Planned.
 After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68 Planned.
-Recounted on 2026-11-18 after pull requests 299 to 316 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
-TEST-50, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
-pull request 267; APP-4 Partial): 200 items, 125 Implemented, 15 Partial and 60 Planned.
+Recounted on 2026-11-18 after pull requests 299 to 318 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
+TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
+pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -4482,7 +4482,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: VERIFY-1 Implemented (pull request 296). The Index counts are 110 Implemented, 13 Partial and 68 Planned (191 items).
 - 2026-11-18: Phase 17 added from design 0093 (benchmarks worth showing; ids claimed on the hub):
   BENCH-2 to BENCH-7, all Planned; LAUNCH-4 now also needs BENCH-7. Q90 to Q92 open.
-- 2026-11-18: Recounted after pull requests 299 to 316 (307, 308 and 309 merged through 309, and 310 to 315
-  through the integration pull request 316): TEST-32 corrected to Implemented (pull request 267), VERIFY-2 and
-  BENCH-2 Implemented, APP-4 Partial (the Windows half). Counted from the rows, the Index holds 200 items: 125
+- 2026-11-18: Recounted after pull requests 299 to 318 (307, 308 and 309 merged through 309, 310 to 315
+  through the integration pull request 316, and 317 with TEST-51 (pull request 318)): TEST-32 corrected to Implemented (pull request 267), VERIFY-2 and
+  BENCH-2 Implemented, APP-4 Partial (the Windows half). Counted from the rows, the Index holds 201 items: 126
   Implemented, 15 Partial and 60 Planned.
