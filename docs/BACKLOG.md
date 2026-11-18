@@ -384,7 +384,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
-| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | NNN (open), (design 0093) |
+| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355 (open), (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Planned | Out | (design 0093) |
 
 ## Phase 0: integrate open work
@@ -1838,7 +1838,7 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   log.
 - **Done when:** The records are committed and this section names the cause or causes with their share of
   the gap, or the change that closes it.
-- **Implemented (2026-11-18, pull request NNN):** Plan
+- **Implemented (2026-11-18, pull request 355):** Plan
   `benchmarks/sweep/plans/2026-11-18-bench-8-w1-efficiency-gap.json`, committed before the first run, with
   two amendments committed before the steps they add. Same units, release 0.4.3, master for the run on the
   Mac; nine records in `benchmarks/sweep/results/` (`2026-11-18-w1-*`), every checksum equal.
@@ -2314,7 +2314,7 @@ Add one dated line per finished item, newest last.
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
 - 2026-11-18: BENCH-3 Partial (pull request 349): W1 on the Mac and the Windows case machine, speedup 1.37,
   efficiency 0.73, 360/360 checksums; BENCH-8 added (Planned, Out) to find the gap to the plan's 0.85.
-- 2026-11-18: BENCH-8 Implemented (pull request NNN): combining the two machines costs 0.01 to 0.06; the
+- 2026-11-18: BENCH-8 Implemented (pull request 355): combining the two machines costs 0.01 to 0.06; the
   tail and the missing queue are below 0.05; the gap is the cost of running through the grid on each machine
   (about 0.78 of each machine alone): on Windows the master on another machine over the LAN (0.16), on the Mac
   the default task priority (0.05) and 0.16 still open. BENCH-9 added (Planned, Out); Q93 open.

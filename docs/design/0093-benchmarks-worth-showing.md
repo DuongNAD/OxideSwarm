@@ -237,7 +237,7 @@ names it.
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | `benchmarks/sweep/` | A LAN record with throughput and efficiency per task length for one and two workers, and the break-even length | Planned |
 | BENCH-6 | Two networks | `benchmarks/sweep/`, `doctor --json` | A record with the Mac on a hotspot and the worker on the home LAN, and the same-day LAN control | Planned |
 | BENCH-7 | README headlines; the interconnect report by Q91 | `README.md`, `benchmarks/interconnect/`, `docs/BACKLOG.md` (LAUNCH-4) | The README's first "Measured" rows link to the records of BENCH-3 to BENCH-6; `ox-mode doc` passes | Planned |
-| BENCH-8 | Why BENCH-3 reached 0.73, not 0.85 | `benchmarks/sweep/plans/`, `benchmarks/sweep/results/` | Records that give each cause its share | Implemented (pull request NNN) |
+| BENCH-8 | Why BENCH-3 reached 0.73, not 0.85 | `benchmarks/sweep/plans/`, `benchmarks/sweep/results/` | Records that give each cause its share | Implemented (pull request 355) |
 | BENCH-9 | Process time against slot idle time through the grid | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/results/` | Records that split the per-machine cost on both machines | Planned |
 
 ## Status log
@@ -252,7 +252,7 @@ names it.
   2.233 tasks/s: speedup 1.37, efficiency 0.73, below the plan's 0.85; every checksum matched. BENCH-8 finds the
   gap. The plan sized tasks at about 3 s from one process on the Mac; under full load they took 7 to 12 s, so
   a plan should size tasks from the machine's best level, not from one process.
-- 2026-11-18: BENCH-8 (pull request NNN): nine records under one plan with two amendments. Combining the Mac
+- 2026-11-18: BENCH-8 (pull request 355): nine records under one plan with two amendments. Combining the Mac
   and the Windows machine costs little (0.94 to 0.99 of the sum of each worker alone through the grid); a
   longer sweep and a queue on the master add less than 0.05. Each worker alone through the grid reaches about
   0.78 of its machine alone: on Windows the master on the other machine over the LAN costs 0.16 (0.94 with the
