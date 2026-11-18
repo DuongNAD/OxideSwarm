@@ -1971,6 +1971,45 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   50 runs of `tests/run_mesh_simulation_tests.py` and 50 with 12 `yes` CPU burners, all passed. The
   `macos-latest` 50-run loop of "Done when" is not run.
 
+### TEST-35: Make the `switch_role` launcher test stable on macOS
+
+- **Evidence:** Reproduced twice: pull request 206 on 2026-11-12, and pull request 260 at `9d8b9cc` on
+  2026-11-16 (job `133322408476`, `launcher scripts (macos-latest)`):
+  `ShellLauncherTests.test_switch_role_master_flow_and_tracked_stop` failed with "AssertionError: 1 != 0"
+  on the launcher's return code. Reruns passed.
+- **Problem:** The launcher returned 1 once in a while; the test does not print why.
+- **Do:** Print the launcher's output on failure, then find the cause.
+- **Done when:** The cause is written here and fixed, or the test passes 50 runs on `macos-latest`.
+- **Partial (2026-11-17, pull request 277):** diagnostics added, cause not found. A failing launcher
+  run now fails with its command, return code, combined output, `master.log` / `worker.log` and the
+  fake binary's recorded calls. The failure did not reproduce locally: 30 runs plain and 30 with 12
+  `yes` CPU burners, each with the default `PATH` and with `PATH="/bin:$PATH"` (120 runs, 0 failures).
+  The launcher returns 1 only when the master port is in use, the master process is not recognised
+  right after it starts, or its log shows no "RustyGrid Master started" within 10 s; one suspected
+  race (a process still showing the launcher's command line just after the fork) was not seen in 300
+  tries. The launcher is unchanged. The next failure on `macos-latest` will print which of these it was.
+- **Implemented (2026-11-18, pull request 338):** the cause is the race that pull request 277 suspected.
+  The diagnostics caught it on `macos-latest` on 2026-11-18 (pull request 337, `launcher scripts
+  (macos-latest)`): `switch_role.sh master` printed "[ERROR] Master failed to start" with an empty log
+  tail, then "[INFO] Stopping master (PID 1431)...", and `master.log` held "RustyGrid Master started on
+  fake". `start_tracked` writes the PID right after the fork. Until the child has exec'd the binary, `ps -p
+  PID -o command=` shows the launcher's own command line, so `pid_is_ours` was false and the start loop
+  gave up on its first pass, before the binary had written anything; a moment later `stop_tracked` found
+  the binary under the same PID. The master start loop now ends early only when the process is gone
+  (`kill -0`) and confirms the PID with `pid_is_ours` once the log line is there, so a reused PID still
+  fails the start. The worker checks after `sleep 1` (the master's local worker) and `sleep 2` (the
+  worker role) use the new `wait_until_ours`, which waits within the same 10 s budget (50 checks 0.2 s
+  apart) and fails at once when the process is gone. `pid_is_ours`, used by `stop` and `status`, is
+  unchanged. Three tests in `tests/test_launcher_scripts.py` put a `ps` on the launcher's `PATH` that shows
+  the launcher's command line until the fake binary has run for 3 s: the master and worker tests failed on
+  the old launcher with the CI symptom and pass now; the third checks that a PID whose command line names
+  another program fails the start and is not signalled. With 8 `yes` CPU burners and `PATH="/bin:$PATH"`
+  (bash 3.2.57), `test_switch_role_master_flow_and_tracked_stop` passed 30 of 30 runs with the fix; the
+  old launcher passed 30 of 30 there too, as in the tries of pull request 277, so the window is shown by
+  the `ps` shim, not by load. The `macos-latest` 50-run loop of "Done when" is not run. No other shell
+  launcher checks a command line right after starting a process (`packaging/usb/install.sh` checks only
+  `kill -0` after `sleep 4`).
+
 ### TEST-36: Remove the 50 ms bound from the symlink-chain manifest test
 
 - **Evidence:** Reproduced on the owner's Windows machine under CPU starvation (4 cores, then 2 cores
