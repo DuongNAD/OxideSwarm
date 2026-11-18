@@ -1375,6 +1375,67 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
 - **Done when:** `tests/test_launcher_scripts.py` covers the rule with fake processor data, and on
   the i7-1355U laptop the kit picks 4 slots or fewer.
 
+## Phase 10: lasting value
+
+Added on 2026-11-10 from [design 0058](design/0058-lasting-value.md), at the owner's word, for its
+first items. The record plans assurance, a written specification, citable evidence and stewardship,
+and adds no feature. Its other items (LV-2, LV-3, LV-6 to LV-9, LV-11 to LV-13, LV-16 and
+LV-17) stay in the design record until the owner adds them here. LV-4 and LV-15 are in Phase 13
+since 2026-11-17. The four items below do not depend
+on each other and can run in parallel. None changes the wire format, a CLI flag or a default, so
+none needs a design record of its own.
+
+### LV-1: Fuzz targets for the parsers of untrusted bytes (first targets)
+
+- **Evidence:** Read on 2026-11-10 at `master` `2f22c48`. The repository has no `fuzz/` directory
+  and no property-testing dependency. Bytes from another machine reach these parsers, the first two
+  before authentication completes: the frame reader and format dispatch of `MessageTransport`
+  (`crates/core/src/protocol.rs`: `recv_raw_frame_max`, `recv_msg_with_codec_max`, frames up to
+  `MAX_FRAME_SIZE`, 64 MiB), the handshake frames (`crates/core/src/cluster_auth.rs`,
+  `crates/core/src/noise_auth.rs`), and `TreeManifest::decode` (`crates/core/src/blob.rs`). The
+  `audit` job of CI reports `bincode` 1.x as unmaintained.
+- **Problem:** Nothing has fed these parsers malformed input at scale. A panic or an unbounded
+  allocation in one of them is a remote denial of service, and before the handshake it needs no
+  secret.
+- **Do:**
+  1. Add a `fuzz/` crate for `cargo fuzz` (libFuzzer), outside the workspace members (add it to
+     `exclude` in the root `Cargo.toml`), with a `Cargo.lock` of its own. List its dependencies for
+     the owner in the pull request.
+  2. Write three targets:
+     - `inbound_frame`: the input is a byte stream that a `MessageTransport` over an in-memory
+       stream reads as `InboundMessage`, once per `WireCodec`, with a small frame limit. The frame
+       reader, the format byte dispatch and both decoders are then in the path.
+     - `server_handshake`: the input is what a peer sends first. Run the server side of the
+       handshake against it over an in-memory stream, with a fixed test secret and a fixed test
+       key.
+     - `tree_manifest`: the input goes to `TreeManifest::decode`.
+
+     If a parser is only reachable through private functions, expose it behind a Cargo feature
+     `fuzzing` of `rusty_grid_core` that is off by default. Do not change a normal build.
+  3. Seed each target's corpus with valid encodings, for example the messages that
+     `crates/core/src/wire_layout_tests.rs` builds.
+  4. Run each target for one hour locally. Record the date, the machine, the number of executions
+     and every finding in `fuzz/README.md`. This is spike R12 of design 0058.
+  5. For each finding follow rule 4: a failing test first, then the fix. A finding that a remote
+     peer can trigger goes through the private route of `docs/SECURITY.md` before any public pull
+     request.
+  6. Add a CI job on Linux that builds the targets and runs each for 60 seconds on pull requests,
+     and for 10 minutes each on the weekly schedule. The job pins a dated nightly toolchain,
+     because `cargo fuzz` needs one. Keep crash inputs as files under `fuzz/regressions/`, and run
+     them in the same job.
+- **Done when:** The three targets build and run in CI. `fuzz/README.md` holds the one-hour record.
+  A malformed frame placed in `fuzz/regressions/` is read without a panic. The later targets of
+  design 0058 LV-1 (the encrypted record reader, the join token and the invite, the journal reader,
+  the JSON-RPC reader of `oxideswarm mcp`) are listed in `fuzz/README.md` as open.
+- **Status:** Partial (2026-11-17, pull request 270). Built: `fuzz/` with the targets `inbound_frame`,
+  `server_handshake` (v2 and v3) and `tree_manifest`, seed corpora, `fuzz/regressions/`, `fuzz/README.md`
+  with the one-hour record (no finding; 24.5 million, 7.7 million and 34.6 million executions) and the
+  `fuzz` CI job on a pinned nightly. Every function the targets call is public, so no `fuzzing`
+  feature was needed. The local runs used a stable toolchain with `-s none`. Open: the `fuzz` job has
+  not run yet on GitHub (Done when: the three targets build and run in CI); Implemented once it is green.
+- **Implemented (2026-11-18):** the `fuzz` CI job runs the three targets green on `master`
+  (first green run on `master` at `b486137`); the later targets are LV-18.
+
 ## Phase 11: findings of the audit of 2026-11-15
 
 These items come from a read-only audit of `master` at `c2462e3` (after 0.2.0 and SCALE-2). Line
