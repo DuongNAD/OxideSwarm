@@ -2190,7 +2190,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   assignments and the default 20 s watchdog or the 10 s task timeouts would fail a slow run with another message;
   on failure print what was waited for and the state reached; keep every assertion.
 - **Done when:** The test passes 100 runs in a row next to 6 spinning processes.
-- **Implemented (2026-11-18, pull request PRNUM):** `WAIT` (60 s) bounds the connection, the Register, both results
+- **Implemented (2026-11-18, pull request 327):** `WAIT` (60 s) bounds the connection, the Register, both results
   and the worker's stop at the end (so the sandbox base outlives the worker, TEST-33); every wait ends as soon as
   its condition holds. The worker runs with `with_dead_peer_timeout(WAIT * 5)` and both tasks with a 300 s
   timeout. When the results do not arrive, the panic says why (the bound ran out, the worker disconnected, or a
