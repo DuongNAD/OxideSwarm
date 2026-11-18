@@ -26,6 +26,65 @@ pub(super) fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(argv).expect("arguments must parse")
 }
 
+/// The bound on how long a test waits for an in-process master to publish its port and accept a
+/// client (TEST-49, TEST-51). It is a limit, not a window: each wait ends as soon as its condition
+/// holds, and a loaded runner can take far longer than a second to build the master's state.
+pub(super) const MASTER_START_BOUND: Duration = Duration::from_secs(30);
+
+/// Returns `127.0.0.1:<port>` once `run_master`, started with `--listen 127.0.0.1:0 --port-file
+/// <port_file>`, has written the port it bound (TEST-51). The master picks its own port, so no
+/// other test in this binary can take it first, as one could when the test bound a probe
+/// listener, dropped it and started the master on its port. Panics with `what` and what it
+/// waited for when `master` ends first or the bound passes.
+pub(super) async fn wait_for_master_port(
+    port_file: &Path,
+    master: &tokio::task::JoinHandle<ExitCode>,
+    what: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + MASTER_START_BOUND;
+    loop {
+        let port = std::fs::read_to_string(port_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0);
+        if let Some(port) = port {
+            return format!("127.0.0.1:{port}");
+        }
+        assert!(
+            !master.is_finished(),
+            "{what}: run_master ended before it wrote its port to {}",
+            port_file.display()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: run_master did not write its port to {} within {} s",
+            port_file.display(),
+            MASTER_START_BOUND.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Connects to the in-process master at `addr`, trying again until `connect_master` succeeds
+/// (TEST-51). Panics with `what` and the last error when `MASTER_START_BOUND` passes first.
+pub(super) async fn connect_master_within_bound(
+    addr: &str,
+    secret: &ClusterSecret,
+    what: &str,
+) -> MessageTransport<GridStream> {
+    let deadline = std::time::Instant::now() + MASTER_START_BOUND;
+    loop {
+        match connect_master(addr, Some(secret)).await {
+            Ok(transport) => return transport,
+            Err(e) if std::time::Instant::now() >= deadline => panic!(
+                "{what}: connect_master to {addr} did not succeed within {} s, last error: {e}",
+                MASTER_START_BOUND.as_secs()
+            ),
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 pub(super) fn submit_args(args: &[&str]) -> SubmitArgs {
     match parse(&[&["submit"], args].concat()).command {
         Commands::Submit(a) => a,
@@ -757,15 +816,17 @@ async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_a
     //    reports `active_bytes` and `max_active_bytes` in `ClusterStatus`, and refuses
     //    the second 600 KiB task with `task requires ... bytes`, `bytes in use`,
     //    `limit 1048576 bytes`, and `--max-active-mb`.
-    let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let run_master_addr = probe_listener.local_addr().unwrap();
-    drop(probe_listener);
-    let run_master_addr_str = run_master_addr.to_string();
+    //    The master picks its own port and writes it to a port file (TEST-51).
+    let port_dir = tempfile::tempdir().unwrap();
+    let port_file = port_dir.path().join("master.port");
+    let port_file_str = port_file.to_str().unwrap().to_string();
     let cli = Cli::try_parse_from([
         "oxideswarm",
         "master",
         "--listen",
-        &run_master_addr_str,
+        "127.0.0.1:0",
+        "--port-file",
+        &port_file_str,
         "--web-ui-addr",
         "127.0.0.1:0",
         "--max-active-mb",
@@ -781,15 +842,18 @@ async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_a
     };
     let master_task = tokio::spawn(run_master(master_args, None, secret_opts));
 
-    let mut connected = None;
-    for _ in 0..50 {
-        if let Ok(t) = connect_master(&run_master_addr_str, Some(&test_secret)).await {
-            connected = Some(t);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut transport = connected.expect("run_master bound and accepted connection");
+    let run_master_addr_str = wait_for_master_port(
+        &port_file,
+        &master_task,
+        "run_master bound and accepted connection",
+    )
+    .await;
+    let mut transport = connect_master_within_bound(
+        &run_master_addr_str,
+        &test_secret,
+        "run_master bound and accepted connection",
+    )
+    .await;
     let make_600k_task = |i: u8| {
         let mut task = Task::new(
             TaskSpec::Command {

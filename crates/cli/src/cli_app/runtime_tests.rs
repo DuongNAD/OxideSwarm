@@ -21,25 +21,9 @@ use super::submit::{
     any_connected_worker_satisfies_vram, build_task_spec, run_submit, run_submit_with_secret,
 };
 use super::tasks::run_status;
-use super::tests::{parse, submit_args};
+use super::tests::{connect_master_within_bound, parse, submit_args, wait_for_master_port};
 use super::worker::{resolve_isolation_read_dirs, resolve_worker_target, run_worker};
 use super::*;
-
-/// Waits until something accepts a TCP connection on `addr`, or 30 s have passed (TEST-49). An
-/// in-process master binds after `run_master` has built its state, which can take much longer
-/// than a second on a loaded runner.
-async fn wait_for_master_bind<A: tokio::net::ToSocketAddrs>(addr: &A) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
 
 /// Runs on its own thread with a 16 MiB stack: this test drives `run_master`, `run_worker`
 /// and the client commands in one future, which overflowed the default 2 MiB test-thread
@@ -380,11 +364,11 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     // 3. `--max-queue-size 2` rejects the 3rd submit, and `RUSTY_GRID_WIRE_CODEC=json`
     //    takes effect on the master when `--wire-codec` is omitted on the CLI.
     //    Also test `[submit] timeout_secs` via `run_submit_with_secret` and `run_mapreduce`.
+    //    The master picks its own port and writes it to a port file (TEST-51).
     let tmp_blob = tempfile::tempdir().unwrap();
-    let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let master_addr = probe_listener.local_addr().unwrap();
-    drop(probe_listener);
-    let master_addr_str = master_addr.to_string();
+    let port_dir = tempfile::tempdir().unwrap();
+    let port_file = port_dir.path().join("master.port");
+    let port_file_str = port_file.to_str().unwrap().to_string();
     let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
 
     std::env::set_var("RUSTY_GRID_WIRE_CODEC", "json");
@@ -404,7 +388,9 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
         "oxideswarm",
         "master",
         "--listen",
-        &master_addr_str,
+        "127.0.0.1:0",
+        "--port-file",
+        &port_file_str,
         "--web-ui-addr",
         "127.0.0.1:0",
         "--max-queue-size",
@@ -422,16 +408,24 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     };
     let master_task = tokio::spawn(run_master(master_args, None, secret_opts.clone()));
 
-    let bound = wait_for_master_bind(&master_addr).await;
-    assert!(bound, "master bound and accepted probe connection");
+    // The port file is written after the bind, so the master has read `RUSTY_GRID_WIRE_CODEC`.
+    let master_addr_str = wait_for_master_port(
+        &port_file,
+        &master_task,
+        "master bound and accepted probe connection",
+    )
+    .await;
     // Clear `RUSTY_GRID_WIRE_CODEC` BEFORE connecting the client so the client speaks
     // `WireCodec::Bincode` (0x02). A master configured with `RUSTY_GRID_WIRE_CODEC=json`
     // must still reply in `WireCodec::Json` (0x01) instead of mirroring the client's bincode.
     std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
 
-    let mut transport = connect_master(&master_addr_str, Some(&test_secret))
-        .await
-        .expect("bincode client connected to json master");
+    let mut transport = connect_master_within_bound(
+        &master_addr_str,
+        &test_secret,
+        "bincode client connected to json master",
+    )
+    .await;
     assert_eq!(
         transport.codec(),
         WireCodec::Bincode,
@@ -852,18 +846,20 @@ speed_hold_factor = 2.25
     //      placement constraints no registered worker can satisfy (`--require-tag nothing --wait`),
     //      waking `--wait` with `ExitCode::FAILURE` and
     //      `"No registered worker matches the placement constraints (tag=nothing)"`.
+    //    The master picks its own port and writes it to a port file (TEST-51).
     let rr_blob = tempfile::tempdir().unwrap();
-    let rr_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let rr_addr = rr_probe.local_addr().unwrap();
-    drop(rr_probe);
-    let rr_addr_str = rr_addr.to_string();
+    let rr_port_dir = tempfile::tempdir().unwrap();
+    let rr_port_file = rr_port_dir.path().join("master.port");
+    let rr_port_file_str = rr_port_file.to_str().unwrap().to_string();
     let rr_blob_str = rr_blob.path().to_str().unwrap().to_string();
 
     let rr_master_cli = Cli::try_parse_from([
         "oxideswarm",
         "master",
         "--listen",
-        &rr_addr_str,
+        "127.0.0.1:0",
+        "--port-file",
+        &rr_port_file_str,
         "--web-ui-addr",
         "127.0.0.1:0",
         "--scheduler-policy",
@@ -884,8 +880,9 @@ speed_hold_factor = 2.25
         rr_secret_opts.clone(),
     ));
 
-    let rr_bound = wait_for_master_bind(&rr_addr).await;
-    assert!(rr_bound, "round-robin master bound");
+    let rr_addr_str =
+        wait_for_master_port(&rr_port_file, &rr_master_task, "round-robin master bound").await;
+    drop(connect_master_within_bound(&rr_addr_str, &test_secret, "round-robin master bound").await);
 
     // Connect two simulated workers over TCP to `rr_addr_str`:
     // - `rr-w1`: 8 cores (`slots:8`), 0% CPU usage -> weighted ratio 0/8=0.0 on task 1, 1/8=0.125 on task 2.

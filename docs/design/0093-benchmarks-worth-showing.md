@@ -230,7 +230,7 @@ names it.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| BENCH-2 | The method and the sweep harness | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/workload_cpu.py`, `benchmarks/sweep/README.md`, `tests/test_bench_sweep.py`, `.github/workflows/ci.yml` (job `agent-bridge`) | The harness runs W1 locally and through a loopback cluster with `--quick --no-write`; the helper tests pass in CI on Linux, macOS and Windows | Planned |
+| BENCH-2 | The method and the sweep harness | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/workload_cpu.py`, `benchmarks/sweep/README.md`, `tests/test_bench_sweep.py`, `.github/workflows/ci.yml` (job `agent-bridge`) | The harness runs W1 locally and through a loopback cluster with `--quick --no-write`; the helper tests pass in CI on Linux, macOS and Windows | Implemented (pull request 314) |
 | BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | `benchmarks/sweep/results/` | Records for W1, and for W2 by Q90, with speedup and efficiency | Planned |
 | BENCH-4 | Offload against local work | `benchmarks/grid/bench_grid.py` (extend (c)) or `benchmarks/sweep/` | A record of the arms of D3, cold, warm and after one edit, with the Mac's CPU seconds | Planned |
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | `benchmarks/sweep/` | A LAN record with throughput and efficiency per task length for one and two workers, and the break-even length | Planned |
@@ -242,3 +242,5 @@ names it.
 - 2026-11-18: Drafted by the coordinator session at the owner's request ("soạn kế hoạch benchmark") after a
   review found the records honest but without a scaling number against the fastest machine, a comparison
   with local work, or a run between two networks. Q90 to Q92 open.
+- 2026-11-18: BENCH-2 Implemented (pull request 314, merged through pull request 316). The record stays a
+  Draft until the owner decides Q90 to Q92.

@@ -161,6 +161,9 @@ Then Phase 14 (LAUNCH-1 to LAUNCH-5) and TEST-48 were added: the table holds 184
 Then Phase 15 (COORD-1 to COORD-3, design 0087) was added and implemented: 187 items, 109 Implemented, 13 Partial and 65 Planned.
 Then TEST-49 and Phase 16 (APP-4, VERIFY-1, APP-5, design 0089) were added: 191 items, 109 Implemented, 13 Partial and 69 Planned.
 After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68 Planned.
+Recounted on 2026-11-18 after pull requests 299 to 318 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
+TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
+pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 
@@ -215,7 +218,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | 283 |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | 265 |
-| TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Planned |  |
+| TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented | 267 |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented | 277 |
 | TEST-35 | Make the `switch_role` launcher test stable on macOS | P3 | S |  |  | Partial | 277 |
@@ -234,6 +237,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
+| TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented | 318 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -356,11 +360,11 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
-| APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
+| APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Partial | (design 0063), (design 0089) |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented | 296, (design 0089) |
-| VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented | 312 (open), (design 0089) |
+| VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented | 312, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
-| BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Planned | (design 0093) |
+| BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Implemented | 314, (design 0093) |
 | BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | (design 0093) |
 | BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | (design 0093) |
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | (design 0093) |
@@ -2955,6 +2959,9 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   fault: under `--isolation off` a task inherits the worker's environment, as designed.
 - **Do:** Start `.\drain.cmd`, or clear the variable for the child.
 - **Done when:** The test passes with the variable set to 1.
+- **Implemented (pull request 267, row corrected on 2026-11-18):** the test starts `.\drain.cmd`
+  (`crates/worker/src/client/tests.rs`). agent-win ran it 3 of 3 times with
+  `NoDefaultCurrentDirectoryInExePath=1` on `master` `fb38aee`.
 
 ### TEST-33: Make the worker-churn stress test deterministic on Windows
 
@@ -3339,6 +3346,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   spinning processes and 200 of 200 next to 40. The old file did not fail here either (200 of 200 at each
   load), so the race was not reproduced locally; the CI log above is the evidence. No other test file reads
   the master's banner lines once after start-up.
+
+### TEST-51: Let the run_master unit tests pick their own port instead of bind-and-drop
+
+- **Evidence:** `cli_app::tests::test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes`
+  (`crates/cli/src/cli_app/tests.rs:792`, "run_master bound and accepted connection") failed in `unit tests
+  (ubuntu-latest)` on 2026-11-18, in the step `cargo test -p rusty_grid_cli --lib --features otel` of pull
+  request 317 (docs only; run `44209756700`, attempt 1, job `134484800892`). The test printed `Failed to start
+  master server: I/O error: Address already in use (os error 98)` before the panic.
+- **Problem:** The test picked the master's port by binding `127.0.0.1:0`, reading the port and dropping the
+  listener, and then started `run_master` on that port. The binary runs its 199 tests in parallel, and
+  another test can take the port in between. Its connect loop was also a one-second window (50 tries, 20 ms
+  apart). The sched2 runtime test (`crates/cli/src/cli_app/runtime_tests.rs`, TEST-49) picked the ports of
+  its two in-process masters the same way.
+- **Do:** Start each in-process master with `--listen 127.0.0.1:0 --port-file <tempdir>/master.port`, wait by
+  condition (30 s bound) until the file holds a port, then wait by condition until `connect_master`
+  succeeds; keep every assertion.
+- **Done when:** The lib test binary of `rusty_grid_cli` passes 50 runs in a row under CPU load.
+- **Implemented (2026-11-18, pull request 318):** Two helpers in `crates/cli/src/cli_app/tests.rs`, shared
+  with `runtime_tests.rs`: `wait_for_master_port` polls the port file every 20 ms and fails with what it
+  waited for when `run_master` ends first or `MASTER_START_BOUND` (30 s) passes, and
+  `connect_master_within_bound` retries `connect_master` until it succeeds or the same bound passes, then
+  fails with the last error. The `--max-active-mb` test and both masters of the sched2 test use them;
+  TEST-49's `wait_for_master_bind` is replaced. Every assertion is kept. On an Apple Silicon Mac (10 cores),
+  the lib test binary of `rusty_grid_cli` (199 tests, default parallel harness) passed 50 of 50 runs in a row
+  next to 4 spinning `yes` processes. The old code was not looped, so the race was not reproduced locally;
+  the CI log above is the evidence. Other tests that pick a port by bind-and-drop and then start a master, a
+  worker or its portal on it were not changed:
+  `crates/cli/tests/discovery_port_e2e.rs` (`free_tcp_port`, `free_udp_port`), `tests/workflow_modes_test.rs`
+  (`two_free_ports`, `free_master_port`, `free_web_port`), `tests/m1_challenger_2_stress.rs` (two dashboard
+  ports), `crates/master/src/server/tests.rs` (the discovery UDP port), `tests/cluster_auth_e2e.rs` (the
+  discovery UDP port) and `crates/worker/src/client/tests.rs` (the standby portal port).
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -3943,6 +3981,10 @@ their first user (Q88), then APP-5.
   development machine: build with `-j 2` and only while someone watches.
 - **Done when:** A dated record holds the checksums of both machines and the trials per hour on one and two
   workers.
+- **Partial (2026-11-18):** the Windows half ran on 2026-11-17 (agent-win, with the owner's yes). The runner
+  builds in release on Windows x86_64, and the committed smoke trial gives checksums that differ from the
+  Mac's at the same commit and inputs while each system repeats its own (design 0089 D6, VERIFY-2). The
+  sweep through the grid (step 3) is BENCH-3 of design 0093; the Mac run of `28c45ef` is the owner's.
 
 ### VERIFY-1: Run a task again on other workers and compare its outputs
 
@@ -3996,6 +4038,10 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   `agent-bridge`.
 - **Done when:** `bench_sweep.py --quick --no-write` runs W1 locally and through a loopback cluster, and the
   helper tests pass in CI on Linux, macOS and Windows.
+- **Implemented (pull request 314):** `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/workload_cpu.py`
+  (W1, a SHA-256 chain whose checksum depends only on seed and units) and `benchmarks/sweep/README.md`;
+  `tests/test_bench_sweep.py` (16 helper tests) runs in the CI job `agent-bridge`. The quick run passed on
+  Windows loopback (8 of 8 checksums).
 
 ### BENCH-3: Sweep scaling
 
@@ -4436,3 +4482,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-17: VERIFY-1 Implemented (pull request 296). The Index counts are 110 Implemented, 13 Partial and 68 Planned (191 items).
 - 2026-11-18: Phase 17 added from design 0093 (benchmarks worth showing; ids claimed on the hub):
   BENCH-2 to BENCH-7, all Planned; LAUNCH-4 now also needs BENCH-7. Q90 to Q92 open.
+- 2026-11-18: Recounted after pull requests 299 to 318 (307, 308 and 309 merged through 309, 310 to 315
+  through the integration pull request 316, and 317 with TEST-51 (pull request 318)): TEST-32 corrected to Implemented (pull request 267), VERIFY-2 and
+  BENCH-2 Implemented, APP-4 Partial (the Windows half). Counted from the rows, the Index holds 201 items: 126
+  Implemented, 15 Partial and 60 Planned.
