@@ -63,7 +63,7 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "1.2"
 
 # System monitoring
-sysinfo = "0.30"
+sysinfo = "0.40"
 
 # Embedded P2P NAT Traversal
 iroh = { version = "1.2", default-features = false, features = ["tls-ring", "portmapper"] }
