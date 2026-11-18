@@ -225,6 +225,7 @@ names it.
 | Q90 | May the README headline of BENCH-3 name Anima Engine and show its numbers, or does it use W1 only? | Measure both. Name Anima Engine only if the owner agrees and its repository is public; otherwise say "a deterministic agent-based simulation" |
 | Q91 | What happens to the hand-typed interconnect report? | Unlink it from the README and stop calling it a benchmark there; keep the file with its header as a record of one run |
 | Q92 | Is "copy and run over ssh" a baseline in BENCH-4? | No: local baselines only, because it needs an SSH server on the Windows machine. Yes if the owner turns one on |
+| Q93 | Should workers run tasks at normal priority by default? BENCH-8: `--task-priority normal` added 0.05 on the Mac and nothing on Windows | Keep below-normal, which keeps the owner's own machine responsive; the README tells dedicated workers to pass `--task-priority normal` |
 
 ## Work items
 
@@ -236,6 +237,8 @@ names it.
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | `benchmarks/sweep/` | A LAN record with throughput and efficiency per task length for one and two workers, and the break-even length | Planned |
 | BENCH-6 | Two networks | `benchmarks/sweep/`, `doctor --json` | A record with the Mac on a hotspot and the worker on the home LAN, and the same-day LAN control | Planned |
 | BENCH-7 | README headlines; the interconnect report by Q91 | `README.md`, `benchmarks/interconnect/`, `docs/BACKLOG.md` (LAUNCH-4) | The README's first "Measured" rows link to the records of BENCH-3 to BENCH-6; `ox-mode doc` passes | Planned |
+| BENCH-8 | Why BENCH-3 reached 0.73, not 0.85 | `benchmarks/sweep/plans/`, `benchmarks/sweep/results/` | Records that give each cause its share | Implemented (pull request 355) |
+| BENCH-9 | Process time against slot idle time through the grid | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/results/` | Records that split the per-machine cost on both machines | Planned |
 
 ## Status log
 
@@ -244,3 +247,15 @@ names it.
   with local work, or a run between two networks. Q90 to Q92 open.
 - 2026-11-18: BENCH-2 Implemented (pull request 314, merged through pull request 316). The record stays a
   Draft until the owner decides Q90 to Q92.
+- 2026-11-18: BENCH-3, first record (pull request 349): W1, 120 tasks of 16,000,000 units, the Mac and the
+  Windows case machine on the home LAN. Fastest machine alone 1.631 tasks/s (Windows), both through the grid
+  2.233 tasks/s: speedup 1.37, efficiency 0.73, below the plan's 0.85; every checksum matched. BENCH-8 finds the
+  gap. The plan sized tasks at about 3 s from one process on the Mac; under full load they took 7 to 12 s, so
+  a plan should size tasks from the machine's best level, not from one process.
+- 2026-11-18: BENCH-8 (pull request 355): nine records under one plan with two amendments. Combining the Mac
+  and the Windows machine costs little (0.94 to 0.99 of the sum of each worker alone through the grid); a
+  longer sweep and a queue on the master add less than 0.05. Each worker alone through the grid reaches about
+  0.78 of its machine alone: on Windows the master on the other machine over the LAN costs 0.16 (0.94 with the
+  master on the same machine, either priority); on the Mac the default task priority costs 0.05 and 0.16 is
+  open (BENCH-9). Q93 added. Lesson: other agents' cargo runs on a measuring machine void runs; the harness
+  should watch for them (BENCH-9 step 1).

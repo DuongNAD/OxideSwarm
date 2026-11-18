@@ -1989,4 +1989,58 @@ mod tests {
         assert!(validate_https_url("https://user:pass@example.com/SHA256SUMS").is_err());
         assert!(validate_https_url("https://github.com/DuongNAD/OxideSwarm/releases").is_ok());
     }
+
+    #[test]
+    fn invite_oxs_argon2_0_5_3_raw_key_and_file_vectors() {
+        fn decode_hex(hex: &str) -> Vec<u8> {
+            assert_eq!(hex.len() % 2, 0);
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+                .collect()
+        }
+
+        let txt = include_str!("../tests/data/invite_argon2_0_5_3.txt");
+        let mut vectors = BTreeMap::new();
+        for line in txt.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (k, v) = trimmed.split_once(' ').expect("key value line");
+            vectors.insert(k, v);
+        }
+
+        let passphrase = vectors["passphrase"];
+        let plaintext = vectors["plaintext"];
+
+        let oxs_fast = include_bytes!("../tests/data/invite_argon2_0_5_3.oxs");
+        assert_eq!(
+            oxs_fast.as_slice(),
+            decode_hex(vectors["oxs_64_2_2"]).as_slice()
+        );
+        let header_fast = validate_invite_oxs_header(oxs_fast).expect("64/2/2 header");
+        let key_fast = derive_invite_oxs_key(passphrase, &header_fast).expect("64/2/2 key");
+        assert_eq!(
+            key_fast.as_slice(),
+            decode_hex(vectors["key_64_2_2"]).as_slice()
+        );
+        assert_eq!(
+            &*decrypt_invite_oxs(oxs_fast, passphrase).expect("64/2/2 decrypt"),
+            plaintext
+        );
+
+        let oxs_default = decode_hex(vectors["oxs_65536_3_1"]);
+        let header_default = validate_invite_oxs_header(&oxs_default).expect("65536/3/1 header");
+        let key_default =
+            derive_invite_oxs_key(passphrase, &header_default).expect("65536/3/1 key");
+        assert_eq!(
+            key_default.as_slice(),
+            decode_hex(vectors["key_65536_3_1"]).as_slice()
+        );
+        assert_eq!(
+            &*decrypt_invite_oxs(&oxs_default, passphrase).expect("65536/3/1 decrypt"),
+            plaintext
+        );
+    }
 }

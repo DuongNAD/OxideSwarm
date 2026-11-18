@@ -82,6 +82,8 @@ Task <TASK_ID> completed successfully.
 Worker: <WORKER_NAME> (<WORKER_UUID>)
 Exit Code: 0
 Execution Time: <COLD_MS>ms
+Tasks: 1 finished, 0 failed, on 1 machines
+Waited: <WAIT_S> s    Sum of task times: <TASK_S> s
 Stdout:
 running <K> tests
 ...
