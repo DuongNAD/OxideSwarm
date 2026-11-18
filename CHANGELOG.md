@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `fuzz/`: three more `cargo fuzz` targets for parsers of untrusted bytes (`LV-18`): `aead_record` (the encrypted record layer, format byte `0x04`, that carries every frame after the handshake), `join_invite` (join tokens, invites and `invite.oxs` files) and `store_journal` (the journal and snapshot readers of `master --state-dir`, through `store::fuzzing` behind a new `fuzzing` Cargo feature of `rusty_grid_master`, off by default), with seeds, regression inputs and three more `fuzz` CI jobs; the JSON-RPC reader of `oxideswarm mcp` is still open. A normal build does not change.
+
 ## [0.4.2] - 2026-11-18
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` and `0.4.1`. It adds `submit --verify` (run a task again on other workers and compare its outputs, `VERIFY-1`), which by default compares only workers with the same operating system and CPU architecture (`VERIFY-2`). It fixes a worker that kept tasks while its sandbox base was unusable (`BUG-25`), the Agent Mesh hub disconnecting a healthy sender for the hub's own replies (`TEST-27`), two worker recovery races (`TEST-23`, partial), and the dev cluster binding the default discovery port (`BUG-26`), and makes eleven flaky tests deterministic (`TEST-42` to `TEST-52`).
