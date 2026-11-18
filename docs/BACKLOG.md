@@ -379,7 +379,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented |  | 312, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | Out | (design 0089) |
 | BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Implemented |  | 314, (design 0093) |
-| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Partial | Out | NNN (open), (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Partial | Out | 349 (open), (design 0093) |
 | BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | Out | (design 0093) |
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
@@ -1771,7 +1771,7 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   step 3 of APP-4.
 - **Done when:** The records are committed under `benchmarks/sweep/results/` with speedup against the
   fastest machine and efficiency against the sum of both.
-- **Partial (2026-11-18, pull request NNN):** W1 on both machines, by the plan committed before the run
+- **Partial (2026-11-18, pull request 349):** W1 on both machines, by the plan committed before the run
   (`benchmarks/sweep/plans/2026-11-18-bench-3-w1-two-machines.json`, 120 tasks of 16,000,000 units, one
   warm-up and 3 measured runs). Release 0.4.3 binaries; the plan names 0.4.2, and 0.4.3 shipped the same day
   without a wire change. Each machine alone, best level (median of 3): the Windows case machine (i5-14600KF,
@@ -2253,5 +2253,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: Release `0.4.3` prepared (no wire change; ENROLL-1c revocation across every lane, LV-18, LV-4
   comments, BUG-27, BUG-28, TEST-35, TEST-53, TEST-54): versions, CHANGELOG with an "Upgrading from 0.4.2"
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
-- 2026-11-18: BENCH-3 Partial (pull request NNN): W1 on the Mac and the Windows case machine, speedup 1.37,
+- 2026-11-18: BENCH-3 Partial (pull request 349): W1 on the Mac and the Windows case machine, speedup 1.37,
   efficiency 0.73, 360/360 checksums; BENCH-8 added (Planned, Out) to find the gap to the plan's 0.85.
