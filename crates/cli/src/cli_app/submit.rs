@@ -950,6 +950,8 @@ async fn run_submit_with_secret_inner(
         Err(code) => return code,
     };
 
+    let submit_started = std::time::Instant::now();
+
     let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
         Ok(t) => t,
         Err(e) => {
@@ -1256,6 +1258,11 @@ async fn run_submit_with_secret_inner(
                     }
                 }
             };
+            let waited_ms = submit_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let summary = crate::run_summary::RunSummary::from_results(
+                std::slice::from_ref(&result),
+                waited_ms,
+            );
             let verify_outcome = match (args.verify, &verify_template) {
                 (Some(replicas), Some(template)) if result.is_success() => Some(
                     verify_on_other_workers(
@@ -1318,6 +1325,7 @@ async fn run_submit_with_secret_inner(
                     if let Some(report) = upload {
                         obj.insert("input_upload".to_string(), serde_json::json!(report));
                     }
+                    summary.insert_json_fields(obj);
                 }
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
@@ -1332,6 +1340,8 @@ async fn run_submit_with_secret_inner(
                 }
                 println!("Exit Code: {}", result.exit_code);
                 println!("Execution Time: {}ms", result.execution_time_ms);
+                println!("{}", summary.tasks_line());
+                println!("{}", summary.waited_line());
                 if let Some(ref saved) = saved_artifacts {
                     println!(
                         "Artifacts ({} saved to {}):",

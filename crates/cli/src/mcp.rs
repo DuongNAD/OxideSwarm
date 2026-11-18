@@ -27,10 +27,10 @@
 //! Standard output (`stdout`) is strictly reserved for JSON-RPC 2.0 frames (`\n` terminated).
 //! All diagnostics, tracing logs, and error messages are strictly routed to `stderr`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -227,12 +227,16 @@ pub const DEFAULT_MASTER_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// so the worker's execution timeout (`exit_code: 124`) completes before the client wait deadline.
 pub const DEFAULT_WAIT_MARGIN_SECS: u64 = 5;
 
+/// Maximum number of async task submission timestamps retained for `task_result` wait timing.
+const MAX_SUBMITTED_TIMESTAMPS: usize = 4096;
+
 pub struct McpState {
     pub master_addr: String,
     pub secret: Option<ClusterSecret>,
     pub workspace_limits: crate::blobs::WorkspaceLimits,
     resolved_master_addr: Mutex<Option<String>>,
     transport: Mutex<Option<MessageTransport<GridStream>>>,
+    submitted_at: Mutex<(VecDeque<TaskId>, HashMap<TaskId, Instant>)>,
 }
 
 impl McpState {
@@ -243,7 +247,28 @@ impl McpState {
             workspace_limits: crate::blobs::WorkspaceLimits::default(),
             resolved_master_addr: Mutex::new(None),
             transport: Mutex::new(None),
+            submitted_at: Mutex::new((VecDeque::new(), HashMap::new())),
         }
+    }
+
+    pub(crate) async fn record_submitted(&self, task_id: TaskId, at: Instant) {
+        let mut guard = self.submitted_at.lock().await;
+        let (order, map) = &mut *guard;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = map.entry(task_id) {
+            e.insert(at);
+            return;
+        }
+        while order.len() >= MAX_SUBMITTED_TIMESTAMPS {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            }
+        }
+        order.push_back(task_id);
+        map.insert(task_id, at);
+    }
+
+    pub(crate) async fn submitted_at(&self, task_id: TaskId) -> Option<Instant> {
+        self.submitted_at.lock().await.1.get(&task_id).copied()
     }
 
     pub fn with_workspace_limits(mut self, limits: crate::blobs::WorkspaceLimits) -> Self {

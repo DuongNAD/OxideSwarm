@@ -11,6 +11,7 @@ pub mod members_cmd;
 pub mod mode_cli;
 pub mod pair;
 pub mod rendezvous_cmd;
+pub mod run_summary;
 pub mod secret_cmd;
 pub mod size_check;
 pub mod usb_kit;

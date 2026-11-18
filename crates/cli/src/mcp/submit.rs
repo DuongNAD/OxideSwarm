@@ -487,11 +487,29 @@ pub fn truncate_stream_for_llm(bytes: &[u8], max_output_bytes: usize) -> (String
     (format!("{head}{notice}{tail}"), true, captured_bytes)
 }
 
+#[cfg(test)]
 pub(super) async fn format_completed_task_result(
     state: &McpState,
     result: &rusty_grid_core::task::TaskResult,
     args: &Value,
     warning: Option<String>,
+) -> ToolCallResult {
+    format_completed_task_result_with_start(
+        state,
+        result,
+        args,
+        warning,
+        Some(std::time::Instant::now()),
+    )
+    .await
+}
+
+pub(super) async fn format_completed_task_result_with_start(
+    state: &McpState,
+    result: &rusty_grid_core::task::TaskResult,
+    args: &Value,
+    warning: Option<String>,
+    started_at: Option<std::time::Instant>,
 ) -> ToolCallResult {
     let output_dir_opt = args.get("output_dir").and_then(Value::as_str);
     let max_output_bytes = args
@@ -620,6 +638,13 @@ pub(super) async fn format_completed_task_result(
         "failed"
     };
 
+    let waited_ms: Option<u64> =
+        started_at.map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    let summary = crate::run_summary::RunSummary::from_results(
+        std::slice::from_ref(result),
+        waited_ms.unwrap_or(0),
+    );
+
     let mut body = json!({
         "task_id": result.task_id.to_string(),
         "status": status_str,
@@ -636,6 +661,9 @@ pub(super) async fn format_completed_task_result(
         "stderr_worker_truncated": stderr_worker_truncated,
         "stderr_captured_bytes": stderr_captured_bytes,
         "duration_ms": result.execution_time_ms,
+        "waited_ms": waited_ms,
+        "task_time_sum_ms": summary.task_time_sum_ms,
+        "machines": summary.machines,
         "error": result.error,
         "artifacts": out_artifacts,
     });
@@ -1056,6 +1084,8 @@ pub(super) async fn tool_submit(
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
+    let submit_started = std::time::Instant::now();
+
     let target_addr = match state.resolve_target_addr().await {
         Ok(addr) => addr,
         Err(e) => return ToolCallResult::error(e),
@@ -1172,6 +1202,7 @@ pub(super) async fn tool_submit(
             };
         }
 
+        state.record_submitted(task_id, submit_started).await;
         ctx.send_progress(
             0,
             None,
@@ -1238,13 +1269,20 @@ pub(super) async fn tool_submit(
                     format!("Task {task_id} completed"),
                 );
                 let worker_id = result.worker_id;
+                let res = format_completed_task_result_with_start(
+                    state,
+                    &result,
+                    args,
+                    warning,
+                    Some(submit_started),
+                )
+                .await;
                 let verify_outcome = match (verify.replicas, &verify_template) {
                     (Some(n), Some(tpl)) if result.is_success() => {
                         Some(verify_completed(state, tpl, &placement, &result, n, verify).await)
                     }
                     _ => None,
                 };
-                let res = format_completed_task_result(state, &result, args, warning).await;
                 let res = attach_verify(res, verify_outcome);
                 attach_workspace_summary(res, ws_meta.as_ref(), Some(worker_id))
             }
@@ -1307,6 +1345,7 @@ pub(super) async fn tool_submit(
                         .await;
                     return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
                 }
+                state.record_submitted(task_id, submit_started).await;
                 ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
                 let mut body = json!({
                     "task_id": task_id.to_string(),
@@ -1343,14 +1382,17 @@ pub(super) async fn tool_submit(
                 {
                     Ok(ClientResponse::TaskStatusInfo {
                         status, state_name, ..
-                    }) => (
-                        format!("{:?}", status),
-                        state_name,
-                        false,
-                        format!(
-                            "Task {task_id} was submitted ({e}); query its outcome with task_result or status"
-                        ),
-                    ),
+                    }) => {
+                        state.record_submitted(task_id, submit_started).await;
+                        (
+                            format!("{:?}", status),
+                            state_name,
+                            false,
+                            format!(
+                                "Task {task_id} was submitted ({e}); query its outcome with task_result or status"
+                            ),
+                        )
+                    }
                     Ok(ClientResponse::Error { message }) if message.contains("not found") => {
                         // A frame written before a receive timeout may still be in flight or may
                         // have been lost when the pooled connection closed. Resend the same
@@ -1374,6 +1416,7 @@ pub(super) async fn tool_submit(
                                         "Task {task_id} cancelled by client"
                                     ));
                                 }
+                                state.record_submitted(task_id, submit_started).await;
                                 ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
                                 let mut body = json!({
                                     "task_id": task_id.to_string(),
@@ -1403,6 +1446,7 @@ pub(super) async fn tool_submit(
                                         "Task {task_id} cancelled by client"
                                     ));
                                 }
+                                state.record_submitted(task_id, submit_started).await;
                                 ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
                                 let mut body = json!({
                                     "task_id": task_id.to_string(),

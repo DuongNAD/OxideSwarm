@@ -8,7 +8,7 @@ use uuid::Uuid;
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
 use rusty_grid_core::task::TaskId;
 
-use super::submit::{format_completed_task_result, prepare_mcp_output_dir_in_dir};
+use super::submit::{format_completed_task_result_with_start, prepare_mcp_output_dir_in_dir};
 use super::{McpState, ToolCallContext, ToolCallResult};
 
 pub(super) async fn tool_task_result(
@@ -135,7 +135,11 @@ pub(super) async fn tool_task_result(
                         Some(step + 1),
                         format!("Task {task_id} completed"),
                     );
-                    return format_completed_task_result(state, &result, args, None).await;
+                    let started_at = state.submitted_at(task_id).await;
+                    return format_completed_task_result_with_start(
+                        state, &result, args, None, started_at,
+                    )
+                    .await;
                 }
                 Ok(Some(ClientResponse::TaskStatusInfo {
                     task_id: tid,
@@ -200,7 +204,9 @@ pub(super) async fn tool_task_result(
             .await
         {
             Ok(ClientResponse::TaskCompleted { result, .. }) => {
-                format_completed_task_result(state, &result, args, None).await
+                let started_at = state.submitted_at(task_id).await;
+                format_completed_task_result_with_start(state, &result, args, None, started_at)
+                    .await
             }
             Ok(ClientResponse::TaskStatusInfo {
                 task_id,
