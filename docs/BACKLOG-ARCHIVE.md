@@ -2272,6 +2272,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `test_shutdown_requested_resolves_on_flag_or_dropped_sender_only` (2 s) and the Windows-only junk executable
   test (5 s).
 
+### TEST-54: Wait by condition in the mapreduce parallelism test
+
+- **Evidence:** `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure`
+  (`tests/master_limits_and_scheduling.rs`, `rusty_grid_master`) failed twice under heavy load on the owner's
+  Apple Silicon Mac on 2026-11-18 with a 60 s mapper timeout, then passed 8 of 8 runs.
+- **Problem:** The test waited up to 10 s for the worker to register and gave each `MapReduceJobSpec` a 60 s
+  `timeout_secs`, with no outer condition wait. Under heavy CPU contention on the same machine, spawning `sh` and
+  scheduling three sequential 1 s map tasks stalled past the 60 s mapper timeout, failing inside the MapReduce
+  engine without queue diagnostics.
+- **Do:** Replace each wait with a condition wait with a generous bound (`180 s`) that returns as soon as the
+  condition holds, raise the job mapper timeouts strictly above that bound (`540 s`), keep every assertion
+  (including the sequential execution lower bound and error message checks), and stop and join the worker before
+  its sandbox `TempDir` drops.
+- **Done when:** `master_limits_and_scheduling` passes and 50 runs in a row of
+  `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure` pass next to 6 `yes > /dev/null`
+  CPU burners.
+- **Implemented (2026-11-18, pull request 333):** `WAIT` (`180 s`) bounds `wait_for_worker_count_within`, the
+  `"serial"` `execute_mapreduce` call, the `"failing"` `execute_mapreduce` call, and worker shutdown before
+  `TempDir` drop (`TEST-33`); every wait ends as soon as its condition holds. Both `MapReduceJobSpec` jobs pass
+  `mapper_timeout_secs = 540` (`WAIT * 3`), and a timed-out `WAIT` prints `master.queue_stats()`. Every assertion
+  stays intact, and the test prints registration and job timings. Verification on an Apple Silicon Mac (10 cores):
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, full
+  `master_limits_and_scheduling` (5 passed in 4.55 s), and 50 of 50 runs of
+  `test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure` next to 6 `yes > /dev/null`
+  processes (`min=3.72s`, `max=27.73s`). Not changed in `tests/master_limits_and_scheduling.rs`:
+  `wait_for_worker_count` (10 s default kept for the other tests), `closed_by_server` (`2 s` / `100–300 ms`
+  probes in connection-budget tests), `wait_task` (`15 s` in GPU backlog test), and
+  `test_mapreduce_tasks_run_on_all_workers_at_once` (`60 s` mapper timeout and `elapsed < 7 s`).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
