@@ -3929,27 +3929,35 @@ async fn test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces
     }
 
     // 3. Spawn a live portal for a loopback-targeting worker and prove it listens on 127.0.0.1
-    //    and does not occupy the port on non-loopback interfaces.
-    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let portal_port = reserve.local_addr().unwrap().port();
-    drop(reserve);
-
+    //    and does not occupy the port on non-loopback interfaces. The portal binds the address
+    //    `spawn_worker_redirection_portal_with_secret` would bind, with port 0, and the test reads
+    //    the port back (TEST-52): a port the test bound, dropped and then handed to the portal
+    //    could be taken by another test in between.
     let worker = make_worker("127.0.0.1:18088");
     let target = PortalTarget::from(worker.master_beacon.clone());
+    let listener = tokio::net::TcpListener::bind(portal_bind_addr_for_target(0, &target).await)
+        .await
+        .expect("bind the portal on an ephemeral port");
+    let portal_addr = listener.local_addr().expect("portal local_addr");
+    assert_eq!(
+        portal_addr.ip(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        "loopback-targeting worker portal must listen on 127.0.0.1, got {portal_addr}"
+    );
+    let portal_port = portal_addr.port();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let portal_handle = tokio::spawn(async move {
-        spawn_worker_redirection_portal_with_secret(portal_port, target, None, shutdown_rx).await;
-    });
+    let portal_handle = tokio::spawn(run_portal(
+        listener,
+        target,
+        None,
+        shutdown_rx,
+        PORTAL_MAX_CONNECTIONS,
+    ));
 
-    let mut connected = None;
-    for _ in 0..30 {
-        if let Ok(stream) = TcpStream::connect(("127.0.0.1", portal_port)).await {
-            connected = Some(stream);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = connected.expect("portal should listen on 127.0.0.1");
+    // The listener is bound before the portal runs, so the connection waits in its backlog.
+    let mut stream = TcpStream::connect(("127.0.0.1", portal_port))
+        .await
+        .expect("portal should listen on 127.0.0.1");
     stream
         .write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await

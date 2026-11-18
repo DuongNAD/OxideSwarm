@@ -238,6 +238,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented | 318 |
+| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | 320 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3377,6 +3378,54 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   (`two_free_ports`, `free_master_port`, `free_web_port`), `tests/m1_challenger_2_stress.rs` (two dashboard
   ports), `crates/master/src/server/tests.rs` (the discovery UDP port), `tests/cluster_auth_e2e.rs` (the
   discovery UDP port) and `crates/worker/src/client/tests.rs` (the standby portal port).
+
+### TEST-52: Let the remaining tests pick ports through the process that binds them, not bind-and-drop
+
+- **Evidence:** Found while fixing TEST-51 (pull request 318): six more test files pick a port by binding
+  `127.0.0.1:0`, reading the port and dropping the socket, and then hand that port to a master, a worker portal or
+  a dev cluster that binds it later. The TEST-51 failure (`Address already in use`, run `44209756700`) shows that
+  another test can take such a port in between. None of the six has failed in CI so far.
+- **Problem:** The same race as TEST-51 wherever the process that binds the port is told a number instead of
+  picking one.
+- **Do:** Where the product can pick the port and report it (port 0 with a port file, or a bound-address
+  accessor), let it, and wait by condition with a 30 s bound. Where it cannot, keep the pick, give the reason in a
+  one-line comment at the site, and name the product change that would remove it.
+- **Done when:** Every site is changed or carries its reason, and each changed test binary passes 20 runs in a row
+  under CPU load.
+- **Partial (2026-11-18, pull request 320):**
+  - Changed: both Web UI tests of `tests/m1_challenger_2_stress.rs` start the dashboard on `127.0.0.1:0` and read
+    `MasterHandle::dashboard_addr()`. The reuse test spawns the second master on the same port again until it holds
+    it (30 s bound, the "must be freed upon master shutdown" message kept) instead of binding a probe listener and
+    dropping it first; its reachability waits are 30 s bounds (were 3 s). The portal part of
+    `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` (`crates/worker/src/client/tests.rs`)
+    binds on `portal_bind_addr_for_target(0, ..)`, asserts that the listener is on 127.0.0.1 and runs `run_portal`
+    on it, as `portal_fixture` already does; its 600 ms connect loop is gone, because the listener is bound before
+    the portal runs. It no longer goes through `spawn_worker_redirection_portal_with_secret`, which is that bind
+    followed by `run_portal`. Every assertion is kept.
+  - Kept, with the reason at the site: `crates/cli/tests/discovery_port_e2e.rs` (the TCP ports, because
+    `ServerConfig::new` turns the beacon off for listen port 0 and `--discovery-port N` does not turn it back on,
+    so a master whose beacon the test checks needs a fixed listen port; the UDP ports, because `--discovery-port 0`
+    turns the beacon off and the master never publishes the port its beacon binds),
+    `crates/master/src/server/tests.rs` and `tests/cluster_auth_e2e.rs` (the discovery UDP port, same reason), and
+    `two_free_ports` and `free_master_port` in `tests/workflow_modes_test.rs` (`launch_local_dev_cluster_with_ports`
+    gives the master port to its workers as `--master 127.0.0.1:<port>` and accepts the dashboard only when its
+    port file holds the port it was given, so neither can be 0). `free_web_port` there is never bound: the master
+    fails on the held grid port before it binds its dashboard, so a reused port cannot change that test's outcome.
+    `test_dev_cluster_refuses_one_port_for_master_and_dashboard` binds its port in no process either.
+  - Product changes that would remove the rest (not made here, each changes behaviour or a flag and needs a design
+    record): let the dev cluster take 0 for both ports (master on `--listen 127.0.0.1:0 --port-file`, workers
+    started once the port is read, the dashboard port taken from `--dashboard-port-file`), which would also remove
+    the bind-and-drop in `launch_local_dev_cluster` (`crates/cli/src/mode_cli.rs`); bind the discovery socket before
+    `MasterServer::spawn_with_config` returns and publish its address on `MasterHandle` and in a port file, with a
+    way to ask for an ephemeral beacon port; let an explicit `--discovery-port N` start the beacon of a master that
+    listens on port 0.
+  - Not in this item (fixed ports, a different pattern): `test_beacon_of_a_master_with_a_loopback_dashboard_advertises_no_dashboard`
+    in `crates/master/src/server/tests.rs` (UDP 18091) and `tests/discovery_integration.rs` (29003, 29004, 29006,
+    each with a 150 ms sleep before the first connect).
+  - On an Apple Silicon Mac (10 cores), next to 4 spinning `yes` processes, 20 runs in a row of each test binary
+    the item touches passed 20 of 20: `m1_challenger_2_stress`, the `rusty_grid_worker` lib, the `rusty_grid_master`
+    lib, `cluster_auth_e2e`, `discovery_port_e2e` and `workflow_modes_test` (120 of 120). The old code was not
+    looped, and the race has not been reproduced locally.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 

@@ -144,6 +144,7 @@ async fn test_loopback_master_binds_discovery_socket_to_loopback_not_all_interfa
 
     // 2. Live loopback master: binds 127.0.0.1:<disc_port>, answers unicast probes on
     //    127.0.0.1:<disc_port>, and leaves non-loopback interfaces unbound.
+    // Bind-and-drop kept (TEST-52): the master never publishes the UDP port its beacon binds.
     let probe_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let disc_port = probe_sock.local_addr().unwrap().port();
     drop(probe_sock);
