@@ -2564,6 +2564,73 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   holds sessions for 30 s by default (`--session-resume-hold-secs`), so resume is on there unless the hold is set
   to 0; `ServerConfig` (library and tests) defaults to 0.
 
+### BUG-29: Offer in the USB installer's folder menu only drives whose root the install accepts
+
+- **Evidence:** On 2026-11-18, on the owner's Windows 11 laptop with kit 0.4.3, "Install OxideSwarm.cmd" offered
+  `2) E:\OxideSwarm-USB` in its folder menu. Choosing it failed with "cannot use E:\OxideSwarm-USB: another
+  account (NT AUTHORITY\Authenticated Users) can delete or re-permission folders at the root of E:\"
+  (`Test-RootSafety`, `packaging/usb/install.ps1`). The refusal itself is correct.
+- **Problem:** The menu (`[IO.DriveInfo]::GetDrives()` filtered by `Test-InstallDrive`) checked only the drive
+  type, file system and bus, not the root check that the install then runs, so it offered a drive the install
+  refuses.
+- **Do:** Build the menu from folders that pass the same check, hiding a failing one or listing it as not
+  usable with the reason; keep the default folder first.
+- **Done when:** A Windows test shows a refused folder listed as not usable (or absent), and the default first.
+- **Implemented (2026-11-18, pull request 341):** The menu runs `Test-RootSafety` on each candidate folder and
+  lists a refused one without a number, as `not usable: <reason>`, so the person at the keyboard learns why a
+  drive is missing; the default stays `1)`, and with only the default usable nothing is asked. Test hooks
+  `OXIDESWARM_USB_LIST_FOLDERS=1` (print the menu and stop) and `OXIDESWARM_USB_DRIVE_CHOICES` (replace the other
+  drives' folders). Tests: `UsbKitTests.test_windows_drive_menu_offers_only_folders_the_install_accepts` (static)
+  and `StaticRepositoryChecks.test_windows_usb_drive_menu_old_install_uninstall_and_failed_start` (Windows CI).
+
+### BUG-30: Let the USB uninstaller remove an install from a kit older than the workspaces marker
+
+- **Evidence:** On the same laptop, "Uninstall OxideSwarm.cmd" refused the old `E:\OxideSwarm` install:
+  "E:\OxideSwarm\workspaces was not created by the USB kit (missing .oxideswarm-usb-workspaces marker; used by
+  another OxideSwarm worker or tool)" (`packaging/usb/uninstall.ps1`). The old kit predates that marker; the
+  owner created it by hand.
+- **Problem:** An install from an older kit could not be removed with the current uninstaller.
+- **Do:** Accept a `workspaces` folder without the marker when the install folder carries
+  `.oxideswarm-usb-install`, `workspaces` sits directly inside it and neither it nor anything inside it is a
+  link, and no other worker or tool uses it (`Get-WorkspaceDirUsers`); refuse every other case. The same in
+  `uninstall.sh` if it has the marker logic.
+- **Done when:** A test removes an old-style install without the marker and still refuses a foreign one.
+- **Implemented (2026-11-18, pull request 341):** `uninstall.ps1` accepts such a folder under those conditions
+  and one more: it is not `%LOCALAPPDATA%\oxideswarm\workspaces`, the default workspace root of a non-USB worker,
+  which a stopped worker may still own. It says so ("an install from an older kit"). `uninstall.sh` has no marker
+  check and is unchanged. Tests: `UsbKitTests.test_windows_uninstaller_removes_an_install_from_an_older_kit`
+  (static) and the Windows test above (an old install is removed; one used by another running worker and one
+  without `.oxideswarm-usb-install` are refused).
+
+### BUG-31: Report a USB-kit worker that stops after its start, with its log, and keep that log
+
+- **Evidence:** On the same laptop, a fresh install into `%LOCALAPPDATA%\OxideSwarm-USB` printed "ERROR: the
+  worker runs but the master does not list it yet; see ...\logs\worker.log", then rolled back and deleted the
+  folder, log included. Reproduced with the same binary: the worker exited about 6 s after its start, because its
+  sandbox base `%TEMP%\oxideswarm-usb\sandboxes` sits in a Temp folder that grants Modify to three leftover
+  accounts, and the worker's sandbox base check refuses it. GPU start-up took about 5 s; `install.ps1` checked the
+  worker only at about 3 s (`install.sh` at 4 s).
+- **Problem:** A worker that stops after the one liveness check is misreported, and the log the error names no
+  longer exists.
+- **Do:** In both installers, check the worker every second during the whole wait for the listing and report
+  "the worker stopped" with its exit code; on any failed start print the last 30 lines of `worker.log` under a
+  header before the rollback; keep the log (or a private copy) through the rollback, so the error names a file
+  that exists. Decide whether the default Windows install still needs `%TEMP%` for its sandbox base.
+- **Done when:** A fake worker that exits at 5 s is reported as stopped, with its log tail printed, and its log
+  exists after the rollback (at least for `install.sh`).
+- **Implemented (2026-11-18, pull request 341):** Both installers watch the worker every second while the
+  listing runs (`install.sh` in the background, `install.ps1` in a runspace) and fail with "the worker stopped N
+  s after it started (exit code C)" (`wait` in bash, a process handle in PowerShell), print the last 30 lines of
+  `worker.log` under a header, and keep `<folder>/logs` through the rollback once the worker has been started
+  (`install.sh` makes it mode 700); `install.sh` keeps its isolation fallback. Sandbox base: a Windows install
+  now uses `<folder>\work` except under `%LOCALAPPDATA%` with `-Isolation fs` (the isolated worker accepts no
+  other folder inside the profile), an update keeps a usable base, and `install.ps1` runs the worker's base check
+  before it joins, naming the folder and accounts and printing, never running, the `icacls /remove:g` command
+  (design 0053 status log). Tests: `UsbKitTests.test_a_worker_that_stops_after_the_start_is_reported_with_its_log`,
+  `test_install_falls_back_to_isolation_off_when_the_isolated_worker_stops`,
+  `test_windows_installer_watches_the_worker_and_keeps_its_log`,
+  `test_windows_task_folders_stay_in_the_install_folder_unless_isolation_needs_temp`, and the Windows test above.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
