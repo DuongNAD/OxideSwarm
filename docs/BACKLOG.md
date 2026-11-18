@@ -387,7 +387,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
-| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Planned | Out | (design 0093) |
+| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355 (open), (design 0093) |
+| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Planned | Out | (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -1846,6 +1847,64 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   log.
 - **Done when:** The records are committed and this section names the cause or causes with their share of
   the gap, or the change that closes it.
+- **Implemented (2026-11-18, pull request 355):** Plan
+  `benchmarks/sweep/plans/2026-11-18-bench-8-w1-efficiency-gap.json`, committed before the first run, with
+  two amendments committed before the steps they add. Same units, release 0.4.3, master for the run on the
+  Mac; nine records in `benchmarks/sweep/results/` (`2026-11-18-w1-*`), every checksum equal.
+
+  | Step | Record | Tasks/s | Efficiency |
+  |---|---|---|---|
+  | BENCH-3: both, 120 tasks, 30 in flight | `w1-two-machines-lan` | 2.233 | 0.734 |
+  | (b) both, 120 tasks, 120 in flight | `w1-two-machines-lan-cc120` | 2.349 | 0.772 |
+  | (a) both, 480 tasks, 30 in flight | `w1-two-machines-lan-480` | 2.301 | 0.756 |
+  | (c) Mac worker alone, master on the same Mac | `w1-mac-worker-only-lan` | 1.108 | 0.785 |
+  | 4b: the same, `--task-priority normal` | `w1-mac-worker-only-normal-priority-lan` | 1.180 | 0.836 |
+  | (c) Windows worker alone, master on the Mac over the LAN | `w1-win-worker-only-lan` | 1.269 | 0.778 |
+  | 1c: Windows alone, master on the same machine | `w1-win-loopback-default-priority` | 1.535 | 0.941 |
+  | 1d: the same, `--task-priority normal` | `w1-win-loopback-normal-priority` | 1.539 | 0.944 |
+
+  Efficiency of a one-worker step is against that machine alone. Findings:
+  1. Combining the machines costs little: both through the grid against the sum of each worker alone
+     through the grid (1.108 + 1.269 = 2.377 tasks/s) is 0.94 for BENCH-3, 0.99 for (b) and 0.97 for (a).
+  2. Causes 1 and 2 are below the plan's 0.05 threshold: (a) adds 0.022 and (b) adds 0.038 to BENCH-3's
+     0.734. The Windows worker took 60 to 70 of 120 tasks in (b) and 300 to 320 of 480 in (a).
+  3. Cause 3 is the gap: each worker alone through the grid reaches about 0.78 of its machine alone.
+     - Windows: with the master on the same machine it reaches 0.94 with either priority, so the default
+       below-normal priority costs nothing there, and the master on another machine over the home LAN costs
+       0.16 (median submit-to-result 15.3 to 17.7 s against 12.0 to 13.8 s, about 3 s more per task).
+     - Mac: the master is on the same Mac, so the LAN is not involved. `--task-priority normal` adds 0.051,
+       at the threshold; the other 0.16 is open. In both Mac steps the warm-up run was faster than the
+       measured runs (1.19 then 1.11, and 1.42 then 1.18 tasks/s), which the heat of a fanless machine under
+       seven minutes of full load could explain; not tested. BENCH-9 splits the cost with per-task times;
+       Q93 asks whether the default priority should change.
+  Deviations: step 1b (the Windows worker with `--task-priority normal` over the LAN) was run once and is
+  void, because the worker restarted during its runs; a second attempt was refused because a cargo test of
+  another project had started on the Mac. Amendment 2 replaced it with 1c and 1d on the Windows machine
+  alone. Steps 2 and 3 ended their grid runs before that cargo test started. A second attempt of 4b was
+  needed for the same reason; the void records are not committed.
+
+### BENCH-9: Split the per-machine cost of running W1 through the grid into task process time and slot idle time
+
+- **Evidence:** BENCH-8: each worker alone through the grid reaches about 0.78 of its machine alone. On the
+  Windows case machine the master on another machine over the LAN costs 0.16 (about 3 s more per task than
+  with the master on the same machine); on the Mac, with the master on the same Mac, 0.16 remains after the
+  0.05 of the default task priority.
+- **Problem:** The records keep only the median submit-to-result time per run, so they cannot tell whether a
+  task process runs slower through the grid (priority, heat, cores) or whether slots stand idle between
+  tasks (the round trip from one result to the next assignment).
+- **Do:**
+  1. The harness records, per grid run, the sum of the worker-reported task times, the slot seconds
+     (slots times wall time), their ratio, and per worker the mean and median task time; per local level the
+     mean and median time of a task process. It also samples for cargo and rustc processes during each run
+     and records what it saw.
+  2. Under a plan committed first: the Windows worker alone with the master on the Mac over the LAN, and
+     with the master on the same machine; the Mac worker alone, and the Mac's local sweep at 10 processes,
+     back to back.
+  3. If slots stand idle on the LAN path, find which step of the round trip takes the time (master and
+     worker logs at debug level for a few tasks).
+- **Done when:** The records split the per-machine cost into process time and idle time on both machines,
+  and this section names the cause of the LAN cost on Windows and of the open 0.16 on the Mac, or the change
+  that closes them.
 
 ## Status log
 
@@ -2264,6 +2323,10 @@ Add one dated line per finished item, newest last.
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
 - 2026-11-18: BENCH-3 Partial (pull request 349): W1 on the Mac and the Windows case machine, speedup 1.37,
   efficiency 0.73, 360/360 checksums; BENCH-8 added (Planned, Out) to find the gap to the plan's 0.85.
+- 2026-11-18: BENCH-8 Implemented (pull request 355): combining the two machines costs 0.01 to 0.06; the
+  tail and the missing queue are below 0.05; the gap is the cost of running through the grid on each machine
+  (about 0.78 of each machine alone): on Windows the master on another machine over the LAN (0.16), on the Mac
+  the default task priority (0.05) and 0.16 still open. BENCH-9 added (Planned, Out); Q93 open.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.

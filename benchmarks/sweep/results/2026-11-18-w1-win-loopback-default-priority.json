@@ -1,0 +1,286 @@
+{
+  "benchmark": "BENCH-2 sweep (design 0093 D1)",
+  "record_format": 1,
+  "date_utc": "2026-11-18T19:19:42Z",
+  "plan": {
+    "item": "BENCH-8 (design 0093), workload W1",
+    "written": "2026-11-18, before any run of this plan, by the coordinator session",
+    "question": "BENCH-3 reached an efficiency of 0.73 on the Mac and the Windows case machine, against the 0.85 its plan expected. How much of the gap comes from the tail of a short sweep, from the harness never letting the master hold a queue, and from the cost of running a task through OxideSwarm on each machine?",
+    "baseline": "BENCH-3 record benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json: 120 tasks, client concurrency 30 (= the 30 slots), grid 2.233 tasks/s, efficiency 0.734; Windows took 60, 70 and 70 of 120 tasks; runs 2.481, 2.233 and 2.225 tasks/s",
+    "workload": {
+      "name": "W1 (benchmarks/sweep/workload_cpu.py, SHA-256 chain)",
+      "units_per_task": 16000000,
+      "seed_base": 0,
+      "runs": "one warm-up run, then 3 measured runs, for every step"
+    },
+    "machines": [
+      "Mac: Apple M5, 10 cores, macOS, AC power; runs the master for the run, the Mac worker (10 slots) and the harness",
+      "Windows case machine: i5-14600KF, 20 logical cores, Windows 11; runs one worker (20 slots)"
+    ],
+    "software": "OxideSwarm 0.4.3 release binaries on both machines, as in BENCH-3; Python 3 on both; the same master setup as BENCH-3 (private HOME, port 9088, a new secret made for this run, discovery beacon off)",
+    "local_baselines": "the two local records of BENCH-3 (Mac 1.412 tasks/s at 10 processes, Windows 1.631 tasks/s at 20 processes); no new local sweep",
+    "steps": [
+      "1. (c) Windows worker alone through the grid: the Mac worker stopped by PID; 120 tasks, client concurrency 20 (= its slots); --local-results <Windows local record> only, so the record's efficiency is grid alone / local alone; slug w1-win-worker-only-lan",
+      "2. (b) both workers, 120 tasks, --client-concurrency 120, so the master holds a queue of up to 90 tasks; --local-results both; slug w1-two-machines-lan-cc120",
+      "3. (a) both workers, 480 tasks, client concurrency 30 (= slots, as in BENCH-3); --local-results both; slug w1-two-machines-lan-480",
+      "4. (c) Mac worker alone through the grid: the Windows worker stopped; 120 tasks, client concurrency 10; --local-results <Mac local record> only; slug w1-mac-worker-only-lan",
+      "The order keeps the Windows worker's time short: it is not needed after the grid runs of step 3."
+    ],
+    "metrics": "tasks per second (median of 3); efficiency as the harness computes it; tasks per worker; checksums equal to a local run of the same seed",
+    "reading_rules": [
+      "Noise: BENCH-3's three runs spread from 2.225 to 2.481 tasks/s (about 10 %). A change in efficiency smaller than 0.05 against BENCH-3's 0.734 is reported as no effect.",
+      "Cause 3, per-task cost on each machine: the two controls give grid-alone / local-alone per machine. Their sum (Mac alone + Windows alone through the grid) is the most both workers can reach through this master; efficiency lost below that sum is lost by combining the two, the rest by running through the grid at all.",
+      "Cause 2, no queue: (b) against BENCH-3. If (b) gains at least 0.05 and the Windows share moves toward 64 of 120, the queue explains that share of the gap. 120 CLI processes waiting at once also load the Mac; if (b) is lower than BENCH-3, that load is named as a possible cause, not the queue.",
+      "Cause 1, few waves: (a) against BENCH-3. With four times the tasks the tail is a quarter of its share; if (a) gains at least 0.05, the tail explains that share.",
+      "The causes are not independent: the record states each step's efficiency and the shares; it does not force them to add up to the gap."
+    ],
+    "expected": "no prediction is made for (a) and (b); the controls are expected between 0.85 and 1.0 of each machine alone; every checksum equal",
+    "publish": "the records are committed whatever they show; BENCH-8 in docs/BACKLOG.md names the causes with their shares, or says which remain open",
+    "amendment_1": {
+      "written": "2026-11-18 16:25 UTC, after step 4 and before step 1, 1b or 4b ran",
+      "why": "Step 4 (the Mac worker alone through the grid, record 2026-11-18-w1-mac-worker-only-lan.json) reached 1.108 tasks/s against 1.412 for the Mac alone: 0.78. Workers run task processes at below-normal priority by default (nice 10 on Unix, BELOW_NORMAL_PRIORITY_CLASS on Windows; --task-priority), which the local sweep does not do; on machines with performance and efficiency cores that may change where the tasks run.",
+      "steps": [
+        "1b. Right after step 1, only if step 1's efficiency is below 0.9: the Windows worker restarted with --task-priority normal, the same sweep as step 1; slug w1-win-worker-only-normal-priority-lan",
+        "4b. After step 3, with the Windows worker stopped and the run master restarted: the Mac worker alone with --task-priority normal, the same sweep as step 4; slug w1-mac-worker-only-normal-priority-lan"
+      ],
+      "reading_rule": "If 4b (or 1b) gains at least 0.05 over step 4 (or step 1), the default task priority explains that share of the per-machine cost; the record says so and does not propose a change of the default here (that is a decision for the owner: the default protects the owner's own use of the machine)."
+    },
+    "amendment_2": {
+      "written": "2026-11-18 18:35 UTC, after steps 1 to 4 and before 4b, 1c or 1d ran",
+      "what_happened": [
+        "Step 1b, first attempt (17:16 to 17:24 UTC), is void: the Windows worker was restarted at 17:21 UTC during its runs (master log). Its record is not committed.",
+        "Step 1b, second attempt: the Windows worker came back with --task-priority normal at 18:24 UTC, but the harness refused to start because a cargo test of another project (started 18:19 UTC by an agent on the Mac, not part of this run) was running on the Mac. Step 4b was refused for the same reason. The run's secret was then rotated and deleted, so step 1b over the LAN needs a new secret carried by hand and is not run in this item.",
+        "Steps 2 and 3 ended their grid runs before 18:19 UTC (step 3: 17:40:10 plus 813 s), so they are not affected."
+      ],
+      "steps": [
+        "4b (unchanged): the Mac worker alone with --task-priority normal, against a master on the same Mac (the Mac worker reached the master over 127.0.0.1 in step 4 too); run when no cargo or rustc process has run on the Mac for 2 minutes; a cargo or rustc process seen during the grid runs makes the attempt void, and it is repeated.",
+        "1c and 1d replace 1b: on the Windows case machine alone, a master and one worker (20 slots) on 127.0.0.1 with a private HOME and no secret (loopback), the harness given --master 127.0.0.1:<port> --skip-local --local-results <Windows local record> --client-concurrency 20, 120 tasks; 1c with the worker's default priority (slug w1-win-loopback-default-priority), 1d with --task-priority normal (slug w1-win-loopback-normal-priority). 1c against 1d isolates the task priority on Windows; 1c against step 1 shows what the LAN and a master on another machine cost."
+      ],
+      "reading_rule": "As in amendment 1: a difference of at least 0.05 in efficiency counts; smaller is no effect."
+    }
+  },
+  "oxideswarm": {
+    "commit": "502831d3c0ec72e5a59ff9928a3c25de27a33581",
+    "dirty_tree": false,
+    "version": "rusty-grid 0.4.3",
+    "build_profile": "unknown"
+  },
+  "workload": {
+    "name": "W1",
+    "file": "benchmarks/sweep/workload_cpu.py",
+    "sha256": "4a4d69b962b3227c1e8509a08e870db6fb4de2f0f8dbfd7cbc37cbb29521ac65",
+    "commit": "502831d3c0ec72e5a59ff9928a3c25de27a33581",
+    "units_per_task": 16000000,
+    "tasks": 120,
+    "seeds": [
+      0,
+      119
+    ],
+    "task_seconds_target": null
+  },
+  "machine": {
+    "hardware": {
+      "cpu_model": "Intel(R) Core(TM) i5-14600KF",
+      "cores": 20,
+      "ram_bytes": 51318800384
+    },
+    "os": {
+      "system": "Windows",
+      "release": "10",
+      "version": "10.0.26300",
+      "machine": "AMD64"
+    },
+    "power": "no battery found",
+    "python": "3.11.9"
+  },
+  "cluster": {
+    "mode": "existing master",
+    "workers": [
+      {
+        "label": "worker-1",
+        "os": "windows",
+        "arch": "x86_64",
+        "slots": 20,
+        "isolation": "off",
+        "link": "TCP/LAN",
+        "protocol": "10",
+        "cpu_cores": 20,
+        "ram_mb": 48941,
+        "has_gpu": false
+      }
+    ],
+    "total_slots": 20,
+    "client_concurrency": 20,
+    "doctor": {
+      "workers": [
+        {
+          "label": "worker-1",
+          "os": "windows",
+          "arch": "x86_64",
+          "cores": 20,
+          "ram_mb": 48941,
+          "isolation": "off",
+          "link": "TCP/LAN",
+          "link_kind": "tcp",
+          "link_rtt_ms": null
+        }
+      ],
+      "checks": [
+        {
+          "id": "C1",
+          "name": "Connect",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "connected without a cluster secret in 1 ms"
+        },
+        {
+          "id": "C2",
+          "name": "Workers",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "1 connected (at least 1 expected)"
+        },
+        {
+          "id": "C3",
+          "name": "In-process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "completed in 0 ms"
+        },
+        {
+          "id": "C4",
+          "name": "Process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "started a process and read its output in 61 ms [iso:off]"
+        },
+        {
+          "id": "C5",
+          "name": "GPU probe",
+          "outcome": "skip",
+          "worker": null,
+          "detail": "no worker advertises a GPU"
+        },
+        {
+          "id": "C6",
+          "name": "Spread",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "4 tasks of 500 ms finished in 544 ms on 1 worker(s): worker-1 4"
+        },
+        {
+          "id": "C7",
+          "name": "Links",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "no relayed link among 1 connected worker(s)"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "upload to the master: 8 MiB in 19 ms, 436.2 MB/s"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "fetch to the worker over tcp: 8 MiB in 77 ms, 107.7 MB/s (submit to result, includes scheduling and a 54 ms task)"
+        }
+      ]
+    }
+  },
+  "load_average_before": null,
+  "load_average_after": null,
+  "local": null,
+  "local_results_used": [
+    {
+      "source": "2026-11-18-w1-local-windows-x86-64.json",
+      "best_tasks_per_s": 1.631,
+      "os": "Windows",
+      "machine": "AMD64",
+      "cpu_model": "Intel(R) Core(TM) i5-14600KF",
+      "cores": 20
+    }
+  ],
+  "grid": {
+    "warmup": {
+      "tasks": 120,
+      "wall_s": 73.7356,
+      "tasks_per_s": 1.6274,
+      "failed_tasks": 0,
+      "tasks_per_worker": {
+        "worker-1": 120
+      },
+      "submit_to_result_p50_s": 12.07715,
+      "submit_to_result_max_s": 14.104
+    },
+    "runs": [
+      {
+        "tasks": 120,
+        "wall_s": 80.6775,
+        "tasks_per_s": 1.4874,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 13.81875,
+        "submit_to_result_max_s": 15.516
+      },
+      {
+        "tasks": 120,
+        "wall_s": 78.1689,
+        "tasks_per_s": 1.5351,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 12.35595,
+        "submit_to_result_max_s": 15.455
+      },
+      {
+        "tasks": 120,
+        "wall_s": 72.1473,
+        "tasks_per_s": 1.6633,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 120
+        },
+        "submit_to_result_p50_s": 12.0154,
+        "submit_to_result_max_s": 12.7891
+      }
+    ],
+    "tasks_per_s": {
+      "median": 1.5351,
+      "min": 1.4874,
+      "max": 1.6633,
+      "runs": 3
+    },
+    "wall_s": {
+      "median": 78.1689,
+      "min": 72.1473,
+      "max": 80.6775,
+      "runs": 3
+    }
+  },
+  "scaling": {
+    "fastest_local_tasks_per_s": 1.631,
+    "sum_local_tasks_per_s": 1.631,
+    "speedup": 0.9412017167381974,
+    "efficiency": 0.9412017167381974,
+    "machines": 1
+  },
+  "checksums": {
+    "compared": 360,
+    "matched": 360,
+    "mismatched": 0,
+    "missing": 0,
+    "mismatches": [],
+    "missing_seeds": []
+  },
+  "failed_tasks": 0,
+  "quick": false,
+  "note": "BENCH-8 step 1c (plan amendment 2): Windows i5-14600KF alone, master and worker on 127.0.0.1, worker 20 slots, default task priority; release 0.4.3"
+}
