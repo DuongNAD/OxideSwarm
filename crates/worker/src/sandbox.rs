@@ -2665,8 +2665,8 @@ mod windows_private_dir_tests {
     use rusty_grid_core::private_file::{
         create_or_open_private_dir_all_with_hooks, current_user_sid, dir_open_grants,
         inspect_dir_security_no_follow, read_dacl, DirSecuritySnapshot, PrivateDirOutcome,
-        SID_ALL_APP_PACKAGES, SID_ANONYMOUS_LOGON, SID_AUTHENTICATED_USERS, SID_NETWORK,
-        SID_REMOTE_DESKTOP_USERS, SID_USERS,
+        SID_ALL_APP_PACKAGES, SID_ANONYMOUS_LOGON, SID_AUTHENTICATED_USERS, SID_GUESTS,
+        SID_NETWORK, SID_USERS,
     };
     use rusty_grid_core::task::TaskId;
     use std::path::Path;
@@ -2912,14 +2912,15 @@ mod windows_private_dir_tests {
         let tmp = tempfile::tempdir().unwrap();
         let user = current_user_sid().unwrap();
 
-        // 1. Write-class foreign grant (`Modify` to Remote Desktop Users) is REFUSED.
+        // 1. Write-class foreign grant (`Modify` to `BUILTIN\Guests`, which exists on every
+        //    Windows edition including Home, unlike `Remote Desktop Users`) is REFUSED.
         let write_dir = tmp.path().join("existing_write_open");
         ensure_private_dir(&write_dir).unwrap();
         let status = Command::new("icacls")
             .arg(&write_dir)
             .args([
                 "/grant",
-                &format!("*{SID_REMOTE_DESKTOP_USERS}:(OI)(CI)M"),
+                &format!("*{SID_GUESTS}:(OI)(CI)M"),
                 &format!("*{SID_NETWORK}:(OI)(CI)R"),
             ])
             .status()
@@ -2934,9 +2935,9 @@ mod windows_private_dir_tests {
                 remedy,
             } => {
                 assert_eq!(path, &write_dir);
-                assert!(reason.contains("BUILTIN\\Remote Desktop Users"), "{reason}");
+                assert!(reason.contains("BUILTIN\\Guests"), "{reason}");
                 assert!(remedy.contains("/remove:g"), "{remedy}");
-                assert!(remedy.contains(SID_REMOTE_DESKTOP_USERS), "{remedy}");
+                assert!(remedy.contains(SID_GUESTS), "{remedy}");
                 assert!(remedy.contains(SID_NETWORK), "{remedy}");
             }
             other => panic!("expected BaseDirUnsafe, got {other:?}"),
@@ -2973,7 +2974,7 @@ mod windows_private_dir_tests {
                 "/grant",
                 &format!("*{SID_NETWORK}:(OI)(CI)R"),
                 &format!("*{SID_ANONYMOUS_LOGON}:(OI)(CI)R"),
-                &format!("*{SID_REMOTE_DESKTOP_USERS}:(OI)(CI)RX"),
+                &format!("*{SID_GUESTS}:(OI)(CI)RX"),
                 &format!("*{SID_ALL_APP_PACKAGES}:(OI)(CI)RX"),
             ])
             .status()
@@ -2994,7 +2995,7 @@ mod windows_private_dir_tests {
         for expected in [
             "NETWORK",
             "ANONYMOUS LOGON",
-            "BUILTIN\\Remote Desktop Users",
+            "BUILTIN\\Guests",
             "ALL APPLICATION PACKAGES",
             &format!("*{user}:(OI)(CI)F"),
             "*S-1-5-18:(OI)(CI)F",

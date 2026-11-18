@@ -2391,6 +2391,29 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   probes in connection-budget tests), `wait_task` (`15 s` in GPU backlog test), and
   `test_mapreduce_tasks_run_on_all_workers_at_once` (`60 s` mapper timeout and `elapsed < 7 s`).
 
+### TEST-55: Windows Home: sandbox s1 grant test without the Remote Desktop Users group
+
+- **Evidence:** `sandbox::windows_private_dir_tests::s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
+  (`crates/worker/src/sandbox.rs:2911`) failed on a Windows 11 Home laptop with
+  `*S-1-5-32-555: No mapping between account names and security IDs was done` at
+  `crates\worker\src\sandbox.rs:2927:9`.
+- **Problem:** Windows Home editions have no `BUILTIN\Remote Desktop Users` local group
+  (`S-1-5-32-555`), so `icacls /grant "*S-1-5-32-555:..."` fails `LookupAccountSidW` before
+  `ensure_private_dir` is tested. Production code in `rusty_grid_core::private_file` only formats
+  `S-1-5-32-555` by string comparison in `sid_label` and does not require the group to exist on
+  the host.
+- **Do:** Replace `SID_REMOTE_DESKTOP_USERS` in the on-disk `icacls` test with `SID_GUESTS`
+  (`S-1-5-32-546`, `BUILTIN\Guests`, present on every Windows edition) while keeping `NETWORK`,
+  `BUILTIN\Users`, `ANONYMOUS LOGON`, and `ALL APPLICATION PACKAGES` and every assertion of
+  [design 0021](design/0021-private-default-sandbox-base.md).
+- **Done when:** `cargo test -p rusty_grid_worker --lib --locked` passes in full on Windows 11 Home.
+- **Implemented (2026-11-19, pull request 356, open):** Replaced `SID_REMOTE_DESKTOP_USERS` with
+  `SID_GUESTS` (`BUILTIN\Guests`) in
+  `s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
+  (`crates/worker/src/sandbox.rs`), keeping the in-memory `SID_REMOTE_DESKTOP_USERS` coverage in
+  `crates/core/src/private_file.rs`; the full `rusty_grid_worker` lib suite passes on Windows 11
+  Home.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
