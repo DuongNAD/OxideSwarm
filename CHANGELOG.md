@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- `switch_role.sh` no longer reports a failed start while the new process has not yet replaced the launcher's command line (`TEST-35`).
 - The worker's shutdown net (`terminate_all_task_process_trees`) kills the registered task process trees while it holds the registry lock, instead of from a copy taken before. A tree torn down at the same moment could close its cgroup leaf descriptors (Linux, delegated cgroup v2) or its Job Object handle (Windows) in between, so the sweep could write to, and read PIDs to kill from, a descriptor number the worker had already reused for another file (`LV-4`).
 - `oxideswarm members revoke` closes every connection of the member at once, on every lane (worker sessions over TCP and QUIC, client connections over TCP and P2P, blob and MCP connections), and requeues the tasks of its workers at once, without the session-resume hold and without their checkpoints; `worker_id` claims of non-members are pruned. No wire change and no store format change (design 0051 D5, `ENROLL-1c`).
 
