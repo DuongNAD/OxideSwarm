@@ -352,6 +352,9 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented |  | 311 |
 | BUG-27 | Compute the result acknowledgement token only when result resume is on | P3 | S |  |  | Implemented |  | 332 |
 | BUG-28 | Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint | P2 | S |  |  | Implemented |  | 334 |
+| BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 (open) |
+| BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 (open) |
+| BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
@@ -2255,3 +2258,6 @@ Add one dated line per finished item, newest last.
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
 - 2026-11-18: BENCH-3 Partial (pull request 349): W1 on the Mac and the Windows case machine, speedup 1.37,
   efficiency 0.73, 360/360 checksums; BENCH-8 added (Planned, Out) to find the gap to the plan's 0.85.
+- 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
+  menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
+  laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.

@@ -46,6 +46,9 @@ KIT_VERSION=""
 KIT_WORKSPACES=""
 KIT_HAS_WORKER=1
 KIT_HAS_CLIENT=1
+# Set once the worker is started: a rollback then keeps <folder>/logs, so the log a failed start
+# points to still exists (BUG-31).
+KEEP_LOGS=0
 
 log_append() {
   if [ -n "$INSTALL_LOG_ACTIVE" ]; then
@@ -86,11 +89,24 @@ rollback_fresh_install() {
   fi
   if [ -n "${ROOT:-}" ] && [ -d "$ROOT" ]; then
     cd "${TMPDIR:-/tmp}" 2>/dev/null || cd / || true
-    if [ "$PREEXISTING_ROOT" = 0 ]; then
+    # After a failed worker start the logs stay, so the error can name them (BUG-31).
+    _keep_logs=0
+    if [ "$KEEP_LOGS" = 1 ] && [ -d "$ROOT/logs" ] && [ ! -L "$ROOT/logs" ]; then _keep_logs=1; fi
+    if [ "$PREEXISTING_ROOT" = 0 ] && [ "$_keep_logs" = 0 ]; then
       rm -rf "$ROOT"
+    elif [ "$PREEXISTING_ROOT" = 0 ]; then
+      for _entry in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+        { [ -e "$_entry" ] || [ -L "$_entry" ]; } || continue
+        [ "$_entry" = "$ROOT/logs" ] && continue
+        rm -rf "$_entry"
+      done
     else
       rm -f "$ROOT/kit-install.conf" "$ROOT/start-worker.sh"
-      rm -rf "${ROOT:?}/bin" "${ROOT:?}/home" "${ROOT:?}/run" "${ROOT:?}/logs" "${ROOT:?}/workspaces"
+      rm -rf "${ROOT:?}/bin" "${ROOT:?}/home" "${ROOT:?}/run" "${ROOT:?}/workspaces"
+      [ "$_keep_logs" = 1 ] || rm -rf "${ROOT:?}/logs"
+    fi
+    if [ "$_keep_logs" = 1 ]; then
+      printf 'The logs of this attempt stay in %s; delete that folder when you no longer need them.\n' "$ROOT/logs" >&2
     fi
   fi
 }
@@ -411,6 +427,8 @@ if [ "$UPDATE" != 1 ] && [ ! -e "$BIN_DIR/oxideswarm" ] && [ ! -e "$STATE/node.k
 fi
 mkdir -p "$BIN_DIR" "$STATE" "$RUN_DIR" "$LOG_DIR"
 chmod 700 "$STATE"
+# The logs can outlive a rolled-back install (BUG-31), so they are this user's only.
+chmod 700 "$LOG_DIR" 2>/dev/null || true
 INSTALL_LOG_ACTIVE="$LOG_DIR/install.log"
 {
   printf '=== OxideSwarm USB installer run (%s) ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
@@ -594,44 +612,108 @@ WORKER_ARGS="worker --name $NAME --no-portal --max-concurrency $SLOTS"
 if [ "$WORKSPACES" = 1 ] && command -v cargo >/dev/null 2>&1; then
   WORKER_ARGS="$WORKER_ARGS --workspaces"
 fi
+WORKER_LOG="$LOG_DIR/worker.log"
+WORKER_PID=""
+WORKER_STARTED_AT=0
+WORKER_EXIT=""
+WORKER_STOPPED_AFTER=0
 start_worker() {
+  # The log holds the worker's own output; it is this user's only (see step 2).
+  : >> "$WORKER_LOG"
+  chmod 600 "$WORKER_LOG" 2>/dev/null || true
   # shellcheck disable=SC2086
-  nohup "$BIN" $WORKER_ARGS --isolation "$ISOLATION" >> "$LOG_DIR/worker.log" 2>&1 &
-  echo $! > "$RUN_DIR/worker.pid"
+  nohup "$BIN" $WORKER_ARGS --isolation "$ISOLATION" >> "$WORKER_LOG" 2>&1 &
+  WORKER_PID=$!
+  echo "$WORKER_PID" > "$RUN_DIR/worker.pid"
+  WORKER_STARTED_AT=$(date +%s)
+}
+# The checks run with RUST_LOG=off: release 0.1.x writes its informational logs to standard output,
+# and iroh logs an error line when a client exits.
+list_workers() {
+  if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" workers --json --master "$TICKET"; else RUST_LOG=off "$BIN" workers --json; fi
+}
+# Whether the listing in file $1 shows this worker as connected. The JSON listing carries the real
+# state; the plain listing also shows disconnected workers.
+worker_listed() {
+  awk -v n="$NAME" '
+      /"name":/ { v = $2; gsub(/[",]/, "", v); cur = v }
+      /"state:connected"/ && cur == n { found = 1 }
+      END { exit !found }' "$1"
+}
+# Waits up to 30 s until the master lists the worker, and checks every second that the worker still
+# runs (BUG-31: one check after 4 s missed a worker that stopped later). Returns 0 once it is listed,
+# 1 as soon as it stopped (WORKER_EXIT holds its exit code), and 2 after 30 s.
+wait_until_listed() {
+  _list="$RUN_DIR/workers.json"
+  _waited=0
+  while [ "$_waited" -lt 30 ]; do
+    list_workers > "$_list" 2>/dev/null &
+    _lister=$!
+    while :; do
+      sleep 1
+      _waited=$((_waited + 1))
+      if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+        WORKER_STOPPED_AFTER=$(( $(date +%s) - WORKER_STARTED_AT ))
+        kill "$_lister" 2>/dev/null || true
+        wait "$_lister" 2>/dev/null || true
+        # The worker is a child of this shell, so wait returns its exit code.
+        WORKER_EXIT=0
+        wait "$WORKER_PID" 2>/dev/null || WORKER_EXIT=$?
+        rm -f "$_list"
+        return 1
+      fi
+      kill -0 "$_lister" 2>/dev/null || break
+      if [ "$_waited" -ge 30 ]; then
+        kill "$_lister" 2>/dev/null || true
+        wait "$_lister" 2>/dev/null || true
+        rm -f "$_list"
+        return 2
+      fi
+    done
+    wait "$_lister" 2>/dev/null || true
+    if worker_listed "$_list"; then
+      rm -f "$_list"
+      return 0
+    fi
+  done
+  rm -f "$_list"
+  return 2
+}
+# A failed start: the end of the worker's log under a header, then the error. The rollback keeps
+# <folder>/logs (KEEP_LOGS), so the file the error names still exists (BUG-31).
+fail_worker_start() {
+  say ""
+  if [ -s "$WORKER_LOG" ]; then
+    say "----- last 30 lines of $WORKER_LOG -----"
+    tail -n 30 "$WORKER_LOG" 2>/dev/null | sed 's/^/  /' || true
+    say "----- end of $WORKER_LOG -----"
+  else
+    say "(the worker wrote nothing to $WORKER_LOG)"
+  fi
+  fail "$1; its log is kept in $WORKER_LOG"
 }
 
 # 6. Start it now; fall back to --isolation off where the OS cannot confine tasks.
 say ""
 say "Starting worker '$NAME' ..."
+KEEP_LOGS=1
 start_worker
-sleep 4
-if ! kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null; then
-  if [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
-    say "  the worker stopped with --isolation $ISOLATION (see $LOG_DIR/worker.log); trying --isolation off"
-    ISOLATION=off
-    start_worker
-    sleep 3
-  fi
-  kill -0 "$(cat "$RUN_DIR/worker.pid")" 2>/dev/null || fail "the worker did not start with --isolation $ISOLATION; see $LOG_DIR/worker.log"
-fi
 
-# 7. Wait until the master lists it. The checks run with RUST_LOG=off: release 0.1.x writes its
-# informational logs to standard output, and iroh logs an error line when a client exits.
-CONNECTED=0
-i=0
-while [ $i -lt 30 ]; do
-  # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-  if { if [ -n "$TICKET" ]; then RUST_LOG=off "$BIN" workers --json --master "$TICKET"; else RUST_LOG=off "$BIN" workers --json; fi; } 2>/dev/null | awk -v n="$NAME" '
-      /"name":/ { v = $2; gsub(/[",]/, "", v); cur = v }
-      /"state:connected"/ && cur == n { found = 1 }
-      END { exit !found }'; then
-    CONNECTED=1
-    break
-  fi
-  sleep 1
-  i=$((i + 1))
-done
-[ "$CONNECTED" = 1 ] || fail "the worker runs but the master does not list it yet; see $LOG_DIR/worker.log"
+# 7. Wait until the master lists it, watching the worker meanwhile.
+LISTED=0
+wait_until_listed || LISTED=$?
+if [ "$LISTED" = 1 ] && [ "$ISOLATION" != off ] && [ "$EXPLICIT_ISOLATION" = 0 ]; then
+  say "  the worker stopped with --isolation $ISOLATION (exit code $WORKER_EXIT, see $WORKER_LOG); trying --isolation off"
+  ISOLATION=off
+  start_worker
+  LISTED=0
+  wait_until_listed || LISTED=$?
+fi
+case "$LISTED" in
+  0) ;;
+  1) fail_worker_start "the worker stopped $WORKER_STOPPED_AFTER s after it started (exit code $WORKER_EXIT)" ;;
+  *) fail_worker_start "the worker ran for 30 s, but the master did not list it" ;;
+esac
 say "  connected (isolation: $ISOLATION)"
 fi
 # What an update keeps: the name, the build, the workspace choice and the isolation.
