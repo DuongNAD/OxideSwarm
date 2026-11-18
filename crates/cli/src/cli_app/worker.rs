@@ -23,44 +23,51 @@ use super::{
     wait_for_worker_shutdown_signal, WorkerArgs, MIB,
 };
 
-/// Resolves `(master_addr, p2p_ticket)` for `oxideswarm worker` across CLI > Env > Config > Default,
-/// ensuring that an explicit `--master` (or `RUSTY_GRID_MASTER_ADDR` / `RUSTY_GRID_MASTER`) is not
-/// overridden by a lower-tier `p2p_ticket` (such as `[worker] p2p_ticket` in the config file).
-pub(super) fn resolve_worker_target(
-    cli_master: Option<String>,
-    cli_ticket: Option<String>,
+/// Resolves `(master_addr, p2p_ticket)` from explicit CLI, env and config values without reading
+/// the process environment.
+pub(super) fn resolve_worker_target_from(
+    cli_master: Option<&str>,
+    cli_ticket: Option<&str>,
+    env_master: Option<(&str, &str)>,
+    env_ticket: Option<&str>,
     worker_cfg: Option<&crate::config::WorkerFileConfig>,
-) -> (String, Option<String>) {
-    let env_master =
-        resolve_opt_string(None, &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"], None);
-    let env_ticket = resolve_opt_string(None, &["RUSTY_GRID_P2P_TICKET"], None);
-    let cfg_master = worker_cfg
-        .and_then(|w| w.master.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let cfg_ticket = worker_cfg
-        .and_then(|w| w.p2p_ticket.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+) -> Result<(String, Option<String>), String> {
+    let clean = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let cli_master = clean(cli_master);
+    let cli_ticket = clean(cli_ticket);
+    let env_master = env_master.and_then(|(var, val)| clean(Some(val)).map(|v| (var, v)));
+    let env_ticket = clean(env_ticket);
+    let cfg_master = clean(worker_cfg.and_then(|w| w.master.as_deref()));
+    let cfg_ticket = clean(worker_cfg.and_then(|w| w.p2p_ticket.as_deref()));
 
-    let cli_master = cli_master
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let cli_ticket = cli_ticket
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
-    let master_raw = cli_master
-        .clone()
-        .or_else(|| env_master.clone())
-        .or(cfg_master)
-        .unwrap_or_else(|| DEFAULT_MASTER_ADDR.to_string());
+    let (source, master_raw) = if let Some(ref m) = cli_master {
+        ("--master", m.clone())
+    } else if let Some((var, ref m)) = env_master {
+        (var, m.clone())
+    } else if let Some(ref m) = cfg_master {
+        ("[worker].master", m.clone())
+    } else {
+        ("default", DEFAULT_MASTER_ADDR.to_string())
+    };
+    if crate::connect::is_p2p_ticket(&master_raw) {
+        return Err(match source {
+            "--master" => {
+                "error: --master: this looks like a P2P ticket; use --p2p-ticket <TICKET> instead"
+                    .into()
+            }
+            "[worker].master" => {
+                "error: [worker].master: this looks like a P2P ticket; use --p2p-ticket <TICKET> or [worker].p2p_ticket instead"
+                    .into()
+            }
+            var => format!(
+                "error: {var}: this looks like a P2P ticket; use --p2p-ticket <TICKET> or RUSTY_GRID_P2P_TICKET instead"
+            ),
+        });
+    }
     let master_addr = normalize_master_addr(&master_raw);
 
     let p2p_ticket = if cli_ticket.is_some() {
@@ -75,7 +82,34 @@ pub(super) fn resolve_worker_target(
         cfg_ticket
     };
 
-    (master_addr, p2p_ticket)
+    Ok((master_addr, p2p_ticket))
+}
+
+/// Resolves `(master_addr, p2p_ticket)` for `oxideswarm worker` across CLI > Env > Config > Default,
+/// ensuring that an explicit `--master` (or `RUSTY_GRID_MASTER_ADDR` / `RUSTY_GRID_MASTER`) is not
+/// overridden by a lower-tier `p2p_ticket` (such as `[worker] p2p_ticket` in the config file).
+pub(super) fn resolve_worker_target(
+    cli_master: Option<String>,
+    cli_ticket: Option<String>,
+    worker_cfg: Option<&crate::config::WorkerFileConfig>,
+) -> Result<(String, Option<String>), String> {
+    let env_master = ["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|v| (name, v))
+        });
+    let env_ticket = resolve_opt_string(None, &["RUSTY_GRID_P2P_TICKET"], None);
+    resolve_worker_target_from(
+        cli_master.as_deref(),
+        cli_ticket.as_deref(),
+        env_master.as_ref().map(|(k, v)| (*k, v.as_str())),
+        env_ticket.as_deref(),
+        worker_cfg,
+    )
 }
 
 pub(super) async fn run_worker(
@@ -109,7 +143,13 @@ pub(super) async fn run_worker(
     };
 
     let (master_addr, p2p_ticket) =
-        resolve_worker_target(args.master, args.p2p_ticket, worker_cfg.as_ref());
+        match resolve_worker_target(args.master, args.p2p_ticket, worker_cfg.as_ref()) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let v3_auth = match secret_opts.resolve_v3_auth(config_file.as_ref(), SecretSection::Worker) {
         Ok(v3) => v3,
@@ -675,4 +715,96 @@ pub(super) fn resolve_isolation_read_dirs(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli_app::{Cli, Commands};
+    use crate::config::WorkerFileConfig;
+    use crate::secret_cmd::SecretOpts;
+    use clap::Parser;
+
+    fn generated_p2p_ticket() -> String {
+        let secret_key = rusty_grid_core::transport::iroh::SecretKey::generate();
+        let addr = rusty_grid_core::transport::iroh::EndpointAddr::from(secret_key.public());
+        rusty_grid_core::transport::serialize_p2p_ticket(&addr)
+            .expect("serialize generated EndpointAddr")
+    }
+
+    #[test]
+    fn worker_master_refuses_p2p_ticket_and_points_to_p2p_ticket_flag() {
+        let ticket = generated_p2p_ticket();
+
+        for (label, outcome) in [
+            (
+                "--master",
+                resolve_worker_target_from(Some(&ticket), None, None, None, None),
+            ),
+            (
+                "RUSTY_GRID_MASTER_ADDR",
+                resolve_worker_target_from(
+                    None,
+                    None,
+                    Some(("RUSTY_GRID_MASTER_ADDR", &ticket)),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "[worker].master",
+                resolve_worker_target_from(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&WorkerFileConfig {
+                        master: Some(ticket.clone()),
+                        ..Default::default()
+                    }),
+                ),
+            ),
+        ] {
+            let err = outcome.unwrap_err();
+            assert!(
+                err.contains("this looks like a P2P ticket; use --p2p-ticket"),
+                "{label}: unexpected error text: {err}"
+            );
+            assert!(
+                !err.contains(&ticket),
+                "{label}: error must not echo the raw ticket: {err}"
+            );
+        }
+
+        let (master_addr, p2p_ticket) =
+            resolve_worker_target_from(None, Some(&ticket), None, None, None)
+                .expect("--p2p-ticket with default master succeeds");
+        assert_eq!(master_addr, DEFAULT_MASTER_ADDR);
+        assert_eq!(p2p_ticket.as_deref(), Some(ticket.as_str()));
+    }
+
+    #[tokio::test]
+    async fn run_worker_exits_failure_when_master_is_a_p2p_ticket() {
+        let ticket = generated_p2p_ticket();
+        let cli = Cli::try_parse_from([
+            "oxideswarm",
+            "worker",
+            "--master",
+            &ticket,
+            "--no-gpu",
+            "--no-portal",
+            "--insecure",
+        ])
+        .expect("parse worker CLI");
+        let Commands::Worker(args) = cli.command else {
+            panic!("expected Worker command");
+        };
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_worker(args, None, SecretOpts::default()),
+        )
+        .await
+        .expect("worker --master <ticket> must fail fast without attempting TCP");
+        assert_eq!(code, ExitCode::FAILURE);
+    }
 }

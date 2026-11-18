@@ -424,7 +424,7 @@ pub struct MasterArgs {
 pub struct WorkerArgs {
     #[arg(
         long,
-        help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN"
+        help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN; for a P2P ticket use --p2p-ticket"
     )]
     pub master: Option<String>,
 
