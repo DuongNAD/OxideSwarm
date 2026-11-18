@@ -238,7 +238,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented | 318 |
-| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | PRNUM |
+| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | 320 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3392,7 +3392,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   one-line comment at the site, and name the product change that would remove it.
 - **Done when:** Every site is changed or carries its reason, and each changed test binary passes 20 runs in a row
   under CPU load.
-- **Partial (2026-11-18, pull request PRNUM):**
+- **Partial (2026-11-18, pull request 320):**
   - Changed: both Web UI tests of `tests/m1_challenger_2_stress.rs` start the dashboard on `127.0.0.1:0` and read
     `MasterHandle::dashboard_addr()`. The reuse test spawns the second master on the same port again until it holds
     it (30 s bound, the "must be freed upon master shutdown" message kept) instead of binding a probe listener and
