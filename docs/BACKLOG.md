@@ -362,7 +362,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Planned | In | (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
-| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, PRNUM, (design 0058) |
+| LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned | Out |  |
@@ -2201,5 +2201,5 @@ Add one dated line per finished item, newest last.
   16 Partial and 59 Planned; 30 open items In, 45 Out.
 - 2026-11-18: LV-1 Implemented (its fuzz CI job is green on `master`), its text moved to the archive;
   LV-18 Partial (pull request 326, the MCP reader is open); TEST-53 Implemented (pull request 327).
-- 2026-11-18: LV-18 Implemented (pull request PRNUM: the target `mcp_request_line` for the JSON-RPC reader of
+- 2026-11-18: LV-18 Implemented (pull request 335: the target `mcp_request_line` for the JSON-RPC reader of
   `oxideswarm mcp`), its text moved to the archive.

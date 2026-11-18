@@ -1477,14 +1477,15 @@ none needs a design record of its own.
   the target needs a function such as `parse_request_line(line) -> Result<JsonRpcRequest,
   JsonRpcResponse>` cut out of `run_stdio_server`. Also open until it runs: the `fuzz` CI job of the
   three new targets.
-- **Implemented (2026-11-18, pull request PRNUM):** step 4. `run_stdio_server` now calls
-  `parse_request_line(line) -> Result<Option<JsonRpcRequest>, JsonRpcResponse>` (`Ok(None)`: a line
-  that gets no reply) and `parse_tool_call(id, params) -> Result<(String, Value), JsonRpcResponse>`
-  (the `tools/call` checks, `validate_tool_arguments` included), both `#[doc(hidden)] pub`; the
+- **Implemented (2026-11-18, pull request 335):** step 4. `run_stdio_server` now calls
+  `parse_request_line(line) -> Result<Option<JsonRpcRequest>, Box<JsonRpcResponse>>` (`Ok(None)`: a
+  line that gets no reply) and `parse_tool_call(id, params) -> Result<(String, Value),
+  Box<JsonRpcResponse>>` (the `tools/call` checks, `validate_tool_arguments` included), both
+  `#[doc(hidden)] pub`; the
   replies to 48 test lines are byte for byte those of `master` `3a0f7c5`. The target
   `mcp_request_line` with seeds, regression inputs and its `fuzz` CI job; a 5-minute local run
   (1,752,586 executions, no finding) is in `fuzz/README.md`. The `fuzz` job runs the four LV-18
-  targets on pull request PRNUM.
+  targets on pull request 335.
 
 ## Phase 11: findings of the audit of 2026-11-15
 
