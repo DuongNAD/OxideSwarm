@@ -12,4 +12,3 @@
 
 crates/worker/src/isolation.rs 5346
 crates/cli/src/mcp.rs 3643
-crates/cli/src/mode_cli.rs 3213
