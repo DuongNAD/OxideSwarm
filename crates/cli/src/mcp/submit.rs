@@ -487,15 +487,21 @@ pub fn truncate_stream_for_llm(bytes: &[u8], max_output_bytes: usize) -> (String
     (format!("{head}{notice}{tail}"), true, captured_bytes)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) async fn format_completed_task_result(
     state: &McpState,
     result: &rusty_grid_core::task::TaskResult,
     args: &Value,
     warning: Option<String>,
 ) -> ToolCallResult {
-    format_completed_task_result_with_start(state, result, args, warning, std::time::Instant::now())
-        .await
+    format_completed_task_result_with_start(
+        state,
+        result,
+        args,
+        warning,
+        Some(std::time::Instant::now()),
+    )
+    .await
 }
 
 pub(super) async fn format_completed_task_result_with_start(
@@ -503,7 +509,7 @@ pub(super) async fn format_completed_task_result_with_start(
     result: &rusty_grid_core::task::TaskResult,
     args: &Value,
     warning: Option<String>,
-    started_at: std::time::Instant,
+    started_at: Option<std::time::Instant>,
 ) -> ToolCallResult {
     let output_dir_opt = args.get("output_dir").and_then(Value::as_str);
     let max_output_bytes = args
@@ -632,9 +638,12 @@ pub(super) async fn format_completed_task_result_with_start(
         "failed"
     };
 
-    let waited_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let summary =
-        crate::run_summary::RunSummary::from_results(std::slice::from_ref(result), waited_ms);
+    let waited_ms: Option<u64> =
+        started_at.map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    let summary = crate::run_summary::RunSummary::from_results(
+        std::slice::from_ref(result),
+        waited_ms.unwrap_or(0),
+    );
 
     let mut body = json!({
         "task_id": result.task_id.to_string(),
@@ -652,7 +661,7 @@ pub(super) async fn format_completed_task_result_with_start(
         "stderr_worker_truncated": stderr_worker_truncated,
         "stderr_captured_bytes": stderr_captured_bytes,
         "duration_ms": result.execution_time_ms,
-        "waited_ms": summary.waited_ms,
+        "waited_ms": waited_ms,
         "task_time_sum_ms": summary.task_time_sum_ms,
         "machines": summary.machines,
         "error": result.error,
@@ -1264,7 +1273,7 @@ pub(super) async fn tool_submit(
                     &result,
                     args,
                     warning,
-                    submit_started,
+                    Some(submit_started),
                 )
                 .await;
                 let verify_outcome = match (verify.replicas, &verify_template) {
@@ -1285,6 +1294,7 @@ pub(super) async fn tool_submit(
             }
             Some(Err(e)) => ToolCallResult::error(format!("Communication error: {e}")),
             None => {
+                state.record_submitted(task_id, submit_started).await;
                 drop(transport);
                 let (status_str, state_name) = match state
                     .request_with_timeout(

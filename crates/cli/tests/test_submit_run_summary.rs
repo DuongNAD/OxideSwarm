@@ -112,6 +112,23 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
             && waited_line.ends_with(" s"),
         "unexpected Waited summary line:\n{ok_stdout}"
     );
+    let (waited_part, sum_part) = waited_line
+        .split_once(" s    Sum of task times: ")
+        .unwrap_or_else(|| panic!("missing summary separator in:\n{waited_line}"));
+    let waited_secs: f64 = waited_part
+        .strip_prefix("Waited: ")
+        .unwrap_or_else(|| panic!("missing Waited prefix in:\n{waited_part}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid waited seconds in '{waited_part}': {e}"));
+    let sum_secs: f64 = sum_part
+        .strip_suffix(" s")
+        .unwrap_or_else(|| panic!("missing seconds suffix in:\n{sum_part}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid task time sum in '{sum_part}': {e}"));
+    assert!(
+        waited_secs >= sum_secs,
+        "expected Waited ({waited_secs} s) >= Sum of task times ({sum_secs} s) for one task:\n{ok_stdout}"
+    );
     assert!(
         !ok_stdout.contains('%'),
         "unexpected percentage in:\n{ok_stdout}"
@@ -167,13 +184,42 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     );
     let json_val: serde_json::Value =
         serde_json::from_slice(&json_out.stdout).expect("parse submit --json output");
-    assert!(
-        json_val["waited_ms"].is_u64(),
-        "missing waited_ms in: {json_val}"
+    assert_eq!(
+        json_val["exit_code"], 0,
+        "unexpected exit_code in: {json_val}"
     );
+    let worker_id_str = json_val["worker_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing worker_id in: {json_val}"));
+    let parsed_worker = uuid::Uuid::parse_str(worker_id_str)
+        .unwrap_or_else(|e| panic!("invalid worker_id UUID '{worker_id_str}': {e}"));
+    assert!(
+        !parsed_worker.is_nil(),
+        "expected non-nil worker_id in: {json_val}"
+    );
+    assert_eq!(
+        json_val["worker_name"], "adopt2-worker",
+        "unexpected worker_name in: {json_val}"
+    );
+    assert!(
+        json_val["stdout"]
+            .as_str()
+            .is_some_and(|s| s.contains("adopt2-json-ok")),
+        "missing expected stdout in: {json_val}"
+    );
+    let waited_ms = json_val["waited_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing waited_ms in: {json_val}"));
+    let task_time_sum_ms = json_val["task_time_sum_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing task_time_sum_ms in: {json_val}"));
     assert_eq!(
         json_val["task_time_sum_ms"], json_val["execution_time_ms"],
         "unexpected task_time_sum_ms in: {json_val}"
+    );
+    assert!(
+        waited_ms >= task_time_sum_ms,
+        "expected waited_ms ({waited_ms}) >= task_time_sum_ms ({task_time_sum_ms}): {json_val}"
     );
     assert_eq!(
         json_val["machines"], 1,
@@ -181,6 +227,7 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     );
 
     let _ = shutdown_tx.send(true);
-    worker_handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
     let _ = master.shutdown();
+    drop(temp);
 }

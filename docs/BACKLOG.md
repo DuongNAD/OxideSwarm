@@ -167,6 +167,7 @@ TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-
 pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
 Then TEST-52 (pull request 320, Partial) and DOC-11 (pull request 322): 202 items, 127 Implemented, 16 Partial and
 59 Planned; 30 open items are In and 45 are Out.
+Recounted on 2026-11-18 with ADOPT-2 Implemented (pull request 350, open; its `Line` value `In` stays until merged) after BUG-29 to BUG-31 (pull request 341), LV-1, LV-18, TEST-53, ENROLL-1c, BUG-27, BUG-28, TEST-35, LV-4, and LV-5: 210 items, 138 Implemented, 16 Partial and 56 Planned; 27 remaining open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -360,7 +361,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | (design 0059) |
-| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350 (open), (design 0059) |
+| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented | In | 350 (open), (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | In | (design 0056) |
@@ -1488,11 +1489,15 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   lines and carries the three fields under `--json`, and `mcp_server_e2e` finds the fields while
   standard output stays JSON-RPC only.
 - **Status (2026-11-18, Implemented):** Pull request 350 (open): adds `crates/cli/src/run_summary.rs`
-  (with the four unit cases of design 0059), prints the two D5 summary lines after
-  `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines` to
-  `submit --json` and the MCP `submit` and `task_result` tools, covers loopback CLI and MCP runs
-  in `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
-  `README.md` and `CHANGELOG.md`.
+  (with the four unit cases of design 0059 plus a two-worker case), prints the two D5 summary lines
+  after `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines`
+  to `submit --json` and the MCP `submit` and `task_result` tools (covering the submitted task only,
+  before `--verify` replicas; for async `submit` or a `submit` wait timeout in the same MCP
+  session, `task_result` measures `waited_ms` from `submit` to the `task_result` reply so it
+  includes caller time between calls and increases on repeat queries, and returns `null` when that
+  session did not record the submission), covers loopback CLI and MCP runs in
+  `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
+  `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
 
 ### ADOPT-3: Install scripts and the scripted time to first result
 
@@ -2232,3 +2237,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
+- 2026-11-18: ADOPT-2 Implemented (pull request 350, open): D5 run summary in `submit --wait`, `--json`, and MCP `submit` / `task_result`, with `waited_ms: null` when the MCP submission timestamp is unknown.

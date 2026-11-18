@@ -425,8 +425,9 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
         task_res_val["waited_ms"].is_u64(),
         "MCP task_result must return waited_ms: {task_res_val}"
     );
+    let async_duration_ms = task_res_val["duration_ms"].as_u64().unwrap();
     assert_eq!(
-        task_res_val["task_time_sum_ms"], task_res_val["duration_ms"],
+        task_res_val["task_time_sum_ms"], async_duration_ms,
         "MCP task_result task_time_sum_ms mismatch: {task_res_val}"
     );
     assert_eq!(
@@ -463,9 +464,70 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
     assert_eq!(checks[0]["id"], "C1");
     assert_eq!(checks[0]["outcome"], "pass");
 
-    // 10. STDOUT HYGIENE VERIFICATION
+    // 10. A fresh MCP process whose session did not submit `task_id` reports `waited_ms: null`.
+    let mut mcp_restarted =
+        McpProcess::spawn(home.path(), &cluster.master_addr, Some(&cluster.secret_hex));
+    mcp_restarted.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "clientInfo": { "name": "e2e-agent-restarted", "version": "1.0.0" }
+            }
+        })
+        .to_string(),
+    );
+    let restart_init = mcp_restarted.read_json_response();
+    assert_eq!(restart_init["id"], 1);
+    mcp_restarted.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })
+        .to_string(),
+    );
+    mcp_restarted.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "task_result",
+                "arguments": {
+                    "task_id": task_id,
+                    "wait": false
+                }
+            }
+        })
+        .to_string(),
+    );
+    let restart_res = mcp_restarted.read_json_response();
+    assert_eq!(restart_res["id"], 2);
+    assert_eq!(restart_res["result"]["isError"], false);
+    let restart_text = restart_res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let restart_val: Value = serde_json::from_str(restart_text).unwrap();
+    assert_eq!(restart_val["task_id"], task_id);
+    assert_eq!(restart_val["exit_code"], 0);
+    assert!(
+        restart_val["waited_ms"].is_null(),
+        "MCP task_result without a session submit time must return waited_ms: null, got: {restart_val}"
+    );
+    assert_eq!(restart_val["task_time_sum_ms"], async_duration_ms);
+    assert_eq!(restart_val["machines"], 1);
+
+    // 11. STDOUT HYGIENE VERIFICATION
     // Assert that EVERY single line emitted on stdout was valid JSON-RPC 2.0.
-    for (idx, line) in mcp.lines_received.iter().enumerate() {
+    for (idx, line) in mcp
+        .lines_received
+        .iter()
+        .chain(mcp_restarted.lines_received.iter())
+        .enumerate()
+    {
         let parsed: Result<Value, _> = serde_json::from_str(line);
         assert!(
             parsed.is_ok(),

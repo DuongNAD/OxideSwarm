@@ -16,7 +16,6 @@ pub(super) async fn tool_task_result(
     args: &Value,
     ctx: &mut ToolCallContext,
 ) -> ToolCallResult {
-    let call_started = std::time::Instant::now();
     let task_id_str = match args.get("task_id").and_then(Value::as_str) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required property 'task_id'"),
@@ -136,7 +135,7 @@ pub(super) async fn tool_task_result(
                         Some(step + 1),
                         format!("Task {task_id} completed"),
                     );
-                    let started_at = state.submitted_at(task_id).await.unwrap_or(call_started);
+                    let started_at = state.submitted_at(task_id).await;
                     return format_completed_task_result_with_start(
                         state, &result, args, None, started_at,
                     )
@@ -205,7 +204,7 @@ pub(super) async fn tool_task_result(
             .await
         {
             Ok(ClientResponse::TaskCompleted { result, .. }) => {
-                let started_at = state.submitted_at(task_id).await.unwrap_or(call_started);
+                let started_at = state.submitted_at(task_id).await;
                 format_completed_task_result_with_start(state, &result, args, None, started_at)
                     .await
             }

@@ -186,4 +186,25 @@ mod tests {
             "Waited: 0.450 s    Sum of task times: 0.400 s"
         );
     }
+
+    #[test]
+    fn test_run_summary_two_tasks_on_two_workers() {
+        let w1 = Uuid::from_u128(1);
+        let w2 = Uuid::from_u128(2);
+        let results = [sample_result(w1, 0, 120), sample_result(w2, 0, 280)];
+        let summary = RunSummary::from_results(&results, 310);
+        assert_eq!(summary.finished, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.machines, 2);
+        assert_eq!(summary.waited_ms, 310);
+        assert_eq!(summary.task_time_sum_ms, 400);
+        assert_eq!(
+            summary.tasks_line(),
+            "Tasks: 2 finished, 0 failed, on 2 machines"
+        );
+        assert_eq!(
+            summary.waited_line(),
+            "Waited: 0.310 s    Sum of task times: 0.400 s"
+        );
+    }
 }

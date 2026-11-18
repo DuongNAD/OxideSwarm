@@ -1,8 +1,7 @@
 # 0059: First users (who gains what, and the order of work that serves them)
 
-Status: Draft (plan; builds nothing; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are
-open)
-Created: 2026-11-10    Updated: 2026-11-17
+Status: Partial (ADOPT-2 implemented in pull request 350, open; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are open)
+Created: 2026-11-10    Updated: 2026-11-18
 
 ## Summary
 
@@ -237,7 +236,13 @@ Waited: <W> s    Sum of task times: <S> s
 - `Sum of task times` adds `TaskResult::execution_time_ms` over the tasks.
 - `machines` counts distinct worker ids.
 - The JSON output of `submit` and the MCP results carry the same values as `waited_ms`,
-  `task_time_sum_ms` and `machines`.
+  `task_time_sum_ms` and `machines`. When `--verify` (`submit`) or `verify` (MCP) runs replicas,
+  the summary covers the first submitted task only and stops before the replicas start. In the MCP
+  server, `task_result` after an asynchronous `submit` or a `submit` wait timeout measures `waited_ms`
+  from that session's `submit` call to the `task_result` reply (which includes caller time between
+  calls and grows on repeat queries), and returns `"waited_ms": null` when that MCP session does not
+  have the submission timestamp (such as after an MCP server restart, from another client, or after
+  cache eviction).
 - For one task, `Waited` minus the task time is queueing and file transfer. It tells the user what
   the grid costs.
 - For several tasks (AX-1, AX-2), the sum is what these tasks took on these workers. The CLI never
@@ -382,7 +387,7 @@ and their status is kept there.
 | ID | Item | Audience | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|---|
 | ADOPT-1 | A study of first use, in two rounds | All | S, owner | Release `0.1.1` | This record | "Study records" holds at least three sessions of the first round, with M15 to M17 | Planned |
-| ADOPT-2 | Run summary in `submit --wait`, in its JSON output and in the MCP results | A1, A2 | S | Nothing for one task. AX-1 and AX-2 for several | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `README.md`, `CHANGELOG.md` | The ADOPT-2 tests of the test plan pass | Planned |
+| ADOPT-2 | Run summary in `submit --wait`, in its JSON output and in the MCP results | A1, A2 | S | Nothing for one task. AX-1 and AX-2 for several | `crates/cli/src/run_summary.rs`, `crates/cli/src/cli_app/submit.rs`, `crates/cli/src/mcp/`, `README.md`, `CHANGELOG.md` | The ADOPT-2 tests of the test plan pass | Implemented |
 | ADOPT-3 | Install scripts and the scripted measure of M15 | All | M | REL-4. LV-5 for the attestation step | `scripts/install.sh`, `scripts/install.ps1`, `tests/test_launcher_scripts.py`, `benchmarks/grid/`, `README.md` | The ADOPT-3 tests pass, and M15 by script is recorded for macOS, Windows and Linux | Planned |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | A1, A2, A4 | M | The first round of ADOPT-1. AX-1 and AX-2 for the first two guides | `docs/guides/`, `docs/README.md`, `crates/core/src/capabilities.rs` if probes are added | Three guides each have a "Verify" block and a dated run record, and the index lists them | Planned |
 
@@ -443,3 +448,6 @@ None yet.
   owner accepted Q82 of [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md). A row
   in the Index starts no item: ADOPT-3 and ADOPT-4 still wait for the first round of ADOPT-1, and Q36
   and Q38 stay open. The text of the items is unchanged.
+- 2026-11-18: ADOPT-2 Implemented in pull request 350 (open): `crates/cli/src/run_summary.rs`,
+  `submit --wait`, `submit --json`, and MCP `submit` / `task_result` (including `waited_ms: null`
+  when an MCP session has no recorded submission timestamp and excluding `--verify` replicas).
