@@ -3824,6 +3824,8 @@ async fn test_windows_worker_task_running_junk_exe_fails_fast_without_error_dial
             .with_sandbox_base_dir(dir.path().join("sandboxes")),
     );
 
+    // SAFETY: `GetErrorMode` takes no argument and only reads the process error mode; the
+    // declaration above matches `UINT GetErrorMode(void)` in kernel32.
     let mode = unsafe { GetErrorMode() };
     let expected_bits = rusty_grid_core::capabilities::WINDOWS_SUPPRESS_ERROR_DIALOGS_MODE;
     assert_eq!(

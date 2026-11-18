@@ -1244,6 +1244,9 @@ fn openat_dir_nofollow(
         path: link_path.to_string(),
         reason: format!("symbolic link target '{target}' contains a NUL byte"),
     })?;
+    // SAFETY: `c_seg` is a NUL-terminated string that lives across the call. `parent_fd` is
+    // passed by value: the callers hand in `root_fd` or a descriptor held in the walk's `stack`,
+    // both open for the call (a closed one would only make `openat` fail).
     let raw = unsafe {
         libc::openat(
             parent_fd,
@@ -1260,6 +1263,8 @@ fn openat_dir_nofollow(
             ),
         });
     }
+    // SAFETY: `raw` (>= 0) is the descriptor `openat` just opened; nothing else owns it, so the
+    // `OwnedFd` is its only owner.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
@@ -1347,6 +1352,7 @@ fn ensure_target_walks_no_on_disk_symlink<'a>(
                 reason: "workspace tree path contains a NUL byte".to_string(),
             }
         })?;
+        // SAFETY: `c_tree` is a NUL-terminated string that lives across the call.
         let raw_root = unsafe {
             libc::open(
                 c_tree.as_ptr(),
@@ -1362,6 +1368,8 @@ fn ensure_target_walks_no_on_disk_symlink<'a>(
                 ),
             });
         }
+        // SAFETY: `raw_root` (>= 0) is the descriptor `open` just opened; nothing else owns it, so
+        // the `OwnedFd` is its only owner.
         let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
         let mut cur: Vec<&str> = Vec::new();
         let mut stack: Vec<UnixWalkState> = Vec::new();
@@ -1393,6 +1401,9 @@ fn ensure_target_walks_no_on_disk_symlink<'a>(
                 reason: format!("symbolic link target '{target}' contains a NUL byte"),
             })?;
             let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `c_seg` is a NUL-terminated string and `st` has room for one `stat`, both
+            // live across the call. `parent_fd` is `root_fd` or the descriptor `ensure_unix_parent_fd`
+            // just returned from `stack`, which nothing changes before this call, so it is open.
             let rc = unsafe {
                 libc::fstatat(
                     parent_fd,
@@ -1415,6 +1426,7 @@ fn ensure_target_walks_no_on_disk_symlink<'a>(
                     ),
                 });
             }
+            // SAFETY: `fstatat` returned 0, so it filled the whole `stat`.
             let st = unsafe { st.assume_init() };
             let mode = st.st_mode & libc::S_IFMT;
             if mode == libc::S_IFLNK {

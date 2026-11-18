@@ -1472,6 +1472,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   Windows, `cargo test -p rusty_grid_cli --test mcp_server_e2e` passes, and
   `crates/core/tests/data/wire_layout.txt` is unchanged.
 - **Progress:** step 3 (`mode_cli.rs`): pull request 325.
+- **Progress:** step 2 (`mcp.rs`): pull request 323.
 
 ### ADOPT-1: A study of first use, in two rounds
 
@@ -1634,6 +1635,8 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
   The clippy job fails on a site without one, and that job is a required check. The Miri job has
   run once on `master`.
+- **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
+  request 324, 145 sites documented.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
