@@ -45,7 +45,7 @@ base64 = "0.23"
 toml_edit = "0.25"
 ring = "0.17"
 spake2 = "0.4"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 tokio-rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 url = "2"
