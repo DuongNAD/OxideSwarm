@@ -357,7 +357,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | (design 0059) |
-| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Planned | In | (design 0059) |
+| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350 (open), (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | In | (design 0056) |
@@ -1484,6 +1484,12 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   one task, one failed task, two tasks on one worker), a waited run on loopback that prints both
   lines and carries the three fields under `--json`, and `mcp_server_e2e` finds the fields while
   standard output stays JSON-RPC only.
+- **Status (2026-11-18, Implemented):** Pull request 350 (open): adds `crates/cli/src/run_summary.rs`
+  (with the four unit cases of design 0059), prints the two D5 summary lines after
+  `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines` to
+  `submit --json` and the MCP `submit` and `task_result` tools, covers loopback CLI and MCP runs
+  in `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
+  `README.md` and `CHANGELOG.md`.
 
 ### ADOPT-3: Install scripts and the scripted time to first result
 
