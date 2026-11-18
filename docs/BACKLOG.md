@@ -336,7 +336,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | Out | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
-| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Planned | In | (design 0058) |
+| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342 (open), (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
@@ -1060,7 +1060,7 @@ none needs a design record of its own.
   attestation per archive, `gh attestation verify` accepts an archive of that run and refuses a
   copy with one changed byte, and both outputs are in the pull request. No `uses:` line in
   `.github/workflows/` names a tag or a branch. The Scorecard workflow has run once.
-- **Status (2026-11-18, Partial):** Steps 1 to 5 are in pull request PRNUM; step 6 stays with the owner.
+- **Status (2026-11-18, Partial):** Steps 1 to 5 are in pull request 342; step 6 stays with the owner.
   - Step 1: `deny.toml` allows ten licences (`Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`,
     `CDLA-Permissive-2.0`, `ISC`, `MIT`, `MPL-2.0`, `Unicode-3.0`, `Unlicense`, `Zlib`, each the only
     choice of at least one crate) plus `NCSA` for `libfuzzer-sys` only, crates.io as the only source
