@@ -119,6 +119,9 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         if !dead {
+            // SAFETY: `kill` touches no memory; `!dead` means the positive `sleep 300` descendant
+            // `pid` spawned by this test was still alive after 100 polls, so it has not been
+            // reaped or reused.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
         assert!(

@@ -199,6 +199,9 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
+    // SAFETY: `OpenProcess` takes plain integers and returns null (handled immediately) or a
+    // fresh process handle; `exit_code` is a live writable `u32` for `GetExitCodeProcess`, and
+    // `CloseHandle` closes that handle once before returning.
     unsafe {
         use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
         use windows_sys::Win32::System::Threading::{

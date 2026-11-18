@@ -46,7 +46,16 @@ impl TrackingAllocator {
     }
 }
 
+// SAFETY: `alloc` and `dealloc` (and the default `alloc_zeroed`/`realloc` built on them) forward
+// every pointer and `Layout` unchanged to `System`, adding only lock-free atomic counter updates
+// that neither allocate nor unwind.
 unsafe impl GlobalAlloc for TrackingAllocator {
+    /// Forwards to [`System::alloc`] and records the allocation in the atomic counters.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`GlobalAlloc::alloc`]: `layout` must have non-zero size, which satisfies the
+    /// inner `System.alloc(layout)` call.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
@@ -70,6 +79,12 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         ptr
     }
 
+    /// Forwards to [`System::dealloc`] and subtracts `layout.size()` from `current_bytes`.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`GlobalAlloc::dealloc`]: `ptr` must denote a block currently allocated via this
+    /// allocator (and therefore [`System`]) with the matching `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
         let size = layout.size() as isize;

@@ -595,7 +595,8 @@ fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
     ] {
         let home = TempDir::new().unwrap();
         let (mut master_fd, mut slave_fd) = (0, 0);
-        // SAFETY: openpty fills both descriptors on success.
+        // SAFETY: `master_fd` and `slave_fd` are distinct writable `c_int` locals, and `openpty`
+        // accepts null for `name`, `termp` and `winp`.
         let rc = unsafe {
             libc::openpty(
                 &mut master_fd,
@@ -606,7 +607,8 @@ fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
             )
         };
         assert_eq!(rc, 0, "openpty");
-        // SAFETY: both descriptors are valid and owned by the files from here on.
+        // SAFETY: `rc == 0` above guarantees `openpty` opened two distinct descriptors, and
+        // nothing else wraps or closes `master_fd` or `slave_fd`.
         let (master, slave) = unsafe {
             (
                 fs::File::from_raw_fd(master_fd),
@@ -614,7 +616,10 @@ fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
             )
         };
         let echo_on = || {
+            // SAFETY: `termios` is plain data, for which all-zero bytes are a valid value.
             let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `slave` stays open for the whole loop body and `t` is a live, writable
+            // `termios` that `tcgetattr` only writes to.
             assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut t) }, 0);
             t.c_lflag & libc::ECHO != 0
         };
@@ -634,8 +639,11 @@ fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // SAFETY: `fds` is one live `pollfd` (`nfds == 1`) for the open `master` descriptor.
             if unsafe { libc::poll(&mut fds, 1, 50) } > 0 {
                 let mut buf = [0u8; 256];
+                // SAFETY: `master` stays open for the whole loop body and `buf` is writable for
+                // `buf.len()` bytes.
                 let n =
                     unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
@@ -650,7 +658,8 @@ fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
             String::from_utf8_lossy(&seen_prompt)
         );
 
-        // SAFETY: signals the child that this test started.
+        // SAFETY: `kill` touches no memory; `child` has not been waited on yet, so its positive
+        // PID still names the `join` child process this test spawned.
         unsafe { libc::kill(child.id() as i32, signal) };
         let status = child.wait().unwrap();
         assert_eq!(

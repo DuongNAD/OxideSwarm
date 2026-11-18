@@ -90,7 +90,8 @@ impl InteractiveJoin {
         use std::os::fd::FromRawFd;
 
         let (mut master_fd, mut slave_fd) = (0, 0);
-        // SAFETY: `openpty` initializes both file descriptors on return code 0.
+        // SAFETY: `master_fd` and `slave_fd` are distinct writable `c_int` locals, and `openpty`
+        // accepts null for `name`, `termp` and `winp`.
         let rc = unsafe {
             libc::openpty(
                 &mut master_fd,
@@ -101,7 +102,8 @@ impl InteractiveJoin {
             )
         };
         assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: both descriptors are valid and uniquely owned from here on.
+        // SAFETY: `rc == 0` above guarantees `openpty` opened two distinct descriptors, and
+        // nothing else wraps or closes `master_fd` or `slave_fd`.
         let (mut pty_master, pty_slave) = unsafe {
             (
                 fs::File::from_raw_fd(master_fd),

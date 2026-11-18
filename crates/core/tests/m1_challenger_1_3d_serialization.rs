@@ -738,6 +738,9 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
     let slice_offset = 1024 * 1024; // 1MB offset
     let slice_len = 2 * 1024 * 1024; // 2MB slice
     let sub_slice = original_task_bytes.slice(slice_offset..slice_offset + slice_len);
+    // SAFETY: `original_task_bytes` keeps its 32 MiB allocation alive past this check and
+    // `slice_offset` is 1 MiB, so `ptr_original.add(slice_offset)` stays within bounds; the
+    // resulting pointer is only compared and formatted.
     let expected_sub_ptr = unsafe { ptr_original.add(slice_offset) };
     assert_eq!(
         sub_slice.inner().as_ptr(),
