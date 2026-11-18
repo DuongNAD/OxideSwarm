@@ -653,7 +653,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery) |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`) |
 | `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](docs/design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
