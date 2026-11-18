@@ -378,17 +378,19 @@ jobs:
           cache-on-failure: true
       - run: cargo test -p rusty_grid_cli --test test_p2p_wan_fallback --locked -- --ignored
 
-  # LV-1: libFuzzer targets of fuzz/ (cargo-fuzz needs a nightly toolchain: dated, so that a new
-  # nightly cannot turn CI red on an unchanged tree). Pull requests and pushes: 60 s per target;
-  # the weekly schedule: 10 minutes per target. The inputs of fuzz/regressions/ run first.
+  # LV-1, LV-18: libFuzzer targets of fuzz/ (cargo-fuzz needs a nightly toolchain: dated, so that a
+  # new nightly cannot turn CI red on an unchanged tree). Pull requests and pushes: 60 s per target;
+  # the weekly schedule: 10 minutes per target. The inputs of fuzz/regressions/ run first. Since
+  # LV-18 the fuzz crate also builds rusty_grid_master and rusty_grid_cli (with iroh), hence the
+  # longer timeout.
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        target: [inbound_frame, server_handshake, tree_manifest]
+        target: [inbound_frame, server_handshake, tree_manifest, aead_record, join_invite, store_journal]
     steps:
       - uses: actions/checkout@v7
       # CI-1: the nightly download failed once (run 44036878952); try it up to four times first, so
