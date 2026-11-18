@@ -55,6 +55,9 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// How long a test waits for a line in a master's log.
+const LOG_WAIT: Duration = Duration::from_secs(20);
+
 fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -83,6 +86,31 @@ impl Service {
     fn log(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    /// Waits until the log contains every one of `needles` and returns it; fails the test with
+    /// the whole log when one is still missing after [`LOG_WAIT`].
+    ///
+    /// The master publishes its ports first and prints "Embedded Dashboard available", the
+    /// dashboard banner and the plain-HTTP warning afterwards, one write per line, so a log read
+    /// once right after the ports appear can stop before any of those lines on a slow runner
+    /// (TEST-50).
+    fn wait_for_log(&self, needles: &[&str]) -> String {
+        wait_for(LOG_WAIT, || {
+            let log = self.log();
+            needles.iter().all(|needle| log.contains(needle))
+        });
+        let log = self.log();
+        let missing: Vec<&str> = needles
+            .iter()
+            .copied()
+            .filter(|needle| !log.contains(needle))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the log never showed {missing:?} within {LOG_WAIT:?}; log:\n{log}"
+        );
+        log
+    }
 }
 
 impl Drop for Service {
@@ -99,6 +127,9 @@ struct Master {
 }
 
 /// Starts `rusty-grid master --listen <listen> ...` and waits until both ports are published.
+///
+/// The startup lines printed after that (the dashboard banner and its warning) may still be on
+/// their way: a test that checks them waits for them with [`Service::wait_for_log`].
 fn start_master(home: &Path, listen: &str, args: &[&str]) -> Master {
     let id = SEQ.fetch_add(1, Ordering::SeqCst);
     let port_file = home.join(format!("master-{id}.port"));
@@ -122,10 +153,6 @@ fn start_master(home: &Path, listen: &str, args: &[&str]) -> Master {
         "master did not publish its ports; log:\n{}",
         service.log()
     );
-    // Give the banner a moment to be flushed after the ports appear.
-    wait_for(Duration::from_secs(5), || {
-        service.log().contains("Embedded Dashboard available")
-    });
     Master {
         grid: SocketAddr::from(([127, 0, 0, 1], read_port(&port_file).unwrap())),
         dashboard: SocketAddr::from(([127, 0, 0, 1], read_port(&dash_file).unwrap())),
@@ -166,7 +193,9 @@ fn home() -> TempDir {
 fn test_a_bare_loopback_master_serves_a_local_dashboard_without_a_login() {
     let home = home();
     let master = start_master(home.path(), "127.0.0.1:0", &["--dashboard-port", "0"]);
-    let log = master.service.log();
+    let log = master
+        .service
+        .wait_for_log(&["Dashboard access: this machine only, no login"]);
 
     assert!(master.dashboard.ip().is_loopback());
     assert_eq!(
@@ -203,11 +232,9 @@ fn test_an_explicit_token_keeps_even_a_loopback_dashboard_locked() {
         http_status(master.dashboard, "/api/status", Some("ops-token")),
         200
     );
-    assert!(
-        !master.service.log().contains("this machine only, no login"),
-        "{}",
-        master.service.log()
-    );
+    // Every banner has a "Dashboard access:" line; wait for it before checking which one it is.
+    let log = master.service.wait_for_log(&["Dashboard access:"]);
+    assert!(!log.contains("this machine only, no login"), "{log}");
 }
 
 #[cfg(unix)]
@@ -216,7 +243,10 @@ fn test_a_master_listening_on_all_interfaces_keeps_its_dashboard_on_loopback_and
     let home = home();
     // `--listen 0.0.0.0` brings in the cluster secret policy (a secret is generated in HOME)...
     let master = start_master(home.path(), "0.0.0.0:0", &["--dashboard-port", "0"]);
-    let log = master.service.log();
+    let log = master.service.wait_for_log(&[
+        "Embedded Dashboard available at http://127.0.0.1:",
+        "secret show --dashboard-token",
+    ]);
 
     // ...but does not drag the dashboard onto the network.
     assert!(
@@ -253,7 +283,10 @@ fn test_dev_mode_is_ignored_and_a_plain_http_warning_printed_for_a_non_loopback_
         "127.0.0.1:0",
         &["--web-ui-addr", "0.0.0.0:0", "--dev"],
     );
-    let log = master.service.log();
+    let log =
+        master
+            .service
+            .wait_for_log(&["WARNING", "plain HTTP", "--dev / OXIDE_DEV_MODE ignored"]);
 
     assert!(log.contains("WARNING"), "log:\n{log}");
     assert!(log.contains("plain HTTP"), "log:\n{log}");
@@ -280,7 +313,8 @@ fn test_a_non_loopback_dashboard_without_dev_or_secret_is_not_open_either() {
         "implicit local access applies to loopback listeners only; log:\n{}",
         master.service.log()
     );
-    assert!(master.service.log().contains("plain HTTP"));
+    let log = master.service.wait_for_log(&["plain HTTP"]);
+    assert!(log.contains("plain HTTP"), "{log}");
 }
 
 #[cfg(unix)]

@@ -230,9 +230,10 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented | 304 |
 | TEST-45 | Keep the second worker of the reaper failover stress test alive | P2 | S |  |  | Implemented | 308 |
 | TEST-46 | Remove the 100 ms bound from the failover latency stress test | P2 | S |  |  | Implemented | 309 |
-| TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
+| TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Implemented | 310 |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
+| TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -333,6 +334,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented | 299 |
+| BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented | 311 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | (design 0088) |
@@ -349,14 +351,21 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned |  |
 | LAUNCH-3 | Record the demo of the user story | P1 | M | LAUNCH-2 | Yes | Planned |  |
-| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3 |  | Planned |  |
+| LAUNCH-4 | Put the demo, the release and the benchmarks at the top of the README | P1 | S | LAUNCH-3, BENCH-7 |  | Planned |  |
 | LAUNCH-5 | Announce the release | P2 | S | LAUNCH-4 | Yes | Planned |  |
 | COORD-1 | Claim design numbers, Q ids, phases and item ids on the hub | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-2 | Changed files on the activity record, with an overlap check | P2 | S |  |  | Implemented | 295, (design 0087) |
 | COORD-3 | One shared place for process lessons | P2 | S |  |  | Implemented | 294, (design 0087) |
 | APP-4 | Trial: Anima Engine trials on the owner's two machines, checksums compared, a sweep through the grid | P1 | S |  | Yes | Planned | (design 0063), (design 0089) |
 | VERIFY-1 | Run a task again on other workers and compare its outputs (`submit --verify`) | P1 | M |  |  | Implemented | 296, (design 0089) |
+| VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented | 312 (open), (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | (design 0089) |
+| BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Planned | (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | (design 0093) |
+| BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | (design 0093) |
+| BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | (design 0093) |
+| BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | (design 0093) |
+| BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -3249,6 +3258,19 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   real leak shows up alone, fix it in capability detection.
 - **Done when:** The cause is named here, and the test passes 200 runs in a row on Windows next to the other
   tests of its binary.
+- **Cause:** Two parts, both measured on the owner's Windows desktop. Alone in its process the count
+  grew by exactly 2 in 5 of 5 runs (147 to 149): handles the first detections allocate once. Next to the
+  other tests of its binary the starting count moved between 169 and 173 from run to run, so the count
+  included other tests' handles. The `+8` of CI was not reproduced exactly here.
+- **Status:** Implemented by pull request 310. A `tokio::sync::RwLock` in the test file
+  (`handle_count_lock`) is taken exclusively by the two tests that count handles
+  (`test_rapid_repeated_detection_sequential_leak_and_stability` and
+  `test_rapid_repeated_detection_concurrent_stress`) and shared by every other test of the file that opens
+  handles (the ten `detect*` override tests and the two CLI end-to-end tests); the serde tests take no lock.
+  Both counting tests run a warm-up detection before the first count. The limits (5 and 15) are unchanged.
+  Afterwards the growth was 0 alone (149 to 149) and next to the other tests (154 to 154, 156 to 156), and
+  the binary takes about 37 s instead of 24 s. The whole binary (all 21 tests, the default parallel
+  harness) passed 200 of 200 runs in a row on Windows, with a handle growth of 0 in every run of both tests.
 
 ### TEST-48: Give each Android bridge test its own worker state
 
@@ -3288,6 +3310,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   20 ms apart, so one second to build the master's state and bind. Both waits now call
   `wait_for_master_bind`, a helper in `runtime_tests.rs` that retries the connect every 20 ms for up to 30 s
   and returns as soon as it succeeds. Every assertion is kept; no other fixed bind wait is left in the file.
+
+### TEST-50: Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e
+
+- **Evidence:** `test_dev_mode_is_ignored_and_a_plain_http_warning_printed_for_a_non_loopback_dashboard`
+  (`tests/cli_dashboard_policy_e2e.rs:258`, `assert!(log.contains("WARNING"))`) failed in `workspace tests
+  (macos-latest)` on 2026-11-17, in pull request 309 (run `44192627449`, attempt 1, job `134425718401`). The
+  log in the panic message ends at `Embedded Dashboard available at http://0.0.0.0:50311`: it has the
+  master's tracing `WARN` about plain HTTP, but neither the banner line `Dashboard access: --dev /
+  OXIDE_DEV_MODE ignored ...` nor the `WARNING: the dashboard is listening on ...` line.
+- **Problem:** `run_master` (`crates/cli/src/cli_app/master.rs`) prints, after `MasterServer::spawn_with_config`
+  has published both port files, `RustyGrid Master started`, the v3 public key, `Embedded Dashboard
+  available`, the `dashboard_banner` lines (`println!`) and then the plain-HTTP `WARNING` (`eprintln!`), one
+  write per line. The test's `start_master` waited for the ports and then (without asserting) up to 5 s for
+  `Embedded Dashboard available`, and each test read the log once. On a slow runner that read can come
+  between two of those writes. A race in the test, not a product defect.
+- **Do:** In every test of the file that checks master log text, wait by condition (20 s bound) until every
+  line it checks is present, print the log on timeout, and keep every assertion.
+- **Done when:** The test binary passes 100 runs in a row under CPU load.
+- **Implemented (2026-11-18, pull request 315):** `Service::wait_for_log(&[needles])` polls the log until it holds every needle,
+  fails with the missing needles and the whole log after `LOG_WAIT` (20 s), and returns the log the test then
+  asserts on. Five tests use it: the bare loopback master (banner line), the explicit token (waits for the
+  `Dashboard access:` line before it checks that the open-access line is absent), the master on all
+  interfaces (dashboard address and `secret show --dashboard-token`), `--dev` on a non-loopback dashboard
+  (`WARNING`, `plain HTTP`, `--dev / OXIDE_DEV_MODE ignored`) and the non-loopback dashboard without `--dev`
+  (`plain HTTP`). The unasserted 5 s wait in `start_master` is gone; no fixed sleep is added. On an Apple
+  Silicon Mac (10 cores), two copies of the test binary at once, 100 runs each: 200 of 200 passed next to 12
+  spinning processes and 200 of 200 next to 40. The old file did not fail here either (200 of 200 at each
+  load), so the race was not reproduced locally; the CI log above is the evidence. No other test file reads
+  the master's banner lines once after start-up.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -3397,6 +3448,23 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   re-checks repeat once after 250 ms; `Sandbox::create` refusals cover the base errors and I/O errors under the base.
   The existing `avoid_workers` and `MAX_WORKER_REJECTIONS_PER_TASK` logic prevents a loop, so no new guard. Test:
   `crates/master/tests/sandbox_base_hand_back.rs`; design 0090.
+
+### BUG-26: Keep the `ox-mode dev cluster` master off the default discovery port
+
+- **Evidence:** Seen with the master log that TEST-43 (pull request 307) adds: the master that
+  `launch_local_dev_cluster_with_ports` starts (`crates/cli/src/mode_cli.rs`) logged `Master UDP Discovery
+  beacon & query responder active bind_addr=127.0.0.1:8089 discovery_port=8089`. It is started without
+  `--discovery-port`, so it takes the default port 8089, on a developer machine that may also run a real
+  cluster, and in the tests that start a dev cluster.
+- **Problem:** The dev cluster's two workers connect with `--master 127.0.0.1:<port>`, so nothing uses its
+  beacon, but the beacon still answers discovery queries on 8089 and can collide with a master that uses the
+  default port on the same machine.
+- **Do:** Start the dev cluster's master with `--discovery-port 0`, which turns the beacon off.
+- **Done when:** The dev cluster's master binds no UDP discovery port, and the dev cluster tests pass.
+- **Status:** Implemented by pull request 311. Both branches of the launcher (isolated home and workspace)
+  pass `--discovery-port 0`; the change adds no line to `mode_cli.rs`, which is at its allowlisted size.
+  While the four dev cluster tests ran on Windows, a watcher listed the UDP endpoints of every `rusty-grid.exe`
+  they started: none with this change; `master 127.0.0.1:8089` with the build before it.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
@@ -3887,10 +3955,91 @@ their first user (Q88), then APP-5.
   `--verify-file`); `verified` or `mismatch` (exit 4), a `verify` object with `--json`, and the same in MCP `submit`.
   `tests/verify_e2e.rs` (Unix) covers verified, mismatch, too few workers, `--verify-file`, the refusals and MCP.
 
+### VERIFY-2: Replicas of `submit --verify` on the same operating system and architecture by default
+
+- **Evidence:** Design 0089 D6. On 2026-11-17 APP-4 ran the same deterministic Anima Engine trial (same commit,
+  same rustc, byte-identical inputs, on the CPU) on Windows x86_64 and on macOS arm64: the final checksums differ
+  in all three arms (control: Windows 2546342991, macOS 1859816024), while five repeat runs on Windows agree. A
+  replica on the other system reports a false mismatch (exit 4).
+- **Do:** By default `submit --verify` picks replicas only among workers whose `os:` and `arch:` tags equal those of
+  the worker that ran the first copy (a tag that worker lacks is not compared, with one notice); the too-few error
+  names the system and `--verify-any-system`; `--verify-any-system` (MCP `verify_any_system`) allows any matching
+  worker. The report names each worker's system.
+- **Done when:** Unit tests of `pick_targets` with mixed `os:`/`arch:` tags pass and `tests/verify_e2e.rs` still
+  passes.
+- **Implemented (2026-11-18, pull request 312):** `crates/cli/src/verify.rs` (`System`, `pick_targets(.., any_system)`), the
+  `--verify-any-system` flag, `verify_any_system` in the MCP `submit` tool, and `os` / `arch` per worker in the
+  `verify` JSON object.
+
 ### APP-5: Guide: Anima Engine sweeps on OxideSwarm, with a recorded run
 
 - **Do:** `docs/guides/anima-engine-sweeps.md` as design 0089 D5, with GPU and CPU variants and VERIFY-1.
 - **Done when:** The guide exists with a recorded sweep and is linked from `README.md`.
+
+## Phase 17: benchmarks worth showing
+
+From [design 0093](design/0093-benchmarks-worth-showing.md). The owner asked on 2026-11-18 whether the
+benchmarks are strong enough to show. The records are scripted and honest, but none of them measures a
+second machine against the fastest machine alone, offload against the laptop itself, or two machines on
+different networks. Every record follows the method of design 0093 D1: the plan is committed before the run,
+the baseline is the fastest machine alone, and efficiency is measured against the sum of what each machine
+does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 before LAUNCH-4.
+
+### BENCH-2: The method and the sweep harness for benchmark records
+
+- **Evidence:** Design 0093 D1. `benchmarks/grid/bench_grid.py` measures loopback only and has no local
+  baseline; DOC-2 shows a report that compared the cluster with its slowest machine.
+- **Do:** Add `benchmarks/sweep/bench_sweep.py` and the synthetic workload `benchmarks/sweep/workload_cpu.py`
+  (W1, standard library, work per task as a parameter), and `benchmarks/sweep/README.md` with the method of
+  D1. The harness runs a workload locally at 1, half and all logical cores, and through a cluster with
+  `submit --json`; it writes the record of D1 rule 5. Add `tests/test_bench_sweep.py` to the CI job
+  `agent-bridge`.
+- **Done when:** `bench_sweep.py --quick --no-write` runs W1 locally and through a loopback cluster, and the
+  helper tests pass in CI on Linux, macOS and Windows.
+
+### BENCH-3: Sweep scaling
+
+- **Evidence:** Design 0093 D2. No record runs real work on two machines against the fastest one alone.
+- **Do:** On the Mac and the Windows case machine, as D2: K trials on each machine alone, through the grid
+  on each worker, then on both; W1 at K = 200 and, by Q90, the Anima Engine runner (W2) at K = 60. A master
+  for the run has a private home, its own port and a secret made for the run. The W2 record also completes
+  step 3 of APP-4.
+- **Done when:** The records are committed under `benchmarks/sweep/results/` with speedup against the
+  fastest machine and efficiency against the sum of both.
+
+### BENCH-4: Offload against local work
+
+- **Evidence:** Design 0093 D3. BENCH-1 (c) never timed the same command on the Mac itself.
+- **Do:** Run `cargo test -p rusty_grid_core --lib --offline` and `cargo build --release --locked --bin
+  oxideswarm` locally on each machine and offloaded from the Mac, cold, warm and after a one-line edit, and
+  record the CPU seconds the Mac spends in each arm. The ssh arm runs only if Q92 is yes.
+- **Done when:** A record holds every arm of D3.
+
+### BENCH-5: Per-task overhead and the break-even task length
+
+- **Evidence:** Design 0093 D4. BENCH-1 (a) measures empty tasks on loopback only.
+- **Do:** On the LAN, W1 tasks of 0, 10 ms, 100 ms, 1 s and 10 s on the fastest machine alone and through the
+  grid on one and two workers, with one CLI process per task and with one long-lived client.
+- **Done when:** A record gives p50 and p95, throughput and efficiency per task length, and the shortest
+  length at which two workers beat the fastest machine alone.
+
+### BENCH-6: Two networks
+
+- **Evidence:** Design 0093 D5. No record measures two machines on different networks; design 0054 plans
+  clusters across the internet.
+- **Do:** With the Mac on a phone's hotspot (the owner switches it) and the Windows worker on the home LAN:
+  `doctor --json` (link kind, round-trip time, MB/s), 100 empty tasks, one 100 MiB input, and BENCH-3 with W1
+  at K = 50; then the same on the LAN the same day.
+- **Done when:** Both records are committed. A relayed link is recorded as it is.
+
+### BENCH-7: Benchmark headlines at the top of the README
+
+- **Evidence:** Design 0093 D6. `README.md` links the hand-typed interconnect report as the comparative
+  benchmark.
+- **Do:** Lead the "Measured" table of `README.md` with the headlines of BENCH-3 to BENCH-6, each linked to
+  its record. Handle the interconnect report by Q91 (default: unlink it from the README and keep the file
+  with its header).
+- **Done when:** The first "Measured" rows link to the records, and `ox-mode doc` passes.
 
 ## Status log
 
@@ -4285,3 +4434,5 @@ Add one dated line per finished item, newest last.
   first workload; Q88 and Q89 decided by the owner's delegation): APP-4, VERIFY-1 (pull request 296) and APP-5.
   Counted from the rows, the Index holds 191 items: 109 Implemented, 13 Partial and 69 Planned.
 - 2026-11-17: VERIFY-1 Implemented (pull request 296). The Index counts are 110 Implemented, 13 Partial and 68 Planned (191 items).
+- 2026-11-18: Phase 17 added from design 0093 (benchmarks worth showing; ids claimed on the hub):
+  BENCH-2 to BENCH-7, all Planned; LAUNCH-4 now also needs BENCH-7. Q90 to Q92 open.

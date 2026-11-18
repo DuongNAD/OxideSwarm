@@ -298,6 +298,7 @@ jobs:
       - run: python tests/test_release_skew.py
       - run: python tests/test_bench_grid.py
       - run: python tests/test_scale_harness.py
+      - run: python tests/test_bench_sweep.py
       - name: run agent mesh test suite
         run: python tests/run_mesh_simulation_tests.py
 

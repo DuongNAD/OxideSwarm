@@ -756,6 +756,7 @@ async fn verify_on_other_workers(
     first_name: Option<String>,
     replicas: usize,
     verify_file: Option<&str>,
+    any_system: bool,
 ) -> Result<crate::verify::Report, String> {
     let connect = || async {
         connect_master(master_addr, secret)
@@ -776,6 +777,7 @@ async fn verify_on_other_workers(
             first_name,
             replicas,
             file: verify_file,
+            any_system,
         },
         connect,
     )
@@ -1265,6 +1267,7 @@ async fn run_submit_with_secret_inner(
                         worker_name.clone(),
                         replicas,
                         args.verify_file.as_deref(),
+                        args.verify_any_system,
                     )
                     .await,
                 ),
