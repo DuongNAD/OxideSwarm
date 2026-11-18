@@ -1,8 +1,9 @@
 # OxideSwarm USB uninstaller for Windows (kit format v0 / v1, design 0053 / 0055).
 # Stops the worker this kit installed, revokes any oxideswarm.toolchain ACL grants recorded in its
 # manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its folder
-# (binaries, credentials, logs, task folders and file cache), and %TEMP%\oxideswarm-usb. Nothing else
-# is touched. Without -InstallRoot it removes the install the installer recorded in HKCU (another
+# (binaries, credentials, logs, task folders and file cache), and %TEMP%\oxideswarm-usb (the task
+# folders of an install with -Isolation fs in %LOCALAPPDATA%, and of installs before 2026-11-18).
+# Nothing else is touched. Without -InstallRoot it removes the install the installer recorded in HKCU (another
 # drive included), else %LOCALAPPDATA%\OxideSwarm-USB (or %LOCALAPPDATA%\OxideSwarm for an older
 # install). Pass -KeepKey to retain <install folder>\home\node.key for rejoining with the same identity.
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-InstallRoot DIR] [-KeepKey] [-Yes]
@@ -107,7 +108,23 @@ $WorkspacesDir = Join-Path $InstallRoot 'workspaces'
 if (Test-Path -LiteralPath $WorkspacesDir) {
     $wsMarker = Join-Path $WorkspacesDir '.oxideswarm-usb-workspaces'
     $foreignUsers = @(Get-WorkspaceDirUsers $WorkspacesDir $Exe $DefaultWorkerWorkspaceRoot)
-    if (-not (Test-Path -LiteralPath $wsMarker) -or $foreignUsers.Count -gt 0) {
+    # An install from a kit older than the .oxideswarm-usb-workspaces marker (BUG-30): its workspaces
+    # folder counts as the kit's when the install folder carries the installer's own marker, the
+    # folder is a real one directly inside it with no link anywhere inside, no running worker or
+    # service uses it, and it is not the default workspace root of a non-USB worker.
+    $olderKitWorkspaces = $false
+    if (-not (Test-Path -LiteralPath $wsMarker) -and $foreignUsers.Count -eq 0 -and
+        -not [string]::Equals($WorkspacesDir, $DefaultWorkerWorkspaceRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath (Join-Path $InstallRoot '.oxideswarm-usb-install'))) {
+        $wsItem = Get-Item -LiteralPath $WorkspacesDir -Force
+        $wsLinks = @(Get-ChildItem -LiteralPath $WorkspacesDir -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | Select-Object -First 1)
+        if ($wsItem.PSIsContainer -and -not ($wsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $wsLinks.Count -eq 0) {
+            $olderKitWorkspaces = $true
+        }
+    }
+    if ($olderKitWorkspaces) {
+        Write-Host "$WorkspacesDir has no .oxideswarm-usb-workspaces marker: an install from an older kit, and no other worker uses it."
+    } elseif (-not (Test-Path -LiteralPath $wsMarker) -or $foreignUsers.Count -gt 0) {
         if ($foreignUsers.Count -gt 0) {
             Write-Host "ERROR: $WorkspacesDir is used by $($foreignUsers -join '; '); not touching $InstallRoot." -ForegroundColor Red
         } elseif ([string]::Equals($WorkspacesDir, $DefaultWorkerWorkspaceRoot, [StringComparison]::OrdinalIgnoreCase)) {

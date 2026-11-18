@@ -95,7 +95,9 @@ Each installer does the following, without administrator rights:
 2. It writes an install log to `<folder>/logs/install.log`, unpacks the binary into a per-user
    folder (`~/Library/Application Support/OxideSwarm`, `%LOCALAPPDATA%\OxideSwarm-USB`, or
    `~/.local/share/oxideswarm`), and automatically rolls back newly created files/registry entries if
-   a fresh install fails (such as a wrong passphrase).
+   a fresh install fails (such as a wrong passphrase). Once the worker has been started, the rollback
+   keeps `<folder>/logs` (`worker.log` and `install.log`, readable by the current user only), so the
+   error can name a log that still exists; delete that folder when you no longer need it.
 3. It joins the cluster (`oxideswarm join --invite-file invite.oxs --no-doctor` on v1, prompting for
    the 4-word passphrase and pairing check confirmation) and seeds `worker_id.<name>` from
    `cluster.secret` or `master_key` in `rusty-grid.toml`.
@@ -125,8 +127,9 @@ Each installer does the following, without administrator rights:
      on Windows (or `-Isolation fs` / `make_kit.sh --isolation fs` when opted in; on Windows,
      `install.ps1` and `start-worker.vbs` set `OXIDESWARM_HOME=<folder>\home`,
      `RUSTY_GRID_ACL_GRANT_LOG=<folder>\home\windows_acl_grants.txt`, and
-     `RUSTY_GRID_SANDBOX_BASE_DIR=%TEMP%\oxideswarm-usb\sandboxes` (`<folder>\work` for a folder
-     outside `%LOCALAPPDATA%`), while `start-worker.vbs` also
+     `RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work` (`%TEMP%\oxideswarm-usb\sandboxes` only for an
+     install in `%LOCALAPPDATA%` with `-Isolation fs`, see "Task folders on Windows" below), while
+     `start-worker.vbs` also
      sets `HOME=<folder>\home` — so worker child processes read `HOME`-based git/ssh config from
      `<folder>\home` in both `off` and `fs` modes — and explicit `RUSTUP_HOME` / `CARGO_HOME` so
      `oxideswarm.toolchain` ACL grants are recorded in `<folder>\home\windows_acl_grants.txt` on
@@ -137,7 +140,10 @@ Each installer does the following, without administrator rights:
      and exits `0xC0000142` unless invoked as `C:\Windows\System32\whoami.exe`; release **0.1.2+**
      supports `--workspaces` under `-Isolation fs` and resolves bare `whoami` to
      `%SystemRoot%\System32\whoami.exe`).
-5. It waits until `oxideswarm workers --json` lists the worker as connected.
+5. It waits until `oxideswarm workers --json` lists the worker as connected, at most 30 seconds, and
+   checks every second that the worker still runs. When the worker stops (or is not listed in time),
+   the installer prints the last 30 lines of `<folder>/logs/worker.log` under a header, then an error
+   with the worker's exit code that names the log, which the rollback keeps.
 6. It adds a start at login: a LaunchAgent, an `HKCU` Run entry, or a `systemd --user` unit.
 7. It runs `oxideswarm doctor`.
 
@@ -189,8 +195,11 @@ An install that uses the GPU build is not updated from a kit without one, unless
 ### Another drive on Windows
 
 When the machine has another fixed NTFS or ReFS drive, `install.ps1` asks where to keep its files
-and lists `%LOCALAPPDATA%\OxideSwarm-USB` (the default) and `<drive>:\OxideSwarm-USB` for each such
-drive, with the free space. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
+and lists `%LOCALAPPDATA%\OxideSwarm-USB` (the default, always first) and `<drive>:\OxideSwarm-USB`
+for each such drive, with the free space. A drive is offered only when the folder on it passes the
+same check the install runs (no other account may rename or re-permission a folder on the way to it,
+or delete or re-permission folders at the drive root); a drive that fails it is listed without a
+number, as `not usable`, with the reason. Without a terminal to ask, it takes the default. `-InstallRoot <DIR>` names
 the folder in advance (`-Update` still accepts legacy `%LOCALAPPDATA%\OxideSwarm` installs, while
 fresh installs refuse `%LOCALAPPDATA%\OxideSwarm` and `%LOCALAPPDATA%\oxideswarm\workspaces` so they
 never collide with a non-USB worker's default workspace root). A folder outside `%LOCALAPPDATA%`:
@@ -204,8 +213,8 @@ never collide with a non-USB worker's default workspace root). A folder outside 
   on, and no folder on the way to it may be renamed, deleted or re-permissioned by another account.
   The result is checked before anything is written, for an update too. A new folder at the root of
   a data drive otherwise lets every local account change its content;
-- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`),
-  while `%TEMP%\oxideswarm-usb\sandboxes` holds task folders for an install under `%LOCALAPPDATA%`.
+- also holds the task folders and the file cache (`RUSTY_GRID_SANDBOX_BASE_DIR=<folder>\work`), as
+  an install under `%LOCALAPPDATA%` does (see "Task folders on Windows").
   In both locations, whenever `--workspaces` is enabled, `install.ps1` always passes
   `--workspace-root <folder>\workspaces` (or `<folder>\usb-kit\workspaces` when updating a legacy
   `%LOCALAPPDATA%\OxideSwarm` install) and marks it with `.oxideswarm-usb-workspaces`.
@@ -214,8 +223,28 @@ The installer records the folder in `HKCU\Software\OxideSwarm\UsbKit`, and `unin
 that install when it gets no `-InstallRoot` (falling back to `%LOCALAPPDATA%\OxideSwarm-USB`, then
 legacy `%LOCALAPPDATA%\OxideSwarm`). Before stopping or deleting anything, `uninstall.ps1` refuses to
 remove `$InstallRoot` if `$InstallRoot\workspaces` lacks `.oxideswarm-usb-workspaces` or is used by
-another worker or service, naming which worker uses it. While an install exists in one folder, the
-installer refuses another one unless `-InstallRoot` asks for it.
+another worker or service, naming which worker uses it. An install from a kit older than that marker
+is still removed when the install folder carries the installer's own `.oxideswarm-usb-install`
+marker, `workspaces` is a real folder with no link inside, no running worker or service uses it, and
+it is not `%LOCALAPPDATA%\oxideswarm\workspaces` (the default workspace root of a non-USB worker).
+While an install exists in one folder, the installer refuses another one unless `-InstallRoot` asks
+for it.
+
+### Task folders on Windows
+
+The worker keeps its task folders and file cache (its sandbox base) in `<folder>\work`, wherever the
+install folder is. The one exception is an install under `%LOCALAPPDATA%` with `-Isolation fs`: the
+isolated worker accepts no other folder inside the user profile than one under `%TEMP%`, so that
+install uses `%TEMP%\oxideswarm-usb\sandboxes`, which `uninstall.ps1` removes. Installs made before
+2026-11-18 used `%TEMP%\oxideswarm-usb\sandboxes` for every install under `%LOCALAPPDATA%`; an update
+keeps the folder an install already uses unless the worker can no longer use it.
+
+Before it joins, the installer checks that folder the way the worker will: no other account may
+rename, delete or re-permission a folder on the way to it, delete or re-permission folders at the
+drive root, or write in the folder itself. When the check fails, it stops with, for example, `your
+Temp folder (C:\Users\<you>\AppData\Local\Temp) lets these accounts change it: ...`, and prints the
+`icacls "<folder>" /remove:g "*<SID>" ...` command that removes those grants. It never runs that
+command: changing the permissions of your folders is your decision.
 
 The checks in steps 5 and 7 run with `RUST_LOG=off`, because release 0.1.x writes informational
 logs to standard output. On Windows PowerShell 5.1, `install.ps1` escapes the double quotes of a P2P
