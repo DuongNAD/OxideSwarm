@@ -2385,6 +2385,32 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   While the four dev cluster tests ran on Windows, a watcher listed the UDP endpoints of every `rusty-grid.exe`
   they started: none with this change; `master 127.0.0.1:8089` with the build before it.
 
+### BUG-28: Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint
+
+- **Evidence:** Starting `oxideswarm worker --master <ticket>` with an iroh P2P ticket left `p2p_ticket`
+  unset and logged plain TCP `TcpStream::connect` `"invalid port value"` errors, while `--p2p-ticket <ticket>`
+  worked. `README.md` (`worker --master <ADDR|auto>`) and `worker --help` document only `HOST:8088`, bare `HOST`,
+  and `auto` for `--master`, with `--p2p-ticket <TICKET>` as the worker's P2P ticket flag.
+- **Problem:** `resolve_worker_target` (`crates/cli/src/cli_app/worker.rs`) called `normalize_master_addr`,
+  which returns `is_p2p_ticket` strings verbatim, and cleared `p2p_ticket` whenever an explicit master string
+  was supplied, so the ticket flowed into `WorkerConfig::master_addr` and `WorkerClient::establish_tcp` tried to
+  dial it over TCP.
+- **Do:** Reject P2P tickets (`is_p2p_ticket`) upfront in `resolve_worker_target_from` (`--master`,
+  `RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) with a clear error pointing to `--p2p-ticket`
+  without echoing the raw ticket, write a failing unit test first generating a fresh ticket from `iroh::SecretKey`
+  at runtime, and document the hint in `worker --master` help and `README.md`.
+- **Done when:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  and `cargo test -p rusty_grid_cli --locked --lib` pass, with the new ticket unit tests confirmed failing
+  before the fix.
+- **Implemented (2026-11-18, pull request 334):** `resolve_worker_target_from` checks `is_p2p_ticket` on the
+  selected target source before calling `normalize_master_addr` and returns
+  `"this looks like a P2P ticket; use --p2p-ticket ..."` without interpolating the ticket; `run_worker` exits with
+  `ExitCode::FAILURE` before credential resolution or networking. Both `worker::tests` tests (testing `--master`,
+  `RUSTY_GRID_MASTER_ADDR`, `[worker].master`, `--p2p-ticket`, and `run_worker` with an `EndpointAddr` JSON ticket
+  generated at runtime from `iroh::SecretKey::generate()`) failed before the fix and pass after (`201 passed; 0
+  failed` in `rusty_grid_cli --lib`). Added the hint to `WorkerArgs::master` in `crates/cli/src/cli_app.rs` and
+  `README.md`.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
