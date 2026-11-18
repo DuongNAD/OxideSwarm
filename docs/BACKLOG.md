@@ -1634,7 +1634,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** The guide exists and is in the index of `docs/README.md`. Proof run V3 is
   recorded with its date in the status log of design 0058. Until a second person has cut a
   release, the item is Partial.
-- **Status (2026-11-18, Partial):** Pull request 351 (open) adds `docs/guides/cut-a-release.md`
+- **Note (2026-11-18):** Pull request 351 (open) adds `docs/guides/cut-a-release.md`
   (covering wire-change rules, release PR preparation, owner merge and `v*` tag push, `SHA256SUMS`
   and `gh attestation verify` checks, isolated macOS and Windows loopback smoke checks, and the step
   2 accounts and workflow-permissions skeleton table) and adds it to `docs/README.md`. Confirming
@@ -2232,3 +2232,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
+- 2026-11-18: LV-15 Partial (pull request 351): guide and accounts skeleton; step 2 holders, steps 3 and 4 stay with the owner.
