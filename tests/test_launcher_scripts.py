@@ -1970,8 +1970,9 @@ public class Program {
 
                 # 2a. Install using baked isolation=fs from kit\isolation, then uninstall (revoking manifest).
                 # Under %LOCALAPPDATA%, where a double-clicked install goes: a folder elsewhere on the
-                # kit's own drive is refused (a CI runner has only one drive).
-                inst_root_fs = os.path.join(tmp_localappdata, "installed-fs")
+                # kit's own drive is refused (a CI runner has only one drive), and under -Isolation fs
+                # + workspaces the worker only accepts the default OxideSwarm-USB path inside the profile.
+                inst_root_fs = os.path.join(tmp_localappdata, "OxideSwarm-USB")
                 inst_fs = subprocess.run(
                     [
                         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1987,6 +1988,11 @@ public class Program {
                 self.assertIn("--isolation fs", vbs_text)
                 self.assertIn("RUSTY_GRID_ACL_GRANT_LOG", vbs_text)
                 self.assertIn("RUSTY_GRID_SANDBOX_BASE_DIR", vbs_text)
+                if shutil.which("cargo"):
+                    self.assertIn("--workspaces --workspace-root", vbs_text)
+                    self.assertTrue(
+                        os.path.isfile(os.path.join(inst_root_fs, "workspaces", ".oxideswarm-usb-workspaces"))
+                    )
                 manifest_fs = os.path.join(inst_root_fs, "home", "windows_acl_grants.txt")
                 self.assertTrue(os.path.isfile(manifest_fs))
 
@@ -2118,7 +2124,7 @@ public class Program {
             finally:
                 for pid_candidate in (
                     pids_log,
-                    os.path.join(tmp_localappdata, "installed-fs", "run", "worker.pid"),
+                    os.path.join(tmp_localappdata, "OxideSwarm-USB", "run", "worker.pid"),
                     os.path.join(tmp_localappdata, "installed-off", "run", "worker.pid"),
                 ):
                     if os.path.isfile(pid_candidate):
@@ -3436,6 +3442,25 @@ public class Program {
             self.assertIn("with -Isolation fs and workspaces", bad_profile_res.stdout)
             self.assertFalse(os.path.exists(custom_profile_root), bad_profile_res.stdout)
 
+            # ... while the default %LOCALAPPDATA%\OxideSwarm-USB root succeeds under -Isolation fs
+            # with workspaces and writes the .oxideswarm-usb-workspaces marker.
+            ok_fs_res = powershell(
+                install_ps1, "-InstallRoot", default_root, "-Name", "win-kit-test",
+                "-Isolation", "fs", "-Workspaces", "-NoAutostart", timeout=120,
+            )
+            self.assertEqual(ok_fs_res.returncode, 0, ok_fs_res.stdout)
+            self.assertIn("connected (isolation: fs)", ok_fs_res.stdout)
+            ok_fs_vbs = read(os.path.join(default_root, "start-worker.vbs"))
+            self.assertIn("--isolation fs", ok_fs_vbs)
+            if shutil.which("cargo"):
+                self.assertIn("--workspaces --workspace-root", ok_fs_vbs)
+                self.assertTrue(
+                    os.path.isfile(os.path.join(default_root, "workspaces", ".oxideswarm-usb-workspaces"))
+                )
+            un_ok_fs = powershell(uninstall_ps1, "-InstallRoot", default_root, "-Yes")
+            self.assertEqual(un_ok_fs.returncode, 0, un_ok_fs.stdout)
+            self.assertFalse(os.path.exists(default_root))
+
             # BUG-31: a worker that stops 5 s after its start is reported as stopped with its exit
             # code, the end of its log is printed, and the rollback keeps the log the error names.
             stop_root = os.path.join(tmp_localappdata, "stop-root")
@@ -3506,6 +3531,13 @@ public class Program {
             self.assertNotEqual(unmarked.returncode, 0, unmarked.stdout)
             self.assertIn(".oxideswarm-usb-install", unmarked.stdout)
             self.assertTrue(os.path.isdir(os.path.join(unmarked_root, "workspaces")))
+
+            # ... and so is a directory masquerading as the .oxideswarm-usb-workspaces marker.
+            dir_marker_root = old_install("dir-marker-kit")
+            os.makedirs(os.path.join(dir_marker_root, "workspaces", ".oxideswarm-usb-workspaces"))
+            dir_marker_res = powershell(uninstall_ps1, "-InstallRoot", dir_marker_root, "-Yes")
+            self.assertNotEqual(dir_marker_res.returncode, 0, dir_marker_res.stdout)
+            self.assertTrue(os.path.isdir(os.path.join(dir_marker_root, "workspaces")))
         finally:
             if other_proc is not None and other_proc.poll() is None:
                 other_proc.kill()

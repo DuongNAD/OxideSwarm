@@ -124,7 +124,7 @@ if (Test-Path -LiteralPath $WorkspacesDir) {
     }
     if ($olderKitWorkspaces) {
         Write-Host "$WorkspacesDir has no .oxideswarm-usb-workspaces marker: an install from an older kit, and no other worker uses it."
-    } elseif (-not (Test-Path -LiteralPath $wsMarker) -or $foreignUsers.Count -gt 0) {
+    } elseif (-not (Test-Path -LiteralPath $wsMarker -PathType Leaf) -or $foreignUsers.Count -gt 0) {
         if ($foreignUsers.Count -gt 0) {
             Write-Host "ERROR: $WorkspacesDir is used by $($foreignUsers -join '; '); not touching $InstallRoot." -ForegroundColor Red
         } elseif ([string]::Equals($WorkspacesDir, $DefaultWorkerWorkspaceRoot, [StringComparison]::OrdinalIgnoreCase)) {

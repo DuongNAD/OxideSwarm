@@ -1561,24 +1561,41 @@ mod tests {
             .join("AppData")
             .join("Local")
             .join("OxideSwarm-USB");
+        let usb_ws = usb_root.join("workspaces");
         let usb_sibling = usb_root.join("other");
+        let usb_evil = usb_root.join("workspaces-evil");
         let legacy_usb_root = fake_profile
             .path()
             .join("AppData")
             .join("Local")
             .join("OxideSwarm")
             .join("usb-kit");
+        let legacy_usb_ws = legacy_usb_root.join("workspaces");
         let legacy_usb_sibling = legacy_usb_root.join("other");
-        for dir in [&usb_sibling, &legacy_usb_sibling] {
+        let legacy_usb_evil = legacy_usb_root.join("workspaces-evil");
+        for dir in [
+            &usb_ws,
+            &usb_sibling,
+            &usb_evil,
+            &legacy_usb_ws,
+            &legacy_usb_sibling,
+            &legacy_usb_evil,
+        ] {
             std::fs::create_dir_all(dir).unwrap();
         }
+        let usb_dotdot = usb_ws.join("..").join("other");
+        let legacy_dotdot = legacy_usb_ws.join("..").join("other");
 
         let host = HostDirs::from_home(fake_profile.path().to_path_buf(), None, None);
         for bad in [
             &usb_root,
             &usb_sibling,
+            &usb_evil,
+            &usb_dotdot,
             &legacy_usb_root,
             &legacy_usb_sibling,
+            &legacy_usb_evil,
+            &legacy_dotdot,
         ] {
             let err = windows::validate_workspace_root_safe(bad, &host).expect_err(&format!(
                 "must refuse non-allowlisted user-profile folder {}",
@@ -1672,6 +1689,33 @@ mod tests {
                 "skipping test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction: host cannot create junctions or file symlinks"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_bug32_refuses_uppercase_usb_workspaces_marker_name() {
+        // `install.ps1` always writes exact lowercase `.oxideswarm-usb-workspaces`, and
+        // `validate_workspace_root_safe` checks reserved metadata names (`store.lock`, `.locks`,
+        // `.oxideswarm-usb-workspaces`) case-sensitively against `read_dir` entries; therefore
+        // `.OXIDESWARM-USB-WORKSPACES` is expected to be refused.
+        let fake_profile = tempfile::tempdir().unwrap();
+        let ws_root = fake_profile
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::write(
+            ws_root.join(".OXIDESWARM-USB-WORKSPACES"),
+            "Created by an OxideSwarm USB kit install.\n",
+        )
+        .unwrap();
+
+        let host = HostDirs::from_home(fake_profile.path().to_path_buf(), None, None);
+        let err = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("must refuse upper-case .OXIDESWARM-USB-WORKSPACES marker name");
+        assert!(err.contains(".OXIDESWARM-USB-WORKSPACES"), "{err}");
     }
 
     #[test]

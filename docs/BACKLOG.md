@@ -1348,15 +1348,20 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `.oxideswarm-usb-workspaces` only when `std::fs::symlink_metadata` confirms a regular non-reparse
   file, refuse custom `-InstallRoot` paths inside `%USERPROFILE%` under `-Isolation fs` with
   workspaces before installing in `packaging/usb/install.ps1`, and cover both in tests.
-- **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction
-  markers and sibling user-profile paths are refused, `install.ps1` refuses custom profile roots
-  before creating directories, and the worker/isolation/launcher checks pass on Windows.
+- **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction/upper-case-name
+  markers and sibling/`workspaces-evil`/`..`-escape user-profile paths are refused, `install.ps1` refuses
+  custom profile roots before creating directories and installs cleanly in `<LOCALAPPDATA>\OxideSwarm-USB`
+  under `-Isolation fs` with workspaces, `uninstall.ps1` requires `.oxideswarm-usb-workspaces` to be a
+  regular file (`-PathType Leaf`), and the worker/isolation/launcher checks pass on Windows (with known
+  unrelated host caveats recorded separately).
 - **Implemented (2026-11-19, pull request 352, open):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
   and `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` to `is_allowed_under_home` and accepted
-  regular non-reparse `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
+  regular non-reparse lowercase `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
   `validate_workspace_root_safe` (`crates/worker/src/isolation/windows/toolchain.rs`); added unit
-  tests in `crates/worker/src/isolation.rs`; and added the pre-install profile check in
-  `packaging/usb/install.ps1` with static and runtime checks in `tests/test_launcher_scripts.py`.
+  tests in `crates/worker/src/isolation.rs` (including `workspaces-evil`, `workspaces\..\other`, and
+  `.OXIDESWARM-USB-WORKSPACES`); added the pre-install profile check in `packaging/usb/install.ps1`
+  and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
+  `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
 
 ## Phase 13: the path to finished
 
