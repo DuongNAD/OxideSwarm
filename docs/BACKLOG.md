@@ -233,7 +233,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-47 | Count only this test's handles in the capability-detection leak test | P2 | S |  |  | Planned |  |
 | TEST-48 | Give each Android bridge test its own worker state | P2 | S |  |  | Implemented | 300 |
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented | 301 |
-| TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented |  |
+| TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented | 315 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -3270,7 +3270,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** In every test of the file that checks master log text, wait by condition (20 s bound) until every
   line it checks is present, print the log on timeout, and keep every assertion.
 - **Done when:** The test binary passes 100 runs in a row under CPU load.
-- **Implemented (2026-11-18):** `Service::wait_for_log(&[needles])` polls the log until it holds every needle,
+- **Implemented (2026-11-18, pull request 315):** `Service::wait_for_log(&[needles])` polls the log until it holds every needle,
   fails with the missing needles and the whole log after `LOG_WAIT` (20 s), and returns the log the test then
   asserts on. Five tests use it: the bare loopback master (banner line), the explicit token (waits for the
   `Dashboard access:` line before it checks that the open-access line is absent), the master on all
