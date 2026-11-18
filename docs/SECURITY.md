@@ -4,6 +4,10 @@ This page says what OxideSwarm protects, what it deliberately does not, which po
 handle the shared cluster secret. It describes the code as it is in this repository; anything planned is
 marked "not implemented".
 
+To check that a release archive is intact and was built by this repository's workflow, and from which commit,
+compare it with `SHA256SUMS` and run `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm`
+([README, Install](../README.md#install)).
+
 ## 1. In one paragraph
 
 A master hands arbitrary commands (shell scripts, programs, compile jobs) to workers, and workers run them

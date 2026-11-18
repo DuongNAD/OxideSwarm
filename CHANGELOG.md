@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - The clippy lint `undocumented_unsafe_blocks` is `deny` for the whole workspace (`[workspace.lints.clippy]`), so an `unsafe` block or `unsafe impl` without a `// SAFETY:` comment fails the required clippy jobs on Linux, macOS and Windows; a new CI job, `miri (rusty_grid_core)`, runs the unit tests of `rusty_grid_core` under Miri on Linux on the dated nightly of the fuzz jobs, with the 93 tests Miri cannot run (C code such as `ring`, processes, sockets, host queries, and seven too slow for it) marked `#[cfg_attr(miri, ignore = "...")]`; it is not a required check (design 0058 D2, `LV-4`). A normal build does not change.
+- Supply chain (`LV-5`): `deny.toml` and a CI job `cargo deny` that checks the licences, banned crates and sources of the workspace and of `fuzz/` (crates.io only; duplicates are warnings); `release.yml` attests the build provenance of every archive with `actions/attest`, and a manual run (`-f mode=attest-only`) builds and attests without a release; every `uses:` in `.github/workflows/` names a full commit with its tag in a comment; an OpenSSF Scorecard workflow (weekly and on pushes to `master`) and its badge; `README.md` (Install) shows `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` and what it proves.
 
 ## [0.4.3] - 2026-11-18
 
