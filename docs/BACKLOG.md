@@ -364,7 +364,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340 (open), (design 0058) |
-| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Planned | In | (design 0058) |
+| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351 (open), (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
@@ -1631,6 +1631,12 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** The guide exists and is in the index of `docs/README.md`. Proof run V3 is
   recorded with its date in the status log of design 0058. Until a second person has cut a
   release, the item is Partial.
+- **Status (2026-11-18, Partial):** Pull request 351 (open) adds `docs/guides/cut-a-release.md`
+  (covering wire-change rules, release PR preparation, owner merge and `v*` tag push, `SHA256SUMS`
+  and `gh attestation verify` checks, isolated macOS and Windows loopback smoke checks, and the step
+  2 accounts and workflow-permissions skeleton table) and adds it to `docs/README.md`. Confirming
+  holders in step 2, granting a second person merge/release rights (step 3), and proof run V3
+  (step 4) stay with the owner.
 
 ## Phase 14: public launch
 
