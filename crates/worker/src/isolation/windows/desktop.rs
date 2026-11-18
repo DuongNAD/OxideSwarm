@@ -57,6 +57,9 @@ fn set_window_object_protected_dacl(
         ));
     }
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries.as_ptr()` points to `entries.len()` initialized `EXPLICIT_ACCESS_W` values
+    // borrowing live SIDs for the duration of this call; on success `new_dacl` receives a
+    // `LocalAlloc` ACL freed via `LocalFree` below.
     let rc = unsafe {
         SetEntriesInAclW(
             entries.len() as u32,
@@ -68,6 +71,8 @@ fn set_window_object_protected_dacl(
     if rc != ERROR_SUCCESS || new_dacl.is_null() {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
+    // SAFETY: `handle` was checked non-null above and identifies a live Window Station or Desktop
+    // opened by this process, and `new_dacl` is the non-null ACL allocated by `SetEntriesInAclW`.
     let set_rc = unsafe {
         SetSecurityInfo(
             handle,
@@ -79,6 +84,8 @@ fn set_window_object_protected_dacl(
             std::ptr::null(),
         )
     };
+    // SAFETY: `new_dacl` is a non-null heap buffer allocated by `SetEntriesInAclW`, no longer
+    // referenced after `SetSecurityInfo` returns, and freed once here.
     unsafe {
         LocalFree(new_dacl as HLOCAL);
     }
@@ -97,6 +104,8 @@ fn grant_sid_on_window_object(handle: HANDLE, sid: PSID, access_mask: u32) -> io
     }
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `handle` was checked non-null above and refers to a live window object; `old_dacl`
+    // and `sd` are valid out-pointers (`sd` owns the descriptor memory freed via `LocalFree` below).
     let rc = unsafe {
         GetSecurityInfo(
             handle,
@@ -114,9 +123,13 @@ fn grant_sid_on_window_object(handle: HANDLE, sid: PSID, access_mask: u32) -> io
     }
     let ea = explicit_access(sid, access_mask, GRANT_ACCESS, NO_INHERITANCE);
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `&ea` points to one initialized `EXPLICIT_ACCESS_W` borrowing a valid `sid`;
+    // `old_dacl` is either null or points into the still-live `sd` allocation from `GetSecurityInfo`.
     let rc2 = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
     let mut set_rc = rc2;
     if rc2 == ERROR_SUCCESS && !new_dacl.is_null() {
+        // SAFETY: `new_dacl` is the valid non-null ACL returned by `SetEntriesInAclW`, live for
+        // `SetSecurityInfo(handle, ...)` and then freed once via `LocalFree`.
         unsafe {
             set_rc = SetSecurityInfo(
                 handle,
@@ -131,6 +144,8 @@ fn grant_sid_on_window_object(handle: HANDLE, sid: PSID, access_mask: u32) -> io
         }
     }
     if !sd.is_null() {
+        // SAFETY: `sd` is non-null, allocated by `GetSecurityInfo`, no longer borrowed by
+        // `old_dacl` after `SetEntriesInAclW`, and freed once here.
         unsafe {
             LocalFree(sd as HLOCAL);
         }
@@ -176,6 +191,9 @@ pub(super) fn create_per_task_desktop(
         let system_sid = OwnedSid::from_well_known(WinLocalSystemSid).map_err(|e| e.to_string())?;
         let admins_sid =
             OwnedSid::from_well_known(WinBuiltinAdministratorsSid).map_err(|e| e.to_string())?;
+        // SAFETY: Under `WINDOWS_SPAWN_LOCK`, `buf` (`512` B) backs `GetUserObjectInformationW`,
+        // `wide_default` is NUL-terminated, `orig_winsta` is restored, `default_desk` is closed
+        // via `CloseDesktop`, and `alt_winsta` is cached in `WORKER_WINSTA` for process lifetime.
         unsafe {
             // Open/create the logon session's built-in non-interactive Window Station
             // (`NULL` -> `Service-0x0-<LogonId>$`).
@@ -287,6 +305,9 @@ pub(super) fn create_per_task_desktop(
     let desk_name = format!("ox_desk_{}_{}", std::process::id(), run_token.simple());
     let wide_desk_name = to_wide(OsStr::new(&desk_name));
 
+    // SAFETY: Under `WINDOWS_SPAWN_LOCK`, `alt_winsta_raw` comes from `WORKER_WINSTA`,
+    // `wide_desk_name` is NUL-terminated for `CreateDesktopW`, `orig_winsta` is restored,
+    // and the returned desktop handle transfers to `WindowsAppContainerGuard`.
     let alt_desk = unsafe {
         let orig_winsta = GetProcessWindowStation();
         if orig_winsta.is_null() {
@@ -338,6 +359,8 @@ pub(super) fn create_per_task_desktop(
         ),
     ];
     if let Err(e) = set_window_object_protected_dacl(alt_desk, &desk_entries) {
+        // SAFETY: `alt_desk` is a valid non-null desktop handle created above and is closed once
+        // here because `create_per_task_desktop` fails before transferring ownership.
         unsafe {
             let _ = CloseDesktop(alt_desk);
         }
