@@ -1,7 +1,7 @@
 # 0055: Opt-in Windows task isolation in the USB setup kit (`USB-2`, `BUG-18`)
 
 Status: Implemented
-Created: 2026-11-10    Updated: 2026-11-10
+Created: 2026-11-10    Updated: 2026-11-18
 
 ## Summary
 
@@ -237,3 +237,6 @@ Minimum release version for `-Isolation fs` on Windows:
 ## Status log
 
 - 2026-11-10: `USB-2` and `BUG-18` implemented and verified on Windows 11.
+- 2026-11-18: D2's sandbox base now applies only to an install under `%LOCALAPPDATA%` with
+  `-Isolation fs`; every other install keeps its task folders in `<InstallRoot>\work`, and the
+  installer checks the base before it joins (design 0053 status log, `BUG-31`).

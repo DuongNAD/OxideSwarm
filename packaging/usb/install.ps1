@@ -9,8 +9,9 @@
 # The install folder is %LOCALAPPDATA%\OxideSwarm-USB unless -InstallRoot names another one or the
 # person at the keyboard picks another fixed NTFS or ReFS drive. Workspaces stay in
 # <install folder>\workspaces so the kit never shares the default worker workspace root
-# (%LOCALAPPDATA%\oxideswarm\workspaces). Outside %LOCALAPPDATA%, the install folder holds the task
-# folders and file cache too, and the installer limits it to this user, SYSTEM and Administrators.
+# (%LOCALAPPDATA%\oxideswarm\workspaces). The task folders and file cache go to <install folder>\work,
+# except with -Isolation fs in %LOCALAPPDATA% (%TEMP%\oxideswarm-usb\sandboxes). Outside %LOCALAPPDATA%,
+# the installer limits the install folder to this user, SYSTEM and Administrators.
 #
 # -Update (what "Update OxideSwarm.cmd" runs) updates an existing install in place: it keeps its
 # folder, name, GPU choice, isolation, cluster membership and start at logon, asks nothing, does
@@ -43,6 +44,9 @@ $script:RollbackArmed = $false
 $script:CreatedPointer = $false
 $script:CreatedRunEntry = $false
 $script:PreexistingRoot = $false
+# Set once the worker is started: a rollback then keeps <install folder>\logs, so the log a failed
+# start points to still exists (BUG-31).
+$script:KeepLogs = $false
 function Write-LogRecord([string]$line) {
     if ($script:InstallLogPath) {
         try { Add-Content -LiteralPath $script:InstallLogPath -Value $line -Encoding UTF8 } catch {}
@@ -53,6 +57,18 @@ function Write-LogRecord([string]$line) {
 function Say([string]$msg) {
     Write-Host $msg
     Write-LogRecord $msg
+}
+# Deletes $path, unless it is a link or holds one: Windows PowerShell 5.1 follows junctions while it
+# deletes, and a task may have made one in its task folder.
+function Remove-TreeNoFollow($path) {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-Host "  kept ${path}: it is a link"; return }
+    if ($item.PSIsContainer) {
+        $link = @(Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | Select-Object -First 1)
+        if ($link.Count -gt 0) { Write-Host "  kept ${path}: it holds a link ($($link[0].FullName))"; return }
+    }
+    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
 }
 function Rollback-FreshInstall {
     if (-not $script:RollbackArmed) { return }
@@ -89,18 +105,28 @@ function Rollback-FreshInstall {
     } catch {}
     try {
         if ($InstallRoot -and (Test-Path -LiteralPath $InstallRoot)) {
-            if (-not $script:PreexistingRoot) {
-                Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            # After a failed worker start the logs stay, so the error can name them (BUG-31).
+            $logsDir = Join-Path $InstallRoot 'logs'
+            $keepLogs = $script:KeepLogs -and (Test-Path -LiteralPath $logsDir)
+            if (-not $script:PreexistingRoot -and -not $keepLogs) {
+                Remove-TreeNoFollow $InstallRoot
+            } elseif (-not $script:PreexistingRoot) {
+                foreach ($c in @(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue)) {
+                    if ($c.Name -eq 'logs') { continue }
+                    Remove-TreeNoFollow $c.FullName
+                }
             } else {
                 foreach ($f in @('.oxideswarm-usb-install', 'kit-install.txt', 'start-worker.vbs', 'revoke-isolation-acls.ps1')) {
                     $p = Join-Path $InstallRoot $f
                     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
                 }
-                foreach ($d in @('bin', 'home', 'run', 'logs', 'workspaces')) {
+                foreach ($d in @('bin', 'home', 'run', 'logs', 'workspaces', 'work')) {
+                    if ($d -eq 'logs' -and $keepLogs) { continue }
                     $dp = Join-Path $InstallRoot $d
-                    if (Test-Path -LiteralPath $dp) { Remove-Item -LiteralPath $dp -Recurse -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path -LiteralPath $dp) { Remove-TreeNoFollow $dp }
                 }
             }
+            if ($keepLogs) { Write-Host "The logs of this attempt stay in $logsDir; delete that folder when you no longer need them." }
         }
     } catch {}
 }
@@ -495,21 +521,135 @@ function Test-RootSafety($root) {
     }
     return $null
 }
-$explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
-if (-not $Update -and -not $explicitRoot -and -not [Console]::IsInputRedirected) {
-    $choices = @($DefaultRoot)
-    foreach ($d in [IO.DriveInfo]::GetDrives()) {
-        if ($d.Name -eq [IO.Path]::GetPathRoot($DefaultRoot)) { continue }
-        $candidate = Join-Path $d.Name 'OxideSwarm-USB'
-        if (-not (Test-InstallDrive $candidate)) { $choices += $candidate }
+# The worker's own check of its sandbox base (task folders and file cache; crates/worker/src/sandbox.rs,
+# ensure_private_dir on Windows, with the masks of crates/core/src/private_file.rs), run before the
+# worker starts so that a refusal names the folder and the accounts (BUG-31). It only reads
+# permissions. DRIVE_ROOT_UNSAFE_MASK and DIR_WRITE_MASK; ANCESTOR_RENAME_MASK is $RenameRights.
+$DriveRootRights = 0x40 -bor 0x40000 -bor 0x80000
+$DirWriteRights = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000
+# Accounts other than this user, SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER, OWNER RIGHTS
+# or an app package that hold one of the $mask rights on $path itself, as @{ sid; name; inherited }
+# (inherited: every such entry came from a folder above).
+function Get-ForeignRights($path, [int]$mask) {
+    $holders = New-Object 'System.Collections.Generic.List[object]'
+    $acl = Get-Acl -LiteralPath $path
+    foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($r.AccessControlType -ne 'Allow') { continue }
+        if ($r.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = $r.IdentityReference.Value
+        if ($sid -in $TrustedSids -or $sid -eq $TrustedInstaller -or $sid -in @('S-1-3-0', 'S-1-3-4') -or $sid -like 'S-1-15-*') { continue }
+        $rights = [int]$r.FileSystemRights
+        if (-not (($rights -band $mask) -or ($rights -band 0x10000000))) { continue }
+        $known = $null
+        foreach ($h in $holders) { if ($h.sid -eq $sid) { $known = $h } }
+        if ($known) {
+            if (-not $r.IsInherited) { $known.inherited = $false }
+        } else {
+            $holders.Add(@{ sid = $sid; name = (Get-AccountName $sid); inherited = [bool]$r.IsInherited })
+        }
     }
-    if ($choices.Count -gt 1) {
+    return , $holders
+}
+# Why the worker would refuse $base as its sandbox base, as @{ dir; why; holders }, or $null: a folder
+# on the way to it is a link, belongs to another account or lets another account rename, delete or
+# re-permission it; another account may delete folders at the drive root; or an existing $base lets
+# another account write in it.
+function Test-SandboxBase($base) {
+    $full = [IO.Path]::GetFullPath($base).TrimEnd('\')
+    $drive = [IO.Path]::GetPathRoot($full)
+    $chain = New-Object 'System.Collections.Generic.List[string]'
+    $dir = Split-Path -Parent $full
+    while ($dir -and $dir.TrimEnd('\') -ne $drive.TrimEnd('\')) {
+        $chain.Insert(0, $dir)
+        $dir = Split-Path -Parent $dir
+    }
+    $chain.Insert(0, $drive)
+    foreach ($d in $chain) {
+        if (-not (Test-Path -LiteralPath $d)) { break }
+        $atDrive = ($d -eq $drive)
+        if (-not $atDrive -and ((Get-Item -LiteralPath $d -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return @{ dir = $d; why = "$d is a link"; holders = @() }
+        }
+        $owner = (Get-Acl -LiteralPath $d).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $TrustedSids -and $owner -ne $TrustedInstaller) {
+            return @{ dir = $d; why = "$d belongs to another account ($(Get-AccountName $owner))"; holders = @() }
+        }
+        $mask = if ($atDrive) { $DriveRootRights } else { $RenameRights }
+        $holders = Get-ForeignRights $d $mask
+        if ($holders.Count -gt 0) { return @{ dir = $d; why = $null; holders = $holders } }
+    }
+    if (Test-Path -LiteralPath $full) {
+        $item = Get-Item -LiteralPath $full -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return @{ dir = $full; why = "$full is a link"; holders = @() } }
+        if (-not $item.PSIsContainer) { return @{ dir = $full; why = "$full is a file"; holders = @() } }
+        $owner = (Get-Acl -LiteralPath $full).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $TrustedSids) {
+            return @{ dir = $full; why = "$full belongs to another account ($(Get-AccountName $owner))"; holders = @() }
+        }
+        $holders = Get-ForeignRights $full $DirWriteRights
+        if ($holders.Count -gt 0) { return @{ dir = $full; why = $null; holders = $holders } }
+    }
+    return $null
+}
+function Format-SandboxBaseProblem($problem) {
+    if ($problem.holders.Count -eq 0) { return $problem.why }
+    $names = (@($problem.holders) | ForEach-Object { $_.name }) -join ', '
+    $tempFull = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $dir = $problem.dir.TrimEnd('\')
+    $what = $problem.dir
+    if ([string]::Equals($dir, $tempFull, [StringComparison]::OrdinalIgnoreCase) -or $dir.StartsWith($tempFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $what = "your Temp folder ($($problem.dir))"
+    }
+    return "$what lets these accounts change it: $names"
+}
+# The icacls command that removes the grants set on the folder itself. The installer only prints it:
+# changing a user's permissions is the user's decision.
+function Get-SandboxBaseFix($problem) {
+    $explicit = @(@($problem.holders) | Where-Object { -not $_.inherited })
+    if ($explicit.Count -eq 0) { return $null }
+    $target = $problem.dir
+    if ($target.EndsWith('\')) { $target += '\' }
+    $sids = ($explicit | ForEach-Object { '"*' + $_.sid + '"' }) -join ' '
+    return ('icacls "' + $target + '" /remove:g ' + $sids)
+}
+$explicitRoot = $PSBoundParameters.ContainsKey('InstallRoot')
+# OXIDESWARM_USB_LIST_FOLDERS=1 prints the folder menu and stops; OXIDESWARM_USB_DRIVE_CHOICES (a
+# ';'-separated list of folders) replaces the folders on the other drives, without the drive checks
+# but with the root check (tests).
+$listFoldersOnly = ($env:OXIDESWARM_USB_LIST_FOLDERS -eq '1')
+if (-not $Update -and -not $explicitRoot -and ($listFoldersOnly -or -not [Console]::IsInputRedirected)) {
+    $choices = @($DefaultRoot)
+    $candidates = @()
+    if ($env:OXIDESWARM_USB_DRIVE_CHOICES) {
+        $candidates = @($env:OXIDESWARM_USB_DRIVE_CHOICES -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } else {
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            if ($d.Name -eq [IO.Path]::GetPathRoot($DefaultRoot)) { continue }
+            $candidate = Join-Path $d.Name 'OxideSwarm-USB'
+            if (-not (Test-InstallDrive $candidate)) { $candidates += $candidate }
+        }
+    }
+    # A folder is offered only when the install would accept it (BUG-29: the menu offered
+    # E:\OxideSwarm-USB, and the install then refused it because another account could delete or
+    # re-permission folders at the root of E:\). A refused one is listed, without a number, with the
+    # reason.
+    $refused = @()
+    foreach ($candidate in $candidates) {
+        $why = $null
+        try { $why = Test-RootSafety $candidate } catch { $why = "its permissions could not be read ($($_.Exception.Message))" }
+        if ($why) { $refused += , @($candidate, $why) } else { $choices += $candidate }
+    }
+    if ($choices.Count -gt 1 -or $refused.Count -gt 0 -or $listFoldersOnly) {
         Write-Host "Where should OxideSwarm keep its files (program, task folders, file cache)?"
         for ($i = 0; $i -lt $choices.Count; $i++) {
             $free = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($choices[$i]))).AvailableFreeSpace / 1GB
             $note = if ($i -eq 0) { ' (default)' } else { '' }
             Write-Host ("  {0}) {1}{2}  {3:N1} GB free" -f ($i + 1), $choices[$i], $note, $free)
         }
+        foreach ($r in $refused) { Write-Host ("  -  {0}  not usable: {1}" -f $r[0], $r[1]) }
+    }
+    if ($listFoldersOnly) { Write-Host "Nothing was installed (OXIDESWARM_USB_LIST_FOLDERS=1)."; exit 0 }
+    if ($choices.Count -gt 1) {
         $pick = Read-Host "Choose [1]"
         if ($pick -match '^\s*(\d+)\s*$' -and [int]$Matches[1] -ge 1 -and [int]$Matches[1] -le $choices.Count) {
             $InstallRoot = $choices[[int]$Matches[1] - 1]
@@ -776,9 +916,51 @@ Write-Host "  binary:  $version"
 
 # Every command below keeps its state in $State and runs from $InstallRoot.
 $GrantLog = Join-Path $State 'windows_acl_grants.txt'
-# Task folders and the file cache: inside a folder outside %LOCALAPPDATA% (private, see step 2), else
-# in the kit's own temp folder, which uninstall.ps1 removes.
-$SandboxBase = if ($PrivateRoot) { Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes' } else { Join-Path $InstallRoot 'work' }
+# Task folders and the file cache (the worker's sandbox base): <install folder>\work, in %LOCALAPPDATA%
+# too since 2026-11-18 (design 0053 status log). Only an install in %LOCALAPPDATA% with -Isolation fs
+# keeps them in %TEMP%\oxideswarm-usb\sandboxes, which uninstall.ps1 removes: the isolated worker
+# takes no other folder inside the user profile (validate_sandbox_base_safe). An update keeps the
+# folder its launcher names while the worker can still use it.
+$SandboxBase = if ($PrivateRoot -and $Isolation -eq 'fs') { Join-Path ([IO.Path]::GetTempPath()) 'oxideswarm-usb\sandboxes' } else { Join-Path $InstallRoot 'work' }
+if ($Update -and $KitHasWorker) {
+    $oldBase = $null
+    $oldVbs = Join-Path $InstallRoot 'start-worker.vbs'
+    if ((Test-Path -LiteralPath $oldVbs) -and ((Get-Content -Raw -LiteralPath $oldVbs) -match 'RUSTY_GRID_SANDBOX_BASE_DIR"\)\s*=\s*"([^"]+)"')) { $oldBase = $Matches[1] }
+    if ($oldBase -and -not [string]::Equals($oldBase.TrimEnd('\'), $SandboxBase.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        $oldProblem = $null
+        if ($PrivateRoot -and $Isolation -eq 'fs') {
+            $oldProblem = "under -Isolation fs the worker takes task folders inside the user profile only from %TEMP%"
+        } else {
+            try { $p = Test-SandboxBase $oldBase; if ($p) { $oldProblem = Format-SandboxBaseProblem $p } } catch { $oldProblem = $null }
+        }
+        if ($oldProblem) { Say "  note:    task folders move from $oldBase to $SandboxBase ($oldProblem)" }
+        else { $SandboxBase = $oldBase }
+    }
+}
+# Check the folder the way the worker will, before anything joins or starts.
+if ($KitHasWorker) {
+    $baseProblem = $null
+    try { $baseProblem = Test-SandboxBase $SandboxBase } catch { Say "  note:    could not read the permissions on the way to ${SandboxBase}: $($_.Exception.Message)" }
+    if ($baseProblem) {
+        $why = Format-SandboxBaseProblem $baseProblem
+        Say "  The worker keeps its task folders in $SandboxBase and would refuse them: $why."
+        $fix = Get-SandboxBaseFix $baseProblem
+        if ($fix) {
+            Say "  To remove those grants, run this yourself in a Command Prompt (this installer never changes permissions):"
+            Say "    $fix"
+        }
+        if (@(@($baseProblem.holders) | Where-Object { $_.inherited }).Count -gt 0) {
+            Say "  Some of these entries are inherited from a folder above $($baseProblem.dir); remove them there."
+        }
+        if ($PrivateRoot -and $Isolation -eq 'fs') {
+            Say "  Or install without -Isolation fs (task folders then stay in $(Join-Path $InstallRoot 'work')), or on another drive with -InstallRoot."
+        } else {
+            Say "  Or choose a folder on another drive with -InstallRoot."
+        }
+        Fail "cannot start the worker: $why"
+    }
+    Write-Host "  tasks:   $SandboxBase"
+}
 $RustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:OXIDESWARM_HOME = $State
@@ -992,35 +1174,83 @@ $cmdLine = 'cmd /c ""' + $Exe + '" ' + $workerArgs + ' >> "' + $log + '" 2>&1"'
     ('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
 ) | Set-Content -Path $vbs -Encoding ASCII
 
+# A failed start (BUG-31): the end of the worker's log under a header, then the error. The rollback
+# keeps <install folder>\logs ($script:KeepLogs), so the file the error names still exists.
+function Fail-WorkerStart($what) {
+    Write-Host ""
+    if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 0) {
+        Write-Host "----- last 30 lines of $log -----"
+        try { Get-Content -LiteralPath $log -Tail 30 -ErrorAction Stop | ForEach-Object { Write-Host "  $_" } } catch { Write-Host "  (it could not be read: $($_.Exception.Message))" }
+        Write-Host "----- end of $log -----"
+    } else {
+        Write-Host "(the worker wrote nothing to $log)"
+    }
+    $kept = if (Test-Path -LiteralPath $log) { $log } else { $script:InstallLogPath }
+    FailAfterStart "$what; its log is kept in $kept"
+}
+function Test-WorkerStopped {
+    if ($workerProc) { try { return [bool]$workerProc.HasExited } catch { } }
+    return -not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)
+}
+function Get-WorkerExitCode {
+    if ($workerProc) { try { if ($workerProc.HasExited) { return "$($workerProc.ExitCode)" } } catch { } }
+    return 'unknown'
+}
+
 # 6. Start it now through the same hidden launcher, so that closing this window does not stop it.
 Write-Host ""
 Write-Host "Starting worker '$Name' ..."
+$script:KeepLogs = $true
+$startClock = [Diagnostics.Stopwatch]::StartNew()
 Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + $vbs + '"') | Out-Null
 $workerPid = $null
+$workerProc = $null
 for ($i = 0; $i -lt 10 -and -not $workerPid; $i++) {
     Start-Sleep -Seconds 1
     $workerPid = Get-CimInstance Win32_Process |
         Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -match '(?:oxideswarm|rusty-grid)(?:\.exe)?["'']?\s+(worker)(\s|$)' } |
         Select-Object -First 1 -ExpandProperty ProcessId
 }
-if (-not $workerPid) { FailAfterStart "the worker did not start; see $log" }
+if (-not $workerPid) { Fail-WorkerStart "the worker did not start within 10 s" }
 $workerPid | Set-Content $pidFile
-Start-Sleep -Seconds 3
-if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { FailAfterStart "the worker stopped right away; see $log" }
+# A handle held from now on lets the installer read the worker's exit code after it ends.
+try { $workerProc = Get-Process -Id $workerPid -ErrorAction Stop; $null = $workerProc.Handle } catch { $workerProc = $null }
 
-# 7. Wait until the master lists it. The checks run without log lines: release 0.1.x writes its
-# informational logs to standard output, which would break the JSON parsing below. The worker
-# was started above, so it keeps its own logging.
+# 7. Wait until the master lists it, and check every second that the worker still runs (BUG-31: one
+# check 3 s after the start missed a worker that stopped after about 6 s). The listing runs in a
+# runspace of its own, so a slow answer does not hold up that check. The checks run without log
+# lines: release 0.1.x writes its informational logs to standard output, which would break the JSON
+# parsing below. The worker was started above, so it keeps its own logging.
 $env:RUST_LOG = 'off'
-$connected = $false
-for ($i = 0; $i -lt 30; $i++) {
+$listScript = {
+    param($exe, $checkArgs)
+    $env:RUST_LOG = 'off'
     # The JSON listing carries the real state; the plain listing also shows disconnected workers.
-    $list = $null
-    try { $list = (& $Exe workers --json @checkArgs | Out-String) | ConvertFrom-Json } catch { $list = $null }
-    if (@($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true; break }
-    Start-Sleep -Seconds 1
+    (& $exe workers --json @checkArgs 2>$null | Out-String)
 }
-if (-not $connected) { FailAfterStart "the worker runs but the master does not list it yet; see $log" }
+$lister = [PowerShell]::Create()
+$connected = $false
+$stoppedAfter = $null
+$waited = 0
+$pending = $null
+while (-not $connected -and $null -eq $stoppedAfter -and $waited -lt 30) {
+    $lister.Commands.Clear()
+    [void]$lister.AddScript($listScript.ToString()).AddArgument($Exe).AddArgument($checkArgs)
+    $pending = $lister.BeginInvoke()
+    while ($true) {
+        Start-Sleep -Seconds 1
+        $waited++
+        if (Test-WorkerStopped) { $stoppedAfter = [int]$startClock.Elapsed.TotalSeconds; break }
+        if ($pending.IsCompleted -or $waited -ge 30) { break }
+    }
+    if (-not $pending.IsCompleted) { try { $lister.Stop() } catch { }; break }
+    $list = $null
+    try { $list = (@($lister.EndInvoke($pending)) -join "`n") | ConvertFrom-Json } catch { $list = $null }
+    if ($null -eq $stoppedAfter -and @($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true }
+}
+if ($pending -and $pending.IsCompleted) { try { $lister.Dispose() } catch { } }
+if ($null -ne $stoppedAfter) { Fail-WorkerStart "the worker stopped $stoppedAfter s after it started (exit code $(Get-WorkerExitCode))" }
+if (-not $connected) { Fail-WorkerStart "the worker ran for 30 s, but the master did not list it" }
 Say "  connected (isolation: $Isolation)"
 }
 # What an update keeps: the name, the build, the workspace choice, roles and isolation.
