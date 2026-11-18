@@ -52,10 +52,15 @@ fn spawn_worker(master: &MasterHandle, name: &str, cores: usize) -> TestWorker {
     }
 }
 
-async fn wait_for_worker_count(master: &MasterHandle, count: usize) -> bool {
+async fn wait_for_worker_count_within(
+    master: &MasterHandle,
+    count: usize,
+    within: Duration,
+) -> usize {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
-        let connected = master
+    let mut connected = 0;
+    while start.elapsed() < within {
+        connected = master
             .list_workers()
             .await
             .map(|w| {
@@ -65,11 +70,15 @@ async fn wait_for_worker_count(master: &MasterHandle, count: usize) -> bool {
             })
             .unwrap_or(0);
         if connected >= count {
-            return true;
+            return connected;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    connected
+}
+
+async fn wait_for_worker_count(master: &MasterHandle, count: usize) -> bool {
+    wait_for_worker_count_within(master, count, Duration::from_secs(10)).await >= count
 }
 
 /// True if the server has closed `stream` (EOF or reset) within `within`.
@@ -254,9 +263,22 @@ async fn test_mapreduce_tasks_run_on_all_workers_at_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_failure() {
+    // Every wait below ends as soon as its condition holds; `WAIT` only turns a hang into a
+    // failure, and `mapper_timeout_secs` sits above it so a slow run under CPU starvation fails
+    // on `WAIT` with queue diagnostics rather than inside the engine's 60 s mapper timeout
+    // (TEST-54).
+    const WAIT: Duration = Duration::from_secs(180);
+    let mapper_timeout_secs = (WAIT * 3).as_secs();
+    let test_started = Instant::now();
+
     let master = spawn_master(grid_config().with_mapreduce_parallelism(1)).await;
-    let _w1 = spawn_worker(&master, "w1", 4);
-    assert!(wait_for_worker_count(&master, 1).await);
+    let mut w1 = spawn_worker(&master, "w1", 4);
+    let connected = wait_for_worker_count_within(&master, 1, WAIT).await;
+    assert!(
+        connected >= 1,
+        "worker did not register within {WAIT:?} (connected={connected})"
+    );
+    println!("worker registered after {:?}", test_started.elapsed());
 
     // Parallelism 1 forces strictly sequential dispatch: 3 one-second mappers need >= 3 s.
     let job = MapReduceJobSpec::new(
@@ -270,15 +292,22 @@ async fn test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_fai
         },
         3,
         1,
-        60,
+        mapper_timeout_secs,
     );
     let started = Instant::now();
-    let result = master.execute_mapreduce(job).await.unwrap();
+    let result = match tokio::time::timeout(WAIT, master.execute_mapreduce(job)).await {
+        Ok(outcome) => outcome.unwrap(),
+        Err(_) => {
+            let stats = master.queue_stats().await;
+            panic!("serial mapreduce job did not finish within {WAIT:?}; queue_stats={stats:?}");
+        }
+    };
+    let serial_elapsed = started.elapsed();
+    println!("serial job finished in {serial_elapsed:?}");
     assert_eq!(result.status, "Completed");
     assert!(
-        started.elapsed() >= Duration::from_millis(2800),
-        "parallelism = 1 must run the partitions one at a time, took {:?}",
-        started.elapsed()
+        serial_elapsed >= Duration::from_millis(2800),
+        "parallelism = 1 must run the partitions one at a time, took {serial_elapsed:?}"
     );
 
     // A mapper that exits non-zero fails the job and says why.
@@ -293,9 +322,17 @@ async fn test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_fai
         },
         2,
         1,
-        60,
+        mapper_timeout_secs,
     );
-    let result = master.execute_mapreduce(failing).await.unwrap();
+    let failing_started = Instant::now();
+    let result = match tokio::time::timeout(WAIT, master.execute_mapreduce(failing)).await {
+        Ok(outcome) => outcome.unwrap(),
+        Err(_) => {
+            let stats = master.queue_stats().await;
+            panic!("failing mapreduce job did not finish within {WAIT:?}; queue_stats={stats:?}");
+        }
+    };
+    println!("failing job finished in {:?}", failing_started.elapsed());
     assert_eq!(result.status, "Failed");
     let error = result.error.expect("a failed job carries its reason");
     assert!(
@@ -303,5 +340,7 @@ async fn test_mapreduce_parallelism_is_configurable_and_a_failed_job_reports_fai
         "{error}"
     );
 
+    let _ = w1.shutdown_tx.send(true);
+    let _ = tokio::time::timeout(WAIT, &mut w1.handle).await;
     let _ = master.shutdown();
 }
