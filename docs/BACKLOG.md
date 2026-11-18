@@ -305,7 +305,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | Out | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | In | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented |  | 162, 175, 187, 189 |
-| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051), 190, 201 |
+| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051), 190, 201, 328 |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented |  | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | In | (design 0053), 185, 195, 207, 228 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented |  | 204 (design 0055) |
@@ -766,6 +766,12 @@ then JOIN-2 and USB-1 in parallel.
   its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
   machine on another network joins through `--p2p` with an invite sent by chat, and the run is
   recorded with its date.
+- **Status (2026-11-18, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
+  loses every connection at once (worker sessions over TCP and QUIC, client connections over TCP
+  and P2P, blob and MCP connections), and the tasks on its workers are requeued at once without the
+  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. Open:
+  cancelling the member's submitted tasks (design 0051 D5 step 2, a store format change for the
+  owner) and ENROLL-1d.
 
 ### USB-1: Set up machines from a USB stick
 

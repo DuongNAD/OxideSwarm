@@ -183,7 +183,7 @@ impl TaskQueue {
 
     /// Releases a held task that was either omitted from `ResumeSession` or whose `adoptable_by`
     /// deadline expired, returning `(optional_journal_record, became_failed, released_to_ready)`.
-    fn release_unadopted_task(
+    pub(super) fn release_unadopted_task(
         inner: &mut TaskQueueInner,
         task_id: TaskId,
         last_worker_id: Option<Uuid>,
