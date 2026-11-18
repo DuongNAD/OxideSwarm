@@ -33,6 +33,8 @@ fn is_process_alive(pid: u32) -> bool {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
+    // SAFETY: the declaration above matches POSIX `int kill(pid_t, int)` (`pid_t` is `i32` on
+    // Unix); `sig == 0` sends no signal and touches no memory.
     unsafe { kill(pid as i32, 0) == 0 }
 }
 
@@ -987,6 +989,9 @@ async fn assert_process_dies(what: &str, pid: u32) {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
+    // SAFETY: the declaration above matches POSIX `int kill(pid_t, int)`; `kill` touches no
+    // memory, and `pid` (`> 0`, since `is_process_alive(0)` returned early) stayed alive across
+    // 100 polls, so it still names the surviving task descendant spawned by this test.
     unsafe { kill(pid as i32, 9) };
     panic!("{what} (pid {pid}) outlived its task");
 }

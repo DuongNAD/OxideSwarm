@@ -51,6 +51,9 @@ fn is_process_alive(pid: u32) -> bool {
 
     const STILL_ACTIVE: u32 = 259;
 
+    // SAFETY: `OpenProcess` takes plain integers and returns null (handled immediately) or a
+    // fresh process handle; `exit_code` is a live writable `u32` for `GetExitCodeProcess`, and
+    // `CloseHandle` closes that handle once before returning.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if handle.is_null() {

@@ -65,6 +65,8 @@ fn test_zero_copy_slicing_and_pointer_invariants() {
     assert_eq!(s3.len(), 10_000);
 
     // Verify pointer offsets are zero-copy directly into raw allocation
+    // SAFETY: `raw` keeps its 1 MiB allocation alive past this block, and offsets 100, 500_000
+    // and 510_000 all lie within its bounds; the resulting pointers are only compared.
     unsafe {
         assert_eq!(s1.as_bytes().as_ptr(), raw_ptr.add(100));
         assert_eq!(s2.as_bytes().as_ptr(), raw_ptr.add(500_000));
