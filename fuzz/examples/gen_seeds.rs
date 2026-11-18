@@ -37,6 +37,7 @@ use rusty_grid_master::store::fuzzing::{
 };
 use rusty_grid_master::store::{JournalRecord, PersistedTaskEntry, SnapshotImage};
 use rusty_grid_master::{RetryAttempt, TaskState};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 fn put(dir: &Path, name: &str, bytes: &[u8]) {
@@ -521,19 +522,206 @@ fn store_journal(dir: &Path) {
     );
 }
 
+/// A `tools/call` request for `name` with `arguments`.
+fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    })
+}
+
+fn mcp_request_line(dir: &Path) {
+    let task_id = Uuid::from_u128(7).to_string();
+    let lines: Vec<(&str, Value)> = vec![
+        // The requests of the lifecycle test in tests/mcp_server_e2e.rs.
+        (
+            "initialize",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "clientInfo": { "name": "seed-agent", "version": "1.0.0" }
+                }
+            }),
+        ),
+        (
+            "notifications_initialized",
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        ),
+        (
+            "ping",
+            json!({ "jsonrpc": "2.0", "id": "p-1", "method": "ping" }),
+        ),
+        (
+            "tools_list",
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+        ),
+        (
+            "notifications_cancelled",
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 6, "reason": "seed" }
+            }),
+        ),
+        // One `tools/call` per tool, with arguments that `validate_tool_arguments` accepts.
+        (
+            "call_status",
+            tool_call(4, "status", json!({ "workers": true, "task_id": task_id })),
+        ),
+        (
+            "call_workers",
+            tool_call(
+                5,
+                "workers",
+                json!({ "connected_only": true, "os": "linux", "arch": "x86_64", "gpu_only": false }),
+            ),
+        ),
+        (
+            "call_submit_command",
+            tool_call(
+                6,
+                "submit",
+                json!({
+                    "command": "echo",
+                    "args": ["hi"],
+                    "env": { "A": "1" },
+                    "stdin": "",
+                    "cores": 1,
+                    "ram_mb": 512,
+                    "timeout_secs": 30,
+                    "max_retries": 1,
+                    "wait": true,
+                    "wait_secs": 10,
+                    "isolation": "fs",
+                    "os": "linux",
+                    "arch": "x86_64",
+                    "worker": "seed-worker",
+                    "require_tags": ["fast"],
+                    "tools": ["cargo"],
+                    "max_output_bytes": 4096,
+                    "verify": 2,
+                    "verify_any_system": false
+                }),
+            ),
+        ),
+        (
+            "call_submit_shell",
+            tool_call(
+                7,
+                "submit",
+                json!({ "type": "shell", "script": "echo hi | wc -c", "interpreter": "sh" }),
+            ),
+        ),
+        (
+            "call_submit_gpu",
+            tool_call(
+                8,
+                "submit",
+                json!({ "type": "gpu", "gpu": true, "matrix_dim": 256, "work_group_size": 16, "vram_mb": 1024 }),
+            ),
+        ),
+        (
+            "call_submit_compile",
+            tool_call(
+                9,
+                "submit",
+                json!({
+                    "type": "compile",
+                    "source_files": { "src/main.rs": "fn main() {}\n" },
+                    "outputs": ["target/release/*"],
+                    "output_dir": "out"
+                }),
+            ),
+        ),
+        (
+            "call_submit_workspace",
+            tool_call(
+                10,
+                "submit",
+                json!({
+                    "command": "cargo",
+                    "args": ["build"],
+                    "workspace": { "name": "demo", "sync_dir": ".", "cwd": "crates/a" }
+                }),
+            ),
+        ),
+        (
+            "call_task_result",
+            tool_call(
+                11,
+                "task_result",
+                json!({ "task_id": task_id, "wait": true, "timeout_secs": 10, "max_output_bytes": 4096 }),
+            ),
+        ),
+        (
+            "call_cancel",
+            tool_call(12, "cancel", json!({ "task_id": task_id })),
+        ),
+        (
+            "call_doctor",
+            tool_call(
+                13,
+                "doctor",
+                json!({ "expect_workers": 2, "timeout_secs": 30, "skip_gpu": true, "skip_spread": true }),
+            ),
+        ),
+        ("call_workspaces", tool_call(14, "workspaces", json!({}))),
+        // Malformed lines, refused at different steps.
+        (
+            "bad_batch_array",
+            json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]),
+        ),
+        (
+            "bad_id_object",
+            json!({ "jsonrpc": "2.0", "id": {}, "method": "ping" }),
+        ),
+        (
+            "bad_version",
+            json!({ "jsonrpc": "1.0", "id": 1, "method": "ping" }),
+        ),
+        (
+            "bad_params_string",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": "x" }),
+        ),
+        (
+            "bad_unknown_method",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }),
+        ),
+        (
+            "bad_call_unknown_tool",
+            tool_call(15, "shutdown", json!({})),
+        ),
+        (
+            "bad_call_task_id",
+            tool_call(16, "cancel", json!({ "task_id": "not-a-uuid" })),
+        ),
+    ];
+    for (name, value) in lines {
+        put(dir, name, value.to_string().as_bytes());
+    }
+    put(dir, "bad_not_json", br#"{"jsonrpc":"2.0","#);
+}
+
 /// Writes the seeds of one target into the directory it is given.
 type SeedWriter = fn(&Path);
 
 fn main() {
     let wanted: Vec<String> = std::env::args().skip(1).collect();
     let root = Path::new("corpus");
-    let targets: [(&str, SeedWriter); 6] = [
+    let targets: [(&str, SeedWriter); 7] = [
         ("inbound_frame", inbound_frame),
         ("server_handshake", server_handshake),
         ("tree_manifest", tree_manifest),
         ("aead_record", aead_record),
         ("join_invite", join_invite),
         ("store_journal", store_journal),
+        ("mcp_request_line", mcp_request_line),
     ];
     for name in &wanted {
         assert!(

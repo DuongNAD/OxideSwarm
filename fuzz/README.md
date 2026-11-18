@@ -2,7 +2,7 @@
 
 `cargo fuzz` (libFuzzer) targets for the parsers that read bytes from another machine, another
 person or a file. LV-1 (`docs/BACKLOG.md`, spike R12 of design 0058) added the first three, which
-read what a peer sends before authentication completes; LV-18 added three more for the parsers
+read what a peer sends before authentication completes; LV-18 added four more for the parsers
 design 0058 LV-1 lists as later targets. The crate is outside the Cargo workspace (`exclude` in the
 root `Cargo.toml`) and has a `Cargo.lock` of its own; a normal `cargo build --workspace` does not
 see it.
@@ -11,7 +11,9 @@ The targets call public functions, with one exception: the readers of the master
 private, so `rusty_grid_master` has a Cargo feature `fuzzing`, off by default, that compiles
 `store::fuzzing` (the journal and snapshot readers on bytes in memory, and the encoders the store
 writes with). Only this crate turns it on; a normal build does not compile it. `rusty_grid_core`
-and `rusty_grid_cli` have no `fuzzing` feature.
+and `rusty_grid_cli` have no `fuzzing` feature. The two functions of the MCP reader,
+`parse_request_line` and `parse_tool_call` in `rusty_grid_cli::mcp`, are `#[doc(hidden)] pub`:
+`run_stdio_server` calls them, and they were cut out of it for `mcp_request_line`.
 
 | Target | Input | What runs |
 |---|---|---|
@@ -21,6 +23,7 @@ and `rusty_grid_cli` have no `fuzzing` feature.
 | `aead_record` | one mode byte, then (even) the byte stream of a peer without the key, or (odd) chunks `[len: u16 LE][op][plaintext]` | The encrypted record layer (format byte `0x04`) with record keys derived from a fixed test session key. Even: a server `MessageTransport` with encryption reads the stream as `InboundMessage` (frame limit 4096, at most 64 frames). Odd: the client side seals each plaintext, `op` keeps, damages, drops, replays or cuts the record, and `AeadReaderSession::decrypt_frame` must accept exactly the records that arrive intact and in order before the first bad one, return each plaintext unchanged, and refuse everything after the first bad one; the same records then go through the `MessageReader` of a split transport, which decodes them |
 | `join_invite` | one mode byte (modulo 4), then the rest | 0: the text piped into `oxideswarm join` (`read_token`, then `InviteToken::decode` or `JoinToken::decode` by prefix). 1: the JSON payload of a join token; the target adds the base64url encoding and the integrity tag made with the secret the payload names. 2: the JSON payload of an invite; the target adds its checksum. 3: an `invite.oxs` file: `validate_invite_oxs_header`, then `decrypt_invite_oxs` with a fixed test passphrase when the header asks for at most 256 KiB and two passes of Argon2id. A token or invite that decodes must decode to the same value after `encode` |
 | `store_journal` | one mode byte, then the rest | The readers of `master --state-dir` through `store::fuzzing`. Bit 0 picks `journal.bin` or `snapshot.bin`; bit 1 picks the whole file, or only what the frames carry, with the target writing the header, lengths and BLAKE3 hashes so that the bincode and JSON decoders behind the hashes are reached; bits 2 and 3 place the snapshot's generation against the journal's. The valid prefix a journal read reports must read again to the same records with no torn tail, accepted records written again by the store's encoder must read back equal, and so must an accepted snapshot |
+| `mcp_request_line` | the bytes `oxideswarm mcp` reads from standard input | Cut into lines as the server reads them (at `\n`, one `\r` before it removed; reading stops at the first line that is not UTF-8, as the server's does). Each line goes to `parse_request_line`, the server's reader of one line (JSON, an object, `id`, `method`, `jsonrpc`, `params`); a `tools/call` request then goes to `parse_tool_call` (the `params` checks and `validate_tool_arguments`). No master and no network. An accepted request has `jsonrpc` `"2.0"`, a method, an `id` and `params` of an allowed JSON type, and written again as one line it reads back to the same request (requests with a float are left out: `serde_json` is built without `float_roundtrip`); an error response serializes and carries a code of the refusing step; an accepted tool call names a tool of `tools/list` |
 
 The in-memory stream, the paused-clock runtime, the chunk splitter and the fixed test secret, keys
 and passphrase are in `src/lib.rs`. None of them is a real secret.
@@ -31,7 +34,7 @@ and passphrase are in `src/lib.rs`. None of them is a real secret.
 
 ```bash
 cd fuzz
-cargo fuzz build -s none                                   # builds the six targets
+cargo fuzz build -s none                                   # builds the seven targets
 cargo fuzz run inbound_frame -s none -- -max_total_time=60 -max_len=4096
 cargo fuzz run aead_record -s none -- -max_total_time=60 -max_len=4096
 ```
@@ -51,7 +54,7 @@ same flag for every `cargo fuzz` command (a different `RUSTFLAGS` rebuilds every
 export RUSTFLAGS="-Clink-arg=-Wl,-undefined,dynamic_lookup"   # macOS only
 ```
 
-The six target binaries built this way have no undefined Rust symbols (`nm -u`). Linux links
+The seven target binaries built this way have no undefined Rust symbols (`nm -u`). Linux links
 shared libraries with undefined symbols by default and needs no flag.
 
 `cargo fuzz run` writes the inputs it finds into `fuzz/corpus/<target>/`, next to the committed
@@ -71,8 +74,11 @@ cargo fuzz run tree_manifest -s none /tmp/work/tree_manifest corpus/tree_manifes
   and v2 manifests, records sealed with the test session key (as a stream, and as chunks for each
   `op`), a join token with an address and one with a ticket, an invite, their JSON payloads, an
   `invite.oxs` at the default cost and one at a cheap cost made with the test passphrase, a journal
-  with one record of each kind (whole, torn, header only, stale, and as payloads only), and
-  snapshots (whole, empty, and as JSON only).
+  with one record of each kind (whole, torn, header only, stale, and as payloads only),
+  snapshots (whole, empty, and as JSON only), and MCP lines: `initialize`, `ping`, `tools/list`,
+  the two notifications, a `tools/call` for each tool with arguments that pass
+  `validate_tool_arguments` (four for `submit`: command, shell, GPU, compile, and one with a
+  workspace), and lines refused at different steps.
 - `regressions/<target>/` holds inputs that must never fail: hand-made malformed inputs, and every
   crash input a run finds, minimised. The CI job runs them first with
   `cargo fuzz run <target> fuzz/regressions/<target> -- -runs=0`. For the first three targets:
@@ -88,11 +94,18 @@ cargo fuzz run tree_manifest -s none /tmp/work/tree_manifest corpus/tree_manifes
   older protocol, a damaged first frame with valid frames after it (refused), a damaged last length
   check (cut as a torn tail), a frame over 64 MiB, a journal newer than its snapshot, payloads that
   are not records or claim `u64::MAX` entries, and snapshots with a wrong length, a length over the
-  bound, a changed checksum, a cut frame header, or JSON that is not a snapshot.
+  bound, a changed checksum, a cut frame header, or JSON that is not a snapshot. For
+  `mcp_request_line`: blank lines, a NUL byte, nesting over the parser's depth limit and deep
+  nesting inside tool arguments, a lone surrogate, control characters, a number out of range, an
+  integer over `u64`, the largest float, a byte order mark, trailing characters, two `id` keys,
+  bytes that are not UTF-8 before and after a request, two requests with CRLF, a `tools/call` with
+  `"id": null` and one without an `id`, tool arguments that are an array, a tool name that is a
+  number, and `submit` arguments refused by the validation (a workspace with `..`, a workspace with
+  `files`, an unknown isolation level, an output pattern with `..`, negative cores).
 
 ## CI
 
-The `fuzz` job (Linux) builds the six targets on a pinned nightly (`nightly-2026-11-10`), runs the
+The `fuzz` job (Linux) builds the seven targets on a pinned nightly (`nightly-2026-11-10`), runs the
 inputs of `regressions/`, then fuzzes each target for 60 seconds on pull requests and pushes, and
 for 10 minutes on the weekly schedule. A finding fails the job and uploads the crash input as the
 artifact `fuzz-artifacts-<target>`: minimise it locally with `cargo fuzz tmin`, and add it to
@@ -142,6 +155,19 @@ the macOS `RUSTFLAGS` above. Command per target, from `fuzz/`:
 No crash, panic, failed assertion, timeout or out-of-memory in any run, and no file in
 `artifacts/`. The round-trip and record-layer assertions held for every input.
 
+`mcp_request_line` ran later on its own, the same way: 2026-11-18, 15:04:55 to 15:09:57 (UTC+7),
+`master` at `3a0f7c5` plus its change, same machine and tool, with other builds and tests on the
+machine (load average 11 when it started, 3.5 at the end). Command, from `fuzz/`:
+`cargo fuzz run mcp_request_line -s none <work dir> corpus/mcp_request_line -- -max_total_time=300 -max_len=4096`.
+
+| Target | Executions | Per second | Coverage (`cov`, edges) | Features (`ft`) | Corpus at the end | Peak RSS | Crashes |
+|---|---|---|---|---|---|---|---|
+| `mcp_request_line` | 1,752,586 | 5,822 | 1,838 | 6,713 | 1,672 inputs, 319 KB | 53 MB | 0 |
+
+No crash, panic, failed assertion, timeout or out-of-memory, and no file in `artifacts/`. Every
+accepted request read back the same after it was written again, and every accepted tool call named
+a tool of `tools/list`.
+
 ## Findings
 
 None in the first hour of each LV-1 target, and none in the five minutes of each LV-18 target.
@@ -151,18 +177,10 @@ below may find more.
 
 ## Open targets
 
-Design 0058 LV-1 names more parsers than these six. They are open:
+Design 0058 LV-1 names more parsers than these seven. They are open:
 
-1. The JSON-RPC reader of `oxideswarm mcp`. The line reader and the request checks (JSON, object,
-   `id`, `method`, `jsonrpc`, `params`) are inline in `run_stdio_server` in
-   `crates/cli/src/mcp.rs`, which reads the process's standard input, so no public function takes
-   one line. A target needs one, for example `pub fn parse_request_line(line: &str) ->
-   Result<JsonRpcRequest, JsonRpcResponse>` cut out of that loop (and a dispatch of the methods
-   that need no master: `initialize`, `ping`, `tools/list`). It waits for MAINT-2, which is
-   splitting `mcp.rs` into submodules. `validate_tool_arguments`, the check of `tools/call`
-   arguments, is public already.
-2. The pairing exchange of `pair.rs` (`invite --code` and `join --code`): the UDP discovery
+1. The pairing exchange of `pair.rs` (`invite --code` and `join --code`): the UDP discovery
    messages and the SPAKE2 exchange on the TCP stream (`run_inviter_session_on_stream`,
    `run_joiner_exchange_on_stream`) are private.
-3. The v3 handshake after the first frame (`v3_server_confirm_first_record`, the `ENROLL` record),
+2. The v3 handshake after the first frame (`v3_server_confirm_first_record`, the `ENROLL` record),
    which needs a session key from a completed handshake.
