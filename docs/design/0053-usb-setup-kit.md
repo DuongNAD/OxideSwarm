@@ -1,7 +1,7 @@
 # 0053: Set up machines from a USB stick
 
 Status: Partial (USB-1a and USB-1b built; USB-1c awaits a cross-machine live stick record). Accepted under decision Q13 (2026-11-09)
-Created: 2026-11-09    Updated: 2026-11-14
+Created: 2026-11-09    Updated: 2026-11-18
 
 ## Summary
 
@@ -288,3 +288,48 @@ installers call only `oxideswarm` subcommands that exist in the version on the s
   and v1 `packaging/usb/` installers/uninstallers with fresh-install rollback and `logs/install.log`
   (`cli_usb_kit_e2e` and Windows/POSIX launcher tests). `USB-1c` docs are updated, while `USB-1`
   stays `Partial` pending a cross-machine live stick run.
+- 2026-11-18: Three findings from a Windows 11 laptop (kit 0.4.3), fixed in `BUG-29`, `BUG-30` and
+  `BUG-31`:
+  - **Drive menu.** It offered `E:\OxideSwarm-USB`, and the install then refused the folder because
+    another account could delete or re-permission folders at the root of `E:\`. The menu now runs
+    the install's own check (`Test-RootSafety`) on each drive and lists a drive that fails it without
+    a number, as `not usable`, with the reason, instead of hiding it, so the person at the keyboard
+    learns why the drive is missing. The default folder stays first.
+  - **Older installs.** `uninstall.ps1` refused an install from a kit older than the
+    `.oxideswarm-usb-workspaces` marker. It now accepts such a `workspaces` folder when the install
+    folder carries `.oxideswarm-usb-install`, `workspaces` is a real folder directly inside it with
+    no link inside, no running worker or service uses it, and it is not the default workspace root
+    of a non-USB worker (`%LOCALAPPDATA%\oxideswarm\workspaces`, which a stopped non-USB worker may
+    still own). Every other case is refused as before. `uninstall.sh` has no such marker check.
+  - **Failed start.** The worker exited about 6 s after its start; the installer checked it only
+    once, at about 3 s (4 s in `install.sh`), so it reported "the master does not list it yet" and
+    the rollback deleted the log it named. Both installers now check the worker every second for
+    the whole wait (`install.ps1` runs the listing in a runspace of its own, `install.sh` in the
+    background), report "the worker stopped N s after it started (exit code C)", print the last 30
+    lines of `worker.log` under a header before the rollback, and keep `<folder>\logs` through the
+    rollback once the worker has been started, so the error names a file that exists.
+    `install.sh` makes `logs` mode 700 and `worker.log` mode 600. The rollback of `install.ps1` no
+    longer deletes a tree that holds a link.
+- 2026-11-18: Sandbox base on Windows, decided. Since the review fixes of 2026-11-10 (pull request
+  207, design 0055 D2) an install under `%LOCALAPPDATA%` used `%TEMP%\oxideswarm-usb\sandboxes`, and
+  an install on another drive `<folder>\work`. On the laptop above, `%LOCALAPPDATA%\Temp` grants
+  Modify to three leftover accounts, so the worker's sandbox base check refused the base and the
+  worker exited. Reading the worker: with `--isolation off` nothing needs `%TEMP%`; only
+  `validate_sandbox_base_safe`, which runs under `--isolation fs`, refuses a base inside the user
+  profile unless it is under `%TEMP%`, `.oxideswarm\sandboxes` or `AppData\Local\oxideswarm\sandboxes`
+  (the last two belong to a non-USB worker). Decision:
+  - a fresh install uses `<folder>\work` wherever the install folder is, except an install under
+    `%LOCALAPPDATA%` with `-Isolation fs`, which keeps `%TEMP%\oxideswarm-usb\sandboxes`;
+  - an update keeps the base its `start-worker.vbs` names, unless the check below refuses it or
+    `-Isolation fs` under `%LOCALAPPDATA%` needs `%TEMP%`; it then moves to the base above and says so;
+  - before it joins, `install.ps1` runs the worker's check on the chosen base (`Test-SandboxBase`,
+    the rules of `ensure_private_dir` on Windows: links, owners, rename-class rights on the folders
+    on the way, delete-class rights at the drive root, write-class rights on the base). A refusal
+    names the folder and the accounts ("your Temp folder (...) lets these accounts change it: ...")
+    and prints `icacls "<folder>" /remove:g "*<SID>" ...` for the grants set on that folder. The
+    installer never runs it and never changes an ACL: that is the user's decision.
+
+  Open, read from the code and not run: under `-Isolation fs`, `validate_workspace_root_safe`
+  likewise refuses `<folder>\workspaces` inside the user profile, so a worker installed under
+  `%LOCALAPPDATA%` with `-Isolation fs` and `--workspaces` would refuse its first workspace task.
+  Not changed here.
