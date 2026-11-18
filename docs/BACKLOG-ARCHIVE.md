@@ -2405,7 +2405,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   every message unchanged.
 - **Done when:** A unit test shows that the token is not computed when resume is off, and that it is the same
   token, computed once, when resume is on; the worker unit tests and the result resume integration tests pass.
-- **Implemented (2026-11-18, pull request PRNUM):** `resume_ack_token(resume_enabled, &result, token)` in
+- **Implemented (2026-11-18, pull request 332):** `resume_ack_token(resume_enabled, &result, token)` in
   `tasks.rs` returns `None` without calling `token` when resume is off; the runner keeps the token as an
   `Option<u64>` that is `Some` exactly when `resume_enabled`, and the three outbox calls take it from there.
   `BufferedTaskResult::new` takes the token from its caller instead of hashing again. The master's `ack_token` is
