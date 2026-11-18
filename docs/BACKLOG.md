@@ -382,11 +382,12 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented |  | 312, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | Out | (design 0089) |
 | BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Implemented |  | 314, (design 0093) |
-| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Planned | Out | (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Partial | Out | 349 (open), (design 0093) |
 | BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | Out | (design 0093) |
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
+| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Planned | Out | (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -1773,6 +1774,15 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   step 3 of APP-4.
 - **Done when:** The records are committed under `benchmarks/sweep/results/` with speedup against the
   fastest machine and efficiency against the sum of both.
+- **Partial (2026-11-18, pull request 349):** W1 on both machines, by the plan committed before the run
+  (`benchmarks/sweep/plans/2026-11-18-bench-3-w1-two-machines.json`, 120 tasks of 16,000,000 units, one
+  warm-up and 3 measured runs). Release 0.4.3 binaries; the plan names 0.4.2, and 0.4.3 shipped the same day
+  without a wire change. Each machine alone, best level (median of 3): the Windows case machine (i5-14600KF,
+  20 processes) 1.631 tasks/s, the Mac (M5, 10 processes) 1.412 tasks/s. Both through one master on the LAN
+  (Windows worker 20 slots, Mac worker 10 slots): 2.233 tasks/s, speedup 1.37 against the fastest machine
+  alone, efficiency 0.73 against the sum (3.04 tasks/s); 360 of 360 checksums equal to the local ones, no
+  failed task. The plan expected at least 0.85: BENCH-8 finds why. Not done: each worker alone through the
+  grid (the plan's step 5 controls), K = 200, and W2 (Q90).
 
 ### BENCH-4: Offload against local work
 
@@ -1807,6 +1817,29 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   its record. Handle the interconnect report by Q91 (default: unlink it from the README and keep the file
   with its header).
 - **Done when:** The first "Measured" rows link to the records, and `ox-mode doc` passes.
+
+### BENCH-8: Find why the two-machine W1 sweep reached 73 % efficiency, not 85 %
+
+- **Evidence:** BENCH-3's record `benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json`: efficiency
+  0.73 (median run 53.7 s against 39.4 s for the sum of both machines alone); runs 2.48, 2.23 and 2.23
+  tasks/s. The Windows worker took 60, 70 and 70 of the 120 tasks; the sum of the local rates gives it 64.
+  `submit_to_result_p50_s` is 10.9 to 12.2 s, while a task under full load takes about 7.1 s on the Mac
+  (10 / 1.412) and 12.3 s on Windows (20 / 1.631).
+- **Problem:** The plan expected at least 0.85, and the record does not say where the rest went. Three causes
+  fit and none is tested:
+  1. Few waves: the plan sized tasks at about 3 s from one process on the Mac, but under full load a task
+     takes 7 to 12 s, so 120 tasks are about four waves on 30 slots. When the queue runs dry, the Mac waits
+     while the last Windows tasks run, up to one Windows task length (12 s against a 39 s ideal).
+  2. No queue for the scheduler: the harness keeps as many submits in flight as there are slots (30), so the
+     master never holds a waiting task and the speed-aware placement of design 0060 never has a choice.
+  3. Per-task overhead: one CLI process per task (BENCH-1 (a): 26 to 69 ms on loopback), the LAN round trip,
+     the sandbox and the Python start; BENCH-5 measures it.
+- **Do:** With the same two workers and units, under a plan committed first: (a) 480 tasks instead of 120;
+  (b) 120 tasks with `--client-concurrency 120`; (c) each worker alone through the grid (BENCH-3's controls).
+  Compare each with the record above; if (b) helps, look at the placement of the last tasks in the master
+  log.
+- **Done when:** The records are committed and this section names the cause or causes with their share of
+  the gap, or the change that closes it.
 
 ## Status log
 
@@ -2223,6 +2256,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-18: Release `0.4.3` prepared (no wire change; ENROLL-1c revocation across every lane, LV-18, LV-4
   comments, BUG-27, BUG-28, TEST-35, TEST-53, TEST-54): versions, CHANGELOG with an "Upgrading from 0.4.2"
   note, README install lines, DEPLOYMENT section 3.5 and the ROADMAP release table.
+- 2026-11-18: BENCH-3 Partial (pull request 349): W1 on the Mac and the Windows case machine, speedup 1.37,
+  efficiency 0.73, 360/360 checksums; BENCH-8 added (Planned, Out) to find the gap to the plan's 0.85.
 - 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.

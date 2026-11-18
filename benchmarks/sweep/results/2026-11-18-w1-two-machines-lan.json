@@ -1,0 +1,324 @@
+{
+  "benchmark": "BENCH-2 sweep (design 0093 D1)",
+  "record_format": 1,
+  "date_utc": "2026-11-18T14:12:51Z",
+  "plan": {
+    "item": "BENCH-3 (design 0093 D2), workload W1",
+    "written": "2026-11-18, before any run of this plan, by the coordinator session",
+    "question": "Does a sweep of independent CPU tasks finish sooner on the owner's Mac and Windows case machine together, through OxideSwarm, than on the fastest of the two alone, and how close does it come to the sum of what each machine does alone?",
+    "workload": {
+      "name": "W1 (benchmarks/sweep/workload_cpu.py, SHA-256 chain)",
+      "units_per_task": 16000000,
+      "about": "about 3 s per task on the Apple M5 (calibrated 2026-11-18: 15.8M to 16.2M units for 3 s)",
+      "tasks": 120,
+      "seed_base": 0,
+      "runs": "one warm-up run, then 3 measured runs"
+    },
+    "machines": [
+      "Mac: Apple M5, 10 cores, 32 GiB, macOS, AC power; runs the master for the run, one worker, and the harness",
+      "Windows case machine: x86_64, 20 logical cores, Windows 11; runs one worker"
+    ],
+    "software": "OxideSwarm 0.4.2 release binaries on both machines; Python 3 on both (python3 on macOS, python on Windows)",
+    "steps": [
+      "1. Each machine alone: bench_sweep.py --plan <this file> --local-only --tasks 120 --units 16000000 --slug w1-local-<os>-<arch>",
+      "2. Mac: a master for the run (private HOME, port 9088, a secret made for the run, discovery beacon off) and a Mac worker with --max-concurrency at the Mac's best local level, started with a private bin directory first on PATH that holds a link named python to python3, so one task command (python) works on both workers",
+      "3. Windows: a worker with --max-concurrency at its best local level, the run's secret copied by hand by the owner (never through Drive, a PR or a commit)",
+      "4. Mac: bench_sweep.py --plan <this file> --tasks 120 --units 16000000 --master 127.0.0.1:9088 --secret-file <run secret> --skip-local --worker-python python --local-results <Mac local record> --local-results <Windows local record> --slug w1-two-machines-lan; tasks run on both workers",
+      "5. Optional controls: the same sweep on each worker alone (stop the other worker), slug w1-mac-worker-only and w1-win-worker-only"
+    ],
+    "metrics": "tasks per second; speedup = grid / max(local Mac, local Windows); efficiency = grid / (local Mac + local Windows); 120 of 120 checksums equal to the local ones",
+    "expected": "speedup above 1.0 and efficiency of at least 0.85 with 3 s tasks on a LAN (design 0093 D2 expects 0.9 for 10 s tasks; shorter tasks carry more per-task overhead: one CLI process per submit, BENCH-1 (a) measured 26 to 69 ms of client overhead per task on loopback); every checksum equal",
+    "publish": "the result is published whatever it is; a result below expectation becomes a BACKLOG item with its cause"
+  },
+  "oxideswarm": {
+    "commit": "5cc76d11c1542a4cd7d6c9c10bc31e9028d8e0b8",
+    "dirty_tree": false,
+    "version": "rusty-grid 0.4.3",
+    "build_profile": "unknown"
+  },
+  "workload": {
+    "name": "W1",
+    "file": "benchmarks/sweep/workload_cpu.py",
+    "sha256": "4a4d69b962b3227c1e8509a08e870db6fb4de2f0f8dbfd7cbc37cbb29521ac65",
+    "commit": "5cc76d11c1542a4cd7d6c9c10bc31e9028d8e0b8",
+    "units_per_task": 16000000,
+    "tasks": 120,
+    "seeds": [
+      0,
+      119
+    ],
+    "task_seconds_target": null
+  },
+  "machine": {
+    "hardware": {
+      "cpu_model": "Apple M5",
+      "cores": 10,
+      "ram_bytes": 34359738368
+    },
+    "os": {
+      "system": "Darwin",
+      "release": "27.2.0",
+      "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+      "machine": "arm64"
+    },
+    "power": [
+      "Now drawing from 'AC Power'",
+      " -InternalBattery-0 (id=36700259)\t100%; charged; 0:00 remaining present: true"
+    ],
+    "python": "3.11.8"
+  },
+  "cluster": {
+    "mode": "existing master",
+    "workers": [
+      {
+        "label": "worker-2",
+        "os": "windows",
+        "arch": "x86_64",
+        "slots": 20,
+        "isolation": "off",
+        "link": "TCP/LAN",
+        "protocol": "10",
+        "cpu_cores": 20,
+        "ram_mb": 48941,
+        "has_gpu": false
+      },
+      {
+        "label": "worker-1",
+        "os": "macos",
+        "arch": "aarch64",
+        "slots": 10,
+        "isolation": "off",
+        "link": "TCP/LAN",
+        "protocol": "10",
+        "cpu_cores": 10,
+        "ram_mb": 32768,
+        "has_gpu": false
+      }
+    ],
+    "total_slots": 30,
+    "client_concurrency": 30,
+    "doctor": {
+      "workers": [
+        {
+          "label": "worker-2",
+          "os": "windows",
+          "arch": "x86_64",
+          "cores": 20,
+          "ram_mb": 48941,
+          "isolation": "off",
+          "link": "TCP/LAN",
+          "link_kind": "tcp",
+          "link_rtt_ms": null
+        },
+        {
+          "label": "worker-1",
+          "os": "macos",
+          "arch": "aarch64",
+          "cores": 10,
+          "ram_mb": 32768,
+          "isolation": "off",
+          "link": "TCP/LAN",
+          "link_kind": "tcp",
+          "link_rtt_ms": null
+        }
+      ],
+      "checks": [
+        {
+          "id": "C1",
+          "name": "Connect",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "connected and authenticated in 0 ms"
+        },
+        {
+          "id": "C2",
+          "name": "Workers",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "2 connected (at least 2 expected)"
+        },
+        {
+          "id": "C3",
+          "name": "In-process probe",
+          "outcome": "pass",
+          "worker": "worker-2",
+          "detail": "completed in 0 ms"
+        },
+        {
+          "id": "C4",
+          "name": "Process probe",
+          "outcome": "pass",
+          "worker": "worker-2",
+          "detail": "started a process and read its output in 63 ms [iso:off]"
+        },
+        {
+          "id": "C3",
+          "name": "In-process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "completed in 0 ms"
+        },
+        {
+          "id": "C4",
+          "name": "Process probe",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "started a process and read its output in 5 ms [iso:off]"
+        },
+        {
+          "id": "C5",
+          "name": "GPU probe",
+          "outcome": "skip",
+          "worker": null,
+          "detail": "no worker advertises a GPU"
+        },
+        {
+          "id": "C6",
+          "name": "Spread",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "8 tasks of 500 ms finished in 618 ms on 2 worker(s): worker-1 3, worker-2 5"
+        },
+        {
+          "id": "C7",
+          "name": "Links",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "no relayed link among 2 connected worker(s)"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": null,
+          "detail": "upload to the master: 8 MiB in 36 ms, 228.6 MB/s"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": "worker-2",
+          "detail": "fetch to the worker over tcp: 8 MiB in 242 ms, 34.6 MB/s (submit to result, includes scheduling and a 61 ms task)"
+        },
+        {
+          "id": "C8",
+          "name": "Blob throughput",
+          "outcome": "pass",
+          "worker": "worker-1",
+          "detail": "fetch to the worker over tcp: 8 MiB in 83 ms, 101.0 MB/s (submit to result, includes scheduling and a 34 ms task)"
+        }
+      ]
+    }
+  },
+  "load_average_before": [
+    3.31,
+    3.27,
+    2.69
+  ],
+  "load_average_after": [
+    3.99,
+    6.47,
+    5.77
+  ],
+  "local": null,
+  "local_results_used": [
+    {
+      "source": "2026-11-18-w1-local-macos-aarch64.json",
+      "best_tasks_per_s": 1.4115,
+      "os": "Darwin",
+      "machine": "arm64",
+      "cpu_model": "Apple M5",
+      "cores": 10
+    },
+    {
+      "source": "2026-11-18-w1-local-windows-x86-64.json",
+      "best_tasks_per_s": 1.631,
+      "os": "Windows",
+      "machine": "AMD64",
+      "cpu_model": "Intel(R) Core(TM) i5-14600KF",
+      "cores": 20
+    }
+  ],
+  "grid": {
+    "warmup": {
+      "tasks": 120,
+      "wall_s": 47.0606,
+      "tasks_per_s": 2.5499,
+      "failed_tasks": 0,
+      "tasks_per_worker": {
+        "worker-1": 60,
+        "worker-2": 60
+      },
+      "submit_to_result_p50_s": 11.20345,
+      "submit_to_result_max_s": 15.6805
+    },
+    "runs": [
+      {
+        "tasks": 120,
+        "wall_s": 48.3677,
+        "tasks_per_s": 2.481,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-2": 60,
+          "worker-1": 60
+        },
+        "submit_to_result_p50_s": 10.89505,
+        "submit_to_result_max_s": 14.7919
+      },
+      {
+        "tasks": 120,
+        "wall_s": 53.7391,
+        "tasks_per_s": 2.233,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-2": 70,
+          "worker-1": 50
+        },
+        "submit_to_result_p50_s": 11.9903,
+        "submit_to_result_max_s": 16.4724
+      },
+      {
+        "tasks": 120,
+        "wall_s": 53.9252,
+        "tasks_per_s": 2.2253,
+        "failed_tasks": 0,
+        "tasks_per_worker": {
+          "worker-1": 50,
+          "worker-2": 70
+        },
+        "submit_to_result_p50_s": 12.174,
+        "submit_to_result_max_s": 15.8788
+      }
+    ],
+    "tasks_per_s": {
+      "median": 2.233,
+      "min": 2.2253,
+      "max": 2.481,
+      "runs": 3
+    },
+    "wall_s": {
+      "median": 53.7391,
+      "min": 48.3677,
+      "max": 53.9252,
+      "runs": 3
+    }
+  },
+  "scaling": {
+    "fastest_local_tasks_per_s": 1.631,
+    "sum_local_tasks_per_s": 3.0425,
+    "speedup": 1.369098712446352,
+    "efficiency": 0.7339359079704191,
+    "machines": 2
+  },
+  "checksums": {
+    "compared": 360,
+    "matched": 360,
+    "mismatched": 0,
+    "missing": 0,
+    "mismatches": [],
+    "missing_seeds": []
+  },
+  "failed_tasks": 0,
+  "quick": false,
+  "note": "BENCH-3 W1, Mac M5 (10 slots) + Windows i5-14600KF (20 slots) on the home LAN; release 0.4.3 binaries (the plan names 0.4.2; 0.4.3 shipped the same day with no wire change)"
+}

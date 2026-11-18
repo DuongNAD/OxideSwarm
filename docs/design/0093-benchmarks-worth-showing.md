@@ -244,3 +244,8 @@ names it.
   with local work, or a run between two networks. Q90 to Q92 open.
 - 2026-11-18: BENCH-2 Implemented (pull request 314, merged through pull request 316). The record stays a
   Draft until the owner decides Q90 to Q92.
+- 2026-11-18: BENCH-3, first record (pull request 349): W1, 120 tasks of 16,000,000 units, the Mac and the
+  Windows case machine on the home LAN. Fastest machine alone 1.631 tasks/s (Windows), both through the grid
+  2.233 tasks/s: speedup 1.37, efficiency 0.73, below the plan's 0.85; every checksum matched. BENCH-8 finds the
+  gap. The plan sized tasks at about 3 s from one process on the Mac; under full load they took 7 to 12 s, so
+  a plan should size tasks from the machine's best level, not from one process.
