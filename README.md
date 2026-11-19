@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="OxideSwarm" width="100%">
+<img src="assets/logo.svg" alt="OxideSwarm" width="420">
 
 # OxideSwarm
 
