@@ -48,6 +48,7 @@ pub(super) fn cleanup_failed_cluster_launch(
     children: &mut [&mut std::process::Child],
     pid_file: &Path,
     json_file: &Path,
+    master_port_file: &Path,
     dash_port_file: &Path,
     isolated_home: Option<&Path>,
 ) {
@@ -57,6 +58,7 @@ pub(super) fn cleanup_failed_cluster_launch(
     }
     let _ = fs::remove_file(pid_file);
     let _ = fs::remove_file(json_file);
+    let _ = fs::remove_file(master_port_file);
     let _ = fs::remove_file(dash_port_file);
     if let Some(home) = isolated_home {
         let _ = fs::remove_dir_all(home);

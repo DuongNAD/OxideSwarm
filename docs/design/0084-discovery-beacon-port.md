@@ -96,3 +96,4 @@ did before (unchanged by this record).
 ## Status log
 
 - 2026-11-17: Implemented (`CLI-2`).
+- 2026-11-19: `TEST-52` owner decision (2026-11-19): options to add an ephemeral beacon port / port file or to let `--discovery-port N` re-enable the beacon on listen port `0` are declined, so `--discovery-port 0` keeps its single meaning ("beacon off") and listen port `0` continues to keep the beacon off. The four discovery-beacon test helpers (`crates/cli/tests/discovery_port_e2e.rs`, `crates/master/src/server/tests.rs`, `tests/cluster_auth_e2e.rs`) remain accepted exceptions with `// Bind-and-drop kept (TEST-52)`.
