@@ -1,7 +1,7 @@
 # 0061: A first application for the model track: trial, client tunnel and usage records
 
-Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 to Q43 are open)
-Created: 2026-11-11    Updated: 2026-11-12
+Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 and Q42 are open; Q43 was closed by Q96 of design 0094 on 2026-11-19: display only)
+Created: 2026-11-11    Updated: 2026-11-19
 
 ## Summary
 
@@ -349,3 +349,6 @@ None yet.
   model server (LLM-12) is a named service, and its client command (LLM-13) sends model
   weights through a tunnel. The text of LLM-9 is unchanged. The spike that D3 names is R14;
   it was numbered R11 on 2026-11-11.
+- 2026-11-19: The owner decided Q96 of [design 0094](0094-road-to-a-shared-research-grid.md): credits
+  only display, are never spent or transferred and have no cash value. It closes Q43 at its default:
+  the balance of LLM-11 displays and refuses nobody.

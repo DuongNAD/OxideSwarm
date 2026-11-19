@@ -57,7 +57,7 @@ These parts were checked and need no rework:
 6. Follow the wire rule in `CLAUDE.md`: a new variant or field goes into the public enum, both
    mirror enums and all four `From` impls.
 7. A change to behaviour, a CLI flag, a port, an environment variable or a default updates
-   `README.md` and gets a design record, in the same pull request.
+   `docs/reference.md` and gets a design record, in the same pull request.
 8. Never read or write the real `~/.oxideswarm`. Give child processes a temporary `HOME` and
    `USERPROFILE` with `Command::env`.
 9. Do not write "verified on hardware" without a dated record of the run.
@@ -252,7 +252,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented |  | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented |  | 315 |
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  | 318 |
-| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
+| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Implemented |  | 320, 364 (open) |
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
@@ -355,7 +355,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
-| SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Planned | In |  |
+| SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
@@ -402,6 +402,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
+| ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -1020,8 +1024,11 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
 ## Phase 9: an open compute network
 
 Draft, added on 2026-11-10 from Phase H of [ROADMAP.md](ROADMAP.md). The architecture and the stage
-exit checks are in [design 0054](design/0054-open-compute-network.md). Decisions Q14 to Q18 of the
-roadmap are open. Each item starts with a threat model of its own and an independent review.
+exit checks are in [design 0054](design/0054-open-compute-network.md). Decisions Q15 to Q18 of the
+roadmap are open; Q96 closed Q14 on 2026-11-19. Each item starts with a threat model of its own and an independent review.
+[Design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19) orders these items
+as stages of a shared research grid: NET-1, NET-3 and NET-4 in its Stage 2, and NET-2 and NET-5 to
+NET-8 in Stage 3. The first part of NET-4 is NET-9, in Phase 19.
 
 | ID | Do | Done when |
 |---|---|---|
@@ -1226,27 +1233,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
   owner's decision of "Done when" (the entry itself is gone) and step 2.
 
-### SEC-17: Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files
-
-- **Evidence:** Read in the review of pull request 352 (BUG-32). `path_starts_with_ci` canonicalises both
-  paths (`normalize_win_path`), so a junction in an ancestor folder (for example
-  `AppData\Local\OxideSwarm-USB` pointing elsewhere) is followed, and `is_reparse_point` checks only the
-  last folder (`crates/worker/src/isolation/windows/mod.rs`, `toolchain.rs`). `SetNamedSecurityInfoW`
-  then rewrites the DACL of the target. The same holds for the allowed entries that existed before
-  BUG-32, so it is not a regression. The marker `.oxideswarm-usb-workspaces` and `store.lock` are not
-  checked for hard links.
-- **Problem:** Only processes of the same user can create such a junction or link, and the
-  `oxideswarm.toolchain` capability gets only non-inherited traverse, so the impact is low. But the rule
-  "the worker rewrites a DACL only on its own folders" depends on it.
-- **Do:**
-  1. Before the rewrite, refuse a reparse point in every folder from the user home to the workspace
-     root.
-  2. Require `nlink == 1` for the marker and `store.lock` (`windows_file_identity`,
-     `crates/worker/src/blob_cache.rs`).
-  3. Add tests with a junction in an ancestor folder and with a hard-linked marker. Where the host
-     cannot create them, skip with a printed reason.
-- **Done when:** Those tests pass on `windows-latest` in CI.
-
 ### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
 
 - **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
@@ -1308,54 +1294,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   under TEST-23.
 - **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
 - **Partial (2026-11-19, pull request 363, open):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
-
-### TEST-52: Let the remaining tests pick ports through the process that binds them, not bind-and-drop
-
-- **Evidence:** Found while fixing TEST-51 (pull request 318): six more test files pick a port by binding
-  `127.0.0.1:0`, reading the port and dropping the socket, and then hand that port to a master, a worker portal or
-  a dev cluster that binds it later. The TEST-51 failure (`Address already in use`, run `44209756700`) shows that
-  another test can take such a port in between. None of the six has failed in CI so far.
-- **Problem:** The same race as TEST-51 wherever the process that binds the port is told a number instead of
-  picking one.
-- **Do:** Where the product can pick the port and report it (port 0 with a port file, or a bound-address
-  accessor), let it, and wait by condition with a 30 s bound. Where it cannot, keep the pick, give the reason in a
-  one-line comment at the site, and name the product change that would remove it.
-- **Done when:** Every site is changed or carries its reason, and each changed test binary passes 20 runs in a row
-  under CPU load.
-- **Partial (2026-11-18, pull request 320):**
-  - Changed: both Web UI tests of `tests/m1_challenger_2_stress.rs` start the dashboard on `127.0.0.1:0` and read
-    `MasterHandle::dashboard_addr()`. The reuse test spawns the second master on the same port again until it holds
-    it (30 s bound, the "must be freed upon master shutdown" message kept) instead of binding a probe listener and
-    dropping it first; its reachability waits are 30 s bounds (were 3 s). The portal part of
-    `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` (`crates/worker/src/client/tests.rs`)
-    binds on `portal_bind_addr_for_target(0, ..)`, asserts that the listener is on 127.0.0.1 and runs `run_portal`
-    on it, as `portal_fixture` already does; its 600 ms connect loop is gone, because the listener is bound before
-    the portal runs. It no longer goes through `spawn_worker_redirection_portal_with_secret`, which is that bind
-    followed by `run_portal`. Every assertion is kept.
-  - Kept, with the reason at the site: `crates/cli/tests/discovery_port_e2e.rs` (the TCP ports, because
-    `ServerConfig::new` turns the beacon off for listen port 0 and `--discovery-port N` does not turn it back on,
-    so a master whose beacon the test checks needs a fixed listen port; the UDP ports, because `--discovery-port 0`
-    turns the beacon off and the master never publishes the port its beacon binds),
-    `crates/master/src/server/tests.rs` and `tests/cluster_auth_e2e.rs` (the discovery UDP port, same reason), and
-    `two_free_ports` and `free_master_port` in `tests/workflow_modes_test.rs` (`launch_local_dev_cluster_with_ports`
-    gives the master port to its workers as `--master 127.0.0.1:<port>` and accepts the dashboard only when its
-    port file holds the port it was given, so neither can be 0). `free_web_port` there is never bound: the master
-    fails on the held grid port before it binds its dashboard, so a reused port cannot change that test's outcome.
-    `test_dev_cluster_refuses_one_port_for_master_and_dashboard` binds its port in no process either.
-  - Product changes that would remove the rest (not made here, each changes behaviour or a flag and needs a design
-    record): let the dev cluster take 0 for both ports (master on `--listen 127.0.0.1:0 --port-file`, workers
-    started once the port is read, the dashboard port taken from `--dashboard-port-file`), which would also remove
-    the bind-and-drop in `launch_local_dev_cluster` (`crates/cli/src/mode_cli.rs`); bind the discovery socket before
-    `MasterServer::spawn_with_config` returns and publish its address on `MasterHandle` and in a port file, with a
-    way to ask for an ephemeral beacon port; let an explicit `--discovery-port N` start the beacon of a master that
-    listens on port 0.
-  - Not in this item (fixed ports, a different pattern): `test_beacon_of_a_master_with_a_loopback_dashboard_advertises_no_dashboard`
-    in `crates/master/src/server/tests.rs` (UDP 18091) and `tests/discovery_integration.rs` (29003, 29004, 29006,
-    each with a 150 ms sleep before the first connect).
-  - On an Apple Silicon Mac (10 cores), next to 4 spinning `yes` processes, 20 runs in a row of each test binary
-    the item touches passed 20 of 20: `m1_challenger_2_stress`, the `rusty_grid_worker` lib, the `rusty_grid_master`
-    lib, `cluster_auth_e2e`, `discovery_port_e2e` and `workflow_modes_test` (120 of 120). The old code was not
-    looped, and the race has not been reproduced locally.
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -1845,6 +1783,159 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   (`competing_processes`). Steps 2 and 3 (the live runs on Windows and Mac under a committed plan, and debug-log
   round-trip breakdown if idle slots remain) are next.
 
+## Phase 19: Stage 1 of the research grid, trusted circles and the first campaign
+
+From [design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19). The owner's
+ultimate goal is that the people who use OxideSwarm pool their machines to research one problem
+together. Stage 1 is a circle of people who know each other, such as friends or a lab, who join one
+cluster from several homes and complete a first campaign. Its exit check: about five owners and ten
+machines complete one campaign, and every result is verified.
+
+The items are outside the stop line of
+[design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md): its D1 puts ECO-3 and
+Phase H outside, and the owner placed APP-4 and APP-5 there. Gate: implementation merges after the
+stability release (Q80); docs-only and test-only work may merge before it, and so may the dry run of
+APP-6, which builds nothing. Order: ECO-9 and NET-9 in parallel, then NET-10, then APP-6. The
+recorded join from another network that APP-6 needs is part of ENROLL-1 (its "Done when", and
+ENROLL-1d).
+
+The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve as recommended"):
+
+- **Q94:** the pilot runs an Anima Engine parameter sweep in deterministic CPU mode. The first Stage 2
+  campaign is chosen after the pilot's record, by the rules of design 0094: independent tasks, results
+  verified by a checksum or a cheap check, code and outputs publishable under design 0057, no personal
+  data in the inputs.
+- **Q95:** the owner and three to five people the owner already knows, with about ten machines on at
+  least two home networks and at least two machines of each operating system and architecture in use.
+- **Q96:** credits only display: not transferable, never spent or sold, with no cash value. It closes
+  Q14 and Q43.
+- **Q97:** Stage 1 runs in parallel with `0.5.0`, as one lane at most, with implementation merged after
+  the stability release.
+
+### ECO-9: Per-participant quotas: running tasks, slots and priority
+
+- **Evidence:** Read on 2026-11-19 at `master` `f77eabd`. A member is one machine key (`MemberEntry`
+  in `crates/core/src/noise_auth.rs`: id, name, key, roles and times), and nothing groups the
+  machines of one person. Fair share is weighted round robin per submitter
+  (`crates/master/src/fair_share.rs`). The submitter is a new id for every client connection
+  (`SubmitterId::Client(Uuid::new_v4())` in `crates/master/src/server/client_and_members.rs`), and
+  it is not persisted (`crates/master/src/queue.rs`). The queue and the journal do not record which
+  member submitted a task; step 2 of revocation in design 0051 D5 needs it and is Planned
+  (ENROLL-1c). The only caps are cluster-wide: `--max-queue-size` and `--max-active-mb`.
+- **Problem:** In a circle one participant can fill every slot. A participant who runs one `submit`
+  per task gets one fair share per process.
+- **Do:**
+  1. Write a design record. Add a participant label to each member, set when the invite is made or
+     later by an admin, and show it in `members list`. Secret (v2) peers and the master's host count
+     as the organiser.
+  2. Record the submitting member of each task in the queue and the journal, as one change with
+     step 2 of ENROLL-1c (a store format change that the owner approves there).
+  3. Key the fair share on the participant, with a weight per participant.
+  4. Add per-participant caps on running tasks, slots held and queued tasks. A task over a running or
+     slot cap waits with a reason that `status` shows. A submission over the queued cap is refused
+     with a typed error.
+  5. State in `README.md` and `docs/SECURITY.md` that quotas share the grid between people who trust
+     each other and are not a boundary against a hostile participant (design 0050 D6).
+- **Done when:** Tests on a loopback cluster pass: a participant with a cap of two running tasks
+  never has more than two running; under contention, a participant who submits through one
+  connection and one who submits through twenty each get half the slots; a submission over the
+  queued cap gets the typed error; the submitter and the caps survive a master restart with
+  `--state-dir`. `members list` shows the label.
+
+### NET-9: Contributor controls on each machine
+
+- **Evidence:** Read on 2026-11-19 at `master` `f77eabd`. A worker has `--max-concurrency`,
+  `--task-priority normal|below-normal|idle` (default `below-normal`) and `--isolation` (`WorkerArgs`
+  in `crates/cli/src/cli_app.rs`). The host CPU threshold for new tasks is the master's
+  `--max-host-cpu-pct` (default 85, `crates/master/src/scheduler.rs`). A worker on a laptop reports
+  its battery (`spawn_mobile_poller` in `crates/worker/src/heartbeat.rs`), and the master's scheduler
+  lowers its concurrency by battery tier (`calculate_effective_concurrency` in
+  `crates/core/src/capabilities.rs`); the contributor cannot ask for no task on battery. The worker
+  reads no network cost and has no schedule. The only local stop is ending the worker process, whose
+  signal handler ends every task process tree (`terminate_all_task_process_trees` in
+  `crates/worker/src/process_tree.rs`).
+- **Problem:** In a circle the master belongs to the organiser. A contributor's limits must hold on
+  the contributor's machine, whatever the master asks.
+- **Do:** Write a design record. Then add these controls to the worker, set in the contributor's own
+  configuration (flags, `RUSTY_GRID_*`, `[worker]` of the config file) and enforced by the worker:
+  1. a host CPU threshold of the worker's own, above which it takes no new task;
+  2. hours: a weekly schedule in local time, and a cap of task hours per day;
+  3. no new task on battery;
+  4. no new task on a metered network, where the operating system reports it (connection cost on
+     Windows, the network path on macOS, NetworkManager on Linux); where it cannot tell, the worker
+     says so at start;
+  5. a local stop switch (for example `oxideswarm worker pause` and `resume`) that takes no new task
+     and ends running tasks within 5 s, while the worker stays connected; the tasks go back with the
+     refusal of [design 0090](design/0090-sandbox-base-refusal-hand-back.md) and run elsewhere
+     without a retry charged;
+  6. a log line that names the control holding a task back, and the controls in `README.md`.
+
+  Opt-in per campaign, the policy of task classes and limits across several worker processes of one
+  machine stay in NET-4. A rule for an idle screen stays in GREEN-1 of design 0056.
+- **Done when:** Worker tests with an injected clock, battery probe and network-cost probe pass: no
+  task starts outside the schedule, on battery, on a metered network or above the CPU threshold; a
+  task assigned while the worker is paused is handed back; `pause` ends a running task within 5 s,
+  and the task completes on another worker with its retry count unchanged. The record of APP-6 lists
+  the controls each contributor set.
+
+### NET-10: Contribution credits per participant, display only
+
+- **Evidence:** Read on 2026-11-19 at `master` `f77eabd`. A task result carries the worker id and the
+  run time (`worker_id` and `execution_time_ms` of `TaskResult` in `crates/core/src/task.rs`).
+  `members.json` maps each worker id to the member that owns it (`worker_owners` of `MembersFile` in
+  `crates/master/src/members.rs`). The master evicts finished tasks beyond `--max-retained-tasks` and
+  `--max-retained-mb`, so the task table cannot be the account. No credit or usage record exists.
+  [Design 0061](design/0061-first-application-model-tunnel.md) proposes usage records and a balance
+  per member for model tunnels (LLM-10, LLM-11), display only by the recommendation of Q43.
+- **Problem:** A participant cannot see what their machines gave to the circle or what their tasks
+  took from it.
+- **Do:** Write a design record. Then:
+  1. Keep a bounded, append-only ledger on the master, in `--state-dir` when it is set and in memory
+     otherwise. For each finished task it holds the participant whose machine ran it, the participant
+     who submitted it, the run time, the cores and GPU the task reserved, the exit code and the time.
+     Each entry credits one participant and debits another by the same amount (design 0054 D6). It
+     has the format of the usage records of LLM-10; the item that lands first defines it.
+  2. Show per participant the tasks and core-seconds contributed and used, over the last day, the
+     last week and all time, in `members list`, its `--json` and the dashboard.
+  3. Keep credits display only: no rule reads them, they cannot move between participants, and they
+     have no cash value (Q96). Nothing sends them off the master (Q39).
+- **Done when:** On a loopback cluster with two participants, the core-seconds each contributed and
+  used match the run times of their tasks, contributed minus used sums to zero over all
+  participants, the numbers survive a master restart with `--state-dir`, and the ledger stays within
+  its bound.
+
+### APP-6: Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified
+
+- **Evidence:** Design 0094 D4. APP-4 is Partial: the Anima Engine runner builds on Windows x86_64
+  and macOS arm64, and one trial gives the same checksum on repeat runs of one system and different
+  checksums on the two systems (design 0089 D6). `submit --verify <N>` runs N replicas on the first
+  worker's operating system and architecture and compares the outputs by BLAKE3 (VERIFY-1, VERIFY-2,
+  `crates/cli/src/verify.rs`). BENCH-3 ran a sweep on two machines of one owner. No run has had
+  machines of more than one owner, and no join from another network is recorded (ENROLL-1).
+- **Problem:** Nothing shows that a group of people can complete a campaign together, or what stops
+  them.
+- **Do:**
+  1. Before the run, commit the campaign sheet under `benchmarks/campaigns/<date>-pilot/`: the
+     workload (the runner at a fixed Anima Engine commit and its hash, deterministic mode,
+     `ANIMA_USE_GPU=0`), the input set (the manifest and the grid of seeds and parameters), the
+     verification rule (`submit --verify 1` with the trial's `checksums.sha256` as `--verify-file`),
+     what the results are and who sees them, the controls each contributor is asked to set, and the
+     participants by label (Q95). Never stage `.env` (design 0089).
+  2. Dry run, which builds nothing and may come before NET-9 and NET-10: two or three participants
+     on a released `0.4.x`, joined by invite with the role `worker`; the organiser is the only
+     `client`.
+  3. The pilot: about five participants and ten machines on at least two networks, with at least two
+     machines of each operating system and architecture in use. Each worker runs `--isolation fs+net`
+     where the runner works under it, `fs` otherwise, with the controls of NET-9; the master shows
+     the credits of NET-10.
+  4. The organiser runs the sweep with a driver over `submit --json --verify 1`. A mismatch is run
+     again, and its cause is recorded.
+- **Done when:** A record under `benchmarks/campaigns/` gives, per participant label and without
+  names, host names or addresses: the machines with system and cores, the network and link kind
+  (`doctor` check C7), the hours online, the tasks run, the credits shown and the controls set; the
+  verification result of every task, with each mismatch explained; and what each participant found
+  hard. It is the exit check of Stage 1 in design 0094.
+
 ## Status log
 
 Add one dated line per finished item, newest last.
@@ -2299,3 +2390,11 @@ Add one dated line per finished item, newest last.
   46 Out.
 - 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
 - 2026-11-19: TEST-57 and TEST-59 added and Implemented (pull request 365, open): `test_capability_queries_under_connect_disconnect_stress` (`tests/m2_challenger_2_stress.rs`) polls every `50 ms` up to `60 s` until `registrations >= 16` and each query count `> 50` instead of a fixed `1.8 s` sleep, and `test_tier2_bva_zero_duration_builtin_task_instant_completion` (`tests/e2e_cluster.rs`) checks task outcome, `0 ms` builtin stdout, and worker `execution_time_ms` while printing elapsed time instead of asserting `< 100 ms`; each passed `50/50` on Windows (`25` alone + `25` under 12 CPU busy loops); texts in the archive.
+- 2026-11-19: SEC-17 Implemented (pull request 360, open; text in the archive): `validate_workspace_root_safe` and a second `validate_workspace_root_ancestors_safe` check under `PREPARE_LOCK` right before `protect_sandbox_base` refuse reparse points on `--workspace-root` and along any raw, lexical, or canonical ancestor when `--workspace-root` is under or resolves into `host.user_home` or `%USERPROFILE%` (including external junctions above or pointing into home, while roots outside home keep no ancestor check and redirected home / `AppData\Local` junctions document the `--workspace-root` target workaround), and `.oxideswarm-usb-workspaces` and `store.lock` read `nNumberOfLinks == 1` directly from `GetFileInformationByHandle` (so ReFS / Dev Drive / network volumes stay accepted); remaining path-based `SetNamedSecurityInfoW` TOCTOU window and extra entries move to SEC-18.
+- 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
+- 2026-11-19: Phase 19 added from design 0094 (Draft): ECO-9, NET-9, NET-10 and APP-6, Planned and Out; Q94 to
+  Q97 open. The recorded join from another network stays in ENROLL-1.
+- 2026-11-19: Q94 to Q97 decided by the owner at the recommended answers; design 0094 Accepted. ECO-9, NET-9,
+  NET-10 and APP-6 stay Planned.
+- 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
+  BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.

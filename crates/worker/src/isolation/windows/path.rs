@@ -16,7 +16,7 @@ pub(super) fn to_wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
+pub(super) fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
     let s = raw.to_string_lossy();
     if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{stripped}"))
@@ -27,7 +27,7 @@ fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
     }
 }
 
-fn lexically_resolve_dots(p: &Path) -> PathBuf {
+pub(super) fn lexically_resolve_dots(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {

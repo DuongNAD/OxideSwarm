@@ -1718,6 +1718,462 @@ mod tests {
         assert!(err.contains(".OXIDESWARM-USB-WORKSPACES"), "{err}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_sec17_refuses_reparse_point_in_ancestor_from_home_and_leaves_target_dacl_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let fake_profile = root_path.join("profile");
+        let victim = root_path.join("victim");
+        let victim_ws = victim.join("workspaces");
+        let victim_temp_ws = victim.join("ox-test").join("workspaces");
+        let victim_local = root_path.join("victim_local");
+        let victim_local_usb_ws = victim_local.join("OxideSwarm-USB").join("workspaces");
+        let victim_local_ox_ws = victim_local.join("oxideswarm").join("workspaces");
+        for dir in [
+            &fake_profile,
+            &victim_ws,
+            &victim_temp_ws,
+            &victim_local_usb_ws,
+            &victim_local_ox_ws,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let orig_victim_sddl =
+            windows::get_path_dacl_sddl(&victim_ws).expect("read original DACL SDDL of victim_ws");
+
+        let mklink_j = |link: &Path, dest: &Path| -> Result<(), String> {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
+            }
+            let out = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &dest.to_string_lossy(),
+                ])
+                .output()
+                .map_err(|e| format!("launch mklink /J: {e}"))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "status={} stderr={}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        };
+
+        let host = HostDirs::from_home(
+            fake_profile.clone(),
+            Some(PathBuf::new()),
+            Some(PathBuf::new()),
+        );
+
+        // 1. BUG-32 USB-kit ancestor junction: AppData\Local\OxideSwarm-USB -> victim.
+        let usb_root = fake_profile
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB");
+        if let Err(reason) = mklink_j(&usb_root, &victim) {
+            eprintln!(
+                "skipping test_sec17_refuses_reparse_point_in_ancestor_from_home_and_leaves_target_dacl_untouched: mklink /J unavailable ({reason})"
+            );
+            return;
+        }
+        let usb_ws = usb_root.join("workspaces");
+        let err = windows::validate_workspace_root_safe(&usb_ws, &host)
+            .expect_err("SEC-17: junction at AppData\\Local\\OxideSwarm-USB must be refused");
+        assert!(
+            err.contains("reparse point") || err.contains("junction"),
+            "{err}"
+        );
+
+        // Also verify WindowsAppContainerGuard::create refuses before any DACL rewrite occurs.
+        let sb_base = root_path.join("sandboxes");
+        let sb_dir = sb_base.join("probe-sec17");
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &host,
+            protected_files: &[],
+            sandbox_base: &sb_base,
+            sandbox_dir: &sb_dir,
+            extra_writable_dir: None,
+            workspace_root: Some(&usb_ws),
+        };
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo ok"]);
+        cmd.current_dir(&sb_dir);
+        let guard_err =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("AppContainer guard must refuse ancestor junction workspace root"),
+                Err(e) => e,
+            };
+        assert_eq!(guard_err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl,
+            "target DACL behind ancestor junction must stay untouched"
+        );
+        std::fs::remove_dir(&usb_root).unwrap();
+
+        // 2. Legacy USB-kit and pre-BUG-32 allowed ancestors inside user_home.
+        let ancestor_cases: Vec<(PathBuf, PathBuf, &str)> = vec![
+            (
+                fake_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join("OxideSwarm")
+                    .join("usb-kit"),
+                fake_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join("OxideSwarm")
+                    .join("usb-kit")
+                    .join("workspaces"),
+                "legacy BUG-32 usb-kit",
+            ),
+            (
+                fake_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join("oxideswarm"),
+                fake_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join("oxideswarm")
+                    .join("workspaces"),
+                "pre-BUG-32 AppData\\Local\\oxideswarm",
+            ),
+            (
+                fake_profile.join(".oxideswarm"),
+                fake_profile.join(".oxideswarm").join("workspaces"),
+                "pre-BUG-32 .oxideswarm",
+            ),
+            (
+                fake_profile.join(".cache").join("oxideswarm"),
+                fake_profile
+                    .join(".cache")
+                    .join("oxideswarm")
+                    .join("workspaces"),
+                "pre-BUG-32 .cache\\oxideswarm",
+            ),
+            (
+                fake_profile.join("AppData").join("Local").join("Temp"),
+                fake_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join("Temp")
+                    .join("ox-test")
+                    .join("workspaces"),
+                "pre-BUG-32 AppData\\Local\\Temp",
+            ),
+        ];
+        for (link_anc, ws_path, label) in ancestor_cases {
+            mklink_j(&link_anc, &victim)
+                .unwrap_or_else(|e| panic!("mklink /J failed for {label}: {e}"));
+            let err = windows::validate_workspace_root_safe(&ws_path, &host)
+                .expect_err(&format!("SEC-17: junction at {label} must be refused"));
+            assert!(
+                err.contains("reparse point") || err.contains("junction"),
+                "{label}: {err}"
+            );
+            std::fs::remove_dir(&link_anc).unwrap();
+            let _ = std::fs::remove_dir_all(fake_profile.join("AppData"));
+        }
+
+        // 3. Intermediate ancestor junction at AppData\Local covering both BUG-32 and pre-BUG-32.
+        let appdata_local = fake_profile.join("AppData").join("Local");
+        let _ = std::fs::remove_dir_all(&appdata_local);
+        mklink_j(&appdata_local, &victim_local).expect("mklink /J at AppData\\Local");
+        for sub in ["OxideSwarm-USB", "oxideswarm"] {
+            let ws_path = appdata_local.join(sub).join("workspaces");
+            let err = windows::validate_workspace_root_safe(&ws_path, &host).expect_err(&format!(
+                "SEC-17: intermediate AppData\\Local junction for {sub} must be refused"
+            ));
+            assert!(
+                err.contains("reparse point") || err.contains("junction"),
+                "{sub}: {err}"
+            );
+            assert!(
+                err.contains("--workspace-root") && err.contains("target"),
+                "{sub} refusal must document --workspace-root target workaround: {err}"
+            );
+        }
+        std::fs::remove_dir(&appdata_local).unwrap();
+        // Workaround: pointing --workspace-root at the junction's target directly is accepted.
+        windows::validate_workspace_root_safe(&victim_local_ox_ws, &host)
+            .expect("pointing --workspace-root at AppData\\Local junction target must succeed");
+
+        // 3b. Home folder itself is a junction (e.g. C:\Users\me -> D:\Users\me):
+        //     default root under the junction home is refused, while --workspace-root on the target works.
+        let real_home_target = root_path.join("real_home_target");
+        let real_home_ws = real_home_target
+            .join("AppData")
+            .join("Local")
+            .join("oxideswarm")
+            .join("workspaces");
+        std::fs::create_dir_all(&real_home_ws).unwrap();
+        let junc_home = root_path.join("junc_home");
+        mklink_j(&junc_home, &real_home_target).expect("mklink /J for junc_home");
+        let junc_home_host = HostDirs::from_home(
+            junc_home.clone(),
+            Some(PathBuf::new()),
+            Some(PathBuf::new()),
+        );
+        let junc_home_ws = junc_home
+            .join("AppData")
+            .join("Local")
+            .join("oxideswarm")
+            .join("workspaces");
+        let err_junc_home = windows::validate_workspace_root_safe(&junc_home_ws, &junc_home_host)
+            .expect_err("SEC-17: user_home that is itself a junction must be refused");
+        assert!(err_junc_home.contains("reparse point"), "{err_junc_home}");
+        assert!(
+            err_junc_home.contains("--workspace-root") && err_junc_home.contains("target"),
+            "junction home refusal must document --workspace-root target workaround: {err_junc_home}"
+        );
+        windows::validate_workspace_root_safe(&real_home_ws, &junc_home_host)
+            .expect("pointing --workspace-root at the junction home's target must succeed");
+        std::fs::remove_dir(&junc_home).unwrap();
+
+        // 4. External junction outside user_home targeting an allowed folder inside user_home.
+        let real_usb_parent = fake_profile
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB");
+        std::fs::create_dir_all(real_usb_parent.join("workspaces")).unwrap();
+        let outside_junc = root_path.join("outside_junc");
+        mklink_j(&outside_junc, &real_usb_parent).expect("mklink /J outside -> inside");
+        let via_outside = outside_junc.join("workspaces");
+        let err_ext = windows::validate_workspace_root_safe(&via_outside, &host)
+            .expect_err("SEC-17: external junction pointing into user_home must be refused");
+        assert!(
+            err_ext.contains("reparse point") || err_ext.contains("junction"),
+            "{err_ext}"
+        );
+        std::fs::remove_dir(&outside_junc).unwrap();
+
+        // 4b. External junction above home (e.g. C:\x -> C:\Users with root C:\x\me\AppData\Local\oxideswarm\workspaces):
+        //     walking the raw path ancestors above home must still refuse C:\x.
+        let fake_users = root_path.join("fake_users");
+        let home_under_users = fake_users.join("me");
+        let ws_under_users = home_under_users
+            .join("AppData")
+            .join("Local")
+            .join("oxideswarm")
+            .join("workspaces");
+        std::fs::create_dir_all(&ws_under_users).unwrap();
+        let x_to_users = root_path.join("x_to_users");
+        mklink_j(&x_to_users, &fake_users).expect("mklink /J x_to_users -> fake_users");
+        let host_under_users =
+            HostDirs::from_home(home_under_users, Some(PathBuf::new()), Some(PathBuf::new()));
+        let via_x_to_users = x_to_users
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("oxideswarm")
+            .join("workspaces");
+        let err_above_home =
+            windows::validate_workspace_root_safe(&via_x_to_users, &host_under_users)
+                .expect_err("SEC-17: external junction above user_home must be refused");
+        assert!(
+            err_above_home.contains("reparse point") && err_above_home.contains("x_to_users"),
+            "{err_above_home}"
+        );
+        std::fs::remove_dir(&x_to_users).unwrap();
+
+        // 4c. Workspace root completely outside home (and outside %USERPROFILE%) has no ancestor check
+        //     unless ws_root itself is a reparse point.
+        let outside_host = HostDirs::from_home(
+            fake_profile.clone(),
+            Some(PathBuf::new()),
+            Some(PathBuf::new()),
+        );
+        let outside_ws = victim_temp_ws.clone();
+        windows::validate_workspace_root_safe(&outside_ws, &outside_host)
+            .expect("plain root outside user_home should pass when not a reparse point");
+        let outside_self_junc = root_path.join("outside_self_junc");
+        mklink_j(&outside_self_junc, &outside_ws).expect("mklink /J outside_self_junc");
+        let err_outside_self =
+            windows::validate_workspace_root_safe(&outside_self_junc, &outside_host)
+                .expect_err("ws_root itself as a reparse point outside home must still be refused");
+        assert!(
+            err_outside_self.contains("reparse point"),
+            "{err_outside_self}"
+        );
+        std::fs::remove_dir(&outside_self_junc).unwrap();
+
+        // 5. Optional directory symlink test (if host has symlink privilege).
+        let dot_ox = fake_profile.join(".oxideswarm");
+        match std::os::windows::fs::symlink_dir(&victim, &dot_ox) {
+            Ok(()) => {
+                let err_sym =
+                    windows::validate_workspace_root_safe(&dot_ox.join("workspaces"), &host)
+                        .expect_err("SEC-17: directory symlink ancestor must be refused");
+                assert!(
+                    err_sym.contains("reparse point") || err_sym.contains("symlink"),
+                    "{err_sym}"
+                );
+                std::fs::remove_dir(&dot_ox).unwrap();
+            }
+            Err(e) => {
+                eprintln!("note: directory symlink creation skipped in SEC-17 test ({e})");
+            }
+        }
+
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl,
+            "victim_ws DACL must remain unchanged across all refused ancestor checks"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec17_refuses_hard_linked_usb_marker_and_store_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let fake_profile = root_path.join("profile");
+        let ws_root = fake_profile
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let host = HostDirs::from_home(fake_profile, Some(PathBuf::new()), Some(PathBuf::new()));
+
+        let marker = ws_root.join(".oxideswarm-usb-workspaces");
+        std::fs::write(&marker, "Created by an OxideSwarm USB kit install.\n").unwrap();
+        let marker_hl = root_path.join("marker_hardlink");
+        if let Err(e) = std::fs::hard_link(&marker, &marker_hl) {
+            eprintln!(
+                "skipping test_sec17_refuses_hard_linked_usb_marker_and_store_lock: host cannot create hard links ({e})"
+            );
+            return;
+        }
+        let err_marker = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("SEC-17: hard-linked .oxideswarm-usb-workspaces must be refused");
+        assert!(
+            err_marker.contains(".oxideswarm-usb-workspaces"),
+            "{err_marker}"
+        );
+        assert!(err_marker.contains("nlink == 1"), "{err_marker}");
+        std::fs::remove_file(&marker_hl).unwrap();
+        windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect("single-link .oxideswarm-usb-workspaces must be accepted");
+
+        // Verify store.lock is accepted when nlink == 1 (even while locked by WorkspaceStore) and
+        // refused when hard-linked (nlink == 2).
+        let lock_path = ws_root.join("store.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock().unwrap();
+        windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect("single-link locked store.lock must be accepted");
+
+        let lock_hl = root_path.join("store_lock_hardlink");
+        std::fs::hard_link(&lock_path, &lock_hl).expect("hard_link store.lock");
+        let err_lock = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("SEC-17: hard-linked store.lock must be refused");
+        assert!(err_lock.contains("store.lock"), "{err_lock}");
+        assert!(err_lock.contains("nlink == 1"), "{err_lock}");
+
+        std::fs::remove_file(&lock_hl).unwrap();
+        windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect("store.lock back to nlink == 1 must be accepted");
+        drop(lock_file);
+
+        // Optional file symlink check on store.lock (when host supports symlinks).
+        std::fs::remove_file(&lock_path).unwrap();
+        let target_file = root_path.join("target_file.txt");
+        std::fs::write(&target_file, "secret\n").unwrap();
+        match std::os::windows::fs::symlink_file(&target_file, &lock_path) {
+            Ok(()) => {
+                let err_sym = windows::validate_workspace_root_safe(&ws_root, &host)
+                    .expect_err("SEC-17: symlinked store.lock must be refused");
+                assert!(err_sym.contains("store.lock"), "{err_sym}");
+                std::fs::remove_file(&lock_path).unwrap();
+            }
+            Err(e) => {
+                eprintln!("note: file symlink creation skipped on store.lock ({e})");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec17_nlink_check_accepts_zero_volume_serial_and_file_index_and_reports_read_error() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        let ws_root = Path::new(r"C:\fake\workspaces");
+        // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain integer and `FILETIME` fields.
+        let mut refs_like_info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        refs_like_info.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        refs_like_info.dwVolumeSerialNumber = 0;
+        refs_like_info.nFileIndexHigh = 0;
+        refs_like_info.nFileIndexLow = 0;
+        refs_like_info.nNumberOfLinks = 1;
+        windows::validate_single_link_file_info(ws_root, "store.lock", Ok(refs_like_info))
+            .expect("ReFS / Dev Drive / network volume with zero serial or file index and nNumberOfLinks == 1 must be accepted");
+
+        let mut multi_link = refs_like_info;
+        multi_link.nNumberOfLinks = 2;
+        let err_multi =
+            windows::validate_single_link_file_info(ws_root, "store.lock", Ok(multi_link))
+                .expect_err("nNumberOfLinks == 2 must be refused");
+        assert!(
+            err_multi.contains("2 hard links") && err_multi.contains("nlink == 1"),
+            "{err_multi}"
+        );
+
+        let mut zero_link = refs_like_info;
+        zero_link.nNumberOfLinks = 0;
+        let err_zero =
+            windows::validate_single_link_file_info(ws_root, "store.lock", Ok(zero_link))
+                .expect_err("nNumberOfLinks == 0 must be refused");
+        assert!(err_zero.contains("nNumberOfLinks == 0"), "{err_zero}");
+
+        let mut reparse = refs_like_info;
+        reparse.dwFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT;
+        let err_reparse =
+            windows::validate_single_link_file_info(ws_root, "store.lock", Ok(reparse))
+                .expect_err("reparse point attribute must be refused");
+        assert!(err_reparse.contains("reparse point"), "{err_reparse}");
+
+        let mut dir_attr = refs_like_info;
+        dir_attr.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        let err_dir = windows::validate_single_link_file_info(ws_root, "store.lock", Ok(dir_attr))
+            .expect_err("directory attribute must be refused");
+        assert!(err_dir.contains("not a regular file"), "{err_dir}");
+
+        let err_read = windows::validate_single_link_file_info(
+            ws_root,
+            "store.lock",
+            Err(std::io::Error::from_raw_os_error(50)),
+        )
+        .expect_err("GetFileInformationByHandle failure must be refused");
+        assert!(
+            err_read.contains("GetFileInformationByHandle") && !err_read.contains("hard links"),
+            "{err_read}"
+        );
+    }
+
     #[test]
     fn test_acl_grant_manifest_path_precedence_honours_oxideswarm_home() {
         use std::ffi::OsStr;
