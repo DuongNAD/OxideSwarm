@@ -20,12 +20,12 @@
 
 ### What is recorded (and what is never collected)
 - **Recorded (under an anonymous label `P1`..`P5`):** your OS and architecture, release version, how long each step took, where you paused or asked for help, what kind of job you tried, and (once, 14 days later) whether you used OxideSwarm again.
-- **Never collected or stored in records:** your real name, username, computer hostname, IP address, passwords, invite codes (`oxs1-...`), pairing codes, `cluster.secret`, `node.key`, contents of your files, screen recordings, or background usage telemetry. OxideSwarm binaries never phone home.
+- **Never collected or stored in records:** your real name, username, computer hostname, IP address, passwords, invite codes (`oxs1-...`), pairing codes, `cluster.secret`, `node.key`, contents of your files, screen recordings, or background usage telemetry. OxideSwarm has no telemetry; across networks (`--p2p`), encrypted traffic between the machines may pass through a public relay (n0/iroh), which sees addresses and amounts, not content.
 
 ### How to stop or remove everything
 - Press `Ctrl+C` in the worker terminal at any time to disconnect and terminate any running task on your machine.
 - Tell the facilitator you want to stop; no reason is needed.
-- To clean up afterwards, delete the downloaded `oxideswarm` binary folder and the temporary `~/.oxideswarm` (or `$OXIDESWARM_HOME`) directory, and ask the facilitator to revoke your temporary study key (`oxideswarm members revoke`).
+- To clean up afterwards, delete the downloaded `oxideswarm` binary folder and only the temporary folder set as `OXIDESWARM_HOME` for the study (never delete an existing `~/.oxideswarm`), and ask the facilitator to revoke your temporary study key (`oxideswarm members revoke`).
 
 ---
 
@@ -45,9 +45,9 @@
 
 ### Những gì được ghi nhận (và những gì tuyệt đối không thu thập)
 - **Được ghi nhận (chỉ gắn nhãn ẩn danh `P1`..`P5`):** hệ điều hành và kiến trúc CPU, phiên bản phát hành đã cài, thời gian hoàn thành từng bước, chỗ nào bạn dừng lại hoặc cần trợ giúp, loại công việc bạn đã thử, và (một lần duy nhất sau 14 ngày) bạn có tự dùng lại OxideSwarm hay không.
-- **Tuyệt đối không thu thập hay lưu lại:** tên thật, tên tài khoản máy (`username`), tên máy (`hostname`), địa chỉ IP, mật khẩu, chuỗi mời (`oxs1-...`), mã ghép nối, `cluster.secret`, `node.key`, nội dung tệp của bạn, video quay màn hình, hay telemetry ngầm. Phần mềm OxideSwarm không bao giờ tự gửi dữ liệu ra ngoài.
+- **Tuyệt đối không thu thập hay lưu lại:** tên thật, tên tài khoản máy (`username`), tên máy (`hostname`), địa chỉ IP, mật khẩu, chuỗi mời (`oxs1-...`), mã ghép nối, `cluster.secret`, `node.key`, nội dung tệp của bạn, video quay màn hình, hay telemetry ngầm. OxideSwarm không thu thập telemetry; khi kết nối khác mạng (`--p2p`), lưu lượng đã mã hóa giữa các máy có thể đi qua relay công cộng (n0/iroh), máy chủ này chỉ thấy địa chỉ và dung lượng, không thấy nội dung.
 
 ### Cách dừng hoặc xóa sạch sau khi thử nghiệm
 - Nhấn `Ctrl+C` trong cửa sổ terminal đang chạy worker bất cứ lúc nào để ngắt kết nối và dừng mọi tác vụ đang chạy trên máy.
 - Báo cho người hướng dẫn nếu bạn muốn dừng giữa chừng; không cần giải thích lý do.
-- Để dọn sạch sau buổi thử nghiệm, chỉ cần xóa thư mục chứa tệp thực thi `oxideswarm` và thư mục cấu hình tạm `~/.oxideswarm` (hoặc `$OXIDESWARM_HOME`), đồng thời nhắc người hướng dẫn thu hồi khóa tạm của máy bạn (`oxideswarm members revoke`).
+- Để dọn sạch sau buổi thử nghiệm, chỉ xóa thư mục chứa tệp thực thi `oxideswarm` và thư mục tạm đã đặt làm `OXIDESWARM_HOME` cho buổi thử (không bao giờ xóa `~/.oxideswarm` đang có sẵn), đồng thời nhắc người hướng dẫn thu hồi khóa tạm của máy bạn (`oxideswarm members revoke`).

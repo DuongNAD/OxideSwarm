@@ -19,7 +19,7 @@ You are invited to try installing and running OxideSwarm for the first time whil
 
 ### What is recorded and published
 - **Recorded during this session:** an anonymous participant label (`P1`–`P5`), your operating system and CPU architecture, release version tested, timing per step, points where you paused or asked for help, general category of any job you tried, and (14 days later) whether you used OxideSwarm again (`M17`).
-- **Never collected or published:** your name, OS username, hostname, IP address, email or chat handle, invites, pairing codes, secrets (`cluster.secret`, `node.key`), file contents, or screen recordings. OxideSwarm sends no automatic telemetry.
+- **Never collected or published:** your name, OS username, hostname, IP address, email or chat handle, invites, pairing codes, secrets (`cluster.secret`, `node.key`), file contents, or screen recordings. OxideSwarm has no telemetry; across networks (`--p2p`), encrypted traffic between the machines may pass through a public relay (n0/iroh), which sees addresses and amounts, not content.
 - **Public record:** The anonymized table (using only `P1`–`P5` labels) will be published in the OxideSwarm public repository (`docs/design/0059-first-users.md`) to guide documentation and tool improvements. You can ask `<FACILITATOR_NAME>` to delete your session record any time before that anonymized table is published.
 
 ### Confirmation checklist (verbal or written off-repo)
@@ -44,7 +44,7 @@ Bạn được mời thử cài đặt và chạy OxideSwarm lần đầu trong 
 
 ### Dữ liệu được ghi nhận và công bố công khai
 - **Được ghi nhận trong buổi thử nghiệm:** nhãn ẩn danh (`P1`–`P5`), hệ điều hành và kiến trúc CPU, phiên bản OxideSwarm đã cài, thời gian hoàn thành từng bước, các điểm bạn dừng lại hoặc cần hướng dẫn, nhóm công việc chung bạn chọn thử, và (sau 14 ngày) câu trả lời có/không về việc bạn có dùng lại OxideSwarm hay không (`M17`).
-- **Tuyệt đối không thu thập hay lưu lại:** họ tên thật, tên tài khoản hệ thống (`username`), tên máy (`hostname`), địa chỉ IP, email hay tài khoản chat, chuỗi mời, mã ghép nối, khóa bí mật (`cluster.secret`, `node.key`), nội dung tệp của bạn, hay video quay màn hình. OxideSwarm không gửi telemetry tự động.
+- **Tuyệt đối không thu thập hay lưu lại:** họ tên thật, tên tài khoản hệ thống (`username`), tên máy (`hostname`), địa chỉ IP, email hay tài khoản chat, chuỗi mời, mã ghép nối, khóa bí mật (`cluster.secret`, `node.key`), nội dung tệp của bạn, hay video quay màn hình. OxideSwarm không thu thập telemetry; khi kết nối khác mạng (`--p2p`), lưu lượng đã mã hóa giữa các máy có thể đi qua relay công cộng (n0/iroh), máy chủ này chỉ thấy địa chỉ và dung lượng, không thấy nội dung.
 - **Bản ghi công khai:** Bảng tổng hợp đã ẩn danh (chỉ ghi `P1`–`P5`) sẽ được đăng lên kho mã nguồn công khai của OxideSwarm (`docs/design/0059-first-users.md`) để cải thiện tài liệu và quy trình cài đặt. Bạn có thể yêu cầu `<FACILITATOR_NAME>` xóa bản ghi buổi thử của mình bất kỳ lúc nào trước khi bảng công khai được cập nhật.
 
 ### Xác nhận đồng ý tham gia (xác nhận trực tiếp hoặc qua tin nhắn riêng, không lưu tên lên repo)
