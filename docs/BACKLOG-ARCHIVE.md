@@ -2841,6 +2841,36 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
   `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
 
+### BUG-33: macOS: the lifeline supervisor closes descriptors one by one up to the soft limit for every task
+
+- **Evidence:** Found in the review of pull request 366 (`TEST-58`, `OxideSwarm_Agent_Hub`
+  `test_runs/review_pr366.md`): `crates/worker/src/process_tree.rs` (`close_fds_except`) looped `libc::close(fd)`
+  up to `RLIMIT_NOFILE` on macOS (`1,048,575` under a developer shell with `ulimit -n 1,048,576`, `65,536`
+  under `packaging/macos/com.oxideswarm.worker.plist`, `256` under default `launchd`). A 20-fork `wait4`
+  probe on Apple M5 before the fix measured per-task `close_fds_except` median wall / CPU times of
+  `111.889 ms` / `111.095 ms` (`mean 111.560 ms` / `110.751 ms`) at `1,048,576` and `7.683 ms` / `7.248 ms`
+  (`mean 7.714 ms` / `7.228 ms`) at `65,536`.
+- **Problem:** Even though the task child only waits for intermediate fork `child_b` to exit, the detached
+  lifeline supervisor burned CPU across cores closing hundreds of thousands of non-existent descriptors on
+  every task spawn when `RLIMIT_NOFILE` was high, amplifying contention on other threads.
+- **Do:** On macOS, list the calling process's open descriptors via `libc::proc_pidinfo(getpid(),
+  libc::PROC_PIDLISTFDS, ...)` into a fixed stack buffer (async-signal-safe after `fork`: no allocation, no
+  locks) and close only those not in `keep`, falling back to the bounded `RLIMIT_NOFILE` loop if
+  `proc_pidinfo` fails or the buffer overflows; keep Linux on `SYS_close_range` and Android unchanged.
+  Add a unit test opening a high-numbered descriptor (`>= 5000`) and proving the supervisor closes it.
+- **Done when:** High-fd unit test and `test_sec5_hardened_runner` pass, per-task close time is measured
+  before/after at `1,048,576` and `65,536`, and every `unsafe` block carries a `// SAFETY:` comment.
+- **Implemented (2026-11-19, pull request TBD, open):** Added `close_open_fds_macos` (fixed 1,024-entry
+  `[libc::proc_fdinfo; 1024]` stack buffer, up to 8 rounds) and `close_fds_range_fallback` in
+  `crates/worker/src/process_tree.rs` ([design 0031](design/0031-containment-after-worker-crash.md)), plus
+  `process_tree::tests::test_supervisor_closes_high_numbered_fd` (`F_DUPFD_CLOEXEC` at `>= 5000`, polling
+  for pipe EOF while child and supervisor remain alive). After the fix on Apple M5 (20 forks via `wait4`):
+  - `ulimit -n 1,048,576`: median wall `0.688 ms` (`mean 0.681 ms`, `min 0.447 ms`), median CPU `0.183 ms`
+    (`mean 0.223 ms`, `min 0.166 ms`) — down from `111.889 ms` / `111.095 ms`.
+  - `ulimit -n 65,536`: median wall `0.678 ms` (`mean 0.669 ms`, `min 0.549 ms`), median CPU `0.181 ms`
+    (`mean 0.196 ms`, `min 0.161 ms`) — down from `7.683 ms` / `7.248 ms`.
+  `rusty_grid_worker --lib` and `test_sec5_hardened_runner` (with and without `--features 3d`) pass.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
