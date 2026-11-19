@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- macOS worker task spawn (`BUG-33`, [design 0031](docs/design/0031-containment-after-worker-crash.md)): the detached lifeline supervisor in `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed stack buffer (`close_open_fds_macos`) and closes only those (falling back to the bounded `RLIMIT_NOFILE` loop if `proc_pidinfo` fails or after 8 full rounds (about 8,184 descriptors)), cutting per-task close-step time on Apple M5 from `111.889 ms` median wall / `111.095 ms` median CPU to `0.688 ms` / `0.183 ms` at `ulimit -n 1,048,576` and from `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`.
+
 ## [0.4.4] - 2026-11-19
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.3`. It fixes the Windows USB kit (the folder menu, the uninstall of older kits, the worker check after start, and `-Isolation fs` with `--workspaces`, `BUG-29` to `BUG-32`), hardens the Windows workspace root against junctions, symbolic links and hard links (`SEC-17`), adds the run summary of `submit --wait` (`ADOPT-2`), and is the first release whose archives carry a signed build provenance attestation (`LV-5`).
