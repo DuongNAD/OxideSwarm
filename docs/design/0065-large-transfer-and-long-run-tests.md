@@ -224,7 +224,7 @@ the binary version it ran.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | TEST-24 | Large-transfer harness and first records | `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` | Records of T1 to T9 are committed for loopback and for two machines over LAN and a relay. Every failed check has its own item or regression test | Partial |
-| TEST-25 | Soak harness and a first 24-hour record | `benchmarks/endurance/endurance.py` (`soak`) | A 24-hour record on a Mac and two Windows machines is committed. It passes D3, or every failed check has its own item | Planned |
+| TEST-25 | Soak harness and a first 24-hour record | `benchmarks/endurance/endurance.py` (`soak`) | A 24-hour record on a Mac and two Windows machines is committed. It passes D3, or every failed check has its own item | Partial |
 | TEST-26 | Short run on a schedule in CI | `.github/workflows/ci.yml` | The job is green on two scheduled runs | Planned |
 
 ## Decisions (decided by owner 2026-11-19)
@@ -258,3 +258,11 @@ The right column records the owner's decisions of 2026-11-19, listed in
   (`7/7` passed across `T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s`
   `50 ms` RTT with `0` worker reaps over `2,164.6 s`, and `T8`; `T1 8 GiB`, `T2 100,000` files,
   `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` remain for step 2).
+- 2026-11-19: TEST-25 step 1 Partial (rebased on `master` after PR 374): added `soak` subcommand of D3
+  to `benchmarks/endurance/endurance.py`, unit tests in `tests/test_endurance_harness.py`
+  (`19/19`), and 45-minute Windows `x86_64` loopback record
+  `benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json`
+  (`5/5` D3 checks passed over `2,703.64 s` across `2,144` tasks, `24` `queue_burst` refusals, `16`
+  injected faults including master restart and journal compaction `1,517,989 -> 24 B` /
+  `769,384 -> 24 B`, flat RSS/handles, bounded idle stores, probe p99 ratio `0.0134`, and `0`
+  leftover PIDs; 24-hour 3-machine step 2 awaits an owner date).

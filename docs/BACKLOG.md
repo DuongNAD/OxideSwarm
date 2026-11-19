@@ -225,7 +225,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
-| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
+| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
@@ -539,6 +539,22 @@ The full suite must pass on a clean machine before CI can require it.
      own ports (Q57).
 - **Done when:** The 24-hour record is committed. It passes the checks of D3, or every failed
   check has its own item or regression test.
+- **Partial (2026-11-19, step 1, branch `win/test-25-soak-harness`):** Added `soak` subcommand
+  of D3 to `benchmarks/endurance/endurance.py` (`--duration`, `--fault-scale`, `--load-scale`,
+  `--sample-interval`, `--workers`, `--slots`, `--workspaces`, `--max-queue-size`, `--state-dir`
+  master restart, worker kill/restart, `ThrottleProxy` link cuts, queue-cap burst, `TaskLedger`
+  single-terminal-state audit, D3 item 6 checks), unit tests in `tests/test_endurance_harness.py`
+  (`19/19` passed), and one 45-minute Windows `x86_64` loopback record on `rusty-grid 0.4.4` at
+  `41493dd`
+  (`benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json`):
+  all `5/5` D3 checks passed in `2,703.64 s` across `2,144` submitted tasks (`1,350` `noop`, `225`
+  `new_input`, `225` `reused_input`, `90` `output`, `45` `workspace_sync`, `45` `cancel`, `44`
+  `probe`, `120` `queue_burst`; `2,099` `ok`, `45` `cancelled`, `24` `queue_burst` refusals, `0`
+  lost/duplicate/hash mismatch/queue errors), `16` injected faults (`8` worker kills, `5` link
+  cuts, `2` queue bursts, `1` master restart), `journal.bin` shrinking `1,517,989 -> 24 B` and
+  `769,384 -> 24 B`, idle stores within `4 GiB` / `2 GiB` bounds with clean sandboxes, probe
+  p99 ratio `0.0134` (`<= 1.5`), and `0` leftover PIDs. The 24-hour 3-machine run (Mac master +
+  two Windows workers, Q57) remains for step 2.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -2419,3 +2435,4 @@ Add one dated line per finished item, newest last.
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: TEST-25 Partial (step 1, branch `win/test-25-soak-harness`, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `soak` subcommand of D3 to `benchmarks/endurance/endurance.py`, unit tests in `tests/test_endurance_harness.py` (`19/19`), and 45-minute Windows `x86_64` loopback record `benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json` (`5/5` D3 checks passed over `2,703.64 s` across `2,144` tasks, `24` `queue_burst` refusals, `16` injected faults, `journal.bin` compaction `1,517,989 -> 24 B` / `769,384 -> 24 B`, flat RSS/handles, bounded idle stores, probe p99 ratio `0.0134`, `0` leftover PIDs; 24-hour 3-machine run remains for step 2, awaiting an owner date). Counted from the rows: 225 items, 151 Implemented, 19 Partial and 55 Planned; 24 open items In, 50 Out.
