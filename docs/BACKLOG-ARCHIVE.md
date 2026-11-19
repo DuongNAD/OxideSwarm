@@ -2567,6 +2567,91 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      0.00 s` `libtest` (`123.72 s -> 3.83 s` wall, 30/30 `skipped:`).
   - **PR #361 CI result (`44437998772`, `windows-latest` job `135271584175`, green across all 3 OSes):** total job duration `1,416 s` (`23.60 min`, vs `30.2 min` median / `43.1 min` max baseline — `-6.6 min`), with Step 7 in `165 s` (`2.75 min`) and Step 8 in `1,149 s` (`19.15 min`).
 
+### TEST-58: Find why the keep_sandboxes sweep test fails on macOS
+
+- **Evidence:** `sandbox::tests::test_ensure_usable_keep_sandboxes_retains_and_subsequent_default_sweeps`
+  (`crates/worker/src/sandbox.rs`, `-p rusty_grid_worker --lib`) failed twice on `macos-latest`: run
+  `44184956339` (`unit tests (macos-latest)`, 2026-11-17) and run `44250010401` (`workspace tests
+  (macos-latest)`, 2026-11-18), both panicking at `!sb_path.exists()` (`subsequent ensure_usable() with
+  keep_sandboxes == false must sweep retained unlocked sandboxes`, `crates/worker/src/sandbox.rs:2645`).
+  Reproduced locally on Apple Silicon (10 cores) at `origin/master` (`f0989363`): `0/200` alone, `0/200`
+  within `sandbox::tests::`, and `2/50` failures (iterations 3 and 16, both at `crates/worker/src/sandbox.rs:2645:9`)
+  when run in parallel with six `runner::*` subprocess tests in the same `rusty_grid_worker --lib` binary.
+- **Problem:** `Sandbox::create` holds an exclusive `flock` (`file.try_lock()`) on `<base_dir>/.locks/<task_id>.lock`.
+  On Unix, `flock(2)` locks attach to the open file description rather than the descriptor. While other
+  tests in the same `rusty_grid_worker` test process concurrently spawn child tasks via
+  `crates/worker/src/process_tree.rs` (`pre_exec` double-forks a detached lifeline supervisor), the forked
+  children inherit duplicate descriptors pointing to the open file description (`O_CLOEXEC` only closes on
+  `execve`, not `fork`). On developer shells with `ulimit -n` at `1,048,576` (not macOS's default: `launchd`
+  defaults to `256` and `packaging/macos/com.oxideswarm.worker.plist` sets `65,536`), each detached
+  supervisor closes descriptors in ascending order (`0, 1, 2, ...`) up to `1,048,575` (`process_tree.rs:691-732`,
+  `1034-1050`); while ascending `close` drops the low-numbered lock fd early, iterating up to the soft limit
+  burns CPU across cores and widens the scheduling window during which newly forked children still hold the
+  inherited lock descriptor (confirmed by the PR 366 review run on `f0989363`: `4/30` failures at soft limit
+  `1,048,576`, `0/30` at `1,024`, and `0/40` after the fix). Because `Sandbox::destroy` (`keep_sandboxes == true`
+  and `false`) and `Drop for Sandbox` only set `self.lock_file = None` (`close(fd)`) without calling
+  `File::unlock()` (`LOCK_UN`), `close` left the `flock` held until the last child closed its duplicate,
+  causing `sweep_leftover_sandboxes_sync` -> `open_and_try_lock_task` -> `try_lock()` to see `WouldBlock`
+  and leave the retained sandbox unswept.
+- **Do:** Reproduce in loops on macOS, add a deterministic unit test modeling an inherited duplicate lock
+  descriptor (`try_clone()`), explicitly unlock task lock files (`File::unlock()`) before closing in
+  `crates/worker/src/sandbox.rs`, and keep `test_ensure_usable_keep_sandboxes_retains_and_subsequent_default_sweeps`
+  and its `!sb_path.exists()` assertion intact.
+- **Done when:** Cause is named, the fix passes deterministically and in 200-run alone, 200-run `sandbox::tests`,
+  and 200-run concurrent loops on macOS without weakening assertions.
+- **Implemented (2026-11-19, pull request 366, open):** Added `release_task_lock` in
+  `crates/worker/src/sandbox.rs` (calls `lock_file.unlock()` before `drop(lock_file)`) and used it across
+  `Sandbox::destroy`, `Drop for Sandbox`, `Sandbox::create` error cleanup, `open_and_try_lock_task_with`,
+  and `sweep_leftover_sandboxes_sync`, plus deterministic unit test
+  `sandbox::tests::test_keep_sandboxes_destroy_unlocks_even_with_inherited_lock_fd` (confirmed to fail before
+  the fix at `sandbox.rs:2690:9` and pass after). The `process_tree.rs` macOS ascending close-loop CPU/wall
+  burn is tracked separately as `BUG-33`. Post-fix verification on Apple Silicon (10 cores, private `HOME`): `0/200` failures alone, `0/200` across `sandbox::tests::`, `0/200` alongside the six
+  concurrent `runner::*` tests, and `0/20` across the full `rusty_grid_worker --lib` binary (304 tests/run).
+
+### TEST-57: m2 capability stress test: wait for reconnects by condition, not a fixed 1.8 s window
+
+- **Evidence:** `test_capability_queries_under_connect_disconnect_stress` (`tests/m2_challenger_2_stress.rs:735`)
+  failed on `windows-latest` in run `44308601329` (attempt 1, after 33 minutes) with
+  `The churn workers must reconnect during the run (observed 8 registrations from 8 workers)`.
+- **Problem:** The test slept for a fixed `1800 ms` (`tests/m2_challenger_2_stress.rs:698`) and then
+  asserted `registered >= 16` and `> 50` iterations in each of the four query loops. Under a starved
+  CI runner, all 8 churn workers completed their initial registration (`observed 8 registrations`),
+  leaving too little of the fixed `1.8 s` window for any worker to reconnect before shutdown.
+- **Do:** Replace the fixed `1.8 s` sleep with a `50 ms` polling loop up to a `60 s` deadline until
+  `registered >= 16` and all four query counts exceed `50`, stopping early if any query task finishes,
+  and keep both final assertions with the elapsed time and counts printed on failure.
+- **Done when:** Both assertions stay, idle run time remains about `2 s`, and the test passes `50/50`
+  (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
+- **Implemented (2026-11-19, pull request 365):** Polls `registry.counts()` and all four atomic
+  query counters every `50 ms` up to `60 s` in `tests/m2_challenger_2_stress.rs` and prints
+  `stress_elapsed` and counts on completion or deadline expiry. On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`,
+  a private folder), `cargo test --locked -p rusty_grid_master --test m2_challenger_2_stress test_capability_queries_under_connect_disconnect_stress -- --exact`
+  passed `50/50` (`0` failures): `25/25` alone (wall `5.0398 / 5.1959 / 6.0501 s`, libtest
+  `0.85 / 0.86 / 1.01 s`) and `25/25` under 12 CPU busy loops (`82.0%` host CPU; wall
+  `5.6473 / 5.8747 / 6.6347 s`, libtest `1.00 / 1.02 / 1.45 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
+  and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings.
+
+### TEST-59: Zero-duration task test: drop the 100 ms wall-clock window
+
+- **Evidence:** `test_tier2_bva_zero_duration_builtin_task_instant_completion`
+  (`tests/e2e_cluster.rs:1078:5`) failed in `workspace tests (macos-latest)` on 2026-11-18 at `be6c1e9`
+  (run `44209594539`, job `134484257136`) with `0-duration task must complete nearly instantly`.
+- **Problem:** The test asserted `elapsed < Duration::from_millis(100)` across a full master-worker
+  round trip (`submit_and_wait`), which depends on runner scheduling rather than task behaviour.
+- **Do:** Raise the cluster/task safety timeouts (`30 s`), print `elapsed` and `res.execution_time_ms`
+  instead of asserting `elapsed < 100 ms`, and assert task success (`res.is_success()`, `exit_code == 0`,
+  `error.is_none()`), the `0 ms` builtin sleep stdout, and bounded worker `execution_time_ms`.
+- **Done when:** No wall-clock `< 100 ms` assertion remains, `elapsed` is printed, and the test passes
+  `50/50` (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
+- **Implemented (2026-11-19, pull request 365):** Updated
+  `test_tier2_bva_zero_duration_builtin_task_instant_completion` in `tests/e2e_cluster.rs` as planned.
+  On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`, a private folder),
+  `cargo test --locked -p rusty_grid_cli --test e2e_cluster test_tier2_bva_zero_duration_builtin_task_instant_completion -- --exact`
+  passed `50/50` (`0` failures): `25/25` alone (wall `6.5930 / 6.8475 / 9.2592 s`, libtest
+  `0.58 / 0.60 / 1.15 s`) and `25/25` under 12 CPU busy loops (`90.0–97.0%` host CPU; wall
+  `7.0569 / 13.5401 / 27.8546 s`, libtest `0.67 / 0.99 / 1.63 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
+  and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
@@ -2840,6 +2925,36 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `.OXIDESWARM-USB-WORKSPACES`); added the pre-install profile check in `packaging/usb/install.ps1`
   and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
   `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
+
+### BUG-33: macOS: the lifeline supervisor closes descriptors one by one up to the soft limit for every task
+
+- **Evidence:** Found in the review of pull request 366 (`TEST-58`, `OxideSwarm_Agent_Hub`
+  `test_runs/review_pr366.md`): `crates/worker/src/process_tree.rs` (`close_fds_except`) looped `libc::close(fd)`
+  up to `RLIMIT_NOFILE` on macOS (`1,048,575` under a developer shell with `ulimit -n 1,048,576`, `65,536`
+  under `packaging/macos/com.oxideswarm.worker.plist`, `256` under default `launchd`). A 20-fork `wait4`
+  probe on Apple M5 before the fix measured per-task `close_fds_except` median wall / CPU times of
+  `111.889 ms` / `111.095 ms` (`mean 111.560 ms` / `110.751 ms`) at `1,048,576` and `7.683 ms` / `7.248 ms`
+  (`mean 7.714 ms` / `7.228 ms`) at `65,536`.
+- **Problem:** Even though the task child only waits for intermediate fork `child_b` to exit, the detached
+  lifeline supervisor burned CPU across cores closing hundreds of thousands of non-existent descriptors on
+  every task spawn when `RLIMIT_NOFILE` was high, amplifying contention on other threads.
+- **Do:** On macOS, list the calling process's open descriptors via `libc::proc_pidinfo(getpid(),
+  libc::PROC_PIDLISTFDS, ...)` into a fixed stack buffer (async-signal-safe after `fork`: no allocation, no
+  locks) and close only those not in `keep`, falling back to the bounded `RLIMIT_NOFILE` loop if
+  `proc_pidinfo` fails or the buffer overflows; keep Linux on `SYS_close_range` and Android unchanged.
+  Add a unit test opening a high-numbered descriptor (`>= 5000`) and proving the supervisor closes it.
+- **Done when:** High-fd unit test and `test_sec5_hardened_runner` pass, per-task close time is measured
+  before/after at `1,048,576` and `65,536`, and every `unsafe` block carries a `// SAFETY:` comment.
+- **Implemented (2026-11-19, pull request 367, open):** Added `close_open_fds_macos` (fixed 1,024-entry
+  `[libc::proc_fdinfo; 1024]` stack buffer, up to 8 rounds) and `close_fds_range_fallback` in
+  `crates/worker/src/process_tree.rs` ([design 0031](design/0031-containment-after-worker-crash.md)), plus
+  `process_tree::tests::test_supervisor_closes_high_numbered_fd` (`F_DUPFD_CLOEXEC` at `>= 5000`, polling
+  for pipe EOF while child and supervisor remain alive). After the fix on Apple M5 (20 forks via `wait4`):
+  - `ulimit -n 1,048,576`: median wall `0.688 ms` (`mean 0.681 ms`, `min 0.447 ms`), median CPU `0.183 ms`
+    (`mean 0.223 ms`, `min 0.166 ms`) — down from `111.889 ms` / `111.095 ms`.
+  - `ulimit -n 65,536`: median wall `0.678 ms` (`mean 0.669 ms`, `min 0.549 ms`), median CPU `0.181 ms`
+    (`mean 0.196 ms`, `min 0.161 ms`) — down from `7.683 ms` / `7.248 ms`.
+  `rusty_grid_worker --lib` and `test_sec5_hardened_runner` (with and without `--features 3d`) pass.
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 

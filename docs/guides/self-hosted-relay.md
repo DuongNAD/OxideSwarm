@@ -80,7 +80,7 @@ Do not use `iroh-relay --dev`: development mode serves plaintext HTTP on port `3
 
 ### 4. Start the master with `--relay-url`
 
-Pass `--relay-url https://<RELAY_HOST>`, set `RUSTY_GRID_RELAY_URL=https://<RELAY_HOST>`, or set `relay_url = "https://<RELAY_HOST>"` under `[master]` in `~/.oxideswarm/rusty-grid.toml` ([README CLI reference](../../README.md#oxideswarm-master-flags)).
+Pass `--relay-url https://<RELAY_HOST>`, set `RUSTY_GRID_RELAY_URL=https://<RELAY_HOST>`, or set `relay_url = "https://<RELAY_HOST>"` under `[master]` in `~/.oxideswarm/rusty-grid.toml` ([CLI reference](../reference.md#oxideswarm-master-flags)).
 
 On the master machine:
 

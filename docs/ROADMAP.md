@@ -7,12 +7,23 @@ Q40 (a trial comes before any build item of design 0061) and Q44 (model weights 
 memory of another machine with no file written there first, design 0062) on 2026-11-11, and
 Q48 (two directions are followed in parallel, design 0063) on 2026-11-12, and Q80 (a stability
 release before `0.5.0`), Q81 (`0.6.0` carries bet A of design 0056), Q82 (the ten exit checks of
-design 0088 are what "finished" means) and Q83 (bet A may start before `0.5.0` ships) on 2026-11-17.
-Created: 2026-11-07    Updated: 2026-11-17
+design 0088 are what "finished" means) and Q83 (bet A may start before `0.5.0` ships) on 2026-11-17,
+and Q94 to Q97 (the road to a shared research grid, design 0094; Q96 closes Q14 and Q43) on
+2026-11-19.
+Created: 2026-11-07    Updated: 2026-11-19
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
 and to the design records. The status of each item lives in the BACKLOG Index, not here.
+
+## Ultimate goal: a shared research grid
+
+The owner's ultimate goal, stated on 2026-11-19, is that the people who use OxideSwarm pool their
+machines to research one problem together, as volunteer computing projects do. Coding agents on one
+owner's machines (Q1) are the first step on that road, and they stay the purpose that "finished" is
+measured against (Q82). [Design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted,
+Q94 to Q97 decided on 2026-11-19) lays out the road as research campaigns that people join, in four
+stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.md).
 
 ## Summary
 
@@ -35,7 +46,9 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   architecture is in [design 0050](design/0050-scale-out-architecture.md).
 - Long-term goal (Draft, 2026-11-10): an open compute network where anyone can offer and use idle
   compute, safely and with checkable results. Phase H carries it, and the architecture is in
-  [design 0054](design/0054-open-compute-network.md).
+  [design 0054](design/0054-open-compute-network.md). Since 2026-11-19
+  [design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted) orders Phase H as the
+  road to a shared research grid.
 - Frontier program (Draft, 2026-11-10): what a person outside the project would switch to
   OxideSwarm for. Tasks become portable, movable and checkable, through bets A to E. Each bet
   starts with a spike that can end it and finishes with a recorded run on real machines. The plan
@@ -373,7 +386,7 @@ Goal: the user story works between two real machines. The design record is
 | WS-3 | P2P tickets in `connect_master`, with a `STREAM_CLIENT` stream tag, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients | Implemented (W1, pull request 157; W7, pull requests 170 and 171) |
 | WS-4 | `cargo build --offline` when `Cargo.toml` is present, and a `tool:rustc` worker tag | FEAT-10 | Implemented (W8, pull request 165) |
 | WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout | Implemented (W5, pull request 168). With a workspace, the task timeout defaults to 1800 s |
-| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` | Partial. Several blobs in flight from one client (W9, pull request 160) is merged; compression is out of scope (design 0006) |
+| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `docs/reference.md` | Partial. Several blobs in flight from one client (W9, pull request 160) is merged; compression is out of scope (design 0006) |
 | WS-7 | A guide in `docs/guides/` for offloading `cargo test` from a coding agent, with a recorded two-machine run | | Implemented. W6 (pull request 174) tests it on Linux, macOS and Windows; W10 (pull request 177) is the [guide](guides/offload-cargo-test.md), with the live run of 2026-11-09 |
 | CACHE-1 | Reuse the result of an identical task, keyed by the command, the environment and the input digests (decision Q7) | Exact repeats of a run | Planned |
 
@@ -530,13 +543,24 @@ The hard problems are not the network. They are:
 H0 can start after ENROLL-1, because it is useful inside trusted clusters. H1 needs SCALE-6. H2
 needs ECO-3 and an independent security review of its threat model.
 
+[Design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19) frames this goal
+as a shared research grid: research campaigns that people join, in four stages ordered by who takes
+part. Stage 0 is today's personal clusters. Stage 1, trusted circles, adds per-participant quotas
+(ECO-9), the first part of NET-4 (NET-9), credits that only display (NET-10) and a pilot campaign
+(APP-6), as Phase 19 of [BACKLOG.md](BACKLOG.md). Stage 2, research campaigns, takes H0 and H2
+(NET-1, NET-3, NET-4), and the public pool becomes campaigns with one submitter each. Stage 3, an
+open research grid, takes H1, H3 and H4 (NET-2, NET-5 to NET-7). Federation (H1) moves after the
+campaigns, because volunteers attach their workers to a campaign directly. Money, tokens and
+payments stay out (Q96). The owner decided Q94 to Q97 on 2026-11-19.
+
 A project that receives donated compute publishes its outputs and its task code. The draft charter
 is [design 0057](design/0057-open-results-charter.md). The owner accepted its principle on
 2026-11-10 (Q27 to Q29), and its text still needs a legal review. It is a
 condition for using the public pool, not a term of the software licence, and it does not cover a
 cluster on its owner's machines.
 
-**Exit check per stage:** the stage table of design 0054, each result recorded with its date.
+**Exit check per stage:** the stage table of design 0054, each result recorded with its date. The
+stages of design 0094 (D2) have exit checks of their own.
 
 ### Frontier program: bets across the phases
 
@@ -675,7 +699,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q10 | Which comes first for builds: compatibility with the Remote Execution API (ECO-1) or the grid's own API and MCP (ECO-6, ECO-7)? | The own API and MCP first, REAPI cache-only next, remote execution last |
 | Q11 | Which licence and is there a commercial or hosted offering? | Keep `MIT OR Apache-2.0`. No hosted offering decided; revisit after the first release |
 | Q12 | Which autoscaling providers does SCALE-5 build first? | SSH pool, then Kubernetes, then one cloud |
-| Q14 | How does the open network (Phase H) count contribution: credits, money or tokens, or nothing? | Open. Recommended: plain credits, earned by verified work and spent on running work; no cryptocurrency |
+| Q14 | How does the open network (Phase H) count contribution: credits, money or tokens, or nothing? | Credits that only display: never spent, sold or transferred, with no cash value; no money, tokens or payments. Decided by the owner on 2026-11-19 through Q96 ([design 0094](design/0094-road-to-a-shared-research-grid.md)). The earlier recommendation, credits spent on running work, is not adopted |
 | Q15 | Which sandbox for strangers' code comes first: WebAssembly or lightweight VMs? | Open. Recommended: WebAssembly first (one binary for every OS, deterministic, cheap to verify), VMs in H3 |
 | Q16 | Which workloads does the public pool take first? | Open. Recommended: open-source CI builds and tests, Monte Carlo and parameter sweeps, rendering; all split well and can be checked |
 | Q17 | Who governs the network once it has outside users? | Open. Recommended: the owner until then, then a neutral steward with an open specification |
@@ -704,7 +728,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
 | Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
-| Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Open. Recommended: display only in the first version |
+| Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Display only; it refuses nobody. Decided by the owner on 2026-11-19 through Q96 (design 0094) |
 | Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
 | Q45 | For design 0062, in which order: the spikes R15 to R18, then one worker that runs the whole model (LLM-12, LLM-13), then the head rule for a split model? | Open. Recommended: that order. The split keeps its place in design 0038 |
 | Q46 | How does the model server of design 0062 that loads from a stream exist: a patch to `llama-server`, offered upstream and built from source by the worker's owner, with no binary in a release? | Open. Recommended: yes, after spike R17; no server of our own |
@@ -733,6 +757,10 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q90 | May the README headline of BENCH-3 name Anima Engine and show its numbers, or does it use the synthetic workload only ([design 0093](design/0093-benchmarks-worth-showing.md))? | Open. Recommended: measure both; name Anima Engine only if the owner agrees and its repository is public, otherwise say "a deterministic agent-based simulation" |
 | Q91 | What happens to the hand-typed interconnect report in `benchmarks/interconnect/` (design 0093)? | Open. Recommended: unlink it from the README and stop calling it a benchmark there; keep the file with its header as a record of one run |
 | Q92 | Is "copy and run over ssh" a baseline in BENCH-4 (design 0093)? | Open. Recommended: no, local baselines only, because it needs an SSH server on the Windows machine; yes if the owner turns one on |
+| Q94 | What is the first research problem: the workload of the Stage 1 pilot (APP-6), and the rule for choosing the first Stage 2 campaign ([design 0094](design/0094-road-to-a-shared-research-grid.md))? | Decided by the owner on 2026-11-19 at the recommended answer: an Anima Engine parameter sweep in deterministic CPU mode for the pilot; the first Stage 2 campaign chosen after the pilot's record, among workloads that split into independent tasks, verify by a checksum or a cheap check, can publish code and outputs under design 0057 and hold no personal data |
+| Q95 | Who takes part in the Stage 1 pilot (design 0094)? | Decided by the owner on 2026-11-19 at the recommended answer: the owner and three to five people the owner already knows, with about ten machines on at least two home networks and at least two machines of each system in use, each agreeing to the campaign sheet before joining |
+| Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of design 0094? | Yes, decided by the owner on 2026-11-19 at the recommended answer. It closes Q14 for the research grid and Q43 |
+| Q97 | Does Stage 1 of design 0094 run in parallel with release `0.5.0`? | Yes, decided by the owner on 2026-11-19 at the recommended answer: one lane at most beside `0.5.0` and bet A, with implementation merged after the stability release (Q80) and docs-only or test-only work before it |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -901,3 +929,11 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 - 2026-11-17: The twelve items that design 0088 names entered [BACKLOG.md](BACKLOG.md) as Phase 13:
   CI-1, MAINT-2, DOC-11, ADOPT-1 to ADOPT-4, AX-1 to AX-3, LV-4 and LV-15, all Planned. CI-1 records
   the cause of the cancelled runs and jobs of 2026-11-16 that "Stability" lists.
+- 2026-11-19: The owner stated the ultimate goal: the people who use OxideSwarm pool their machines to
+  research one problem together. Section "Ultimate goal: a shared research grid" added, and Phase H
+  points to [design 0094](design/0094-road-to-a-shared-research-grid.md) (Draft), which orders the
+  road as research campaigns in four stages. Its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.md)
+  (ECO-9, NET-9, NET-10, APP-6). Q94 to Q97 are open.
+- 2026-11-19: The owner decided Q94 to Q97 at the recommended answers ("Approve as recommended").
+  Design 0094 is Accepted. Q96 closes Q14 and Q43: credits only display, and no money, tokens or
+  payments.
