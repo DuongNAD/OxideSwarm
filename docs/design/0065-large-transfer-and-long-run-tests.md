@@ -1,6 +1,6 @@
 # 0065: Tests for large transfers and long runs
 
-Status: Partial (TEST-24 step 1 harness + Windows loopback record; Q57–Q59 decided by owner 2026-11-19)
+Status: Partial (TEST-24 and TEST-25 step 1 harnesses + Windows loopback records, PR 374 and PR 381; Q57–Q59 decided by owner 2026-11-19)
 Created: 2026-11-14    Updated: 2026-11-19
 
 ## Summary
@@ -258,11 +258,14 @@ The right column records the owner's decisions of 2026-11-19, listed in
   (`7/7` passed across `T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s`
   `50 ms` RTT with `0` worker reaps over `2,164.6 s`, and `T8`; `T1 8 GiB`, `T2 100,000` files,
   `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` remain for step 2).
-- 2026-11-19: TEST-25 step 1 Partial (rebased on `master` after PR 374): added `soak` subcommand of D3
+- 2026-11-19: TEST-25 step 1 Partial (pull request 381, rebased on `master` after PR 374 and updated after review): added `soak` subcommand of D3
   to `benchmarks/endurance/endurance.py`, unit tests in `tests/test_endurance_harness.py`
-  (`19/19`), and 45-minute Windows `x86_64` loopback record
+  (`20/20`), and 45-minute Windows `x86_64` loopback record
   `benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json`
-  (`5/5` D3 checks passed over `2,703.64 s` across `2,144` tasks, `24` `queue_burst` refusals, `16`
-  injected faults including master restart and journal compaction `1,517,989 -> 24 B` /
-  `769,384 -> 24 B`, flat RSS/handles, bounded idle stores, probe p99 ratio `0.0134`, and `0`
-  leftover PIDs; 24-hour 3-machine step 2 awaits an owner date).
+  (`6/6` checks passed over `2,704.22 s` across `2,185` submitted/unique master tasks, `0` multi-result tasks,
+  `0` submit failures, `4` real retries/orphan requeues from `GET /api/tasks` + master `INFO` logs [debug-only stale/late
+  drops unmeasured at `INFO`], `16/16` injected faults including master restart and journal compaction
+  `1,525,821 -> 24 B` / `801,453 -> 24 B`; per-process-lifetime master RSS `16.0 -> 35.5 MiB` [gen 0] and
+  `29.2 -> 40.3 MiB` [gen 1]; bounded idle stores and mid-run worker cache `<= 2,125.0 MiB` within pinned headroom;
+  fault-excluded clean probe p99 `130.85 -> 146.51 ms` [`14`/`16` samples, ratio `1.1197`]; `0` leftover PIDs
+  and `0` leftover task process trees; 24-hour 3-machine step 2 awaits an owner date).

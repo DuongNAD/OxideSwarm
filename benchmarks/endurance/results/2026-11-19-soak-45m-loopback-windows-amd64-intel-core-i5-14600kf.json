@@ -1,8 +1,8 @@
 {
   "benchmark": "TEST-25 soak endurance suite",
-  "date_utc": "2026-11-19T10:03:21Z",
+  "date_utc": "2026-11-19T12:30:08Z",
   "git": {
-    "commit": "41493dd6753be36eb84f88f90906ff2321f73b40",
+    "commit": "4c11a458058a44cd9a247df95baa86fc63ec3439",
     "dirty_tree": false
   },
   "binary": {
@@ -41,9 +41,9 @@
     "rate_mbps": null,
     "delay_ms": 0.0
   },
-  "measured_rtt_ms": 0.426,
+  "measured_rtt_ms": 0.363,
   "disk_check": {
-    "free_bytes": 58770956288,
+    "free_bytes": 58561396736,
     "total_bytes": 498595786752,
     "required_bytes": 11051991040,
     "largest_file_bytes": 104857600,
@@ -54,7 +54,7 @@
   "all_passed": true,
   "soak": {
     "passed": true,
-    "actual_duration_s": 2703.64,
+    "actual_duration_s": 2704.22,
     "fault_plan": [
       {
         "at_s": 300.0,
@@ -172,142 +172,238 @@
     "faults_executed": [
       {
         "kind": "worker_kill",
-        "t_s": 300.05,
+        "seq": 0,
+        "planned_at_s": 300.0,
+        "t_s": 300.0,
+        "end_s": 315.36,
         "worker_index": 0,
-        "old_pid": 24068,
-        "new_pid": 7536,
-        "down_s": 15.0
+        "old_pid": 42660,
+        "new_pid": 29284,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "link_cut",
-        "t_s": 450.75,
+        "seq": 0,
+        "planned_at_s": 450.0,
+        "t_s": 450.72,
+        "end_s": 458.22,
         "worker_index": 0,
-        "pause_s": 7.5
+        "pause_s": 7.5,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 600.19,
+        "seq": 1,
+        "planned_at_s": 600.0,
+        "t_s": 600.16,
+        "end_s": 615.5,
         "worker_index": 1,
-        "old_pid": 17976,
-        "new_pid": 33276,
-        "down_s": 15.0
+        "old_pid": 38044,
+        "new_pid": 11868,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "link_cut",
-        "t_s": 900.09,
+        "seq": 1,
+        "planned_at_s": 900.0,
+        "t_s": 900.05,
+        "end_s": 907.55,
         "worker_index": 1,
-        "pause_s": 7.5
+        "pause_s": 7.5,
+        "ok": true
       },
       {
         "kind": "queue_burst",
-        "t_s": 900.09,
-        "burst_size": 72,
-        "max_queue_size": 64
+        "seq": 0,
+        "planned_at_s": 900.0,
+        "t_s": 900.05,
+        "end_s": 946.81,
+        "worker_index": null,
+        "burst_size": 80,
+        "max_queue_size": 64,
+        "accepted": 80,
+        "refused": 0,
+        "failed": 0,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 900.09,
+        "seq": 2,
+        "planned_at_s": 900.0,
+        "t_s": 900.05,
+        "end_s": 948.58,
         "worker_index": 2,
-        "old_pid": 19632,
-        "new_pid": 33292,
-        "down_s": 15.0
+        "old_pid": 43840,
+        "new_pid": 28760,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 1200.0,
+        "seq": 3,
+        "planned_at_s": 1200.0,
+        "t_s": 1200.2,
+        "end_s": 1215.58,
         "worker_index": 0,
-        "old_pid": 7536,
-        "new_pid": 25396,
-        "down_s": 15.0
+        "old_pid": 29284,
+        "new_pid": 48232,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "link_cut",
-        "t_s": 1350.06,
+        "seq": 2,
+        "planned_at_s": 1350.0,
+        "t_s": 1350.0,
+        "end_s": 1357.5,
         "worker_index": 2,
-        "pause_s": 7.5
+        "pause_s": 7.5,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 1500.16,
+        "seq": 4,
+        "planned_at_s": 1500.0,
+        "t_s": 1500.09,
+        "end_s": 1515.45,
         "worker_index": 1,
-        "old_pid": 33276,
-        "new_pid": 37996,
-        "down_s": 15.0
+        "old_pid": 11868,
+        "new_pid": 10004,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "link_cut",
-        "t_s": 1800.06,
+        "seq": 3,
+        "planned_at_s": 1800.0,
+        "t_s": 1800.23,
+        "end_s": 1807.73,
         "worker_index": 0,
-        "pause_s": 7.5
-      },
-      {
-        "kind": "worker_kill",
-        "t_s": 1800.06,
-        "worker_index": 2,
-        "old_pid": 33292,
-        "new_pid": 19316,
-        "down_s": 15.0
+        "pause_s": 7.5,
+        "ok": true
       },
       {
         "kind": "master_restart",
-        "t_s": 1800.06,
+        "seq": 0,
+        "planned_at_s": 1800.0,
+        "t_s": 1800.23,
+        "end_s": 1807.97,
+        "worker_index": null,
         "compaction": {
           "reason": "scheduled_restart",
           "generation": 0,
           "exit_code": 0,
-          "before_bytes": 1517989,
+          "before_bytes": 1525821,
           "after_bytes": 24,
           "shrank": true
         },
-        "new_master_port": 29781
+        "new_master_port": 1798,
+        "ok": true
       },
       {
         "kind": "queue_burst",
-        "t_s": 1800.06,
-        "burst_size": 72,
-        "max_queue_size": 64
+        "seq": 1,
+        "planned_at_s": 1800.0,
+        "t_s": 1807.97,
+        "end_s": 1846.91,
+        "worker_index": null,
+        "burst_size": 80,
+        "max_queue_size": 64,
+        "accepted": 80,
+        "refused": 0,
+        "failed": 0,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 2100.22,
+        "seq": 5,
+        "planned_at_s": 1800.0,
+        "t_s": 1800.23,
+        "end_s": 1848.61,
+        "worker_index": 2,
+        "old_pid": 28760,
+        "new_pid": 44732,
+        "down_s": 15.0,
+        "ok": true
+      },
+      {
+        "kind": "worker_kill",
+        "seq": 6,
+        "planned_at_s": 2100.0,
+        "t_s": 2100.12,
+        "end_s": 2115.48,
         "worker_index": 0,
-        "old_pid": 25396,
-        "new_pid": 40556,
-        "down_s": 15.0
+        "old_pid": 48232,
+        "new_pid": 8520,
+        "down_s": 15.0,
+        "ok": true
       },
       {
         "kind": "link_cut",
-        "t_s": 2250.51,
+        "seq": 4,
+        "planned_at_s": 2250.0,
+        "t_s": 2250.44,
+        "end_s": 2257.94,
         "worker_index": 1,
-        "pause_s": 7.5
+        "pause_s": 7.5,
+        "ok": true
       },
       {
         "kind": "worker_kill",
-        "t_s": 2400.12,
+        "seq": 7,
+        "planned_at_s": 2400.0,
+        "t_s": 2400.02,
+        "end_s": 2415.38,
         "worker_index": 1,
-        "old_pid": 37996,
-        "new_pid": 42928,
-        "down_s": 15.0
+        "old_pid": 10004,
+        "new_pid": 48908,
+        "down_s": 15.0,
+        "ok": true
       }
     ],
+    "fault_errors": [],
     "master_audit": {
       "master_generations": 2,
-      "result_messages_logged": 2144,
-      "unique_result_tasks": 2144,
+      "result_messages_logged": 2185,
+      "unique_result_tasks": 2185,
       "multi_result_tasks": {},
-      "failover_sweeps": 13,
+      "failover_sweeps": 12,
+      "superseded_failovers": 0,
       "reaper_failovers": 0,
-      "requeues_logged": 0,
-      "stale_results_ignored": 0,
-      "late_results_ignored": 0,
-      "queue_record_errors": 0
+      "orphan_requeues": 4,
+      "evacuations_logged": 0,
+      "requeues_logged": 4,
+      "requeued_task_ids": [
+        "11624c42-8a63-4287-aad3-1ff2ee2c6069",
+        "51567d25-c32c-476e-a9d2-3b1ac40dee6c",
+        "6a3c3c1c-3e9c-4dfd-96b3-1399abc43669",
+        "fa44c496-250c-49d7-80ec-e09a5d79a19f"
+      ],
+      "evacuated_task_ids": [],
+      "stale_late_results_measured": false,
+      "stale_results_ignored": null,
+      "late_results_ignored": null,
+      "queue_record_errors": 0,
+      "stale_late_results_note": "Ignored stale/late results are logged at DEBUG level in crates/master/src and are not measured under default INFO logging",
+      "missing_from_master_results": [],
+      "untracked_master_results": [],
+      "task_api_snapshots": 2,
+      "task_api_errors": [],
+      "task_api_tasks_observed": 2185,
+      "task_api_retries_total": 4,
+      "task_api_retried_tasks": 4,
+      "task_api_failovers_total": 4,
+      "task_api_evacuations_total": 0,
+      "retries_source": "master_task_api"
     },
     "compactions": [
       {
         "reason": "scheduled_restart",
         "generation": 0,
         "exit_code": 0,
-        "before_bytes": 1517989,
+        "before_bytes": 1525821,
         "after_bytes": 24,
         "shrank": true
       },
@@ -315,7 +411,7 @@
         "reason": "final_stop",
         "generation": 1,
         "exit_code": 0,
-        "before_bytes": 769384,
+        "before_bytes": 801453,
         "after_bytes": 24,
         "shrank": true
       }
@@ -324,21 +420,24 @@
       "1_accounting": {
         "passed": true,
         "ledger": {
-          "submitted": 2144,
-          "completed": 2144,
+          "submitted": 2185,
+          "completed": 2185,
           "lost_tasks": [],
           "duplicate_results": [],
           "hash_mismatches": [],
           "unexpected_outcomes": [],
           "untracked_results": [],
-          "retries_total": 0,
-          "retried_tasks": 0,
-          "refusals": 24,
-          "refusals_by_kind": {
-            "queue_burst": 24
-          },
+          "retries_total": 4,
+          "retried_tasks": 4,
+          "refusals": 0,
+          "refusals_by_kind": {},
+          "refusal_reason_counts": {},
+          "refusals_detail": [],
+          "submit_failures_count": 0,
+          "submit_failures_by_kind": {},
+          "submit_failures": [],
           "outcome_counts": {
-            "ok": 2099,
+            "ok": 2140,
             "cancelled": 45
           },
           "by_kind": {
@@ -348,8 +447,8 @@
               "failed_check": 0
             },
             "probe": {
-              "submitted": 44,
-              "terminal": 44,
+              "submitted": 45,
+              "terminal": 45,
               "failed_check": 0
             },
             "output": {
@@ -378,58 +477,82 @@
               "failed_check": 0
             },
             "queue_burst": {
-              "submitted": 120,
-              "terminal": 120,
+              "submitted": 160,
+              "terminal": 160,
               "failed_check": 0
             }
           },
           "ok": true,
-          "master_failover_sweeps": 13,
-          "master_requeues_logged": 0
+          "master_failover_sweeps": 12,
+          "master_requeues_logged": 4,
+          "master_failovers_total": 4,
+          "retries_source": "master_task_api"
         },
-        "master_duplicate_executions": 0
+        "master_evidence_present": true,
+        "master_duplicate_executions": 0,
+        "master_multi_result_tasks": {},
+        "master_unique_result_tasks": 2185,
+        "master_expected_submitted": 2185,
+        "master_queue_record_errors": 0,
+        "master_missing_results": [],
+        "master_untracked_results": []
       },
       "2_resource_plateau": {
         "mode": "short_run_early_vs_late",
         "baseline_window_s": [
-          423.42,
-          1209.72
+          423.22,
+          1208.64
         ],
         "late_window_s": [
-          1934.92,
-          2702.03
+          1934.23,
+          2701.97
         ],
         "roles": {
           "master": {
             "baseline_samples": 14,
             "late_samples": 14,
+            "baseline_pids": [
+              47248
+            ],
+            "late_pids": [
+              18300
+            ],
+            "same_process": false,
             "memory": {
-              "second_hour_mean_bytes": 32238445.714285713,
-              "last_hour_mean_bytes": 40218331.428571425,
-              "limit_bytes": 65792877.71428572,
+              "second_hour_mean_bytes": 32722651.42857143,
+              "last_hour_mean_bytes": 40255780.571428575,
+              "limit_bytes": 66277083.42857143,
               "passed": true
             },
             "handles": {
-              "second_hour_mean": 198.28571428571428,
-              "last_hour_mean": 196.07142857142858,
-              "limit": 218.11428571428573,
+              "second_hour_mean": 198.42857142857142,
+              "last_hour_mean": 201.07142857142858,
+              "limit": 218.27142857142857,
               "passed": true
             },
             "passed": true
           },
           "worker0": {
             "baseline_samples": 13,
-            "late_samples": 14,
+            "late_samples": 13,
+            "baseline_pids": [
+              29284
+            ],
+            "late_pids": [
+              8520,
+              48232
+            ],
+            "same_process": false,
             "memory": {
-              "second_hour_mean_bytes": 30071256.615384616,
-              "last_hour_mean_bytes": 29971017.14285714,
-              "limit_bytes": 63625688.615384616,
+              "second_hour_mean_bytes": 30031241.846153848,
+              "last_hour_mean_bytes": 30650683.076923076,
+              "limit_bytes": 63585673.84615385,
               "passed": true
             },
             "handles": {
-              "second_hour_mean": 306.46153846153845,
-              "last_hour_mean": 295.5,
-              "limit": 337.10769230769233,
+              "second_hour_mean": 307.61538461538464,
+              "last_hour_mean": 303.38461538461536,
+              "limit": 338.3769230769231,
               "passed": true
             },
             "passed": true
@@ -437,16 +560,25 @@
           "worker1": {
             "baseline_samples": 13,
             "late_samples": 14,
+            "baseline_pids": [
+              11868,
+              38044
+            ],
+            "late_pids": [
+              10004,
+              48908
+            ],
+            "same_process": false,
             "memory": {
-              "second_hour_mean_bytes": 29379347.692307692,
-              "last_hour_mean_bytes": 30485357.714285713,
-              "limit_bytes": 62933779.692307696,
+              "second_hour_mean_bytes": 29652204.307692308,
+              "last_hour_mean_bytes": 29518409.14285714,
+              "limit_bytes": 63206636.307692304,
               "passed": true
             },
             "handles": {
-              "second_hour_mean": 302.15384615384613,
-              "last_hour_mean": 296.64285714285717,
-              "limit": 332.3692307692308,
+              "second_hour_mean": 304.46153846153845,
+              "last_hour_mean": 296,
+              "limit": 334.90769230769234,
               "passed": true
             },
             "passed": true
@@ -454,20 +586,233 @@
           "worker2": {
             "baseline_samples": 13,
             "late_samples": 14,
+            "baseline_pids": [
+              28760,
+              43840
+            ],
+            "late_pids": [
+              44732
+            ],
+            "same_process": false,
             "memory": {
-              "second_hour_mean_bytes": 29236932.923076924,
-              "last_hour_mean_bytes": 32289938.285714287,
-              "limit_bytes": 62791364.92307693,
+              "second_hour_mean_bytes": 27920226.46153846,
+              "last_hour_mean_bytes": 31769161.14285714,
+              "limit_bytes": 61474658.461538464,
               "passed": true
             },
             "handles": {
-              "second_hour_mean": 303.38461538461536,
-              "last_hour_mean": 305.14285714285717,
-              "limit": 333.7230769230769,
+              "second_hour_mean": 303.7692307692308,
+              "last_hour_mean": 308.5,
+              "limit": 334.1461538461539,
               "passed": true
             },
             "passed": true
           }
+        },
+        "process_lifetimes": {
+          "master": [
+            {
+              "pid": 47248,
+              "generation": 0,
+              "first_t_s": 0.36,
+              "last_t_s": 1752.64,
+              "samples": 30,
+              "first_rss_bytes": 16764928,
+              "peak_rss_bytes": 37273600,
+              "last_rss_bytes": 37273600,
+              "rss_delta_bytes": 20508672,
+              "first_handles": 188,
+              "peak_handles": 229,
+              "last_handles": 203,
+              "handles_delta": 15
+            },
+            {
+              "pid": 18300,
+              "generation": 1,
+              "first_t_s": 1813.23,
+              "last_t_s": 2701.97,
+              "samples": 16,
+              "first_rss_bytes": 30670848,
+              "peak_rss_bytes": 42303488,
+              "last_rss_bytes": 42303488,
+              "rss_delta_bytes": 11632640,
+              "first_handles": 228,
+              "peak_handles": 228,
+              "last_handles": 199,
+              "handles_delta": -29
+            }
+          ],
+          "worker0": [
+            {
+              "pid": 42660,
+              "generation": 0,
+              "first_t_s": 0.36,
+              "last_t_s": 242.03,
+              "samples": 5,
+              "first_rss_bytes": 16056320,
+              "peak_rss_bytes": 28434432,
+              "last_rss_bytes": 28434432,
+              "rss_delta_bytes": 12378112,
+              "first_handles": 171,
+              "peak_handles": 303,
+              "last_handles": 301,
+              "handles_delta": 130
+            },
+            {
+              "pid": 29284,
+              "generation": 1,
+              "first_t_s": 362.8,
+              "last_t_s": 1148.09,
+              "samples": 14,
+              "first_rss_bytes": 25436160,
+              "peak_rss_bytes": 31092736,
+              "last_rss_bytes": 30879744,
+              "rss_delta_bytes": 5443584,
+              "first_handles": 305,
+              "peak_handles": 342,
+              "last_handles": 309,
+              "handles_delta": 4
+            },
+            {
+              "pid": 48232,
+              "generation": 2,
+              "first_t_s": 1269.11,
+              "last_t_s": 2055.09,
+              "samples": 14,
+              "first_rss_bytes": 30453760,
+              "peak_rss_bytes": 31514624,
+              "last_rss_bytes": 31490048,
+              "rss_delta_bytes": 1036288,
+              "first_handles": 303,
+              "peak_handles": 342,
+              "last_handles": 308,
+              "handles_delta": 5
+            },
+            {
+              "pid": 8520,
+              "generation": 3,
+              "first_t_s": 2176.06,
+              "last_t_s": 2701.97,
+              "samples": 10,
+              "first_rss_bytes": 26525696,
+              "peak_rss_bytes": 31023104,
+              "last_rss_bytes": 30961664,
+              "rss_delta_bytes": 4435968,
+              "first_handles": 305,
+              "peak_handles": 305,
+              "last_handles": 300,
+              "handles_delta": -5
+            }
+          ],
+          "worker1": [
+            {
+              "pid": 38044,
+              "generation": 0,
+              "first_t_s": 0.36,
+              "last_t_s": 543.98,
+              "samples": 10,
+              "first_rss_bytes": 15974400,
+              "peak_rss_bytes": 28413952,
+              "last_rss_bytes": 28041216,
+              "rss_delta_bytes": 12066816,
+              "first_handles": 171,
+              "peak_handles": 303,
+              "last_handles": 300,
+              "handles_delta": 129
+            },
+            {
+              "pid": 11868,
+              "generation": 1,
+              "first_t_s": 664.72,
+              "last_t_s": 1450.47,
+              "samples": 14,
+              "first_rss_bytes": 29646848,
+              "peak_rss_bytes": 31105024,
+              "last_rss_bytes": 31072256,
+              "rss_delta_bytes": 1425408,
+              "first_handles": 303,
+              "peak_handles": 314,
+              "last_handles": 305,
+              "handles_delta": 2
+            },
+            {
+              "pid": 10004,
+              "generation": 2,
+              "first_t_s": 1571.41,
+              "last_t_s": 2357.44,
+              "samples": 14,
+              "first_rss_bytes": 25837568,
+              "peak_rss_bytes": 33288192,
+              "last_rss_bytes": 31125504,
+              "rss_delta_bytes": 5287936,
+              "first_handles": 305,
+              "peak_handles": 342,
+              "last_handles": 308,
+              "handles_delta": 3
+            },
+            {
+              "pid": 48908,
+              "generation": 3,
+              "first_t_s": 2417.86,
+              "last_t_s": 2701.97,
+              "samples": 6,
+              "first_rss_bytes": 19742720,
+              "peak_rss_bytes": 30482432,
+              "last_rss_bytes": 30482432,
+              "rss_delta_bytes": 10739712,
+              "first_handles": 171,
+              "peak_handles": 305,
+              "last_handles": 301,
+              "handles_delta": 130
+            }
+          ],
+          "worker2": [
+            {
+              "pid": 43840,
+              "generation": 0,
+              "first_t_s": 0.36,
+              "last_t_s": 845.95,
+              "samples": 15,
+              "first_rss_bytes": 16044032,
+              "peak_rss_bytes": 28770304,
+              "last_rss_bytes": 28299264,
+              "rss_delta_bytes": 12255232,
+              "first_handles": 171,
+              "peak_handles": 302,
+              "last_handles": 300,
+              "handles_delta": 129
+            },
+            {
+              "pid": 28760,
+              "generation": 1,
+              "first_t_s": 966.84,
+              "last_t_s": 1752.64,
+              "samples": 14,
+              "first_rss_bytes": 26775552,
+              "peak_rss_bytes": 32067584,
+              "last_rss_bytes": 32067584,
+              "rss_delta_bytes": 5292032,
+              "first_handles": 309,
+              "peak_handles": 312,
+              "last_handles": 309,
+              "handles_delta": 0
+            },
+            {
+              "pid": 44732,
+              "generation": 2,
+              "first_t_s": 1873.67,
+              "last_t_s": 2701.97,
+              "samples": 15,
+              "first_rss_bytes": 31686656,
+              "peak_rss_bytes": 31850496,
+              "last_rss_bytes": 31768576,
+              "rss_delta_bytes": 81920,
+              "first_handles": 311,
+              "peak_handles": 312,
+              "last_handles": 306,
+              "handles_delta": -5
+            }
+          ]
         },
         "passed": true
       },
@@ -477,12 +822,28 @@
         "blob_store_limit_bytes": 4294967296,
         "pinned_headroom_bytes": 763363328,
         "blob_store_ok": true,
+        "worker_cache_peak_bytes": {
+          "worker_cache_w0_bytes": 2146435072,
+          "worker_cache_w1_bytes": 2228226815,
+          "worker_cache_w2_bytes": 2140143616
+        },
+        "worker_cache_over_base_limit_samples": {
+          "worker_cache_w1_bytes": [
+            {
+              "t_s": 1873.67,
+              "bytes": 2228226815
+            }
+          ]
+        },
         "worker_cache_idle_bytes": {
-          "worker_cache_w0_bytes": 2122317824,
-          "worker_cache_w1_bytes": 2120220672,
-          "worker_cache_w2_bytes": 2133854109
+          "worker_cache_w0_bytes": 2128610709,
+          "worker_cache_w1_bytes": 2107639671,
+          "worker_cache_w2_bytes": 2090860544
         },
         "worker_cache_limit_bytes": 2147483648,
+        "worker_pinned_headroom_bytes": 591396864,
+        "worker_cache_peak_ok": true,
+        "worker_cache_idle_ok": true,
         "worker_cache_ok": true,
         "unexpected_sandbox_entries": {},
         "tmp_leftovers": {},
@@ -492,7 +853,7 @@
             "reason": "scheduled_restart",
             "generation": 0,
             "exit_code": 0,
-            "before_bytes": 1517989,
+            "before_bytes": 1525821,
             "after_bytes": 24,
             "shrank": true
           },
@@ -500,7 +861,7 @@
             "reason": "final_stop",
             "generation": 1,
             "exit_code": 0,
-            "before_bytes": 769384,
+            "before_bytes": 801453,
             "after_bytes": 24,
             "shrank": true
           }
@@ -510,286 +871,305 @@
       },
       "4_probe_p99": {
         "mode": "short_run_early_vs_late",
-        "total_probes": 44,
-        "ok_probes": 44,
+        "total_probes": 45,
+        "ok_probes": 45,
+        "excluded_fault_probes": 8,
+        "fault_windows_used": 16,
+        "fault_pad_s": 15.0,
+        "min_samples_required": 10,
         "baseline_count": 14,
-        "late_count": 13,
-        "baseline_p99_ms": 9678.178,
-        "late_p99_ms": 129.243,
-        "ratio": 0.0134,
+        "late_count": 16,
+        "baseline_p99_ms": 130.852,
+        "late_p99_ms": 146.509,
+        "ratio": 1.1197,
         "max_ratio": 1.5,
         "passed": true
       },
       "5_clean_stop": {
         "leftover_pids": [],
+        "leftover_task_trees": [],
+        "passed": true
+      },
+      "6_fault_injection": {
+        "planned_count": 16,
+        "executed_count": 16,
+        "ok_count": 16,
+        "error_count": 0,
+        "errors": [],
         "passed": true
       }
     },
     "probe_summary": {
-      "count": 44,
-      "ok_count": 44,
+      "count": 45,
+      "ok_count": 45,
       "samples": [
         {
-          "t_s": 0.41,
-          "latency_ms": 149.439,
+          "t_s": 0.36,
+          "latency_ms": 121.226,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 60.56,
-          "latency_ms": 129.21,
+          "t_s": 60.5,
+          "latency_ms": 101.087,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 120.7,
-          "latency_ms": 114.437,
+          "t_s": 120.61,
+          "latency_ms": 112.168,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 180.83,
-          "latency_ms": 114.276,
+          "t_s": 180.73,
+          "latency_ms": 113.669,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 240.95,
-          "latency_ms": 112.806,
+          "t_s": 240.86,
+          "latency_ms": 142.019,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 301.08,
-          "latency_ms": 127.591,
+          "t_s": 301.02,
+          "latency_ms": 98.257,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 361.2,
-          "latency_ms": 111.423,
+          "t_s": 361.11,
+          "latency_ms": 128.185,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 421.33,
-          "latency_ms": 115.378,
+          "t_s": 421.25,
+          "latency_ms": 131.25,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 481.44,
-          "latency_ms": 144.048,
+          "t_s": 481.38,
+          "latency_ms": 98.657,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 541.59,
-          "latency_ms": 111.668,
+          "t_s": 541.48,
+          "latency_ms": 97.501,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 601.7,
-          "latency_ms": 97.269,
+          "t_s": 601.59,
+          "latency_ms": 97.219,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 661.81,
-          "latency_ms": 98.11,
+          "t_s": 661.7,
+          "latency_ms": 95.881,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 721.92,
-          "latency_ms": 173.665,
+          "t_s": 721.8,
+          "latency_ms": 114.571,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 782.09,
-          "latency_ms": 112.771,
+          "t_s": 781.94,
+          "latency_ms": 111.068,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 842.2,
-          "latency_ms": 116.414,
+          "t_s": 842.05,
+          "latency_ms": 97.604,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 902.33,
-          "latency_ms": 11098.393,
+          "t_s": 902.17,
+          "latency_ms": 18676.957,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 973.44,
-          "latency_ms": 131.302,
+          "t_s": 980.84,
+          "latency_ms": 97.167,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1033.58,
-          "latency_ms": 122.287,
+          "t_s": 1040.94,
+          "latency_ms": 80.968,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1093.7,
-          "latency_ms": 127.874,
+          "t_s": 1101.03,
+          "latency_ms": 114.117,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1153.84,
-          "latency_ms": 97.812,
+          "t_s": 1161.16,
+          "latency_ms": 112.394,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1213.95,
-          "latency_ms": 112.503,
+          "t_s": 1221.28,
+          "latency_ms": 127.45,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1274.08,
-          "latency_ms": 96.273,
+          "t_s": 1281.41,
+          "latency_ms": 114.523,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1334.17,
-          "latency_ms": 95.883,
+          "t_s": 1341.53,
+          "latency_ms": 101.11,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1394.28,
-          "latency_ms": 111.914,
+          "t_s": 1401.64,
+          "latency_ms": 127.52,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1454.41,
-          "latency_ms": 98.909,
+          "t_s": 1461.78,
+          "latency_ms": 130.521,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1514.51,
-          "latency_ms": 96.867,
+          "t_s": 1521.92,
+          "latency_ms": 96.93,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1574.62,
-          "latency_ms": 98.313,
+          "t_s": 1582.03,
+          "latency_ms": 98.615,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1634.73,
-          "latency_ms": 113.69,
+          "t_s": 1642.12,
+          "latency_ms": 92.261,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1694.86,
-          "latency_ms": 113.386,
+          "t_s": 1702.22,
+          "latency_ms": 97.248,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1754.98,
-          "latency_ms": 98.705,
+          "t_s": 1762.33,
+          "latency_ms": 98.04,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1875.11,
-          "latency_ms": 99.73,
+          "t_s": 1822.44,
+          "latency_ms": 6624.095,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1935.22,
-          "latency_ms": 98.945,
+          "t_s": 1889.06,
+          "latency_ms": 98.111,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 1995.31,
-          "latency_ms": 98.059,
+          "t_s": 1949.17,
+          "latency_ms": 81.582,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2055.42,
-          "latency_ms": 98.259,
+          "t_s": 2009.27,
+          "latency_ms": 112.7,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2115.53,
-          "latency_ms": 131.249,
+          "t_s": 2069.38,
+          "latency_ms": 101.139,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2175.67,
-          "latency_ms": 97.202,
+          "t_s": 2129.5,
+          "latency_ms": 113.187,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2235.76,
-          "latency_ms": 98.941,
+          "t_s": 2189.61,
+          "latency_ms": 148.977,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2295.88,
-          "latency_ms": 96.73,
+          "t_s": 2249.77,
+          "latency_ms": 113.857,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2355.98,
-          "latency_ms": 114.529,
+          "t_s": 2309.89,
+          "latency_ms": 111.596,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2416.11,
-          "latency_ms": 98.201,
+          "t_s": 2370.02,
+          "latency_ms": 98.415,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2476.2,
-          "latency_ms": 96.614,
+          "t_s": 2430.12,
+          "latency_ms": 113.137,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2536.31,
-          "latency_ms": 96.878,
+          "t_s": 2490.25,
+          "latency_ms": 97.456,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2596.41,
-          "latency_ms": 112.499,
+          "t_s": 2550.34,
+          "latency_ms": 132.523,
           "ok": true,
           "rc": 0
         },
         {
-          "t_s": 2656.53,
-          "latency_ms": 97.997,
+          "t_s": 2610.48,
+          "latency_ms": 127.331,
+          "ok": true,
+          "rc": 0
+        },
+        {
+          "t_s": 2670.62,
+          "latency_ms": 97.255,
           "ok": true,
           "rc": 0
         }
@@ -799,35 +1179,35 @@
       "sample_count": 46,
       "processes": {
         "master": {
-          "peak_rss_bytes": 42356736,
-          "min_rss_bytes": 16809984,
-          "peak_handles": 230,
+          "peak_rss_bytes": 42303488,
+          "min_rss_bytes": 16764928,
+          "peak_handles": 229,
           "peak_threads": 28,
-          "max_cpu_seconds": 37.312,
+          "max_cpu_seconds": 32.641,
           "samples": 46
         },
         "worker0": {
           "peak_rss_bytes": 31514624,
-          "min_rss_bytes": 16060416,
-          "peak_handles": 339,
+          "min_rss_bytes": 16056320,
+          "peak_handles": 342,
           "peak_threads": 33,
-          "max_cpu_seconds": 9.375,
-          "samples": 44
+          "max_cpu_seconds": 8.594,
+          "samples": 43
         },
         "worker1": {
-          "peak_rss_bytes": 32477184,
-          "min_rss_bytes": 16015360,
-          "peak_handles": 313,
-          "peak_threads": 33,
-          "max_cpu_seconds": 6.484,
+          "peak_rss_bytes": 33288192,
+          "min_rss_bytes": 15974400,
+          "peak_handles": 342,
+          "peak_threads": 36,
+          "max_cpu_seconds": 7.906,
           "samples": 44
         },
         "worker2": {
-          "peak_rss_bytes": 36335616,
-          "min_rss_bytes": 15945728,
-          "peak_handles": 313,
+          "peak_rss_bytes": 32067584,
+          "min_rss_bytes": 16044032,
+          "peak_handles": 312,
           "peak_threads": 30,
-          "max_cpu_seconds": 9.25,
+          "max_cpu_seconds": 7.328,
           "samples": 44
         }
       },
@@ -837,70 +1217,74 @@
           "final_bytes": 4285531715
         },
         "state_dir_bytes": {
-          "peak_bytes": 2982336,
-          "final_bytes": 2982336
+          "peak_bytes": 3031188,
+          "final_bytes": 3031188
         },
         "journal_bin_bytes": {
-          "peak_bytes": 1479261,
-          "final_bytes": 769384
+          "peak_bytes": 1486084,
+          "final_bytes": 801453
         },
         "snapshot_bin_bytes": {
-          "peak_bytes": 2014341,
-          "final_bytes": 2014341
+          "peak_bytes": 2023905,
+          "final_bytes": 2023905
         },
         "sandbox_w0_bytes": {
-          "peak_bytes": 2167406592,
-          "final_bytes": 2122317824
+          "peak_bytes": 2146435072,
+          "final_bytes": 2128610709
         },
         "worker_cache_w0_bytes": {
-          "peak_bytes": 2167406592,
-          "final_bytes": 2122317824
+          "peak_bytes": 2146435072,
+          "final_bytes": 2128610709
         },
         "sandbox_w1_bytes": {
-          "peak_bytes": 2140143616,
-          "final_bytes": 2120220672
+          "peak_bytes": 2268072703,
+          "final_bytes": 2107639671
         },
         "worker_cache_w1_bytes": {
-          "peak_bytes": 2140143616,
-          "final_bytes": 2120220672
+          "peak_bytes": 2228226815,
+          "final_bytes": 2107639671
         },
         "sandbox_w2_bytes": {
-          "peak_bytes": 2254440522,
-          "final_bytes": 2133854109
+          "peak_bytes": 2140143616,
+          "final_bytes": 2090860544
         },
         "worker_cache_w2_bytes": {
-          "peak_bytes": 2160069548,
-          "final_bytes": 2133854109
+          "peak_bytes": 2140143616,
+          "final_bytes": 2090860544
         }
       }
     },
     "samples": [
       {
-        "t_s": 0.41,
+        "t_s": 0.36,
         "processes": {
           "master": {
-            "rss_bytes": 16809984,
-            "handles": 192,
+            "rss_bytes": 16764928,
+            "handles": 188,
             "threads": 27,
-            "cpu_seconds": 0.016
+            "cpu_seconds": 0.078,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 16060416,
+            "rss_bytes": 16056320,
             "handles": 171,
             "threads": 27,
-            "cpu_seconds": 0.078
+            "cpu_seconds": 0.016,
+            "pid": 42660
           },
           "worker1": {
-            "rss_bytes": 16015360,
+            "rss_bytes": 15974400,
             "handles": 171,
             "threads": 27,
-            "cpu_seconds": 0.016
+            "cpu_seconds": 0.016,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 15945728,
+            "rss_bytes": 16044032,
             "handles": 171,
             "threads": 27,
-            "cpu_seconds": 0.062
+            "cpu_seconds": 0.031,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -917,31 +1301,35 @@
         }
       },
       {
-        "t_s": 60.81,
+        "t_s": 60.8,
         "processes": {
           "master": {
-            "rss_bytes": 30806016,
+            "rss_bytes": 30969856,
             "handles": 193,
             "threads": 25,
-            "cpu_seconds": 1.734
+            "cpu_seconds": 1.641,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 27975680,
-            "handles": 305,
-            "threads": 29,
-            "cpu_seconds": 1.609
+            "rss_bytes": 23580672,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.172,
+            "pid": 42660
           },
           "worker1": {
-            "rss_bytes": 27639808,
-            "handles": 301,
-            "threads": 27,
-            "cpu_seconds": 0.641
+            "rss_bytes": 27889664,
+            "handles": 303,
+            "threads": 29,
+            "cpu_seconds": 0.75,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 23953408,
+            "rss_bytes": 23654400,
             "handles": 301,
             "threads": 27,
-            "cpu_seconds": 0.953
+            "cpu_seconds": 0.875,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -949,40 +1337,44 @@
           "state_dir_bytes": 50223,
           "journal_bin_bytes": 49711,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 355467264,
-          "worker_cache_w0_bytes": 355467264,
-          "sandbox_w1_bytes": 69206016,
-          "worker_cache_w1_bytes": 69206016,
-          "sandbox_w2_bytes": 162529495,
-          "worker_cache_w2_bytes": 162529495
+          "sandbox_w0_bytes": 269484032,
+          "worker_cache_w0_bytes": 269484032,
+          "sandbox_w1_bytes": 138412032,
+          "worker_cache_w1_bytes": 138412032,
+          "sandbox_w2_bytes": 179306711,
+          "worker_cache_w2_bytes": 179306711
         }
       },
       {
-        "t_s": 121.22,
+        "t_s": 121.14,
         "processes": {
           "master": {
-            "rss_bytes": 30945280,
+            "rss_bytes": 31174656,
             "handles": 193,
             "threads": 25,
-            "cpu_seconds": 3.359
+            "cpu_seconds": 3.0,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 27762688,
-            "handles": 305,
-            "threads": 29,
-            "cpu_seconds": 2.094
+            "rss_bytes": 23515136,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.406,
+            "pid": 42660
           },
           "worker1": {
-            "rss_bytes": 27869184,
-            "handles": 301,
-            "threads": 27,
-            "cpu_seconds": 0.922
+            "rss_bytes": 28098560,
+            "handles": 303,
+            "threads": 29,
+            "cpu_seconds": 1.453,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28426240,
+            "rss_bytes": 28209152,
             "handles": 301,
             "threads": 27,
-            "cpu_seconds": 2.328
+            "cpu_seconds": 1.547,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -990,40 +1382,44 @@
           "state_dir_bytes": 98432,
           "journal_bin_bytes": 97920,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 485490688,
-          "worker_cache_w0_bytes": 485490688,
-          "sandbox_w1_bytes": 102760448,
-          "worker_cache_w1_bytes": 102760448,
-          "sandbox_w2_bytes": 543162756,
-          "worker_cache_w2_bytes": 543162756
+          "sandbox_w0_bytes": 303038464,
+          "worker_cache_w0_bytes": 303038464,
+          "sandbox_w1_bytes": 420478976,
+          "worker_cache_w1_bytes": 420478976,
+          "sandbox_w2_bytes": 391119236,
+          "worker_cache_w2_bytes": 391119236
         }
       },
       {
-        "t_s": 181.62,
+        "t_s": 181.58,
         "processes": {
           "master": {
-            "rss_bytes": 31113216,
+            "rss_bytes": 31453184,
             "handles": 191,
             "threads": 23,
-            "cpu_seconds": 4.281
+            "cpu_seconds": 3.812,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 28155904,
-            "handles": 301,
+            "rss_bytes": 27844608,
+            "handles": 300,
             "threads": 25,
-            "cpu_seconds": 2.875
+            "cpu_seconds": 1.859,
+            "pid": 42660
           },
           "worker1": {
-            "rss_bytes": 27631616,
+            "rss_bytes": 28037120,
             "handles": 299,
             "threads": 25,
-            "cpu_seconds": 1.094
+            "cpu_seconds": 1.531,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28160000,
+            "rss_bytes": 28078080,
             "handles": 301,
             "threads": 27,
-            "cpu_seconds": 2.656
+            "cpu_seconds": 2.078,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -1031,40 +1427,44 @@
           "state_dir_bytes": 146638,
           "journal_bin_bytes": 146126,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 704643072,
-          "worker_cache_w0_bytes": 704643072,
-          "sandbox_w1_bytes": 113246208,
-          "worker_cache_w1_bytes": 113246208,
-          "sandbox_w2_bytes": 583008816,
-          "worker_cache_w2_bytes": 583008816
+          "sandbox_w0_bytes": 418381824,
+          "worker_cache_w0_bytes": 418381824,
+          "sandbox_w1_bytes": 420478976,
+          "worker_cache_w1_bytes": 420478976,
+          "sandbox_w2_bytes": 545260080,
+          "worker_cache_w2_bytes": 545260080
         }
       },
       {
-        "t_s": 242.11,
+        "t_s": 242.03,
         "processes": {
           "master": {
-            "rss_bytes": 31268864,
+            "rss_bytes": 31416320,
             "handles": 191,
             "threads": 23,
-            "cpu_seconds": 5.609
+            "cpu_seconds": 4.781,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 27987968,
-            "handles": 303,
-            "threads": 27,
-            "cpu_seconds": 3.766
+            "rss_bytes": 28434432,
+            "handles": 301,
+            "threads": 25,
+            "cpu_seconds": 2.328,
+            "pid": 42660
           },
           "worker1": {
-            "rss_bytes": 27770880,
-            "handles": 299,
-            "threads": 25,
-            "cpu_seconds": 1.641
+            "rss_bytes": 28024832,
+            "handles": 301,
+            "threads": 27,
+            "cpu_seconds": 1.953,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28278784,
+            "rss_bytes": 28356608,
             "handles": 299,
             "threads": 25,
-            "cpu_seconds": 3.172
+            "cpu_seconds": 2.594,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -1072,34 +1472,37 @@
           "state_dir_bytes": 195586,
           "journal_bin_bytes": 195074,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 973078528,
-          "worker_cache_w0_bytes": 973078528,
-          "sandbox_w1_bytes": 270532608,
-          "worker_cache_w1_bytes": 270532608,
-          "sandbox_w2_bytes": 638583516,
-          "worker_cache_w2_bytes": 638583516
+          "sandbox_w0_bytes": 642777088,
+          "worker_cache_w0_bytes": 642777088,
+          "sandbox_w1_bytes": 594542592,
+          "worker_cache_w1_bytes": 594542592,
+          "sandbox_w2_bytes": 661652188,
+          "worker_cache_w2_bytes": 661652188
         }
       },
       {
-        "t_s": 302.53,
+        "t_s": 302.41,
         "processes": {
           "master": {
-            "rss_bytes": 27963392,
+            "rss_bytes": 27828224,
             "handles": 192,
             "threads": 27,
-            "cpu_seconds": 7.156
+            "cpu_seconds": 5.828,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 28237824,
+            "rss_bytes": 28090368,
             "handles": 298,
             "threads": 26,
-            "cpu_seconds": 1.719
+            "cpu_seconds": 2.484,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28434432,
+            "rss_bytes": 28147712,
             "handles": 300,
             "threads": 28,
-            "cpu_seconds": 4.219
+            "cpu_seconds": 2.859,
+            "pid": 43840
           }
         },
         "dirs": {
@@ -1107,81 +1510,89 @@
           "state_dir_bytes": 244308,
           "journal_bin_bytes": 243796,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 1149239296,
-          "worker_cache_w0_bytes": 1149239296,
-          "sandbox_w1_bytes": 270532608,
-          "worker_cache_w1_bytes": 270532608,
-          "sandbox_w2_bytes": 941622320,
-          "worker_cache_w2_bytes": 941622320
+          "sandbox_w0_bytes": 862978048,
+          "worker_cache_w0_bytes": 862978048,
+          "sandbox_w1_bytes": 800063488,
+          "worker_cache_w1_bytes": 800063488,
+          "sandbox_w2_bytes": 731907120,
+          "worker_cache_w2_bytes": 731907120
         }
       },
       {
-        "t_s": 362.97,
+        "t_s": 362.8,
         "processes": {
           "master": {
-            "rss_bytes": 32198656,
+            "rss_bytes": 32129024,
             "handles": 191,
             "threads": 25,
-            "cpu_seconds": 8.125
+            "cpu_seconds": 6.625,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 28282880,
+            "rss_bytes": 28413952,
             "handles": 298,
             "threads": 26,
-            "cpu_seconds": 2.141
+            "cpu_seconds": 2.953,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28237824,
-            "handles": 300,
-            "threads": 28,
-            "cpu_seconds": 4.578
+            "rss_bytes": 28463104,
+            "handles": 298,
+            "threads": 26,
+            "cpu_seconds": 3.0,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 29683712,
-            "handles": 303,
-            "threads": 28,
-            "cpu_seconds": 0.969
+            "rss_bytes": 25436160,
+            "handles": 305,
+            "threads": 30,
+            "cpu_seconds": 0.812,
+            "pid": 29284
           }
         },
         "dirs": {
           "blob_store_bytes": 2613052464,
-          "state_dir_bytes": 292511,
-          "journal_bin_bytes": 291999,
+          "state_dir_bytes": 292001,
+          "journal_bin_bytes": 291489,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 1387266048,
-          "worker_cache_w0_bytes": 1387266048,
-          "sandbox_w1_bytes": 347078656,
-          "worker_cache_w1_bytes": 347078656,
-          "sandbox_w2_bytes": 1012925488,
-          "worker_cache_w2_bytes": 1012925488
+          "sandbox_w0_bytes": 1066401792,
+          "worker_cache_w0_bytes": 1066401792,
+          "sandbox_w1_bytes": 965738496,
+          "worker_cache_w1_bytes": 965738496,
+          "sandbox_w2_bytes": 731907120,
+          "worker_cache_w2_bytes": 731907120
         }
       },
       {
-        "t_s": 423.42,
+        "t_s": 423.22,
         "processes": {
           "master": {
-            "rss_bytes": 32260096,
-            "handles": 192,
+            "rss_bytes": 32432128,
+            "handles": 195,
             "threads": 24,
-            "cpu_seconds": 9.156
+            "cpu_seconds": 7.359,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 29999104,
-            "handles": 300,
-            "threads": 25,
-            "cpu_seconds": 2.344
-          },
-          "worker2": {
-            "rss_bytes": 28368896,
+            "rss_bytes": 28000256,
             "handles": 298,
             "threads": 24,
-            "cpu_seconds": 5.25
+            "cpu_seconds": 3.078,
+            "pid": 38044
+          },
+          "worker2": {
+            "rss_bytes": 28487680,
+            "handles": 300,
+            "threads": 26,
+            "cpu_seconds": 3.625,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30060544,
-            "handles": 305,
-            "threads": 29,
-            "cpu_seconds": 1.562
+            "rss_bytes": 29888512,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.281,
+            "pid": 29284
           }
         },
         "dirs": {
@@ -1189,40 +1600,44 @@
           "state_dir_bytes": 342802,
           "journal_bin_bytes": 342290,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 1563426816,
-          "worker_cache_w0_bytes": 1563426816,
-          "sandbox_w1_bytes": 380633088,
-          "worker_cache_w1_bytes": 380633088,
-          "sandbox_w2_bytes": 1237320925,
-          "worker_cache_w2_bytes": 1237320925
+          "sandbox_w0_bytes": 1225785344,
+          "worker_cache_w0_bytes": 1225785344,
+          "sandbox_w1_bytes": 978321408,
+          "worker_cache_w1_bytes": 978321408,
+          "sandbox_w2_bytes": 973079773,
+          "worker_cache_w2_bytes": 973079773
         }
       },
       {
-        "t_s": 483.84,
+        "t_s": 483.58,
         "processes": {
           "master": {
-            "rss_bytes": 27877376,
+            "rss_bytes": 32264192,
             "handles": 191,
             "threads": 23,
-            "cpu_seconds": 9.797
+            "cpu_seconds": 8.047,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 28270592,
+            "rss_bytes": 28028928,
             "handles": 300,
             "threads": 26,
-            "cpu_seconds": 2.688
+            "cpu_seconds": 3.562,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28430336,
-            "handles": 300,
-            "threads": 26,
-            "cpu_seconds": 5.547
+            "rss_bytes": 28495872,
+            "handles": 298,
+            "threads": 24,
+            "cpu_seconds": 3.922,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 25665536,
-            "handles": 302,
-            "threads": 25,
-            "cpu_seconds": 2.031
+            "rss_bytes": 25812992,
+            "handles": 304,
+            "threads": 27,
+            "cpu_seconds": 1.547,
+            "pid": 29284
           }
         },
         "dirs": {
@@ -1230,75 +1645,82 @@
           "state_dir_bytes": 390234,
           "journal_bin_bytes": 389722,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 1698693120,
-          "worker_cache_w0_bytes": 1698693120,
-          "sandbox_w1_bytes": 430964736,
-          "worker_cache_w1_bytes": 430964736,
-          "sandbox_w2_bytes": 1250952585,
-          "worker_cache_w2_bytes": 1250952585
+          "sandbox_w0_bytes": 1322254336,
+          "worker_cache_w0_bytes": 1322254336,
+          "sandbox_w1_bytes": 1049624576,
+          "worker_cache_w1_bytes": 1049624576,
+          "sandbox_w2_bytes": 1025508745,
+          "worker_cache_w2_bytes": 1025508745
         }
       },
       {
-        "t_s": 544.41,
+        "t_s": 543.98,
         "processes": {
           "master": {
-            "rss_bytes": 32092160,
-            "handles": 192,
+            "rss_bytes": 32366592,
+            "handles": 191,
             "threads": 23,
-            "cpu_seconds": 11.047
+            "cpu_seconds": 8.844,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 28037120,
-            "handles": 307,
+            "rss_bytes": 28041216,
+            "handles": 300,
             "threads": 26,
-            "cpu_seconds": 3.594
+            "cpu_seconds": 3.672,
+            "pid": 38044
           },
           "worker2": {
-            "rss_bytes": 28721152,
-            "handles": 298,
-            "threads": 24,
-            "cpu_seconds": 5.859
+            "rss_bytes": 28295168,
+            "handles": 302,
+            "threads": 26,
+            "cpu_seconds": 4.484,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 25841664,
-            "handles": 304,
-            "threads": 27,
-            "cpu_seconds": 2.422
+            "rss_bytes": 30035968,
+            "handles": 302,
+            "threads": 25,
+            "cpu_seconds": 2.062,
+            "pid": 29284
           }
         },
         "dirs": {
           "blob_store_bytes": 3576694326,
-          "state_dir_bytes": 438097,
-          "journal_bin_bytes": 437585,
+          "state_dir_bytes": 437358,
+          "journal_bin_bytes": 436846,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 1765801984,
-          "worker_cache_w0_bytes": 1765801984,
-          "sandbox_w1_bytes": 658505728,
-          "worker_cache_w1_bytes": 658505728,
-          "sandbox_w2_bytes": 1303381558,
-          "worker_cache_w2_bytes": 1303381558
+          "sandbox_w0_bytes": 1475346432,
+          "worker_cache_w0_bytes": 1475346432,
+          "sandbox_w1_bytes": 1049624576,
+          "worker_cache_w1_bytes": 1049624576,
+          "sandbox_w2_bytes": 1219495478,
+          "worker_cache_w2_bytes": 1219495478
         }
       },
       {
-        "t_s": 604.78,
+        "t_s": 604.36,
         "processes": {
           "master": {
-            "rss_bytes": 28499968,
-            "handles": 190,
+            "rss_bytes": 28680192,
+            "handles": 191,
             "threads": 25,
-            "cpu_seconds": 11.953
+            "cpu_seconds": 9.906,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 29097984,
-            "handles": 300,
+            "rss_bytes": 28594176,
+            "handles": 302,
             "threads": 28,
-            "cpu_seconds": 6.312
+            "cpu_seconds": 5.062,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30355456,
-            "handles": 302,
-            "threads": 25,
-            "cpu_seconds": 3.203
+            "rss_bytes": 30085120,
+            "handles": 304,
+            "threads": 27,
+            "cpu_seconds": 2.734,
+            "pid": 29284
           }
         },
         "dirs": {
@@ -1306,40 +1728,44 @@
           "state_dir_bytes": 487385,
           "journal_bin_bytes": 486873,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2031091712,
-          "worker_cache_w0_bytes": 2031091712,
-          "sandbox_w1_bytes": 658505728,
-          "worker_cache_w1_bytes": 658505728,
-          "sandbox_w2_bytes": 1452279523,
-          "worker_cache_w2_bytes": 1452279523
+          "sandbox_w0_bytes": 1657798656,
+          "worker_cache_w0_bytes": 1657798656,
+          "sandbox_w1_bytes": 1049624576,
+          "worker_cache_w1_bytes": 1049624576,
+          "sandbox_w2_bytes": 1451230947,
+          "worker_cache_w2_bytes": 1451230947
         }
       },
       {
-        "t_s": 665.19,
+        "t_s": 664.72,
         "processes": {
           "master": {
-            "rss_bytes": 32911360,
-            "handles": 193,
+            "rss_bytes": 33116160,
+            "handles": 191,
             "threads": 25,
-            "cpu_seconds": 12.891
+            "cpu_seconds": 10.859,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 29085696,
-            "handles": 300,
+            "rss_bytes": 28770304,
+            "handles": 302,
             "threads": 28,
-            "cpu_seconds": 6.656
+            "cpu_seconds": 5.266,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30318592,
-            "handles": 304,
-            "threads": 29,
-            "cpu_seconds": 4.266
+            "rss_bytes": 30183424,
+            "handles": 302,
+            "threads": 27,
+            "cpu_seconds": 3.375,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 29446144,
-            "handles": 301,
+            "rss_bytes": 29646848,
+            "handles": 303,
             "threads": 28,
-            "cpu_seconds": 0.391
+            "cpu_seconds": 0.438,
+            "pid": 11868
           }
         },
         "dirs": {
@@ -1347,1382 +1773,1507 @@
           "state_dir_bytes": 534511,
           "journal_bin_bytes": 533999,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2123366400,
-          "worker_cache_w0_bytes": 2123366400,
-          "sandbox_w1_bytes": 758120448,
-          "worker_cache_w1_bytes": 758120448,
-          "sandbox_w2_bytes": 1504708497,
-          "worker_cache_w2_bytes": 1504708497
+          "sandbox_w0_bytes": 1938817024,
+          "worker_cache_w0_bytes": 1938817024,
+          "sandbox_w1_bytes": 1149239296,
+          "worker_cache_w1_bytes": 1149239296,
+          "sandbox_w2_bytes": 1486882705,
+          "worker_cache_w2_bytes": 1486882705
         }
       },
       {
-        "t_s": 725.59,
+        "t_s": 725.09,
         "processes": {
           "master": {
-            "rss_bytes": 32948224,
-            "handles": 194,
+            "rss_bytes": 33136640,
+            "handles": 191,
             "threads": 23,
-            "cpu_seconds": 13.906
+            "cpu_seconds": 11.75,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 29028352,
-            "handles": 298,
-            "threads": 24,
-            "cpu_seconds": 7.078
+            "rss_bytes": 28590080,
+            "handles": 302,
+            "threads": 26,
+            "cpu_seconds": 5.625,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30638080,
-            "handles": 304,
-            "threads": 27,
-            "cpu_seconds": 4.844
+            "rss_bytes": 29888512,
+            "handles": 302,
+            "threads": 25,
+            "cpu_seconds": 3.609,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 29548544,
-            "handles": 303,
+            "rss_bytes": 30285824,
+            "handles": 305,
             "threads": 29,
-            "cpu_seconds": 0.969
+            "cpu_seconds": 1.0,
+            "pid": 11868
           }
         },
         "dirs": {
           "blob_store_bytes": 4225763217,
-          "state_dir_bytes": 583458,
-          "journal_bin_bytes": 582946,
+          "state_dir_bytes": 582719,
+          "journal_bin_bytes": 582207,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2064646144,
-          "worker_cache_w0_bytes": 2064646144,
-          "sandbox_w1_bytes": 929038336,
-          "worker_cache_w1_bytes": 929038336,
-          "sandbox_w2_bytes": 1581254718,
-          "worker_cache_w2_bytes": 1581254718
+          "sandbox_w0_bytes": 2004877312,
+          "worker_cache_w0_bytes": 2004877312,
+          "sandbox_w1_bytes": 1315962880,
+          "worker_cache_w1_bytes": 1315962880,
+          "sandbox_w2_bytes": 1592789054,
+          "worker_cache_w2_bytes": 1592789054
         }
       },
       {
-        "t_s": 786.26,
+        "t_s": 785.55,
         "processes": {
           "master": {
-            "rss_bytes": 33165312,
-            "handles": 196,
+            "rss_bytes": 33280000,
+            "handles": 193,
             "threads": 25,
-            "cpu_seconds": 15.578
+            "cpu_seconds": 12.984,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 29089792,
-            "handles": 300,
+            "rss_bytes": 28737536,
+            "handles": 302,
             "threads": 26,
-            "cpu_seconds": 8.078
+            "cpu_seconds": 6.406,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30666752,
-            "handles": 305,
+            "rss_bytes": 29888512,
+            "handles": 303,
             "threads": 26,
-            "cpu_seconds": 5.344
+            "cpu_seconds": 4.047,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 29749248,
-            "handles": 299,
-            "threads": 25,
-            "cpu_seconds": 1.359
+            "rss_bytes": 30285824,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.375,
+            "pid": 11868
           }
         },
         "dirs": {
-          "blob_store_bytes": 4219471934,
-          "state_dir_bytes": 633504,
-          "journal_bin_bytes": 632992,
+          "blob_store_bytes": 4290775102,
+          "state_dir_bytes": 631441,
+          "journal_bin_bytes": 630929,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2167406592,
-          "worker_cache_w0_bytes": 2167406592,
-          "sandbox_w1_bytes": 1086324736,
-          "worker_cache_w1_bytes": 1086324736,
-          "sandbox_w2_bytes": 1766853016,
-          "worker_cache_w2_bytes": 1766853016
+          "sandbox_w0_bytes": 2096103424,
+          "worker_cache_w0_bytes": 2096103424,
+          "sandbox_w1_bytes": 1377828864,
+          "worker_cache_w1_bytes": 1377828864,
+          "sandbox_w2_bytes": 1821378968,
+          "worker_cache_w2_bytes": 1821378968
         }
       },
       {
-        "t_s": 846.69,
+        "t_s": 845.95,
         "processes": {
           "master": {
-            "rss_bytes": 33181696,
-            "handles": 193,
+            "rss_bytes": 33341440,
+            "handles": 191,
             "threads": 23,
-            "cpu_seconds": 17.422
+            "cpu_seconds": 14.141,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 29093888,
+            "rss_bytes": 28299264,
             "handles": 300,
-            "threads": 26,
-            "cpu_seconds": 9.25
+            "threads": 24,
+            "cpu_seconds": 6.922,
+            "pid": 43840
           },
           "worker0": {
-            "rss_bytes": 30334976,
-            "handles": 303,
-            "threads": 26,
-            "cpu_seconds": 6.203
+            "rss_bytes": 30081024,
+            "handles": 301,
+            "threads": 24,
+            "cpu_seconds": 4.391,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 29757440,
-            "handles": 299,
-            "threads": 25,
-            "cpu_seconds": 1.469
+            "rss_bytes": 29978624,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.672,
+            "pid": 11868
           }
         },
         "dirs": {
           "blob_store_bytes": 4218423186,
-          "state_dir_bytes": 681462,
-          "journal_bin_bytes": 680950,
+          "state_dir_bytes": 680952,
+          "journal_bin_bytes": 680440,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2142240768,
-          "worker_cache_w0_bytes": 2142240768,
-          "sandbox_w1_bytes": 1086324736,
-          "worker_cache_w1_bytes": 1086324736,
-          "sandbox_w2_bytes": 2038434200,
-          "worker_cache_w2_bytes": 2038434200
+          "sandbox_w0_bytes": 2068840448,
+          "worker_cache_w0_bytes": 2068840448,
+          "sandbox_w1_bytes": 1464860672,
+          "worker_cache_w1_bytes": 1464860672,
+          "sandbox_w2_bytes": 2046822808,
+          "worker_cache_w2_bytes": 2046822808
         }
       },
       {
-        "t_s": 907.17,
+        "t_s": 906.45,
         "processes": {
           "master": {
-            "rss_bytes": 26509312,
-            "handles": 230,
+            "rss_bytes": 26705920,
+            "handles": 229,
             "threads": 24,
-            "cpu_seconds": 19.438
+            "cpu_seconds": 15.406,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 31277056,
-            "handles": 339,
-            "threads": 32,
-            "cpu_seconds": 6.625
+            "rss_bytes": 30564352,
+            "handles": 342,
+            "threads": 33,
+            "cpu_seconds": 5.047,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 25501696,
-            "handles": 298,
+            "rss_bytes": 26046464,
+            "handles": 300,
             "threads": 25,
-            "cpu_seconds": 1.938
+            "cpu_seconds": 2.094,
+            "pid": 11868
           }
         },
         "dirs": {
           "blob_store_bytes": 4287629204,
-          "state_dir_bytes": 749673,
-          "journal_bin_bytes": 749161,
+          "state_dir_bytes": 745447,
+          "journal_bin_bytes": 744935,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2142240768,
-          "worker_cache_w0_bytes": 2142240768,
-          "sandbox_w1_bytes": 1185939456,
-          "worker_cache_w1_bytes": 1185939456,
-          "sandbox_w2_bytes": 2125466182,
-          "worker_cache_w2_bytes": 2125466182
+          "sandbox_w0_bytes": 2098200576,
+          "worker_cache_w0_bytes": 2098200576,
+          "sandbox_w1_bytes": 1547698176,
+          "worker_cache_w1_bytes": 1547698176,
+          "sandbox_w2_bytes": 2069891654,
+          "worker_cache_w2_bytes": 2069891654
         }
       },
       {
-        "t_s": 967.67,
+        "t_s": 966.84,
         "processes": {
           "master": {
-            "rss_bytes": 34627584,
-            "handles": 200,
+            "rss_bytes": 34816000,
+            "handles": 203,
             "threads": 23,
-            "cpu_seconds": 21.578
+            "cpu_seconds": 16.953,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 31481856,
-            "handles": 303,
-            "threads": 26,
-            "cpu_seconds": 7.719
+            "rss_bytes": 31092736,
+            "handles": 309,
+            "threads": 28,
+            "cpu_seconds": 5.953,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 30208000,
-            "handles": 304,
-            "threads": 29,
-            "cpu_seconds": 2.922
+            "rss_bytes": 30875648,
+            "handles": 313,
+            "threads": 36,
+            "cpu_seconds": 2.422,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 27029504,
-            "handles": 311,
-            "threads": 30,
-            "cpu_seconds": 0.828
+            "rss_bytes": 26775552,
+            "handles": 309,
+            "threads": 28,
+            "cpu_seconds": 0.766,
+            "pid": 28760
           }
         },
         "dirs": {
           "blob_store_bytes": 4226811801,
-          "state_dir_bytes": 848032,
-          "journal_bin_bytes": 847520,
+          "state_dir_bytes": 855864,
+          "journal_bin_bytes": 855352,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2116026368,
-          "worker_cache_w0_bytes": 2116026368,
-          "sandbox_w1_bytes": 1387266048,
-          "worker_cache_w1_bytes": 1387266048,
-          "sandbox_w2_bytes": 2143292148,
-          "worker_cache_w2_bytes": 2143292148
+          "sandbox_w0_bytes": 2144337920,
+          "worker_cache_w0_bytes": 2144337920,
+          "sandbox_w1_bytes": 1617952984,
+          "worker_cache_w1_bytes": 1617952984,
+          "sandbox_w2_bytes": 2054162799,
+          "worker_cache_w2_bytes": 2054162799
         }
       },
       {
-        "t_s": 1028.48,
+        "t_s": 1027.22,
         "processes": {
           "master": {
-            "rss_bytes": 34721792,
-            "handles": 201,
+            "rss_bytes": 34906112,
+            "handles": 203,
             "threads": 24,
-            "cpu_seconds": 23.625
+            "cpu_seconds": 18.0,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 31469568,
-            "handles": 305,
+            "rss_bytes": 30961664,
+            "handles": 309,
             "threads": 26,
-            "cpu_seconds": 8.844
+            "cpu_seconds": 6.484,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 30146560,
-            "handles": 304,
+            "rss_bytes": 31039488,
+            "handles": 306,
             "threads": 27,
-            "cpu_seconds": 3.547
+            "cpu_seconds": 2.672,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 27025408,
-            "handles": 311,
-            "threads": 29,
-            "cpu_seconds": 1.594
+            "rss_bytes": 27070464,
+            "handles": 309,
+            "threads": 27,
+            "cpu_seconds": 1.266,
+            "pid": 28760
           }
         },
         "dirs": {
           "blob_store_bytes": 4293920667,
-          "state_dir_bytes": 899138,
-          "journal_bin_bytes": 898626,
+          "state_dir_bytes": 905151,
+          "journal_bin_bytes": 904639,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2129657856,
-          "worker_cache_w0_bytes": 2129657856,
-          "sandbox_w1_bytes": 1524629504,
-          "worker_cache_w1_bytes": 1524629504,
-          "sandbox_w2_bytes": 2061503047,
-          "worker_cache_w2_bytes": 2061503047
+          "sandbox_w0_bytes": 2130706432,
+          "worker_cache_w0_bytes": 2130706432,
+          "sandbox_w1_bytes": 1690304901,
+          "worker_cache_w1_bytes": 1690304901,
+          "sandbox_w2_bytes": 2058356930,
+          "worker_cache_w2_bytes": 2058356930
         }
       },
       {
-        "t_s": 1088.89,
+        "t_s": 1087.61,
         "processes": {
           "master": {
-            "rss_bytes": 34938880,
-            "handles": 202,
-            "threads": 25,
-            "cpu_seconds": 24.641
+            "rss_bytes": 34992128,
+            "handles": 204,
+            "threads": 26,
+            "cpu_seconds": 18.703,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 31424512,
-            "handles": 305,
+            "rss_bytes": 31043584,
+            "handles": 309,
             "threads": 26,
-            "cpu_seconds": 9.328
+            "cpu_seconds": 6.891,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 30416896,
-            "handles": 304,
+            "rss_bytes": 31080448,
+            "handles": 306,
             "threads": 27,
-            "cpu_seconds": 4.172
+            "cpu_seconds": 3.078,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 31485952,
-            "handles": 309,
-            "threads": 27,
-            "cpu_seconds": 2.234
+            "rss_bytes": 26927104,
+            "handles": 307,
+            "threads": 25,
+            "cpu_seconds": 1.609,
+            "pid": 28760
           }
         },
         "dirs": {
           "blob_store_bytes": 4259317832,
-          "state_dir_bytes": 946779,
-          "journal_bin_bytes": 946267,
+          "state_dir_bytes": 953872,
+          "journal_bin_bytes": 953360,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2136997888,
-          "worker_cache_w0_bytes": 2136997888,
-          "sandbox_w1_bytes": 1659895808,
-          "worker_cache_w1_bytes": 1659895808,
-          "sandbox_w2_bytes": 2100300705,
-          "worker_cache_w2_bytes": 2100300705
+          "sandbox_w0_bytes": 2104492032,
+          "worker_cache_w0_bytes": 2104492032,
+          "sandbox_w1_bytes": 1767899871,
+          "worker_cache_w1_bytes": 1767899871,
+          "sandbox_w2_bytes": 2114980034,
+          "worker_cache_w2_bytes": 2114980034
         }
       },
       {
-        "t_s": 1149.3,
+        "t_s": 1148.09,
         "processes": {
           "master": {
-            "rss_bytes": 35987456,
-            "handles": 202,
-            "threads": 24,
-            "cpu_seconds": 25.422
+            "rss_bytes": 36110336,
+            "handles": 203,
+            "threads": 23,
+            "cpu_seconds": 19.484,
+            "pid": 47248
           },
           "worker0": {
-            "rss_bytes": 31391744,
-            "handles": 303,
-            "threads": 24,
-            "cpu_seconds": 9.375
+            "rss_bytes": 30879744,
+            "handles": 309,
+            "threads": 26,
+            "cpu_seconds": 7.609,
+            "pid": 29284
           },
           "worker1": {
-            "rss_bytes": 30429184,
-            "handles": 305,
+            "rss_bytes": 31084544,
+            "handles": 314,
             "threads": 28,
-            "cpu_seconds": 4.531
+            "cpu_seconds": 3.734,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 31776768,
-            "handles": 309,
-            "threads": 27,
-            "cpu_seconds": 3.031
+            "rss_bytes": 26927104,
+            "handles": 307,
+            "threads": 25,
+            "cpu_seconds": 1.859,
+            "pid": 28760
           }
         },
         "dirs": {
           "blob_store_bytes": 4282386332,
-          "state_dir_bytes": 995481,
-          "journal_bin_bytes": 994969,
+          "state_dir_bytes": 1002574,
+          "journal_bin_bytes": 1002062,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2136997888,
-          "worker_cache_w0_bytes": 2136997888,
-          "sandbox_w1_bytes": 1696595968,
-          "worker_cache_w1_bytes": 1696595968,
-          "sandbox_w2_bytes": 2144340725,
-          "worker_cache_w2_bytes": 2144340725
+          "sandbox_w0_bytes": 2142240768,
+          "worker_cache_w0_bytes": 2142240768,
+          "sandbox_w1_bytes": 1892680415,
+          "worker_cache_w1_bytes": 1892680415,
+          "sandbox_w2_bytes": 2099251222,
+          "worker_cache_w2_bytes": 2099251222
         }
       },
       {
-        "t_s": 1209.72,
+        "t_s": 1208.64,
         "processes": {
           "master": {
-            "rss_bytes": 31617024,
-            "handles": 200,
-            "threads": 25,
-            "cpu_seconds": 26.672
+            "rss_bytes": 31969280,
+            "handles": 202,
+            "threads": 24,
+            "cpu_seconds": 21.375,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 30420992,
-            "handles": 304,
-            "threads": 27,
-            "cpu_seconds": 5.156
+            "rss_bytes": 31084544,
+            "handles": 307,
+            "threads": 28,
+            "cpu_seconds": 4.656,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 31846400,
-            "handles": 310,
-            "threads": 28,
-            "cpu_seconds": 3.859
+            "rss_bytes": 26992640,
+            "handles": 309,
+            "threads": 27,
+            "cpu_seconds": 2.281,
+            "pid": 28760
           }
         },
         "dirs": {
           "blob_store_bytes": 4285531887,
-          "state_dir_bytes": 1045848,
-          "journal_bin_bytes": 1045336,
+          "state_dir_bytes": 1052941,
+          "journal_bin_bytes": 1052429,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2136997888,
-          "worker_cache_w0_bytes": 2136997888,
-          "sandbox_w1_bytes": 1909456896,
-          "worker_cache_w1_bytes": 1909456896,
-          "sandbox_w2_bytes": 2096106061,
-          "worker_cache_w2_bytes": 2096106061
+          "sandbox_w0_bytes": 2143289344,
+          "worker_cache_w0_bytes": 2143289344,
+          "sandbox_w1_bytes": 2135950220,
+          "worker_cache_w1_bytes": 2135950220,
+          "sandbox_w2_bytes": 2091911190,
+          "worker_cache_w2_bytes": 2091911190
         }
       },
       {
-        "t_s": 1270.12,
+        "t_s": 1269.11,
         "processes": {
           "master": {
-            "rss_bytes": 31776768,
-            "handles": 201,
-            "threads": 25,
-            "cpu_seconds": 27.312
+            "rss_bytes": 36274176,
+            "handles": 203,
+            "threads": 24,
+            "cpu_seconds": 22.375,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 30228480,
-            "handles": 303,
+            "rss_bytes": 31105024,
+            "handles": 305,
             "threads": 28,
-            "cpu_seconds": 5.359
+            "cpu_seconds": 5.359,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 32026624,
+            "rss_bytes": 27111424,
             "handles": 308,
             "threads": 28,
-            "cpu_seconds": 4.562
+            "cpu_seconds": 2.547,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30113792,
-            "handles": 305,
-            "threads": 30,
-            "cpu_seconds": 0.375
+            "rss_bytes": 30453760,
+            "handles": 303,
+            "threads": 28,
+            "cpu_seconds": 0.781,
+            "pid": 48232
           }
         },
         "dirs": {
           "blob_store_bytes": 4280289179,
-          "state_dir_bytes": 1093939,
-          "journal_bin_bytes": 1093274,
+          "state_dir_bytes": 1101305,
+          "journal_bin_bytes": 1099287,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2139095040,
-          "worker_cache_w0_bytes": 2139095040,
-          "sandbox_w1_bytes": 1984954368,
-          "worker_cache_w1_bytes": 1984954368,
-          "sandbox_w2_bytes": 2049968718,
-          "worker_cache_w2_bytes": 2049968718
+          "sandbox_w0_bytes": 2097152000,
+          "worker_cache_w0_bytes": 2097152000,
+          "sandbox_w1_bytes": 2133853240,
+          "worker_cache_w1_bytes": 2133853240,
+          "sandbox_w2_bytes": 2091911190,
+          "worker_cache_w2_bytes": 2091911190
         }
       },
       {
-        "t_s": 1330.53,
+        "t_s": 1329.64,
         "processes": {
           "master": {
-            "rss_bytes": 36265984,
-            "handles": 202,
-            "threads": 25,
-            "cpu_seconds": 28.75
+            "rss_bytes": 36524032,
+            "handles": 203,
+            "threads": 24,
+            "cpu_seconds": 24.406,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 30486528,
-            "handles": 303,
+            "rss_bytes": 31059968,
+            "handles": 305,
             "threads": 26,
-            "cpu_seconds": 5.734
+            "cpu_seconds": 6.578,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 32002048,
-            "handles": 309,
+            "rss_bytes": 31281152,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 5.031
+            "cpu_seconds": 2.891,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30089216,
+            "rss_bytes": 30539776,
             "handles": 306,
             "threads": 30,
-            "cpu_seconds": 1.094
+            "cpu_seconds": 1.359,
+            "pid": 48232
           }
         },
         "dirs": {
-          "blob_store_bytes": 4283434906,
-          "state_dir_bytes": 1150304,
-          "journal_bin_bytes": 1141654,
+          "blob_store_bytes": 4283434734,
+          "state_dir_bytes": 1158388,
+          "journal_bin_bytes": 1148232,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2140143616,
-          "worker_cache_w0_bytes": 2140143616,
-          "sandbox_w1_bytes": 2124414976,
-          "worker_cache_w1_bytes": 2124414976,
-          "sandbox_w2_bytes": 2142243752,
-          "worker_cache_w2_bytes": 2142243752
+          "sandbox_w0_bytes": 2133852160,
+          "worker_cache_w0_bytes": 2133852160,
+          "sandbox_w1_bytes": 2128610534,
+          "worker_cache_w1_bytes": 2128610534,
+          "sandbox_w2_bytes": 2082473834,
+          "worker_cache_w2_bytes": 2082473834
         }
       },
       {
-        "t_s": 1390.95,
+        "t_s": 1390.05,
         "processes": {
           "master": {
-            "rss_bytes": 32198656,
-            "handles": 201,
+            "rss_bytes": 36749312,
+            "handles": 203,
             "threads": 24,
-            "cpu_seconds": 29.703
+            "cpu_seconds": 25.781,
+            "pid": 47248
           },
           "worker1": {
-            "rss_bytes": 30113792,
-            "handles": 301,
-            "threads": 24,
-            "cpu_seconds": 5.812
+            "rss_bytes": 31068160,
+            "handles": 305,
+            "threads": 26,
+            "cpu_seconds": 7.562,
+            "pid": 11868
           },
           "worker2": {
-            "rss_bytes": 32047104,
+            "rss_bytes": 27095040,
             "handles": 310,
             "threads": 27,
-            "cpu_seconds": 5.531
-          },
-          "worker0": {
-            "rss_bytes": 30441472,
-            "handles": 303,
-            "threads": 27,
-            "cpu_seconds": 1.938
-          }
-        },
-        "dirs": {
-          "blob_store_bytes": 4218423194,
-          "state_dir_bytes": 1206135,
-          "journal_bin_bytes": 1189345,
-          "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2113929216,
-          "worker_cache_w0_bytes": 2113929216,
-          "sandbox_w1_bytes": 2124414976,
-          "worker_cache_w1_bytes": 2124414976,
-          "sandbox_w2_bytes": 2118125986,
-          "worker_cache_w2_bytes": 2118125986
-        }
-      },
-      {
-        "t_s": 1451.42,
-        "processes": {
-          "master": {
-            "rss_bytes": 36528128,
-            "handles": 201,
-            "threads": 24,
-            "cpu_seconds": 30.594
-          },
-          "worker1": {
-            "rss_bytes": 30441472,
-            "handles": 301,
-            "threads": 24,
-            "cpu_seconds": 6.484
-          },
-          "worker2": {
-            "rss_bytes": 32100352,
-            "handles": 311,
-            "threads": 28,
-            "cpu_seconds": 5.891
+            "cpu_seconds": 3.203,
+            "pid": 28760
           },
           "worker0": {
             "rss_bytes": 30445568,
             "handles": 303,
             "threads": 27,
-            "cpu_seconds": 2.156
+            "cpu_seconds": 1.781,
+            "pid": 48232
+          }
+        },
+        "dirs": {
+          "blob_store_bytes": 4218423194,
+          "state_dir_bytes": 1214299,
+          "journal_bin_bytes": 1196438,
+          "snapshot_bin_bytes": 0,
+          "sandbox_w0_bytes": 2131755008,
+          "worker_cache_w0_bytes": 2131755008,
+          "sandbox_w1_bytes": 2098202002,
+          "worker_cache_w1_bytes": 2098202002,
+          "sandbox_w2_bytes": 2127562602,
+          "worker_cache_w2_bytes": 2127562602
+        }
+      },
+      {
+        "t_s": 1450.47,
+        "processes": {
+          "master": {
+            "rss_bytes": 36835328,
+            "handles": 203,
+            "threads": 24,
+            "cpu_seconds": 26.875,
+            "pid": 47248
+          },
+          "worker1": {
+            "rss_bytes": 31072256,
+            "handles": 305,
+            "threads": 26,
+            "cpu_seconds": 7.906,
+            "pid": 11868
+          },
+          "worker2": {
+            "rss_bytes": 31289344,
+            "handles": 310,
+            "threads": 27,
+            "cpu_seconds": 3.766,
+            "pid": 28760
+          },
+          "worker0": {
+            "rss_bytes": 30474240,
+            "handles": 304,
+            "threads": 28,
+            "cpu_seconds": 2.297,
+            "pid": 48232
           }
         },
         "dirs": {
           "blob_store_bytes": 4260366234,
-          "state_dir_bytes": 1261517,
-          "journal_bin_bytes": 1236742,
+          "state_dir_bytes": 1270566,
+          "journal_bin_bytes": 1244345,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2142240768,
-          "worker_cache_w0_bytes": 2142240768,
-          "sandbox_w1_bytes": 2140143616,
-          "worker_cache_w1_bytes": 2140143616,
-          "sandbox_w2_bytes": 2138049103,
-          "worker_cache_w2_bytes": 2138049103
+          "sandbox_w0_bytes": 2128609280,
+          "worker_cache_w0_bytes": 2128609280,
+          "sandbox_w1_bytes": 2098202175,
+          "worker_cache_w1_bytes": 2098202175,
+          "sandbox_w2_bytes": 2089813526,
+          "worker_cache_w2_bytes": 2089813526
         }
       },
       {
-        "t_s": 1511.86,
+        "t_s": 1510.97,
         "processes": {
           "master": {
-            "rss_bytes": 31850496,
-            "handles": 202,
+            "rss_bytes": 32813056,
+            "handles": 204,
             "threads": 25,
-            "cpu_seconds": 32.125
+            "cpu_seconds": 28.359,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 32288768,
+            "rss_bytes": 31535104,
             "handles": 310,
             "threads": 27,
-            "cpu_seconds": 6.328
+            "cpu_seconds": 4.625,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30277632,
-            "handles": 303,
+            "rss_bytes": 30523392,
+            "handles": 310,
             "threads": 27,
-            "cpu_seconds": 2.812
+            "cpu_seconds": 2.75,
+            "pid": 48232
           }
         },
         "dirs": {
           "blob_store_bytes": 4240443291,
-          "state_dir_bytes": 1322175,
-          "journal_bin_bytes": 1289261,
+          "state_dir_bytes": 1329353,
+          "journal_bin_bytes": 1295274,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2119172096,
-          "worker_cache_w0_bytes": 2119172096,
-          "sandbox_w1_bytes": 2065694720,
-          "worker_cache_w1_bytes": 2065694720,
-          "sandbox_w2_bytes": 2142243581,
-          "worker_cache_w2_bytes": 2142243581
+          "sandbox_w0_bytes": 2136997888,
+          "worker_cache_w0_bytes": 2136997888,
+          "sandbox_w1_bytes": 2126513901,
+          "worker_cache_w1_bytes": 2126513901,
+          "sandbox_w2_bytes": 2066744509,
+          "worker_cache_w2_bytes": 2066744509
         }
       },
       {
-        "t_s": 1572.28,
+        "t_s": 1571.41,
         "processes": {
           "master": {
-            "rss_bytes": 31997952,
-            "handles": 201,
+            "rss_bytes": 32825344,
+            "handles": 203,
             "threads": 24,
-            "cpu_seconds": 33.188
+            "cpu_seconds": 29.0,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 32301056,
+            "rss_bytes": 31363072,
             "handles": 310,
             "threads": 28,
-            "cpu_seconds": 6.672
+            "cpu_seconds": 4.703,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30482432,
-            "handles": 304,
-            "threads": 30,
-            "cpu_seconds": 3.453
+            "rss_bytes": 30318592,
+            "handles": 302,
+            "threads": 28,
+            "cpu_seconds": 3.703,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 25718784,
-            "handles": 301,
-            "threads": 28,
-            "cpu_seconds": 0.359
+            "rss_bytes": 25837568,
+            "handles": 305,
+            "threads": 30,
+            "cpu_seconds": 0.422,
+            "pid": 10004
           }
         },
         "dirs": {
           "blob_store_bytes": 4219471769,
-          "state_dir_bytes": 1375668,
-          "journal_bin_bytes": 1334705,
+          "state_dir_bytes": 1384060,
+          "journal_bin_bytes": 1341798,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2087714816,
-          "worker_cache_w0_bytes": 2087714816,
-          "sandbox_w1_bytes": 2065694720,
-          "worker_cache_w1_bytes": 2065694720,
-          "sandbox_w2_bytes": 2135951777,
-          "worker_cache_w2_bytes": 2135951777
+          "sandbox_w0_bytes": 2142240768,
+          "worker_cache_w0_bytes": 2142240768,
+          "sandbox_w1_bytes": 2126514073,
+          "worker_cache_w1_bytes": 2126514073,
+          "sandbox_w2_bytes": 2066744509,
+          "worker_cache_w2_bytes": 2066744509
         }
       },
       {
-        "t_s": 1632.72,
+        "t_s": 1631.83,
         "processes": {
           "master": {
-            "rss_bytes": 36364288,
-            "handles": 201,
+            "rss_bytes": 37150720,
+            "handles": 204,
             "threads": 24,
-            "cpu_seconds": 34.906
+            "cpu_seconds": 30.344,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 32243712,
-            "handles": 310,
-            "threads": 27,
-            "cpu_seconds": 7.531
+            "rss_bytes": 31985664,
+            "handles": 312,
+            "threads": 29,
+            "cpu_seconds": 5.312,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30408704,
-            "handles": 302,
-            "threads": 26,
-            "cpu_seconds": 3.922
+            "rss_bytes": 30519296,
+            "handles": 300,
+            "threads": 24,
+            "cpu_seconds": 4.016,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 25927680,
+            "rss_bytes": 30146560,
             "handles": 305,
-            "threads": 27,
-            "cpu_seconds": 0.734
+            "threads": 29,
+            "cpu_seconds": 1.0,
+            "pid": 10004
           }
         },
         "dirs": {
           "blob_store_bytes": 4242540441,
-          "state_dir_bytes": 1432880,
-          "journal_bin_bytes": 1383995,
+          "state_dir_bytes": 1442241,
+          "journal_bin_bytes": 1391827,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2133852160,
-          "worker_cache_w0_bytes": 2133852160,
-          "sandbox_w1_bytes": 2139095040,
-          "worker_cache_w1_bytes": 2139095040,
-          "sandbox_w2_bytes": 2132805877,
-          "worker_cache_w2_bytes": 2132805877
+          "sandbox_w0_bytes": 2129657856,
+          "worker_cache_w0_bytes": 2129657856,
+          "sandbox_w1_bytes": 2105542727,
+          "worker_cache_w1_bytes": 2105542727,
+          "sandbox_w2_bytes": 2098201443,
+          "worker_cache_w2_bytes": 2098201443
         }
       },
       {
-        "t_s": 1693.16,
+        "t_s": 1692.23,
         "processes": {
           "master": {
-            "rss_bytes": 36327424,
-            "handles": 201,
+            "rss_bytes": 37236736,
+            "handles": 203,
             "threads": 24,
-            "cpu_seconds": 35.906
+            "cpu_seconds": 31.516,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 32231424,
+            "rss_bytes": 31993856,
             "handles": 309,
             "threads": 26,
-            "cpu_seconds": 7.891
+            "cpu_seconds": 5.703,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30375936,
+            "rss_bytes": 30298112,
             "handles": 302,
             "threads": 26,
-            "cpu_seconds": 4.172
+            "cpu_seconds": 4.547,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 26300416,
-            "handles": 306,
+            "rss_bytes": 30199808,
+            "handles": 304,
             "threads": 28,
-            "cpu_seconds": 1.312
+            "cpu_seconds": 1.109,
+            "pid": 10004
           }
         },
         "dirs": {
           "blob_store_bytes": 4222617498,
-          "state_dir_bytes": 1489323,
-          "journal_bin_bytes": 1432376,
+          "state_dir_bytes": 1496544,
+          "journal_bin_bytes": 1438145,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2142240768,
-          "worker_cache_w0_bytes": 2138046464,
-          "sandbox_w1_bytes": 2099249152,
-          "worker_cache_w1_bytes": 2099249152,
-          "sandbox_w2_bytes": 2142243235,
-          "worker_cache_w2_bytes": 2142243235
+          "sandbox_w0_bytes": 2106589184,
+          "worker_cache_w0_bytes": 2106589184,
+          "sandbox_w1_bytes": 2117077237,
+          "worker_cache_w1_bytes": 2117077237,
+          "sandbox_w2_bytes": 2123367267,
+          "worker_cache_w2_bytes": 2123367267
         }
       },
       {
-        "t_s": 1753.56,
+        "t_s": 1752.64,
         "processes": {
           "master": {
-            "rss_bytes": 36519936,
-            "handles": 201,
+            "rss_bytes": 37273600,
+            "handles": 203,
             "threads": 24,
-            "cpu_seconds": 37.312
+            "cpu_seconds": 32.641,
+            "pid": 47248
           },
           "worker2": {
-            "rss_bytes": 32251904,
-            "handles": 310,
-            "threads": 27,
-            "cpu_seconds": 8.453
+            "rss_bytes": 32067584,
+            "handles": 309,
+            "threads": 26,
+            "cpu_seconds": 5.875,
+            "pid": 28760
           },
           "worker0": {
-            "rss_bytes": 30388224,
+            "rss_bytes": 30330880,
             "handles": 302,
             "threads": 26,
-            "cpu_seconds": 4.906
+            "cpu_seconds": 5.5,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 26251264,
+            "rss_bytes": 30179328,
             "handles": 303,
-            "threads": 25,
-            "cpu_seconds": 1.641
+            "threads": 27,
+            "cpu_seconds": 1.266,
+            "pid": 10004
           }
         },
         "dirs": {
           "blob_store_bytes": 4284483310,
-          "state_dir_bytes": 1544346,
-          "journal_bin_bytes": 1479261,
+          "state_dir_bytes": 1552445,
+          "journal_bin_bytes": 1486084,
           "snapshot_bin_bytes": 0,
-          "sandbox_w0_bytes": 2142240768,
-          "worker_cache_w0_bytes": 2142240768,
-          "sandbox_w1_bytes": 2058354688,
-          "worker_cache_w1_bytes": 2058354688,
-          "sandbox_w2_bytes": 2078280099,
-          "worker_cache_w2_bytes": 2078280099
+          "sandbox_w0_bytes": 2103443456,
+          "worker_cache_w0_bytes": 2103443456,
+          "sandbox_w1_bytes": 2117077411,
+          "worker_cache_w1_bytes": 2117077411,
+          "sandbox_w2_bytes": 2084569781,
+          "worker_cache_w2_bytes": 2084569781
         }
       },
       {
-        "t_s": 1813.98,
+        "t_s": 1813.23,
         "processes": {
           "master": {
-            "rss_bytes": 29388800,
-            "handles": 197,
+            "rss_bytes": 30670848,
+            "handles": 228,
             "threads": 28,
-            "cpu_seconds": 0.203
+            "cpu_seconds": 0.188,
+            "pid": 18300
           },
           "worker0": {
-            "rss_bytes": 26673152,
-            "handles": 314,
+            "rss_bytes": 26959872,
+            "handles": 342,
             "threads": 33,
-            "cpu_seconds": 5.562
+            "cpu_seconds": 6.297,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 27275264,
-            "handles": 313,
-            "threads": 33,
-            "cpu_seconds": 2.344
+            "rss_bytes": 26718208,
+            "handles": 342,
+            "threads": 34,
+            "cpu_seconds": 1.531,
+            "pid": 10004
           }
         },
         "dirs": {
           "blob_store_bytes": 4259317660,
-          "state_dir_bytes": 2125558,
-          "journal_bin_bytes": 33809,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2088763392,
-          "worker_cache_w0_bytes": 2088763392,
-          "sandbox_w1_bytes": 2101346304,
-          "worker_cache_w1_bytes": 2101346304,
-          "sandbox_w2_bytes": 2130709073,
-          "worker_cache_w2_bytes": 2130709073
+          "state_dir_bytes": 2118552,
+          "journal_bin_bytes": 22508,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2129657856,
+          "worker_cache_w0_bytes": 2129657856,
+          "sandbox_w1_bytes": 2098203217,
+          "worker_cache_w1_bytes": 2098203217,
+          "sandbox_w2_bytes": 2084569781,
+          "worker_cache_w2_bytes": 2084569781
         }
       },
       {
-        "t_s": 1874.44,
-        "processes": {
-          "master": {
-            "rss_bytes": 34709504,
-            "handles": 198,
-            "threads": 27,
-            "cpu_seconds": 2.016
-          },
-          "worker0": {
-            "rss_bytes": 31084544,
-            "handles": 308,
-            "threads": 28,
-            "cpu_seconds": 6.656
-          },
-          "worker1": {
-            "rss_bytes": 32112640,
-            "handles": 307,
-            "threads": 29,
-            "cpu_seconds": 2.75
-          },
-          "worker2": {
-            "rss_bytes": 27254784,
-            "handles": 305,
-            "threads": 28,
-            "cpu_seconds": 0.453
-          }
-        },
-        "dirs": {
-          "blob_store_bytes": 4273997379,
-          "state_dir_bytes": 2212038,
-          "journal_bin_bytes": 108274,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2133852160,
-          "worker_cache_w0_bytes": 2133852160,
-          "sandbox_w1_bytes": 2098200576,
-          "worker_cache_w1_bytes": 2098200576,
-          "sandbox_w2_bytes": 2130709247,
-          "worker_cache_w2_bytes": 2130709247
-        }
-      },
-      {
-        "t_s": 1934.92,
-        "processes": {
-          "master": {
-            "rss_bytes": 39018496,
-            "handles": 199,
-            "threads": 27,
-            "cpu_seconds": 2.891
-          },
-          "worker0": {
-            "rss_bytes": 31059968,
-            "handles": 309,
-            "threads": 28,
-            "cpu_seconds": 7.188
-          },
-          "worker1": {
-            "rss_bytes": 32079872,
-            "handles": 307,
-            "threads": 27,
-            "cpu_seconds": 2.859
-          },
-          "worker2": {
-            "rss_bytes": 36335616,
-            "handles": 308,
-            "threads": 29,
-            "cpu_seconds": 0.891
-          }
-        },
-        "dirs": {
-          "blob_store_bytes": 4254074610,
-          "state_dir_bytes": 2268560,
-          "journal_bin_bytes": 156964,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2113929216,
-          "worker_cache_w0_bytes": 2113929216,
-          "sandbox_w1_bytes": 2098200576,
-          "worker_cache_w1_bytes": 2098200576,
-          "sandbox_w2_bytes": 2078280620,
-          "worker_cache_w2_bytes": 2160069548
-        }
-      },
-      {
-        "t_s": 1995.36,
+        "t_s": 1873.67,
         "processes": {
           "master": {
             "rss_bytes": 39178240,
-            "handles": 195,
-            "threads": 24,
-            "cpu_seconds": 4.016
+            "handles": 204,
+            "threads": 27,
+            "cpu_seconds": 2.484,
+            "pid": 18300
           },
           "worker0": {
             "rss_bytes": 31514624,
             "handles": 308,
-            "threads": 27,
-            "cpu_seconds": 7.828
+            "threads": 29,
+            "cpu_seconds": 7.547,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 31969280,
-            "handles": 305,
-            "threads": 25,
-            "cpu_seconds": 3.156
+            "rss_bytes": 33288192,
+            "handles": 308,
+            "threads": 29,
+            "cpu_seconds": 2.297,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31674368,
-            "handles": 303,
-            "threads": 25,
-            "cpu_seconds": 1.328
+            "rss_bytes": 31686656,
+            "handles": 311,
+            "threads": 30,
+            "cpu_seconds": 0.953,
+            "pid": 44732
+          }
+        },
+        "dirs": {
+          "blob_store_bytes": 4273997379,
+          "state_dir_bytes": 2259693,
+          "journal_bin_bytes": 139299,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2146435072,
+          "worker_cache_w0_bytes": 2146435072,
+          "sandbox_w1_bytes": 2268072703,
+          "worker_cache_w1_bytes": 2228226815,
+          "sandbox_w2_bytes": 2135950005,
+          "worker_cache_w2_bytes": 2135950005
+        }
+      },
+      {
+        "t_s": 1934.23,
+        "processes": {
+          "master": {
+            "rss_bytes": 39297024,
+            "handles": 203,
+            "threads": 27,
+            "cpu_seconds": 3.297,
+            "pid": 18300
+          },
+          "worker0": {
+            "rss_bytes": 31469568,
+            "handles": 308,
+            "threads": 27,
+            "cpu_seconds": 7.797,
+            "pid": 48232
+          },
+          "worker1": {
+            "rss_bytes": 31133696,
+            "handles": 307,
+            "threads": 27,
+            "cpu_seconds": 2.562,
+            "pid": 10004
+          },
+          "worker2": {
+            "rss_bytes": 31698944,
+            "handles": 312,
+            "threads": 30,
+            "cpu_seconds": 1.281,
+            "pid": 44732
+          }
+        },
+        "dirs": {
+          "blob_store_bytes": 4224714482,
+          "state_dir_bytes": 2316051,
+          "journal_bin_bytes": 187519,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2089811968,
+          "worker_cache_w0_bytes": 2089811968,
+          "sandbox_w1_bytes": 2110786650,
+          "worker_cache_w1_bytes": 2110786650,
+          "sandbox_w2_bytes": 2106589704,
+          "worker_cache_w2_bytes": 2106589704
+        }
+      },
+      {
+        "t_s": 1994.67,
+        "processes": {
+          "master": {
+            "rss_bytes": 39354368,
+            "handles": 200,
+            "threads": 24,
+            "cpu_seconds": 4.281,
+            "pid": 18300
+          },
+          "worker0": {
+            "rss_bytes": 31490048,
+            "handles": 308,
+            "threads": 27,
+            "cpu_seconds": 8.281,
+            "pid": 48232
+          },
+          "worker1": {
+            "rss_bytes": 31105024,
+            "handles": 307,
+            "threads": 27,
+            "cpu_seconds": 3.188,
+            "pid": 10004
+          },
+          "worker2": {
+            "rss_bytes": 31645696,
+            "handles": 309,
+            "threads": 27,
+            "cpu_seconds": 1.672,
+            "pid": 44732
           }
         },
         "dirs": {
           "blob_store_bytes": 4283434565,
-          "state_dir_bytes": 2324015,
-          "journal_bin_bytes": 204089,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2119172096,
-          "worker_cache_w0_bytes": 2119172096,
-          "sandbox_w1_bytes": 2114977792,
-          "worker_cache_w1_bytes": 2114977792,
-          "sandbox_w2_bytes": 2119174911,
-          "worker_cache_w2_bytes": 2119174911
+          "state_dir_bytes": 2372829,
+          "journal_bin_bytes": 236158,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2143289344,
+          "worker_cache_w0_bytes": 2143289344,
+          "sandbox_w1_bytes": 2138049279,
+          "worker_cache_w1_bytes": 2138049279,
+          "sandbox_w2_bytes": 2092958216,
+          "worker_cache_w2_bytes": 2092958216
         }
       },
       {
-        "t_s": 2055.8,
+        "t_s": 2055.09,
         "processes": {
           "master": {
-            "rss_bytes": 39403520,
-            "handles": 197,
+            "rss_bytes": 39174144,
+            "handles": 201,
             "threads": 25,
-            "cpu_seconds": 5.203
+            "cpu_seconds": 5.484,
+            "pid": 18300
           },
           "worker0": {
-            "rss_bytes": 31428608,
+            "rss_bytes": 31490048,
             "handles": 308,
             "threads": 27,
-            "cpu_seconds": 8.281
+            "cpu_seconds": 8.594,
+            "pid": 48232
           },
           "worker1": {
-            "rss_bytes": 31985664,
-            "handles": 305,
-            "threads": 25,
-            "cpu_seconds": 3.219
+            "rss_bytes": 31150080,
+            "handles": 308,
+            "threads": 28,
+            "cpu_seconds": 3.484,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31670272,
-            "handles": 313,
-            "threads": 28,
-            "cpu_seconds": 2.266
+            "rss_bytes": 31653888,
+            "handles": 309,
+            "threads": 27,
+            "cpu_seconds": 2.203,
+            "pid": 44732
           }
         },
         "dirs": {
-          "blob_store_bytes": 4270851481,
-          "state_dir_bytes": 2383828,
-          "journal_bin_bytes": 255727,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2058354688,
-          "worker_cache_w0_bytes": 2058354688,
-          "sandbox_w1_bytes": 2114977792,
-          "worker_cache_w1_bytes": 2114977792,
-          "sandbox_w2_bytes": 2142243411,
-          "worker_cache_w2_bytes": 2142243411
+          "blob_store_bytes": 4250928537,
+          "state_dir_bytes": 2429940,
+          "journal_bin_bytes": 285236,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2141192192,
+          "worker_cache_w0_bytes": 2141192192,
+          "sandbox_w1_bytes": 2102397523,
+          "worker_cache_w1_bytes": 2102397523,
+          "sandbox_w2_bytes": 2085617838,
+          "worker_cache_w2_bytes": 2085617838
         }
       },
       {
-        "t_s": 2116.26,
+        "t_s": 2115.61,
         "processes": {
           "master": {
-            "rss_bytes": 35352576,
-            "handles": 196,
+            "rss_bytes": 35209216,
+            "handles": 202,
             "threads": 27,
-            "cpu_seconds": 6.0
+            "cpu_seconds": 6.453,
+            "pid": 18300
           },
           "worker1": {
-            "rss_bytes": 32100352,
-            "handles": 307,
-            "threads": 29,
-            "cpu_seconds": 3.422
+            "rss_bytes": 31174656,
+            "handles": 306,
+            "threads": 28,
+            "cpu_seconds": 3.781,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31707136,
-            "handles": 302,
-            "threads": 26,
-            "cpu_seconds": 2.688
-          },
-          "worker0": {
-            "rss_bytes": 20443136,
-            "handles": 187,
-            "threads": 29,
-            "cpu_seconds": 0.047
+            "rss_bytes": 31813632,
+            "handles": 310,
+            "threads": 30,
+            "cpu_seconds": 2.656,
+            "pid": 44732
           }
         },
         "dirs": {
           "blob_store_bytes": 4275045957,
-          "state_dir_bytes": 2438442,
-          "journal_bin_bytes": 302288,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2094006272,
-          "worker_cache_w0_bytes": 2094006272,
-          "sandbox_w1_bytes": 2095054848,
-          "worker_cache_w1_bytes": 2095054848,
-          "sandbox_w2_bytes": 2146437888,
-          "worker_cache_w2_bytes": 2146437888
+          "state_dir_bytes": 2486115,
+          "journal_bin_bytes": 333616,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2136997888,
+          "worker_cache_w0_bytes": 2136997888,
+          "sandbox_w1_bytes": 2098203565,
+          "worker_cache_w1_bytes": 2098203565,
+          "sandbox_w2_bytes": 2129658030,
+          "worker_cache_w2_bytes": 2129658030
         }
       },
       {
-        "t_s": 2176.72,
+        "t_s": 2176.06,
         "processes": {
           "master": {
-            "rss_bytes": 39731200,
-            "handles": 195,
+            "rss_bytes": 41459712,
+            "handles": 200,
             "threads": 26,
-            "cpu_seconds": 6.891
+            "cpu_seconds": 7.422,
+            "pid": 18300
           },
           "worker1": {
-            "rss_bytes": 32477184,
-            "handles": 306,
-            "threads": 28,
-            "cpu_seconds": 4.188
+            "rss_bytes": 31170560,
+            "handles": 307,
+            "threads": 29,
+            "cpu_seconds": 4.141,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31739904,
-            "handles": 304,
+            "rss_bytes": 31768576,
+            "handles": 308,
             "threads": 28,
-            "cpu_seconds": 2.719
+            "cpu_seconds": 2.859,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 26386432,
-            "handles": 303,
-            "threads": 27,
-            "cpu_seconds": 0.453
+            "rss_bytes": 26525696,
+            "handles": 305,
+            "threads": 29,
+            "cpu_seconds": 0.672,
+            "pid": 8520
           }
         },
         "dirs": {
           "blob_store_bytes": 4260365719,
-          "state_dir_bytes": 2494312,
-          "journal_bin_bytes": 350717,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2145386496,
-          "worker_cache_w0_bytes": 2145386496,
-          "sandbox_w1_bytes": 2136997888,
-          "worker_cache_w1_bytes": 2136997888,
-          "sandbox_w2_bytes": 2146437888,
-          "worker_cache_w2_bytes": 2146437888
+          "state_dir_bytes": 2541589,
+          "journal_bin_bytes": 381306,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2109734912,
+          "worker_cache_w0_bytes": 2109734912,
+          "sandbox_w1_bytes": 2122320640,
+          "worker_cache_w1_bytes": 2122320640,
+          "sandbox_w2_bytes": 2129658030,
+          "worker_cache_w2_bytes": 2129658030
         }
       },
       {
-        "t_s": 2237.14,
+        "t_s": 2236.52,
         "processes": {
           "master": {
-            "rss_bytes": 41783296,
-            "handles": 196,
+            "rss_bytes": 41594880,
+            "handles": 201,
             "threads": 25,
-            "cpu_seconds": 8.203
+            "cpu_seconds": 9.266,
+            "pid": 18300
           },
           "worker1": {
-            "rss_bytes": 32448512,
+            "rss_bytes": 31121408,
             "handles": 306,
             "threads": 26,
-            "cpu_seconds": 4.609
+            "cpu_seconds": 4.828,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31723520,
-            "handles": 304,
+            "rss_bytes": 31764480,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 3.203
+            "cpu_seconds": 3.172,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 30658560,
-            "handles": 305,
-            "threads": 29,
-            "cpu_seconds": 1.219
+            "rss_bytes": 30429184,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 0.891,
+            "pid": 8520
           }
         },
         "dirs": {
           "blob_store_bytes": 4212131049,
-          "state_dir_bytes": 2552581,
-          "journal_bin_bytes": 400816,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2138046464,
-          "worker_cache_w0_bytes": 2138046464,
-          "sandbox_w1_bytes": 2104492032,
-          "worker_cache_w1_bytes": 2104492032,
-          "sandbox_w2_bytes": 2133854632,
-          "worker_cache_w2_bytes": 2133854632
+          "state_dir_bytes": 2599548,
+          "journal_bin_bytes": 431405,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2058354688,
+          "worker_cache_w0_bytes": 2058354688,
+          "sandbox_w1_bytes": 2108688980,
+          "worker_cache_w1_bytes": 2108688980,
+          "sandbox_w2_bytes": 2120220672,
+          "worker_cache_w2_bytes": 2120220672
         }
       },
       {
-        "t_s": 2297.56,
+        "t_s": 2297.02,
         "processes": {
           "master": {
-            "rss_bytes": 37675008,
-            "handles": 196,
+            "rss_bytes": 40755200,
+            "handles": 204,
             "threads": 25,
-            "cpu_seconds": 9.25
+            "cpu_seconds": 10.047,
+            "pid": 18300
           },
           "worker1": {
-            "rss_bytes": 32370688,
+            "rss_bytes": 31158272,
             "handles": 309,
             "threads": 28,
-            "cpu_seconds": 4.922
+            "cpu_seconds": 4.953,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31744000,
-            "handles": 304,
+            "rss_bytes": 31764480,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 3.625
+            "cpu_seconds": 3.516,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 30945280,
+            "rss_bytes": 30629888,
             "handles": 303,
             "threads": 27,
-            "cpu_seconds": 1.594
+            "cpu_seconds": 1.359,
+            "pid": 8520
           }
         },
         "dirs": {
-          "blob_store_bytes": 4272948456,
-          "state_dir_bytes": 2608694,
-          "journal_bin_bytes": 448815,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2130706432,
-          "worker_cache_w0_bytes": 2130706432,
-          "sandbox_w1_bytes": 2127560704,
-          "worker_cache_w1_bytes": 2127560704,
-          "sandbox_w2_bytes": 2103445754,
-          "worker_cache_w2_bytes": 2103445754
+          "blob_store_bytes": 4240442600,
+          "state_dir_bytes": 2655748,
+          "journal_bin_bytes": 479838,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2122318039,
+          "worker_cache_w0_bytes": 2126512343,
+          "sandbox_w1_bytes": 2067794516,
+          "worker_cache_w1_bytes": 2067794516,
+          "sandbox_w2_bytes": 2131755008,
+          "worker_cache_w2_bytes": 2131755008
         }
       },
       {
-        "t_s": 2358.01,
+        "t_s": 2357.44,
         "processes": {
           "master": {
-            "rss_bytes": 41951232,
-            "handles": 197,
+            "rss_bytes": 37765120,
+            "handles": 201,
             "threads": 25,
-            "cpu_seconds": 10.438
+            "cpu_seconds": 10.688,
+            "pid": 18300
           },
           "worker1": {
-            "rss_bytes": 32190464,
+            "rss_bytes": 31125504,
             "handles": 308,
             "threads": 27,
-            "cpu_seconds": 5.094
+            "cpu_seconds": 5.109,
+            "pid": 10004
           },
           "worker2": {
-            "rss_bytes": 31825920,
-            "handles": 304,
+            "rss_bytes": 31789056,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 4.422
+            "cpu_seconds": 4.031,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 30633984,
+            "rss_bytes": 30674944,
             "handles": 303,
             "threads": 27,
-            "cpu_seconds": 1.953
+            "cpu_seconds": 2.016,
+            "pid": 8520
           }
         },
         "dirs": {
           "blob_store_bytes": 4264559847,
-          "state_dir_bytes": 2665217,
-          "journal_bin_bytes": 497881,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2126512128,
-          "worker_cache_w0_bytes": 2126512128,
-          "sandbox_w1_bytes": 2111832064,
-          "worker_cache_w1_bytes": 2111832064,
-          "sandbox_w2_bytes": 2109737384,
-          "worker_cache_w2_bytes": 2109737384
+          "state_dir_bytes": 2711666,
+          "journal_bin_bytes": 527390,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2055209521,
+          "worker_cache_w0_bytes": 2055209521,
+          "sandbox_w1_bytes": 2067794516,
+          "worker_cache_w1_bytes": 2067794516,
+          "sandbox_w2_bytes": 2140143616,
+          "worker_cache_w2_bytes": 2140143616
         }
       },
       {
-        "t_s": 2418.47,
+        "t_s": 2417.86,
         "processes": {
           "master": {
-            "rss_bytes": 37822464,
-            "handles": 196,
+            "rss_bytes": 37830656,
+            "handles": 201,
             "threads": 27,
-            "cpu_seconds": 11.953
+            "cpu_seconds": 11.906,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 31854592,
-            "handles": 304,
+            "rss_bytes": 31825920,
+            "handles": 308,
             "threads": 28,
-            "cpu_seconds": 4.828
+            "cpu_seconds": 4.719,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 30765056,
+            "rss_bytes": 30801920,
             "handles": 302,
             "threads": 28,
-            "cpu_seconds": 2.609
+            "cpu_seconds": 2.562,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 20598784,
-            "handles": 187,
-            "threads": 29,
-            "cpu_seconds": 0.047
+            "rss_bytes": 19742720,
+            "handles": 171,
+            "threads": 27,
+            "cpu_seconds": 0.078,
+            "pid": 48908
           }
         },
         "dirs": {
           "blob_store_bytes": 4280288487,
-          "state_dir_bytes": 2722034,
-          "journal_bin_bytes": 546174,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2112880640,
-          "worker_cache_w0_bytes": 2112880640,
-          "sandbox_w1_bytes": 2104492032,
-          "worker_cache_w1_bytes": 2104492032,
-          "sandbox_w2_bytes": 2102397352,
-          "worker_cache_w2_bytes": 2102397352
+          "state_dir_bytes": 2769471,
+          "journal_bin_bytes": 577502,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2070938161,
+          "worker_cache_w0_bytes": 2070938161,
+          "sandbox_w1_bytes": 2067794516,
+          "worker_cache_w1_bytes": 2067794516,
+          "sandbox_w2_bytes": 2138046464,
+          "worker_cache_w2_bytes": 2138046464
         }
       },
       {
-        "t_s": 2478.95,
+        "t_s": 2478.33,
         "processes": {
           "master": {
-            "rss_bytes": 42049536,
-            "handles": 195,
+            "rss_bytes": 42082304,
+            "handles": 201,
             "threads": 24,
-            "cpu_seconds": 13.016
+            "cpu_seconds": 12.844,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 31862784,
-            "handles": 304,
-            "threads": 28,
-            "cpu_seconds": 5.422
+            "rss_bytes": 31850496,
+            "handles": 309,
+            "threads": 29,
+            "cpu_seconds": 5.203,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 31059968,
-            "handles": 303,
-            "threads": 29,
-            "cpu_seconds": 2.984
+            "rss_bytes": 30994432,
+            "handles": 300,
+            "threads": 26,
+            "cpu_seconds": 2.797,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 26202112,
-            "handles": 303,
-            "threads": 27,
-            "cpu_seconds": 0.562
+            "rss_bytes": 26644480,
+            "handles": 305,
+            "threads": 29,
+            "cpu_seconds": 0.578,
+            "pid": 48908
           }
         },
         "dirs": {
           "blob_store_bytes": 4256171413,
-          "state_dir_bytes": 2776675,
-          "journal_bin_bytes": 592969,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2105540608,
-          "worker_cache_w0_bytes": 2105540608,
-          "sandbox_w1_bytes": 2105540608,
-          "worker_cache_w1_bytes": 2105540608,
-          "sandbox_w2_bytes": 2095057320,
-          "worker_cache_w2_bytes": 2095057320
+          "state_dir_bytes": 2824924,
+          "journal_bin_bytes": 624297,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2119172831,
+          "worker_cache_w0_bytes": 2119172831,
+          "sandbox_w1_bytes": 2113931818,
+          "worker_cache_w1_bytes": 2113931818,
+          "sandbox_w2_bytes": 2135949312,
+          "worker_cache_w2_bytes": 2135949312
         }
       },
       {
-        "t_s": 2539.39,
+        "t_s": 2538.78,
         "processes": {
           "master": {
-            "rss_bytes": 42123264,
-            "handles": 196,
+            "rss_bytes": 42225664,
+            "handles": 201,
             "threads": 25,
-            "cpu_seconds": 14.406
+            "cpu_seconds": 14.141,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 31830016,
-            "handles": 304,
+            "rss_bytes": 31797248,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 6.297
+            "cpu_seconds": 6.078,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 31010816,
+            "rss_bytes": 31014912,
             "handles": 302,
             "threads": 26,
-            "cpu_seconds": 3.359
+            "cpu_seconds": 3.125,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 30552064,
+            "rss_bytes": 26370048,
             "handles": 305,
             "threads": 29,
-            "cpu_seconds": 0.859
+            "cpu_seconds": 0.719,
+            "pid": 48908
           }
         },
         "dirs": {
           "blob_store_bytes": 4283434736,
-          "state_dir_bytes": 2832063,
-          "journal_bin_bytes": 640004,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2138046464,
-          "worker_cache_w0_bytes": 2138046464,
-          "sandbox_w1_bytes": 2117074944,
-          "worker_cache_w1_bytes": 2117074944,
-          "sandbox_w2_bytes": 2146437369,
-          "worker_cache_w2_bytes": 2146437369
+          "state_dir_bytes": 2879025,
+          "journal_bin_bytes": 670593,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2127561786,
+          "worker_cache_w0_bytes": 2127561786,
+          "sandbox_w1_bytes": 2113931818,
+          "worker_cache_w1_bytes": 2113931818,
+          "sandbox_w2_bytes": 2067791872,
+          "worker_cache_w2_bytes": 2067791872
         }
       },
       {
-        "t_s": 2599.89,
+        "t_s": 2599.42,
         "processes": {
           "master": {
-            "rss_bytes": 42270720,
-            "handles": 197,
+            "rss_bytes": 42242048,
+            "handles": 201,
             "threads": 25,
-            "cpu_seconds": 15.281
+            "cpu_seconds": 14.984,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 33927168,
-            "handles": 305,
+            "rss_bytes": 31805440,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 6.766
+            "cpu_seconds": 6.641,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 31338496,
-            "handles": 302,
-            "threads": 26,
-            "cpu_seconds": 4.172
+            "rss_bytes": 30953472,
+            "handles": 300,
+            "threads": 24,
+            "cpu_seconds": 3.469,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 30498816,
-            "handles": 301,
-            "threads": 25,
-            "cpu_seconds": 0.922
+            "rss_bytes": 30466048,
+            "handles": 303,
+            "threads": 27,
+            "cpu_seconds": 1.109,
+            "pid": 48908
           }
         },
         "dirs": {
-          "blob_store_bytes": 4240443119,
-          "state_dir_bytes": 2891404,
-          "journal_bin_bytes": 691746,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2140143616,
-          "worker_cache_w0_bytes": 2140143616,
-          "sandbox_w1_bytes": 2117074944,
-          "worker_cache_w1_bytes": 2117074944,
-          "sandbox_w2_bytes": 2254440522,
-          "worker_cache_w2_bytes": 2105542557
+          "blob_store_bytes": 4269803247,
+          "state_dir_bytes": 2938063,
+          "journal_bin_bytes": 721560,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2126513383,
+          "worker_cache_w0_bytes": 2126513383,
+          "sandbox_w1_bytes": 2102397310,
+          "worker_cache_w1_bytes": 2102397310,
+          "sandbox_w2_bytes": 2132803584,
+          "worker_cache_w2_bytes": 2132803584
         }
       },
       {
-        "t_s": 2660.38,
+        "t_s": 2659.86,
         "processes": {
           "master": {
-            "rss_bytes": 42340352,
-            "handles": 196,
+            "rss_bytes": 42287104,
+            "handles": 200,
             "threads": 24,
-            "cpu_seconds": 16.406
+            "cpu_seconds": 16.219,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 32096256,
-            "handles": 311,
+            "rss_bytes": 31821824,
+            "handles": 308,
             "threads": 26,
-            "cpu_seconds": 7.703
+            "cpu_seconds": 7.234,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 31326208,
+            "rss_bytes": 31023104,
             "handles": 302,
             "threads": 26,
-            "cpu_seconds": 4.438
+            "cpu_seconds": 3.688,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 30793728,
-            "handles": 303,
-            "threads": 27,
-            "cpu_seconds": 1.266
+            "rss_bytes": 30412800,
+            "handles": 301,
+            "threads": 25,
+            "cpu_seconds": 1.891,
+            "pid": 48908
           }
         },
         "dirs": {
           "blob_store_bytes": 4249880130,
-          "state_dir_bytes": 2948610,
-          "journal_bin_bytes": 740962,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2090860544,
-          "worker_cache_w0_bytes": 2090860544,
-          "sandbox_w1_bytes": 2120220672,
-          "worker_cache_w1_bytes": 2120220672,
-          "sandbox_w2_bytes": 2133853935,
-          "worker_cache_w2_bytes": 2133853935
+          "state_dir_bytes": 2997074,
+          "journal_bin_bytes": 772290,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2129659111,
+          "worker_cache_w0_bytes": 2129659111,
+          "sandbox_w1_bytes": 2107639671,
+          "worker_cache_w1_bytes": 2107639671,
+          "sandbox_w2_bytes": 2090860544,
+          "worker_cache_w2_bytes": 2090860544
         }
       },
       {
-        "t_s": 2702.03,
+        "t_s": 2701.97,
         "processes": {
           "master": {
-            "rss_bytes": 42356736,
-            "handles": 194,
+            "rss_bytes": 42303488,
+            "handles": 199,
             "threads": 23,
-            "cpu_seconds": 16.922
+            "cpu_seconds": 16.719,
+            "pid": 18300
           },
           "worker2": {
-            "rss_bytes": 32067584,
-            "handles": 302,
+            "rss_bytes": 31768576,
+            "handles": 306,
             "threads": 24,
-            "cpu_seconds": 7.938
+            "cpu_seconds": 7.328,
+            "pid": 44732
           },
           "worker0": {
-            "rss_bytes": 31023104,
+            "rss_bytes": 30961664,
             "handles": 300,
             "threads": 24,
-            "cpu_seconds": 4.703
+            "cpu_seconds": 3.984,
+            "pid": 8520
           },
           "worker1": {
-            "rss_bytes": 30527488,
+            "rss_bytes": 30482432,
             "handles": 301,
             "threads": 25,
-            "cpu_seconds": 1.406
+            "cpu_seconds": 2.031,
+            "pid": 48908
           }
         },
         "dirs": {
           "blob_store_bytes": 4285531715,
-          "state_dir_bytes": 2982336,
-          "journal_bin_bytes": 769384,
-          "snapshot_bin_bytes": 2014341,
-          "sandbox_w0_bytes": 2122317824,
-          "worker_cache_w0_bytes": 2122317824,
-          "sandbox_w1_bytes": 2120220672,
-          "worker_cache_w1_bytes": 2120220672,
-          "sandbox_w2_bytes": 2133854109,
-          "worker_cache_w2_bytes": 2133854109
+          "state_dir_bytes": 3031188,
+          "journal_bin_bytes": 801453,
+          "snapshot_bin_bytes": 2023905,
+          "sandbox_w0_bytes": 2128610709,
+          "worker_cache_w0_bytes": 2128610709,
+          "sandbox_w1_bytes": 2107639671,
+          "worker_cache_w1_bytes": 2107639671,
+          "sandbox_w2_bytes": 2090860544,
+          "worker_cache_w2_bytes": 2090860544
         }
       }
     ]
