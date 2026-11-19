@@ -224,7 +224,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | In | (design 0065) |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
@@ -506,6 +506,22 @@ The full suite must pass on a clean machine before CI can require it.
   4. For every failed check, open an item or write a failing regression test (rule 4).
 - **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
   `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
+- **Partial (2026-11-19, pull request 374):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
+  `sample`, Python 3 standard library only), `benchmarks/endurance/README.md`, and
+  `tests/test_endurance_harness.py` (`14/14` passed, wired into CI `agent-bridge`), and ran
+  loopback scenarios on Windows `x86_64` (`rusty-grid 0.4.3` at `a3e5b71`, Windows Defender
+  real-time protection on): `7/7` passed in `2,648.17 s`
+  (`benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`):
+  `T1` (`1 GiB` `10.033 s`, `3 GiB` `67.899 s`; peak RSS delta `-3.9 MiB` master / `-2.8 MiB`
+  worker / `+0.64 MiB` client vs `128 MiB` bound), `T2` (`20,000` files, `173,998,510 B`,
+  `233.124 s`, `20,001` blobs stored), `T3` (`1,000 MiB` output `10.757 s` ok; `1,100 MiB`
+  refused naming `--output-limit-mb`), `T4` (second `3 GiB` submit uploaded `0` blobs / `0 B`),
+  `T6` (`64 MiB` fetch cut via loopback proxy recovered cleanly in `4.440 s`, `0` `.part`
+  leftovers), `T7` (`256 MiB` in + `256 MiB` out over `2.0 Mbit/s` / `50 ms` RTT TCP finished in
+  `2,164.622 s` with `worker_reaped = false`), and `T8` (`--blob-store-mb 64` refused `72 MiB`
+  and concurrent `40 + 40 MiB` uploads naming `--blob-store-mb`, `0` tmp leftovers). `T1 (8 GiB)`,
+  `T2 (100,000 files)`, `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` links
+  remain for step 2.
 
 ### TEST-25: Run a cluster for 24 hours under load and faults
 
@@ -2409,5 +2425,6 @@ Add one dated line per finished item, newest last.
   NET-10 and APP-6 stay Planned.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
+- 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: NET-9 Partial (pull request 377, open draft until the stability release; [design 0095](design/0095-contributor-controls.md)): worker-side `--max-host-cpu-pct` (`RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT`), `--allow-hours` (with boundary heartbeats), `--daily-task-hours` (in-memory), `--pause-on-battery`, `--pause-on-metered` (retaining last known state on probe timeout), `--control-file` (owner-private checks + `.watch` PID warning), and `oxideswarm worker pause|resume|status` (worker-lifetime watcher, `5 s` task stop + abort refusal fallback + [design 0090](design/0090-sandbox-base-refusal-hand-back.md) hand-back, heartbeat `101.0` hold + `state:held`, master `--max-host-cpu-pct` validated `1.0..=100.0`) implemented with zero wire changes and verified on macOS; remaining: merge after the stability release and record contributor settings in APP-6.
