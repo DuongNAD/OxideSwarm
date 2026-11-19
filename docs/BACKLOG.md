@@ -405,7 +405,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Partial | Out | TBD (open), (design 0095), (design 0094) |
+| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Partial | Out | 377 (open), (design 0095), (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
 
@@ -1879,7 +1879,7 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   task assigned while the worker is paused is handed back; `pause` ends a running task within 5 s,
   and the task completes on another worker with its retry count unchanged. The record of APP-6 lists
   the controls each contributor set.
-- **Partial (pull request #TBD, draft):** [Design 0095](design/0095-contributor-controls.md), the
+- **Partial (pull request #377, draft):** [Design 0095](design/0095-contributor-controls.md), the
   worker and CLI controls (`--max-host-cpu-pct`, `--allow-hours`, `--daily-task-hours`,
   `--pause-on-battery`, `--pause-on-metered`, `--control-file`, and
   `oxideswarm worker pause|resume|status` with `5 s` task stop and [design 0090](design/0090-sandbox-base-refusal-hand-back.md)
@@ -2410,4 +2410,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
-- 2026-11-19: NET-9 Partial (pull request TBD, open draft until the stability release; [design 0095](design/0095-contributor-controls.md)): worker-side `--max-host-cpu-pct` (`RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT`), `--allow-hours`, `--daily-task-hours`, `--pause-on-battery`, `--pause-on-metered`, `--control-file`, and `oxideswarm worker pause|resume|status` (`5 s` task stop + [design 0090](design/0090-sandbox-base-refusal-hand-back.md) refusal hand-back) implemented with zero wire changes and verified by injected-probe unit and 2-worker integration tests; remaining: merge after the stability release and record contributor settings in APP-6.
+- 2026-11-19: NET-9 Partial (pull request 377, open draft until the stability release; [design 0095](design/0095-contributor-controls.md)): worker-side `--max-host-cpu-pct` (`RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT`), `--allow-hours`, `--daily-task-hours`, `--pause-on-battery`, `--pause-on-metered`, `--control-file`, and `oxideswarm worker pause|resume|status` (`5 s` task stop + [design 0090](design/0090-sandbox-base-refusal-hand-back.md) refusal hand-back) implemented with zero wire changes and verified by injected-probe unit and 2-worker integration tests; remaining: merge after the stability release and record contributor settings in APP-6.

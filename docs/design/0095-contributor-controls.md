@@ -1,6 +1,6 @@
 # 0095: Contributor controls on each machine (NET-9)
 
-Status: Draft (implementation open in a draft pull request until the stability release)
+Status: Draft (implementation open in draft pull request 377 until the stability release)
 Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
@@ -180,3 +180,4 @@ Protocol version stays `10`.
 ## Status log
 
 - 2026-11-19: Claimed `design 0095` on the hub and wrote initial `Draft` design for `NET-9` before implementation on `mac/net-9-contributor-controls`.
+- 2026-11-19: Implemented `NET-9` and opened draft pull request 377 (zero wire changes; verified on macOS).
