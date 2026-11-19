@@ -1045,6 +1045,47 @@
             font-weight: 600;
             color: var(--dot-red);
         }
+        .credits-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 10px 12px;
+        }
+        .credits-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 8px;
+        }
+        .credits-title { font-size: 12px; font-weight: 700; color: var(--text); }
+        .credits-tabs { display: flex; gap: 4px; }
+        .credits-tab {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .credits-tab.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 700; }
+        .credits-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+        .credits-table th {
+            text-align: left;
+            color: var(--text-dim);
+            font-size: 10.5px;
+            padding: 4px 6px;
+            border-bottom: 1px solid var(--border);
+        }
+        .credits-table td {
+            padding: 5px 6px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            font-family: ui-monospace, SFMono-Regular, monospace;
+        }
+        .credits-table td:first-child { font-family: inherit; font-weight: 600; }
+        .credits-foot { margin-top: 6px; font-size: 10.5px; color: var(--text-dim); }
     </style>
 </head>
 <body>
@@ -1144,6 +1185,20 @@
                 </div>
 
                 <div class="devices-list" id="deviceList">
+                </div>
+
+                <!-- CONTRIBUTION CREDITS CARD (Display Only, Q96) -->
+                <div class="credits-card" id="creditsCard">
+                    <div class="credits-header">
+                        <span class="credits-title">Contribution Credits (Display Only)</span>
+                        <div class="credits-tabs" id="creditsWindowTabs">
+                            <button class="credits-tab active" data-win="last_24h" onclick="setCreditWindow('last_24h')">24h</button>
+                            <button class="credits-tab" data-win="last_7d" onclick="setCreditWindow('last_7d')">7d</button>
+                            <button class="credits-tab" data-win="all_time" onclick="setCreditWindow('all_time')">All Time</button>
+                        </div>
+                    </div>
+                    <div id="creditsBody" style="font-size:11.5px;color:var(--text-dim);">No completed tasks recorded yet.</div>
+                    <div class="credits-foot" id="creditsFooter">Display only (Q96) — contribution records never affect scheduling, admission, or quotas.</div>
                 </div>
             </div>
         </div>
@@ -2301,6 +2356,47 @@
             setHtml(document.getElementById('deviceList'), joinHtml(cards));
         }
 
+        let activeCreditWindow = 'last_24h';
+        let lastCreditsSnapshot = null;
+
+        function setCreditWindow(win) {
+            activeCreditWindow = win;
+            const btns = document.querySelectorAll('#creditsWindowTabs .credits-tab');
+            btns.forEach(b => b.classList.toggle('active', b.getAttribute('data-win') === win));
+            if (lastCreditsSnapshot) renderCredits(lastCreditsSnapshot);
+        }
+
+        function fmtCreditSide(side) {
+            const c = side || {};
+            const gpuPart = num(c.gpu_ms) > 0 ? ` • ${num(c.gpu_secs).toFixed(1)} GPU-s` : '';
+            return `${num(c.tasks)} tasks • ${num(c.core_secs).toFixed(1)} core-s${gpuPart}`;
+        }
+
+        function renderCredits(snap) {
+            const body = document.getElementById('creditsBody');
+            const foot = document.getElementById('creditsFooter');
+            if (!body || !snap || typeof snap !== 'object') return;
+            lastCreditsSnapshot = snap;
+            const list = Array.isArray(snap.participants) ? snap.participants : [];
+            if (list.length === 0) {
+                setHtml(body, html`<span style="color:var(--text-dim)">No completed tasks recorded yet.</span>`);
+            } else {
+                const winKey = activeCreditWindow;
+                const rows = list.map(p => {
+                    const w = (p && p[winKey]) || {};
+                    const ids = Array.isArray(p.member_ids) && p.member_ids.length > 0
+                        ? ` (${p.member_ids.map(id => shortText(id, 8)).join(', ')})`
+                        : '';
+                    return html`<tr><td>${p.label || ''}${ids}</td><td>${fmtCreditSide(w.ran_for_others)}</td><td>${fmtCreditSide(w.used_from_others)}</td><td>${fmtCreditSide(w.self_run)}</td></tr>`;
+                });
+                setHtml(body, html`<table class="credits-table"><thead><tr><th>Participant</th><th>Ran for others</th><th>Used from others</th><th>Self-run</th></tr></thead><tbody>${rows}</tbody></table>`);
+            }
+            if (foot) {
+                const trunc = snap.window_truncated ? ' • oldest 7d records archived (all-time exact)' : '';
+                foot.textContent = `Display only (Q96) — contribution records never affect scheduling, admission, or quotas • ${num(snap.total_records)} records${trunc}`;
+            }
+        }
+
         function paintLatency(ms) {
             const pill = document.getElementById('latencyPill');
             if (!pill) return;
@@ -2379,6 +2475,14 @@
                 console.error("Render error:", e);
                 throw e;
             }
+
+            try {
+                const cRes = await apiFetch('/api/credits');
+                if (cRes.ok) {
+                    const cData = await cRes.json();
+                    renderCredits(cData);
+                }
+            } catch (_) {}
         }
         syncData().catch(() => {});
         setInterval(() => syncData().catch(() => {}), 3000);

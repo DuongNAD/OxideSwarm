@@ -376,6 +376,9 @@ pub struct TaskEntry {
     pub error_message: Option<String>,
     /// Fair-share submitter identity (not persisted across restarts).
     pub submitter: SubmitterId,
+    /// Authenticated OXS-AUTH v3 submitting member ID, if submitted over a v3 connection
+    /// (in-memory only until `ECO-9` / `ENROLL-1c` `STORE_FORMAT_VERSION` 5).
+    pub submitted_by_member: Option<String>,
     /// Compact metadata retained in RAM after the full `TaskResult` spills to `cold_results/`.
     pub cold_result: Option<ColdResultSummary>,
     /// True when the task's input trees or workspace source tree require `oxideswarm-tree/2`
@@ -627,7 +630,7 @@ pub enum ResultDisposition {
 }
 
 /// Outcome of `TaskQueue::record_result_from`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultOutcome {
     pub disposition: ResultDisposition,
     /// State of the task after the call.
@@ -645,6 +648,14 @@ pub struct ResultOutcome {
     pub timeout_secs: u64,
     /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
+    /// Declared CPU core reservation of the task (clamped to >= 1) for contribution ledger booking.
+    pub cpu_cores: usize,
+    /// Whether GPU capability or VRAM was reserved on the task.
+    pub gpu_reserved: bool,
+    /// Authenticated v3 submitting member id captured at submission, if any.
+    pub submitted_by_member: Option<String>,
+    /// Upper bound on how long ago this task was submitted (`max(mono_elapsed, utc_elapsed + 1s)`).
+    pub elapsed_since_submit_ms: u64,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.

@@ -351,6 +351,20 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "N",
+        help = "Maximum raw records retained by the contribution credits ledger before rollover into archived totals (default 100000; env RUSTY_GRID_MAX_CREDIT_RECORDS)"
+    )]
+    pub max_credit_records: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "Maximum bytes kept by the contribution credits ledger snapshot and journal before rollover (default 33554432; env RUSTY_GRID_MAX_CREDIT_BYTES)"
+    )]
+    pub max_credit_bytes: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "MB",
         help = "Megabytes of active (queued, scheduled, running, retrying) task payloads the master queue holds at once (default 256; env RUSTY_GRID_MAX_ACTIVE_MB)"
     )]

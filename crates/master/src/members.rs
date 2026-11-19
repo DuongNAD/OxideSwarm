@@ -2084,6 +2084,12 @@ impl MemberStore {
         list
     }
 
+    /// Returns the enrolled OXS-AUTH v3 `member_id` owning `worker_id`, if any.
+    pub fn worker_owner(&self, worker_id: &Uuid) -> Option<String> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard.state.worker_owners.get(worker_id).cloned()
+    }
+
     /// Renames an enrolled member by ID, unique hex prefix, or current name.
     pub fn rename_member(&self, target: &str, new_name: &str) -> GridResult<MemberEntry> {
         let clean = validate_member_name(new_name)?;

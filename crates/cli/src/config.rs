@@ -99,6 +99,10 @@ pub struct MasterFileConfig {
     pub max_retained_tasks: Option<usize>,
     /// Megabytes of finished-task payload and output the master keeps (default 256).
     pub max_retained_mb: Option<u64>,
+    /// Maximum raw records kept by the contribution credits ledger before rollover (default 100000).
+    pub max_credit_records: Option<usize>,
+    /// Maximum bytes kept on disk/RAM by the contribution credits ledger before rollover (default 33554432).
+    pub max_credit_bytes: Option<u64>,
     /// Megabytes of active (non-terminal) task payloads the master queue holds at once (default 256).
     pub max_active_mb: Option<u64>,
     /// Tasks of one `mapreduce` job in flight at once.

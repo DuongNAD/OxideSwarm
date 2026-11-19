@@ -647,6 +647,7 @@ impl TaskQueue {
                     result: p.result,
                     error_message: p.error_message,
                     submitter: SubmitterId::Default,
+                    submitted_by_member: None,
                     cold_result: p.cold_result,
                     requires_tree_v2,
                 };

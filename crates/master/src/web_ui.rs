@@ -89,6 +89,7 @@ pub struct WebUiState {
     /// Permits for open WebSocket/SSE streams ([`MAX_STREAM_CLIENTS`]).
     pub stream_slots: Arc<Semaphore>,
     pub cluster_secret: Option<rusty_grid_core::ClusterSecret>,
+    pub credits: Option<Arc<crate::credits::CreditsLedger>>,
     pub rendezvous_registry:
         Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::RendezvousLease>>>,
 }
@@ -169,6 +170,7 @@ pub fn create_web_ui_state(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let credits = master_handle.as_ref().map(|h| Arc::clone(h.credits()));
     WebUiState {
         registry,
         queue,
@@ -183,6 +185,7 @@ pub fn create_web_ui_state(
         auth_config: Arc::new(AuthConfig::default()),
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         cluster_secret,
+        credits,
         rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
     }
 }
@@ -282,6 +285,7 @@ pub fn create_web_ui_router_full(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let credits = master_handle.as_ref().map(|h| Arc::clone(h.credits()));
     let state = WebUiState {
         registry,
         queue,
@@ -296,6 +300,7 @@ pub fn create_web_ui_router_full(
         auth_config: Arc::clone(&auth_config),
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         cluster_secret,
+        credits,
         rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
     };
 
@@ -306,6 +311,7 @@ pub fn create_web_ui_router_full(
         .route("/metrics", get(api_metrics))
         .route("/api/status", get(api_status))
         .route("/api/workers", get(api_get_workers))
+        .route("/api/credits", get(api_get_credits))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
         .route("/api/tasks/{task_id}", get(api_get_task_standardized))
         // Discovery & Rendezvous Probe APIs
@@ -740,6 +746,35 @@ async fn api_status(
 
 async fn api_get_workers(State(state): State<WebUiState>) -> Json<Vec<WorkerInfo>> {
     Json(state.registry.list_all_workers().await)
+}
+
+async fn api_get_credits(
+    State(state): State<WebUiState>,
+    auth: Option<Extension<AuthIdentity>>,
+) -> Json<crate::credits::CreditsSnapshot> {
+    let Some(ref ledger) = state.credits else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return Json(crate::credits::CreditsSnapshot::empty(now));
+    };
+    let is_admin = !state.auth_config.enabled
+        || auth.as_ref().is_some_and(|Extension(id)| {
+            id.scopes
+                .iter()
+                .any(|s| s.allows(crate::auth::AuthScope::Admin))
+        });
+    let mut member_names = std::collections::HashMap::new();
+    if is_admin {
+        if let Some(ref handle) = state.master_handle {
+            for member in handle.members().list_members() {
+                member_names.insert(member.id, member.name);
+            }
+        }
+    }
+    let participant_labels = std::collections::HashMap::new();
+    Json(ledger.snapshot_for_display(&participant_labels, &member_names, is_admin))
 }
 
 async fn api_get_tasks(
@@ -2049,5 +2084,158 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "a task larger than max_active_bytes can never fit and must return 413"
         );
+    }
+
+    #[tokio::test]
+    async fn test_api_credits_rbac_and_empty_or_direct_handler() {
+        let alice_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
+        let bob_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
+        let alice_id = alice_kp.public_key().member_id();
+        let bob_id = bob_kp.public_key().member_id();
+        let members = crate::server::MemberStore::from_entries(vec![
+            rusty_grid_core::noise_auth::MemberEntry::new(
+                "alice-secret-host",
+                *alice_kp.public_key(),
+                vec![
+                    rusty_grid_core::noise_auth::MemberRole::Worker,
+                    rusty_grid_core::noise_auth::MemberRole::Client,
+                ],
+            ),
+            rusty_grid_core::noise_auth::MemberEntry::new(
+                "bob-secret-host",
+                *bob_kp.public_key(),
+                vec![
+                    rusty_grid_core::noise_auth::MemberRole::Worker,
+                    rusty_grid_core::noise_auth::MemberRole::Client,
+                ],
+            ),
+        ]);
+        let master = crate::server::MasterServer::spawn(
+            crate::server::ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_auth_mode(crate::server::AuthMode::Members)
+                .with_members(members),
+        )
+        .await
+        .unwrap();
+        master
+            .credits()
+            .record_task(crate::credits::TaskUsageInput {
+                task_id: TaskId::new(),
+                worker_id: uuid::Uuid::new_v4(),
+                duration_ms: 1500,
+                cpu_cores: 2,
+                gpu_reserved: false,
+                exit_code: 0,
+                verified: None,
+                runner_member_id: Some(alice_id.clone()),
+                submitter_member_id: Some(bob_id.clone()),
+            })
+            .unwrap();
+
+        let auth = AuthConfig::new()
+            .with_token(
+                "obs-secret-token",
+                "observer",
+                &[crate::auth::AuthScope::Observer],
+            )
+            .with_token(
+                "adm-secret-token",
+                "admin",
+                &[crate::auth::AuthScope::Admin],
+            );
+        let router = create_web_ui_router_with_auth(
+            master.registry().clone(),
+            master.queue().clone(),
+            Arc::clone(master.scheduler_notify()),
+            Some(master.clone()),
+            None,
+            auth,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let unauth = client
+            .get(format!("http://{addr}/api/credits"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // Observer sees labels only, NEVER raw member_ids or machine names (design 0094 D9(c)).
+        let obs_res = client
+            .get(format!("http://{addr}/api/credits"))
+            .bearer_auth("obs-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(obs_res.status(), StatusCode::OK);
+        let obs_body = obs_res.text().await.unwrap();
+        assert!(
+            !obs_body.contains(&alice_id),
+            "observer leaked alice member_id: {obs_body}"
+        );
+        assert!(
+            !obs_body.contains(&bob_id),
+            "observer leaked bob member_id: {obs_body}"
+        );
+        assert!(
+            !obs_body.contains("alice-secret-host") && !obs_body.contains("bob-secret-host"),
+            "observer leaked machine names: {obs_body}"
+        );
+        let obs_snap: crate::credits::CreditsSnapshot = serde_json::from_str(&obs_body).unwrap();
+        assert!(obs_snap.display_only);
+        assert!(obs_snap.conservation_holds());
+        assert_eq!(obs_snap.participants.len(), 2);
+        assert!(obs_snap
+            .participants
+            .iter()
+            .all(|p| p.member_ids.is_empty()));
+
+        // Admin sees member names and `member_ids`.
+        let adm_res = client
+            .get(format!("http://{addr}/api/credits"))
+            .bearer_auth("adm-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(adm_res.status(), StatusCode::OK);
+        let adm_snap: crate::credits::CreditsSnapshot = adm_res.json().await.unwrap();
+        assert!(adm_snap.conservation_holds());
+        let alice_row = adm_snap
+            .participants
+            .iter()
+            .find(|p| p.label == "alice-secret-host")
+            .expect("admin sees alice row");
+        assert_eq!(alice_row.member_ids, vec![alice_id]);
+
+        let forbidden_for_observer = client
+            .post(format!("http://{addr}/api/credits"))
+            .bearer_auth("obs-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden_for_observer.status(), StatusCode::FORBIDDEN);
+
+        let method_not_allowed_for_admin = client
+            .post(format!("http://{addr}/api/credits"))
+            .bearer_auth("adm-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            method_not_allowed_for_admin.status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        server.abort();
+        let _ = master.shutdown();
     }
 }

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod blob_store;
 pub mod cold_results;
+pub mod credits;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod fair_share;
@@ -37,6 +38,10 @@ pub use blob_store::{
 pub use cold_results::{
     ColdResultSummary, COLD_RESULTS_DIR, DEFAULT_MAX_HOT_TERMINAL_BYTES,
     DEFAULT_MAX_HOT_TERMINAL_TASKS,
+};
+pub use credits::{
+    CreditsConfig, CreditsLedger, CreditsSnapshot, DEFAULT_MAX_CREDIT_BYTES,
+    DEFAULT_MAX_CREDIT_RECORDS,
 };
 pub use fair_share::SubmitterId;
 pub use liveness::{RxClock, StampedStream};

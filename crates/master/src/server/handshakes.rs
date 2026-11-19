@@ -32,6 +32,7 @@ use rusty_grid_core::{
 };
 
 use crate::blob_store::BlobStore;
+use crate::credits::CreditsLedger;
 use crate::member_connections::MemberConnections;
 use crate::queue::TaskQueue;
 use crate::registry::WorkerRegistry;
@@ -864,6 +865,7 @@ pub(super) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     handshake_permit: Option<OwnedSemaphorePermit>,
     mapreduce_parallelism: usize,
     blob_store: Option<Arc<BlobStore>>,
+    credits: Option<Arc<CreditsLedger>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -897,6 +899,7 @@ pub(super) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
         auth_ctx,
         handshake_permit,
         blob_store,
+        credits,
         #[cfg(feature = "dashboard")]
         broadcast_tx,
     )
@@ -925,6 +928,7 @@ pub(super) async fn handle_multiplexed_connection<
     auth_ctx: MasterAuthContext,
     handshake_permit: Option<OwnedSemaphorePermit>,
     blob_store: Option<Arc<BlobStore>>,
+    credits: Option<Arc<CreditsLedger>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -958,6 +962,7 @@ pub(super) async fn handle_multiplexed_connection<
         auth_ctx,
         handshake_permit,
         blob_store,
+        credits,
         #[cfg(feature = "dashboard")]
         broadcast_tx,
     )

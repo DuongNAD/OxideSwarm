@@ -58,6 +58,7 @@ impl TaskQueue {
     ///
     /// When the queue is full (`QueueFull` or `QueueByteLimitExceeded`), `task_slot` is left
     /// untouched so the caller can retry after backoff without ever cloning the task payload.
+    #[cfg(test)]
     pub(crate) async fn try_submit_slot(&self, task_slot: &mut Option<Task>) -> GridResult<TaskId> {
         self.try_submit_slot_from(task_slot, SubmitterId::Default)
             .await
@@ -65,10 +66,23 @@ impl TaskQueue {
 
     /// Like [`try_submit_slot`](Self::try_submit_slot), associating the task with `submitter` for
     /// multi-client fair-share scheduling.
+    #[cfg(test)]
     pub(crate) async fn try_submit_slot_from(
         &self,
         task_slot: &mut Option<Task>,
         submitter: SubmitterId,
+    ) -> GridResult<TaskId> {
+        self.try_submit_slot_from_with_member(task_slot, submitter, None)
+            .await
+    }
+
+    /// Like [`try_submit_slot_from`](Self::try_submit_slot_from), also recording the submitting
+    /// v3 member id (in memory) for contribution ledger accounting.
+    pub(crate) async fn try_submit_slot_from_with_member(
+        &self,
+        task_slot: &mut Option<Task>,
+        submitter: SubmitterId,
+        submitted_by_member: Option<String>,
     ) -> GridResult<TaskId> {
         let task_ref = task_slot
             .as_ref()
@@ -142,6 +156,7 @@ impl TaskQueue {
                 priority: 0,
                 sequence,
                 submitter,
+                submitted_by_member,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
@@ -263,6 +278,20 @@ impl TaskQueue {
         submitter: SubmitterId,
         requires_tree_v2: bool,
     ) -> GridResult<TaskId> {
+        self.submit_from_with_tree_v2_and_member(task, priority, submitter, requires_tree_v2, None)
+            .await
+    }
+
+    /// Submits a task with explicit `priority`, `submitter` fair-share attribution,
+    /// `requires_tree_v2` requirement, and optional submitting v3 member id (`NET-10`).
+    pub async fn submit_from_with_tree_v2_and_member(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+        requires_tree_v2: bool,
+        submitted_by_member: Option<String>,
+    ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
         #[cfg(feature = "otel")]
         let requires_gpu = task.requirements.gpu_required;
@@ -329,6 +358,7 @@ impl TaskQueue {
                 priority,
                 sequence,
                 submitter,
+                submitted_by_member,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
