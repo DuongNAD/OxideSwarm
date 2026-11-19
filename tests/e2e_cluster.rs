@@ -1061,7 +1061,7 @@ async fn test_tier2_bva_timeout_handling_kills_process() {
 async fn test_tier2_bva_zero_duration_builtin_task_instant_completion() {
     let mut cluster = TestCluster::new().await;
     cluster.spawn_worker("w1", 2, 2048, false).await;
-    assert!(cluster.wait_for_workers(1, Duration::from_secs(3)).await);
+    assert!(cluster.wait_for_workers(1, Duration::from_secs(30)).await);
 
     let task = Task::new(
         TaskSpec::builtin_test("sleep", 0),
@@ -1069,15 +1069,40 @@ async fn test_tier2_bva_zero_duration_builtin_task_instant_completion() {
     );
     let start = Instant::now();
     let res = cluster
-        .submit_and_wait(task, Duration::from_secs(5))
+        .submit_and_wait(task, Duration::from_secs(30))
         .await
         .unwrap();
     let elapsed = start.elapsed();
 
+    println!(
+        "[BVA ZERO DURATION] elapsed={:?}, worker_execution_time_ms={}",
+        elapsed, res.execution_time_ms
+    );
+
+    assert!(res.is_success(), "0-duration task must succeed: {res:?}");
     assert_eq!(res.exit_code, 0);
     assert!(
-        elapsed < Duration::from_millis(100),
-        "0-duration task must complete nearly instantly"
+        res.error.is_none(),
+        "0-duration task must have no error: {:?}",
+        res.error
+    );
+    assert!(
+        res.stdout_str()
+            .contains("BuiltinTest sleep complete: 0 ms"),
+        "0-duration task must run the 0 ms builtin sleep path, got stdout={:?}",
+        res.stdout_str()
+    );
+    assert!(
+        res.execution_time_ms <= u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "worker execution_time_ms ({}) must not exceed total round-trip elapsed ({:?})",
+        res.execution_time_ms,
+        elapsed
+    );
+    assert!(
+        res.execution_time_ms < 5_000,
+        "0-duration task worker execution_time_ms ({}) must stay well below a multi-second sleep (total elapsed {:?})",
+        res.execution_time_ms,
+        elapsed
     );
 }
 

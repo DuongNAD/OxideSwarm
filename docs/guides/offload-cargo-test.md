@@ -15,7 +15,7 @@ A client or MCP coding agent syncs a local Rust checkout into a persistent named
 
 ### 1. Start the worker with persistent workspaces enabled
 
-Workers keep persistent workspaces disabled by default (`crates/worker/src/client.rs`). Pass `--workspaces` (or set `RUSTY_GRID_WORKSPACES=1` or `workspaces = true` under `[worker]` in `rusty-grid.toml`; full flag and variable tables are in [README.md](../../README.md#oxideswarm-worker-flags)) so the worker opens `WorkspaceStore` (`crates/worker/src/workspace.rs`) and advertises `ProtocolCapabilities::WORKSPACES`.
+Workers keep persistent workspaces disabled by default (`crates/worker/src/client.rs`). Pass `--workspaces` (or set `RUSTY_GRID_WORKSPACES=1` or `workspaces = true` under `[worker]` in `rusty-grid.toml`; full flag and variable tables are in [docs/reference.md](../reference.md#oxideswarm-worker-flags)) so the worker opens `WorkspaceStore` (`crates/worker/src/workspace.rs`) and advertises `ProtocolCapabilities::WORKSPACES`.
 
 On a macOS or Linux worker machine:
 

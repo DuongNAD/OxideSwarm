@@ -37,7 +37,8 @@ grep -n "STORE_FORMAT_VERSION" crates/master/src/store.rs
    - [Cargo.toml](../../Cargo.toml): set `[workspace.package] version = "<X.Y.Z>"`. Workspace crates inherit `version.workspace = true`; keep `version = "0.0.0"` in `fuzz/Cargo.toml`.
    - [Cargo.lock](../../Cargo.lock) and [fuzz/Cargo.lock](../../fuzz/Cargo.lock): refresh the OxideSwarm workspace package version entries and confirm `cargo check --workspace --all-targets --locked` passes.
    - [CHANGELOG.md](../../CHANGELOG.md): move the items under `## [Unreleased]` into `## [<X.Y.Z>] - <YYYY-MM-DD>`, write a summary paragraph naming protocol and store compatibility, and add `### Upgrading from <PREV>`. Leave an empty `## [Unreleased]` section at the top.
-   - [README.md](../../README.md): update `the latest is v<X.Y.Z>`, the archive filenames in `Install`, and `OxideSwarm <X.Y.Z> covers the user story above` in `Status and limits`.
+   - [README.md](../../README.md): update `the latest is v<X.Y.Z>` and the archive filenames in `Install`.
+   - [docs/reference.md](../reference.md): update `the latest is v<X.Y.Z>` and the archive filenames in `Install`, and `OxideSwarm <X.Y.Z> covers the user story above` in `Status and limits`.
    - [DEPLOYMENT.md](../../DEPLOYMENT.md): update the protocol release range line in section `3.5`.
    - [ROADMAP.md](../ROADMAP.md): update the dated `Releases (<YYYY-MM-DD>):` bullet under `Where the project stands` and add a row to the `Releases` table (no status-log entry).
    - [BACKLOG.md](../BACKLOG.md): append one dated line `Release <X.Y.Z> prepared (<wire and contents summary>)` to `## Status log`.
@@ -57,10 +58,10 @@ cargo check --workspace --all-targets --locked
 On the release author's workstation:
 
 ```bash
-git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md README.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
+git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md README.md docs/reference.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
 git commit -m "release: prepare <X.Y.Z> (no wire change)"
 git push -u origin <AUTHOR>/release-<X.Y.Z>
-gh pr create --title "release: prepare <X.Y.Z> (no wire change)" --body "Release preparation for <X.Y.Z>, approved by the owner in chat on <YYYY-MM-DD> (\"<OWNER_APPROVAL>\"). No wire change: protocol <P>, store format <S>; it mixes freely with <PREV>.\n\n- Versions: Cargo.toml, Cargo.lock, fuzz/Cargo.lock\n- CHANGELOG.md, README.md, DEPLOYMENT.md, docs/ROADMAP.md, docs/BACKLOG.md\n\nAfter merge: tag v<X.Y.Z> on the merge commit, then run the Mac and Windows release checks."
+gh pr create --title "release: prepare <X.Y.Z> (no wire change)" --body "Release preparation for <X.Y.Z>, approved by the owner in chat on <YYYY-MM-DD> (\"<OWNER_APPROVAL>\"). No wire change: protocol <P>, store format <S>; it mixes freely with <PREV>.\n\n- Versions: Cargo.toml, Cargo.lock, fuzz/Cargo.lock\n- CHANGELOG.md, README.md, docs/reference.md, DEPLOYMENT.md, docs/ROADMAP.md, docs/BACKLOG.md\n\nAfter merge: tag v<X.Y.Z> on the merge commit, then run the Mac and Windows release checks."
 ```
 
 ### 3. Merge and push the `v<X.Y.Z>` tag to run `.github/workflows/release.yml`

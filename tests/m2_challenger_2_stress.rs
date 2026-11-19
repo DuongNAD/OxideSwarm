@@ -694,8 +694,35 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
         }
     });
 
-    // Run the stress test for 1.8 seconds under high worker churn and continuous queries
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    // Keep churn and query loops running until every worker has reconnected at least once
+    // (16 total registrations across 8 churn workers) and all four query tasks have made
+    // sustained progress (> 50 iterations each), rather than sleeping a fixed 1.8 s window
+    // that a starved CI runner can overrun before reconnects finish (TEST-57).
+    let stress_start = Instant::now();
+    let stress_deadline = Duration::from_secs(60);
+    let poll_step = Duration::from_millis(50);
+    let condition_met = loop {
+        let (registered, _, _) = registry.counts().await;
+        let q_gpu = gpu_query_count.load(Ordering::SeqCst);
+        let q_cpu = non_gpu_query_count.load(Ordering::SeqCst);
+        let q_act = active_query_count.load(Ordering::SeqCst);
+        let q_fil = filter_query_count.load(Ordering::SeqCst);
+        if registered >= 16 && q_gpu > 50 && q_cpu > 50 && q_act > 50 && q_fil > 50 {
+            break true;
+        }
+        if q1_handle.is_finished()
+            || q2_handle.is_finished()
+            || q3_handle.is_finished()
+            || q4_handle.is_finished()
+        {
+            break false;
+        }
+        if stress_start.elapsed() >= stress_deadline {
+            break false;
+        }
+        tokio::time::sleep(poll_step).await;
+    };
+    let stress_elapsed = stress_start.elapsed();
 
     // Signal query tasks and worker churn to terminate
     running.store(false, Ordering::Relaxed);
@@ -717,24 +744,31 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
     let q_cpu = non_gpu_query_count.load(Ordering::SeqCst);
     let q_act = active_query_count.load(Ordering::SeqCst);
     let q_fil = filter_query_count.load(Ordering::SeqCst);
+    let (registered, _, _) = registry.counts().await;
 
     println!(
-        "[CAPABILITY QUERY STRESS] Queries under churn: GPU={}, NonGPU={}, Active={}, Eligible={}",
-        q_gpu, q_cpu, q_act, q_fil
+        "[CAPABILITY QUERY STRESS] Queries under churn in {:?}: GPU={}, NonGPU={}, Active={}, Eligible={}, Registered={}",
+        stress_elapsed, q_gpu, q_cpu, q_act, q_fil, registered
+    );
+
+    assert!(
+        condition_met,
+        "Stress target (registrations >= 16 and > 50 queries of each kind) not reached within {:?} (elapsed={:?}, registered={}, GPU={}, NonGPU={}, Active={}, Eligible={})",
+        stress_deadline, stress_elapsed, registered, q_gpu, q_cpu, q_act, q_fil
     );
 
     assert!(
         q_gpu > 50 && q_cpu > 50 && q_act > 50 && q_fil > 50,
-        "Continuous query progress must be sustained under churn (observed GPU={}, NonGPU={}, Active={}, Eligible={})",
-        q_gpu, q_cpu, q_act, q_fil
+        "Continuous query progress must be sustained under churn in {:?} (observed GPU={}, NonGPU={}, Active={}, Eligible={})",
+        stress_elapsed, q_gpu, q_cpu, q_act, q_fil
     );
 
     // Every churn connection registers a fresh worker id, and this test starts no reaper, so
     // disconnected entries stay: the total shows that the queries really ran against churn.
-    let (registered, _, _) = registry.counts().await;
     assert!(
         registered >= 16,
-        "The churn workers must reconnect during the run (observed {registered} registrations from 8 workers)"
+        "The churn workers must reconnect during the run in {:?} (observed {registered} registrations from 8 workers)",
+        stress_elapsed
     );
 
     let _ = master_shutdown_tx.send(true);
