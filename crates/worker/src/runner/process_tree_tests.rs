@@ -279,14 +279,17 @@ async fn test_partial_output_survives_timeout_and_cancellation() {
     let (runner, _dir) = runner_with(|c| c);
     let task = script_task(
         "echo partial-out\necho partial-err >&2\nsleep 300\n".into(),
-        1,
+        3,
     );
     let res = runner.execute_task(&task, None, None).await;
     assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
     assert!(
         res.stdout_str().contains("partial-out"),
-        "{:?}",
-        res.stdout_str()
+        "exit_code={} error={:?} stdout={:?} stderr={:?}",
+        res.exit_code,
+        res.error,
+        res.stdout_str(),
+        res.stderr_str()
     );
     assert!(
         res.stderr_str().contains("partial-err"),
@@ -294,26 +297,47 @@ async fn test_partial_output_survives_timeout_and_cancellation() {
         res.stderr_str()
     );
     assert!(
-        res.stderr_str().contains("Task timed out after 1s"),
+        res.stderr_str().contains("Task timed out after 3s"),
         "{:?}",
         res.stderr_str()
     );
-    assert!(res.error.as_deref().unwrap().contains("timed out after 1s"));
+    assert!(res.error.as_deref().unwrap().contains("timed out after 3s"));
 
-    let task = script_task("echo partial-out\nsleep 300\n".into(), 60);
+    let marker_dir = tempfile::tempdir().unwrap();
+    let ready = marker_dir.path().join("printed");
+    let task = script_task(
+        format!("echo partial-out\n: > '{}'\nsleep 300\n", ready.display()),
+        60,
+    );
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let run = tokio::spawn({
         let runner = Arc::clone(&runner);
         async move { runner.execute_task(&task, None, Some(cancel_rx)).await }
     });
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !ready.exists() {
+            assert!(
+                !run.is_finished(),
+                "task exited before printing first line / marker"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("task did not print first line within 60 s");
     cancel_tx.send("enough".into()).unwrap();
-    let res = run.await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("cancelled task did not finish within 60 s")
+        .unwrap();
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
     assert!(
         res.stdout_str().contains("partial-out"),
-        "{:?}",
-        res.stdout_str()
+        "exit_code={} error={:?} stdout={:?} stderr={:?}",
+        res.exit_code,
+        res.error,
+        res.stdout_str(),
+        res.stderr_str()
     );
 }
 
