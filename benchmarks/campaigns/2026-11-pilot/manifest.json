@@ -4,12 +4,15 @@
   "workload": {
     "name": "anima-engine-esel1",
     "binary_name": "run_esel1_experiment",
-    "commit": "7a825cc56135df83d5a513ecf59fe3b2e9f1dd92",
-    "smoke_record_commit": "a3734c3",
+    "repository": "DuongNAD/Anima-Engine",
+    "branch": "feat/ecological-selection",
+    "commit": "963f436e68c7197bace3e9e7bf86bd8cd6a6601e",
+    "pull_request": "DuongNAD/Anima-Engine#167",
+    "build": "cargo build --release --features desktop --example run_esel1_experiment (run from src-tauri/ at workload.commit, by the organiser only)",
     "deterministic": true,
     "gpu": false,
-    "runner_ready": false,
-    "blocker": "Anima-Engine commit 7a825cc run_esel1_experiment only runs --smoke at T_smoke ticks, ignores ANIMA_SIM_SEED (live_experiment.rs:1679), exits 2 without manifests/esel1-preregistration.json, and writes wall-clock timings into out/smoke/checksums.sha256. Update run_esel1_experiment in Anima-Engine to accept --seed, --founders, --food-cap-abundant, --food-cap-scarce, and --duration-ticks and write deterministic out/smoke/verify_checksums.txt, and stage manifests/ via --extra-input <LOCAL_MANIFESTS_DIR>:manifests. Until then, run APP-6 step 2 (dry run) against dry_run_manifest.json and standin_workload.py.",
+    "runner_ready": true,
+    "runner_note": "Anima-Engine PR 167 (merge commit 963f436e) adds run_esel1_experiment --trial: one seed and one parameter set per run, no staged files, deterministic out/trial/verify_checksums.txt. The organiser builds one release binary per os/arch at workload.commit and fills runner_sha256 before the dry run; until then driver.py --runner refuses the <fill-before-run> placeholders. Never fill a hash from a participant's own build.",
     "runner_sha256": {
       "macos/aarch64": "<fill-before-run>",
       "windows/x86_64": "<fill-before-run>"
@@ -18,8 +21,7 @@
   "defaults": {
     "command": "./run_esel1_experiment",
     "args": [
-      "--manifest-dir",
-      "manifests",
+      "--trial",
       "--out",
       "out",
       "--seed",
@@ -35,22 +37,19 @@
     ],
     "inputs": [],
     "outputs": [
-      "out/smoke/**"
+      "out/trial/**"
     ],
     "env": {
       "ANIMA_DETERMINISTIC": "1",
       "ANIMA_USE_GPU": "0"
     },
     "verify": 1,
-    "verify_file": "out/smoke/verify_checksums.txt",
+    "verify_file": "out/trial/verify_checksums.txt",
     "verify_any_system": false,
     "require_isolation": "fs",
     "require_tags": [],
     "timeout_secs": 1800,
-    "mismatch_retries": 1,
-    "required_external_inputs": [
-      "manifests/esel1-preregistration.json"
-    ]
+    "mismatch_retries": 1
   },
   "grid_summary": {
     "founders": [
