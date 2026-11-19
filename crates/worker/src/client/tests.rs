@@ -2,6 +2,9 @@ use super::*;
 use rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE;
 use rusty_grid_core::task::TaskRequirements;
 
+/// Generous condition-wait bound for async client tests under parallel CPU load (`TEST-60`).
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[test]
 fn test_worker_config_builder() {
     let id = Uuid::new_v4();
@@ -151,9 +154,9 @@ async fn test_shutdown_requested_resolves_on_flag_or_dropped_sender_only() {
         shutdown_requested(&mut rx).await;
     });
     tx.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), waiter)
+    tokio::time::timeout(TEST_WAIT_TIMEOUT, waiter)
         .await
-        .expect("flag must wake the waiter")
+        .expect("waited up to 60s for shutdown_requested waiter to wake after flag flip")
         .unwrap();
 
     // ... when it was already set before waiting, and when the sender is gone.
@@ -1071,15 +1074,22 @@ fn process_alive(pid: u32) -> bool {
 
 /// Waits for the `Running` progress message of `task_id`.
 async fn wait_running(rx: &mut mpsc::Receiver<WorkerMessage>, task_id: TaskId) {
+    let deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut seen = Vec::new();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(WorkerMessage::TaskProgress {
                 task_id: id,
                 status: TaskStatus::Running,
                 ..
             })) if id == task_id => return,
-            Ok(Some(_)) => {}
-            other => panic!("task {task_id} never started running: {other:?}"),
+            Ok(Some(msg)) => seen.push(msg.variant_name()),
+            Ok(None) => panic!(
+                "worker channel closed while waiting for task {task_id} Running progress (seen: {seen:?})"
+            ),
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for task {task_id} to report Running (seen: {seen:?})"
+            ),
         }
     }
 }
@@ -1335,9 +1345,11 @@ async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130
         .handle_cancel_task(queued_id, Some("cancelled while waiting for permit".into()))
         .await;
 
-    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let msg = tokio::time::timeout(TEST_WAIT_TIMEOUT, rx.recv())
         .await
-        .expect("cancelled permit-waiting task must report promptly")
+        .unwrap_or_else(|_| {
+            panic!("waited up to {TEST_WAIT_TIMEOUT:?} for cancelled permit-waiting task {queued_id} TaskResult")
+        })
         .expect("channel open");
     match msg {
         WorkerMessage::TaskResult {
@@ -1357,27 +1369,36 @@ async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130
     }
 
     // Wait for `running` to complete naturally, then verify permit is released and a third task runs.
+    let running_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut running_seen = Vec::new();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout_at(running_deadline, rx.recv()).await {
             Ok(Some(WorkerMessage::TaskResult {
                 task_id, exit_code, ..
             })) if task_id == running_id => {
                 assert_eq!(exit_code, 0);
                 break;
             }
-            Ok(Some(_)) => {}
-            other => panic!("running task did not finish: {other:?}"),
+            Ok(Some(msg)) => running_seen.push(msg.variant_name()),
+            Ok(None) => panic!(
+                "worker channel closed while waiting for running task {running_id} TaskResult (seen: {running_seen:?})"
+            ),
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for running task {running_id} to finish (seen: {running_seen:?})"
+            ),
         }
     }
 
     let follow_up = Task::new(
         rusty_grid_core::task::TaskSpec::command("echo", vec!["permit_ok".into()]),
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 60),
     );
     let follow_id = follow_up.id;
     client.handle_assign_task(follow_up, tx).await;
+    let follow_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut follow_seen = Vec::new();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout_at(follow_deadline, rx.recv()).await {
             Ok(Some(WorkerMessage::TaskResult {
                 task_id,
                 exit_code,
@@ -1388,8 +1409,13 @@ async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130
                 assert!(String::from_utf8_lossy(&stdout.0).contains("permit_ok"));
                 break;
             }
-            Ok(Some(_)) => {}
-            other => panic!("follow_up task did not finish: {other:?}"),
+            Ok(Some(msg)) => follow_seen.push(msg.variant_name()),
+            Ok(None) => panic!(
+                "worker channel closed while waiting for follow_up task {follow_id} TaskResult (seen: {follow_seen:?})"
+            ),
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for follow_up task {follow_id} to finish (seen: {follow_seen:?})"
+            ),
         }
     }
     assert_eq!(client.concurrency_semaphore().available_permits(), 1);
@@ -1402,16 +1428,19 @@ async fn test_a_leftover_sandbox_directory_does_not_fail_the_assignment() {
     let (tx, mut rx) = mpsc::channel(16);
     let task = Task::new(
         rusty_grid_core::task::TaskSpec::command("echo", vec!["fresh".into()]),
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 60),
     );
     // What a worker killed mid-task (power loss, Android low-memory kill) leaves behind.
     let leftover = dir.path().join(task.id.to_string());
     std::fs::create_dir_all(&leftover).unwrap();
     std::fs::write(leftover.join("half_written.txt"), "stale").unwrap();
 
-    client.handle_assign_task(task.clone(), tx).await;
+    let task_id = task.id;
+    client.handle_assign_task(task, tx).await;
+    let deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut seen = Vec::new();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(WorkerMessage::TaskResult {
                 exit_code,
                 stdout,
@@ -1425,8 +1454,13 @@ async fn test_a_leftover_sandbox_directory_does_not_fail_the_assignment() {
                 assert!(String::from_utf8_lossy(&stdout.0).contains("fresh"));
                 break;
             }
-            Ok(Some(_)) => {}
-            other => panic!("no result: {other:?}"),
+            Ok(Some(msg)) => seen.push(msg.variant_name()),
+            Ok(None) => panic!(
+                "worker channel closed before task {task_id} reported TaskResult (seen: {seen:?})"
+            ),
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for leftover-sandbox task {task_id} TaskResult (seen: {seen:?})"
+            ),
         }
     }
     assert!(!leftover.join("half_written.txt").exists());
@@ -1445,19 +1479,31 @@ async fn test_with_keep_sandboxes_a_leftover_directory_is_moved_aside_not_delete
     let (tx, mut rx) = mpsc::channel(16);
     let task = Task::new(
         rusty_grid_core::task::TaskSpec::command("echo", vec!["again".into()]),
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 60),
     );
     let leftover = dir.path().join(task.id.to_string());
     std::fs::create_dir_all(&leftover).unwrap();
     std::fs::write(leftover.join("kept.txt"), "debug data").unwrap();
 
-    client.handle_assign_task(task.clone(), tx).await;
+    let task_id = task.id;
+    client.handle_assign_task(task, tx).await;
+    let deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut seen = Vec::new();
     loop {
-        if let Ok(Some(WorkerMessage::TaskResult { exit_code, .. })) =
-            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
-        {
-            assert_eq!(exit_code, 0);
-            break;
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(WorkerMessage::TaskResult {
+                exit_code, error, ..
+            })) => {
+                assert_eq!(exit_code, 0, "task failed: {error:?}");
+                break;
+            }
+            Ok(Some(msg)) => seen.push(msg.variant_name()),
+            Ok(None) => panic!(
+                "worker channel closed before keep_sandboxes task {task_id} reported TaskResult (seen: {seen:?})"
+            ),
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for keep_sandboxes task {task_id} TaskResult (seen: {seen:?})"
+            ),
         }
     }
     let moved: Vec<_> = std::fs::read_dir(dir.path())
@@ -1541,15 +1587,12 @@ async fn test_lane_writer_sends_control_messages_ahead_of_queued_data() {
 
     // ... goes out right after it, ahead of the data message that was queued earlier.
     let mut order = Vec::new();
-    for _ in 0..3 {
-        let msg = tokio::time::timeout(
-            Duration::from_secs(5),
-            lane.peer.recv_msg::<WorkerMessage>(),
-        )
-        .await
-        .expect("frame in time")
-        .unwrap()
-        .expect("frame");
+    for step in 0..3 {
+        let msg = tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.peer.recv_msg::<WorkerMessage>())
+            .await
+            .unwrap_or_else(|_| panic!("waited up to 60s for lane writer frame {step}"))
+            .unwrap()
+            .expect("frame");
         order.push(match msg {
             WorkerMessage::Heartbeat { .. } => "heartbeat".to_string(),
             WorkerMessage::TaskResult { stdout, .. } => format!("result:{}", stdout.0.len()),
@@ -1575,10 +1618,10 @@ async fn test_lane_writer_reports_a_write_failure() {
         })
         .await
         .unwrap();
-    match tokio::time::timeout(Duration::from_secs(2), lane.events_rx.recv()).await {
+    match tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.events_rx.recv()).await {
         Ok(Some(Inbound::Failed("test", _))) => {}
         other => panic!(
-            "expected a write failure event, got {:?}",
+            "waited up to 60s for a write failure event, got {:?}",
             other.map(|o| o.is_some())
         ),
     }
@@ -1607,9 +1650,9 @@ async fn test_lane_writer_flushes_pending_control_messages_before_closing() {
         .unwrap()
         .unwrap();
     assert!(matches!(msg, WorkerMessage::Disconnecting { .. }));
-    tokio::time::timeout(Duration::from_secs(2), lane.task)
+    tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.task)
         .await
-        .expect("the writer exits once the control queue is flushed")
+        .expect("waited up to 60s for the writer to exit once the control queue is flushed")
         .unwrap();
 }
 
@@ -1637,14 +1680,11 @@ async fn test_lane_writer_fails_only_oversized_task_result_and_keeps_session_ali
         .await
         .unwrap();
 
-    let first = tokio::time::timeout(
-        Duration::from_secs(5),
-        lane.peer.recv_msg::<WorkerMessage>(),
-    )
-    .await
-    .expect("oversized fallback frame in time")
-    .unwrap()
-    .expect("first frame");
+    let first = tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.peer.recv_msg::<WorkerMessage>())
+        .await
+        .expect("waited up to 60s for oversized fallback frame")
+        .unwrap()
+        .expect("first frame");
     match first {
         WorkerMessage::TaskResult {
             task_id,
@@ -1671,14 +1711,11 @@ async fn test_lane_writer_fails_only_oversized_task_result_and_keeps_session_ali
         other => panic!("expected failed TaskResult for oversized task, got {other:?}"),
     }
 
-    let second = tokio::time::timeout(
-        Duration::from_secs(5),
-        lane.peer.recv_msg::<WorkerMessage>(),
-    )
-    .await
-    .expect("subsequent frame in time")
-    .unwrap()
-    .expect("second frame");
+    let second = tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.peer.recv_msg::<WorkerMessage>())
+        .await
+        .expect("waited up to 60s for subsequent frame")
+        .unwrap()
+        .expect("second frame");
     match second {
         WorkerMessage::TaskResult {
             task_id,
@@ -1724,14 +1761,11 @@ async fn test_lane_writer_oversized_checkpoint_is_dropped_and_keeps_lane_alive()
         .await
         .unwrap();
 
-    let next = tokio::time::timeout(
-        Duration::from_secs(5),
-        lane.peer.recv_msg::<WorkerMessage>(),
-    )
-    .await
-    .expect("subsequent frame in time after oversized checkpoint")
-    .unwrap()
-    .expect("frame after dropped checkpoint");
+    let next = tokio::time::timeout(TEST_WAIT_TIMEOUT, lane.peer.recv_msg::<WorkerMessage>())
+        .await
+        .expect("waited up to 60s for subsequent frame after oversized checkpoint")
+        .unwrap()
+        .expect("frame after dropped checkpoint");
     match next {
         WorkerMessage::TaskResult {
             task_id,
@@ -1924,9 +1958,9 @@ async fn test_encrypted_lane_writer_accounts_for_full_25_byte_aead_overhead() {
         .await
         .unwrap();
 
-    let first = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+    let first = tokio::time::timeout(TEST_WAIT_TIMEOUT, peer.recv_msg::<WorkerMessage>())
         .await
-        .expect("rewritten frame arrives on encrypted lane")
+        .expect("waited up to 60s for rewritten frame on encrypted lane")
         .expect("encrypted frame must not fail AEAD limit")
         .expect("first message");
     match first {
@@ -1949,9 +1983,9 @@ async fn test_encrypted_lane_writer_accounts_for_full_25_byte_aead_overhead() {
         other => panic!("expected rewritten TaskResult, got {other:?}"),
     }
 
-    let second = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+    let second = tokio::time::timeout(TEST_WAIT_TIMEOUT, peer.recv_msg::<WorkerMessage>())
         .await
-        .expect("second frame arrives on encrypted lane")
+        .expect("waited up to 60s for second frame on encrypted lane")
         .unwrap()
         .expect("second message");
     match second {
@@ -2248,9 +2282,9 @@ async fn messages_after_a_battery_change(ack_message: Option<String>) -> Vec<&'s
     let (stop_tx, stop_rx) = watch::channel(false);
     let worker = tokio::spawn(async move { client.run(stop_rx).await });
 
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    let (stream, _) = tokio::time::timeout(TEST_WAIT_TIMEOUT, listener.accept())
         .await
-        .expect("the worker connects")
+        .expect("waited up to 60s for the worker to connect")
         .unwrap();
     let mut master = MessageTransport::new(stream);
     let Some(WorkerMessage::Register { worker_id, .. }) =
@@ -2274,21 +2308,27 @@ async fn messages_after_a_battery_change(ack_message: Option<String>) -> Vec<&'s
     // running, and so has read the battery already: what follows is a change.
     let probe = Task::new(
         rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
-        TaskRequirements::generic(64, 10),
+        TaskRequirements::generic(64, 60),
     );
     let probe_id = probe.id;
     master
         .send_msg(&MasterMessage::AssignTask { task: probe })
         .await
         .unwrap();
+    let probe_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let mut probe_seen = Vec::new();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), master.recv_msg::<WorkerMessage>())
-            .await
-            .expect("an answer to the probe task")
-        {
-            Ok(Some(WorkerMessage::TaskResult { task_id, .. })) if task_id == probe_id => break,
-            Ok(Some(_)) => {}
-            other => panic!("worker went away before answering the probe task: {other:?}"),
+        match tokio::time::timeout_at(probe_deadline, master.recv_msg::<WorkerMessage>()).await {
+            Ok(Ok(Some(WorkerMessage::TaskResult { task_id, .. }))) if task_id == probe_id => {
+                break;
+            }
+            Ok(Ok(Some(msg))) => probe_seen.push(msg.variant_name()),
+            Ok(other) => {
+                panic!("worker went away before answering probe task {probe_id}: {other:?}")
+            }
+            Err(_) => panic!(
+                "waited up to {TEST_WAIT_TIMEOUT:?} for an answer to probe task {probe_id} (seen: {probe_seen:?})"
+            ),
         }
     }
     handle.update(MobileLiveStatus {
@@ -2308,7 +2348,7 @@ async fn messages_after_a_battery_change(ack_message: Option<String>) -> Vec<&'s
         }
     }
     let _ = stop_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, worker).await;
     seen
 }
 
@@ -2449,9 +2489,9 @@ async fn test_run_refuses_an_unparsable_p2p_ticket_instead_of_retrying_forever()
             .with_no_battery(true),
     );
     let (_tx, rx) = watch::channel(false);
-    let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+    let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, client.run(rx))
         .await
-        .expect("a configuration error must end run() at once, not loop");
+        .expect("waited up to 60s for configuration error to end run() instead of looping");
     assert!(matches!(result, Err(GridError::Config(_))), "{result:?}");
 }
 
@@ -2468,9 +2508,9 @@ async fn test_run_refuses_to_start_when_task_sandboxes_cannot_be_created() {
             .with_no_battery(true),
     );
     let (_tx, rx) = watch::channel(false);
-    let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+    let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, client.run(rx))
         .await
-        .expect("an unusable sandbox directory must end run() at once, not loop");
+        .expect("waited up to 60s for unusable sandbox directory error to end run()");
     match result {
         Err(GridError::Config(msg)) => {
             assert!(
@@ -2519,9 +2559,9 @@ async fn test_run_refuses_isolation_this_platform_cannot_enforce() {
             .with_no_battery(true),
     );
     let (_tx, rx) = watch::channel(false);
-    let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+    let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, client.run(rx))
         .await
-        .expect("an impossible isolation level must end run() at once");
+        .expect("waited up to 60s for unsupported isolation error to end run()");
     match result {
         Err(GridError::Config(msg)) => {
             assert!(
@@ -2573,9 +2613,9 @@ async fn test_run_refuses_a_reserved_or_malformed_user_tag() {
                 .with_no_battery(true),
         );
         let (_tx, rx) = watch::channel(false);
-        let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+        let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, client.run(rx))
             .await
-            .expect("an invalid tag must end run() at once, not loop");
+            .expect("waited up to 60s for invalid tag error to end run()");
         match result {
             Err(GridError::Config(msg)) => {
                 assert!(
@@ -2828,9 +2868,9 @@ async fn portal_get(addr: std::net::SocketAddr, request: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(request).await.unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+    tokio::time::timeout(TEST_WAIT_TIMEOUT, stream.read_to_end(&mut response))
         .await
-        .expect("portal answered in time")
+        .expect("waited up to 60s for portal response")
         .expect("portal closed the connection cleanly (no reset)");
     String::from_utf8_lossy(&response).to_string()
 }
@@ -2907,15 +2947,19 @@ async fn test_portal_answers_requests_with_large_headers_without_a_reset() {
 async fn test_portal_request_reader_gives_up_on_a_silent_client() {
     let (mut client, mut server) = tokio::io::duplex(64);
     // A client that connects and sends nothing must not hold a task and a socket forever.
-    let started = std::time::Instant::now();
-    let line = read_portal_request_line_with(&mut server, Duration::from_millis(150)).await;
+    let line = tokio::time::timeout(
+        TEST_WAIT_TIMEOUT,
+        read_portal_request_line_with(&mut server, Duration::from_millis(150)),
+    )
+    .await
+    .expect("waited up to 60s for silent-client request reader to give up");
     assert!(line.is_none());
-    assert!(started.elapsed() < Duration::from_secs(2));
     // Headers that arrive in pieces are still assembled.
     use tokio::io::AsyncWriteExt;
-    let reader = tokio::spawn(async move {
-        read_portal_request_line_with(&mut server, Duration::from_secs(2)).await
-    });
+    let reader =
+        tokio::spawn(
+            async move { read_portal_request_line_with(&mut server, TEST_WAIT_TIMEOUT).await },
+        );
     client.write_all(b"GET /api/sta").await.unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
     client
@@ -2939,9 +2983,9 @@ async fn test_portal_caps_concurrent_connections() {
     // ...so a third is dropped at once instead of becoming another idle task.
     let mut third = TcpStream::connect(addr).await.unwrap();
     let mut buf = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(1), third.read(&mut buf))
+    let n = tokio::time::timeout(TEST_WAIT_TIMEOUT, third.read(&mut buf))
         .await
-        .expect("the surplus connection is closed promptly");
+        .expect("waited up to 60s for surplus portal connection to close");
     assert!(matches!(n, Ok(0) | Err(_)));
     let _ = shutdown.send(true);
 }
@@ -3046,18 +3090,16 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
     let (stop_tx, stop_rx) = watch::channel(false);
     let worker_task = tokio::spawn(async move { client.run(stop_rx).await });
 
-    let reg_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let reg_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     loop {
-        if master
-            .list_workers()
-            .await
-            .is_ok_and(|workers| workers.len() == 1)
-        {
+        let workers = master.list_workers().await.unwrap_or_default();
+        if workers.len() == 1 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < reg_deadline,
-            "worker did not register with master in time"
+            "waited up to {TEST_WAIT_TIMEOUT:?} for worker to register with master (workers: {})",
+            workers.len()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -3067,14 +3109,16 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
     // needed and removing the upload `tokio::select!` makes `upload_task_outputs` hang.
     let mut task = Task::new(
         rusty_grid_core::task::TaskSpec::shell_script("echo upload-payload > out.txt"),
-        TaskRequirements::generic(1, 10),
+        TaskRequirements::generic(1, 60),
     );
     task.output_globs = vec!["out.txt".into()];
     let task_id = master.submit_task(task).await.expect("submit task");
 
-    tokio::time::timeout(Duration::from_secs(5), upload_started_rx)
+    tokio::time::timeout(TEST_WAIT_TIMEOUT, upload_started_rx)
         .await
-        .expect("task must reach upload_task_outputs and send BlobRequest")
+        .unwrap_or_else(|_| {
+            panic!("waited up to {TEST_WAIT_TIMEOUT:?} for task {task_id} to reach upload_task_outputs and send BlobRequest")
+        })
         .unwrap();
 
     assert_eq!(
@@ -3085,7 +3129,7 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
 
     master.cancel_task(task_id).await.expect("cancel task");
 
-    let finish_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let finish_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     while tokio::time::Instant::now() < finish_deadline {
         let got_result = !observed_results.lock().unwrap().is_empty();
         let active_zero = master
@@ -3119,10 +3163,10 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
     #[cfg(unix)]
     let task2 = Task::new(
         rusty_grid_core::task::TaskSpec::shell_script(format!(
-            "sleep 5 &\necho done > '{}'\nexit 0",
+            "sleep 30 &\necho done > '{}'\nexit 0",
             marker_path.display()
         )),
-        TaskRequirements::generic(1, 10),
+        TaskRequirements::generic(1, 60),
     );
     #[cfg(windows)]
     let task2 = {
@@ -3142,13 +3186,13 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
                 working_dir: None,
                 stdin: None,
             },
-            TaskRequirements::generic(1, 10),
+            TaskRequirements::generic(1, 60),
         );
         t.staged_files
                 .push(rusty_grid_core::task::StagedFile::new(
                     "drain.cmd",
                     rusty_grid_core::task::Bytes::from_static(
-                        b"@echo off\r\nstart /B ping -n 6 127.0.0.1\r\necho done > \"%MARKER_PATH%\"\r\nexit /B 0\r\n",
+                        b"@echo off\r\nstart /B ping -n 31 127.0.0.1\r\necho done > \"%MARKER_PATH%\"\r\nexit /B 0\r\n",
                     ),
                     true,
                 ));
@@ -3156,18 +3200,19 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
     };
     let task2_id = master.submit_task(task2).await.expect("submit task 2");
 
-    let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let marker_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     while !marker_path.exists() {
         assert!(
             tokio::time::Instant::now() < marker_deadline,
-            "task 2 did not write exit marker in time"
+            "waited up to {TEST_WAIT_TIMEOUT:?} for task 2 to write exit marker {}",
+            marker_path.display()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     master.cancel_task(task2_id).await.expect("cancel task 2");
 
-    let finish2_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let finish2_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     while tokio::time::Instant::now() < finish2_deadline {
         let got_two = observed_results.lock().unwrap().len() >= 2;
         let active_zero = master
@@ -3193,7 +3238,7 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
     );
 
     let _ = stop_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, worker_task).await;
     proxy_task.abort();
     let _ = master.shutdown();
 }
@@ -3238,7 +3283,7 @@ fn test_worker_client_with_hung_blender_path_reports_no_blender_within_timeout()
     let elapsed = started.elapsed();
     if let Ok(raw) = std::fs::read_to_string(&pid_file) {
         let pid: u32 = raw.trim().parse().expect("valid hung grandchild pid");
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while process_alive(pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3252,7 +3297,7 @@ fn test_worker_client_with_hung_blender_path_reports_no_blender_within_timeout()
     assert!(!client.capabilities().has_blender);
     assert!(client.capabilities().blender_version.is_none());
     assert!(
-        elapsed < Duration::from_secs(6),
+        elapsed < Duration::from_secs(30),
         "WorkerClient::new took too long ({elapsed:?}) when blender_path hung"
     );
 }
@@ -3930,14 +3975,18 @@ async fn test_windows_worker_task_running_junk_exe_fails_fast_without_error_dial
     for exe_path in [&junk_non_pe_str, &junk_mz_str] {
         let task = Task::new(
             rusty_grid_core::task::TaskSpec::command(exe_path.clone(), vec![]),
-            TaskRequirements::generic(1, 5),
+            TaskRequirements::generic(1, 30),
         );
         let res = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             client.runner.execute_task(&task, None, None),
         )
         .await
-        .expect("junk .exe task must fail fast without hanging on a modal dialog");
+        .unwrap_or_else(|_| {
+            panic!(
+                "waited up to 30s for junk .exe ({exe_path}) to fail fast without hanging on a modal dialog"
+            )
+        });
         assert!(
             !res.is_success() && res.exit_code != 0,
             "junk .exe ({exe_path}) must fail with non-zero exit code, got: {res:?}"
@@ -3952,14 +4001,18 @@ async fn test_windows_worker_task_running_junk_exe_fails_fast_without_error_dial
                 "cmd.exe",
                 vec!["/C".to_string(), exe_path.clone()],
             ),
-            TaskRequirements::generic(1, 5),
+            TaskRequirements::generic(1, 30),
         );
         let res = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             client.runner.execute_task(&child_task, None, None),
         )
         .await
-        .expect("child process running junk .exe must fail fast without hanging");
+        .unwrap_or_else(|_| {
+            panic!(
+                "waited up to 30s for child process running junk .exe ({exe_path}) to fail fast without hanging"
+            )
+        });
         assert!(
             !res.is_success() && res.exit_code != 0,
             "child running junk .exe ({exe_path}) must fail with non-zero exit code, got: {res:?}"
@@ -4067,7 +4120,7 @@ async fn test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces
     }
 
     let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(2), portal_handle).await;
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, portal_handle).await;
 }
 
 #[test]

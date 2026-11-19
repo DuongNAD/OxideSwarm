@@ -2652,6 +2652,44 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `7.0569 / 13.5401 / 27.8546 s`, libtest `0.67 / 0.99 / 1.63 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
   and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings.
 
+### TEST-60: Windows: worker client::tests time out at 5 s under parallel load
+
+- **Evidence:** During full `cargo test -p rusty_grid_worker --lib --locked` under parallel load on
+  Windows 11 Home (12 logical threads), four `client::tests` cases failed at `5 s`
+  `Elapsed(())` timeouts (reproduced `9/20` failures in full `--lib` under 6 CPU busy loops on
+  `origin/master` `4b9be26`, while filtered `client::tests` alone passed `20/20` alone and `20/20`
+  under 6 busy loops):
+  - `test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130`: `9/20` (`client/tests.rs:1369`, `running task did not finish: Err(Elapsed(()))`),
+  - `test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks`: `5/20` (`client/tests.rs:3077`, `task must reach upload_task_outputs and send BlobRequest: Elapsed(())`),
+  - `test_a_leftover_sandbox_directory_does_not_fail_the_assignment`: `3/20` (`client/tests.rs:1429`, `no result: Err(Elapsed(()))`),
+  - `test_windows_worker_task_running_junk_exe_fails_fast_without_error_dialog`: `3/20` (`client/tests.rs:3962`, `child process running junk .exe must fail fast without hanging: Elapsed(())`),
+  alongside an unrelated `1/20` MSYS2 `sh.exe` `add_item` fork/mount collision on 1 run.
+- **Problem:** Multiple async waits in `crates/worker/src/client/tests.rs` used tight `1–5 s`
+  timeouts (and a `< 2 s` elapsed check in `test_portal_request_reader_gives_up_on_a_silent_client`),
+  per-recv `5 s` timeouts inside loops instead of a total deadline, and tight `5–10 s` mock task
+  timeouts, tripping when the full `273`-test `--lib` binary scheduled dozens of subprocesses in parallel.
+- **Do:** Replace those `1–5 s` waits and the `< 2 s` wall-clock check with generous condition waits
+  (`TEST_WAIT_TIMEOUT = 60 s` using total `timeout_at` deadlines in loops, `30 s` on `junk .exe`
+  modal-dialog checks and Unix hung-Blender probe, `5 s` grandchild poll), raise tight mock task
+  timeouts (`5–30 s` -> `30–60 s`, Case 2 background child `sleep 30 &` / `ping -n 31`), replace the
+  unbounded loop in `test_with_keep_sandboxes_a_leftover_directory_is_moved_aside_not_deleted` with a
+  bounded `60 s` deadline, and name the awaited condition and observed message variants on failure
+  without weakening any behaviour assertion.
+- **Done when:** All assertions remain intact, `client::tests` passes `20/20` alone and `20/20` under
+  `6` busy loops, and full `rusty_grid_worker --lib` under `6` busy loops records `0` `client::tests`
+  `Elapsed(())` timeouts.
+- **Implemented (2026-11-19, pull request 378, open):** Updated `crates/worker/src/client/tests.rs` as planned (keeping
+  negative-assertion `50 ms` and `300 ms` waits untouched). On Windows 11 Home (12 logical threads,
+  isolated env `%USERPROFILE%\ox_c_env\test60_env`), post-fix verification passed:
+  - `cargo test -p rusty_grid_worker --lib --locked client::tests` (`81` tests): `20/20` passed
+    alone (`4.23–4.46 s` libtest / `5.08–6.32 s` wall) and `20/20` passed under `6` Python busy loops
+    (`4.48–8.24 s` libtest / `5.70–10.25 s` wall);
+  - `cargo test -p rusty_grid_worker --lib --locked` (`273` tests): `20/20` passed (`0` failures)
+    under `6` Python busy loops (`12.11–30.99 s` libtest / `13.57–32.73 s` wall, vs `11/20` pass /
+    `9/20` fail baseline).
+  Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `ox-mode test size`, and `ox-mode doc verify` all passed.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
@@ -3005,6 +3043,47 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   workarounds, external junctions above and into home, `nlink != 1` hard links, and zero-serial/index
   handling (`SEC-18` tracks the remaining path-based `SetNamedSecurityInfoW` TOCTOU window, other root
   entries, and separate-walk / `RUSTY_GRID_REQUIRE_*` proof tests).
+
+### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
+
+- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
+  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
+  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
+    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
+    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
+    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
+    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
+  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
+    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
+  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
+    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
+    a skipped test shows as `ok`.
+- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
+  gaps. Only processes of the same user can create the links, so the impact is low.
+- **Do:**
+  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
+     and require `nlink == 1` for every file whose DACL is written.
+  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
+     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
+     `SetSecurityInfo` on that handle.
+  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
+     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
+     skips.
+- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
+- **Implemented (2026-11-19, pull request 372, open):** `validate_workspace_root_entries_safe` and
+  `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory
+  `.locks` / workspace folders, and hard-linked (`nNumberOfLinks != 1`) `.locks/*` and
+  `<ws>/{state.json,lock,state.json.tmp}` files before any inheritable DACL rewrite runs;
+  `open_verified_dacl_handle`, `set_protected_dacl_on_handle`, `set_protected_dacl_on_path`,
+  `set_protected_dacl_on_single_link_file_if_exists`, and `protect_sandbox_base` open every modified
+  directory and file with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, verify non-reparse
+  type and `nNumberOfLinks == 1` via `GetFileInformationByHandle`, check `GetFinalPathNameByHandleW` against
+  the lexical long path (`GetLongPathNameW`), and apply `SetSecurityInfo` on that handle (with `<ws>` and
+  metadata DACL failures propagated instead of skipped); `check_chain_from_home` matches home only on
+  `Normal` components so a bare drive prefix (`C:`) no longer resolves via CWD; and the tests in
+  `crates/worker/src/isolation.rs` prove the `host.user_home` and `%USERPROFILE%` walks independently,
+  verify bare-prefix exclusion under home CWD, assert refusal texts, exercise `PREPARE_LOCK` / handle /
+  metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
 
 ## Phase 13: the path to finished
 
