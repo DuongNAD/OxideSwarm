@@ -2595,7 +2595,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   and its `!sb_path.exists()` assertion intact.
 - **Done when:** Cause is named, the fix passes deterministically and in 200-run alone, 200-run `sandbox::tests`,
   and 200-run concurrent loops on macOS without weakening assertions.
-- **Implemented (2026-11-19, pull request TBD, open):** Added `release_task_lock` in
+- **Implemented (2026-11-19, pull request 366, open):** Added `release_task_lock` in
   `crates/worker/src/sandbox.rs` (calls `lock_file.unlock()` before `drop(lock_file)`) and used it across
   `Sandbox::destroy`, `Drop for Sandbox`, `Sandbox::create` error cleanup, `open_and_try_lock_task_with`,
   and `sweep_leftover_sandboxes_sync`, plus deterministic unit test
