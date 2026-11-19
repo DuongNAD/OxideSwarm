@@ -2707,7 +2707,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `attempts == 1`.
 - **Done when:** All outcome assertions stay intact and `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`
   passes `20/20` under `6` busy loops after the fix.
-- **Implemented (2026-11-19, pull request TBD, open):** Updated `tests/worker_cluster_auth.rs` as planned. On
+- **Implemented (2026-11-19, pull request 387, open):** Updated `tests/worker_cluster_auth.rs` as planned. On
   a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
   `HOME`, running `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`:
   - Before fix (on `origin/master` `fc694126`): `20/20` passed (`188.76 s` total, `8.11–10.36 s` per run;
