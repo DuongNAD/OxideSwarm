@@ -1,7 +1,7 @@
 # 0065: Tests for large transfers and long runs
 
-Status: Draft (plan; builds nothing; Q57 to Q59 are open)
-Created: 2026-11-14    Updated: 2026-11-14
+Status: Partial (TEST-24 step 1 harness + Windows loopback record; Q57–Q59 decided by owner 2026-11-19)
+Created: 2026-11-14    Updated: 2026-11-19
 
 ## Summary
 
@@ -220,7 +220,7 @@ the binary version it ran.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| TEST-24 | Large-transfer harness and first records | `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` | Records of T1 to T9 are committed for loopback and for two machines over LAN and a relay. Every failed check has its own item or regression test | Planned |
+| TEST-24 | Large-transfer harness and first records | `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` | Records of T1 to T9 are committed for loopback and for two machines over LAN and a relay. Every failed check has its own item or regression test | Partial |
 | TEST-25 | Soak harness and a first 24-hour record | `benchmarks/endurance/endurance.py` (`soak`) | A 24-hour record on a Mac and two Windows machines is committed. It passes D3, or every failed check has its own item | Planned |
 | TEST-26 | Short run on a schedule in CI | `.github/workflows/ci.yml` | The job is green on two scheduled runs | Planned |
 
@@ -248,3 +248,10 @@ The right column is a recommended default, not a decision. They are listed in
 - 2026-11-14: Draft created at the owner's request, after a progress check found that no test
   moves more than a few MiB through the blob path or runs for hours. It builds nothing. It adds
   TEST-24 to TEST-26 (Planned) and decisions Q57 to Q59.
+- 2026-11-19: TEST-24 step 1 Partial: added `benchmarks/endurance/endurance.py` (`transfer`,
+  `throttle`, `sample`, stdlib only), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py`
+  (`11/11`, wired into CI `agent-bridge`), and Windows `x86_64` loopback record
+  `benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`
+  (`7/7` passed across `T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s`
+  `50 ms` RTT with `0` worker reaps over `2,164.6 s`, and `T8`; `T1 8 GiB`, `T2 100,000` files,
+  `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` remain for step 2).
