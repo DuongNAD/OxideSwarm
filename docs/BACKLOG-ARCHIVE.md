@@ -2708,7 +2708,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All assertions remain intact and
   `cargo test -p rusty_grid_worker --lib --locked -- --exact runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation`
   passes `20/20` under `6` busy loops after the fix.
-- **Implemented (2026-11-19, pull request TBD, open):** Updated `crates/worker/src/runner/process_tree_tests.rs`.
+- **Implemented (2026-11-19, pull request 388, open):** Updated `crates/worker/src/runner/process_tree_tests.rs`.
   On a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
   `HOME`, running `runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation` (`--locked`):
   - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`62.54 s` total, `2.04–4.11 s` per run;
@@ -2745,7 +2745,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All outcome invariants stay intact and `cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked`
   passes `20/20` under `6` busy loops on macOS, with Linux verified by CI (`sec5 hardened runner (ubuntu-latest)`
   and `workspace tests (ubuntu-latest)`).
-- **Implemented (2026-11-19, pull request TBD, open):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`,
+- **Implemented (2026-11-19, pull request 388, open):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`,
   `crates/worker/tests/common/mod.rs`, and `crates/worker/src/process_tree.rs`. On 10-core Apple Silicon macOS
   under `6` Python busy loops, private `HOME`, running `cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked`:
   - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`84.62 s` total, `3.03–6.03 s` per run;
