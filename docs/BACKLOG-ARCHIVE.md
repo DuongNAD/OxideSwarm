@@ -2818,7 +2818,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   serial `>= 250 ms`, negative `Queued`, and `1 s` timeout test assertion intact).
 - **Done when:** All 65 tests keep full assertions (including `elapsed >= 250 ms` serialization and the
   `1 s` timeout test) and pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/e2e_cluster.rs` and verified on
+- **Implemented (2026-11-19, pull request 399, open):** Updated `tests/e2e_cluster.rs` and verified on
   Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures before the fix is
   expected since the `5 s` timeout occurred on a 12-thread Windows laptop):
   - Before fix (`origin/master` `98570ab9`): `20/20` passed (`162.16 s` total, `7.52–9.50 s` per run).
