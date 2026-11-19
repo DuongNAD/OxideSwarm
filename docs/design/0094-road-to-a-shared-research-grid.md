@@ -1,6 +1,6 @@
 # 0094: The road to a shared research grid
 
-Status: Draft (plan; builds nothing; Q94 to Q97 are open)
+Status: Accepted (plan; builds nothing; the owner decided Q94 to Q97 on 2026-11-19)
 Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
@@ -11,7 +11,7 @@ the road as research campaigns that people join, in four stages from today's per
 an open research grid, each with an exit check that a dated record can show. It orders the items of
 Phase 9 and of [design 0054](0054-open-compute-network.md) by stage instead of adding a second
 plan, and it adds four items for Stage 1 (ECO-9, NET-9, NET-10, APP-6). Money, tokens and payments
-stay out, and credits only display. It builds nothing; Q94 to Q97 are open.
+stay out, and credits only display. It builds nothing. The owner decided Q94 to Q97 on 2026-11-19.
 
 ## Context
 
@@ -24,9 +24,8 @@ stay out, and credits only display. It builds nothing; Q94 to Q97 are open.
   against which "finished" is measured (Q82, [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md)).
 - The model is volunteer computing, as in BOINC and Folding@home (design 0054, Context), run on
   OxideSwarm. Each person keeps their own cluster (ecosystem model A, Q13).
-- The owner agreed in chat that credits only display: they cannot be transferred and have no cash
-  value. Q14 and Q43 are still open in [ROADMAP.md](../ROADMAP.md), so Q96 asks for the formal
-  decision.
+- Credits only display: they cannot be transferred and have no cash value. The owner decided it as
+  Q96 on 2026-11-19, which closes Q14 and Q43 of [ROADMAP.md](../ROADMAP.md).
 
 ### What exists
 
@@ -51,7 +50,7 @@ The state at `master` `f77eabd` on 2026-11-19, release `0.4.3`.
 ### What earlier records plan
 
 - **Design 0054 and Phase 9 of [BACKLOG.md](../BACKLOG.md):** an open compute network in stages H0
-  to H4, items NET-1 to NET-8. Q14 to Q18 are open.
+  to H4, items NET-1 to NET-8. Q15 to Q18 are open; Q96 closed Q14.
 - **[Design 0056](0056-frontier-program.md):** NET-1 earlier, in trusted clusters (Q21); quorum
   runs with `--distinct owner` as the redundancy part of NET-3 built early (PROOF-2); idle-aware
   contribution on desktops (GREEN-1); independent rebuilds as a first public workload (PROOF-5).
@@ -61,7 +60,7 @@ The state at `master` `f77eabd` on 2026-11-19, release `0.4.3`.
   ends sooner, and pooled compute alone is not such a job. A campaign gives a volunteer another
   reason: the research problem itself.
 - **[Design 0061](0061-first-application-model-tunnel.md):** usage records and a balance per member
-  for model tunnels (LLM-10, LLM-11), display only in the first version (Q43, open).
+  for model tunnels (LLM-10, LLM-11), display only (Q43, closed by Q96).
 - **Design 0088 D1:** Phase H and the quotas of Phase G are outside the stop line. This record does
   not move the line.
 - **Q80:** a stability release comes before any item of `0.5.0` is built.
@@ -169,8 +168,8 @@ cluster and adds a worker process to the circle's cluster.
    the first part of NET-4, and it takes the schedule and mains-power parts of GREEN-1.
 5. **Contribution credits (NET-10).** Per participant: the work their machines ran for others and the
    work their tasks used. They only display (D8).
-6. **The pilot campaign (APP-6).** An Anima Engine parameter sweep by the recommendation of Q94,
-   verified with `submit --verify` on the same system (VERIFY-2). The participants are Q95. A dry run
+6. **The pilot campaign (APP-6).** An Anima Engine parameter sweep (Q94), verified with
+   `submit --verify` on the same system (VERIFY-2). The participants follow Q95. A dry run
    with two or three participants on a released `0.4.x` builds nothing and comes first.
 
 In Stage 1 the master counts completed tasks for credits. Verification is client side, so the
@@ -274,7 +273,7 @@ the independent review.
 - **The charter.** Design 0057 treats compute as donated and its outputs as open. Paid compute would
   be a market, not a donation.
 
-Q14 stays the place where this is decided. Q96 asks for the decision.
+The owner decided this as Q96 on 2026-11-19. It closes Q14 for the research grid and Q43.
 
 ### D9 Threat model by stage
 
@@ -299,11 +298,11 @@ in doubt, a task does not run.
   - a join from another network serves a model tunnel (LLM-9) and a campaign alike;
   - NET-10 and LLM-10 share one record format (D8).
 - Release `0.6.0` is bet A (Q81), and it serves the purpose of Q1. Stage 1 does not take its place.
-  Q97 asks whether Stage 1 runs in parallel, as one lane at most.
+  Stage 1 runs in parallel with both, as one lane at most (Q97, decided on 2026-11-19).
 
 ### D11 Order of work and gates
 
-1. Now: this record, which builds nothing. The owner answers Q94 to Q97.
+1. This record, which builds nothing. The owner decided Q94 to Q97 on 2026-11-19.
 2. Before the stability release (Q80), only docs-only or test-only work of Stage 1 merges: the design
    record of each item, the campaign sheet of APP-6, and tests that pin today's behaviour. The dry
    run of APP-6 on a released `0.4.x` builds nothing and may run once the owner names its
@@ -363,14 +362,16 @@ The texts are in [BACKLOG.md](../BACKLOG.md), Phase 19, where their status is ke
 Items of other records that this road needs: ENROLL-1 (step 2 of ENROLL-1c, ENROLL-1d), APP-4 and
 VERIFY-2 for Stage 1; NET-1, NET-3, NET-4 and PROOF-2 for Stage 2; NET-2, NET-5 to NET-8 for Stage 3.
 
-## Decisions for the owner
+## Decisions
 
-| ID | Question | Recommended answer |
+The owner decided all four on 2026-11-19 at the recommended answers ("Approve as recommended").
+
+| ID | Question | Decision |
 |---|---|---|
-| Q94 | What is the first research problem: the workload of the Stage 1 pilot, and the rule for choosing the first Stage 2 campaign? | The pilot runs an Anima Engine parameter sweep in deterministic CPU mode: its trials end in a checksum, VERIFY-2 checks them today, and the participants know the owner. The first Stage 2 campaign is chosen after the pilot's record, among workloads that split into independent tasks of minutes, whose results a checksum or a cheap check verifies, whose code and outputs can be published under design 0057, and whose inputs hold no personal data. Candidates: Anima Engine if it then has a public release (Q52), independent rebuilds (PROOF-5), and the workloads of Q16 |
-| Q95 | Who takes part in the Stage 1 pilot? | The owner and three to five people the owner already knows, for example participants of ADOPT-1 or of the USB kit trial, with about ten machines on at least two home networks and at least two machines of each operating system and architecture in use, so that VERIFY-2 finds a replica. Each person reads the campaign sheet and agrees to it before joining |
-| Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of this record? | Yes. The owner agreed in chat on 2026-11-19. The answer also closes Q14 for the research grid (no money, tokens or payments) and Q43 (a balance displays and refuses nobody) |
-| Q97 | Does Stage 1 run in parallel with release `0.5.0`? | Yes, as one lane at most beside `0.5.0` and bet A (`0.6.0`), with implementation merged after the stability release (Q80) and docs-only or test-only work before it. Quotas, contributor controls and joins from other networks serve model serving as well |
+| Q94 | What is the first research problem: the workload of the Stage 1 pilot, and the rule for choosing the first Stage 2 campaign? | Decided on 2026-11-19. The pilot runs an Anima Engine parameter sweep in deterministic CPU mode: its trials end in a checksum, VERIFY-2 checks them today, and the participants know the owner. The first Stage 2 campaign is chosen after the pilot's record, among workloads that split into independent tasks of minutes, whose results a checksum or a cheap check verifies, whose code and outputs can be published under design 0057, and whose inputs hold no personal data. Candidates: Anima Engine if it then has a public release (Q52), independent rebuilds (PROOF-5), and the workloads of Q16 |
+| Q95 | Who takes part in the Stage 1 pilot? | Decided on 2026-11-19. The owner and three to five people the owner already knows, for example participants of ADOPT-1 or of the USB kit trial, with about ten machines on at least two home networks and at least two machines of each operating system and architecture in use, so that VERIFY-2 finds a replica. Each person reads the campaign sheet and agrees to it before joining |
+| Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of this record? | Yes, decided on 2026-11-19. It closes Q14 for the research grid (no money, tokens or payments) and Q43 (a balance displays and refuses nobody) |
+| Q97 | Does Stage 1 run in parallel with release `0.5.0`? | Yes, decided on 2026-11-19: one lane at most beside `0.5.0` and bet A (`0.6.0`), with implementation merged after the stability release (Q80) and docs-only or test-only work before it. Quotas, contributor controls and joins from other networks serve model serving as well |
 
 ## Risks
 
@@ -388,3 +389,6 @@ VERIFY-2 for Stage 1; NET-1, NET-3, NET-4 and PROOF-2 for Stage 2; NET-2, NET-5 
   `agent_bridge.py claim` (design 0087): design 0094, phase 19, Q94 to Q97, ECO-9, NET-9, NET-10 and
   APP-6. The four items entered [BACKLOG.md](../BACKLOG.md) as Phase 19, Planned and outside the stop
   line. Q94 to Q97 are open.
+- 2026-11-19: The owner decided Q94 to Q97 at the recommended answers in chat ("Approve as
+  recommended"). Status set to Accepted. Q96 closes Q14 and Q43. The four items of Phase 19 stay
+  Planned.

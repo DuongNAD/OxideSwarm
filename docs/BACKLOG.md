@@ -400,10 +400,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
-| ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 | Planned | Out | (design 0094) |
-| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 | Planned | Out | (design 0094) |
-| NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 | Planned | Out | (design 0094) |
+| ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -1022,9 +1022,9 @@ decisions Q10 and Q11 are open. Items that overlap an existing one say which the
 ## Phase 9: an open compute network
 
 Draft, added on 2026-11-10 from Phase H of [ROADMAP.md](ROADMAP.md). The architecture and the stage
-exit checks are in [design 0054](design/0054-open-compute-network.md). Decisions Q14 to Q18 of the
-roadmap are open. Each item starts with a threat model of its own and an independent review.
-[Design 0094](design/0094-road-to-a-shared-research-grid.md) (Draft, 2026-11-19) orders these items
+exit checks are in [design 0054](design/0054-open-compute-network.md). Decisions Q15 to Q18 of the
+roadmap are open; Q96 closed Q14 on 2026-11-19. Each item starts with a threat model of its own and an independent review.
+[Design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19) orders these items
 as stages of a shared research grid: NET-1, NET-3 and NET-4 in its Stage 2, and NET-2 and NET-5 to
 NET-8 in Stage 3. The first part of NET-4 is NET-9, in Phase 19.
 
@@ -1783,7 +1783,7 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
 
 ## Phase 19: Stage 1 of the research grid, trusted circles and the first campaign
 
-From [design 0094](design/0094-road-to-a-shared-research-grid.md) (Draft, 2026-11-19). The owner's
+From [design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19). The owner's
 ultimate goal is that the people who use OxideSwarm pool their machines to research one problem
 together. Stage 1 is a circle of people who know each other, such as friends or a lab, who join one
 cluster from several homes and complete a first campaign. Its exit check: about five owners and ten
@@ -1795,7 +1795,20 @@ Phase H outside, and the owner placed APP-4 and APP-5 there. Gate: implementatio
 stability release (Q80); docs-only and test-only work may merge before it, and so may the dry run of
 APP-6, which builds nothing. Order: ECO-9 and NET-9 in parallel, then NET-10, then APP-6. The
 recorded join from another network that APP-6 needs is part of ENROLL-1 (its "Done when", and
-ENROLL-1d). Q94 to Q97 are open.
+ENROLL-1d).
+
+The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve as recommended"):
+
+- **Q94:** the pilot runs an Anima Engine parameter sweep in deterministic CPU mode. The first Stage 2
+  campaign is chosen after the pilot's record, by the rules of design 0094: independent tasks, results
+  verified by a checksum or a cheap check, code and outputs publishable under design 0057, no personal
+  data in the inputs.
+- **Q95:** the owner and three to five people the owner already knows, with about ten machines on at
+  least two home networks and at least two machines of each operating system and architecture in use.
+- **Q96:** credits only display: not transferable, never spent or sold, with no cash value. It closes
+  Q14 and Q43.
+- **Q97:** Stage 1 runs in parallel with `0.5.0`, as one lane at most, with implementation merged after
+  the stability release.
 
 ### ECO-9: Per-participant quotas: running tasks, slots and priority
 
@@ -2378,3 +2391,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
 - 2026-11-19: Phase 19 added from design 0094 (Draft): ECO-9, NET-9, NET-10 and APP-6, Planned and Out; Q94 to
   Q97 open. The recorded join from another network stays in ENROLL-1.
+- 2026-11-19: Q94 to Q97 decided by the owner at the recommended answers; design 0094 Accepted. ECO-9, NET-9,
+  NET-10 and APP-6 stay Planned.
