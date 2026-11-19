@@ -2755,7 +2755,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   still `Queued` after `quick_cpu` completes on a free CPU worker.
 - **Done when:** All 14 tests in `tests/gpu_wgpu_compute_test.rs` keep full routing and negative checks,
   compile with and without `--features gpu-wgpu`, and pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/gpu_wgpu_compute_test.rs` and verified on
+- **Implemented (2026-11-19, pull request 396, open):** Updated `tests/gpu_wgpu_compute_test.rs` and verified on
   Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
   - Before fix (`origin/master` `98570ab9`): `20/20` passed (`97.83 s` total, `4.71–6.37 s` per run).
   - After fix: `cargo test -p rusty_grid_worker --test gpu_wgpu_compute_test --features gpu-wgpu --no-run --locked`
