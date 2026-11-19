@@ -5,6 +5,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-19
+
+A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.3`. It fixes the Windows USB kit (the folder menu, the uninstall of older kits, the worker check after start, and `-Isolation fs` with `--workspaces`, `BUG-29` to `BUG-32`), hardens the Windows workspace root against junctions, symbolic links and hard links (`SEC-17`), adds the run summary of `submit --wait` (`ADOPT-2`), and is the first release whose archives carry a signed build provenance attestation (`LV-5`).
+
+### Upgrading from 0.4.3
+
+- Replace the binaries in any order; no clean stop is needed.
+- Windows machines set up from the USB kit: run `install.ps1` of the `0.4.4` kit again to get the installer fixes; a kit worker with `-Isolation fs` and `--workspaces` now accepts its own `<install>\workspaces` (`BUG-32`).
+- Windows workers with `--isolation fs|fs+net` and `--workspaces`: a workspace root reached through a junction or symbolic link is now refused, including a user profile that is itself a junction or an `AppData\Local` moved with `mklink /J`; point `--workspace-root` at the junction's target instead (`SEC-17`).
+- `ox-mode dev cluster` no longer uses `127.0.0.1:9090` and `8080`: it prints the dashboard URL and writes the ports to `.dev_cluster.json`, which `ox-mode dev status` reads; drop `--port` and `RUSTY_GRID_DASHBOARD_PORT` for a dev cluster (`TEST-52`).
+- Check an archive's build provenance with `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` (README, Install); releases up to `0.4.3` have no attestation.
+
 ### Added
 - The clippy lint `undocumented_unsafe_blocks` is `deny` for the whole workspace (`[workspace.lints.clippy]`), so an `unsafe` block or `unsafe impl` without a `// SAFETY:` comment fails the required clippy jobs on Linux, macOS and Windows; a new CI job, `miri (rusty_grid_core)`, runs the unit tests of `rusty_grid_core` under Miri on Linux on the dated nightly of the fuzz jobs, with the 93 tests Miri cannot run (C code such as `ring`, processes, sockets, host queries, and seven too slow for it) marked `#[cfg_attr(miri, ignore = "...")]`; it is not a required check (design 0058 D2, `LV-4`). A normal build does not change.
 - Supply chain (`LV-5`): `deny.toml` and a CI job `cargo deny` that checks the licences, banned crates and sources of the workspace and of `fuzz/` (crates.io only; duplicates are warnings); `release.yml` attests the build provenance of every archive with `actions/attest`, and a manual run (`-f mode=attest-only`) builds and attests without a release; every `uses:` in `.github/workflows/` names a full commit with its tag in a comment; an OpenSSF Scorecard workflow (weekly and on pushes to `master`) and its badge; `README.md` (Install) shows `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` and what it proves.
