@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 benchmarks/endurance/endurance.py - Large-transfer and resource endurance harness
-for OxideSwarm (TEST-24, design 0065).
+for OxideSwarm (TEST-24 & TEST-25, design 0065).
 
 Python 3 standard library only. Follows the isolation and privacy rules of
 benchmarks/grid/bench_grid.py: starts its own master and worker(s) on 127.0.0.1
@@ -14,6 +14,7 @@ no host name, user name, private path, or non-loopback IP address.
 
 Subcommands:
   transfer   Run large-transfer scenarios (T1..T9) and write a JSON record
+  soak       Run multi-worker fault-injection soak test (D3) and write a JSON record
   throttle   Run a standalone loopback TCP bandwidth/delay proxy on 127.0.0.1
   sample     Sample memory, open handles, threads, CPU time, and store directories
 """
@@ -22,16 +23,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
 import datetime
 import getpass
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
 import random
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
@@ -39,7 +44,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -205,7 +210,43 @@ def theoretical_single_blob_bound_mib_per_s(
     return round(chunk_mib / (rtt_ms / 1000.0), 3)
 
 
-# ---------------------------------------------------------------- task ledger (D3 / TEST-25 reuse)
+# ---------------------------------------------------------------- task ledger & D3 soak checks
+
+
+_DURATION_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([smhdSMHD]?)\s*$")
+_DURATION_UNITS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def parse_duration_seconds(raw: Any) -> float:
+    """Parse durations like '45m', '24h', '180s', '1.5h', or numeric seconds (> 0)."""
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    else:
+        m = _DURATION_RE.match(str(raw or ""))
+        if not m:
+            raise ValueError("invalid duration %r (expected e.g. '180s', '45m', '24h')" % (raw,))
+        val = float(m.group(1)) * _DURATION_UNITS[m.group(2).lower()]
+    if not math.isfinite(val) or val <= 0.0:
+        raise ValueError("duration must be positive (got %r)" % (raw,))
+    return val
+
+
+def percentile(values: Iterable[float], pct: float) -> float:
+    """Compute linear-interpolated percentile (0..100) over a non-empty numeric sequence."""
+    ordered = sorted(float(v) for v in values)
+    if not ordered:
+        raise ValueError("percentile requires at least one value")
+    if pct <= 0.0:
+        return ordered[0]
+    if pct >= 100.0:
+        return ordered[-1]
+    pos = (pct / 100.0) * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
 
 
 class TaskLedger:
@@ -215,17 +256,24 @@ class TaskLedger:
         self._lock = threading.Lock()
         self._submitted: Dict[str, Dict[str, Any]] = {}
         self._results: Dict[str, List[Dict[str, Any]]] = {}
+        self._retries: Dict[str, int] = {}
+        self._refusals: List[Dict[str, str]] = []
 
     def record_submit(
         self,
         task_id: str,
         expected_hash: Optional[str] = None,
         expected_outcome: str = "ok",
+        kind: str = "generic",
+        allowed_outcomes: Optional[Iterable[str]] = None,
     ) -> None:
+        allowed = tuple(allowed_outcomes) if allowed_outcomes is not None else (expected_outcome,)
         with self._lock:
             self._submitted[task_id] = {
                 "expected_hash": expected_hash,
                 "expected_outcome": expected_outcome,
+                "allowed_outcomes": allowed,
+                "kind": kind,
             }
 
     def record_result(
@@ -233,11 +281,26 @@ class TaskLedger:
         task_id: str,
         actual_hash: Optional[str] = None,
         outcome: str = "ok",
+        worker_id: Optional[str] = None,
     ) -> None:
         with self._lock:
             self._results.setdefault(task_id, []).append(
-                {"actual_hash": actual_hash, "outcome": outcome}
+                {
+                    "actual_hash": actual_hash,
+                    "outcome": outcome,
+                    "worker_id": worker_id,
+                }
             )
+
+    def record_retry(self, task_id: str, count: int = 1) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            self._retries[task_id] = self._retries.get(task_id, 0) + int(count)
+
+    def record_submit_refusal(self, kind: str, reason: str) -> None:
+        with self._lock:
+            self._refusals.append({"kind": str(kind), "reason": str(reason)})
 
     def audit(self) -> Dict[str, Any]:
         with self._lock:
@@ -246,39 +309,61 @@ class TaskLedger:
             hash_mismatches: List[Dict[str, Any]] = []
             unexpected_outcomes: List[Dict[str, Any]] = []
             untracked_results: List[str] = []
+            by_kind: Dict[str, Dict[str, int]] = {}
+            outcome_counts: Dict[str, int] = {}
 
             for tid, sub in self._submitted.items():
+                kind = sub.get("kind", "generic")
+                kentry = by_kind.setdefault(kind, {"submitted": 0, "terminal": 0, "failed_check": 0})
+                kentry["submitted"] += 1
                 res_list = self._results.get(tid, [])
                 if not res_list:
                     lost.append(tid)
+                    kentry["failed_check"] += 1
                     continue
+                kentry["terminal"] += 1
                 if len(res_list) > 1:
                     duplicates.append(tid)
+                    kentry["failed_check"] += 1
                 res = res_list[0]
-                if res["outcome"] != sub["expected_outcome"]:
+                outcome = res["outcome"]
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+                bad = False
+                if outcome not in sub["allowed_outcomes"]:
+                    bad = True
                     unexpected_outcomes.append(
                         {
                             "task_id": tid,
-                            "expected": sub["expected_outcome"],
-                            "actual": res["outcome"],
+                            "kind": kind,
+                            "expected": list(sub["allowed_outcomes"]),
+                            "actual": outcome,
                         }
                     )
                 if (
                     sub["expected_hash"] is not None
-                    and res["outcome"] == "ok"
+                    and outcome == "ok"
                     and res["actual_hash"] != sub["expected_hash"]
                 ):
+                    bad = True
                     hash_mismatches.append(
                         {
                             "task_id": tid,
+                            "kind": kind,
                             "expected": sub["expected_hash"],
                             "actual": res["actual_hash"],
                         }
                     )
+                if bad:
+                    kentry["failed_check"] += 1
 
             for tid in self._results:
                 if tid not in self._submitted:
                     untracked_results.append(tid)
+
+            refusals_by_kind: Dict[str, int] = {}
+            for r in self._refusals:
+                rk = str(r.get("kind") or "generic")
+                refusals_by_kind[rk] = refusals_by_kind.get(rk, 0) + 1
 
             ok = (
                 not lost
@@ -289,14 +374,334 @@ class TaskLedger:
             )
             return {
                 "submitted": len(self._submitted),
-                "completed": sum(1 for r in self._results.values() if r),
+                "completed": sum(1 for tid in self._submitted if self._results.get(tid)),
                 "lost_tasks": sorted(lost),
                 "duplicate_results": sorted(duplicates),
                 "hash_mismatches": hash_mismatches,
                 "unexpected_outcomes": unexpected_outcomes,
                 "untracked_results": sorted(untracked_results),
+                "retries_total": sum(self._retries.values()),
+                "retried_tasks": len(self._retries),
+                "refusals": len(self._refusals),
+                "refusals_by_kind": refusals_by_kind,
+                "outcome_counts": outcome_counts,
+                "by_kind": by_kind,
                 "ok": ok,
             }
+
+
+def plan_soak_minute(
+    minute_idx: int,
+    seed: int,
+    load_scale: float = 1.0,
+    workspaces: bool = True,
+    reused_pool_size: int = 5,
+) -> List[Dict[str, Any]]:
+    """Design 0065 D3 #2 deterministic per-minute seeded soak load."""
+    if load_scale <= 0.0:
+        raise ValueError("load_scale must be positive")
+    rng = random.Random(int(seed) + 1009 * (int(minute_idx) + 1))
+
+    def _scaled(base: int) -> int:
+        if load_scale >= 1.0:
+            return int(round(base * load_scale))
+        return max(1, int(round(base * load_scale)))
+
+    n_noop = _scaled(30)
+    n_new = _scaled(5)
+    n_reused = _scaled(5)
+    n_output = _scaled(2)
+    n_ws = 1 if workspaces else 0
+    n_cancel = 1
+
+    items: List[Dict[str, Any]] = []
+    for _ in range(n_noop):
+        items.append({"kind": "noop"})
+    for _ in range(n_new):
+        base_mib = rng.randint(10, 100)
+        sz = max(1 * MIB, int(round(base_mib * MIB * min(1.0, load_scale))))
+        items.append({"kind": "new_input", "size_bytes": sz, "seed": rng.randint(1, 2**31 - 1)})
+    for _ in range(n_reused):
+        items.append({"kind": "reused_input", "pool_index": rng.randrange(max(1, int(reused_pool_size)))})
+    for _ in range(n_output):
+        out_sz = max(1 * MIB, int(round(50 * MIB * min(1.0, load_scale))))
+        items.append({"kind": "output", "size_bytes": out_sz, "seed": rng.randint(1, 2**31 - 1)})
+    for _ in range(n_ws):
+        items.append({"kind": "workspace_sync", "seed": rng.randint(1, 2**31 - 1)})
+    for _ in range(n_cancel):
+        items.append({"kind": "cancel", "sleep_s": 20.0})
+
+    rng.shuffle(items)
+    for seq, item in enumerate(items):
+        item["minute"] = int(minute_idx)
+        item["seq"] = seq
+    return items
+
+
+def plan_soak_faults(
+    duration_s: float,
+    fault_scale: float = 1.0,
+    n_workers: int = 3,
+) -> List[Dict[str, Any]]:
+    """Design 0065 D3 #3 deterministic fault schedule scaled by --fault-scale."""
+    if duration_s <= 0.0:
+        raise ValueError("duration_s must be positive")
+    if fault_scale <= 0.0:
+        raise ValueError("fault_scale must be positive")
+    workers = max(1, int(n_workers))
+    events: List[Dict[str, Any]] = []
+    # Keep final drain buffer near the end of the run so faults have time to recover.
+    margin = min(duration_s * 0.10, max(5.0, 60.0 * fault_scale))
+
+    specs = (
+        ("worker_kill", 20.0 * 60.0 * fault_scale, max(2.0, 60.0 * fault_scale)),
+        ("link_cut", 30.0 * 60.0 * fault_scale, max(1.0, 30.0 * fault_scale)),
+        ("queue_burst", 60.0 * 60.0 * fault_scale, 0.0),
+        ("master_restart", 120.0 * 60.0 * fault_scale, 0.0),
+    )
+    for kind, period_s, down_s in specs:
+        idx = 0
+        t = period_s
+        while t < duration_s - margin:
+            events.append(
+                {
+                    "at_s": round(t, 3),
+                    "kind": kind,
+                    "worker_index": idx % workers if kind in ("worker_kill", "link_cut") else None,
+                    "down_s": round(down_s, 3),
+                    "seq": idx,
+                }
+            )
+            idx += 1
+            t = period_s * (idx + 1)
+
+    events.sort(key=lambda e: (e["at_s"], e["kind"]))
+    return events
+
+
+def split_soak_windows(
+    rows: List[Dict[str, Any]],
+    duration_s: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """Return (baseline_rows, late_rows, mode_label) using D3 hour-2 vs last-hour or early/late fallback."""
+    ordered = sorted(rows, key=lambda r: float(r.get("t_s", 0.0)))
+    if duration_s >= 3.0 * 3600.0:
+        base = [r for r in ordered if 3600.0 <= float(r.get("t_s", 0.0)) < 7200.0]
+        late = [r for r in ordered if float(r.get("t_s", 0.0)) >= duration_s - 3600.0]
+        if base and late:
+            return base, late, "hour2_vs_last_hour"
+
+    # Short soak (< 3 h) or sparse trace: skip initial warmup row(s) and compare early vs late halves.
+    effective_dur = max(float(duration_s), max((float(r.get("t_s", 0.0)) for r in ordered), default=0.0))
+    if len(ordered) >= 4:
+        post_warmup = ordered[1:]
+    else:
+        post_warmup = ordered
+    base = [r for r in post_warmup if 0.15 * effective_dur <= float(r.get("t_s", 0.0)) < 0.45 * effective_dur]
+    late = [r for r in post_warmup if float(r.get("t_s", 0.0)) >= 0.70 * effective_dur]
+    if not base or not late:
+        mid = max(1, len(post_warmup) // 2)
+        base = post_warmup[:mid]
+        late = post_warmup[mid:]
+    return base, late, "short_run_early_vs_late"
+
+
+def check_soak_resource_plateau(
+    samples: List[Dict[str, Any]],
+    duration_s: float,
+) -> Dict[str, Any]:
+    """Design 0065 D3 #6.2: memory within max(10%, 32 MiB) and handles within 10% across baseline vs late."""
+    base_rows, late_rows, mode = split_soak_windows(samples, duration_s)
+    if not base_rows or not late_rows:
+        return {"mode": mode, "roles": {}, "passed": False, "reason": "insufficient_samples"}
+
+    roles_seen: Set[str] = set()
+    for row in base_rows:
+        roles_seen.update(row.get("processes", {}).keys())
+    late_roles: Set[str] = set()
+    for row in late_rows:
+        late_roles.update(row.get("processes", {}).keys())
+    roles = sorted(r for r in (roles_seen & late_roles) if r != "client")
+    if not roles:
+        return {"mode": mode, "roles": {}, "passed": False, "reason": "no_common_process_roles"}
+
+    role_checks: Dict[str, Any] = {}
+    all_ok = True
+    for role in roles:
+        b_rss = [row["processes"][role]["rss_bytes"] for row in base_rows if role in row.get("processes", {})]
+        l_rss = [row["processes"][role]["rss_bytes"] for row in late_rows if role in row.get("processes", {})]
+        b_h = [row["processes"][role]["handles"] for row in base_rows if role in row.get("processes", {})]
+        l_h = [row["processes"][role]["handles"] for row in late_rows if role in row.get("processes", {})]
+        mem = check_memory_plateau(statistics.mean(b_rss), statistics.mean(l_rss))
+        hnd = check_handle_plateau(statistics.mean(b_h), statistics.mean(l_h))
+        role_ok = bool(mem["passed"] and hnd["passed"])
+        all_ok = all_ok and role_ok
+        role_checks[role] = {
+            "baseline_samples": len(b_rss),
+            "late_samples": len(l_rss),
+            "memory": mem,
+            "handles": hnd,
+            "passed": role_ok,
+        }
+
+    return {
+        "mode": mode,
+        "baseline_window_s": [base_rows[0]["t_s"], base_rows[-1]["t_s"]],
+        "late_window_s": [late_rows[0]["t_s"], late_rows[-1]["t_s"]],
+        "roles": role_checks,
+        "passed": all_ok,
+    }
+
+
+def check_soak_disk_and_journal(
+    samples: List[Dict[str, Any]],
+    blob_store_limit_bytes: int,
+    worker_cache_limit_bytes: int,
+    pinned_headroom_bytes: int,
+    idle_sandbox_entries: Dict[str, List[str]],
+    tmp_leftovers: Dict[str, List[str]],
+    compactions: List[Dict[str, Any]],
+    idle_blob_store_bytes: Optional[int] = None,
+    idle_worker_cache_bytes: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """Design 0065 D3 #6.3: store/cache bounds, idle sandboxes hold cache only, journal shrinks on compaction."""
+    blob_peaks = [
+        int(row.get("dirs", {}).get("blob_store_bytes", 0))
+        for row in samples
+        if "blob_store_bytes" in row.get("dirs", {})
+    ]
+    peak_blob_bytes = max(blob_peaks) if blob_peaks else 0
+    if idle_blob_store_bytes is None:
+        idle_blob_store_bytes = int(samples[-1]["dirs"]["blob_store_bytes"]) if samples and "blob_store_bytes" in samples[-1].get("dirs", {}) else 0
+
+    store_peak_ok = peak_blob_bytes <= int(blob_store_limit_bytes) + int(pinned_headroom_bytes)
+    store_idle_ok = int(idle_blob_store_bytes) <= int(blob_store_limit_bytes)
+
+    if idle_worker_cache_bytes is None:
+        idle_worker_cache_bytes = {}
+        if samples:
+            for k, v in samples[-1].get("dirs", {}).items():
+                if k == "worker_cache_bytes" or k.startswith("worker_cache_w"):
+                    idle_worker_cache_bytes[k] = int(v)
+    cache_ok = all(int(v) <= int(worker_cache_limit_bytes) for v in idle_worker_cache_bytes.values())
+
+    unexpected_sandbox_entries = {
+        w: sorted(e for e in entries if e not in ("cache", ".locks"))
+        for w, entries in idle_sandbox_entries.items()
+        if any(e not in ("cache", ".locks") for e in entries)
+    }
+    non_empty_tmp = {k: sorted(v) for k, v in tmp_leftovers.items() if v}
+    sandbox_ok = (not unexpected_sandbox_entries) and (not non_empty_tmp)
+
+    journal_ok = bool(compactions) and all(
+        int(c["after_bytes"]) < int(c["before_bytes"])
+        for c in compactions
+        if int(c["before_bytes"]) > 24
+    )
+
+    return {
+        "blob_store_peak_bytes": peak_blob_bytes,
+        "blob_store_idle_bytes": int(idle_blob_store_bytes),
+        "blob_store_limit_bytes": int(blob_store_limit_bytes),
+        "pinned_headroom_bytes": int(pinned_headroom_bytes),
+        "blob_store_ok": bool(store_peak_ok and store_idle_ok),
+        "worker_cache_idle_bytes": dict(idle_worker_cache_bytes),
+        "worker_cache_limit_bytes": int(worker_cache_limit_bytes),
+        "worker_cache_ok": bool(cache_ok),
+        "unexpected_sandbox_entries": unexpected_sandbox_entries,
+        "tmp_leftovers": non_empty_tmp,
+        "sandbox_ok": bool(sandbox_ok),
+        "compactions": list(compactions),
+        "journal_compaction_ok": bool(journal_ok),
+        "passed": bool(store_peak_ok and store_idle_ok and cache_ok and sandbox_ok and journal_ok),
+    }
+
+
+def check_soak_probe_p99(
+    probes: List[Dict[str, Any]],
+    duration_s: float,
+    max_ratio: float = 1.5,
+) -> Dict[str, Any]:
+    """Design 0065 D3 #6.4: probe p99 latency in last window <= 1.5x baseline window."""
+    ok_probes = [p for p in probes if p.get("ok") and p.get("latency_ms") is not None]
+    base_rows, late_rows, mode = split_soak_windows(ok_probes, duration_s)
+    if not base_rows or not late_rows:
+        return {
+            "mode": mode,
+            "total_probes": len(probes),
+            "ok_probes": len(ok_probes),
+            "passed": False,
+            "reason": "insufficient_probes",
+        }
+    base_p99 = percentile([float(r["latency_ms"]) for r in base_rows], 99.0)
+    late_p99 = percentile([float(r["latency_ms"]) for r in late_rows], 99.0)
+    ratio_res = check_p99_ratio(max(0.001, base_p99), late_p99, max_ratio=max_ratio)
+    return {
+        "mode": mode,
+        "total_probes": len(probes),
+        "ok_probes": len(ok_probes),
+        "baseline_count": len(base_rows),
+        "late_count": len(late_rows),
+        "baseline_p99_ms": round(base_p99, 3),
+        "late_p99_ms": round(late_p99, 3),
+        "ratio": ratio_res["ratio"],
+        "max_ratio": max_ratio,
+        "passed": bool(ratio_res["passed"] and len(ok_probes) == len(probes)),
+    }
+
+
+def evaluate_soak_pass_checks(
+    *,
+    ledger_audit: Dict[str, Any],
+    samples: List[Dict[str, Any]],
+    probes: List[Dict[str, Any]],
+    duration_s: float,
+    blob_store_limit_bytes: int,
+    worker_cache_limit_bytes: int,
+    pinned_headroom_bytes: int,
+    idle_sandbox_entries: Dict[str, List[str]],
+    tmp_leftovers: Dict[str, List[str]],
+    compactions: List[Dict[str, Any]],
+    leftover_pids: List[int],
+    idle_blob_store_bytes: Optional[int] = None,
+    idle_worker_cache_bytes: Optional[Dict[str, int]] = None,
+    master_duplicate_executions: int = 0,
+) -> Dict[str, Any]:
+    """Compute all five D3 item 6 pass/fail criteria over recorded soak telemetry."""
+    c1_ok = bool(ledger_audit.get("ok")) and int(master_duplicate_executions) == 0
+    c1 = {
+        "passed": c1_ok,
+        "ledger": ledger_audit,
+        "master_duplicate_executions": int(master_duplicate_executions),
+    }
+    c2 = check_soak_resource_plateau(samples, duration_s)
+    c3 = check_soak_disk_and_journal(
+        samples,
+        blob_store_limit_bytes=blob_store_limit_bytes,
+        worker_cache_limit_bytes=worker_cache_limit_bytes,
+        pinned_headroom_bytes=pinned_headroom_bytes,
+        idle_sandbox_entries=idle_sandbox_entries,
+        tmp_leftovers=tmp_leftovers,
+        compactions=compactions,
+        idle_blob_store_bytes=idle_blob_store_bytes,
+        idle_worker_cache_bytes=idle_worker_cache_bytes,
+    )
+    c4 = check_soak_probe_p99(probes, duration_s)
+    c5 = {
+        "leftover_pids": [int(p) for p in leftover_pids],
+        "passed": len(leftover_pids) == 0,
+    }
+    all_passed = bool(c1["passed"] and c2["passed"] and c3["passed"] and c4["passed"] and c5["passed"])
+    return {
+        "all_passed": all_passed,
+        "checks": {
+            "1_accounting": c1,
+            "2_resource_plateau": c2,
+            "3_disk_and_journal": c3,
+            "4_probe_p99": c4,
+            "5_clean_stop": c5,
+        },
+    }
 
 
 # ---------------------------------------------------------------- seeded data & verification
@@ -548,9 +953,14 @@ def list_tmp_entries(blob_root: str) -> List[str]:
 
 
 def dir_bytes(path: str) -> int:
-    total = 0
     if not path or not os.path.exists(path):
         return 0
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
     for root, _dirs, files in os.walk(path):
         for fn in files:
             try:
@@ -1001,13 +1411,8 @@ class ThrottleProxy:
         self._c2s_bucket.set_rate_bps(rate_bps)
         self._s2c_bucket.set_rate_bps(rate_bps)
 
-    def cut_links(self, pause_s: float = 0.0) -> None:
-        with self._lock:
-            self.cuts += 1
-            if pause_s > 0:
-                self._paused_until = max(self._paused_until, time.monotonic() + pause_s)
-            pairs = list(self._active_pairs)
-            self._active_pairs.clear()
+    @staticmethod
+    def _close_pairs(pairs: List[Tuple[socket.socket, socket.socket]]) -> None:
         for a, b in pairs:
             for s in (a, b):
                 try:
@@ -1018,6 +1423,24 @@ class ThrottleProxy:
                     s.close()
                 except OSError:
                     pass
+
+    def retarget(self, target_host: str, target_port: int) -> None:
+        """Update upstream target host/port (e.g. after master restart) and reset active links."""
+        with self._lock:
+            self.target_host = target_host
+            self.target_port = int(target_port)
+            pairs = list(self._active_pairs)
+            self._active_pairs.clear()
+        self._close_pairs(pairs)
+
+    def cut_links(self, pause_s: float = 0.0) -> None:
+        with self._lock:
+            self.cuts += 1
+            if pause_s > 0:
+                self._paused_until = max(self._paused_until, time.monotonic() + pause_s)
+            pairs = list(self._active_pairs)
+            self._active_pairs.clear()
+        self._close_pairs(pairs)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1031,16 +1454,7 @@ class ThrottleProxy:
         with self._lock:
             pairs = list(self._active_pairs)
             self._active_pairs.clear()
-        for a, b in pairs:
-            for s in (a, b):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
-                    s.close()
-                except OSError:
-                    pass
+        self._close_pairs(pairs)
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=3.0)
         for t in list(self._worker_threads):
@@ -1461,6 +1875,7 @@ class EnduranceCluster:
             TMPDIR=tmp_dir,
             RUSTY_GRID_CONFIG=self.empty_config,
             RUSTY_GRID_NO_BATTERY="1",
+            NO_COLOR="1",
         )
         return env
 
@@ -1664,6 +2079,572 @@ class EnduranceCluster:
             except Exception:
                 pass
         self.procs = []
+
+
+def pid_alive(pid: int) -> bool:
+    """Return True if process `pid` is currently running (checked strictly by exact PID)."""
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and int(code.value) == 259
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except OSError:
+        pass
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def expected_seeded_sha256(size_bytes: int, seed: int) -> str:
+    """Compute SHA-256 of deterministic seeded payload bytes without writing a second copy on disk."""
+    rng = random.Random(int(seed))
+    h = hashlib.sha256()
+    rem = int(size_bytes)
+    while rem > 0:
+        n = min(4 * MIB, rem)
+        h.update(rng.randbytes(n) if hasattr(rng, "randbytes") else bytes(rng.getrandbits(8) for _ in range(n)))
+        rem -= n
+    return h.hexdigest()
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_MASTER_RESULT_RE = re.compile(
+    r"Task execution result received.*?\btask_id=([0-9a-f-]+)"
+    r"|\btask_id=([0-9a-f-]+).*?Task execution result received"
+)
+_REAPER_FAILOVER_RE = re.compile(
+    r"Reaper triggered task failover reassignment.*?\bcount=(\d+)"
+    r"|\bcount=(\d+).*?Reaper triggered task failover reassignment"
+)
+
+
+def audit_master_log_texts(log_texts: Iterable[str]) -> Dict[str, Any]:
+    """Parse master log generations (stripping ANSI escapes) for results, failovers, and queue errors."""
+    texts = list(log_texts)
+    recv_counts: Dict[str, int] = {}
+    failovers = 0
+    reaper_failovers = 0
+    requeues = 0
+    stale_ignored = 0
+    late_ignored = 0
+    queue_record_errors = 0
+    for raw in texts:
+        txt = _ANSI_ESCAPE_RE.sub("", raw or "")
+        for ln in txt.splitlines():
+            m = _MASTER_RESULT_RE.search(ln)
+            if m:
+                tid = m.group(1) or m.group(2)
+                recv_counts[tid] = recv_counts.get(tid, 0) + 1
+            if "Worker disconnected; executing failover sweep" in ln:
+                failovers += 1
+            rm = _REAPER_FAILOVER_RE.search(ln)
+            if rm:
+                reaper_failovers += int(rm.group(1) or rm.group(2) or 0)
+            if "Requeuing" in ln or "Scheduling retry" in ln or "state=Retrying" in ln:
+                requeues += 1
+            if "Ignored result from a worker/session that does not own the task" in ln:
+                stale_ignored += 1
+            if "Ignoring result for terminal task" in ln:
+                late_ignored += 1
+            if "Failed to record task result in queue" in ln:
+                queue_record_errors += 1
+    multi_result = {tid: cnt for tid, cnt in recv_counts.items() if cnt > 1}
+    return {
+        "master_generations": len(texts),
+        "result_messages_logged": sum(recv_counts.values()),
+        "unique_result_tasks": len(recv_counts),
+        "multi_result_tasks": multi_result,
+        "failover_sweeps": failovers,
+        "reaper_failovers": reaper_failovers,
+        "requeues_logged": requeues + reaper_failovers,
+        "stale_results_ignored": stale_ignored,
+        "late_results_ignored": late_ignored,
+        "queue_record_errors": queue_record_errors,
+    }
+
+
+class SoakCluster(EnduranceCluster):
+    """Multi-worker soak cluster with --state-dir, per-worker loopback proxies, and fault injection."""
+
+    def __init__(
+        self,
+        binary: str,
+        workdir: str,
+        workers: int = 3,
+        slots: int = 4,
+        blob_store_mb: int = 4096,
+        blob_cache_mb: int = 2048,
+        max_queue_size: int = 64,
+        workspaces: bool = True,
+        session_resume_hold_secs: Optional[int] = None,
+        rate_mbps: Optional[float] = None,
+        delay_ms: float = 0.0,
+    ) -> None:
+        state_dir = os.path.join(os.path.abspath(workdir), "master-state")
+        super().__init__(
+            binary,
+            workdir,
+            workers=workers,
+            blob_store_mb=blob_store_mb,
+            blob_cache_mb=blob_cache_mb,
+            state_dir=state_dir,
+        )
+        self.slots = int(slots)
+        self.max_queue_size = int(max_queue_size)
+        self.workspaces = bool(workspaces)
+        self.session_resume_hold_secs = session_resume_hold_secs
+        self.rate_mbps = rate_mbps
+        self.delay_ms = float(delay_ms)
+        self.workspace_dirs = [os.path.join(self.workdir, "workspaces-w%d" % i) for i in range(self.n_workers)]
+        self.proxies: List[ThrottleProxy] = []
+
+        self._lifecycle_lock = threading.RLock()
+        self._addr_lock = threading.Lock()
+        self._master_restarting = threading.Event()
+        self._sync_lock = threading.Lock()
+        self._active_sync_submits = 0
+        self._sync_cond = threading.Condition(self._sync_lock)
+
+        self._master_gen = 0
+        self._master_entry: Optional[Tuple[int, subprocess.Popen, Any]] = None
+        self._worker_gen = [0] * self.n_workers
+        self._worker_entries: Dict[int, Tuple[subprocess.Popen, Any]] = {}
+        self._worker_down: Set[int] = set()
+        self._tracked_clients_lock = threading.Lock()
+        self._tracked_clients: Set[subprocess.Popen] = set()
+        self._unclean_pids: List[int] = []
+        self.compactions: List[Dict[str, Any]] = []
+
+    def current_master_addr(self) -> str:
+        with self._addr_lock:
+            return self.master_addr
+
+    def wait_if_restarting(self, timeout: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout
+        while self._master_restarting.is_set() and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+    def enter_sync_submit(self) -> None:
+        deadline = time.monotonic() + 60.0
+        with self._sync_cond:
+            while self._master_restarting.is_set():
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._sync_cond.wait(timeout=min(0.25, rem))
+            self._active_sync_submits += 1
+
+    def exit_sync_submit(self) -> None:
+        with self._sync_cond:
+            self._active_sync_submits = max(0, self._active_sync_submits - 1)
+            self._sync_cond.notify_all()
+
+    def active_pids(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        with self._lifecycle_lock:
+            if self._master_entry is not None and self._master_entry[1].poll() is None:
+                out["master"] = self._master_entry[1].pid
+            for idx, (proc, _log) in self._worker_entries.items():
+                if proc.poll() is None:
+                    out["worker%d" % idx] = proc.pid
+        with self._extra_pids_lock:
+            out.update(self._extra_pids)
+        return out
+
+    def _spawn_role_proc(self, log_name: str, home_name: str, args: List[str], new_group: bool = False) -> Tuple[subprocess.Popen, Any]:
+        log = open(os.path.join(self.workdir, log_name + ".log"), "wb")
+        kw: Dict[str, Any] = {}
+        if IS_WINDOWS:
+            if new_group:
+                kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        p = subprocess.Popen(
+            [self.binary] + args,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=self._build_env(os.path.join(self.workdir, "home-" + home_name)),
+            **kw,
+        )
+        return p, log
+
+    def _start_master_locked(self) -> None:
+        assert self.state_dir is not None
+        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(self.blob_dir, exist_ok=True)
+        port_file = os.path.join(self.workdir, "master.port")
+        dash_file = os.path.join(self.workdir, "dash.port")
+        for fp in (port_file, dash_file):
+            if os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+        args = [
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            port_file,
+            "--dashboard-port",
+            "0",
+            "--dashboard-port-file",
+            dash_file,
+            "--discovery-port",
+            "0",
+            "--blob-dir",
+            self.blob_dir,
+            "--blob-store-mb",
+            str(int(self.blob_store_mb or 4096)),
+            "--state-dir",
+            self.state_dir,
+            "--max-queue-size",
+            str(self.max_queue_size),
+        ]
+        if self.session_resume_hold_secs is not None:
+            args += ["--session-resume-hold-secs", str(int(self.session_resume_hold_secs))]
+
+        gen = self._master_gen
+        self._master_gen += 1
+        p, log = self._spawn_role_proc("master-%d" % gen, "master", args, new_group=True)
+        self._master_entry = (gen, p, log)
+        self.pids["master"] = p.pid
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if p.poll() is not None:
+                raise RuntimeError("master exited early (gen=%d code=%s)" % (gen, p.returncode))
+            if os.path.exists(port_file) and os.path.getsize(port_file) > 0:
+                with open(port_file, encoding="utf-8", errors="replace") as f:
+                    txt = f.read().strip()
+                if txt:
+                    addr = txt if ":" in txt else "127.0.0.1:" + txt
+                    host, pstr = addr.rsplit(":", 1)
+                    with self._addr_lock:
+                        self.master_addr = addr
+                        self.master_host = host
+                        self.master_port = int(pstr)
+                    return
+            time.sleep(0.05)
+        raise RuntimeError("master did not publish its port within 30 s")
+
+    def _start_worker_locked(self, idx: int) -> None:
+        os.makedirs(self.sandbox_dirs[idx], exist_ok=True)
+        target_addr = self.proxies[idx].bound_addr if idx < len(self.proxies) else self.current_master_addr()
+        args = [
+            "worker",
+            "--master",
+            target_addr,
+            "--name",
+            "w%d" % idx,
+            "--no-portal",
+            "--no-gpu",
+            "--max-concurrency",
+            str(self.slots),
+            "--sandbox-base-dir",
+            self.sandbox_dirs[idx],
+            "--blob-cache-mb",
+            str(int(self.blob_cache_mb or 2048)),
+        ]
+        if self.workspaces:
+            os.makedirs(self.workspace_dirs[idx], exist_ok=True)
+            args += ["--workspaces", "--workspace-root", self.workspace_dirs[idx]]
+        gen = self._worker_gen[idx]
+        self._worker_gen[idx] += 1
+        p, log = self._spawn_role_proc("worker%d-%d" % (idx, gen), "worker%d" % idx, args, new_group=False)
+        self._worker_entries[idx] = (p, log)
+        self.pids["worker%d" % idx] = p.pid
+        self._worker_down.discard(idx)
+
+    def _wait_workers_connected(self, expected_indices: Iterable[int], timeout: float = 60.0) -> None:
+        idx_list = list(expected_indices)
+        want = {"w%d" % idx for idx in idx_list}
+        if not want:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lifecycle_lock:
+                if self._master_entry is not None and self._master_entry[1].poll() is not None:
+                    gen, mp, _log = self._master_entry
+                    tail = "\n".join(self.read_log("master-%d" % gen).splitlines()[-10:])
+                    raise RuntimeError("master exited early (code=%s): %s" % (mp.returncode, tail))
+                for idx in idx_list:
+                    entry = self._worker_entries.get(idx)
+                    if entry is not None and entry[0].poll() is not None:
+                        wlog = "worker%d-%d" % (idx, max(0, self._worker_gen[idx] - 1))
+                        tail = "\n".join(self.read_log(wlog).splitlines()[-10:])
+                        raise RuntimeError("worker%d exited early (code=%s): %s" % (idx, entry[0].returncode, tail))
+            r = self.run_client(["workers", "--json"], timeout=15)
+            if r.returncode == 0:
+                try:
+                    listed = json.loads(r.stdout)
+                except ValueError:
+                    listed = []
+                if isinstance(listed, list):
+                    connected_names = set()
+                    for item in listed:
+                        tags = item.get("tags") or []
+                        state = next((t.split(":", 1)[1] for t in tags if str(t).startswith("state:")), "connected")
+                        if state == "connected":
+                            connected_names.add(item.get("name"))
+                    if want.issubset(connected_names):
+                        return
+            time.sleep(0.15)
+        raise RuntimeError("expected workers %s did not connect within %.0f s" % (sorted(want), timeout))
+
+    def start(self) -> "SoakCluster":
+        with self._lifecycle_lock:
+            self._start_master_locked()
+            self.proxies = [
+                ThrottleProxy(
+                    self.master_host,
+                    self.master_port,
+                    rate_mbps=self.rate_mbps,
+                    delay_ms=self.delay_ms,
+                ).start()
+                for _ in range(self.n_workers)
+            ]
+            for i in range(self.n_workers):
+                self._start_worker_locked(i)
+            self._wait_workers_connected(range(self.n_workers), timeout=60.0)
+        return self
+
+    def kill_worker(self, idx: int) -> int:
+        with self._lifecycle_lock:
+            entry = self._worker_entries.pop(idx, None)
+            self._worker_down.add(idx)
+            if entry is None:
+                return 0
+            p, log = entry
+            pid = p.pid
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=10.0)
+            if pid_alive(pid):
+                self._unclean_pids.append(pid)
+            try:
+                log.close()
+            except Exception:
+                pass
+            return pid
+
+    def start_worker(self, idx: int) -> int:
+        with self._lifecycle_lock:
+            self._start_worker_locked(idx)
+            new_pid = self._worker_entries[idx][0].pid
+        if not self._master_restarting.is_set():
+            self._wait_workers_connected([idx], timeout=45.0)
+        return new_pid
+
+    def cut_worker_link(self, idx: int, pause_s: float) -> None:
+        if 0 <= idx < len(self.proxies):
+            self.proxies[idx].cut_links(pause_s=pause_s)
+
+    def stop_master(self, reason: str) -> Optional[Dict[str, Any]]:
+        assert self.state_dir is not None
+        with self._lifecycle_lock:
+            if self._master_entry is None:
+                return None
+            gen, p, log = self._master_entry
+            journal_path = os.path.join(self.state_dir, "journal.bin")
+            before_bytes = dir_bytes(journal_path)
+            pid = p.pid
+            if p.poll() is None:
+                if IS_WINDOWS:
+                    p.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    p.terminate()
+                try:
+                    p.wait(timeout=25.0)
+                except subprocess.TimeoutExpired:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=5.0)
+            if pid_alive(pid):
+                self._unclean_pids.append(pid)
+            after_bytes = dir_bytes(journal_path)
+            try:
+                log.close()
+            except Exception:
+                pass
+            self._master_entry = None
+            comp = {
+                "reason": reason,
+                "generation": gen,
+                "exit_code": p.returncode,
+                "before_bytes": int(before_bytes),
+                "after_bytes": int(after_bytes),
+                "shrank": int(after_bytes) < int(before_bytes),
+            }
+            self.compactions.append(comp)
+            return comp
+
+    def restart_master(self) -> Dict[str, Any]:
+        with self._sync_cond:
+            self._master_restarting.set()
+            wait_deadline = time.monotonic() + 60.0
+            while self._active_sync_submits > 0 and time.monotonic() < wait_deadline:
+                self._sync_cond.wait(timeout=0.2)
+        try:
+            comp = self.stop_master("scheduled_restart")
+            with self._lifecycle_lock:
+                self._start_master_locked()
+                for prx in self.proxies:
+                    prx.retarget(self.master_host, self.master_port)
+                expected = [i for i in range(self.n_workers) if i not in self._worker_down]
+            self._wait_workers_connected(expected, timeout=60.0)
+            return comp or {}
+        finally:
+            with self._sync_cond:
+                self._master_restarting.clear()
+                self._sync_cond.notify_all()
+
+    def run_client(
+        self,
+        args: List[str],
+        timeout: float = 120.0,
+        master_addr: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        addr = master_addr or self.current_master_addr()
+        cmd = [self.binary] + args[:1] + ["--master", addr] + args[1:]
+        kw: Dict[str, Any] = {} if IS_WINDOWS else {"start_new_session": True}
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.client_env,
+            **kw,
+        )
+        with self._tracked_clients_lock:
+            self._tracked_clients.add(p)
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(cmd, p.returncode, stdout or "", stderr or "")
+        except subprocess.TimeoutExpired:
+            p.kill()
+            stdout, stderr = p.communicate()
+            return subprocess.CompletedProcess(
+                cmd,
+                124,
+                stdout or "",
+                (stderr or "") + "\n[harness] client timed out after %.1f s" % timeout,
+            )
+        finally:
+            with self._tracked_clients_lock:
+                self._tracked_clients.discard(p)
+
+    def spawn_submit(
+        self,
+        submit_args: List[str],
+        master_addr: Optional[str] = None,
+    ) -> subprocess.Popen:
+        addr = master_addr or self.current_master_addr()
+        return super().spawn_submit(submit_args, master_addr=addr)
+
+    def dir_map(self) -> Dict[str, str]:
+        assert self.state_dir is not None
+        dirs: Dict[str, str] = {
+            "blob_store_bytes": self.blob_dir,
+            "state_dir_bytes": self.state_dir,
+            "journal_bin_bytes": os.path.join(self.state_dir, "journal.bin"),
+            "snapshot_bin_bytes": os.path.join(self.state_dir, "snapshot.bin"),
+        }
+        for i, sd in enumerate(self.sandbox_dirs):
+            dirs["sandbox_w%d_bytes" % i] = sd
+            dirs["worker_cache_w%d_bytes" % i] = os.path.join(sd, "cache", "blobs")
+        return dirs
+
+    def idle_disk_snapshot(self) -> Dict[str, Any]:
+        sandbox_entries = {
+            "w%d" % i: sorted(os.listdir(sd))
+            for i, sd in enumerate(self.sandbox_dirs)
+            if os.path.isdir(sd)
+        }
+        tmp_leftovers: Dict[str, List[str]] = {
+            "master_blobs_tmp": list_tmp_entries(self.blob_dir),
+        }
+        worker_caches: Dict[str, int] = {}
+        for i, sd in enumerate(self.sandbox_dirs):
+            cache_root = os.path.join(sd, "cache", "blobs")
+            worker_caches["worker_cache_w%d_bytes" % i] = dir_bytes(cache_root)
+            tmp_leftovers["w%d_cache_tmp" % i] = list_tmp_entries(cache_root)
+            locks_dir = os.path.join(sd, ".locks")
+            if os.path.isdir(locks_dir):
+                tmp_leftovers["w%d_locks" % i] = sorted(os.listdir(locks_dir))
+        return {
+            "idle_blob_store_bytes": dir_bytes(self.blob_dir),
+            "idle_worker_cache_bytes": worker_caches,
+            "idle_sandbox_entries": sandbox_entries,
+            "tmp_leftovers": tmp_leftovers,
+        }
+
+    def audit_master_logs(self) -> Dict[str, Any]:
+        return audit_master_log_texts(self.read_log("master-%d" % gen) for gen in range(self._master_gen))
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            for idx in sorted(list(self._worker_entries.keys())):
+                p, log = self._worker_entries.pop(idx)
+                pid = p.pid
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=5.0)
+                if pid_alive(pid):
+                    self._unclean_pids.append(pid)
+                try:
+                    log.close()
+                except Exception:
+                    pass
+        self.stop_master("final_stop")
+        for prx in self.proxies:
+            prx.stop()
+        with self._tracked_clients_lock:
+            for p in list(self._tracked_clients):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=5.0)
+                    if pid_alive(p.pid):
+                        self._unclean_pids.append(p.pid)
+        self.procs = []
+
+    def leftover_pids(self) -> List[int]:
+        alive = list(self._unclean_pids)
+        with self._lifecycle_lock:
+            if self._master_entry is not None and self._master_entry[1].poll() is None:
+                alive.append(self._master_entry[1].pid)
+            for p, _log in self._worker_entries.values():
+                if p.poll() is None:
+                    alive.append(p.pid)
+        with self._tracked_clients_lock:
+            for p in self._tracked_clients:
+                if p.poll() is None:
+                    alive.append(p.pid)
+        return sorted(set(alive))
 
 
 def measure_tcp_rtt_ms(host: str, port: int, attempts: int = 5) -> Optional[float]:
@@ -1878,19 +2859,8 @@ def run_t3(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     pass_bytes = int(args.t3_pass_mib) * MIB
     fail_bytes = int(args.t3_fail_mib) * MIB
 
-    # Compute expected sha256 deterministically without keeping a local copy first
-    def _expected_sha(sz: int, seed: int) -> str:
-        rng = random.Random(seed)
-        h = hashlib.sha256()
-        rem = sz
-        while rem > 0:
-            n = min(4 * MIB, rem)
-            h.update(rng.randbytes(n) if hasattr(rng, "randbytes") else bytes(rng.getrandbits(8) for _ in range(n)))
-            rem -= n
-        return h.hexdigest()
-
     pass_seed = args.seed + 301
-    pass_sha = _expected_sha(pass_bytes, pass_seed)
+    pass_sha = expected_seeded_sha256(pass_bytes, pass_seed)
     c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
     sampler: Optional[BackgroundSampler] = None
     try:
@@ -2559,58 +3529,45 @@ def compute_largest_file_bytes(scenarios: List[str], args: argparse.Namespace) -
     return max(candidates)
 
 
+_WORKER_SOAK_SLEEP_SRC = """
+import sys, time
+print("SOAK_STARTED", flush=True)
+time.sleep(float(sys.argv[2]))
+print("SOAK_DONE", flush=True)
+""".strip()
+
+_WORKER_SOAK_WS_SRC = """
+import hashlib, os, sys
+target = sys.argv[2]
+if not os.path.isfile(target):
+    print("WS_MISSING", target)
+    sys.exit(3)
+h = hashlib.sha256()
+with open(target, "rb") as f:
+    h.update(f.read())
+print("WS_OK " + h.hexdigest())
+""".strip()
+
+
 # ---------------------------------------------------------------- CLI subcommands
 
 
-def validate_transfer_args(args: argparse.Namespace) -> None:
-    """Reject unimplemented multi-machine links and remote flags in step 1 (TEST-24)."""
-    link = (getattr(args, "link", None) or "").strip().lower()
-    if link != "loopback":
-        raise ValueError(
-            "only --link loopback is supported in TEST-24 step 1 (got --link %r; two-machine links arrive in step 2)"
-            % getattr(args, "link", None)
-        )
-    bad_flags: List[str] = []
-    if getattr(args, "master", None):
-        bad_flags.append("--master")
-    if getattr(args, "secret_file", None):
-        bad_flags.append("--secret-file")
-    if getattr(args, "insecure", False):
-        bad_flags.append("--insecure")
-    if bad_flags:
-        raise ValueError(
-            "%s require two-machine mode (TEST-24 step 2) and cannot be combined with loopback step 1"
-            % ", ".join(bad_flags)
-        )
-
-
-def cmd_transfer(args: argparse.Namespace) -> int:
-    try:
-        validate_transfer_args(args)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
-
-    binary = os.path.abspath(args.bin)
-    if not os.path.isfile(binary):
-        raise SystemExit("binary not found: %s" % binary)
-
-    raw_list = [s.strip().upper() for s in args.scenarios.split(",") if s.strip()]
-    if raw_list == ["ALL"]:
-        scenarios = list(ALL_SCENARIOS)
-    else:
-        bad = [s for s in raw_list if s not in SCENARIO_RUNNERS]
-        if bad:
-            raise SystemExit("unknown scenario id(s): %s" % ", ".join(bad))
-        scenarios = raw_list
-
-    largest_bytes = compute_largest_file_bytes(scenarios, args)
-    if args.work_dir:
-        os.makedirs(args.work_dir, exist_ok=True)
-        work_root = tempfile.mkdtemp(prefix="oxendurance-", dir=os.path.abspath(args.work_dir))
+def _prepare_work_root(work_dir: Optional[str], largest_bytes: int, keep_workdir: bool = False) -> Tuple[str, Dict[str, Any]]:
+    if work_dir:
+        os.makedirs(work_dir, exist_ok=True)
+        work_root = tempfile.mkdtemp(prefix="oxendurance-", dir=os.path.abspath(work_dir))
     else:
         work_root = tempfile.mkdtemp(prefix="oxendurance-")
+    try:
+        disk_check = check_free_space(work_root, largest_bytes)
+    except Exception:
+        if not keep_workdir:
+            shutil.rmtree(work_root, ignore_errors=True)
+        raise
+    return work_root, disk_check
 
-    disk_check = check_free_space(work_root, largest_bytes)
+
+def _collect_env_metadata(binary: str, rtt_ms: Optional[float], link: str) -> Dict[str, Any]:
     started = datetime.datetime.now(datetime.timezone.utc)
     hw = hardware()
     os_facts = os_info()
@@ -2618,9 +3575,8 @@ def cmd_transfer(args: argparse.Namespace) -> int:
     version = sh([binary, "--version"])
     av_realtime = windows_realtime_av_enabled()
 
-    # Probe loopback TCP connect latency before heavy runs
-    loopback_rtt_ms: Optional[float] = args.rtt_ms
-    if loopback_rtt_ms is None and args.link == "loopback":
+    loopback_rtt_ms = rtt_ms
+    if loopback_rtt_ms is None and link == "loopback":
         probe_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe_srv.bind(("127.0.0.1", 0))
         probe_srv.listen(4)
@@ -2645,6 +3601,749 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         pt.join(timeout=2.0)
         probe_srv.close()
 
+    return {
+        "started": started,
+        "hw": hw,
+        "os_facts": os_facts,
+        "git": git,
+        "version": version,
+        "av_realtime": av_realtime,
+        "loopback_rtt_ms": loopback_rtt_ms,
+    }
+
+
+def _save_or_print_record(
+    record: Dict[str, Any],
+    *,
+    out_path: Optional[str],
+    default_link: str,
+    started: datetime.datetime,
+    os_facts: Dict[str, str],
+    hw: Dict[str, Any],
+    no_write: bool,
+    work_root: str,
+) -> bool:
+    quarantined = False
+    if no_write:
+        text = json.dumps(record, indent=2) + "\n"
+        assert_record_private(text, forbidden=[work_root])
+        print(text)
+    else:
+        target = out_path or result_path(os.path.join(HERE, "results"), started, default_link, os_facts, hw)
+        write_res = write_record(target, record, forbidden=[work_root])
+        quarantined = bool(write_res["quarantined"])
+        if quarantined:
+            print("quarantined", write_res["path"], flush=True)
+        else:
+            print("wrote", write_res["path"], flush=True)
+    return quarantined
+
+
+def validate_transfer_args(args: argparse.Namespace) -> None:
+    """Reject unimplemented multi-machine links and remote flags in step 1 (TEST-24)."""
+    link = (getattr(args, "link", None) or "").strip().lower()
+    if link != "loopback":
+        raise ValueError(
+            "only --link loopback is supported in TEST-24 step 1 (got --link %r; two-machine links arrive in step 2)"
+            % getattr(args, "link", None)
+        )
+    bad_flags: List[str] = []
+    if getattr(args, "master", None):
+        bad_flags.append("--master")
+    if getattr(args, "secret_file", None):
+        bad_flags.append("--secret-file")
+    if getattr(args, "insecure", False):
+        bad_flags.append("--insecure")
+    if bad_flags:
+        raise ValueError(
+            "%s require two-machine mode (TEST-24 step 2) and cannot be combined with loopback step 1"
+            % ", ".join(bad_flags)
+        )
+
+
+def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Validate and parse TEST-25 step 1 soak CLI parameters."""
+    link = (getattr(args, "link", None) or "").strip().lower()
+    if link != "loopback":
+        raise ValueError(
+            "only --link loopback is supported in TEST-25 step 1 (got --link %r; multi-machine soak runs in step 2)"
+            % getattr(args, "link", None)
+        )
+    duration_s = parse_duration_seconds(args.duration)
+    sample_interval_s = parse_duration_seconds(args.sample_interval)
+    fault_scale = float(args.fault_scale)
+    load_scale = float(args.load_scale)
+    workers = int(args.workers)
+    slots = int(args.slots)
+    max_queue_size = int(args.max_queue_size)
+    blob_store_mb = int(args.blob_store_mb)
+    blob_cache_mb = int(args.blob_cache_mb)
+    if fault_scale <= 0.0:
+        raise ValueError("--fault-scale must be positive (got %r)" % args.fault_scale)
+    if load_scale <= 0.0:
+        raise ValueError("--load-scale must be positive (got %r)" % args.load_scale)
+    if workers < 2 or workers > 3:
+        raise ValueError("--workers must be 2 or 3 per design 0065 D3 (got %d)" % workers)
+    if slots < 1:
+        raise ValueError("--slots must be >= 1 (got %d)" % slots)
+    if max_queue_size < 1:
+        raise ValueError("--max-queue-size must be >= 1 (got %d)" % max_queue_size)
+    if blob_store_mb < 64:
+        raise ValueError("--blob-store-mb must be >= 64 (got %d)" % blob_store_mb)
+    if blob_cache_mb < 32:
+        raise ValueError("--blob-cache-mb must be >= 32 (got %d)" % blob_cache_mb)
+    return {
+        "duration_s": duration_s,
+        "sample_interval_s": sample_interval_s,
+        "fault_scale": fault_scale,
+        "load_scale": load_scale,
+        "workers": workers,
+        "slots": slots,
+        "max_queue_size": max_queue_size,
+        "blob_store_mb": blob_store_mb,
+        "blob_cache_mb": blob_cache_mb,
+    }
+
+
+def _classify_soak_terminal(rc: int, parsed_json: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not parsed_json:
+        return None
+    if "exit_code" in parsed_json:
+        code = int(parsed_json["exit_code"])
+        err = str(parsed_json.get("error") or "").lower()
+        if code == 0:
+            return "ok"
+        if code == 130 or "cancel" in err:
+            return "cancelled"
+        return "failed"
+    if "status" in parsed_json:
+        st = str(parsed_json["status"]).lower()
+        if st in ("completed", "ok"):
+            return "ok"
+        if st == "cancelled":
+            return "cancelled"
+        if st == "failed":
+            return "failed"
+    if "error" in parsed_json:
+        err = str(parsed_json["error"] or "").lower()
+        if "not found" in err:
+            return "not_found"
+        if "cancel" in err:
+            return "cancelled"
+    return None
+
+
+def _wait_for_soak_result(
+    cluster: SoakCluster,
+    tid: str,
+    timeout_s: float = 420.0,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    deadline = time.monotonic() + timeout_s
+    last_json: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        cluster.wait_if_restarting(timeout=min(45.0, max(1.0, deadline - time.monotonic())))
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        res = cluster.run_client(
+            ["result", tid, "--wait", "--json"],
+            timeout=max(5.0, min(45.0, rem)),
+        )
+        parsed = extract_json_payload(res.stdout)
+        if parsed:
+            last_json = parsed
+        outcome = _classify_soak_terminal(res.returncode, parsed)
+        if outcome is not None:
+            return outcome, parsed
+        time.sleep(0.35)
+    return "timeout", last_json
+
+
+def _run_async_soak_task(
+    cluster: SoakCluster,
+    ledger: TaskLedger,
+    submit_args: List[str],
+    *,
+    kind: str,
+    expected_hash: Optional[str] = None,
+    hash_extractor: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+    cleanup_paths: Iterable[str] = (),
+    work_root: str = "",
+) -> None:
+    try:
+        res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
+        parsed = extract_json_payload(res.stdout)
+        tid = str((parsed or {}).get("task_id") or "")
+        status_str = str((parsed or {}).get("status") or "").lower()
+        if res.returncode != 0 or not tid or status_str != "submitted":
+            msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
+            ledger.record_submit_refusal(kind, redact_text(str(msg).strip(), [work_root]))
+            return
+        ledger.record_submit(tid, expected_hash=expected_hash, expected_outcome="ok", kind=kind)
+    finally:
+        for p in cleanup_paths:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=480.0)
+    got_hash = hash_extractor(term_json) if (hash_extractor and term_json and outcome == "ok") else None
+    wid = str(term_json.get("worker_id")) if term_json and term_json.get("worker_id") else None
+    ledger.record_result(tid, actual_hash=got_hash, outcome=outcome, worker_id=wid)
+
+
+def _run_cancel_soak_task(
+    cluster: SoakCluster,
+    ledger: TaskLedger,
+    worker_python: str,
+    sleep_s: float,
+    work_root: str,
+) -> None:
+    cluster.wait_if_restarting(timeout=30.0)
+    cmd_args = [
+        "--timeout-secs",
+        "60",
+    ] + _worker_python_args(worker_python, _WORKER_SOAK_SLEEP_SRC, [str(sleep_s)])
+    res = cluster.run_client(["submit", "--json"] + cmd_args, timeout=30.0)
+    parsed = extract_json_payload(res.stdout)
+    tid = str((parsed or {}).get("task_id") or "")
+    if res.returncode != 0 or not tid:
+        msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
+        ledger.record_submit_refusal("cancel", redact_text(str(msg).strip(), [work_root]))
+        return
+    ledger.record_submit(
+        tid,
+        expected_outcome="cancelled",
+        kind="cancel",
+        allowed_outcomes=("cancelled",),
+    )
+
+    # Wait briefly for task to start running before cancelling
+    wait_deadline = time.monotonic() + 10.0
+    while time.monotonic() < wait_deadline:
+        st_res = cluster.run_client(["status", "--task-id", tid, "--json"], timeout=15.0)
+        st_json = extract_json_payload(st_res.stdout)
+        st_val = str((st_json or {}).get("state") or (st_json or {}).get("status") or "").lower()
+        if "running" in st_val or "cancel" in st_val or "completed" in st_val or "failed" in st_val:
+            break
+        time.sleep(0.2)
+
+    cancelled = False
+    for _ in range(3):
+        cluster.wait_if_restarting(timeout=30.0)
+        c_res = cluster.run_client(["cancel", tid, "--json"], timeout=15.0)
+        c_json = extract_json_payload(c_res.stdout)
+        if c_res.returncode == 0 and (c_json or {}).get("cancelled"):
+            cancelled = True
+            break
+        time.sleep(0.3)
+
+    if not cancelled:
+        # Task may have already completed or hit master restart; still wait to verify terminal state
+        outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=60.0)
+    else:
+        outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=60.0)
+    wid = str(term_json.get("worker_id")) if term_json and term_json.get("worker_id") else None
+    ledger.record_result(tid, outcome=outcome, worker_id=wid)
+
+
+def _run_output_soak_task(
+    cluster: SoakCluster,
+    ledger: TaskLedger,
+    worker_python: str,
+    size_bytes: int,
+    seed: int,
+    out_dir: str,
+    work_root: str,
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    exp_sha = expected_seeded_sha256(size_bytes, seed)
+    cluster.enter_sync_submit()
+    try:
+        cmd_args = [
+            "submit",
+            "--output",
+            "out.bin",
+            "--output-dir",
+            out_dir,
+            "--timeout-secs",
+            "600",
+            "--wait",
+            "--json",
+        ] + _worker_python_args(
+            worker_python,
+            _WORKER_GEN_OUTPUT_SRC,
+            ["out.bin", str(size_bytes), str(seed), "-"],
+        )
+        res = cluster.run_client(cmd_args, timeout=600.0)
+    finally:
+        cluster.exit_sync_submit()
+
+    parsed = extract_json_payload(res.stdout)
+    tid = str((parsed or {}).get("task_id") or "")
+    if not tid:
+        msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
+        ledger.record_submit_refusal("output", redact_text(str(msg).strip(), [work_root]))
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return
+
+    ledger.record_submit(tid, expected_hash=exp_sha, expected_outcome="ok", kind="output")
+    dl_path = os.path.join(out_dir, "out.bin")
+    outputs_info = _extract_outputs_info(parsed)
+    got_sha: Optional[str] = None
+    if (
+        res.returncode == 0
+        and os.path.isfile(dl_path)
+        and outputs_info
+        and HEX64_RE.match(str(outputs_info[0].get("id") or ""))
+    ):
+        got_sz, sha = sha256_file(dl_path)
+        if got_sz == size_bytes:
+            got_sha = sha
+    outcome = "ok" if res.returncode == 0 else (_classify_soak_terminal(res.returncode, parsed) or "failed")
+    wid = str(parsed.get("worker_id")) if parsed and parsed.get("worker_id") else None
+    ledger.record_result(tid, actual_hash=got_sha, outcome=outcome, worker_id=wid)
+    shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, Any]) -> Dict[str, Any]:
+    duration_s = float(parsed_params["duration_s"])
+    sample_interval_s = float(parsed_params["sample_interval_s"])
+    fault_scale = float(parsed_params["fault_scale"])
+    load_scale = float(parsed_params["load_scale"])
+    n_workers = int(parsed_params["workers"])
+    slots = int(parsed_params["slots"])
+    max_queue_size = int(parsed_params["max_queue_size"])
+    blob_store_mb = int(parsed_params["blob_store_mb"])
+    blob_cache_mb = int(parsed_params["blob_cache_mb"])
+    workspaces = bool(args.workspaces)
+
+    sc_dir = os.path.join(work_root, "soak")
+    inputs_dir = os.path.join(sc_dir, "inputs")
+    reused_dir = os.path.join(sc_dir, "reused")
+    outputs_dir = os.path.join(sc_dir, "outputs")
+    ws_src_dir = os.path.join(sc_dir, "ws-src")
+    for d in (inputs_dir, reused_dir, outputs_dir, ws_src_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # Create 5-file rotating reused-input pool + static workspace files
+    reused_pool: List[Dict[str, Any]] = []
+    reused_sz = max(1 * MIB, int(round(16 * MIB * min(1.0, load_scale))))
+    for ridx in range(5):
+        rp = os.path.join(reused_dir, "reused-%d.bin" % ridx)
+        meta = generate_seeded_file(rp, reused_sz, int(args.seed) + 700 + ridx)
+        meta["path"] = rp
+        reused_pool.append(meta)
+
+    with open(os.path.join(ws_src_dir, "README.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("OxideSwarm TEST-25 workspace soak fixture\n")
+
+    fault_plan = plan_soak_faults(duration_s, fault_scale=fault_scale, n_workers=n_workers)
+    fault_events_log: List[Dict[str, Any]] = []
+    probe_samples: List[Dict[str, Any]] = []
+    probe_lock = threading.Lock()
+    ledger = TaskLedger()
+    ws_lock = threading.Lock()
+    verify_re = re.compile(r"VERIFY_OK\s+\d+\s+([0-9a-f]{64})")
+    ws_re = re.compile(r"WS_OK\s+([0-9a-f]{64})")
+
+    cluster = SoakCluster(
+        args.bin,
+        os.path.join(sc_dir, "cluster"),
+        workers=n_workers,
+        slots=slots,
+        blob_store_mb=blob_store_mb,
+        blob_cache_mb=blob_cache_mb,
+        max_queue_size=max_queue_size,
+        workspaces=workspaces,
+        session_resume_hold_secs=args.session_resume_hold_secs,
+        rate_mbps=args.rate_mbps,
+        delay_ms=args.delay_ms,
+    )
+
+    sampler: Optional[BackgroundSampler] = None
+    probe_stop = threading.Event()
+    probe_thread: Optional[threading.Thread] = None
+    fault_threads: List[threading.Thread] = []
+    soak_t0 = time.monotonic()
+
+    def _run_probe_once() -> None:
+        max_attempts = 3
+        t_now = round(time.monotonic() - soak_t0, 2)
+        res: Optional[subprocess.CompletedProcess] = None
+        dt_ms = 0.0
+        parsed: Optional[Dict[str, Any]] = None
+        for attempt in range(max_attempts):
+            if cluster._master_restarting.is_set():
+                return
+            cluster.enter_sync_submit()
+            t_sub = time.perf_counter()
+            try:
+                res = cluster.run_client(
+                    ["submit", "--wait", "--json", "--timeout-secs", "60", "--command", args.worker_python, "--", "-c", "print('PROBE_OK')"],
+                    timeout=90.0,
+                )
+                dt_ms = round((time.perf_counter() - t_sub) * 1000.0, 3)
+            finally:
+                cluster.exit_sync_submit()
+
+            parsed = extract_json_payload(res.stdout)
+            if res.returncode == 0:
+                break
+            err_low = str((parsed or {}).get("error") or res.stderr or res.stdout or "").lower()
+            is_queue_full = "queue" in err_low and ("full" in err_low or "capacity" in err_low)
+            if is_queue_full and attempt + 1 < max_attempts:
+                time.sleep(2.5)
+                continue
+            break
+
+        if res is None:
+            return
+        txt = decode_bytes_field((parsed or {}).get("stdout"))
+        ok = res.returncode == 0 and "PROBE_OK" in txt
+        tid = str((parsed or {}).get("task_id") or "")
+        if tid:
+            ledger.record_submit(tid, expected_outcome="ok", kind="probe")
+            ledger.record_result(tid, outcome="ok" if ok else "failed")
+        with probe_lock:
+            probe_samples.append({"t_s": t_now, "latency_ms": dt_ms, "ok": bool(ok), "rc": res.returncode})
+
+    def _probe_loop() -> None:
+        _run_probe_once()
+        while not probe_stop.wait(sample_interval_s):
+            _run_probe_once()
+
+    def _extract_verify_sha(term_json: Dict[str, Any]) -> Optional[str]:
+        txt = decode_bytes_field(term_json.get("stdout"))
+        m = verify_re.search(txt)
+        return m.group(1) if m else None
+
+    def _extract_ws_sha(term_json: Dict[str, Any]) -> Optional[str]:
+        txt = decode_bytes_field(term_json.get("stdout"))
+        m = ws_re.search(txt)
+        return m.group(1) if m else None
+
+    def _dispatch_item(item: Dict[str, Any]) -> None:
+        kind = item["kind"]
+        seq_tag = "%d_%d" % (item["minute"], item["seq"])
+        if kind == "noop":
+            _run_async_soak_task(
+                cluster,
+                ledger,
+                ["--timeout-secs", "60", "--command", args.worker_python, "--", "-c", "print('NOOP_OK')"],
+                kind="noop",
+                work_root=work_root,
+            )
+        elif kind == "new_input":
+            p = os.path.join(inputs_dir, "new_%s.bin" % seq_tag)
+            meta = generate_seeded_file(p, int(item["size_bytes"]), int(item["seed"]))
+            submit_args = [
+                "--input",
+                p + ":payload.bin",
+                "--timeout-secs",
+                "300",
+            ] + _worker_python_args(
+                args.worker_python,
+                _WORKER_VERIFY_FILE_SRC,
+                ["payload.bin", str(meta["size_bytes"]), meta["sha256"]],
+            )
+            _run_async_soak_task(
+                cluster,
+                ledger,
+                submit_args,
+                kind="new_input",
+                expected_hash=meta["sha256"],
+                hash_extractor=_extract_verify_sha,
+                cleanup_paths=(p,),
+                work_root=work_root,
+            )
+        elif kind == "reused_input":
+            meta = reused_pool[int(item["pool_index"]) % len(reused_pool)]
+            submit_args = [
+                "--input",
+                meta["path"] + ":payload.bin",
+                "--timeout-secs",
+                "300",
+            ] + _worker_python_args(
+                args.worker_python,
+                _WORKER_VERIFY_FILE_SRC,
+                ["payload.bin", str(meta["size_bytes"]), meta["sha256"]],
+            )
+            _run_async_soak_task(
+                cluster,
+                ledger,
+                submit_args,
+                kind="reused_input",
+                expected_hash=meta["sha256"],
+                hash_extractor=_extract_verify_sha,
+                work_root=work_root,
+            )
+        elif kind == "output":
+            out_dir = os.path.join(outputs_dir, "out_%s" % seq_tag)
+            _run_output_soak_task(
+                cluster,
+                ledger,
+                args.worker_python,
+                int(item["size_bytes"]),
+                int(item["seed"]),
+                out_dir,
+                work_root,
+            )
+        elif kind == "workspace_sync":
+            with ws_lock:
+                marker_path = os.path.join(ws_src_dir, "sync_marker.txt")
+                body_bytes = ("SOAK_WS|%d|%d|%d\n" % (item["minute"], item["seq"], item["seed"])).encode("utf-8")
+                with open(marker_path, "wb") as mf:
+                    mf.write(body_bytes)
+                exp_sha = hashlib.sha256(body_bytes).hexdigest()
+                submit_args = [
+                    "--workspace",
+                    "soak-ws",
+                    "--sync",
+                    ws_src_dir,
+                    "--timeout-secs",
+                    "180",
+                ] + _worker_python_args(args.worker_python, _WORKER_SOAK_WS_SRC, ["sync_marker.txt"])
+                res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
+            parsed = extract_json_payload(res.stdout)
+            tid = str((parsed or {}).get("task_id") or "")
+            status_str = str((parsed or {}).get("status") or "").lower()
+            if res.returncode != 0 or not tid or status_str != "submitted":
+                msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
+                ledger.record_submit_refusal("workspace_sync", redact_text(str(msg).strip(), [work_root]))
+                return
+            ledger.record_submit(tid, expected_hash=exp_sha, expected_outcome="ok", kind="workspace_sync")
+            outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=300.0)
+            got_sha = _extract_ws_sha(term_json) if (term_json and outcome == "ok") else None
+            wid = str(term_json.get("worker_id")) if term_json and term_json.get("worker_id") else None
+            ledger.record_result(tid, actual_hash=got_sha, outcome=outcome, worker_id=wid)
+        elif kind == "cancel":
+            _run_cancel_soak_task(cluster, ledger, args.worker_python, float(item["sleep_s"]), work_root)
+
+    def _trigger_fault(ev: Dict[str, Any]) -> None:
+        fkind = ev["kind"]
+        t_start = round(time.monotonic() - soak_t0, 2)
+        if fkind == "worker_kill":
+            widx = int(ev["worker_index"])
+            old_pid = cluster.kill_worker(widx)
+            time.sleep(float(ev["down_s"]))
+            new_pid = cluster.start_worker(widx)
+            fault_events_log.append(
+                {
+                    "kind": "worker_kill",
+                    "t_s": t_start,
+                    "worker_index": widx,
+                    "old_pid": old_pid,
+                    "new_pid": new_pid,
+                    "down_s": ev["down_s"],
+                }
+            )
+        elif fkind == "link_cut":
+            widx = int(ev["worker_index"])
+            cluster.cut_worker_link(widx, pause_s=float(ev["down_s"]))
+            fault_events_log.append(
+                {
+                    "kind": "link_cut",
+                    "t_s": t_start,
+                    "worker_index": widx,
+                    "pause_s": ev["down_s"],
+                }
+            )
+        elif fkind == "master_restart":
+            comp = cluster.restart_master()
+            fault_events_log.append(
+                {
+                    "kind": "master_restart",
+                    "t_s": t_start,
+                    "compaction": comp,
+                    "new_master_port": cluster.master_port,
+                }
+            )
+        elif fkind == "queue_burst":
+            total_burst = max_queue_size + 8
+            b_args = [
+                "--timeout-secs",
+                "120",
+            ] + _worker_python_args(args.worker_python, _WORKER_SOAK_SLEEP_SRC, ["2.5"])
+            with ThreadPoolExecutor(max_workers=24) as bpool:
+                futs = [
+                    bpool.submit(
+                        _run_async_soak_task,
+                        cluster,
+                        ledger,
+                        b_args,
+                        kind="queue_burst",
+                        work_root=work_root,
+                    )
+                    for _ in range(total_burst)
+                ]
+                for bf in futs:
+                    bf.result()
+            fault_events_log.append(
+                {
+                    "kind": "queue_burst",
+                    "t_s": t_start,
+                    "burst_size": total_burst,
+                    "max_queue_size": max_queue_size,
+                }
+            )
+
+    samples: List[Dict[str, Any]] = []
+    idle_snap: Dict[str, Any] = {}
+    master_audit: Dict[str, Any] = {}
+    leftover: List[int] = []
+    try:
+        cluster.start()
+        soak_t0 = time.monotonic()
+        sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
+        probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
+        probe_thread.start()
+
+        end_deadline = soak_t0 + duration_s
+        next_fault_idx = 0
+        minute_idx = 0
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            pending_futures = []
+            while time.monotonic() < end_deadline:
+                minute_start = time.monotonic()
+                minute_items = plan_soak_minute(
+                    minute_idx,
+                    int(args.seed),
+                    load_scale=load_scale,
+                    workspaces=workspaces,
+                )
+                minute_window = min(60.0, max(1.0, end_deadline - minute_start))
+                spacing = (minute_window * 0.85) / max(1, len(minute_items))
+
+                for item in minute_items:
+                    while time.monotonic() < end_deadline and next_fault_idx < len(fault_plan):
+                        elapsed = time.monotonic() - soak_t0
+                        if elapsed >= float(fault_plan[next_fault_idx]["at_s"]):
+                            ev = fault_plan[next_fault_idx]
+                            next_fault_idx += 1
+                            ft = threading.Thread(target=_trigger_fault, args=(ev,), daemon=True)
+                            ft.start()
+                            fault_threads.append(ft)
+                        else:
+                            break
+                    if time.monotonic() >= end_deadline:
+                        break
+                    pending_futures.append(pool.submit(_dispatch_item, item))
+                    pending_futures = [f for f in pending_futures if not f.done()]
+                    if spacing > 0.05:
+                        time.sleep(min(spacing, max(0.0, end_deadline - time.monotonic())))
+
+                while time.monotonic() < min(end_deadline, minute_start + 60.0):
+                    while next_fault_idx < len(fault_plan) and (time.monotonic() - soak_t0) >= float(fault_plan[next_fault_idx]["at_s"]):
+                        ev = fault_plan[next_fault_idx]
+                        next_fault_idx += 1
+                        ft = threading.Thread(target=_trigger_fault, args=(ev,), daemon=True)
+                        ft.start()
+                        fault_threads.append(ft)
+                    time.sleep(0.25)
+
+                minute_idx += 1
+
+            # Wait for any scheduled fault threads still finishing (with remaining budget)
+            for ft in fault_threads:
+                ft.join(timeout=120.0)
+            for fut in pending_futures:
+                fut.result()
+
+        # Wait until cluster queue is completely idle before taking idle disk snapshot
+        idle_deadline = time.monotonic() + 90.0
+        while time.monotonic() < idle_deadline:
+            st = cluster.run_client(["status", "--json"], timeout=15.0)
+            sj = extract_json_payload(st.stdout)
+            if sj and int(sj.get("pending_tasks", 1)) == 0 and int(sj.get("running_tasks", 1)) == 0:
+                break
+            time.sleep(0.5)
+        time.sleep(1.5)
+
+        probe_stop.set()
+        if probe_thread is not None:
+            probe_thread.join(timeout=60.0)
+        if sampler is not None and not sampler._stop.is_set():
+            samples = sampler.stop()
+        idle_snap = cluster.idle_disk_snapshot()
+    finally:
+        probe_stop.set()
+        if probe_thread is not None:
+            probe_thread.join(timeout=5.0)
+        if sampler is not None and not sampler._stop.is_set():
+            samples = sampler.stop()
+        cluster.stop()
+        master_audit = cluster.audit_master_logs()
+        leftover = cluster.leftover_pids()
+        shutil.rmtree(sc_dir, ignore_errors=True)
+
+    ledger_audit = ledger.audit()
+    ledger_audit["master_failover_sweeps"] = master_audit.get("failover_sweeps", 0)
+    ledger_audit["master_requeues_logged"] = master_audit.get("requeues_logged", 0)
+
+    # Pinned headroom covers one minute of concurrent new-input/reused/output blobs in flight
+    pinned_headroom = int((5 * 100 + 2 * 50) * MIB * min(1.0, load_scale) + 128 * MIB)
+    actual_duration_s = round(time.monotonic() - soak_t0, 2)
+    pass_eval = evaluate_soak_pass_checks(
+        ledger_audit=ledger_audit,
+        samples=samples,
+        probes=probe_samples,
+        duration_s=duration_s,
+        blob_store_limit_bytes=blob_store_mb * MIB,
+        worker_cache_limit_bytes=blob_cache_mb * MIB,
+        pinned_headroom_bytes=pinned_headroom,
+        idle_sandbox_entries=idle_snap.get("idle_sandbox_entries", {}),
+        tmp_leftovers=idle_snap.get("tmp_leftovers", {}),
+        compactions=cluster.compactions,
+        leftover_pids=leftover,
+        idle_blob_store_bytes=idle_snap.get("idle_blob_store_bytes"),
+        idle_worker_cache_bytes=idle_snap.get("idle_worker_cache_bytes"),
+        master_duplicate_executions=int(master_audit.get("queue_record_errors", 0)),
+    )
+    return {
+        "passed": pass_eval["all_passed"],
+        "actual_duration_s": actual_duration_s,
+        "fault_plan": fault_plan,
+        "faults_executed": fault_events_log,
+        "master_audit": master_audit,
+        "compactions": cluster.compactions,
+        "pass_checks": pass_eval["checks"],
+        "probe_summary": {
+            "count": len(probe_samples),
+            "ok_count": sum(1 for p in probe_samples if p.get("ok")),
+            "samples": probe_samples,
+        },
+        "resource_summary": BackgroundSampler.summarize(samples),
+        "samples": samples,
+    }
+
+
+def cmd_transfer(args: argparse.Namespace) -> int:
+    try:
+        validate_transfer_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    binary = os.path.abspath(args.bin)
+    if not os.path.isfile(binary):
+        raise SystemExit("binary not found: %s" % binary)
+
+    raw_list = [s.strip().upper() for s in args.scenarios.split(",") if s.strip()]
+    if raw_list == ["ALL"]:
+        scenarios = list(ALL_SCENARIOS)
+    else:
+        bad = [s for s in raw_list if s not in SCENARIO_RUNNERS]
+        if bad:
+            raise SystemExit("unknown scenario id(s): %s" % ", ".join(bad))
+        scenarios = raw_list
+
+    largest_bytes = compute_largest_file_bytes(scenarios, args)
+    work_root, disk_check = _prepare_work_root(args.work_dir, largest_bytes, keep_workdir=args.keep_workdir)
+    meta = _collect_env_metadata(binary, args.rtt_ms, args.link)
+
     results: List[Dict[str, Any]] = []
     try:
         for sc in scenarios:
@@ -2662,12 +4361,12 @@ def cmd_transfer(args: argparse.Namespace) -> int:
 
     record = {
         "benchmark": "TEST-24 large-transfer endurance suite",
-        "date_utc": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "git": git,
-        "binary": {"version": version, "build_profile": build_profile(binary)},
-        "hardware": hw,
-        "os": os_facts,
-        "windows_realtime_av_enabled": av_realtime,
+        "date_utc": meta["started"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "git": meta["git"],
+        "binary": {"version": meta["version"], "build_profile": build_profile(binary)},
+        "hardware": meta["hw"],
+        "os": meta["os_facts"],
+        "windows_realtime_av_enabled": meta["av_realtime"],
         "power": power_state(),
         "python": platform.python_version(),
         "link": args.link,
@@ -2675,8 +4374,8 @@ def cmd_transfer(args: argparse.Namespace) -> int:
             "seed": int(args.seed),
             "sample_interval_s": float(args.sample_interval),
         },
-        "measured_rtt_ms": loopback_rtt_ms,
-        "theoretical_single_blob_bound_mib_per_s": theoretical_single_blob_bound_mib_per_s(loopback_rtt_ms),
+        "measured_rtt_ms": meta["loopback_rtt_ms"],
+        "theoretical_single_blob_bound_mib_per_s": theoretical_single_blob_bound_mib_per_s(meta["loopback_rtt_ms"]),
         "disk_check": disk_check,
         "verification_note": (
             "Client streams seeded random bytes while computing SHA-256 and the worker script re-reads the sandbox payload "
@@ -2692,22 +4391,108 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         "scenarios": results,
     }
 
-    quarantined = False
-    if args.no_write:
-        text = json.dumps(record, indent=2) + "\n"
-        assert_record_private(text, forbidden=[work_root])
-        print(text)
-    else:
-        out_path = args.out or result_path(os.path.join(HERE, "results"), started, args.link, os_facts, hw)
-        write_res = write_record(out_path, record, forbidden=[work_root])
-        quarantined = bool(write_res["quarantined"])
-        if quarantined:
-            print("quarantined", write_res["path"], flush=True)
-        else:
-            print("wrote", write_res["path"], flush=True)
-
+    quarantined = _save_or_print_record(
+        record,
+        out_path=args.out,
+        default_link=args.link,
+        started=meta["started"],
+        os_facts=meta["os_facts"],
+        hw=meta["hw"],
+        no_write=args.no_write,
+        work_root=work_root,
+    )
     for r in results:
         print("  %-4s %-5s %s" % (r["id"], "PASS" if r["passed"] else "FAIL", r["name"]), flush=True)
+    if quarantined:
+        return 2
+    return 0 if record["all_passed"] else 1
+
+
+def cmd_soak(args: argparse.Namespace) -> int:
+    try:
+        parsed_params = validate_soak_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    binary = os.path.abspath(args.bin)
+    if not os.path.isfile(binary):
+        raise SystemExit("binary not found: %s" % binary)
+
+    largest_bytes = max(100 * MIB, int(round(100 * MIB * min(1.0, parsed_params["load_scale"]))))
+    work_root, disk_check = _prepare_work_root(args.work_dir, largest_bytes, keep_workdir=args.keep_workdir)
+    meta = _collect_env_metadata(binary, args.rtt_ms, args.link)
+
+    try:
+        print(
+            "[soak] starting duration=%.1fs fault_scale=%s load_scale=%s workers=%d slots=%d max_queue=%d"
+            % (
+                parsed_params["duration_s"],
+                parsed_params["fault_scale"],
+                parsed_params["load_scale"],
+                parsed_params["workers"],
+                parsed_params["slots"],
+                parsed_params["max_queue_size"],
+            ),
+            flush=True,
+        )
+        soak_res = run_soak(args, work_root, parsed_params)
+    finally:
+        if not args.keep_workdir:
+            shutil.rmtree(work_root, ignore_errors=True)
+
+    record = {
+        "benchmark": "TEST-25 soak endurance suite",
+        "date_utc": meta["started"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "git": meta["git"],
+        "binary": {"version": meta["version"], "build_profile": build_profile(binary)},
+        "hardware": meta["hw"],
+        "os": meta["os_facts"],
+        "windows_realtime_av_enabled": meta["av_realtime"],
+        "power": power_state(),
+        "python": platform.python_version(),
+        "link": args.link,
+        "parameters": {
+            "seed": int(args.seed),
+            "duration": str(args.duration),
+            "duration_s": float(parsed_params["duration_s"]),
+            "fault_scale": float(parsed_params["fault_scale"]),
+            "load_scale": float(parsed_params["load_scale"]),
+            "sample_interval_s": float(parsed_params["sample_interval_s"]),
+            "workers": int(parsed_params["workers"]),
+            "slots": int(parsed_params["slots"]),
+            "workspaces": bool(args.workspaces),
+            "max_queue_size": int(parsed_params["max_queue_size"]),
+            "blob_store_mb": int(parsed_params["blob_store_mb"]),
+            "blob_cache_mb": int(parsed_params["blob_cache_mb"]),
+            "session_resume_hold_secs": args.session_resume_hold_secs,
+            "rate_mbps": args.rate_mbps,
+            "delay_ms": float(args.delay_ms),
+        },
+        "measured_rtt_ms": meta["loopback_rtt_ms"],
+        "disk_check": disk_check,
+        "verification_note": (
+            "Client streams seeded random bytes while computing SHA-256 and worker task scripts re-read staged inputs "
+            "or workspace marker files and check SHA-256 independently of the code under test; oxideswarm computes and verifies "
+            "BLAKE3 in Master BlobStore and Worker BlobCache."
+        ),
+        "note": redact_text(args.label, [work_root]),
+        "all_passed": bool(soak_res["passed"]),
+        "soak": soak_res,
+    }
+
+    dur_label = "soak-%s-%s" % (_slug(str(args.duration)), args.link)
+    quarantined = _save_or_print_record(
+        record,
+        out_path=args.out,
+        default_link=dur_label,
+        started=meta["started"],
+        os_facts=meta["os_facts"],
+        hw=meta["hw"],
+        no_write=args.no_write,
+        work_root=work_root,
+    )
+    for cname, cval in soak_res["pass_checks"].items():
+        print("  %-20s %s" % (cname, "PASS" if cval.get("passed") else "FAIL"), flush=True)
     if quarantined:
         return 2
     return 0 if record["all_passed"] else 1
@@ -2831,6 +4616,36 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--no-write", action="store_true", help="Print JSON record instead of writing file")
     tr.add_argument("--label", default="", help="Free-text note stored in the record")
 
+    sk = sub.add_parser("soak", help="Run multi-worker fault-injection soak test (TEST-25, D3)")
+    sk.add_argument("--bin", default=default_bin, help="Path to built oxideswarm binary")
+    sk.add_argument("--worker-python", default=sys.executable, help="Python executable path on worker")
+    sk.add_argument("--duration", default="60m", help="Soak duration (e.g. 3m, 45m, 60m, 24h)")
+    sk.add_argument("--fault-scale", type=float, default=1.0, help="Multiply D3 fault intervals (<1 compresses faults)")
+    sk.add_argument("--load-scale", type=float, default=1.0, help="Scale per-minute task counts and blob sizes")
+    sk.add_argument("--sample-interval", default="60s", help="Resource and timed-probe interval (e.g. 15s, 60s)")
+    sk.add_argument("--workers", type=int, default=3, help="Number of workers (2 or 3)")
+    sk.add_argument("--slots", type=int, default=4, help="Execution slots per worker")
+    sk.add_argument(
+        "--workspaces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable persistent worker workspaces and per-minute sync tasks (default: on)",
+    )
+    sk.add_argument("--max-queue-size", type=int, default=64, help="Master --max-queue-size cap for burst test")
+    sk.add_argument("--blob-store-mb", type=int, default=4096, help="Master --blob-store-mb cap")
+    sk.add_argument("--blob-cache-mb", type=int, default=2048, help="Worker --blob-cache-mb cap")
+    sk.add_argument("--session-resume-hold-secs", type=int, help="Optional master --session-resume-hold-secs override")
+    sk.add_argument("--rate-mbps", type=float, help="Optional per-worker ThrottleProxy bandwidth cap in Mbit/s")
+    sk.add_argument("--delay-ms", type=float, default=0.0, help="Optional per-worker ThrottleProxy RTT delay in ms")
+    sk.add_argument("--work-dir", help="Base directory for temporary stores, state dirs, and payloads")
+    sk.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
+    sk.add_argument("--link", default="loopback", help="Link label (loopback only in step 1)")
+    sk.add_argument("--rtt-ms", type=float, help="Measured link RTT in ms")
+    sk.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base PRNG seed")
+    sk.add_argument("--out", help="Output JSON record path")
+    sk.add_argument("--no-write", action="store_true", help="Print JSON record instead of writing file")
+    sk.add_argument("--label", default="", help="Free-text note stored in the record")
+
     th = sub.add_parser("throttle", help="Run loopback TCP throttle proxy (127.0.0.1 only)")
     th.add_argument("--listen", default="127.0.0.1:0", help="Listen address (127.0.0.1:PORT)")
     th.add_argument("--target", required=True, help="Upstream HOST:PORT")
@@ -2856,6 +4671,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     if args.subcommand == "transfer":
         return cmd_transfer(args)
+    if args.subcommand == "soak":
+        return cmd_soak(args)
     if args.subcommand == "throttle":
         return cmd_throttle(args)
     if args.subcommand == "sample":

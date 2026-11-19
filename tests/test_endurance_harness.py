@@ -421,5 +421,218 @@ class SamplerAndPrivacyTests(unittest.TestCase):
                 endurance.validate_transfer_args(bad_args)
 
 
+class SoakHarnessTests(unittest.TestCase):
+    def test_parse_duration_seconds_and_soak_arg_validation(self):
+        self.assertEqual(endurance.parse_duration_seconds("180s"), 180.0)
+        self.assertEqual(endurance.parse_duration_seconds("45m"), 2700.0)
+        self.assertEqual(endurance.parse_duration_seconds("24h"), 86400.0)
+        self.assertAlmostEqual(endurance.parse_duration_seconds("1.5h"), 5400.0)
+        self.assertEqual(endurance.parse_duration_seconds("90"), 90.0)
+        for bad in ("", "0", "-5m", "10w", "abc"):
+            with self.assertRaises(ValueError):
+                endurance.parse_duration_seconds(bad)
+
+        ap = endurance.build_parser()
+        parsed = endurance.validate_soak_args(ap.parse_args(["soak", "--duration", "45m", "--fault-scale", "0.25"]))
+        self.assertEqual(parsed["duration_s"], 2700.0)
+        self.assertEqual(parsed["sample_interval_s"], 60.0)
+        self.assertEqual(parsed["fault_scale"], 0.25)
+        self.assertEqual(parsed["workers"], 3)
+
+        for bad_argv in (
+            ["soak", "--link", "lan-tcp"],
+            ["soak", "--workers", "1"],
+            ["soak", "--workers", "4"],
+            ["soak", "--fault-scale", "0"],
+            ["soak", "--max-queue-size", "0"],
+        ):
+            with self.assertRaises(ValueError, msg="expected ValueError for %s" % bad_argv):
+                endurance.validate_soak_args(ap.parse_args(bad_argv))
+
+    def test_plan_soak_minute_and_faults_deterministic(self):
+        a = endurance.plan_soak_minute(0, seed=42, load_scale=1.0, workspaces=True)
+        b = endurance.plan_soak_minute(0, seed=42, load_scale=1.0, workspaces=True)
+        c = endurance.plan_soak_minute(1, seed=42, load_scale=1.0, workspaces=True)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(len(a), 44)  # 30 + 5 + 5 + 2 + 1 + 1
+
+        counts = {}
+        for item in a:
+            counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+            if item["kind"] == "new_input":
+                self.assertGreaterEqual(item["size_bytes"], 10 * endurance.MIB)
+                self.assertLessEqual(item["size_bytes"], 100 * endurance.MIB)
+            if item["kind"] == "output":
+                self.assertEqual(item["size_bytes"], 50 * endurance.MIB)
+        self.assertEqual(
+            counts,
+            {"noop": 30, "new_input": 5, "reused_input": 5, "output": 2, "workspace_sync": 1, "cancel": 1},
+        )
+
+        no_ws = endurance.plan_soak_minute(0, seed=42, load_scale=1.0, workspaces=False)
+        self.assertEqual(len(no_ws), 43)
+
+        faults_full = endurance.plan_soak_faults(24 * 3600.0, fault_scale=1.0, n_workers=3)
+        kinds_full = {f["kind"] for f in faults_full}
+        self.assertEqual(kinds_full, {"worker_kill", "link_cut", "queue_burst", "master_restart"})
+
+        faults_45m = endurance.plan_soak_faults(45 * 60.0, fault_scale=0.25, n_workers=3)
+        kinds_45m = {}
+        for f in faults_45m:
+            kinds_45m[f["kind"]] = kinds_45m.get(f["kind"], 0) + 1
+        self.assertGreaterEqual(kinds_45m.get("worker_kill", 0), 8)
+        self.assertGreaterEqual(kinds_45m.get("link_cut", 0), 5)
+        self.assertGreaterEqual(kinds_45m.get("queue_burst", 0), 2)
+        self.assertGreaterEqual(kinds_45m.get("master_restart", 0), 1)
+
+    def test_soak_ledger_retries_refusals_and_allowed_outcomes(self):
+        lg = endurance.TaskLedger()
+        lg.record_submit("t-ok", expected_hash="h1", expected_outcome="ok", kind="new_input")
+        lg.record_retry("t-ok", 2)
+        lg.record_result("t-ok", actual_hash="h1", outcome="ok", worker_id="w0")
+
+        lg.record_submit("t-cancel", expected_outcome="cancelled", kind="cancel", allowed_outcomes=("cancelled",))
+        lg.record_result("t-cancel", outcome="cancelled", worker_id="w1")
+        lg.record_submit_refusal("queue_burst", "Queue is full (capacity: 64)")
+
+        audit = lg.audit()
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["submitted"], 2)
+        self.assertEqual(audit["completed"], 2)
+        self.assertEqual(audit["retries_total"], 2)
+        self.assertEqual(audit["retried_tasks"], 1)
+        self.assertEqual(audit["refusals"], 1)
+        self.assertEqual(audit["refusals_by_kind"], {"queue_burst": 1})
+        self.assertEqual(audit["by_kind"]["cancel"]["failed_check"], 0)
+
+    def _make_recorded_soak(self, *, hours_24: bool = False):
+        if hours_24:
+            duration_s = 24 * 3600.0
+            times = [0.0, 3600.0, 4800.0, 6000.0, 82800.0, 84000.0, 85200.0, 86400.0]
+        else:
+            duration_s = 2700.0
+            times = [0.0, 450.0, 750.0, 1050.0, 1950.0, 2250.0, 2600.0]
+
+        samples = [
+            {
+                "t_s": t,
+                "processes": {
+                    "master": {"rss_bytes": 60 * endurance.MIB, "handles": 120},
+                    "worker0": {"rss_bytes": 40 * endurance.MIB, "handles": 90},
+                },
+                "dirs": {
+                    "blob_store_bytes": 100 * endurance.MIB,
+                    "worker_cache_w0_bytes": 50 * endurance.MIB,
+                },
+            }
+            for t in times
+        ]
+        probes = [{"t_s": t, "latency_ms": 20.0, "ok": True} for t in times if t > 0]
+        lg = endurance.TaskLedger()
+        lg.record_submit("t1", expected_hash="abc", kind="new_input")
+        lg.record_result("t1", actual_hash="abc", outcome="ok")
+        return {
+            "ledger_audit": lg.audit(),
+            "samples": samples,
+            "probes": probes,
+            "duration_s": duration_s,
+            "blob_store_limit_bytes": 256 * endurance.MIB,
+            "worker_cache_limit_bytes": 128 * endurance.MIB,
+            "pinned_headroom_bytes": 64 * endurance.MIB,
+            "idle_sandbox_entries": {"w0": ["cache", ".locks"], "w1": ["cache", ".locks"]},
+            "tmp_leftovers": {"master_blobs_tmp": [], "w0_cache_tmp": [], "w0_locks": [], "w1_locks": []},
+            "compactions": [{"before_bytes": 50000, "after_bytes": 24}],
+            "leftover_pids": [],
+            "idle_blob_store_bytes": 100 * endurance.MIB,
+            "idle_worker_cache_bytes": {"w0": 50 * endurance.MIB},
+            "master_duplicate_executions": 0,
+        }
+
+    def test_evaluate_soak_pass_checks_pass_and_fail_cases(self):
+        # Clean 24-hour and clean 45-minute recorded inputs both pass D3 item 6
+        rec24 = self._make_recorded_soak(hours_24=True)
+        res24 = endurance.evaluate_soak_pass_checks(**rec24)
+        self.assertTrue(res24["all_passed"])
+        self.assertEqual(res24["checks"]["2_resource_plateau"]["mode"], "hour2_vs_last_hour")
+
+        rec45 = self._make_recorded_soak(hours_24=False)
+        res45 = endurance.evaluate_soak_pass_checks(**rec45)
+        self.assertTrue(res45["all_passed"])
+        self.assertEqual(res45["checks"]["2_resource_plateau"]["mode"], "short_run_early_vs_late")
+
+        # 1) Master duplicate execution / lost task fails 1_accounting
+        bad1 = self._make_recorded_soak(hours_24=False)
+        bad1["master_duplicate_executions"] = 1
+        r1 = endurance.evaluate_soak_pass_checks(**bad1)
+        self.assertFalse(r1["all_passed"])
+        self.assertFalse(r1["checks"]["1_accounting"]["passed"])
+
+        # 2) Last-hour memory or handle drift fails 2_resource_plateau
+        bad2 = self._make_recorded_soak(hours_24=True)
+        for s in bad2["samples"]:
+            if s["t_s"] >= 82800.0:
+                s["processes"]["master"]["handles"] = 160
+        r2 = endurance.evaluate_soak_pass_checks(**bad2)
+        self.assertFalse(r2["checks"]["2_resource_plateau"]["passed"])
+
+        # 3a) Non-shrinking journal fails 3_disk_and_journal
+        bad3a = self._make_recorded_soak(hours_24=False)
+        bad3a["compactions"] = [{"before_bytes": 50000, "after_bytes": 50000}]
+        r3a = endurance.evaluate_soak_pass_checks(**bad3a)
+        self.assertFalse(r3a["checks"]["3_disk_and_journal"]["journal_compaction_ok"])
+        self.assertFalse(r3a["checks"]["3_disk_and_journal"]["passed"])
+
+        # 3b) Leftover file/dir beside cache/ and .locks/ in idle sandbox or stray .lock fails 3_disk_and_journal
+        bad3b = self._make_recorded_soak(hours_24=False)
+        bad3b["idle_sandbox_entries"]["w0"] = ["cache", ".locks", "orphan-task-dir"]
+        r3b = endurance.evaluate_soak_pass_checks(**bad3b)
+        self.assertFalse(r3b["checks"]["3_disk_and_journal"]["sandbox_ok"])
+        self.assertFalse(r3b["checks"]["3_disk_and_journal"]["passed"])
+
+        bad3c = self._make_recorded_soak(hours_24=False)
+        bad3c["tmp_leftovers"]["w0_locks"] = ["stray.lock"]
+        r3c = endurance.evaluate_soak_pass_checks(**bad3c)
+        self.assertFalse(r3c["checks"]["3_disk_and_journal"]["sandbox_ok"])
+        self.assertFalse(r3c["checks"]["3_disk_and_journal"]["passed"])
+
+        # 4) Probe p99 ratio > 1.5x fails 4_probe_p99
+        bad4 = self._make_recorded_soak(hours_24=True)
+        bad4["probes"].append({"t_s": 85500.0, "latency_ms": 40.0, "ok": True})
+        r4 = endurance.evaluate_soak_pass_checks(**bad4)
+        self.assertFalse(r4["checks"]["4_probe_p99"]["passed"])
+
+        # 5) Leftover PID fails 5_clean_stop
+        bad5 = self._make_recorded_soak(hours_24=False)
+        bad5["leftover_pids"] = [999999]
+        r5 = endurance.evaluate_soak_pass_checks(**bad5)
+        self.assertFalse(r5["checks"]["5_clean_stop"]["passed"])
+        self.assertFalse(r5["all_passed"])
+
+    def test_audit_master_log_texts_ansi_and_failovers(self):
+        gen0 = "\n".join(
+            [
+                "\x1b[32mINFO\x1b[0m Task execution result received \x1b[2mworker_id=\x1b[0mw0 \x1b[2mtask_id=\x1b[0maaaaaaaa-1111-2222-3333-444444444444 exit_code=0",
+                "\x1b[33mWARN\x1b[0m Worker disconnected; executing failover sweep worker_id=w0",
+                "\x1b[32mINFO\x1b[0m Reaper triggered task failover reassignment count=2",
+                "\x1b[32mINFO\x1b[0m \x1b[2mtask_id=\x1b[0maaaaaaaa-1111-2222-3333-444444444444 Task execution result received exit_code=0",
+                "DEBUG Ignored result from a worker/session that does not own the task",
+                "DEBUG Ignoring result for terminal task",
+            ]
+        )
+        gen1 = "\x1b[32mINFO\x1b[0m Task execution result received task_id=bbbbbbbb-1111-2222-3333-444444444444 exit_code=0\n"
+        audit = endurance.audit_master_log_texts([gen0, gen1])
+        self.assertEqual(audit["master_generations"], 2)
+        self.assertEqual(audit["result_messages_logged"], 3)
+        self.assertEqual(audit["unique_result_tasks"], 2)
+        self.assertEqual(audit["multi_result_tasks"], {"aaaaaaaa-1111-2222-3333-444444444444": 2})
+        self.assertEqual(audit["failover_sweeps"], 1)
+        self.assertEqual(audit["reaper_failovers"], 2)
+        self.assertEqual(audit["requeues_logged"], 2)
+        self.assertEqual(audit["stale_results_ignored"], 1)
+        self.assertEqual(audit["late_results_ignored"], 1)
+        self.assertEqual(audit["queue_record_errors"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
