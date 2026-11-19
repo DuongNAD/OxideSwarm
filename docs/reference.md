@@ -746,7 +746,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands
 | Subcommand | Flags / Aliases | Description |
 | :--- | :--- | :--- |
-| `oxideswarm status` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
+| `oxideswarm status` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics (counting `cancelled_tasks` apart from `failed_tasks` in protocol 11+), a specific task's status (`--task-id`), or connected workers (`--workers`) |
 | `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
 | `oxideswarm workspaces` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |

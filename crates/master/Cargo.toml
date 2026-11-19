@@ -200,5 +200,5 @@ required-features = ["dashboard"]
 
 
 [[test]]
-name = "window_v9_peers"
-path = "../../tests/window_v9_peers.rs"
+name = "window_v10_peers"
+path = "../../tests/window_v10_peers.rs"

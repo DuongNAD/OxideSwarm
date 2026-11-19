@@ -173,6 +173,7 @@ and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 
 Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged): 216 distinct items, 144 Implemented, 18 Partial and 54 Planned; 26 remaining open items are In and 46 are Out.
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
+Recounted on 2026-11-19 from the rows, with BUG-22 Partial (draft, design 0098): 225 items, 152 Implemented, 19 Partial and 54 Planned; 23 open items are In and 50 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -359,7 +360,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
-| BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
+| BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Partial | In | (draft) |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
 | BUG-25 | Hand a task back to the master when the worker's sandbox base is unusable at assignment | P2 | S |  |  | Implemented |  | 299 |
@@ -1301,6 +1302,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   for the next wire change after 0.4.0.
 - **Owner decision (2026-11-19):** no protocol bump for BUG-22 alone; it goes into the next planned wire
   change.
+- **Partial (2026-11-19, draft, [design 0098](design/0098-protocol-11-train.md)):** implements the base of the shared protocol 11 train (`PROTOCOL_VERSION_CURRENT = 11`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 10`, `v0.4.4` in `wire_layout_previous.txt`): adds `cancelled_tasks: usize` to `ClientResponse::ClusterStatus` (`ClientResponse::for_peer(10)` folds it into `failed_tasks`; `LegacyV10BinaryClientResponse` / `HumanLegacyV10ClientResponse` omit it for v10 peers), separates failed vs. cancelled in `TaskQueue::cluster_buckets`, displays `cancelled_tasks` in `oxideswarm status`, `status --json`, and MCP `status`, and verifies `1` and `1` end to end in `test_status_cancelled_tasks` and `window_v10_peers`. Remains `Partial` in a draft pull request until the `0.4.x` stability release ships and follow-on protocol 11 wire pull requests (`NET-10`, `ECO-9`) merge and release.
 
 ## Phase 13: the path to finished
 
@@ -2405,3 +2407,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
+- 2026-11-19: BUG-22 Partial (draft, [design 0098](design/0098-protocol-11-train.md)): implements the protocol 11 train base (`PROTOCOL_VERSION_CURRENT = 11`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 10`, `v0.4.4` in `wire_layout_previous.txt`) with `cancelled_tasks: usize` in `ClientResponse::ClusterStatus`, `TaskQueue::cluster_buckets`, `oxideswarm status` / `--json`, MCP `status`, and v10 peer folding (`ClientResponse::for_peer(10)`), verified by `window_v10_peers` and `test_status_cancelled_tasks`; stays Partial in draft until the stability release and train wire PRs (`NET-10`, `ECO-9`) merge and release.

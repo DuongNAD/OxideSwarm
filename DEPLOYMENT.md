@@ -273,17 +273,17 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 
 ### 3.5 Upgrading a running grid (master and workers)
 `Task`, `TaskResult`, and message frames are encoded positionally with bincode. Workers, clients, and the master
-exchange `PROTOCOL_VERSION_CURRENT` (version 10 in releases `0.4.0` to `0.4.4`, 9 in `0.3.0`). **A master accepts one version back**
+exchange `PROTOCOL_VERSION_CURRENT` (version `11` on the protocol 11 train, `10` in releases `0.4.0` to `0.4.4`, `9` in `0.3.0`). **A master accepts one version back**
 (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT - 1`, the window of `docs/design/0083-one-version-window.md`):
-a `0.4.0` (protocol 10) master serves `0.3.0` (protocol 9) workers and clients, which keep working unchanged while you
-upgrade them one at a time; a task copy sent to a protocol 9 worker has no extension lists (an extension a worker must
-understand is never placed on it), and `oxideswarm workers` lists such a worker with the tag `proto:9`. A worker or
+a protocol `11` master serves `0.4.x` (`protocol 10`) workers and clients, which keep working unchanged while you
+upgrade them one at a time (a `ClusterStatus` reply sent to a protocol `10` client folds `cancelled_tasks` into
+`failed_tasks`), and `oxideswarm workers` lists a `protocol 10` worker with the tag `proto:10`. A worker or
 client takes from the master only an echo of its own version, so a newer worker or client is still refused by an older
-master (`10` refused by `9`): the window protects a newer master from older peers, never the reverse. A pull request
+master (`11` refused by `10`): the window protects a newer master from older peers, never the reverse. A pull request
 that cannot be additive closes the window for its version (`MIN == CURRENT`); the release notes say so. When the master
-later moves to protocol 11, every worker still on 9 is refused: finish the worker upgrade first (`proto:<n>` shows who
-is behind; the master also logs a warning once per session). Each side refuses any peer outside its
-`PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`.
+moves to protocol `11`, every worker or client still on `9` (`v0.3.0`) is refused: finish upgrading any `proto:9` peers
+to `0.4.x` (`proto:10`) before upgrading the master (`proto:<n>` shows who is behind; the master also logs a warning
+once per session). Each side refuses any peer outside its `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`.
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`
 and `ClientResponse` (unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and
 `connect_master` runs a side-effect-free `Hello` version check before sending any state-changing request so a

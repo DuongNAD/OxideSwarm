@@ -1576,6 +1576,7 @@ async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires
                                     running_tasks: 0,
                                     completed_tasks: 0,
                                     failed_tasks: 0,
+                                    cancelled_tasks: 0,
                                     active_bytes: 0,
                                     max_active_bytes: 0,
                                     store_error: None,

@@ -846,11 +846,9 @@ enum HumanMasterMessage {
     },
 }
 
-/// The bincode mirror of [`MasterMessage`], generic over the task type so the v10 form
-/// (`Task`) and the v9 form (`LegacyV9Task`, design 0083 D3) are one definition and cannot
-/// disagree on variant order.
+/// The bincode mirror of [`MasterMessage`] (`MasterMessage` layout is shared across v10 and v11).
 #[derive(Serialize, Deserialize)]
-pub(super) enum BinaryMasterMessage<T = Task> {
+pub(super) enum BinaryMasterMessage {
     RegisterAck {
         accepted: bool,
         worker_id: Uuid,
@@ -865,10 +863,10 @@ pub(super) enum BinaryMasterMessage<T = Task> {
         timestamp: u64,
     },
     AssignTask {
-        task: T,
+        task: Task,
     },
     AssignTaskWithCheckpoint {
-        task: T,
+        task: Task,
         latest_checkpoint: Option<CheckpointData>,
     },
     CancelTask {
@@ -882,7 +880,7 @@ pub(super) enum BinaryMasterMessage<T = Task> {
     RoleHandoverAck {
         accepted: bool,
         reason: Option<String>,
-        task_queue_snapshot: Vec<T>,
+        task_queue_snapshot: Vec<Task>,
         connected_workers: Vec<WorkerCapabilities>,
     },
     UnknownVariant {
@@ -1084,7 +1082,7 @@ impl From<HumanMasterMessage> for MasterMessage {
     }
 }
 
-impl From<MasterMessage> for BinaryMasterMessage<Task> {
+impl From<MasterMessage> for BinaryMasterMessage {
     fn from(msg: MasterMessage) -> Self {
         match msg {
             MasterMessage::RegisterAck {
@@ -1144,8 +1142,8 @@ impl From<MasterMessage> for BinaryMasterMessage<Task> {
     }
 }
 
-impl<T: Into<Task>> From<BinaryMasterMessage<T>> for MasterMessage {
-    fn from(msg: BinaryMasterMessage<T>) -> Self {
+impl From<BinaryMasterMessage> for MasterMessage {
+    fn from(msg: BinaryMasterMessage) -> Self {
         match msg {
             BinaryMasterMessage::RegisterAck {
                 accepted,
@@ -1165,14 +1163,12 @@ impl<T: Into<Task>> From<BinaryMasterMessage<T>> for MasterMessage {
             BinaryMasterMessage::HeartbeatAck { timestamp } => {
                 MasterMessage::HeartbeatAck { timestamp }
             }
-            BinaryMasterMessage::AssignTask { task } => {
-                MasterMessage::AssignTask { task: task.into() }
-            }
+            BinaryMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
             BinaryMasterMessage::AssignTaskWithCheckpoint {
                 task,
                 latest_checkpoint,
             } => MasterMessage::AssignTaskWithCheckpoint {
-                task: task.into(),
+                task,
                 latest_checkpoint,
             },
             BinaryMasterMessage::CancelTask { task_id, reason } => {
@@ -1193,7 +1189,7 @@ impl<T: Into<Task>> From<BinaryMasterMessage<T>> for MasterMessage {
             } => MasterMessage::RoleHandoverAck {
                 accepted,
                 reason,
-                task_queue_snapshot: task_queue_snapshot.into_iter().map(Into::into).collect(),
+                task_queue_snapshot,
                 connected_workers,
             },
             BinaryMasterMessage::UnknownVariant { tag, raw_bytes } => {
@@ -1201,66 +1197,6 @@ impl<T: Into<Task>> From<BinaryMasterMessage<T>> for MasterMessage {
             }
             BinaryMasterMessage::BlobReply { request_id, reply } => {
                 MasterMessage::BlobReply { request_id, reply }
-            }
-        }
-    }
-}
-
-impl BinaryMasterMessage<Task> {
-    /// Maps every task the message carries (`AssignTask`, `AssignTaskWithCheckpoint` and the
-    /// `RoleHandoverAck` snapshot) and leaves every other variant as it is.
-    fn map_task<U>(self, mut f: impl FnMut(Task) -> U) -> BinaryMasterMessage<U> {
-        match self {
-            Self::RegisterAck {
-                accepted,
-                worker_id,
-                heartbeat_interval_secs,
-                protocol_version,
-                features,
-                message,
-            } => BinaryMasterMessage::RegisterAck {
-                accepted,
-                worker_id,
-                heartbeat_interval_secs,
-                protocol_version,
-                features,
-                message,
-            },
-            Self::HeartbeatAck { timestamp } => BinaryMasterMessage::HeartbeatAck { timestamp },
-            Self::AssignTask { task } => BinaryMasterMessage::AssignTask { task: f(task) },
-            Self::AssignTaskWithCheckpoint {
-                task,
-                latest_checkpoint,
-            } => BinaryMasterMessage::AssignTaskWithCheckpoint {
-                task: f(task),
-                latest_checkpoint,
-            },
-            Self::CancelTask { task_id, reason } => {
-                BinaryMasterMessage::CancelTask { task_id, reason }
-            }
-            Self::Shutdown {
-                reason,
-                grace_period_secs,
-            } => BinaryMasterMessage::Shutdown {
-                reason,
-                grace_period_secs,
-            },
-            Self::RoleHandoverAck {
-                accepted,
-                reason,
-                task_queue_snapshot,
-                connected_workers,
-            } => BinaryMasterMessage::RoleHandoverAck {
-                accepted,
-                reason,
-                task_queue_snapshot: task_queue_snapshot.into_iter().map(f).collect(),
-                connected_workers,
-            },
-            Self::UnknownVariant { tag, raw_bytes } => {
-                BinaryMasterMessage::UnknownVariant { tag, raw_bytes }
-            }
-            Self::BlobReply { request_id, reply } => {
-                BinaryMasterMessage::BlobReply { request_id, reply }
             }
         }
     }
@@ -1314,34 +1250,12 @@ pub(super) fn master_message_for_peer(msg: &MasterMessage, peer_version: u32) ->
     }
 }
 
-/// The bincode payload of a [`MasterMessage`] for a v9 worker: the v10 form with
-/// [`super::client_msg_mirrors::LegacyV9Task`] in place of `Task`. `msg` has already been through
-/// [`master_message_for_peer`].
-pub(super) fn serialize_master_message_v9_bincode(
-    msg: MasterMessage,
-) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
-    use super::client_msg_mirrors::LegacyV9Task;
-    let wire = BinaryMasterMessage::<Task>::from(msg).map_task(LegacyV9Task::from);
-    bincode::serialize(&wire)
-}
-
-/// Reads a bincode [`MasterMessage`] in the v9 layout (a frozen reader for tests, design 0083).
-#[cfg(any(test, feature = "test-extensions"))]
-pub(super) fn deserialize_master_message_v9_bincode(
-    slice: &[u8],
-) -> Result<MasterMessage, super::ProtocolError> {
-    use super::client_msg_mirrors::LegacyV9Task;
-    let wire: BinaryMasterMessage<LegacyV9Task> =
-        super::codec::bincode_exact_deserialize(slice).map_err(super::ProtocolError::Bincode)?;
-    Ok(wire.into())
-}
-
 impl Serialize for MasterMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             HumanMasterMessage::from(self.clone()).serialize(serializer)
         } else {
-            BinaryMasterMessage::<Task>::from(self.clone()).serialize(serializer)
+            BinaryMasterMessage::from(self.clone()).serialize(serializer)
         }
     }
 }
@@ -1351,7 +1265,7 @@ impl<'de> Deserialize<'de> for MasterMessage {
         if deserializer.is_human_readable() {
             HumanMasterMessage::deserialize(deserializer).map(Into::into)
         } else {
-            BinaryMasterMessage::<Task>::deserialize(deserializer).map(Into::into)
+            BinaryMasterMessage::deserialize(deserializer).map(Into::into)
         }
     }
 }
