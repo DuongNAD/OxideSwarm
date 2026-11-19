@@ -1,6 +1,6 @@
 # 0097: Per-participant quotas and participant labels (`ECO-9` and `ENROLL-1c` step 2)
 
-Status: Draft (Master-side quotas, store format 5 + ENROLL-1c step 2, and dashboard API/UI implemented on draft PR; Wire change: deferred to the protocol 11 train with BUG-22 and NET-10)
+Status: Draft (Master-side quotas, store format 5 + ENROLL-1c step 2, and dashboard API/UI implemented on draft PR 384; Wire change: deferred to the protocol 11 train with BUG-22 and NET-10)
 Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
@@ -296,4 +296,4 @@ pub struct MembersFile {
 ## Status log
 
 - 2026-11-19: Claimed `design 0097` on the hub and wrote initial design record for `ECO-9` and `ENROLL-1c` step 2 on branch `mac/eco-9-participant-quotas`.
-- 2026-11-19: Implemented master participant labels/quotas (`ECO-9`), `TaskStore` format `4 -> 5` and `ENROLL-1c` step 2 revocation cancellation, master CLI/TOML flags, RBAC HTTP `/api/quotas*` + `/api/members/{member_id}/participant` endpoints, Cockpit card, and 7-test loopback suite (`test_eco9_participant_quotas` passed `3/3` consecutive runs on macOS); protocol 11 CLI RPC fields remain deferred with `BUG-22` and `NET-10`.
+- 2026-11-19: Implemented master participant labels/quotas (`ECO-9`), `TaskStore` format `4 -> 5` and `ENROLL-1c` step 2 revocation cancellation, master CLI/TOML flags, RBAC HTTP `/api/quotas*` + `/api/members/{member_id}/participant` endpoints, Cockpit card, and 7-test loopback suite (`test_eco9_participant_quotas` passed `3/3` consecutive runs on macOS) on draft pull request 384; protocol 11 CLI RPC fields remain deferred with `BUG-22` and `NET-10`.

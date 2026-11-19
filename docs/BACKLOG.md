@@ -317,7 +317,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | Out | 163 |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  | Yes | Partial | In | 159 |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Implemented |  | 162, 175, 187, 189 |
-| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051, 0097), 190, 201, 328 |
+| ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051, 0097), 190, 201, 328, 384 (open) |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented |  | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | In | (design 0053), 185, 195, 207, 228 |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented |  | 204 (design 0055) |
@@ -404,7 +404,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
-| ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Partial | Out | (design 0094, 0097) |
+| ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Partial | Out | (design 0094, 0097), 384 (open) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376 (open), (design 0094) |
@@ -814,7 +814,7 @@ then JOIN-2 and USB-1 in parallel.
   loses every connection at once (worker sessions over TCP and QUIC, client connections over TCP
   and P2P, blob and MCP connections), and the tasks on its workers are requeued at once without the
   resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS.
-- **Status (2026-11-19, Partial):** ENROLL-1c, step 2 (`store format 5`, [design 0097](design/0097-per-participant-quotas.md)):
+- **Status (2026-11-19, Partial):** ENROLL-1c, step 2 (draft pull request 384, `store format 5`, [design 0097](design/0097-per-participant-quotas.md)):
   `TaskRecord` and `JournalEntry::TaskSubmitted` now persist `submitted_by_member`, `TaskStore::open`
   upgrades clean-shutdown format `4` snapshots automatically, and `RevokeMember` cancels active
   queued and running tasks submitted by the revoked member while notifying executing workers and leaving
@@ -1868,7 +1868,7 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   (`GET /api/quotas` with non-Admin D9 redaction, `POST /api/quotas/default`,
   `POST /api/quotas/participants/{participant}`, `POST /api/members/{member_id}/participant`),
   Cockpit quota card, and master CLI/TOML flags (`--default-participant-*`,
-  `--participant-quota`) are implemented on draft pull request ([design 0097](design/0097-per-participant-quotas.md));
+  `--participant-quota`) are implemented on draft pull request 384 ([design 0097](design/0097-per-participant-quotas.md));
   `crates/master/tests/test_eco9_participant_quotas.rs` (7 loopback tests) passes 3/3 consecutive
   runs on macOS. Protocol 10 wire definitions are unchanged; the CLI wire additions (`members list`
   label column, `status` wait/quota fields, `members label`, `invite --participant`) remain open
@@ -2443,4 +2443,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
-- 2026-11-19: ECO-9 Partial and ENROLL-1c step 2 complete ([design 0097](design/0097-per-participant-quotas.md)): added master participant labels, `GridError::QuotaExceeded` (`QUOTA_EXCEEDED`), priority-banded fair share, per-participant running/slot/queued caps, master CLI/TOML flags, RBAC HTTP `/api/quotas*` and `/api/members/{member_id}/participant` endpoints + Cockpit card, `TaskStore` format `4 -> 5` (`submitted_by_member` + clean-shutdown upgrade), and `RevokeMember` cancelling submitted tasks (`test_eco9_participant_quotas` 7/7 passed 3/3 runs on macOS); protocol 10 wire definitions stay unchanged with CLI wire fields deferred to the protocol 11 train with BUG-22 and NET-10.
+- 2026-11-19: ECO-9 Partial and ENROLL-1c step 2 complete (draft pull request 384, open, [design 0097](design/0097-per-participant-quotas.md)): added master participant labels, `GridError::QuotaExceeded` (`QUOTA_EXCEEDED`), priority-banded fair share, per-participant running/slot/queued caps, master CLI/TOML flags, RBAC HTTP `/api/quotas*` and `/api/members/{member_id}/participant` endpoints + Cockpit card, `TaskStore` format `4 -> 5` (`submitted_by_member` + clean-shutdown upgrade), and `RevokeMember` cancelling submitted tasks (`test_eco9_participant_quotas` 7/7 passed 3/3 runs on macOS); protocol 10 wire definitions stay unchanged with CLI wire fields deferred to the protocol 11 train with BUG-22 and NET-10.
