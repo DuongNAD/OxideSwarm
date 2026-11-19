@@ -1,6 +1,6 @@
 # 0096: Contribution credits per participant, display only (NET-10)
 
-Status: Draft (stops after the design record; awaits coordinator decision on bundling the `ClientResponse` wire change with BUG-22 and ECO-9)
+Status: Draft (stops after the design record; draft pull request 379 open awaiting coordinator decision on bundling the `ClientResponse` wire change with BUG-22 and ECO-9)
 Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
@@ -288,4 +288,4 @@ Once approved for implementation:
 
 ## Status log
 
-- 2026-11-19: Claimed `design 0096` on the hub and wrote initial `Draft` design for `NET-10` on branch `mac/net-10-contribution-credits`. Verified that showing credits in `oxideswarm members list` and `oxideswarm status` requires a `ClientResponse` wire change (`PROTOCOL_VERSION_CURRENT` currently `10`), and stopped before Rust/wire implementation awaiting coordinator decision.
+- 2026-11-19: Claimed `design 0096` on the hub and wrote initial `Draft` design for `NET-10` on branch `mac/net-10-contribution-credits` (draft pull request 379). Verified that showing credits in `oxideswarm members list` and `oxideswarm status` requires a `ClientResponse` wire change (`PROTOCOL_VERSION_CURRENT` currently `10`), and stopped before Rust/wire implementation awaiting coordinator decision.
