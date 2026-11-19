@@ -590,7 +590,14 @@ fn parse_owner_lock_id(file_name: &str) -> Option<Uuid> {
 }
 
 fn acquire_owner_lock(owners: &Path) -> io::Result<OwnerLockGuard> {
-    for _ in 0..8 {
+    acquire_owner_lock_with(owners, &mut |_| {})
+}
+
+fn acquire_owner_lock_with(
+    owners: &Path,
+    after_open: &mut dyn FnMut(&Path),
+) -> io::Result<OwnerLockGuard> {
+    for _ in 0..16 {
         let owner_id = Uuid::new_v4();
         let path = owners.join(format!("{owner_id}.lock"));
         let mut opts = std::fs::OpenOptions::new();
@@ -605,24 +612,32 @@ fn acquire_owner_lock(owners: &Path) -> io::Result<OwnerLockGuard> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
+        after_open(&path);
         match file.try_lock() {
             Ok(()) => {
-                return Ok(OwnerLockGuard {
-                    owner_id,
-                    path,
-                    file: Some(file),
-                });
+                let file_meta = match file.metadata() {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&path);
+                        let _ = file.unlock();
+                        drop(file);
+                        return Err(err);
+                    }
+                };
+                if crate::sandbox::lock_file_is_still_named(&path, &file, &file_meta) {
+                    return Ok(OwnerLockGuard {
+                        owner_id,
+                        path,
+                        file: Some(file),
+                    });
+                }
+                let _ = file.unlock();
+                drop(file);
+                continue;
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                let _ = std::fs::remove_file(&path);
                 drop(file);
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "owner lock '{}' was locked by another process",
-                        path.display()
-                    ),
-                ));
+                continue;
             }
             Err(std::fs::TryLockError::Error(err)) => {
                 let _ = std::fs::remove_file(&path);
@@ -1519,10 +1534,9 @@ mod tests {
             std::fs::write(&part_out, part.to_string_lossy().as_bytes()).unwrap();
             std::fs::write(&ready_out, b"ready").unwrap();
             // Hold the BlobCache owner lock until parent kills this process.
-            for _ in 0..600 {
-                std::thread::sleep(Duration::from_millis(100));
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
             }
-            return;
         }
 
         struct ChildKillGuard(Option<std::process::Child>);
@@ -1728,5 +1742,66 @@ mod tests {
             std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn acquire_owner_lock_retries_when_sibling_claims_or_unlinks_before_lock() {
+        // Case A: sibling acquires, unlinks, and drops the brand-new lock file between open and
+        // try_lock; acquire_owner_lock_with must detect the unlinked file and retry with a new UUID.
+        let dir = tempfile::tempdir().unwrap();
+        let owners = dir.path().join("owners");
+        std::fs::create_dir_all(&owners).unwrap();
+
+        let mut seen_paths: Vec<PathBuf> = Vec::new();
+        let guard_a = acquire_owner_lock_with(&owners, &mut |path| {
+            seen_paths.push(path.to_path_buf());
+            if seen_paths.len() == 1 {
+                let sibling = open_existing_owner_lock(path).unwrap();
+                sibling.try_lock().unwrap();
+                std::fs::remove_file(path).unwrap();
+                let _ = sibling.unlock();
+                drop(sibling);
+            }
+        })
+        .unwrap();
+        assert_eq!(seen_paths.len(), 2, "must retry once with a fresh UUID");
+        let first_id_a =
+            parse_owner_lock_id(seen_paths[0].file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_ne!(guard_a.owner_id, first_id_a);
+        assert!(guard_a.path.is_file());
+        drop(guard_a);
+        assert_eq!(std::fs::read_dir(&owners).unwrap().count(), 0);
+
+        // Case B: sibling holds the exclusive lock on attempt 0; acquire_owner_lock_with sees
+        // WouldBlock, leaves the sibling's lock untouched, and succeeds on attempt 1 with a new UUID.
+        let mut held_by_sibling: Option<File> = None;
+        let mut sibling_path: Option<PathBuf> = None;
+        let mut seen_b = 0usize;
+        let guard_b = acquire_owner_lock_with(&owners, &mut |path| {
+            seen_b += 1;
+            if seen_b == 1 {
+                let sibling = open_existing_owner_lock(path).unwrap();
+                sibling.try_lock().unwrap();
+                sibling_path = Some(path.to_path_buf());
+                held_by_sibling = Some(sibling);
+            }
+        })
+        .unwrap();
+        assert_eq!(seen_b, 2);
+        let sib_p = sibling_path.unwrap();
+        let sib_id = parse_owner_lock_id(sib_p.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_ne!(guard_b.owner_id, sib_id);
+        assert!(
+            sib_p.is_file(),
+            "sibling's held lock file must not be unlinked"
+        );
+        assert!(guard_b.path.is_file());
+        drop(guard_b);
+        if let Some(sib) = held_by_sibling {
+            let _ = std::fs::remove_file(&sib_p);
+            let _ = sib.unlock();
+            drop(sib);
+        }
+        assert_eq!(std::fs::read_dir(&owners).unwrap().count(), 0);
     }
 }
