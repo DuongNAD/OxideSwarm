@@ -203,6 +203,17 @@ pub enum GridError {
     /// this binary version, or could not be written.
     #[error("Storage error: {0}")]
     Storage(String),
+
+    /// A per-participant quota (`ECO-9`, design 0097) refused the submission.
+    #[error("Participant '{participant}' quota exceeded ({limit_kind}): {detail}")]
+    QuotaExceeded {
+        /// Canonical participant label or fallback identity (`"organiser"` / `member:<id>`).
+        participant: String,
+        /// Which quota refused the request (`max_queued_tasks`, `max_slots`, `priority_band`, etc.).
+        limit_kind: String,
+        /// Human-readable reason and configured ceiling.
+        detail: String,
+    },
 }
 
 impl GridError {
@@ -237,6 +248,7 @@ impl GridError {
             GridError::Config(_) => "CONFIG_ERROR",
             GridError::PortFile { .. } => "PORT_FILE_ERROR",
             GridError::Storage(_) => "STORAGE_ERROR",
+            GridError::QuotaExceeded { .. } => "QUOTA_EXCEEDED",
         }
     }
 
@@ -253,6 +265,7 @@ impl GridError {
                 max_bytes,
                 ..
             } => *task_bytes <= *max_bytes && *max_bytes > 0,
+            GridError::QuotaExceeded { limit_kind, .. } => limit_kind == "max_queued_tasks",
             GridError::Io(err) => matches!(
                 err.kind(),
                 io::ErrorKind::ConnectionReset
@@ -481,6 +494,32 @@ mod tests {
             !q_bytes_too_large.is_transient(),
             "a task larger than max_bytes can never fit by waiting"
         );
+
+        let q_queued = GridError::QuotaExceeded {
+            participant: "alice".into(),
+            limit_kind: "max_queued_tasks".into(),
+            detail: "2 queued tasks already active (limit 2)".into(),
+        };
+        assert_eq!(q_queued.error_code(), "QUOTA_EXCEEDED");
+        assert!(q_queued.is_transient());
+        assert!(q_queued.to_string().contains("alice"));
+        assert!(q_queued.to_string().contains("max_queued_tasks"));
+
+        let q_slots = GridError::QuotaExceeded {
+            participant: "alice".into(),
+            limit_kind: "max_slots".into(),
+            detail: "task requests 8 cores > max_slots 4".into(),
+        };
+        assert_eq!(q_slots.error_code(), "QUOTA_EXCEEDED");
+        assert!(!q_slots.is_transient());
+
+        let q_band = GridError::QuotaExceeded {
+            participant: "alice".into(),
+            limit_kind: "priority_band".into(),
+            detail: "requested 90 exceeds band max 33".into(),
+        };
+        assert_eq!(q_band.error_code(), "QUOTA_EXCEEDED");
+        assert!(!q_band.is_transient());
     }
 
     #[test]

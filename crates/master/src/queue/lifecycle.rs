@@ -1707,4 +1707,38 @@ impl TaskQueue {
 
         Ok(outcome)
     }
+
+    /// Cancels every non-terminal task originally submitted by `member_id` (`ENROLL-1c` step 2,
+    /// design 0051 D5). Returns `(task_id, outcome)` for every task newly transitioned to
+    /// `Cancelled` so callers can notify executing workers and wake waiting clients.
+    pub async fn cancel_tasks_submitted_by(
+        &self,
+        member_id: &str,
+        reason: &str,
+    ) -> Vec<(TaskId, CancelOutcome)> {
+        let target_ids: Vec<TaskId> = {
+            let inner = self.inner.read().await;
+            inner
+                .active_sizes
+                .keys()
+                .filter_map(|id| inner.tasks.get(id))
+                .filter(|e| {
+                    !e.state.is_terminal() && e.submitted_by_member.as_deref() == Some(member_id)
+                })
+                .map(|e| e.task.id)
+                .collect()
+        };
+        let mut outcomes = Vec::with_capacity(target_ids.len());
+        for tid in target_ids {
+            if let Ok(outcome) = self
+                .cancel_task_detailed(&tid, Some(reason.to_string()))
+                .await
+            {
+                if outcome.newly_cancelled {
+                    outcomes.push((tid, outcome));
+                }
+            }
+        }
+        outcomes
+    }
 }

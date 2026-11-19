@@ -1143,6 +1143,16 @@
                     <div class="topology-diagram" id="topologyDiagram">Đang dựng sơ đồ topology...</div>
                 </div>
 
+                <!-- PARTICIPANT QUOTAS CARD (ECO-9) -->
+                <div class="topology-card" id="quotasCard">
+                    <div class="topology-header">
+                        <span>⚖️ PARTICIPANT QUOTAS & FAIR SHARE</span>
+                        <span class="topo-badge" id="quotasDefaultBadge">default: uncapped</span>
+                    </div>
+                    <div id="quotasTrustNote" style="font-size:11px; color:var(--text-dim); margin:4px 0 8px 0;"></div>
+                    <div id="quotasTableWrap" style="overflow-x:auto; font-size:12px;">Waiting for quota status...</div>
+                </div>
+
                 <div class="devices-list" id="deviceList">
                 </div>
             </div>
@@ -2379,6 +2389,84 @@
                 console.error("Render error:", e);
                 throw e;
             }
+            refreshQuotas().catch(() => {});
+        }
+
+        function fmtQuotaLim(used, limit) {
+            return limit !== null && limit !== undefined ? `${used}/${limit}` : `${used}/∞`;
+        }
+
+        function renderQuotas(dto) {
+            const noteEl = document.getElementById('quotasTrustNote');
+            const defEl = document.getElementById('quotasDefaultBadge');
+            const wrap = document.getElementById('quotasTableWrap');
+            if (!wrap || !dto || typeof dto !== 'object') return;
+            if (noteEl) noteEl.textContent = dto.trust_note || '';
+            if (defEl && dto.default_quota) {
+                const dq = dto.default_quota;
+                const parts = [];
+                if (dq.max_running_tasks != null) parts.push(`run:${dq.max_running_tasks}`);
+                if (dq.max_slots != null) parts.push(`slots:${dq.max_slots}`);
+                if (dq.max_queued_tasks != null) parts.push(`queued:${dq.max_queued_tasks}`);
+                if (dq.priority_band) parts.push(`band:${dq.priority_band}`);
+                defEl.textContent = parts.length ? `default: ${parts.join(' ')}` : 'default: uncapped';
+            }
+            const rows = Array.isArray(dto.participants) ? dto.participants : [];
+            wrap.replaceChildren();
+            if (rows.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.color = 'var(--text-dim)';
+                empty.textContent = 'No active or configured participant quotas yet.';
+                wrap.appendChild(empty);
+                return;
+            }
+            const tbl = document.createElement('table');
+            tbl.style.width = '100%';
+            tbl.style.borderCollapse = 'collapse';
+            const thead = document.createElement('thead');
+            const htr = document.createElement('tr');
+            for (const h of ['Participant', 'Running', 'Slots', 'Queued', 'Band', 'Wt', 'Wait']) {
+                const th = document.createElement('th');
+                th.textContent = h;
+                th.style.textAlign = 'left';
+                th.style.padding = '4px 6px';
+                th.style.borderBottom = '1px solid var(--border)';
+                htr.appendChild(th);
+            }
+            thead.appendChild(htr);
+            tbl.appendChild(thead);
+            const tbody = document.createElement('tbody');
+            for (const row of rows) {
+                const tr = document.createElement('tr');
+                const eq = row.effective_quota || {};
+                const u = row.usage || {};
+                const cells = [
+                    row.participant || '-',
+                    fmtQuotaLim(u.running_tasks || 0, eq.max_running_tasks),
+                    fmtQuotaLim(u.running_slots || 0, eq.max_slots),
+                    fmtQuotaLim(u.queued_tasks || 0, eq.max_queued_tasks),
+                    eq.priority_band || 'none',
+                    String(row.fair_share_weight || 1),
+                    row.wait_reason || 'active',
+                ];
+                for (const text of cells) {
+                    const td = document.createElement('td');
+                    td.textContent = text;
+                    td.style.padding = '4px 6px';
+                    td.style.borderBottom = '1px solid var(--surface-subtle)';
+                    tr.appendChild(td);
+                }
+                tbody.appendChild(tr);
+            }
+            tbl.appendChild(tbody);
+            wrap.appendChild(tbl);
+        }
+
+        async function refreshQuotas() {
+            const res = await apiFetch('/api/quotas');
+            if (!res.ok) return;
+            const dto = await res.json();
+            renderQuotas(dto);
         }
         syncData().catch(() => {});
         setInterval(() => syncData().catch(() => {}), 3000);

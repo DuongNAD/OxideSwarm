@@ -25,13 +25,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::{
     rbac_auth_middleware, resolve_dashboard_auth, security_headers_middleware, AuthConfig,
-    AuthIdentity,
+    AuthIdentity, AuthScope,
 };
 use crate::dashboard::dto::{
     ClusterSnapshotDto, ClusterStatusDto, DashboardStreamMessage, TaskQueryParams,
     WorkerSummaryDto, DEFAULT_TASK_LIST_LIMIT, MAX_TASK_LIST_LIMIT, SNAPSHOT_MAX_TASKS,
 };
+use crate::fair_share::SubmitterId;
 use crate::queue::{TaskInfo, TaskQueue};
+use crate::quotas::{
+    ParticipantQuota, PriorityBand, QuotaController, QuotasSnapshotDto, MEMBER_PARTICIPANT_PREFIX,
+};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use rusty_grid_core::mode::{
     dispatch_mode_action, find_workspace_root, get_mode_descriptors, ModeDescriptor,
@@ -80,6 +84,7 @@ pub struct WebUiState {
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     pub modes_state: Arc<tokio::sync::Mutex<ModesRunState>>,
     pub master_handle: Option<crate::server::MasterHandle>,
+    pub quota_controller: Option<Arc<QuotaController>>,
     pub p2p_ticket: Option<String>,
     pub broadcast_tx: broadcast::Sender<DashboardStreamMessage>,
     pub server_addr: SocketAddr,
@@ -169,12 +174,16 @@ pub fn create_web_ui_state(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let quota_controller = master_handle
+        .as_ref()
+        .map(|h| Arc::clone(h.quota_controller()));
     WebUiState {
         registry,
         queue,
         scheduler_notify,
         modes_state,
         master_handle,
+        quota_controller,
         p2p_ticket,
         broadcast_tx,
         server_addr,
@@ -282,12 +291,16 @@ pub fn create_web_ui_router_full(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let quota_controller = master_handle
+        .as_ref()
+        .map(|h| Arc::clone(h.quota_controller()));
     let state = WebUiState {
         registry,
         queue,
         scheduler_notify,
         modes_state,
         master_handle,
+        quota_controller,
         p2p_ticket,
         broadcast_tx,
         server_addr,
@@ -308,6 +321,17 @@ pub fn create_web_ui_router_full(
         .route("/api/workers", get(api_get_workers))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
         .route("/api/tasks/{task_id}", get(api_get_task_standardized))
+        // Per-Participant Quota & Label APIs (`ECO-9`)
+        .route("/api/quotas", get(api_get_quotas))
+        .route("/api/quotas/default", post(api_set_default_quota))
+        .route(
+            "/api/quotas/participants/{participant}",
+            post(api_set_participant_quota),
+        )
+        .route(
+            "/api/members/{member_id}/participant",
+            post(api_set_member_participant),
+        )
         // Discovery & Rendezvous Probe APIs
         .route("/api/discovery/probe", get(api_discovery_probe))
         .route("/api/rendezvous/register", post(api_rendezvous_register))
@@ -812,6 +836,9 @@ struct SubmitTaskPayload {
     /// Minimum GPU VRAM the task needs in MB (default none). Implies `gpu_required`.
     #[serde(default)]
     vram_mb: Option<u64>,
+    /// Optional numeric priority (`ECO-9` priority band checked when configured).
+    #[serde(default)]
+    priority: Option<u32>,
 }
 
 impl SubmitTaskPayload {
@@ -862,14 +889,9 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-async fn api_submit_task(
-    State(state): State<WebUiState>,
-    payload: Result<Json<SubmitTaskPayload>, JsonRejection>,
-) -> Response {
-    // A body that does not parse is the caller's mistake and is answered with 400 and the reason;
-    // it used to run a default `echo` and report success.
-    let Json(payload) = match payload {
-        Ok(payload) => payload,
+fn extract_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, Box<Response>> {
+    match payload {
+        Ok(Json(value)) => Ok(value),
         Err(rejection) => {
             let status = match rejection.status() {
                 StatusCode::UNPROCESSABLE_ENTITY | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
@@ -877,15 +899,60 @@ async fn api_submit_task(
                 }
                 other => other,
             };
-            return json_error(status, rejection.body_text());
+            Err(Box::new(json_error(status, rejection.body_text())))
         }
+    }
+}
+
+async fn api_submit_task(
+    State(state): State<WebUiState>,
+    payload: Result<Json<SubmitTaskPayload>, JsonRejection>,
+) -> Response {
+    // A body that does not parse is the caller's mistake and is answered with 400 and the reason;
+    // it used to run a default `echo` and report success.
+    let payload = match extract_json(payload) {
+        Ok(payload) => payload,
+        Err(resp) => return *resp,
     };
+    let req_priority = payload.priority;
     let task = match payload.into_task() {
         Ok(task) => task,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     };
 
-    match state.queue.submit(task).await {
+    let submit_res = if let Some(ref qc) = state.quota_controller {
+        let participant = qc.participant_for_member(None);
+        let effective = qc.effective_quota(&participant);
+        match qc.resolve_submission_priority(&participant, req_priority) {
+            Ok(priority) => {
+                let submitter = if !qc.members().is_empty() {
+                    SubmitterId::Participant(participant.clone())
+                } else {
+                    SubmitterId::Default
+                };
+                state
+                    .queue
+                    .submit_attributed(
+                        task,
+                        priority,
+                        submitter,
+                        Some(participant),
+                        None,
+                        effective.max_queued_tasks,
+                        effective.max_slots,
+                        false,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    } else if let Some(priority) = req_priority {
+        state.queue.submit_with_priority(task, priority).await
+    } else {
+        state.queue.submit(task).await
+    };
+
+    match submit_res {
         Ok(id) => {
             state.scheduler_notify.notify_one();
             (
@@ -900,6 +967,14 @@ async fn api_submit_task(
         Err(rusty_grid_core::GridError::Config(message)) => {
             json_error(StatusCode::BAD_REQUEST, message)
         }
+        Err(e @ rusty_grid_core::GridError::QuotaExceeded { .. }) => {
+            let status = if e.is_transient() {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            json_error(status, e.to_string())
+        }
         Err(e @ rusty_grid_core::GridError::QueueFull { .. }) => {
             json_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
         }
@@ -913,6 +988,193 @@ async fn api_submit_task(
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetQuotaPayload {
+    #[serde(default)]
+    max_running_tasks: Option<usize>,
+    #[serde(default)]
+    max_slots: Option<usize>,
+    #[serde(default)]
+    max_queued_tasks: Option<usize>,
+    #[serde(default)]
+    priority_band: Option<PriorityBand>,
+    #[serde(default)]
+    fair_share_weight: Option<u32>,
+}
+
+impl SetQuotaPayload {
+    fn into_option(self) -> Option<ParticipantQuota> {
+        let q = ParticipantQuota {
+            max_running_tasks: self.max_running_tasks,
+            max_slots: self.max_slots,
+            max_queued_tasks: self.max_queued_tasks,
+            priority_band: self.priority_band,
+            fair_share_weight: self.fair_share_weight,
+        };
+        if q.is_empty() {
+            None
+        } else {
+            Some(q)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetMemberParticipantPayload {
+    participant: Option<String>,
+}
+
+async fn api_get_quotas(
+    State(state): State<WebUiState>,
+    identity: Option<Extension<AuthIdentity>>,
+) -> Response {
+    let is_admin = !state.auth_config.enabled
+        || identity.is_some_and(|Extension(id)| id.has_scope(AuthScope::Admin));
+    let usage = state.queue.participant_usage().await;
+    let dto = match state.quota_controller.as_ref() {
+        Some(qc) => qc.snapshot_dto(&usage, is_admin),
+        None => QuotasSnapshotDto {
+            trust_note: "Quotas share the grid cooperatively between people who trust each other and are not a security boundary against a hostile participant (design 0050 D6).".to_string(),
+            default_quota: ParticipantQuota::default(),
+            participants: Vec::new(),
+            members: Vec::new(),
+        },
+    };
+    Json(dto).into_response()
+}
+
+fn map_quota_mutation_err(err: rusty_grid_core::GridError) -> Response {
+    match err {
+        rusty_grid_core::GridError::Config(msg) => json_error(StatusCode::BAD_REQUEST, msg),
+        other => json_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+async fn api_set_default_quota(
+    State(state): State<WebUiState>,
+    payload: Result<Json<SetQuotaPayload>, JsonRejection>,
+) -> Response {
+    let payload = match extract_json(payload) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(ref qc) = state.quota_controller else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "quota controller is not active on this router",
+        );
+    };
+    let quota_opt = payload.into_option();
+    let members = Arc::clone(qc.members());
+    let stored =
+        match tokio::task::spawn_blocking(move || members.set_default_participant_quota(quota_opt))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return map_quota_mutation_err(e),
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("blocking task failed: {e}"),
+                );
+            }
+        };
+    state.scheduler_notify.notify_one();
+    Json(serde_json::json!({
+        "default_quota": qc.effective_default_quota(),
+        "persisted_override": stored,
+    }))
+    .into_response()
+}
+
+async fn api_set_participant_quota(
+    State(state): State<WebUiState>,
+    Path(participant): Path<String>,
+    payload: Result<Json<SetQuotaPayload>, JsonRejection>,
+) -> Response {
+    let payload = match extract_json(payload) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(ref qc) = state.quota_controller else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "quota controller is not active on this router",
+        );
+    };
+    let quota_opt = payload.into_option();
+    let members = Arc::clone(qc.members());
+    let (canonical, stored) = match tokio::task::spawn_blocking(move || {
+        members.set_participant_quota(&participant, quota_opt)
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return map_quota_mutation_err(e),
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blocking task failed: {e}"),
+            );
+        }
+    };
+    state.scheduler_notify.notify_one();
+    Json(serde_json::json!({
+        "participant": canonical,
+        "effective_quota": qc.effective_quota(&canonical),
+        "persisted_override": stored,
+    }))
+    .into_response()
+}
+
+async fn api_set_member_participant(
+    State(state): State<WebUiState>,
+    Path(member_id): Path<String>,
+    payload: Result<Json<SetMemberParticipantPayload>, JsonRejection>,
+) -> Response {
+    let payload = match extract_json(payload) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(ref qc) = state.quota_controller else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "quota controller is not active on this router",
+        );
+    };
+    let members = Arc::clone(qc.members());
+    let (resolved_id, stored_label) = match tokio::task::spawn_blocking(move || {
+        members.set_member_participant(&member_id, payload.participant.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return map_quota_mutation_err(e),
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blocking task failed: {e}"),
+            );
+        }
+    };
+    let effective_bucket = stored_label
+        .clone()
+        .unwrap_or_else(|| format!("{MEMBER_PARTICIPANT_PREFIX}{resolved_id}"));
+    state
+        .queue
+        .rekey_member_participant(&resolved_id, effective_bucket.clone())
+        .await;
+    state.scheduler_notify.notify_one();
+    Json(serde_json::json!({
+        "member_id": resolved_id,
+        "participant": stored_label,
+        "effective_bucket": effective_bucket,
+    }))
+    .into_response()
 }
 
 async fn api_get_task_standardized(
@@ -1745,6 +2007,7 @@ mod tests {
             cores: None,
             ram_mb: None,
             vram_mb: None,
+            priority: None,
         }
     }
 
@@ -2049,5 +2312,171 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "a task larger than max_active_bytes can never fit and must return 413"
         );
+    }
+
+    #[tokio::test]
+    async fn test_quotas_http_rbac_redaction_and_enforcement() {
+        use crate::quotas::{ParticipantQuota, PriorityBand, QuotaPolicyConfig};
+        use crate::server::{MasterServer, MemberStore, ServerConfig};
+        use rusty_grid_core::noise_auth::{MemberEntry, MemberRole, NodeKeypair};
+
+        let alice = NodeKeypair::generate().unwrap();
+        let bob = NodeKeypair::generate().unwrap();
+        let members = MemberStore::from_entries(vec![
+            MemberEntry::new(
+                "alice-secret-host",
+                *alice.public_key(),
+                vec![MemberRole::Client],
+            ),
+            MemberEntry::new(
+                "bob-secret-host",
+                *bob.public_key(),
+                vec![MemberRole::Client],
+            ),
+        ]);
+        members
+            .set_member_participant(&alice.member_id(), Some("lab-alpha"))
+            .unwrap();
+
+        let auth_cfg = AuthConfig::new()
+            .with_token("obs-tok", "observer", &[AuthScope::Observer])
+            .with_token("sub-tok", "submitter", &[AuthScope::Submitter])
+            .with_token("adm-tok", "admin", &[AuthScope::Admin]);
+
+        let policy = QuotaPolicyConfig {
+            default_quota: ParticipantQuota {
+                max_queued_tasks: Some(1),
+                priority_band: Some(PriorityBand::Normal),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_dashboard_port(0)
+            .with_auth_config(auth_cfg)
+            .with_members(members)
+            .with_quota_policy(policy);
+        let master = MasterServer::spawn(cfg).await.unwrap();
+        let dash = format!("http://{}", master.dashboard_addr().unwrap());
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+
+        // Observer sees anonymized participant labels & zero raw member IDs or hostnames.
+        let obs_resp = http
+            .get(format!("{dash}/api/quotas"))
+            .bearer_auth("obs-tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(obs_resp.status(), reqwest::StatusCode::OK);
+        let obs_text = obs_resp.text().await.unwrap();
+        assert!(!obs_text.contains(&alice.member_id()), "{obs_text}");
+        assert!(!obs_text.contains(&bob.member_id()), "{obs_text}");
+        assert!(!obs_text.contains("alice-secret-host"), "{obs_text}");
+        assert!(obs_text.contains("lab-alpha"), "{obs_text}");
+        assert!(obs_text.contains("participant-1"), "{obs_text}");
+
+        // Observer receives 403 on all mutating quota/label routes.
+        for (path, body) in [
+            (
+                "/api/quotas/default",
+                serde_json::json!({"max_running_tasks": 2}),
+            ),
+            (
+                "/api/quotas/participants/lab-alpha",
+                serde_json::json!({"max_running_tasks": 3}),
+            ),
+            (
+                &format!("/api/members/{}/participant", bob.member_id()),
+                serde_json::json!({"participant": "team-bob"}),
+            ),
+        ] {
+            let r = http
+                .post(format!("{dash}{path}"))
+                .bearer_auth("obs-tok")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+        }
+
+        // Admin receives full member list, can assign labels & quotas, and invalid inputs fail 400.
+        let adm_resp = http
+            .get(format!("{dash}/api/quotas"))
+            .bearer_auth("adm-tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(adm_resp.status(), reqwest::StatusCode::OK);
+        let adm_json: serde_json::Value = adm_resp.json().await.unwrap();
+        assert_eq!(adm_json["members"].as_array().unwrap().len(), 2);
+
+        let bad_prefix = http
+            .post(format!(
+                "{dash}/api/members/{}/participant",
+                bob.member_id()
+            ))
+            .bearer_auth("adm-tok")
+            .json(&serde_json::json!({"participant": "member:spoof"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_prefix.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let bad_zero = http
+            .post(format!("{dash}/api/quotas/participants/lab-alpha"))
+            .bearer_auth("adm-tok")
+            .json(&serde_json::json!({"max_running_tasks": 0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_zero.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let set_bob = http
+            .post(format!(
+                "{dash}/api/members/{}/participant",
+                bob.member_id()
+            ))
+            .bearer_auth("adm-tok")
+            .json(&serde_json::json!({"participant": "team-bob"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(set_bob.status(), reqwest::StatusCode::OK);
+
+        // Priority > Normal band (66) fails 400; 1st queued task succeeds, 2nd returns 429.
+        let too_high_prio = http
+            .post(format!("{dash}/api/tasks"))
+            .bearer_auth("sub-tok")
+            .json(&serde_json::json!({"command": "echo hi", "priority": 90}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(too_high_prio.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let first_ok = http
+            .post(format!("{dash}/api/tasks"))
+            .bearer_auth("sub-tok")
+            .json(&serde_json::json!({"command": "echo first"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first_ok.status(), reqwest::StatusCode::OK);
+
+        let second_limited = http
+            .post(format!("{dash}/api/tasks"))
+            .bearer_auth("sub-tok")
+            .json(&serde_json::json!({"command": "echo second"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            second_limited.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let _ = master.shutdown();
     }
 }

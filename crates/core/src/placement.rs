@@ -52,6 +52,9 @@ pub const EXT_TAG_PREFIX: &str = "ext:";
 pub const PROTO_TAG_PREFIX: &str = "proto:";
 /// Tag the master adds to a listed worker when it negotiated `ProtocolCapabilities::WORKSPACES`.
 pub const FEAT_WORKSPACES_TAG: &str = "feat:workspaces";
+/// Non-constraint metadata tag attached by `submit --verify <N>` / MCP `verify` so a master with
+/// per-participant quotas can refuse `N > max_queued_tasks` upfront without changing protocol 10.
+pub const VERIFY_REPLICAS_TAG_PREFIX: &str = "oxs:verify-replicas=";
 /// Tag prefixes only the worker or the master may set.
 pub const RESERVED_TAG_PREFIXES: [&str; 11] = [
     OS_TAG_PREFIX,
@@ -199,6 +202,14 @@ pub fn listed_supports_workspaces(caps: &WorkerCapabilities) -> bool {
 /// The task concurrency limit (`slots:<n>`) a worker advertised in its tags, if any (`n >= 1`).
 pub fn advertised_slots(caps: &WorkerCapabilities) -> Option<usize> {
     tag_value(&caps.tags, SLOTS_TAG_PREFIX)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Number of verification replicas announced on `Task::tags` by `submit --verify <N>` or MCP
+/// `verify` (`oxs:verify-replicas=<N>`), if present and `>= 1`.
+pub fn parse_verify_replicas_tag(tags: &[String]) -> Option<usize> {
+    tag_value(tags, VERIFY_REPLICAS_TAG_PREFIX)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
 }

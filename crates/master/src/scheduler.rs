@@ -30,8 +30,9 @@ use rusty_grid_core::placement::Placement;
 use rusty_grid_core::protocol::{MasterMessage, ProtocolCapabilities};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 
-use crate::fair_share::FairWalkCursor;
+use crate::fair_share::{FairWalkCursor, SubmitterId};
 use crate::queue::{AssignedLoad, QueueOrderKey, TaskQueue, TaskView};
+use crate::quotas::{ParticipantQuota, ParticipantUsageCounts, QuotaController};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::server::WaiterMap;
 use crate::speed::{new_shared_speed_book, SharedSpeedBook, SpeedBook, TaskKey};
@@ -306,6 +307,7 @@ pub enum ScheduleSkipReason {
     WorkspaceBusy,
     WaitingForFasterWorker,
     ClusterLacksCapability(String),
+    ParticipantQuotaReached { participant: String, reason: String },
 }
 
 /// Comprehensive outcome report produced by a scheduling pass.
@@ -1436,6 +1438,8 @@ pub struct WorkloadScheduler {
     max_in_flight_dispatches_per_worker: usize,
     /// Active deferred dispatch waiter count per worker (`BUG-20`).
     in_flight_dispatches: Arc<std::sync::Mutex<HashMap<Uuid, usize>>>,
+    /// Optional per-participant quota controller (`ECO-9`, design 0097).
+    quota_controller: Option<Arc<QuotaController>>,
 }
 
 impl WorkloadScheduler {
@@ -1461,12 +1465,19 @@ impl WorkloadScheduler {
             dispatch_reserve_timeout: DISPATCH_RESERVE_TIMEOUT,
             max_in_flight_dispatches_per_worker: MAX_IN_FLIGHT_DISPATCH_WAITERS_PER_WORKER,
             in_flight_dispatches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            quota_controller: None,
         }
     }
 
     /// Hands the scheduler the client waiter map (see the `waiters` field).
     pub fn with_waiters(mut self, waiters: WaiterMap) -> Self {
         self.waiters = Some(waiters);
+        self
+    }
+
+    /// Attaches a per-participant quota controller (`ECO-9`, design 0097).
+    pub fn with_quota_controller(mut self, quota_controller: Arc<QuotaController>) -> Self {
+        self.quota_controller = Some(quota_controller);
         self
     }
 
@@ -1704,6 +1715,45 @@ impl WorkloadScheduler {
         state.last_seen = Some(Instant::now());
     }
 
+    async fn collect_slot_violations(
+        &self,
+        qc: &QuotaController,
+        cached_quotas: Option<&HashMap<String, ParticipantQuota>>,
+    ) -> Vec<(TaskId, String)> {
+        self.queue
+            .queued_slot_quota_violations(|p| {
+                cached_quotas
+                    .and_then(|m| m.get(p))
+                    .map(|q| q.max_slots)
+                    .unwrap_or_else(|| qc.effective_quota(p).max_slots)
+            })
+            .await
+    }
+
+    async fn fail_unfulfillable_and_wake_waiters(&self, unfulfillable: &[(TaskId, String)]) {
+        for (task_id, reason) in unfulfillable {
+            if let Some(result) = self
+                .queue
+                .fail_unfulfillable_task(task_id, reason.clone())
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    reason = %reason,
+                    "Failing unfulfillable task"
+                );
+                if let Some(ref waiters) = self.waiters {
+                    let mut lock = waiters.write().await;
+                    if let Some(senders) = lock.remove(task_id) {
+                        for tx in senders {
+                            let _ = tx.send(result.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Performs an atomic batch scheduling pass assigning up to `max_batch_size` tasks:
     /// 1. Processes expired delayed retries in the queue.
     /// 2. Takes the active workers and what the master's own books say each one carries.
@@ -1735,10 +1785,25 @@ impl WorkloadScheduler {
             }
         }
 
+        let quota_qc = self
+            .quota_controller
+            .as_deref()
+            .filter(|qc| qc.has_any_quota_configured());
+
         // Step 2: Active workers (checked before touching the queue: no worker, nothing to clone)
         let (mut workers, registered, reg_epoch) = self.registry.scheduler_snapshot().await;
         if workers.is_empty() {
+            if let Some(ref qc) = self.quota_controller {
+                qc.clear_wait_reasons_if_nonempty();
+            }
             let mut report = ScheduleReport::default();
+            if let Some(qc) = quota_qc {
+                let violations = self.collect_slot_violations(qc, None).await;
+                if !violations.is_empty() {
+                    self.fail_unfulfillable_and_wake_waiters(&violations).await;
+                    report.unfulfillable = violations;
+                }
+            }
             for task_id in self.queue.ready_task_ids(max_batch_size).await {
                 report
                     .skipped
@@ -1796,38 +1861,241 @@ impl WorkloadScheduler {
             (false, None)
         };
 
-        // Step 3: Walk the queue
+        let mut participant_usage: HashMap<String, ParticipantUsageCounts> = HashMap::new();
+        let mut participant_quotas: HashMap<String, ParticipantQuota> = HashMap::new();
+        let mut excluded_submitters: HashSet<SubmitterId> = HashSet::new();
+        let mut excluded_participants: HashSet<String> = HashSet::new();
+        let mut wait_reasons: HashMap<String, String> = HashMap::new();
         let mut report = ScheduleReport::default();
+        let mut unfulfillable_ids: HashSet<TaskId> = HashSet::new();
+        if let Some(qc) = quota_qc {
+            let usage_map = self.queue.participant_usage().await;
+            let mut weight_updates = Vec::with_capacity(usage_map.len());
+            for (participant, counts) in usage_map {
+                let quota = qc.effective_quota(&participant);
+                if counts.queued_tasks > 0 {
+                    let w = quota.fair_share_weight.unwrap_or(1).max(1);
+                    weight_updates.push((SubmitterId::Participant(participant.clone()), w));
+                    if let Some(max_run) = quota.max_running_tasks {
+                        if counts.running_tasks >= max_run {
+                            let reason = format!(
+                                "running quota reached ({}/{max_run} tasks)",
+                                counts.running_tasks
+                            );
+                            wait_reasons.insert(participant.clone(), reason);
+                            excluded_participants.insert(participant.clone());
+                            excluded_submitters
+                                .insert(SubmitterId::Participant(participant.clone()));
+                        }
+                    }
+                    if !excluded_participants.contains(&participant) {
+                        if let Some(max_slots) = quota.max_slots {
+                            if counts.running_slots >= max_slots {
+                                let reason = format!(
+                                    "slot quota reached ({}/{max_slots} slots)",
+                                    counts.running_slots
+                                );
+                                wait_reasons.insert(participant.clone(), reason);
+                                excluded_participants.insert(participant.clone());
+                                excluded_submitters
+                                    .insert(SubmitterId::Participant(participant.clone()));
+                            }
+                        }
+                    }
+                }
+                participant_quotas.insert(participant.clone(), quota);
+                participant_usage.insert(participant, counts);
+            }
+            self.queue.sync_participant_weights(&weight_updates).await;
+            for (task_id, reason) in self
+                .collect_slot_violations(qc, Some(&participant_quotas))
+                .await
+            {
+                if unfulfillable_ids.insert(task_id) {
+                    report.unfulfillable.push((task_id, reason));
+                }
+            }
+        } else if let Some(ref qc) = self.quota_controller {
+            qc.clear_wait_reasons_if_nonempty();
+        }
+
+        // Step 3: Walk the queue
         let mut placements: Vec<(TaskId, usize)> = Vec::new();
         if (engine.free_slots > 0 || need_unfulfillable_sweep) && max_batch_size > 0 {
             let mut need_sweep = need_unfulfillable_sweep;
             let scan_budget = self.config.max_scan_per_pass.max(1);
             let mut ran_fair = false;
-            if engine.free_slots > 0 && self.queue.active_submitter_count().await > 1 {
+            if engine.free_slots > 0
+                && (self.queue.active_submitter_count().await > 1 || quota_qc.is_some())
+            {
                 ran_fair = true;
                 let mut fair_cursor = FairWalkCursor::default();
                 let mut fair_scanned = 0usize;
+                let mut pages_fetched = 0usize;
+                let max_pages = (scan_budget / SCAN_PAGE).saturating_add(16).max(16);
                 let mut fair_exhausted = false;
-                while engine.free_slots > 0 && fair_scanned < scan_budget {
+                while engine.free_slots > 0
+                    && fair_scanned < scan_budget
+                    && pages_fetched < max_pages
+                {
                     let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(fair_scanned));
                     if page_limit == 0 {
                         break;
                     }
+                    pages_fetched += 1;
                     let views = self
                         .queue
-                        .ready_views_fair(&mut fair_cursor, page_limit)
+                        .ready_views_fair_excluding(
+                            &mut fair_cursor,
+                            page_limit,
+                            &excluded_submitters,
+                        )
                         .await;
                     let fetched = views.len();
-                    fair_scanned += fetched;
+                    fn view_participant(view: &TaskView) -> Option<&str> {
+                        view.participant.as_deref().or(match &view.submitter {
+                            SubmitterId::Participant(p) => Some(p.as_str()),
+                            _ => None,
+                        })
+                    }
                     if !engine.gpu_waiting
                         && self.config.preserve_gpu_for_gpu_tasks
-                        && views.iter().any(|v| engine.any_gpu_worker_fits_view(v))
+                        && views.iter().any(|v| {
+                            let quota_blocked = quota_qc.is_some()
+                                && (excluded_submitters.contains(&v.submitter)
+                                    || view_participant(v).is_some_and(|p| {
+                                        excluded_participants.contains(p)
+                                            || participant_quotas.get(p).is_some_and(|q| {
+                                                let slots = v.requirements.cpu_cores.max(1);
+                                                let used = participant_usage
+                                                    .get(p)
+                                                    .copied()
+                                                    .unwrap_or_default();
+                                                q.max_running_tasks
+                                                    .is_some_and(|m| used.running_tasks >= m)
+                                                    || q.max_slots.is_some_and(|m| {
+                                                        slots > m
+                                                            || used
+                                                                .running_slots
+                                                                .saturating_add(slots)
+                                                                > m
+                                                    })
+                                            })
+                                    }));
+                            !quota_blocked && engine.any_gpu_worker_fits_view(v)
+                        })
                     {
                         engine.note_gpu_waiting();
                         self.note_gpu_demand();
                     }
                     let mut broke_early = false;
                     for view in &views {
+                        if unfulfillable_ids.contains(&view.task_id) {
+                            continue;
+                        }
+                        if quota_qc.is_some() {
+                            let participant_opt = view_participant(view);
+                            if let Some(participant) = participant_opt {
+                                if excluded_submitters.contains(&view.submitter)
+                                    || excluded_participants.contains(participant)
+                                {
+                                    excluded_submitters.insert(view.submitter.clone());
+                                    if report.skipped.len() < max_batch_size {
+                                        let reason = wait_reasons
+                                            .get(participant)
+                                            .cloned()
+                                            .unwrap_or_else(|| "quota reached".to_string());
+                                        report.skipped.push((
+                                            view.task_id,
+                                            ScheduleSkipReason::ParticipantQuotaReached {
+                                                participant: participant.to_string(),
+                                                reason,
+                                            },
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                if let Some(quota) = participant_quotas.get(participant) {
+                                    let usage = participant_usage
+                                        .entry(participant.to_string())
+                                        .or_default();
+                                    if let Some(max_run) = quota.max_running_tasks {
+                                        if usage.running_tasks >= max_run {
+                                            let reason = format!(
+                                                "running quota reached ({}/{max_run} tasks)",
+                                                usage.running_tasks
+                                            );
+                                            wait_reasons
+                                                .entry(participant.to_string())
+                                                .or_insert_with(|| reason.clone());
+                                            excluded_participants.insert(participant.to_string());
+                                            excluded_submitters.insert(SubmitterId::Participant(
+                                                participant.to_string(),
+                                            ));
+                                            excluded_submitters.insert(view.submitter.clone());
+                                            if report.skipped.len() < max_batch_size {
+                                                report.skipped.push((
+                                                    view.task_id,
+                                                    ScheduleSkipReason::ParticipantQuotaReached {
+                                                        participant: participant.to_string(),
+                                                        reason,
+                                                    },
+                                                ));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    let task_slots = view.requirements.cpu_cores.max(1);
+                                    if let Some(max_slots) = quota.max_slots {
+                                        if task_slots > max_slots {
+                                            if unfulfillable_ids.insert(view.task_id) {
+                                                report.unfulfillable.push((
+                                                    view.task_id,
+                                                    format!(
+                                                        "task requires {task_slots} slot(s), exceeding participant '{participant}' max_slots={max_slots}"
+                                                    ),
+                                                ));
+                                            }
+                                            continue;
+                                        }
+                                        if usage.running_slots.saturating_add(task_slots)
+                                            > max_slots
+                                        {
+                                            let reason = format!(
+                                                "slot quota reached ({}/{max_slots} slots, need {task_slots})",
+                                                usage.running_slots
+                                            );
+                                            wait_reasons
+                                                .entry(participant.to_string())
+                                                .or_insert_with(|| reason.clone());
+                                            if usage.running_slots >= max_slots {
+                                                excluded_participants
+                                                    .insert(participant.to_string());
+                                                excluded_submitters.insert(
+                                                    SubmitterId::Participant(
+                                                        participant.to_string(),
+                                                    ),
+                                                );
+                                                excluded_submitters.insert(view.submitter.clone());
+                                            } else {
+                                                fair_scanned += 1;
+                                            }
+                                            if report.skipped.len() < max_batch_size {
+                                                report.skipped.push((
+                                                    view.task_id,
+                                                    ScheduleSkipReason::ParticipantQuotaReached {
+                                                        participant: participant.to_string(),
+                                                        reason,
+                                                    },
+                                                ));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        fair_scanned += 1;
                         #[cfg(feature = "otel")]
                         let place_span = tracing::info_span!(
                             target: crate::otel::OTEL_SPAN_TARGET,
@@ -1848,6 +2116,67 @@ impl WorkloadScheduler {
                                     );
                                 }
                                 placements.push((view.task_id, idx));
+                                if quota_qc.is_some() {
+                                    let participant_opt = view_participant(view);
+                                    if let Some(participant) = participant_opt {
+                                        let task_slots = view.requirements.cpu_cores.max(1);
+                                        let usage = participant_usage
+                                            .entry(participant.to_string())
+                                            .or_default();
+                                        usage.running_tasks += 1;
+                                        usage.running_slots =
+                                            usage.running_slots.saturating_add(task_slots);
+                                        usage.queued_tasks = usage.queued_tasks.saturating_sub(1);
+                                        if let Some(quota) = participant_quotas.get(participant) {
+                                            if let Some(max_run) = quota.max_running_tasks {
+                                                if usage.running_tasks >= max_run {
+                                                    if usage.queued_tasks > 0 {
+                                                        wait_reasons
+                                                            .entry(participant.to_string())
+                                                            .or_insert_with(|| {
+                                                                format!(
+                                                                    "running quota reached ({}/{max_run} tasks)",
+                                                                    usage.running_tasks
+                                                                )
+                                                            });
+                                                    }
+                                                    excluded_participants
+                                                        .insert(participant.to_string());
+                                                    excluded_submitters.insert(
+                                                        SubmitterId::Participant(
+                                                            participant.to_string(),
+                                                        ),
+                                                    );
+                                                    excluded_submitters
+                                                        .insert(view.submitter.clone());
+                                                }
+                                            }
+                                            if let Some(max_slots) = quota.max_slots {
+                                                if usage.running_slots >= max_slots {
+                                                    if usage.queued_tasks > 0 {
+                                                        wait_reasons
+                                                            .entry(participant.to_string())
+                                                            .or_insert_with(|| {
+                                                                format!(
+                                                                    "slot quota reached ({}/{max_slots} slots)",
+                                                                    usage.running_slots
+                                                                )
+                                                            });
+                                                    }
+                                                    excluded_participants
+                                                        .insert(participant.to_string());
+                                                    excluded_submitters.insert(
+                                                        SubmitterId::Participant(
+                                                            participant.to_string(),
+                                                        ),
+                                                    );
+                                                    excluded_submitters
+                                                        .insert(view.submitter.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if view.requires_gpu {
                                     self.note_gpu_demand();
                                 }
@@ -1892,7 +2221,11 @@ impl WorkloadScheduler {
                         break;
                     }
                 }
-                if fair_exhausted && self.config.fail_unfulfillable_tasks {
+                if fair_exhausted
+                    && excluded_submitters.is_empty()
+                    && excluded_participants.is_empty()
+                    && self.config.fail_unfulfillable_tasks
+                {
                     *self
                         .unfulfillable_sweep
                         .lock()
@@ -2032,29 +2365,13 @@ impl WorkloadScheduler {
                 }
             }
         }
+        if let Some(qc) = quota_qc {
+            qc.set_wait_reasons(wait_reasons);
+        }
         self.rr_cursor
             .store(engine.rr_cursor, std::sync::atomic::Ordering::Relaxed);
-        for (task_id, reason) in &report.unfulfillable {
-            if let Some(result) = self
-                .queue
-                .fail_unfulfillable_task(task_id, reason.clone())
-                .await
-            {
-                warn!(
-                    task_id = %task_id,
-                    reason = %reason,
-                    "Failing unfulfillable task"
-                );
-                if let Some(ref waiters) = self.waiters {
-                    let mut lock = waiters.write().await;
-                    if let Some(senders) = lock.remove(task_id) {
-                        for tx in senders {
-                            let _ = tx.send(result.clone());
-                        }
-                    }
-                }
-            }
-        }
+        self.fail_unfulfillable_and_wake_waiters(&report.unfulfillable)
+            .await;
         if placements.is_empty() {
             return Ok(report);
         }
@@ -6997,7 +7314,7 @@ mod tests {
                         TaskRequirements::generic(1, 32),
                     ),
                     0,
-                    sub_a,
+                    sub_a.clone(),
                 )
                 .await
                 .unwrap();
@@ -7011,7 +7328,7 @@ mod tests {
                         TaskRequirements::generic(1, 32),
                     ),
                     0,
-                    sub_b,
+                    sub_b.clone(),
                 )
                 .await
                 .unwrap();
@@ -7063,7 +7380,7 @@ mod tests {
                     TaskRequirements::generic(1, 32),
                 ),
                 0,
-                sub_a,
+                sub_a.clone(),
             )
             .await
             .unwrap();
@@ -7084,7 +7401,7 @@ mod tests {
                     TaskRequirements::generic(4, 32),
                 ),
                 0,
-                sub_a,
+                sub_a.clone(),
             )
             .await
             .unwrap();
@@ -7805,5 +8122,224 @@ mod tests {
         );
         assert_eq!(registry.get_worker(w).await.unwrap().active_tasks, 0);
         assert!(!queue.assigned_loads().await.contains_key(&w));
+    }
+
+    #[tokio::test]
+    async fn participant_running_and_slot_quotas_avoid_starving_lower_band() {
+        use crate::quotas::{PriorityBand, QuotaPolicyConfig};
+        use crate::server::MemberStore;
+        use std::collections::BTreeMap;
+
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let wid = Uuid::new_v4();
+        registry
+            .register(
+                wid,
+                WorkerCapabilities::new("w-quota", 8, 16_384, false, false, None),
+                "127.0.0.1:9310".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let members = Arc::new(MemberStore::new());
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "alice".to_string(),
+            ParticipantQuota {
+                max_running_tasks: Some(2),
+                priority_band: Some(PriorityBand::High),
+                ..Default::default()
+            },
+        );
+        overrides.insert(
+            "bob".to_string(),
+            ParticipantQuota {
+                priority_band: Some(PriorityBand::Low),
+                ..Default::default()
+            },
+        );
+        let qc = Arc::new(QuotaController::new(
+            members,
+            QuotaPolicyConfig {
+                default_quota: ParticipantQuota::default(),
+                participant_overrides: overrides,
+            },
+        ));
+
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_max_batch_size(16),
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+        )
+        .with_quota_controller(Arc::clone(&qc));
+
+        let sub_alice = SubmitterId::Participant("alice".into());
+        let sub_bob = SubmitterId::Participant("bob".into());
+        // Flood queue with 250 high-band tasks from alice, then 2 low-band tasks from bob.
+        let mut alice_ids = Vec::new();
+        for i in 0..250 {
+            let tid = queue
+                .submit_attributed(
+                    Task::new(
+                        TaskSpec::new_command(format!("alice-{i}"), vec![]),
+                        TaskRequirements::generic(1, 32),
+                    ),
+                    100,
+                    sub_alice.clone(),
+                    Some("alice".to_string()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            alice_ids.push(tid);
+        }
+        let mut bob_ids = Vec::new();
+        for i in 0..2 {
+            let tid = queue
+                .submit_attributed(
+                    Task::new(
+                        TaskSpec::new_command(format!("bob-{i}"), vec![]),
+                        TaskRequirements::generic(1, 32),
+                    ),
+                    0,
+                    sub_bob.clone(),
+                    Some("bob".to_string()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            bob_ids.push(tid);
+        }
+
+        let report = sched.schedule_batch(16).await.unwrap();
+        let placed_alice = report
+            .assignments
+            .iter()
+            .filter(|a| alice_ids.contains(&a.task_id))
+            .count();
+        let placed_bob = report
+            .assignments
+            .iter()
+            .filter(|a| bob_ids.contains(&a.task_id))
+            .count();
+        assert_eq!(placed_alice, 2, "alice must stop at max_running_tasks=2");
+        assert_eq!(
+            placed_bob, 2,
+            "bob low-band tasks must run with zero starvation"
+        );
+        assert!(qc.wait_reasons().contains_key("alice"));
+
+        // Verify max_slots allows a 1-core task while blocking a 3-core task once 2/4 slots are held.
+        let registry2 = WorkerRegistry::new();
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
+        registry2
+            .register(
+                Uuid::new_v4(),
+                WorkerCapabilities::new("w-slots", 8, 16_384, false, false, None),
+                "127.0.0.1:9311".parse().unwrap(),
+                tx2,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut overrides2 = BTreeMap::new();
+        overrides2.insert(
+            "carol".to_string(),
+            ParticipantQuota {
+                max_slots: Some(4),
+                ..Default::default()
+            },
+        );
+        let qc2 = Arc::new(QuotaController::new(
+            Arc::new(MemberStore::new()),
+            QuotaPolicyConfig {
+                default_quota: ParticipantQuota::default(),
+                participant_overrides: overrides2,
+            },
+        ));
+        let queue2 = TaskQueue::new();
+        let sched2 = WorkloadScheduler::new(
+            SchedulerConfig::default().with_max_batch_size(16),
+            registry2,
+            queue2.clone(),
+            Arc::new(Notify::new()),
+        )
+        .with_quota_controller(Arc::clone(&qc2));
+
+        let sub_carol = SubmitterId::Participant("carol".into());
+        let t_2a = queue2
+            .submit_attributed(
+                Task::new(
+                    TaskSpec::new_command("c-2", vec![]),
+                    TaskRequirements::generic(2, 32),
+                ),
+                0,
+                sub_carol.clone(),
+                Some("carol".to_string()),
+                None,
+                None,
+                Some(4),
+                false,
+            )
+            .await
+            .unwrap();
+        let t_3 = queue2
+            .submit_attributed(
+                Task::new(
+                    TaskSpec::new_command("c-3", vec![]),
+                    TaskRequirements::generic(3, 32),
+                ),
+                0,
+                sub_carol.clone(),
+                Some("carol".to_string()),
+                None,
+                None,
+                Some(4),
+                false,
+            )
+            .await
+            .unwrap();
+        let t_1 = queue2
+            .submit_attributed(
+                Task::new(
+                    TaskSpec::new_command("c-1", vec![]),
+                    TaskRequirements::generic(1, 32),
+                ),
+                0,
+                sub_carol,
+                Some("carol".to_string()),
+                None,
+                None,
+                Some(4),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let report2 = sched2.schedule_batch(16).await.unwrap();
+        let assigned_ids: Vec<TaskId> = report2.assignments.iter().map(|a| a.task_id).collect();
+        assert!(assigned_ids.contains(&t_2a));
+        assert!(
+            !assigned_ids.contains(&t_3),
+            "3-core task would exceed max_slots=4 (2+3>4)"
+        );
+        assert!(
+            assigned_ids.contains(&t_1),
+            "1-core task fits remaining 2 slots (2+1<=4)"
+        );
+        let usage = queue2.participant_usage().await;
+        assert_eq!(usage["carol"].running_slots, 3);
     }
 }

@@ -112,6 +112,10 @@ Add `oxideswarm mcp` as a stdio MCP server in Claude Code, Codex or Cursor:
   automatic failover.
 - Anyone who holds the cluster secret can run commands on every worker. No independent security
   review has been published yet.
+- Cooperative per-participant quotas (`--default-participant-max-*`, `--participant-quota`, and
+  dashboard `/api/quotas`) limit accidental overuse across participants (`ECO-9`,
+  [design 0097](docs/design/0097-per-participant-quotas.md)); they are scheduling limits for
+  trusted circle members, not a security boundary against a hostile participant.
 - Android: the app does not build yet (AND-1), and the Termux worker has not run on a device.
 - No language model serving yet: release `0.5.0` is Design only.
 - Mixed versions: upgrade the master first; it accepts peers one protocol version back.

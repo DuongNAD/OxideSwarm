@@ -32,7 +32,7 @@ use rusty_grid_core::WorkerCapabilities;
 pub const MISMATCH_EXIT_CODE: u8 = 4;
 
 /// The help text of the CLI flag.
-pub const VERIFY_HELP: &str = "After the task completes, run it again on N other matching workers with the same operating system and CPU architecture as the first run (see --verify-any-system) and compare the declared outputs (--output) by BLAKE3; prints 'verified' or 'mismatch' (exit 4). Only for deterministic tasks: a non-deterministic task will report a mismatch";
+pub const VERIFY_HELP: &str = "After the task completes, run it again on N other matching workers with the same operating system and CPU architecture as the first run (see --verify-any-system) and compare the declared outputs (--output) by BLAKE3; prints 'verified' or 'mismatch' (exit 4). Replicas count against the submitter's per-participant quota (`max_queued_tasks`, `max_running_tasks`, `max_slots`), and a `--verify N` exceeding `max_queued_tasks` is refused up front. Only for deterministic tasks: a non-deterministic task will report a mismatch";
 
 /// The help text of `--verify-any-system`.
 pub const VERIFY_ANY_SYSTEM_HELP: &str = "With --verify: let the replicas run on matching workers with another operating system or CPU architecture than the first run. By default they do not, because the same deterministic program can give different results on two systems";
@@ -292,7 +292,10 @@ pub fn replica_task(template: &Task, worker: Uuid) -> Task {
     let mut task = template.clone();
     task.id = TaskId::new();
     let pin = format!("{REQUIRE_PREFIX}worker=");
-    task.tags.retain(|t| !t.starts_with(&pin));
+    task.tags.retain(|t| {
+        !t.starts_with(&pin)
+            && !t.starts_with(rusty_grid_core::placement::VERIFY_REPLICAS_TAG_PREFIX)
+    });
     task.tags.push(format!("{pin}{worker}"));
     task
 }
@@ -321,7 +324,19 @@ pub async fn run_replicas(
                 });
             }
             Ok((_, target, Err(e))) => {
-                failure.get_or_insert(format!("replica on worker {} failed: {e}", target.name));
+                let quota_hint = if e.contains("QUOTA_EXCEEDED")
+                    || e.contains("max_queued_tasks")
+                    || e.contains("max_running_tasks")
+                    || e.contains("max_slots")
+                {
+                    " (--verify replicas count against the submitter's per-participant quota)"
+                } else {
+                    ""
+                };
+                failure.get_or_insert(format!(
+                    "replica on worker {} failed: {e}{quota_hint}",
+                    target.name
+                ));
             }
             Err(e) => {
                 failure.get_or_insert(format!("replica task panicked: {e}"));
@@ -547,7 +562,7 @@ mod tests {
 
     #[test]
     fn replica_is_pinned_with_a_fresh_id() {
-        let template = Task::new(
+        let mut template = Task::new(
             rusty_grid_core::task::TaskSpec::Command {
                 program: "true".into(),
                 args: vec![],
@@ -557,10 +572,15 @@ mod tests {
             },
             TaskRequirements::generic(1, 10),
         );
+        template.tags.push(format!(
+            "{}3",
+            rusty_grid_core::placement::VERIFY_REPLICAS_TAG_PREFIX
+        ));
         let w = Uuid::new_v4();
         let r = replica_task(&template, w);
         assert_ne!(r.id, template.id);
         assert!(r.tags.contains(&format!("require:worker={w}")));
+        assert!(rusty_grid_core::placement::parse_verify_replicas_tag(&r.tags).is_none());
     }
 
     /// A connected idle worker as `ListWorkers` reports it, with the master's `id:` tag and the

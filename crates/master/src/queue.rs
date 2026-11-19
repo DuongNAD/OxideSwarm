@@ -374,8 +374,14 @@ pub struct TaskEntry {
     pub retry_history: Vec<RetryAttempt>,
     pub result: Option<TaskResult>,
     pub error_message: Option<String>,
-    /// Fair-share submitter identity (not persisted across restarts).
+    /// Fair-share submitter identity (derived at submit and re-derived from `submitted_by_member` on replay).
     pub submitter: SubmitterId,
+    /// Quota accounting bucket (`"organiser"`, assigned participant label, or `"member:<id>"`),
+    /// tracked independently of `submitter` so `"organiser"` clients can keep connection-scoped
+    /// fair share when no v3 members are enrolled while sharing one quota budget (`ECO-9`).
+    pub(crate) participant: Option<String>,
+    /// Authenticated OXS-AUTH v3 submitting member ID, if any (`ECO-9` / `ENROLL-1c` step 2).
+    pub submitted_by_member: Option<String>,
     /// Compact metadata retained in RAM after the full `TaskResult` spills to `cold_results/`.
     pub cold_result: Option<ColdResultSummary>,
     /// True when the task's input trees or workspace source tree require `oxideswarm-tree/2`
@@ -516,6 +522,10 @@ pub struct TaskView {
     pub required_features: ProtocolCapabilities,
     /// Workers that already handed this task back without running it.
     pub avoid: Vec<Uuid>,
+    /// Fair-share submitter identity (participant/client/default) for quota gating.
+    pub submitter: SubmitterId,
+    /// Quota accounting bucket for this task, if attributed (`ECO-9`).
+    pub participant: Option<String>,
     /// The task's placement constraints (`require:` tags), or why they cannot be read. Submission
     /// validates them, so an error only reaches here for a task that bypassed it; such a task is
     /// placed nowhere.
@@ -543,6 +553,8 @@ impl TaskView {
             ),
             required_features: required_features(task),
             avoid: Vec::new(),
+            submitter: SubmitterId::Default,
+            participant: None,
             placement: task.scheduling_placement(),
             workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
@@ -950,7 +962,7 @@ fn mark_entry_scheduled(
     entry.pending_failover_charge = false;
     entry.pending_failover_reason = None;
     entry.scheduled_instant = Some(now);
-    (entry.task.clone(), zr, entry.submitter)
+    (entry.task.clone(), zr, entry.submitter.clone())
 }
 
 impl TaskQueueInner {
@@ -1155,7 +1167,7 @@ impl TaskQueueInner {
             let submitter = self
                 .tasks
                 .get(&key.task_id)
-                .map_or(SubmitterId::Default, |e| e.submitter);
+                .map_or(SubmitterId::Default, |e| e.submitter.clone());
             self.fair_queues.insert(submitter, key);
             if let Some(entry) = self.tasks.get_mut(&key.task_id) {
                 entry.queued_instant = Instant::now();
@@ -1168,8 +1180,8 @@ impl TaskQueueInner {
         let submitter = self
             .tasks
             .get(&key.task_id)
-            .map_or(SubmitterId::Default, |e| e.submitter);
-        self.fair_queues.remove(submitter, key);
+            .map_or(SubmitterId::Default, |e| e.submitter.clone());
+        self.fair_queues.remove(&submitter, key);
         removed
     }
 
@@ -1195,6 +1207,7 @@ impl TaskQueueInner {
                 result: entry.result.clone(),
                 error_message: entry.error_message.clone(),
                 cold_result: entry.cold_result.clone(),
+                submitted_by_member: entry.submitted_by_member.clone(),
             })
             .collect();
         tasks.sort_unstable_by_key(|e| e.sequence);

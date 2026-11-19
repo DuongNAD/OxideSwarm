@@ -117,6 +117,14 @@ fn next_queue_wait_backoff(current: Duration) -> Duration {
 }
 
 /// Lightweight in-memory Map/Reduce engine executing jobs across cluster workers.
+/// Attribution and quota context attached to a client's [`MapReduceEngine`] (`ECO-9` / `ENROLL-1c`).
+#[derive(Clone)]
+pub struct MapReduceAttribution {
+    pub quota_controller: Arc<crate::quotas::QuotaController>,
+    pub submitted_by_member: Option<String>,
+    pub client_submitter: crate::fair_share::SubmitterId,
+}
+
 #[derive(Clone)]
 pub struct MapReduceEngine {
     queue: TaskQueue,
@@ -124,6 +132,7 @@ pub struct MapReduceEngine {
     waiters: WaiterMap,
     registry: Option<WorkerRegistry>,
     parallelism: usize,
+    attribution: Option<MapReduceAttribution>,
     #[cfg(test)]
     cancel_abandoned_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -141,9 +150,17 @@ impl MapReduceEngine {
             waiters,
             registry: None,
             parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
+            attribution: None,
             #[cfg(test)]
             cancel_abandoned_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Attaches per-participant quota enforcement and member revocation attribution to map and
+    /// reduce task submissions (`ECO-9`, `ENROLL-1c` step 2).
+    pub fn with_attribution(mut self, attribution: MapReduceAttribution) -> Self {
+        self.attribution = Some(attribution);
+        self
     }
 
     #[cfg(test)]
@@ -425,10 +442,55 @@ impl MapReduceEngine {
             lock.entry(task_id).or_default().push(tx);
         }
         guard.waiter_registered = true;
+        let submitted_priority = if let Some(ref attr) = self.attribution {
+            let participant = attr
+                .quota_controller
+                .participant_for_member(attr.submitted_by_member.as_deref());
+            match attr
+                .quota_controller
+                .resolve_submission_priority(&participant, None)
+            {
+                Ok(p) => Some((participant, p)),
+                Err(e) => {
+                    guard.waiter_registered = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let wait_start = Instant::now();
         let mut backoff = Duration::from_millis(25);
         loop {
-            match self.queue.try_submit_slot(&mut task_slot).await {
+            let submit_res = if let (Some(ref attr), Some((ref participant, priority))) =
+                (&self.attribution, &submitted_priority)
+            {
+                let effective = attr.quota_controller.effective_quota(participant);
+                let submitter = if attr.submitted_by_member.is_some()
+                    || !attr.quota_controller.members().is_empty()
+                {
+                    crate::fair_share::SubmitterId::Participant(participant.clone())
+                } else {
+                    attr.client_submitter.clone()
+                };
+                self.queue
+                    .try_submit_slot_attributed(
+                        &mut task_slot,
+                        *priority,
+                        submitter,
+                        Some(participant.clone()),
+                        attr.submitted_by_member.clone(),
+                        Some(attr.quota_controller.members().as_ref()),
+                        effective.max_queued_tasks,
+                        effective.max_slots,
+                    )
+                    .await
+            } else {
+                self.queue.try_submit_slot(&mut task_slot).await
+            };
+            match submit_res {
                 Ok(_) => {
                     guard.armed = true;
                     break;
@@ -440,8 +502,10 @@ impl MapReduceEngine {
                     return Err(e);
                 }
                 Err(
-                    e @ (GridError::QueueByteLimitExceeded { .. } | GridError::QueueFull { .. }),
-                ) => {
+                    e @ (GridError::QueueByteLimitExceeded { .. }
+                    | GridError::QueueFull { .. }
+                    | GridError::QuotaExceeded { .. }),
+                ) if e.is_transient() => {
                     let idle_since = progress.map_or(wait_start, |p| p.last().max(wait_start));
                     let remaining = timeout.saturating_sub(idle_since.elapsed());
                     if remaining.is_zero() {

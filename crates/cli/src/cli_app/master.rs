@@ -739,6 +739,21 @@ async fn run_master_inner(
         master_cfg.as_ref().and_then(|m| m.discovery_port),
     );
     server_config = apply_discovery_port(server_config, discovery_port);
+    let quota_policy = match build_master_quota_policy(
+        args.default_participant_max_running,
+        args.default_participant_max_slots,
+        args.default_participant_max_queued,
+        args.default_participant_priority,
+        &args.participant_quotas,
+        master_cfg.as_ref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Invalid participant quota configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    server_config = server_config.with_quota_policy(quota_policy);
     if args.dev {
         server_config = server_config.with_dev_mode(true);
     }
@@ -888,6 +903,152 @@ fn apply_discovery_port(config: ServerConfig, port: Option<u16>) -> ServerConfig
         None => config,
         Some(0) => config.with_discovery(false),
         Some(p) => config.with_discovery_port(p),
+    }
+}
+
+/// Resolves per-participant quota defaults (`CLI > RUSTY_GRID_DEFAULT_PARTICIPANT_* > TOML`) and
+/// layered per-participant overrides (`TOML [master].participant_quotas` overridden field-by-field
+/// by repeatable `--participant-quota <PARTICIPANT:SPEC>` flags), validating all values >= 1.
+pub(super) fn build_master_quota_policy(
+    default_max_running: Option<usize>,
+    default_max_slots: Option<usize>,
+    default_max_queued: Option<usize>,
+    default_priority: Option<String>,
+    participant_specs: &[String],
+    master_cfg: Option<&MasterFileConfig>,
+) -> Result<rusty_grid_master::quotas::QuotaPolicyConfig, String> {
+    use rusty_grid_master::quotas::{
+        parse_participant_quota_spec, validate_quota_target, ParticipantQuota, PriorityBand,
+        QuotaPolicyConfig,
+    };
+    use std::collections::BTreeMap;
+
+    let max_running_tasks = resolve_opt_usize(
+        default_max_running,
+        &["RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_RUNNING"],
+        master_cfg.and_then(|m| m.default_participant_max_running),
+    );
+    let max_slots = resolve_opt_usize(
+        default_max_slots,
+        &["RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_SLOTS"],
+        master_cfg.and_then(|m| m.default_participant_max_slots),
+    );
+    let max_queued_tasks = resolve_opt_usize(
+        default_max_queued,
+        &["RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_QUEUED"],
+        master_cfg.and_then(|m| m.default_participant_max_queued),
+    );
+    let priority_band = match resolve_opt_string(
+        default_priority,
+        &["RUSTY_GRID_DEFAULT_PARTICIPANT_PRIORITY"],
+        master_cfg.and_then(|m| m.default_participant_priority.clone()),
+    ) {
+        Some(raw) => Some(raw.parse::<PriorityBand>()?),
+        None => None,
+    };
+
+    let mut participant_overrides: BTreeMap<String, ParticipantQuota> = BTreeMap::new();
+    if let Some(cfg) = master_cfg {
+        for (target, quota) in &cfg.participant_quotas {
+            let canonical = validate_quota_target(target)?;
+            participant_overrides.insert(canonical, quota.clone());
+        }
+    }
+    for spec in participant_specs {
+        let (canonical, cli_quota) = parse_participant_quota_spec(spec)?;
+        participant_overrides
+            .entry(canonical)
+            .and_modify(|existing| *existing = cli_quota.merge_with_default(existing))
+            .or_insert(cli_quota);
+    }
+
+    let policy = QuotaPolicyConfig {
+        default_quota: ParticipantQuota {
+            max_running_tasks,
+            max_slots,
+            max_queued_tasks,
+            priority_band,
+            fair_share_weight: None,
+        },
+        participant_overrides,
+    };
+    policy.validate()?;
+    Ok(policy)
+}
+
+#[cfg(test)]
+mod quota_policy_tests {
+    use super::*;
+    use rusty_grid_master::quotas::{ParticipantQuota, PriorityBand};
+
+    #[test]
+    fn quota_policy_precedence_and_validation() {
+        let mut toml_overrides = std::collections::BTreeMap::new();
+        toml_overrides.insert(
+            "Alice".to_string(),
+            ParticipantQuota {
+                max_running_tasks: Some(1),
+                max_slots: Some(4),
+                ..Default::default()
+            },
+        );
+        let master_cfg = MasterFileConfig {
+            default_participant_max_running: Some(2),
+            default_participant_max_slots: Some(8),
+            default_participant_max_queued: Some(20),
+            default_participant_priority: Some("low".into()),
+            participant_quotas: toml_overrides,
+            ..Default::default()
+        };
+
+        std::env::set_var("RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_SLOTS", "10");
+        std::env::set_var("RUSTY_GRID_DEFAULT_PARTICIPANT_PRIORITY", "normal");
+        let res = build_master_quota_policy(
+            Some(5),
+            None,
+            None,
+            None,
+            &[
+                "alice:running=3,priority=high,weight=2".to_string(),
+                "member:abcd1234:queued=4".to_string(),
+            ],
+            Some(&master_cfg),
+        );
+        std::env::remove_var("RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_SLOTS");
+        std::env::remove_var("RUSTY_GRID_DEFAULT_PARTICIPANT_PRIORITY");
+
+        let policy = res.expect("valid policy");
+        assert_eq!(policy.default_quota.max_running_tasks, Some(5)); // CLI beats TOML
+        assert_eq!(policy.default_quota.max_slots, Some(10)); // env beats TOML
+        assert_eq!(policy.default_quota.max_queued_tasks, Some(20)); // TOML fallback
+        assert_eq!(
+            policy.default_quota.priority_band,
+            Some(PriorityBand::Normal)
+        );
+
+        let alice = policy.participant_overrides.get("alice").unwrap();
+        assert_eq!(alice.max_running_tasks, Some(3)); // CLI field overrides TOML field
+        assert_eq!(alice.max_slots, Some(4)); // TOML field kept
+        assert_eq!(alice.priority_band, Some(PriorityBand::High));
+        assert_eq!(alice.fair_share_weight, Some(2));
+        assert_eq!(
+            policy
+                .participant_overrides
+                .get("member:abcd1234")
+                .unwrap()
+                .max_queued_tasks,
+            Some(4)
+        );
+
+        // Zero limits and invalid priority bands must fail cleanly.
+        assert!(build_master_quota_policy(Some(0), None, None, None, &[], None).is_err());
+        assert!(
+            build_master_quota_policy(None, None, None, Some("urgent".into()), &[], None).is_err()
+        );
+        assert!(
+            build_master_quota_policy(None, None, None, None, &["bob:slots=0".into()], None)
+                .is_err()
+        );
     }
 }
 

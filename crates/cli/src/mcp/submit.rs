@@ -1075,8 +1075,15 @@ pub(super) async fn tool_submit(
     if !output_globs.is_empty() {
         task = task.with_output_globs(output_globs);
     }
-    let task_id = task.id;
     let verify_template = verify.replicas.map(|_| task.clone());
+    if let Some(replicas) = verify.replicas {
+        task.tags.push(format!(
+            "{}{}",
+            rusty_grid_core::placement::VERIFY_REPLICAS_TAG_PREFIX,
+            replicas
+        ));
+    }
+    let task_id = task.id;
     *ctx.submitted_task_id.lock().await = Some(task_id);
 
     if ctx.is_cancelled() {

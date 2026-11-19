@@ -92,13 +92,15 @@ pub const JOURNAL_MAGIC: &[u8; 8] = b"OXSWJRN1";
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
 /// On-disk layout version written by this module. Version 2 appended `Task::workspace` to the
 /// bincode form of `Task` (protocol version 6), version 3 appended `TaskRequirements::vram_mb`
-/// (protocol version 9), and version 4 appended `Task::extensions` and
-/// `TaskRequirements::extensions` (protocol version 10, design 0082).
-pub const STORE_FORMAT_VERSION: u32 = 4;
-/// Oldest layout version this module still opens. A version 1 journal can only hold records of
-/// the old `Task` layout, and the protocol version in its header (below 6) refuses those records
-/// (`read_journal`); a version 1 snapshot is JSON and carries over unchanged, as does a version 1
-/// journal with no records, so the clean-shutdown upgrade of `DEPLOYMENT.md` 3.5 keeps working.
+/// (protocol version 9), version 4 appended `Task::extensions` and
+/// `TaskRequirements::extensions` (protocol version 10, design 0082), and version 5 appended
+/// `submitted_by_member` on `JournalRecord::TaskSubmitted` and `PersistedTaskEntry` (`ECO-9` /
+/// `ENROLL-1c` step 2, design 0097).
+pub const STORE_FORMAT_VERSION: u32 = 5;
+/// Oldest layout version this module still opens. Version 1..=4 journals can hold records of an
+/// older `JournalRecord` layout and are refused if uncompacted (`parse_journal`), whereas a clean
+/// shutdown leaves a self-describing JSON snapshot and an empty journal so upgrading per
+/// `DEPLOYMENT.md` 3.5 carries tasks forward and rewrites both headers to version 5.
 pub const MIN_STORE_FORMAT_VERSION: u32 = 1;
 /// Size of the file header in bytes.
 pub const HEADER_LEN: usize = 24;
@@ -132,6 +134,8 @@ pub enum JournalRecord {
         priority: u32,
         sequence: u64,
         submitted_at_utc: u64,
+        /// Authenticated OXS-AUTH v3 submitting member ID, if any (`ECO-9` / `ENROLL-1c` step 2).
+        submitted_by_member: Option<String>,
     },
     TaskDispatched {
         task_id: TaskId,
@@ -217,6 +221,9 @@ pub struct PersistedTaskEntry {
     pub error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_result: Option<crate::cold_results::ColdResultSummary>,
+    /// Authenticated OXS-AUTH v3 submitting member ID, if any (`ECO-9` / `ENROLL-1c` step 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by_member: Option<String>,
 }
 
 /// Point-in-time image of the queue written by compaction.
@@ -369,8 +376,8 @@ impl TaskStore {
         let journal_path = dir.join(JOURNAL_FILE);
         let loaded = read_journal(&journal_path, snapshot_generation)?;
         if let Some(s) = &snapshot {
-            if s.version != PROTOCOL_VERSION_CURRENT {
-                // Self-describing JSON: carry it over to the current protocol version.
+            if s.version != PROTOCOL_VERSION_CURRENT || s.format != STORE_FORMAT_VERSION {
+                // Self-describing JSON: carry it over to the current format and protocol version.
                 write_snapshot_file(&dir, s.generation, &s.image)?;
             }
         }
@@ -898,6 +905,7 @@ fn reset_journal(
 }
 
 struct Header {
+    format: u32,
     protocol: u32,
     generation: u64,
 }
@@ -918,6 +926,7 @@ fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<Header
         )));
     }
     Ok(Header {
+        format,
         protocol: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
         generation: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
     })
@@ -990,6 +999,7 @@ fn write_snapshot_file(dir: &Path, generation: u64, image: &SnapshotImage) -> Gr
 
 struct LoadedSnapshot {
     image: SnapshotImage,
+    format: u32,
     version: u32,
     generation: u64,
 }
@@ -1032,6 +1042,7 @@ fn parse_snapshot(path: &Path, bytes: &[u8]) -> GridResult<LoadedSnapshot> {
         .map_err(|e| corrupt(&format!("cannot decode the snapshot: {e}")))?;
     Ok(LoadedSnapshot {
         image,
+        format: header.format,
         version: header.protocol,
         generation: header.generation,
     })
@@ -1163,15 +1174,17 @@ fn parse_journal(path: &Path, bytes: &[u8], snapshot_generation: u64) -> GridRes
         )));
     }
     if bytes.len() == HEADER_LEN {
-        out.reset = header.protocol != PROTOCOL_VERSION_CURRENT;
+        out.reset =
+            header.protocol != PROTOCOL_VERSION_CURRENT || header.format != STORE_FORMAT_VERSION;
         return Ok(out);
     }
-    if header.protocol != PROTOCOL_VERSION_CURRENT {
+    if header.protocol != PROTOCOL_VERSION_CURRENT || header.format != STORE_FORMAT_VERSION {
         return Err(GridError::Storage(format!(
-            "{} holds uncompacted records written by protocol version {}, but this binary \
-             is protocol version {PROTOCOL_VERSION_CURRENT}; start the previous binary and stop \
+            "{} holds uncompacted records written by store format {} (protocol version {}), but this binary \
+             is store format {STORE_FORMAT_VERSION} (protocol version {PROTOCOL_VERSION_CURRENT}); start the previous binary and stop \
              it cleanly (which compacts the journal) before upgrading",
             path.display(),
+            header.format,
             header.protocol
         )));
     }
@@ -1272,6 +1285,7 @@ mod tests {
             priority: 5,
             sequence,
             submitted_at_utc: 1_700_000_000 + sequence,
+            submitted_by_member: None,
         }
     }
 
@@ -1302,6 +1316,7 @@ mod tests {
                 priority: 9,
                 sequence: 7,
                 submitted_at_utc: 11,
+                submitted_by_member: Some("member-a".into()),
             },
             JournalRecord::TaskDispatched {
                 task_id: id,
@@ -1533,6 +1548,7 @@ mod tests {
                 result: None,
                 error_message: None,
                 cold_result: None,
+                submitted_by_member: None,
             })
             .collect();
         SnapshotImage {
@@ -1693,13 +1709,14 @@ mod tests {
     }
 
     /// Store format 2 appended `Task::workspace` (protocol 6), format 3 appended
-    /// `TaskRequirements::vram_mb` (protocol 9) and format 4 appended the two `extensions` lists
-    /// (protocol 10), so a clean shutdown under format 1, 2 or 3 still upgrades, and records of
-    /// any old layout are refused.
+    /// `TaskRequirements::vram_mb` (protocol 9), format 4 appended the two `extensions` lists
+    /// (protocol 10), and format 5 appended `submitted_by_member` (`ECO-9` / `ENROLL-1c` step 2).
+    /// Clean-shutdown files under formats 1..=4 upgrade cleanly, while uncompacted journals from
+    /// any old format or protocol are refused.
     #[test]
     fn format_1_files_of_a_clean_shutdown_load_and_format_1_records_are_refused() {
         let old = PROTOCOL_VERSION_CURRENT - 1;
-        for old_format in [1_u32, 2_u32, 3_u32] {
+        for old_format in [1_u32, 2_u32, 3_u32, 4_u32] {
             let dir = tempfile::tempdir().unwrap();
             let image = image_with(2);
             {
@@ -1739,6 +1756,74 @@ mod tests {
             let msg = expect_storage_err(TaskStore::open(dir.path()));
             assert!(msg.contains("store format version"), "{msg}");
         }
+    }
+
+    #[test]
+    fn format_4_clean_shutdown_upgrades_to_5_and_uncompacted_format_4_at_protocol_10_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = task("legacy-v4");
+        let t_id = t.id;
+        // Write a clean-shutdown snapshot JSON matching format 4 (explicitly omitting
+        // `submitted_by_member`) and a matching empty journal, both claiming format 4 at protocol 10.
+        let snapshot_json = serde_json::json!({
+            "next_sequence": 2,
+            "tasks": [{
+                "task": t,
+                "priority": 1,
+                "sequence": 1,
+                "state": "queued",
+                "assigned_worker_id": null,
+                "submitted_at_utc": 1700000001,
+                "retry_count": 0,
+                "failover_count": 0,
+                "evacuation_count": 0,
+                "rejection_count": 0,
+                "avoid_workers": [],
+                "adoptable_by_worker": null,
+                "fail_if_not_adopted": false,
+                "retry_history": [],
+                "result": null,
+                "error_message": null,
+                "cold_result": null
+            }],
+            "terminal_order": []
+        });
+        let payload = serde_json::to_vec(&snapshot_json).unwrap();
+        let mut snap_bytes = Vec::new();
+        let mut snap_header = header_bytes(SNAPSHOT_MAGIC, 1);
+        snap_header[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        snap_bytes.extend_from_slice(&snap_header);
+        snap_bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        snap_bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+        snap_bytes.extend_from_slice(&payload);
+        std::fs::write(dir.path().join(SNAPSHOT_FILE), snap_bytes).unwrap();
+
+        let mut jrn_header = header_bytes(JOURNAL_MAGIC, 1);
+        jrn_header[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        std::fs::write(journal_path(dir.path()), jrn_header).unwrap();
+
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        let snap = rec
+            .snapshot
+            .expect("clean format-4 snapshot upgrades to format 5");
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].task.id, t_id);
+        assert_eq!(snap.tasks[0].submitted_by_member, None);
+        drop(store);
+
+        for name in [SNAPSHOT_FILE, JOURNAL_FILE] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            let format = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            assert_eq!(format, 5, "{name} header must upgrade to format 5");
+        }
+
+        // An uncompacted format-4 journal at the same protocol version (10) must be refused.
+        let uncompacted_dir = tempfile::tempdir().unwrap();
+        write_all(uncompacted_dir.path(), &[marker(1)]);
+        set_header_format(&journal_path(uncompacted_dir.path()), 4);
+        let msg = expect_storage_err(TaskStore::open(uncompacted_dir.path()));
+        assert!(msg.contains("uncompacted records"), "{msg}");
+        assert!(msg.contains("store format 4"), "{msg}");
     }
 
     #[test]
@@ -2056,6 +2141,7 @@ mod tests {
                 result: Some(result),
                 error_message: None,
                 cold_result: None,
+                submitted_by_member: None,
             }],
             terminal_order: vec![id],
         };
@@ -2159,6 +2245,7 @@ mod tests {
                     priority: 9,
                     sequence: 7,
                     submitted_at_utc: 11,
+                    submitted_by_member: None,
                 },
             ),
             (
@@ -2390,5 +2477,59 @@ mod tests {
                 w4.hashed_bytes
             );
         }
+    }
+
+    #[test]
+    fn v0_4_4_clean_fixture_upgrades_to_format_5_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SNAPSHOT_FILE),
+            include_bytes!("../tests/data/store_v0_4_4_clean/snapshot.bin"),
+        )
+        .unwrap();
+        std::fs::write(
+            journal_path(dir.path()),
+            include_bytes!("../tests/data/store_v0_4_4_clean/journal.bin"),
+        )
+        .unwrap();
+
+        let (store, recovery) =
+            TaskStore::open(dir.path()).expect("clean v0.4.4 store must upgrade to format 5");
+        assert!(
+            recovery.records.is_empty(),
+            "clean v0.4.4 shutdown must have header-only journal"
+        );
+        let snap = recovery.snapshot.expect("clean v0.4.4 snapshot present");
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].submitted_by_member, None);
+        drop(store);
+
+        let (_store2, recovery2) =
+            TaskStore::open(dir.path()).expect("upgraded format 5 store must reopen");
+        assert_eq!(recovery2.snapshot.unwrap().tasks.len(), 1);
+        let jpath = journal_path(dir.path());
+        let jbytes = std::fs::read(&jpath).unwrap();
+        let journal_hdr = parse_header(&jpath, JOURNAL_MAGIC, &jbytes).unwrap();
+        assert_eq!(journal_hdr.format, STORE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v0_4_4_dirty_fixture_is_refused_without_rewriting_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirty_journal = include_bytes!("../tests/data/store_v0_4_4_dirty/journal.bin");
+        std::fs::write(journal_path(dir.path()), dirty_journal).unwrap();
+
+        let err = TaskStore::open(dir.path())
+            .expect_err("uncompacted v0.4.4 format-4 journal must be refused");
+        assert!(matches!(err, GridError::Storage(_)), "unexpected: {err}");
+        assert_eq!(
+            std::fs::read(journal_path(dir.path())).unwrap().as_slice(),
+            dirty_journal.as_slice(),
+            "refused v0.4.4 dirty store must leave journal.bin untouched"
+        );
+        assert!(
+            !dir.path().join(SNAPSHOT_FILE).exists(),
+            "refused open must not create snapshot.bin"
+        );
     }
 }

@@ -133,6 +133,8 @@ async fn test_attach_store_and_replay_recovers_all_d2_5_states_and_preserves_cou
                     task_key: submitted_key,
                     priority: 0,
                     submitter: SubmitterId::Default,
+                    participant: None,
+                    submitted_by_member: None,
                     sequence: seq,
                     state: TaskState::Submitted,
                     assigned_worker_id: None,
@@ -1730,6 +1732,7 @@ async fn test_workspace_affinity_replay_uses_terminal_finish_timestamp() {
                 priority: 0,
                 sequence: 1,
                 submitted_at_utc: 1_000,
+                submitted_by_member: None,
             })
             .unwrap()
             .await
@@ -2085,14 +2088,14 @@ async fn fair_share_ready_views_interleaves_submitters_with_weights() {
     let mut set_b = HashSet::new();
     for i in 0..20 {
         let tid = q
-            .submit_from(echo_task(&format!("a-{i}")), 0, sub_a)
+            .submit_from(echo_task(&format!("a-{i}")), 0, sub_a.clone())
             .await
             .unwrap();
         set_a.insert(tid);
     }
     for i in 0..5 {
         let tid = q
-            .submit_from(echo_task(&format!("b-{i}")), 0, sub_b)
+            .submit_from(echo_task(&format!("b-{i}")), 0, sub_b.clone())
             .await
             .unwrap();
         set_b.insert(tid);
@@ -2106,7 +2109,7 @@ async fn fair_share_ready_views_interleaves_submitters_with_weights() {
     let b_count = views.iter().filter(|v| set_b.contains(&v.task_id)).count();
     assert_eq!((a_count, b_count), (5, 5));
 
-    q.set_submitter_weight(sub_a, 3).await;
+    q.set_submitter_weight(sub_a.clone(), 3).await;
     let mut weighted_cursor = crate::fair_share::FairWalkCursor::default();
     let w_views = q.ready_views_fair(&mut weighted_cursor, 8).await;
     assert_eq!(w_views.len(), 8);
@@ -2121,7 +2124,10 @@ async fn fair_share_ready_views_interleaves_submitters_with_weights() {
     assert_eq!((wa, wb), (6, 2));
 
     // Priority preservation within each submitter's queue.
-    let a_high = q.submit_from(echo_task("a-high"), 50, sub_a).await.unwrap();
+    let a_high = q
+        .submit_from(echo_task("a-high"), 50, sub_a.clone())
+        .await
+        .unwrap();
     let mut prio_cursor = crate::fair_share::FairWalkCursor::default();
     let p_views = q.ready_views_fair(&mut prio_cursor, 4).await;
     assert!(
@@ -2524,5 +2530,60 @@ async fn test_handle_workers_revoked_drops_checkpoints_of_tasks_last_failed_on_t
     assert_eq!(
         queue.get_task(&running).await.unwrap().state,
         TaskState::Queued
+    );
+}
+
+#[tokio::test]
+async fn revocation_write_lock_guard_refuses_revoked_member_even_after_scan() {
+    use rusty_grid_core::noise_auth::{MemberEntry, MemberRole, NodeKeypair};
+
+    let ka = NodeKeypair::generate().unwrap();
+    let member_id = ka.member_id();
+    let members = crate::server::MemberStore::from_entries(vec![MemberEntry::new(
+        "race-alice",
+        *ka.public_key(),
+        vec![MemberRole::Client],
+    )]);
+    let queue = TaskQueue::new();
+
+    let accepted = queue
+        .submit_attributed_checked(
+            Task::new(
+                TaskSpec::command("echo", vec!["before-revoke".into()]),
+                TaskRequirements::generic(1, 32),
+            ),
+            0,
+            crate::fair_share::SubmitterId::Participant("alice".into()),
+            Some("alice".into()),
+            Some(member_id.clone()),
+            Some(&members),
+            None,
+            None,
+            false,
+        )
+        .await;
+    assert!(accepted.is_ok());
+
+    members.revoke_member(&member_id).unwrap();
+    let revoked_err = queue
+        .submit_attributed_checked(
+            Task::new(
+                TaskSpec::command("echo", vec!["post-revoke-race".into()]),
+                TaskRequirements::generic(1, 32),
+            ),
+            0,
+            crate::fair_share::SubmitterId::Participant("alice".into()),
+            Some("alice".into()),
+            Some(member_id),
+            Some(&members),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("revoked member must be refused under queue write lock");
+    assert!(
+        matches!(revoked_err, GridError::AuthFailed(_)),
+        "unexpected error: {revoked_err:?}"
     );
 }
