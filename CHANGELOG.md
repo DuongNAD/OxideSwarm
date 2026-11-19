@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Campaign driver and pilot sheet (`APP-6` steps 1 and 4, [design 0094](docs/design/0094-road-to-a-shared-research-grid.md)): `benchmarks/campaigns/driver.py` (Python standard library) reads a campaign manifest, verifies runner binary SHA-256 hashes when provided, refuses secret inputs (`.env`, `.env.*`, `*.secret`, `invite.oxs`), submits each unit via `oxideswarm submit --json --verify 1` (and `--verify-file`), automatically reruns verification mismatches once and records both attempts, writes atomic label-only JSON records (`P1`..`P5`, scrubbing names, hostnames, UUIDs, IP addresses, and `oxs1-*` tokens), supports `--dry-run` and `--resume` after interrupts without resubmitting completed units, and ships with `benchmarks/campaigns/2026-11-pilot/README.md` (campaign sheet, runtime estimate, and one-page participant guide), a 200-unit `manifest.json`, and `tests/test_campaign_driver.py`.
+
 ### Fixed
 - macOS worker task spawn (`BUG-33`, [design 0031](docs/design/0031-containment-after-worker-crash.md)): the detached lifeline supervisor in `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed stack buffer (`close_open_fds_macos`) and closes only those (falling back to the bounded `RLIMIT_NOFILE` loop if `proc_pidinfo` fails or after 8 full rounds (about 8,184 descriptors)), cutting per-task close-step time on Apple M5 from `111.889 ms` median wall / `111.095 ms` median CPU to `0.688 ms` / `0.183 ms` at `ulimit -n 1,048,576` and from `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`.
 

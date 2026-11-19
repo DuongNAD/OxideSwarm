@@ -407,7 +407,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | TBD (open), (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -1937,6 +1937,13 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   (`doctor` check C7), the hours online, the tasks run, the credits shown and the controls set; the
   verification result of every task, with each mismatch explained; and what each participant found
   hard. It is the exit check of Stage 1 in design 0094.
+- **Partial (2026-11-19, pull request TBD, open; item stays `Planned`):** Steps 1 and 4 done: committed
+  the campaign sheet and one-page participant guide (`benchmarks/campaigns/2026-11-pilot/README.md`), the
+  200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`), the
+  standard-library Python driver (`benchmarks/campaigns/driver.py`), and `tests/test_campaign_driver.py`
+  (wired in `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local
+  loopback cluster with a deterministic stand-in command. Steps 2 (dry run) and 3 (pilot run) remain
+  **Planned**.
 
 ## Status log
 
@@ -2402,3 +2409,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: APP-6 Partial (item stays `Planned`, pull request TBD, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
