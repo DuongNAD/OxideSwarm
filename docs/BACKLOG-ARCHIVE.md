@@ -2860,7 +2860,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Add a unit test opening a high-numbered descriptor (`>= 5000`) and proving the supervisor closes it.
 - **Done when:** High-fd unit test and `test_sec5_hardened_runner` pass, per-task close time is measured
   before/after at `1,048,576` and `65,536`, and every `unsafe` block carries a `// SAFETY:` comment.
-- **Implemented (2026-11-19, pull request TBD, open):** Added `close_open_fds_macos` (fixed 1,024-entry
+- **Implemented (2026-11-19, pull request 367, open):** Added `close_open_fds_macos` (fixed 1,024-entry
   `[libc::proc_fdinfo; 1024]` stack buffer, up to 8 rounds) and `close_fds_range_fallback` in
   `crates/worker/src/process_tree.rs` ([design 0031](design/0031-containment-after-worker-crash.md)), plus
   `process_tree::tests::test_supervisor_closes_high_numbered_fd` (`F_DUPFD_CLOEXEC` at `>= 5000`, polling
