@@ -13,6 +13,8 @@ pub use rusty_grid_core::mode::{
 };
 
 mod dev;
+// LV-4: cfg(unix) libc::killpg / signal calls for local dev cluster teardown.
+#[allow(unsafe_code)]
 mod dev_launch;
 mod doc;
 mod research;

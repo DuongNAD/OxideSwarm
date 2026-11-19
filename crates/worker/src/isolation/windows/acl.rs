@@ -1,16 +1,22 @@
 //! Windows SID management, DACL/SDDL manipulation, and ACL grant manifest logging.
 
-use super::path::{is_reparse_point, normalize_win_path, to_wide};
+use super::path::{
+    components_ci_eq, expected_lexical_long_path, is_reparse_point, normalize_win_path,
+    strip_verbatim_prefix, to_wide,
+};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStringExt;
-use std::path::Path;
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+use std::path::{Path, PathBuf};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    SDDL_REVISION_1, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, EXPLICIT_ACCESS_W, SDDL_REVISION_1, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
@@ -20,6 +26,12 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
     TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -217,7 +229,7 @@ pub fn oxideswarm_toolchain_sid_string() -> io::Result<String> {
     OwnedSid::oxideswarm_toolchain()?.to_sid_string()
 }
 
-pub(super) fn explicit_access(
+pub(in crate::isolation) fn explicit_access(
     sid: PSID,
     access_mask: u32,
     access_mode: i32,
@@ -235,6 +247,58 @@ pub(super) fn explicit_access(
             ptstrName: sid as *mut u16,
         },
     }
+}
+
+/// # Safety
+/// Caller must ensure `dacl` (when non-null) points to a valid Windows `ACL` inside a live
+/// security descriptor and `target_sid` is a valid Win32 SID pointer.
+unsafe fn dacl_ptr_has_ace(
+    dacl: *mut ACL,
+    target_sid: PSID,
+    ace_type: u32,
+    required_mask: u32,
+    required_flags: u32,
+) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    let mut acl_info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: `dacl` is non-null inside a live descriptor, and `acl_info` has `size_of::<ACL_SIZE_INFORMATION>()` writable bytes.
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            &mut acl_info as *mut _ as *mut _,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    for idx in 0..acl_info.AceCount {
+        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `dacl` is live and `idx < acl_info.AceCount`.
+        if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
+            // SAFETY: `GetAce` succeeded with non-null `ace_ptr` pointing to a DWORD-aligned ACE header inside `dacl`.
+            let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
+            if header.AceType as u32 == ace_type
+                && (header.AceFlags as u32 & INHERIT_ONLY_ACE) == 0
+                && (header.AceFlags as u32 & required_flags) == required_flags
+            {
+                // SAFETY: `ace_type` is allow or deny (both start with the `ACCESS_ALLOWED_ACE` layout),
+                // DWORD-aligned inside live `dacl`.
+                let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+                let ace_sid = (&ace.SidStart as *const u32) as PSID;
+                // SAFETY: `ace_sid` lies inside the live ACE and `target_sid` points to the caller's SID.
+                if unsafe { EqualSid(ace_sid, target_sid) } != 0
+                    && (ace.Mask & required_mask) == required_mask
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn dacl_has_ace(
@@ -271,46 +335,52 @@ fn dacl_has_ace(
         return false;
     }
 
-    let mut acl_info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: `dacl` is non-null inside still-live `sd`, and `acl_info` has `size_of::<ACL_SIZE_INFORMATION>()` writable bytes.
-    let ok = unsafe {
-        GetAclInformation(
-            dacl,
-            &mut acl_info as *mut _ as *mut _,
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    };
-    let mut found = false;
-    if ok != 0 {
-        for idx in 0..acl_info.AceCount {
-            let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-            // SAFETY: `dacl` is backed by live `sd`, and `idx < acl_info.AceCount`.
-            if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
-                // SAFETY: `GetAce` succeeded with non-null `ace_ptr` pointing to a DWORD-aligned ACE header inside `dacl`.
-                let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
-                if header.AceType as u32 == ace_type
-                    && (header.AceFlags as u32 & INHERIT_ONLY_ACE) == 0
-                    && (header.AceFlags as u32 & required_flags) == required_flags
-                {
-                    // SAFETY: `ace_type` is allow or deny (both start with the `ACCESS_ALLOWED_ACE` layout),
-                    // DWORD-aligned inside live `dacl`.
-                    let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
-                    let ace_sid = (&ace.SidStart as *const u32) as PSID;
-                    // SAFETY: `ace_sid` lies inside the live ACE and `target_sid` points to the caller's SID.
-                    if unsafe { EqualSid(ace_sid, target_sid) } != 0
-                        && (ace.Mask & required_mask) == required_mask
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // SAFETY: `dacl` lies inside live `sd`, and `target_sid` is the caller's valid SID pointer.
+    let found =
+        unsafe { dacl_ptr_has_ace(dacl, target_sid, ace_type, required_mask, required_flags) };
     if !sd.is_null() {
         // SAFETY: `sd` is non-null, allocated by `GetNamedSecurityInfoW`, no longer borrowed by
-        // `dacl` after the loop, and freed once here.
+        // `dacl` after `dacl_ptr_has_ace`, and freed once here.
+        unsafe {
+            LocalFree(sd as HLOCAL);
+        }
+    }
+    found
+}
+
+pub(super) fn handle_dacl_grants_sid(handle: HANDLE, target_sid: PSID, required_mask: u32) -> bool {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `handle` is an open object handle with `READ_CONTROL`; `dacl` borrows from `sd`,
+    // which owns the returned `LocalAlloc` descriptor freed below.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS || dacl.is_null() {
+        if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetSecurityInfo` above and is freed once here.
+            unsafe {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+        return false;
+    }
+
+    // SAFETY: `dacl` lies inside live `sd`, and `target_sid` is the caller's valid SID pointer.
+    let found =
+        unsafe { dacl_ptr_has_ace(dacl, target_sid, ACCESS_ALLOWED_ACE_TYPE, required_mask, 0) };
+    if !sd.is_null() {
+        // SAFETY: `sd` is non-null, allocated by `GetSecurityInfo`, no longer borrowed by `dacl`,
+        // and freed once here.
         unsafe {
             LocalFree(sd as HLOCAL);
         }
@@ -508,19 +578,185 @@ pub(super) fn merge_entries_on_path_unprotected(
     Ok(())
 }
 
-/// Replaces `path`'s DACL with a fresh protected DACL (`PROTECTED_DACL_SECURITY_INFORMATION`)
-/// built purely from `entries`. Refuses to operate on symlinks or NTFS junctions.
-pub(super) fn set_protected_dacl_on_path(
+/// RAII wrapper closing an owned Win32 `HANDLE` on drop.
+pub(super) struct OwnedHandle(pub(super) HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            // SAFETY: `self.0` is an owned non-null Win32 handle opened by `CreateFileW`.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ExpectedHandleKind {
+    Directory { allow_missing: bool },
+    SingleLinkFile { allow_missing: bool },
+}
+
+fn final_path_from_handle(handle: HANDLE) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; 260];
+    // SAFETY: `handle` is a valid open file/directory handle and `buf` has `buf.len()` writable `u16` elements.
+    let mut len = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) >= buf.len() {
+        buf.resize(len as usize + 1, 0);
+        // SAFETY: `handle` remains open and `buf` was resized to hold `len` UTF-16 code units.
+        len = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+    }
+    if len == 0 || (len as usize) >= buf.len() {
+        return Err(io::Error::last_os_error());
+    }
+    let path = OsString::from_wide(&buf[..len as usize]);
+    Ok(strip_verbatim_prefix(PathBuf::from(path)))
+}
+
+/// Opens `path` without following a final reparse point (`FILE_FLAG_BACKUP_SEMANTICS |
+/// FILE_FLAG_OPEN_REPARSE_POINT`), reads `GetFileInformationByHandle` to verify non-reparse type
+/// and (for files) `nNumberOfLinks == 1`, and compares `GetFinalPathNameByHandleW` against the
+/// lexical long path so ancestor symlinks or junctions swapped before open are refused before
+/// touching the handle's DACL.
+pub(super) fn open_verified_dacl_handle(
     path: &Path,
-    entries: &[EXPLICIT_ACCESS_W],
-) -> io::Result<()> {
-    if is_reparse_point(path) {
+    expect: ExpectedHandleKind,
+) -> io::Result<Option<(OwnedHandle, BY_HANDLE_FILE_INFORMATION)>> {
+    let allow_missing = match expect {
+        ExpectedHandleKind::Directory { allow_missing }
+        | ExpectedHandleKind::SingleLinkFile { allow_missing } => allow_missing,
+    };
+    let wide_path = to_wide(path.as_os_str());
+    // SAFETY: `wide_path` is a NUL-terminated UTF-16 `Vec<u16>` alive across `CreateFileW`.
+    let raw = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            WRITE_DAC | READ_CONTROL | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        let err = io::Error::last_os_error();
+        if allow_missing && err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    let handle = OwnedHandle(raw);
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` contains only plain integer and `FILETIME` fields.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle.0` is an open handle from `CreateFileW` and `&mut info` is writable.
+    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+        let err = io::Error::last_os_error();
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("refusing to set DACL on reparse point {}", path.display()),
+            format!(
+                "refusing to set DACL on '{}' because file information (GetFileInformationByHandle) could not be read: {err}",
+                path.display()
+            ),
         ));
     }
-    let wide_path = to_wide(path.as_os_str());
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to set DACL on reparse point '{}'", path.display()),
+        ));
+    }
+    match expect {
+        ExpectedHandleKind::Directory { .. } => {
+            if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to set directory DACL on non-directory '{}'",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        ExpectedHandleKind::SingleLinkFile { .. } => {
+            if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to set file DACL on directory '{}'",
+                        path.display()
+                    ),
+                ));
+            }
+            if info.nNumberOfLinks == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to set DACL on '{}' because it reported nNumberOfLinks == 0 (cannot confirm a single hard link, nlink == 1)",
+                        path.display()
+                    ),
+                ));
+            }
+            if info.nNumberOfLinks != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to set DACL on '{}' because it has {} hard links (must be a single-link regular file, nlink == 1)",
+                        path.display(),
+                        info.nNumberOfLinks
+                    ),
+                ));
+            }
+        }
+    }
+    let final_path = final_path_from_handle(handle.0).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to set DACL on '{}' because GetFinalPathNameByHandleW failed: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let lexical_path = expected_lexical_long_path(path);
+    if !components_ci_eq(&final_path, &lexical_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to set DACL on '{}' because the opened handle resolved to '{}' instead of the lexical path '{}' (ancestor symlink or junction); pass the target directory directly",
+                path.display(),
+                final_path.display(),
+                lexical_path.display()
+            ),
+        ));
+    }
+    Ok(Some((handle, info)))
+}
+
+/// Replaces `handle`'s DACL with a fresh protected DACL (`PROTECTED_DACL_SECURITY_INFORMATION`)
+/// built purely from `entries` via `SetSecurityInfo`.
+pub(super) fn set_protected_dacl_on_handle(
+    handle: HANDLE,
+    entries: &[EXPLICIT_ACCESS_W],
+) -> io::Result<()> {
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     // SAFETY: `entries.as_ptr()` points to `entries.len()` initialized `EXPLICIT_ACCESS_W` values
     // with null existing ACL, and `new_dacl` receives a `LocalAlloc` ACL freed below.
@@ -535,11 +771,11 @@ pub(super) fn set_protected_dacl_on_path(
     if rc != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
-    // SAFETY: `wide_path` is NUL-terminated UTF-16 alive for this call and `new_dacl` is a live ACL
+    // SAFETY: `handle` is an open object handle with `WRITE_DAC` and `new_dacl` is a live ACL
     // created by `SetEntriesInAclW`.
     let set_rc = unsafe {
-        SetNamedSecurityInfoW(
-            wide_path.as_ptr(),
+        SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -548,7 +784,7 @@ pub(super) fn set_protected_dacl_on_path(
             std::ptr::null(),
         )
     };
-    // SAFETY: `new_dacl` is no longer referenced after `SetNamedSecurityInfoW` and is freed once.
+    // SAFETY: `new_dacl` is no longer referenced after `SetSecurityInfo` and is freed once.
     unsafe {
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
@@ -558,6 +794,121 @@ pub(super) fn set_protected_dacl_on_path(
         return Err(io::Error::from_raw_os_error(set_rc as i32));
     }
     Ok(())
+}
+
+/// Replaces directory `path`'s DACL with a fresh protected DACL through a verified no-follow
+/// handle (`open_verified_dacl_handle` + `SetSecurityInfo`), refusing symlinks, junctions,
+/// non-directories, and ancestor reparse-point swaps.
+pub(in crate::isolation) fn set_protected_dacl_on_path(
+    path: &Path,
+    entries: &[EXPLICIT_ACCESS_W],
+) -> io::Result<()> {
+    let Some((handle, _)) = open_verified_dacl_handle(
+        path,
+        ExpectedHandleKind::Directory {
+            allow_missing: false,
+        },
+    )?
+    else {
+        return Ok(());
+    };
+    set_protected_dacl_on_handle(handle.0, entries)
+}
+
+/// Replaces regular single-link file `path`'s DACL with a fresh protected DACL through a verified
+/// no-follow handle when `path` exists (`Ok(())` if missing), refusing symlinks, directories,
+/// hard-linked files (`nlink != 1`), and ancestor reparse-point swaps.
+pub(super) fn set_protected_dacl_on_single_link_file_if_exists(
+    path: &Path,
+    entries: &[EXPLICIT_ACCESS_W],
+) -> io::Result<()> {
+    let Some((handle, _)) = open_verified_dacl_handle(
+        path,
+        ExpectedHandleKind::SingleLinkFile {
+            allow_missing: true,
+        },
+    )?
+    else {
+        return Ok(());
+    };
+    set_protected_dacl_on_handle(handle.0, entries)
+}
+
+/// # Safety
+/// Caller must ensure `sd` is a valid live `PSECURITY_DESCRIPTOR` returned by a Win32 security API.
+unsafe fn sd_to_dacl_sddl(sd: PSECURITY_DESCRIPTOR) -> io::Result<String> {
+    let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+    let mut sddl_len: u32 = 0;
+    // SAFETY: `sd` is a live security descriptor from the caller, and `sddl_ptr` receives a
+    // NUL-terminated `LocalAlloc` UTF-16 string freed via `LocalFree` below.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut sddl_ptr,
+            &mut sddl_len,
+        )
+    };
+    if ok == 0 || sddl_ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0usize;
+    // SAFETY: On success `ConvertSecurityDescriptorToStringSecurityDescriptorW` writes a
+    // NUL-terminated UTF-16 string at `sddl_ptr`.
+    unsafe {
+        while *sddl_ptr.add(len) != 0 {
+            len += 1;
+        }
+    }
+    // SAFETY: `sddl_ptr` has at least `len` initialized `u16` elements before its trailing NUL.
+    let slice = unsafe { std::slice::from_raw_parts(sddl_ptr, len) };
+    let sddl = OsString::from_wide(slice).to_string_lossy().into_owned();
+    // SAFETY: `sddl_ptr` was allocated by `ConvertSecurityDescriptorToStringSecurityDescriptorW`
+    // and is freed once after copying.
+    unsafe {
+        LocalFree(sddl_ptr as HLOCAL);
+    }
+    Ok(sddl)
+}
+
+pub(super) fn get_handle_dacl_sddl(handle: HANDLE) -> io::Result<String> {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `handle` is an open object handle with `READ_CONTROL`; `sd` receives an owned
+    // `LocalAlloc` security descriptor freed via `LocalFree` below.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS || sd.is_null() {
+        if !sd.is_null() {
+            // SAFETY: `sd` was allocated by `GetSecurityInfo` above and is freed once here.
+            unsafe {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+        return Err(if rc != ERROR_SUCCESS {
+            io::Error::from_raw_os_error(rc as i32)
+        } else {
+            io::Error::last_os_error()
+        });
+    }
+    // SAFETY: `sd` is the live non-null security descriptor returned by `GetSecurityInfo`.
+    let res = unsafe { sd_to_dacl_sddl(sd) };
+    // SAFETY: `sd` is no longer needed after conversion and is freed once here.
+    unsafe {
+        LocalFree(sd as HLOCAL);
+    }
+    res
 }
 
 /// Queries the current DACL of `path` as an SDDL string (`D:...`) via
@@ -580,54 +931,26 @@ pub fn get_path_dacl_sddl(path: &Path) -> io::Result<String> {
             &mut sd,
         )
     };
-    if rc != ERROR_SUCCESS {
+    if rc != ERROR_SUCCESS || sd.is_null() {
         if !sd.is_null() {
             // SAFETY: `sd` was allocated by `GetNamedSecurityInfoW` above and is freed once here.
             unsafe {
                 LocalFree(sd as HLOCAL);
             }
         }
-        return Err(io::Error::from_raw_os_error(rc as i32));
+        return Err(if rc != ERROR_SUCCESS {
+            io::Error::from_raw_os_error(rc as i32)
+        } else {
+            io::Error::last_os_error()
+        });
     }
-    let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
-    let mut sddl_len: u32 = 0;
-    // SAFETY: `sd` is the live descriptor returned by `GetNamedSecurityInfoW`, and `sddl_ptr`
-    // receives a NUL-terminated `LocalAlloc` UTF-16 string freed via `LocalFree` below.
-    let ok = unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            sd,
-            SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
-            &mut sddl_ptr,
-            &mut sddl_len,
-        )
-    };
-    // SAFETY: `sd` is no longer needed after conversion and is freed once here when non-null.
+    // SAFETY: `sd` is the live non-null security descriptor returned by `GetNamedSecurityInfoW`.
+    let res = unsafe { sd_to_dacl_sddl(sd) };
+    // SAFETY: `sd` is no longer needed after conversion and is freed once here.
     unsafe {
-        if !sd.is_null() {
-            LocalFree(sd as HLOCAL);
-        }
+        LocalFree(sd as HLOCAL);
     }
-    if ok == 0 || sddl_ptr.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let mut len = 0usize;
-    // SAFETY: On success `ConvertSecurityDescriptorToStringSecurityDescriptorW` writes a
-    // NUL-terminated UTF-16 string at `sddl_ptr`.
-    unsafe {
-        while *sddl_ptr.add(len) != 0 {
-            len += 1;
-        }
-    }
-    // SAFETY: `sddl_ptr` has at least `len` initialized `u16` elements before its trailing NUL.
-    let slice = unsafe { std::slice::from_raw_parts(sddl_ptr, len) };
-    let sddl = OsString::from_wide(slice).to_string_lossy().into_owned();
-    // SAFETY: `sddl_ptr` was allocated by `ConvertSecurityDescriptorToStringSecurityDescriptorW`
-    // and is freed once after copying.
-    unsafe {
-        LocalFree(sddl_ptr as HLOCAL);
-    }
-    Ok(sddl)
+    res
 }
 
 /// Restores `path`'s DACL (including its `SE_DACL_PROTECTED` vs unprotected inheritance state)

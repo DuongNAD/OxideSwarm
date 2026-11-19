@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "campaign_id": "2026-11-pilot-dry-run",
+  "workload": {
+    "name": "app6-standin-workload",
+    "script": "standin_workload.py",
+    "deterministic": true,
+    "gpu": false,
+    "runner_ready": true
+  },
+  "defaults": {
+    "command": "python3",
+    "args": [
+      "standin_workload.py",
+      "--seed",
+      "{seed}",
+      "--founders",
+      "{live.founders}",
+      "--food-cap-abundant",
+      "{live.food_cap_abundant}",
+      "--food-cap-scarce",
+      "{live.food_cap_scarce}",
+      "--duration-ticks",
+      "{duration_ticks}",
+      "--out",
+      "out"
+    ],
+    "inputs": [
+      "standin_workload.py:standin_workload.py"
+    ],
+    "outputs": [
+      "out/smoke/**"
+    ],
+    "env": {
+      "ANIMA_DETERMINISTIC": "1",
+      "ANIMA_USE_GPU": "0"
+    },
+    "verify": 1,
+    "verify_file": "out/smoke/verify_checksums.txt",
+    "verify_any_system": false,
+    "require_isolation": "fs",
+    "require_tags": [],
+    "timeout_secs": 300,
+    "mismatch_retries": 1
+  },
+  "grid_summary": {
+    "founders": [
+      30,
+      45
+    ],
+    "food_cap_pairs": [
+      [
+        50,
+        25
+      ],
+      [
+        50,
+        13
+      ],
+      [
+        50,
+        4
+      ]
+    ],
+    "seeds": [
+      100001,
+      100002
+    ],
+    "duration_ticks": 18000,
+    "unit_count": 12
+  },
+  "units": [
+    {
+      "id": "u001",
+      "seed": 100001,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 25,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u002",
+      "seed": 100002,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 25,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    },
+    {
+      "id": "u003",
+      "seed": 100001,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 13,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u004",
+      "seed": 100002,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 13,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    },
+    {
+      "id": "u005",
+      "seed": 100001,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 4,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u006",
+      "seed": 100002,
+      "params": {
+        "live.founders": 30,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 4,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    },
+    {
+      "id": "u007",
+      "seed": 100001,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 25,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u008",
+      "seed": 100002,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 25,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    },
+    {
+      "id": "u009",
+      "seed": 100001,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 13,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u010",
+      "seed": 100002,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 13,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    },
+    {
+      "id": "u011",
+      "seed": 100001,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 4,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100001"
+      }
+    },
+    {
+      "id": "u012",
+      "seed": 100002,
+      "params": {
+        "live.founders": 45,
+        "live.food_cap_abundant": 50,
+        "live.food_cap_scarce": 4,
+        "duration_ticks": 18000
+      },
+      "env": {
+        "ANIMA_SIM_SEED": "100002"
+      }
+    }
+  ]
+}

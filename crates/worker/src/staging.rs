@@ -498,7 +498,9 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{value:.1} {unit}")
 }
 
+// LV-4: cfg(unix) libc::mkfifo fixture in staging tests (production staging.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use rusty_grid_core::blob::{BlobId, SANDBOX_ROOT};
