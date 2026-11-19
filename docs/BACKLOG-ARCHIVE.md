@@ -2817,7 +2817,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `.with_no_cuda(true)` / `.with_redirection_portal(false)` (`TEST-20`).
 - **Do:** Poll up to `TEST_WAIT_TIMEOUT = 60 s` using `.any(|t| t.assigned_worker_id == Some(w1.worker_id) && t.state == TaskState::Running)` (plus `completed_count >= 2` in the reduce-crash test) and panic with `task_summary` diagnostics instead of falling back after `4–6 s`; adopt the `TEST-54` MapReduce timeout pairing (`MR_WAIT = 180 s` outer `tokio::time::timeout` dumping `queue_stats` + `task_summary`, and `MR_TASK_TIMEOUT_SECS = 540` strictly above `MR_WAIT` across all specs); widen all `wait_for_workers` calls (`5 s` -> `60 s`); and apply the `TEST-20` worker config flags in `spawn_test_worker`.
 - **Done when:** All 11 tests keep every MapReduce, intermediate shuffle retention, and `retry_count == 0` map-phase invariant, and pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/m5_challenger_2_stress.rs` and
+- **Implemented (2026-11-19, pull request 398, open):** Updated `tests/m5_challenger_2_stress.rs` and
   verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
   - Before fix (`origin/master` `98570ab9`): `18/20` passed, **`2/20` failed** at `:623:10`
     (`252.31 s` total, `4.97–67.79 s` per run).
