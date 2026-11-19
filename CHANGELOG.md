@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Large-transfer endurance harness and first Windows loopback records (`TEST-24`, [design 0065](docs/design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`, standard library only), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (wired into CI `agent-bridge`), and loopback record `benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json` covering `T1` (`1`/`3 GiB`), `T2` (`20,000` files), `T3`, `T4`, `T6`, `T7` (`2.0 Mbit/s` / `50 ms`), and `T8` (`7/7` passed; `T1 8 GiB`, `T2 100k`, `T5`, `T9`, and two-machine links remain for step 2).
+
 ### Fixed
 - macOS worker task spawn (`BUG-33`, [design 0031](docs/design/0031-containment-after-worker-crash.md)): the detached lifeline supervisor in `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed stack buffer (`close_open_fds_macos`) and closes only those (falling back to the bounded `RLIMIT_NOFILE` loop if `proc_pidinfo` fails or after 8 full rounds (about 8,184 descriptors)), cutting per-task close-step time on Apple M5 from `111.889 ms` median wall / `111.095 ms` median CPU to `0.688 ms` / `0.183 ms` at `ulimit -n 1,048,576` and from `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`.
 
