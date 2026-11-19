@@ -19,8 +19,8 @@ mod toolchain;
 
 use super::{HostDirs, IsolationLevel, Jail};
 use acl::{
-    explicit_access, merge_entries_on_path, merge_entries_on_path_unprotected,
-    set_protected_dacl_on_path,
+    merge_entries_on_path, merge_entries_on_path_unprotected,
+    set_protected_dacl_on_single_link_file_if_exists,
 };
 use desktop::{create_per_task_desktop, CloseDesktop};
 use path::{discover_msvc_details, to_wide};
@@ -55,18 +55,24 @@ pub use acl::{
     get_path_dacl_sddl, oxideswarm_toolchain_sid_string, restore_path_dacl_sddl, OwnedSid,
     OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME,
 };
+pub(super) use acl::{explicit_access, set_protected_dacl_on_path};
 pub(super) use path::resolve_program;
 pub use path::{
     is_reparse_point, normalize_win_path, path_starts_with_ci, resolve_windows_msvc_env,
     worker_profile_prefix,
 };
 pub use spawn::{is_process_elevated, AppContainerChild};
-#[cfg(test)]
-pub(super) use toolchain::validate_single_link_file_info;
 pub use toolchain::{
     prepare_worker_toolchains, revoke_oxideswarm_toolchain_acls, revoke_toolchain_sid_on_tree,
     validate_protected_files_outside_toolchains, validate_sandbox_base_safe,
     validate_workspace_root_safe,
+};
+#[cfg(test)]
+pub(super) use toolchain::{
+    validate_single_link_file_info, validate_workspace_root_safe_with_env_home,
+};
+pub(super) use toolchain::{
+    validate_workspace_dir_entries_safe, validate_workspace_root_entries_safe,
 };
 
 const HRESULT_ALREADY_EXISTS: i32 =
@@ -478,17 +484,40 @@ impl WindowsAppContainerGuard {
                 };
                 protect_sandbox_base(jail.sandbox_base, toolchain_sid.as_psid(), manifest_opt)?;
                 if let Some(ws_root) = jail.workspace_root {
+                    #[cfg(test)]
+                    ws_root_recheck_test_hook::run_before_recheck(ws_root);
                     validate_workspace_root_ancestors_safe(ws_root, jail.host)
                         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    validate_workspace_root_entries_safe(ws_root)
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    #[cfg(test)]
+                    ws_root_recheck_test_hook::run_before_protect(ws_root);
                     protect_sandbox_base(ws_root, toolchain_sid.as_psid(), manifest_opt)?;
                 }
             }
 
             let mut workspace_dirs_to_restore = Vec::new();
-            if jail.workspace_root.is_some() {
+            if let Some(ws_root) = jail.workspace_root {
                 let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
                 if let Some(ws_dir) = jail.sandbox_dir.parent() {
-                    if ws_dir.exists() && !is_reparse_point(ws_dir) {
+                    if is_reparse_point(ws_dir) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing to configure AppContainer on a reparse-point workspace directory '{}'",
+                                ws_dir.display()
+                            ),
+                        ));
+                    }
+                    if ws_dir.exists() {
+                        if path_starts_with_ci(ws_dir, ws_root) {
+                            let ws_name = ws_dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            validate_workspace_dir_entries_safe(ws_root, &ws_name, ws_dir)
+                                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                        }
                         let ws_parent_entries = [
                             owner_only_entries[0],
                             owner_only_entries[1],
@@ -501,11 +530,34 @@ impl WindowsAppContainerGuard {
                             ),
                         ];
                         set_protected_dacl_on_path(ws_dir, &ws_parent_entries)?;
+                        #[cfg(test)]
+                        ws_root_recheck_test_hook::run_before_meta_dacl(ws_dir);
+                        let owner_only_file_entries = [
+                            explicit_access(
+                                user_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                            explicit_access(
+                                system_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                            explicit_access(
+                                admins_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                        ];
                         for meta_name in ["state.json", "lock"] {
                             let meta_path = ws_dir.join(meta_name);
-                            if meta_path.exists() && !is_reparse_point(&meta_path) {
-                                let _ = set_protected_dacl_on_path(&meta_path, &owner_only_entries);
-                            }
+                            set_protected_dacl_on_single_link_file_if_exists(
+                                &meta_path,
+                                &owner_only_file_entries,
+                            )?;
                         }
                     }
                 }
@@ -539,8 +591,9 @@ impl WindowsAppContainerGuard {
                 // Set a single inheritable protected DACL on `<sandbox_dir>` root granting access
                 // only to CurrentUser, SYSTEM, Administrators, and this task's specific
                 // `app_container_sid` (omitting `WRITE_DAC` and `WRITE_OWNER` so the task cannot
-                // alter its own sandbox ACL). Win32 `SetNamedSecurityInfoW` propagates `(I)` to
-                // staged children inside `<sandbox_dir>` automatically without walking (N6).
+                // alter its own sandbox ACL). Win32 `SetSecurityInfo` on the verified handle
+                // propagates `(I)` to staged children inside `<sandbox_dir>` automatically without
+                // walking (N6).
                 let task_sandbox_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
                 let sandbox_entries = [
                     owner_only_entries[0],
@@ -739,9 +792,18 @@ pub(super) async fn probe_with_config(
     let fail =
         |what: String| format!("--isolation {level} cannot be enforced on this host: {what}");
 
+    // Canonicalize ancestor junctions / `SUBST` drives when `sandbox_base` itself is not a
+    // reparse point (matching `TaskRunner`'s per-task execution path), while keeping a junction or
+    // symlink directly at `sandbox_base` unnormalized so start-up still refuses it.
+    let effective_base = if !is_reparse_point(sandbox_base) {
+        normalize_win_path(sandbox_base)
+    } else {
+        sandbox_base.to_path_buf()
+    };
+
     let host_clone = host.clone();
     let protected_clone = protected_files.to_vec();
-    let base_clone = sandbox_base.to_path_buf();
+    let base_clone = effective_base.clone();
     tokio::task::spawn_blocking(move || {
         let _ = sweep_leftover_appcontainer_profiles_for_base(&base_clone);
         prepare_worker_toolchains(&host_clone, &protected_clone, Some(&base_clone))
@@ -807,17 +869,17 @@ pub(super) async fn probe_with_config(
         }
     }
 
-    let probe_dir = sandbox_base.join(format!(".isolation-probe-{}", std::process::id()));
+    let probe_dir = effective_base.join(format!(".isolation-probe-{}", std::process::id()));
     std::fs::create_dir_all(&probe_dir).map_err(|e| {
         format!(
             "--isolation {level}: cannot create the probe directory {}: {e}",
             probe_dir.display()
         )
     })?;
-    let norm_base = if !is_reparse_point(sandbox_base) {
-        normalize_win_path(sandbox_base)
+    let norm_base = if !is_reparse_point(&effective_base) {
+        normalize_win_path(&effective_base)
     } else {
-        sandbox_base.to_path_buf()
+        effective_base.clone()
     };
     let norm_probe_dir = if !is_reparse_point(&probe_dir) {
         normalize_win_path(&probe_dir)
@@ -909,3 +971,55 @@ pub(super) async fn probe_with_config(
 
 #[cfg(test)]
 pub(crate) use spawn::lua_test_hook;
+
+/// Test-only hooks for exercising `PREPARE_LOCK` re-check, handle verification, and metadata DACL
+/// guards in `WindowsAppContainerGuard::create_blocking` (SEC-18). Never compiled outside tests.
+#[cfg(test)]
+pub(crate) mod ws_root_recheck_test_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type HookSlot = RefCell<Option<Box<dyn FnOnce(&Path)>>>;
+
+    thread_local! {
+        static BEFORE_RECHECK: HookSlot = const { RefCell::new(None) };
+        static BEFORE_PROTECT: HookSlot = const { RefCell::new(None) };
+        static BEFORE_META_DACL: HookSlot = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_before_recheck(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_RECHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn set_before_protect(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_PROTECT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn set_before_meta_dacl(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_META_DACL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear_all() {
+        BEFORE_RECHECK.with(|slot| *slot.borrow_mut() = None);
+        BEFORE_PROTECT.with(|slot| *slot.borrow_mut() = None);
+        BEFORE_META_DACL.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    pub(super) fn run_before_recheck(path: &Path) {
+        if let Some(hook) = BEFORE_RECHECK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+
+    pub(super) fn run_before_protect(path: &Path) {
+        if let Some(hook) = BEFORE_PROTECT.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+
+    pub(super) fn run_before_meta_dacl(path: &Path) {
+        if let Some(hook) = BEFORE_META_DACL.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+}

@@ -224,7 +224,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | In | (design 0065) |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
@@ -358,7 +358,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
-| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
+| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
@@ -408,7 +408,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376 (open), (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -507,6 +507,22 @@ The full suite must pass on a clean machine before CI can require it.
   4. For every failed check, open an item or write a failing regression test (rule 4).
 - **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
   `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
+- **Partial (2026-11-19, pull request 374):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
+  `sample`, Python 3 standard library only), `benchmarks/endurance/README.md`, and
+  `tests/test_endurance_harness.py` (`14/14` passed, wired into CI `agent-bridge`), and ran
+  loopback scenarios on Windows `x86_64` (`rusty-grid 0.4.3` at `a3e5b71`, Windows Defender
+  real-time protection on): `7/7` passed in `2,648.17 s`
+  (`benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`):
+  `T1` (`1 GiB` `10.033 s`, `3 GiB` `67.899 s`; peak RSS delta `-3.9 MiB` master / `-2.8 MiB`
+  worker / `+0.64 MiB` client vs `128 MiB` bound), `T2` (`20,000` files, `173,998,510 B`,
+  `233.124 s`, `20,001` blobs stored), `T3` (`1,000 MiB` output `10.757 s` ok; `1,100 MiB`
+  refused naming `--output-limit-mb`), `T4` (second `3 GiB` submit uploaded `0` blobs / `0 B`),
+  `T6` (`64 MiB` fetch cut via loopback proxy recovered cleanly in `4.440 s`, `0` `.part`
+  leftovers), `T7` (`256 MiB` in + `256 MiB` out over `2.0 Mbit/s` / `50 ms` RTT TCP finished in
+  `2,164.622 s` with `worker_reaped = false`), and `T8` (`--blob-store-mb 64` refused `72 MiB`
+  and concurrent `40 + 40 MiB` uploads naming `--blob-store-mb`, `0` tmp leftovers). `T1 (8 GiB)`,
+  `T2 (100,000 files)`, `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` links
+  remain for step 2.
 
 ### TEST-25: Run a cluster for 24 hours under load and faults
 
@@ -1236,33 +1252,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
   owner's decision of "Done when" (the entry itself is gone) and step 2.
 
-### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
-
-- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
-  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
-  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
-    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
-    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
-    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
-    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
-  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
-    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
-  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
-    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
-    a skipped test shows as `ok`.
-- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
-  gaps. Only processes of the same user can create the links, so the impact is low.
-- **Do:**
-  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
-     and require `nlink == 1` for every file whose DACL is written.
-  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
-     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
-     `SetSecurityInfo` on that handle.
-  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
-     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
-     skips.
-- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
-
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
 - **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
@@ -1938,6 +1927,15 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   (`doctor` check C7), the hours online, the tasks run, the credits shown and the controls set; the
   verification result of every task, with each mismatch explained; and what each participant found
   hard. It is the exit check of Stage 1 in design 0094.
+- **Partial (2026-11-19, pull request 376, open; item stays `Planned`):** Steps 1 and 4 done: committed
+  the campaign sheet and one-page participant guide (`benchmarks/campaigns/2026-11-pilot/README.md`), the
+  200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`, noting the
+  Anima Engine runner blocker and switching `--verify-file` to deterministic `out/smoke/verify_checksums.txt`),
+  `dry_run_manifest.json` + `standin_workload.py` for step 2 on `0.4.4`, the standard-library Python driver
+  (`benchmarks/campaigns/driver.py`), and `tests/test_campaign_driver.py` (wired in
+  `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local loopback
+  cluster on `dry_run_manifest.json`. Steps 2 (dry run) and 3 (pilot run, blocked on the Anima Engine
+  runner update as well as `NET-9` and `NET-10`) remain **Planned**.
 
 ## Status log
 
@@ -2402,5 +2400,8 @@ Add one dated line per finished item, newest last.
   NET-10 and APP-6 stay Planned.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
+- 2026-11-19: SEC-18 Implemented (pull request 372, open; text in the archive): `validate_workspace_root_entries_safe` and `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory `.locks`/workspace folders, and hard-linked `.locks/*` and `<ws>/{state.json,lock,state.json.tmp}` files; `open_verified_dacl_handle` and `set_protected_dacl_on_handle` verify `GetFileInformationByHandle` and `GetFinalPathNameByHandleW` against the lexical long path (`GetLongPathNameW`) before calling `SetSecurityInfo` on `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` handles; `check_chain_from_home` matches home only on `Normal` components (no bare `C:` CWD expansion); and tests prove each home walk independently, assert refusal texts, exercise `PREPARE_LOCK` / handle / metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
+- 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
+- 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
