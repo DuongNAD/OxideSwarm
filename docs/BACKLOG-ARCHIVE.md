@@ -2567,6 +2567,50 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      0.00 s` `libtest` (`123.72 s -> 3.83 s` wall, 30/30 `skipped:`).
   - **PR #361 CI result (`44437998772`, `windows-latest` job `135271584175`, green across all 3 OSes):** total job duration `1,416 s` (`23.60 min`, vs `30.2 min` median / `43.1 min` max baseline — `-6.6 min`), with Step 7 in `165 s` (`2.75 min`) and Step 8 in `1,149 s` (`19.15 min`).
 
+### TEST-57: m2 capability stress test: wait for reconnects by condition, not a fixed 1.8 s window
+
+- **Evidence:** `test_capability_queries_under_connect_disconnect_stress` (`tests/m2_challenger_2_stress.rs:735`)
+  failed on `windows-latest` in run `44308601329` (attempt 1, after 33 minutes) with
+  `The churn workers must reconnect during the run (observed 8 registrations from 8 workers)`.
+- **Problem:** The test slept for a fixed `1800 ms` (`tests/m2_challenger_2_stress.rs:698`) and then
+  asserted `registered >= 16` and `> 50` iterations in each of the four query loops. Under a starved
+  CI runner, all 8 churn workers completed their initial registration (`observed 8 registrations`),
+  leaving too little of the fixed `1.8 s` window for any worker to reconnect before shutdown.
+- **Do:** Replace the fixed `1.8 s` sleep with a `50 ms` polling loop up to a `60 s` deadline until
+  `registered >= 16` and all four query counts exceed `50`, stopping early if any query task finishes,
+  and keep both final assertions with the elapsed time and counts printed on failure.
+- **Done when:** Both assertions stay, idle run time remains about `2 s`, and the test passes `50/50`
+  (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
+- **Implemented (2026-11-19, pull request 365):** Polls `registry.counts()` and all four atomic
+  query counters every `50 ms` up to `60 s` in `tests/m2_challenger_2_stress.rs` and prints
+  `stress_elapsed` and counts on completion or deadline expiry. On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`,
+  a private folder), `cargo test --locked -p rusty_grid_master --test m2_challenger_2_stress test_capability_queries_under_connect_disconnect_stress -- --exact`
+  passed `50/50` (`0` failures): `25/25` alone (wall `5.0398 / 5.1959 / 6.0501 s`, libtest
+  `0.85 / 0.86 / 1.01 s`) and `25/25` under 12 CPU busy loops (`82.0%` host CPU; wall
+  `5.6473 / 5.8747 / 6.6347 s`, libtest `1.00 / 1.02 / 1.45 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
+  and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings.
+
+### TEST-59: Zero-duration task test: drop the 100 ms wall-clock window
+
+- **Evidence:** `test_tier2_bva_zero_duration_builtin_task_instant_completion`
+  (`tests/e2e_cluster.rs:1078:5`) failed in `workspace tests (macos-latest)` on 2026-11-18 at `be6c1e9`
+  (run `44209594539`, job `134484257136`) with `0-duration task must complete nearly instantly`.
+- **Problem:** The test asserted `elapsed < Duration::from_millis(100)` across a full master-worker
+  round trip (`submit_and_wait`), which depends on runner scheduling rather than task behaviour.
+- **Do:** Raise the cluster/task safety timeouts (`30 s`), print `elapsed` and `res.execution_time_ms`
+  instead of asserting `elapsed < 100 ms`, and assert task success (`res.is_success()`, `exit_code == 0`,
+  `error.is_none()`), the `0 ms` builtin sleep stdout, and bounded worker `execution_time_ms`.
+- **Done when:** No wall-clock `< 100 ms` assertion remains, `elapsed` is printed, and the test passes
+  `50/50` (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
+- **Implemented (2026-11-19, pull request 365):** Updated
+  `test_tier2_bva_zero_duration_builtin_task_instant_completion` in `tests/e2e_cluster.rs` as planned.
+  On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`, a private folder),
+  `cargo test --locked -p rusty_grid_cli --test e2e_cluster test_tier2_bva_zero_duration_builtin_task_instant_completion -- --exact`
+  passed `50/50` (`0` failures): `25/25` alone (wall `6.5930 / 6.8475 / 9.2592 s`, libtest
+  `0.58 / 0.60 / 1.15 s`) and `25/25` under 12 CPU busy loops (`90.0–97.0%` host CPU; wall
+  `7.0569 / 13.5401 / 27.8546 s`, libtest `0.67 / 0.99 / 1.63 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
+  and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
