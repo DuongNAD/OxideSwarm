@@ -10,7 +10,7 @@
 //! `RUSTY_GRID_REQUIRE_APPCONTAINER=1` (set in CI) likewise turns any missing host precondition
 //! into a failure via `cannot_run`.
 //!
-//! `OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1` (set ONLY on Windows CI's Step 8
+//! `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8=1` (set ONLY on Windows CI's Step 8
 //! `cargo test --workspace` invocation after Step 7 has already executed
 //! `test_feat3_os_isolation` serially with `--test-threads=1 --nocapture`) lets the existing
 //! `#[cfg(windows)]` AppContainer tests return early with a printed `skipped:` notice so Step 8
@@ -3050,15 +3050,15 @@ mod windows {
 
     /// Windows CI runs `test_feat3_os_isolation` serially in its own step (`--test-threads=1`)
     /// before `cargo test --workspace` (Step 8). Step 8 sets
-    /// `OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1` on itself so these already-run Windows tests
+    /// `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8=1` on itself so these already-run Windows tests
     /// print a skip notice without excluding the binary or masking any newly added target or test.
     fn skip_duplicate_ci_workspace_pass() -> bool {
         if matches!(
-            std::env::var("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8").as_deref(),
+            std::env::var("RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         ) {
             eprintln!(
-                "skipped: already executed in Windows AppContainer isolation step (OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1)"
+                "skipped: already executed in Windows AppContainer isolation step (RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8=1)"
             );
             return true;
         }

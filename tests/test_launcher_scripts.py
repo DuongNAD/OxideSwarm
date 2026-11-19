@@ -3592,10 +3592,10 @@ public class Program {
         step7_non_comment = "\n".join(
             line for line in step7_block.splitlines() if not line.lstrip().startswith("#")
         )
-        self.assertEqual(non_comment_ci.count("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8"), 1)
-        self.assertNotIn("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8", step7_non_comment)
+        self.assertEqual(non_comment_ci.count("RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8"), 1)
+        self.assertNotIn("RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8", step7_non_comment)
         self.assertIn(
-            "OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8: ${{ matrix.os == 'windows-latest' && '1' || '' }}",
+            "RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8: ${{ matrix.os == 'windows-latest' && '1' || '' }}",
             step8_block,
         )
 
