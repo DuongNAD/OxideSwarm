@@ -1688,5 +1688,7 @@ impl WorkerClient {
     }
 }
 
+// LV-4: cfg(windows) WaitForSingleObject test probe in client/tests.rs (production client.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests;

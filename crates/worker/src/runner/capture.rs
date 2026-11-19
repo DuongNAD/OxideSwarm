@@ -125,7 +125,10 @@ async fn read_into_capture<R: tokio::io::AsyncRead + Unpin>(
             Ok(0) => break, // EOF reached
             Ok(n) => lock_capture(&capture).push(&scratch[..n], max_bytes),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) => {
+                warn!(error = %e, "Task output stream read ended with error");
+                break;
+            }
         }
     }
 }
