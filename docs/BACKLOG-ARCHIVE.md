@@ -2821,7 +2821,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All 3 tests keep every Tier 3 rendezvous discovery, keyed isolation,
   anti-harvesting, and CLI URL rejection assertion, print service + child diagnostics on failure, and
   pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/rendezvous_discovery_e2e.rs` and
+- **Implemented (2026-11-19, pull request 400, open):** Updated `tests/rendezvous_discovery_e2e.rs` and
   verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures
   before the fix is expected since the `20 s` timeout occurred on a 12-thread Windows laptop):
   - Before fix (`origin/master` `d321d97f`): `20/20` passed (`195.42 s` total, `9.54–11.58 s` per
