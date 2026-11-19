@@ -2733,6 +2733,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-68: gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines
+
+- **Evidence:** During CI on pull request 387 (`workspace tests (windows-latest)`, run `44597494223`,
+  `cargo test --workspace --locked --no-fail-fast`), `test_adversarial_scheduling_isolation_mixed_cluster`
+  panicked at `tests/gpu_wgpu_compute_test.rs:1218:10`:
+  `quick wait: Timeout { operation: "wait_task(...)", duration_secs: 3 }`.
+- **Problem:** `tests/gpu_wgpu_compute_test.rs` used fixed `3–8 s` condition-wait and `wait_task`
+  timeouts (`5 s` worker registration and `5 s` `wait_task` with `15 s` task timeout in Scenario 7
+  `test_e2e_cluster_gpu_task_distribution`; `5 s` registration, `8 s` × 12 `wait_task` calls with
+  `10 s`/`15 s` task timeouts, `3 s` Worker 3 `Disconnected` wait, and `3 s` `quick_cpu` `wait_task`
+  with `5 s` task timeout in Scenario 11 `test_adversarial_scheduling_isolation_mixed_cluster`), causing
+  false timeouts on loaded CI runners.
+- **Do:** Define `TEST_WAIT_TIMEOUT = 60 s` and shared helper `wait_for_workers` polling
+  `master.list_workers()` until the predicate passes or dumping observed `(worker_id, status)` pairs on
+  timeout; raise the worker registration (`5 s` -> `60 s`), Worker 3 disconnect (`3 s` -> `60 s`),
+  `wait_task` (`3–8 s` -> `60 s`), and `TaskRequirements` task execution timeouts (`5–15 s` -> `60 s`)
+  with descriptive failure panics naming the awaited condition and task/worker IDs; keep every strict
+  capability routing assertion and the `500 ms` negative check before asserting `stranded_id` stays
+  `Queued`, and strengthen the negative check by re-checking `master.get_task_status(stranded_id)` is
+  still `Queued` after `quick_cpu` completes on a free CPU worker.
+- **Done when:** All 14 tests in `tests/gpu_wgpu_compute_test.rs` keep full routing and negative checks,
+  compile with and without `--features gpu-wgpu`, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request TBD):** Updated `tests/gpu_wgpu_compute_test.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`97.83 s` total, `4.71–6.37 s` per run).
+  - After fix: `cargo test -p rusty_grid_worker --test gpu_wgpu_compute_test --features gpu-wgpu --no-run --locked`
+    compiled cleanly, default `14/14` passed in `4.41 s`, and the 20-run loop under 6 Python busy loops
+    passed `20/20` (`95.01 s` total, `4.69–4.91 s` per run, `0` failures).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
