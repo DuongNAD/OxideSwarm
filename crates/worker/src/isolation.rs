@@ -2948,6 +2948,46 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_eviction_not_found_skipped_while_bad_entries_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let ws_root = root_path.join("workspaces");
+        let evicted_ws = ws_root.join("evicted_ws");
+        let active_ws = ws_root.join("active_ws");
+        std::fs::create_dir_all(active_ws.join("tree")).unwrap();
+        std::fs::create_dir_all(active_ws.join("tmp")).unwrap();
+        std::fs::write(active_ws.join("state.json"), "{}").unwrap();
+        std::fs::write(active_ws.join("lock"), "").unwrap();
+
+        // Concurrently evicted workspace dir or already-wiped entries (NotFound) must be skipped.
+        windows::validate_workspace_dir_entries_safe(&ws_root, "evicted_ws", &evicted_ws)
+            .expect("missing workspace dir removed by eviction must be skipped");
+        std::fs::remove_dir_all(active_ws.join("tree")).unwrap();
+        std::fs::remove_dir_all(active_ws.join("tmp")).unwrap();
+        std::fs::remove_file(active_ws.join("state.json")).unwrap();
+        windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect("evicted workspace entries removed between read_dir and stat must be skipped");
+
+        // Real security violations (junction or hard-linked metadata) stay refused.
+        let hardlink_outside = root_path.join("outside_state.json");
+        std::fs::write(&hardlink_outside, "{}").unwrap();
+        std::fs::hard_link(&hardlink_outside, active_ws.join("state.json")).unwrap();
+        let err_hl = windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect_err("hard-linked state.json must still be refused");
+        assert!(err_hl.contains("nlink == 1"), "{err_hl}");
+        std::fs::remove_file(active_ws.join("state.json")).unwrap();
+
+        let victim_dir = root_path.join("victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        mklink_j(&active_ws.join("tree"), &victim_dir).unwrap();
+        let err_junc = windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect_err("junction tree must still be refused");
+        assert!(err_junc.contains("reparse point"), "{err_junc}");
+        std::fs::remove_dir(active_ws.join("tree")).unwrap();
+    }
+
     #[test]
     fn test_acl_grant_manifest_path_precedence_honours_oxideswarm_home() {
         use std::ffi::OsStr;

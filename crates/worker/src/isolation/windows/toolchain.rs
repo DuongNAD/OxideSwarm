@@ -617,14 +617,25 @@ pub(in crate::isolation) fn validate_single_link_file_info(
     Ok(())
 }
 
-fn check_real_directory(ws_root: &Path, entry_name: &str, entry_path: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(entry_path).map_err(|e| {
-        format!(
-            "refusing to rewrite the DACL of existing folder '{}' because metadata for '{}' could not be read: {e}",
-            ws_root.display(),
-            entry_name
-        )
-    })?;
+/// Validates that `entry_path` is a real non-reparse directory, returning `Ok(false)` if the
+/// entry vanished concurrently (for example during another slot's workspace eviction/wipe) and
+/// `Ok(true)` if it exists and is valid.
+fn check_real_directory_allow_missing(
+    ws_root: &Path,
+    entry_name: &str,
+    entry_path: &Path,
+) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(entry_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because metadata for '{}' could not be read: {e}",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+    };
     if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || meta.file_type().is_symlink()
     {
         return Err(format!(
@@ -640,37 +651,20 @@ fn check_real_directory(ws_root: &Path, entry_name: &str, entry_path: &Path) -> 
             entry_name
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Validates that `entry_path` is an existing regular non-reparse file with `nNumberOfLinks == 1`,
-/// reading `nNumberOfLinks` directly from `GetFileInformationByHandle` so volumes with zero
-/// 64-bit file index or volume serial (ReFS, Dev Drive, network volumes) are still accepted.
-fn check_single_link_regular_file(
-    ws_root: &Path,
-    entry_name: &str,
-    entry_path: &Path,
-) -> Result<(), String> {
-    check_single_link_regular_file_impl(ws_root, entry_name, entry_path, false)
-}
-
+/// Validates that `entry_path`, if still present, is a regular non-reparse file with
+/// `nNumberOfLinks == 1` (reading `nNumberOfLinks` directly from `GetFileInformationByHandle`),
+/// returning `Ok(())` when the entry vanished concurrently (e.g. eviction/wipe).
 fn check_single_link_regular_file_allow_missing(
     ws_root: &Path,
     entry_name: &str,
     entry_path: &Path,
 ) -> Result<(), String> {
-    check_single_link_regular_file_impl(ws_root, entry_name, entry_path, true)
-}
-
-fn check_single_link_regular_file_impl(
-    ws_root: &Path,
-    entry_name: &str,
-    entry_path: &Path,
-    allow_missing: bool,
-) -> Result<(), String> {
     let meta = match std::fs::symlink_metadata(entry_path) {
         Ok(meta) => meta,
-        Err(e) if allow_missing && e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(format!(
                 "refusing to rewrite the DACL of existing folder '{}' because metadata for '{}' could not be read: {e}",
@@ -696,7 +690,7 @@ fn check_single_link_regular_file_impl(
     }
     let file = match rusty_grid_core::blob::open_regular_file_nofollow(entry_path) {
         Ok((file, _)) => file,
-        Err(e) if allow_missing && e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
             let msg = e.to_string();
             if msg.contains("symbolic links") {
@@ -725,36 +719,48 @@ fn check_single_link_regular_file_impl(
 
 /// Validates one named workspace directory (`<ws_root>\<ws_name>`) and its direct entries
 /// (`tree`, `tmp` as real non-reparse directories; `state.json`, `lock`, and transient
-/// `state.json.tmp` as single-link non-reparse regular files).
-pub(super) fn validate_workspace_dir_entries_safe(
+/// `state.json.tmp` as single-link non-reparse regular files). Entries removed concurrently by
+/// another slot's workspace eviction (`NotFound`) are skipped safely.
+pub(in crate::isolation) fn validate_workspace_dir_entries_safe(
     ws_root: &Path,
     ws_name: &str,
     ws_dir: &Path,
 ) -> Result<(), String> {
-    check_real_directory(ws_root, ws_name, ws_dir)?;
-    let sub_entries = std::fs::read_dir(ws_dir).map_err(|e| {
-        format!(
-            "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
-            ws_root.display(),
-            ws_name
-        )
-    })?;
-    for sub_res in sub_entries {
-        let sub = sub_res.map_err(|e| {
-            format!(
-                "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+    if !check_real_directory_allow_missing(ws_root, ws_name, ws_dir)? {
+        return Ok(());
+    }
+    let sub_entries = match std::fs::read_dir(ws_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
                 ws_root.display(),
                 ws_name
-            )
-        })?;
+            ));
+        }
+    };
+    for sub_res in sub_entries {
+        let sub = match sub_res {
+            Ok(sub) => sub,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+                    ws_root.display(),
+                    ws_name
+                ));
+            }
+        };
         let sub_name = sub.file_name();
         let sub_s = sub_name.to_string_lossy();
         let sub_path = sub.path();
         let rel = format!("{ws_name}/{sub_s}");
         match sub_s.as_ref() {
-            "tree" | "tmp" => check_real_directory(ws_root, &rel, &sub_path)?,
-            "state.json" | "lock" => check_single_link_regular_file(ws_root, &rel, &sub_path)?,
-            "state.json.tmp" => {
+            "tree" | "tmp" => {
+                let _ = check_real_directory_allow_missing(ws_root, &rel, &sub_path)?;
+            }
+            "state.json" | "lock" | "state.json.tmp" => {
                 check_single_link_regular_file_allow_missing(ws_root, &rel, &sub_path)?;
             }
             _ => {
@@ -772,8 +778,11 @@ pub(super) fn validate_workspace_dir_entries_safe(
 
 /// Validates every top-level entry of `ws_root` that a DACL rewrite can reach, failing closed on
 /// unexpected files, symlinks/junctions, hard-linked metadata or lock files, or unreadable
-/// directories (`Ok(())` when `ws_root` does not exist yet).
-pub(super) fn validate_workspace_root_entries_safe(ws_root: &Path) -> Result<(), String> {
+/// directories (`Ok(())` when `ws_root` does not exist yet or an entry disappears mid-walk due
+/// to eviction).
+pub(in crate::isolation) fn validate_workspace_root_entries_safe(
+    ws_root: &Path,
+) -> Result<(), String> {
     let entries = match std::fs::read_dir(ws_root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -785,39 +794,57 @@ pub(super) fn validate_workspace_root_entries_safe(ws_root: &Path) -> Result<(),
         }
     };
     for entry_res in entries {
-        let entry = entry_res.map_err(|e| {
-            format!(
-                "refusing to rewrite the DACL of existing folder '{}' because an entry could not be read: {e}",
-                ws_root.display()
-            )
-        })?;
+        let entry = match entry_res {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because an entry could not be read: {e}",
+                    ws_root.display()
+                ));
+            }
+        };
         let name = entry.file_name();
         let s = name.to_string_lossy();
         let entry_path = entry.path();
         if s == ".oxideswarm-usb-workspaces" || s == "store.lock" {
-            check_single_link_regular_file(ws_root, &s, &entry_path)?;
+            check_single_link_regular_file_allow_missing(ws_root, &s, &entry_path)?;
             continue;
         }
         if s == ".locks" {
-            check_real_directory(ws_root, &s, &entry_path)?;
-            let lock_entries = std::fs::read_dir(&entry_path).map_err(|e| {
-                format!(
-                    "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
-                    ws_root.display(),
-                    s
-                )
-            })?;
-            for sub_res in lock_entries {
-                let sub = sub_res.map_err(|e| {
-                    format!(
-                        "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+            if !check_real_directory_allow_missing(ws_root, &s, &entry_path)? {
+                continue;
+            }
+            let lock_entries = match std::fs::read_dir(&entry_path) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
                         ws_root.display(),
                         s
-                    )
-                })?;
+                    ));
+                }
+            };
+            for sub_res in lock_entries {
+                let sub = match sub_res {
+                    Ok(sub) => sub,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(format!(
+                            "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+                            ws_root.display(),
+                            s
+                        ));
+                    }
+                };
                 let sub_name = sub.file_name();
                 let sub_s = sub_name.to_string_lossy();
-                check_single_link_regular_file(ws_root, &format!(".locks/{sub_s}"), &sub.path())?;
+                check_single_link_regular_file_allow_missing(
+                    ws_root,
+                    &format!(".locks/{sub_s}"),
+                    &sub.path(),
+                )?;
             }
             continue;
         }

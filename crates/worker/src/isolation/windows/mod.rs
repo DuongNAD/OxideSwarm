@@ -33,10 +33,7 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use toolchain::{
-    protect_sandbox_base, validate_workspace_dir_entries_safe,
-    validate_workspace_root_ancestors_safe, validate_workspace_root_entries_safe,
-};
+use toolchain::{protect_sandbox_base, validate_workspace_root_ancestors_safe};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, SET_ACCESS};
 use windows_sys::Win32::Security::Isolation::{
@@ -73,6 +70,9 @@ pub use toolchain::{
 #[cfg(test)]
 pub(super) use toolchain::{
     validate_single_link_file_info, validate_workspace_root_safe_with_env_home,
+};
+pub(super) use toolchain::{
+    validate_workspace_dir_entries_safe, validate_workspace_root_entries_safe,
 };
 
 const HRESULT_ALREADY_EXISTS: i32 =
@@ -591,8 +591,9 @@ impl WindowsAppContainerGuard {
                 // Set a single inheritable protected DACL on `<sandbox_dir>` root granting access
                 // only to CurrentUser, SYSTEM, Administrators, and this task's specific
                 // `app_container_sid` (omitting `WRITE_DAC` and `WRITE_OWNER` so the task cannot
-                // alter its own sandbox ACL). Win32 `SetNamedSecurityInfoW` propagates `(I)` to
-                // staged children inside `<sandbox_dir>` automatically without walking (N6).
+                // alter its own sandbox ACL). Win32 `SetSecurityInfo` on the verified handle
+                // propagates `(I)` to staged children inside `<sandbox_dir>` automatically without
+                // walking (N6).
                 let task_sandbox_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
                 let sandbox_entries = [
                     owner_only_entries[0],
@@ -791,9 +792,18 @@ pub(super) async fn probe_with_config(
     let fail =
         |what: String| format!("--isolation {level} cannot be enforced on this host: {what}");
 
+    // Canonicalize ancestor junctions / `SUBST` drives when `sandbox_base` itself is not a
+    // reparse point (matching `TaskRunner`'s per-task execution path), while keeping a junction or
+    // symlink directly at `sandbox_base` unnormalized so start-up still refuses it.
+    let effective_base = if !is_reparse_point(sandbox_base) {
+        normalize_win_path(sandbox_base)
+    } else {
+        sandbox_base.to_path_buf()
+    };
+
     let host_clone = host.clone();
     let protected_clone = protected_files.to_vec();
-    let base_clone = sandbox_base.to_path_buf();
+    let base_clone = effective_base.clone();
     tokio::task::spawn_blocking(move || {
         let _ = sweep_leftover_appcontainer_profiles_for_base(&base_clone);
         prepare_worker_toolchains(&host_clone, &protected_clone, Some(&base_clone))
@@ -859,17 +869,17 @@ pub(super) async fn probe_with_config(
         }
     }
 
-    let probe_dir = sandbox_base.join(format!(".isolation-probe-{}", std::process::id()));
+    let probe_dir = effective_base.join(format!(".isolation-probe-{}", std::process::id()));
     std::fs::create_dir_all(&probe_dir).map_err(|e| {
         format!(
             "--isolation {level}: cannot create the probe directory {}: {e}",
             probe_dir.display()
         )
     })?;
-    let norm_base = if !is_reparse_point(sandbox_base) {
-        normalize_win_path(sandbox_base)
+    let norm_base = if !is_reparse_point(&effective_base) {
+        normalize_win_path(&effective_base)
     } else {
-        sandbox_base.to_path_buf()
+        effective_base.clone()
     };
     let norm_probe_dir = if !is_reparse_point(&probe_dir) {
         normalize_win_path(&probe_dir)
