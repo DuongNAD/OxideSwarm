@@ -1695,6 +1695,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 expected_workers=["win-a"],
                 expected_count=1,
                 sample_interval_s=60.0,
+                max_concurrent_per_source=8,
             )
 
             started_pids: List[int] = []
@@ -2240,6 +2241,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 expected_workers=["win-a"],
                 expected_count=1,
                 sample_interval_s=60.0,
+                max_concurrent_per_source=8,
             )
             with (
                 mock.patch.object(rs.WorkerAgent, "_start_worker", lambda s: 0),
@@ -2602,6 +2604,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             self.assertFalse(srv._try_acquire_conn_slot("127.0.0.1"))
 
             def assert_trickle_aborts(initial_bytes: bytes, max_ticks: int = 20):
+                t0 = time.monotonic()
                 st = socket.create_connection(("127.0.0.1", srv_dl.port), timeout=5.0)
                 socks.append(st)
                 st.settimeout(2.0)
@@ -2610,21 +2613,30 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 for _ in range(max_ticks):
                     try:
                         st.sendall(b"a")
+                    except (TimeoutError, socket.timeout) as exc:
+                        self.fail("unexpected client send timeout: %s" % (exc,))
                     except OSError:
                         aborted = True
                         break
                     time.sleep(0.15)
                 if not aborted:
+                    st.settimeout(1.5)
                     try:
-                        if st.recv(1024) == b"":
+                        tail = st.recv(1024)
+                        if tail == b"":
                             aborted = True
+                    except (TimeoutError, socket.timeout):
+                        aborted = False
                     except OSError:
                         aborted = True
+                elapsed = time.monotonic() - t0
                 try:
                     st.close()
                 except OSError:
                     pass
-                self.assertTrue(aborted, "trickle request did not time out within cumulative deadline")
+                self.assertTrue(aborted, "server did not close trickling request by deadline")
+                self.assertGreaterEqual(elapsed, 0.45, "connection closed before 0.6s deadline (%.3fs)" % elapsed)
+                self.assertLess(elapsed, 2.5, "trickle was not cut before 3s budget (%.3fs)" % elapsed)
                 rel_end = time.monotonic() + 3.0
                 while srv_dl.active_connections > 0 and time.monotonic() < rel_end:
                     time.sleep(0.02)
@@ -2654,6 +2666,133 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                     pass
             srv_dl.stop()
             srv.stop()
+
+    def test_r2_malformed_http_reply_counts_as_verify_skip(self):
+        rs = endurance.remote_soak
+        sec_text = secrets.token_hex(32)
+        key = rs.derive_control_key(sec_text)
+
+        def serve_raw_once(raw_reply: bytes):
+            lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lsock.bind(("127.0.0.1", 0))
+            lsock.listen(2)
+            lsock.settimeout(5.0)
+            port = lsock.getsockname()[1]
+
+            def _srv():
+                try:
+                    conn, _addr = lsock.accept()
+                    with conn:
+                        conn.settimeout(5.0)
+                        RemoteSoakCryptoAndValidationTests._drain_http_post_request(conn)
+                        conn.sendall(raw_reply)
+                        try:
+                            conn.shutdown(socket.SHUT_WR)
+                            conn.settimeout(0.5)
+                            conn.recv(64)
+                        except OSError:
+                            pass
+                finally:
+                    lsock.close()
+
+            th = threading.Thread(target=_srv, daemon=True)
+            th.start()
+            return port, th
+
+        # Part A: garbage status line and truncated chunked body both raise ControlProtocolError
+        for raw_payload in (
+            b"HELLO\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+        ):
+            port_bad, th_bad = serve_raw_once(raw_payload)
+            client = rs.SignedControlClient("http://127.0.0.1:%d" % port_bad, "win-a", key)
+            with self.assertRaises(rs.ControlProtocolError):
+                client.post("/v1/poll", {"run_id": "run-r2"}, timeout_s=5.0)
+            th_bad.join(timeout=5.0)
+            self.assertFalse(th_bad.is_alive())
+
+        # Part B: live WorkerAgent survives a garbage status line poll reply, counts verify skip, and completes shutdown
+        (_echo_host, echo_port), echo_close = _start_echo_server()
+        tmp = tempfile.mkdtemp(prefix="ox-r2-badhttp-")
+        srv = None
+        port_garbage = None
+        th_garbage = None
+        try:
+            sec_path = os.path.join(tmp, "run.secret")
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(sec_text + "\n")
+            fake_bin = os.path.join(tmp, "fake.bin")
+            with open(fake_bin, "wb") as f:
+                f.write(b"mock")
+            srv = rs.SoakControlServer(
+                "127.0.0.1:0",
+                key,
+                expected_workers=["win-a"],
+                expected_count=1,
+                sample_interval_s=60.0,
+                max_concurrent_per_source=8,
+            )
+            port_garbage, th_garbage = serve_raw_once(b"HELLO\r\n\r\n")
+            garbage_client = rs.SignedControlClient("http://127.0.0.1:%d" % port_garbage, "win-a", key)
+
+            with (
+                mock.patch.object(rs.WorkerAgent, "_start_worker", lambda s: 0),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
+                mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
+                mock.patch.object(endurance, "hardware", return_value={"cpu": "mock", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
+                mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1", "machine": "amd64"}),
+                mock.patch.object(endurance, "windows_realtime_av_enabled", return_value=False),
+            ):
+                ag = rs.WorkerAgent(
+                    endurance,
+                    binary=fake_bin,
+                    master_addr="127.0.0.1:%d" % echo_port,
+                    control_addr=srv.connect_addr,
+                    secret_file=sec_path,
+                    name="win-a",
+                    work_dir=os.path.join(tmp, "w"),
+                    poll_interval_s=0.05,
+                    connect_timeout_s=30.0,
+                    orphan_timeout_s=30.0,
+                )
+                orig_post = ag._client.post
+                first_poll_done = threading.Event()
+                lock_flag = threading.Lock()
+                injected = [False]
+
+                def route_first_poll_to_garbage(path, payload, timeout_s=15.0):
+                    do_bad = False
+                    if path == "/v1/poll":
+                        with lock_flag:
+                            if not injected[0]:
+                                injected[0] = True
+                                do_bad = True
+                    if do_bad:
+                        try:
+                            return garbage_client.post(path, payload, timeout_s=5.0)
+                        finally:
+                            first_poll_done.set()
+                    return orig_post(path, payload, timeout_s=timeout_s)
+
+                ag._client.post = route_first_poll_to_garbage  # type: ignore[method-assign]
+                rc_box = []
+                th_ag = threading.Thread(target=lambda: rc_box.append(ag.run()), daemon=True)
+                th_ag.start()
+                self.assertEqual(srv.wait_for_agents(1, timeout_s=30.0), ["win-a"])
+                self.assertTrue(first_poll_done.wait(timeout=10.0))
+                sh_res = srv.dispatch_command("win-a", "shutdown", {}, timeout_s=30.0)["result"]
+                th_ag.join(timeout=15.0)
+                self.assertFalse(th_ag.is_alive())
+                self.assertEqual(rc_box, [0])
+                self.assertEqual(sh_res["skipped_polls_verify"], 1)
+                self.assertEqual(srv.worker_metadata()[0]["skipped_polls_verify"], 1)
+        finally:
+            if th_garbage is not None:
+                th_garbage.join(timeout=5.0)
+            if srv is not None:
+                srv.stop()
+            echo_close()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 @unittest.skipUnless(

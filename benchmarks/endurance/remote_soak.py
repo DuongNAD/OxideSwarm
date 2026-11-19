@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import hmac
+import http.client
 import http.server
 import io
 import ipaddress
@@ -1137,22 +1138,25 @@ class SignedControlClient:
         resp_headers: Any = {}
         resp_raw = b""
         try:
-            with self._opener.open(req, timeout=timeout_s) as resp:
-                status = int(resp.status)
-                resp_headers = resp.headers or {}
-                resp_raw = self._read_capped_reply(resp, resp_headers, path)
-        except urllib.error.HTTPError as exc:
-            status = int(exc.code)
-            resp_headers = exc.headers or {}
             try:
-                if status == 503:
-                    raise ControlBusyError("control server busy (503) on %s" % path)
-                resp_raw = self._read_capped_reply(exc.fp, resp_headers, path)
-            finally:
+                with self._opener.open(req, timeout=timeout_s) as resp:
+                    status = int(resp.status)
+                    resp_headers = resp.headers or {}
+                    resp_raw = self._read_capped_reply(resp, resp_headers, path)
+            except urllib.error.HTTPError as exc:
+                status = int(exc.code)
+                resp_headers = exc.headers or {}
                 try:
-                    exc.close()
-                except Exception:
-                    pass
+                    if status == 503:
+                        raise ControlBusyError("control server busy (503) on %s" % path)
+                    resp_raw = self._read_capped_reply(exc.fp, resp_headers, path)
+                finally:
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+        except http.client.HTTPException as exc:
+            raise ControlProtocolError("malformed control server HTTP reply on %s: %s" % (path, exc)) from exc
 
         if status == 401:
             raise ControlProtocolError("control server rejected authentication (401) on %s" % path)
