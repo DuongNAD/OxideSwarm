@@ -1627,6 +1627,64 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn require_appcontainer_from_env() -> bool {
+        std::env::var_os("RUSTY_GRID_REQUIRE_APPCONTAINER")
+            .is_some_and(|v| !v.is_empty() && v != std::ffi::OsStr::new("0"))
+    }
+
+    #[cfg(windows)]
+    fn handle_windows_isolation_skip(test_name: &str, why: &str, require: bool) {
+        assert!(
+            !require,
+            "RUSTY_GRID_REQUIRE_APPCONTAINER=1 but {test_name} cannot run: {why}"
+        );
+        eprintln!(
+            "skipping {test_name}: {why} (set RUSTY_GRID_REQUIRE_APPCONTAINER=1 to fail instead)"
+        );
+    }
+
+    #[cfg(windows)]
+    fn fail_or_skip_windows_isolation_test(test_name: &str, why: &str) {
+        handle_windows_isolation_skip(test_name, why, require_appcontainer_from_env());
+    }
+
+    #[cfg(windows)]
+    fn mklink_j(link: &Path, dest: &Path) -> Result<(), String> {
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
+        }
+        let out = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &dest.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| format!("launch mklink /J: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "status={} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    struct HookResetGuard;
+
+    #[cfg(windows)]
+    impl Drop for HookResetGuard {
+        fn drop(&mut self) {
+            windows::ws_root_recheck_test_hook::clear_all();
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction() {
         let fake_profile = tempfile::tempdir().unwrap();
@@ -1646,47 +1704,31 @@ mod tests {
         let marker = ws_root.join(".oxideswarm-usb-workspaces");
         let mut tested_any = false;
 
-        let junction_status = std::process::Command::new("cmd")
-            .args([
-                "/C",
-                "mklink",
-                "/J",
-                &marker.to_string_lossy(),
-                &target_dir.to_string_lossy(),
-            ])
-            .status();
-        match junction_status {
-            Ok(status) if status.success() => {
+        match mklink_j(&marker, &target_dir) {
+            Ok(()) => {
                 tested_any = true;
                 let err = windows::validate_workspace_root_safe(&ws_root, &host)
                     .expect_err("must refuse .oxideswarm-usb-workspaces when it is a junction");
                 assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
                 std::fs::remove_dir(&marker).unwrap();
             }
-            Ok(status) => {
-                eprintln!("note: mklink /J unavailable ({status})");
-            }
-            Err(e) => {
-                eprintln!("note: mklink /J failed to launch ({e})");
+            Err(reason) => {
+                eprintln!("note: mklink /J unavailable ({reason})");
             }
         }
 
-        match std::os::windows::fs::symlink_file(&target_file, &marker) {
-            Ok(()) => {
-                tested_any = true;
-                let err = windows::validate_workspace_root_safe(&ws_root, &host)
-                    .expect_err("must refuse .oxideswarm-usb-workspaces when it is a file symlink");
-                assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
-                std::fs::remove_file(&marker).unwrap();
-            }
-            Err(e) => {
-                eprintln!("note: file symlink creation skipped ({e})");
-            }
+        if crate::sandbox::try_create_test_symlink_file(&target_file, &marker) {
+            tested_any = true;
+            let err = windows::validate_workspace_root_safe(&ws_root, &host)
+                .expect_err("must refuse .oxideswarm-usb-workspaces when it is a file symlink");
+            assert!(err.contains(".oxideswarm-usb-workspaces"), "{err}");
+            std::fs::remove_file(&marker).unwrap();
         }
 
         if !tested_any {
-            eprintln!(
-                "skipping test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction: host cannot create junctions or file symlinks"
+            fail_or_skip_windows_isolation_test(
+                "test_bug32_refuses_usb_workspaces_marker_as_symlink_or_junction",
+                "host cannot create junctions or file symlinks",
             );
         }
     }
@@ -1743,31 +1785,6 @@ mod tests {
         let orig_victim_sddl =
             windows::get_path_dacl_sddl(&victim_ws).expect("read original DACL SDDL of victim_ws");
 
-        let mklink_j = |link: &Path, dest: &Path| -> Result<(), String> {
-            if let Some(parent) = link.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
-            }
-            let out = std::process::Command::new("cmd")
-                .args([
-                    "/C",
-                    "mklink",
-                    "/J",
-                    &link.to_string_lossy(),
-                    &dest.to_string_lossy(),
-                ])
-                .output()
-                .map_err(|e| format!("launch mklink /J: {e}"))?;
-            if out.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "status={} stderr={}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ))
-            }
-        };
-
         let host = HostDirs::from_home(
             fake_profile.clone(),
             Some(PathBuf::new()),
@@ -1780,8 +1797,9 @@ mod tests {
             .join("Local")
             .join("OxideSwarm-USB");
         if let Err(reason) = mklink_j(&usb_root, &victim) {
-            eprintln!(
-                "skipping test_sec17_refuses_reparse_point_in_ancestor_from_home_and_leaves_target_dacl_untouched: mklink /J unavailable ({reason})"
+            fail_or_skip_windows_isolation_test(
+                "test_sec17_refuses_reparse_point_in_ancestor_from_home_and_leaves_target_dacl_untouched",
+                &format!("mklink /J unavailable ({reason})"),
             );
             return;
         }
@@ -1793,9 +1811,10 @@ mod tests {
             "{err}"
         );
 
-        // Also verify WindowsAppContainerGuard::create refuses before any DACL rewrite occurs.
+        // Also verify WindowsAppContainerGuard::create refuses with the same message before any
+        // DACL rewrite occurs.
         let sb_base = root_path.join("sandboxes");
-        let sb_dir = sb_base.join("probe-sec17");
+        let sb_dir = sb_base.join(".isolation-probe-sec17");
         std::fs::create_dir_all(&sb_dir).unwrap();
         let jail = Jail {
             level: IsolationLevel::Fs,
@@ -1817,6 +1836,13 @@ mod tests {
                 Err(e) => e,
             };
         assert_eq!(guard_err.kind(), std::io::ErrorKind::PermissionDenied);
+        let guard_msg = guard_err.to_string();
+        assert!(
+            guard_msg.contains("reparse point")
+                && guard_msg.contains("OxideSwarm-USB")
+                && guard_msg.contains("--workspace-root"),
+            "unexpected guard refusal text: {guard_msg}"
+        );
         assert_eq!(
             windows::get_path_dacl_sddl(&victim_ws).unwrap(),
             orig_victim_sddl,
@@ -2013,20 +2039,14 @@ mod tests {
 
         // 5. Optional directory symlink test (if host has symlink privilege).
         let dot_ox = fake_profile.join(".oxideswarm");
-        match std::os::windows::fs::symlink_dir(&victim, &dot_ox) {
-            Ok(()) => {
-                let err_sym =
-                    windows::validate_workspace_root_safe(&dot_ox.join("workspaces"), &host)
-                        .expect_err("SEC-17: directory symlink ancestor must be refused");
-                assert!(
-                    err_sym.contains("reparse point") || err_sym.contains("symlink"),
-                    "{err_sym}"
-                );
-                std::fs::remove_dir(&dot_ox).unwrap();
-            }
-            Err(e) => {
-                eprintln!("note: directory symlink creation skipped in SEC-17 test ({e})");
-            }
+        if crate::sandbox::try_create_test_symlink_dir(&victim, &dot_ox) {
+            let err_sym = windows::validate_workspace_root_safe(&dot_ox.join("workspaces"), &host)
+                .expect_err("SEC-17: directory symlink ancestor must be refused");
+            assert!(
+                err_sym.contains("reparse point") || err_sym.contains("symlink"),
+                "{err_sym}"
+            );
+            std::fs::remove_dir(&dot_ox).unwrap();
         }
 
         assert_eq!(
@@ -2054,8 +2074,9 @@ mod tests {
         std::fs::write(&marker, "Created by an OxideSwarm USB kit install.\n").unwrap();
         let marker_hl = root_path.join("marker_hardlink");
         if let Err(e) = std::fs::hard_link(&marker, &marker_hl) {
-            eprintln!(
-                "skipping test_sec17_refuses_hard_linked_usb_marker_and_store_lock: host cannot create hard links ({e})"
+            fail_or_skip_windows_isolation_test(
+                "test_sec17_refuses_hard_linked_usb_marker_and_store_lock",
+                &format!("host cannot create hard links ({e})"),
             );
             return;
         }
@@ -2100,16 +2121,11 @@ mod tests {
         std::fs::remove_file(&lock_path).unwrap();
         let target_file = root_path.join("target_file.txt");
         std::fs::write(&target_file, "secret\n").unwrap();
-        match std::os::windows::fs::symlink_file(&target_file, &lock_path) {
-            Ok(()) => {
-                let err_sym = windows::validate_workspace_root_safe(&ws_root, &host)
-                    .expect_err("SEC-17: symlinked store.lock must be refused");
-                assert!(err_sym.contains("store.lock"), "{err_sym}");
-                std::fs::remove_file(&lock_path).unwrap();
-            }
-            Err(e) => {
-                eprintln!("note: file symlink creation skipped on store.lock ({e})");
-            }
+        if crate::sandbox::try_create_test_symlink_file(&target_file, &lock_path) {
+            let err_sym = windows::validate_workspace_root_safe(&ws_root, &host)
+                .expect_err("SEC-17: symlinked store.lock must be refused");
+            assert!(err_sym.contains("store.lock"), "{err_sym}");
+            std::fs::remove_file(&lock_path).unwrap();
         }
     }
 
@@ -2172,6 +2188,804 @@ mod tests {
             err_read.contains("GetFileInformationByHandle") && !err_read.contains("hard links"),
             "{err_read}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_require_switch_fails_instead_of_skipping() {
+        handle_windows_isolation_skip("probe_test", "host lacks capability", false);
+        let panicked = std::panic::catch_unwind(|| {
+            handle_windows_isolation_skip("probe_test", "host lacks capability", true);
+        });
+        let err = panicked.expect_err("require=true must panic instead of skipping");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("RUSTY_GRID_REQUIRE_APPCONTAINER=1")
+                && msg.contains("probe_test")
+                && msg.contains("host lacks capability"),
+            "unexpected panic message: {msg}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_each_home_walk_is_proved_independently() {
+        if std::env::var_os("OX_SEC18_INDEP_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let root = tempfile::tempdir().unwrap();
+            let env_home = windows::normalize_win_path(root.path()).join("env_home");
+            std::fs::create_dir_all(&env_home).unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "isolation::tests::test_sec18_each_home_walk_is_proved_independently",
+                    "--nocapture",
+                ])
+                .env("OX_SEC18_INDEP_CHILD", "1")
+                .env("USERPROFILE", &env_home)
+                .env_remove("OXIDESWARM_HOME")
+                .env_remove("RUSTY_GRID_ACL_GRANT_LOG")
+                .output()
+                .expect("spawn child test for independent home walks");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed; 0 failed"),
+                "child independent-home-walk test failed:\nstatus={:?}\nstdout={stdout}\nstderr={stderr}",
+                out.status
+            );
+            return;
+        }
+
+        let child_root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(child_root.path());
+        let env_home = windows::normalize_win_path(&PathBuf::from(
+            std::env::var_os("USERPROFILE").expect("child USERPROFILE"),
+        ));
+        let host_home = root_path.join("host_home");
+        let victim = root_path.join("victim");
+        let victim_ws = victim.join("workspaces");
+        let sb_base = root_path.join("sandboxes");
+        let sb_dir = sb_base.join(".isolation-probe-sec18-indep");
+        for dir in [&host_home, &victim_ws, &sb_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let orig_victim_sddl =
+            windows::get_path_dacl_sddl(&victim_ws).expect("read original DACL SDDL");
+
+        // Confirm %USERPROFILE% (`env_home`) is disjoint from `host_home`.
+        assert!(
+            !windows::path_starts_with_ci(&host_home, &env_home)
+                && !windows::path_starts_with_ci(&env_home, &host_home),
+            "host_home ({}) and env_home ({}) must be disjoint",
+            host_home.display(),
+            env_home.display()
+        );
+
+        let host_usb_root = host_home
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB");
+        if let Err(reason) = mklink_j(&host_usb_root, &victim) {
+            fail_or_skip_windows_isolation_test(
+                "test_sec18_each_home_walk_is_proved_independently",
+                &format!("mklink /J unavailable ({reason})"),
+            );
+            return;
+        }
+        let host_usb_ws = host_usb_root.join("workspaces");
+        let host_only = HostDirs::from_home(
+            host_home.clone(),
+            Some(PathBuf::new()),
+            Some(PathBuf::new()),
+        );
+        let empty_host =
+            HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
+
+        // A. Proof for `host.user_home` walk alone: `%USERPROFILE%` (`env_home`) is disjoint.
+        let err_host = windows::validate_workspace_root_safe(&host_usb_ws, &host_only)
+            .expect_err("host.user_home walk must refuse junction under host_home");
+        assert!(
+            err_host.contains("reparse point")
+                && err_host.contains("OxideSwarm-USB")
+                && err_host.contains("--workspace-root"),
+            "{err_host}"
+        );
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo ok"]);
+        cmd.current_dir(&sb_dir);
+        let jail_host = Jail {
+            level: IsolationLevel::Fs,
+            host: &host_only,
+            protected_files: &[],
+            sandbox_base: &sb_base,
+            sandbox_dir: &sb_dir,
+            extra_writable_dir: None,
+            workspace_root: Some(&host_usb_ws),
+        };
+        let guard_err_host =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail_host, &cmd)
+            {
+                Ok(_) => panic!("guard must refuse junction under host.user_home"),
+                Err(e) => e,
+            };
+        assert_eq!(guard_err_host.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            guard_err_host.to_string().contains("reparse point")
+                && guard_err_host.to_string().contains("OxideSwarm-USB")
+                && guard_err_host.to_string().contains("--workspace-root"),
+            "{guard_err_host}"
+        );
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl
+        );
+
+        // Counter-proof: without `host.user_home`, `%USERPROFILE%` (`env_home`) does NOT trigger.
+        windows::validate_workspace_root_safe(&host_usb_ws, &empty_host)
+            .expect("empty host.user_home must prove %USERPROFILE% did not trigger for host_home");
+        std::fs::remove_dir(&host_usb_root).unwrap();
+
+        // B. Proof for `%USERPROFILE%` walk alone: `host.user_home` (`host_home`) is disjoint.
+        let env_ox_root = env_home.join("AppData").join("Local").join("oxideswarm");
+        mklink_j(&env_ox_root, &victim).expect("mklink /J under env_home");
+        let env_ox_ws = env_ox_root.join("workspaces");
+        let err_env = windows::validate_workspace_root_safe(&env_ox_ws, &host_only)
+            .expect_err("%USERPROFILE% walk must refuse junction under env_home");
+        assert!(
+            err_env.contains("reparse point")
+                && err_env.contains("oxideswarm")
+                && err_env.contains("--workspace-root"),
+            "{err_env}"
+        );
+        let jail_env = Jail {
+            level: IsolationLevel::Fs,
+            host: &host_only,
+            protected_files: &[],
+            sandbox_base: &sb_base,
+            sandbox_dir: &sb_dir,
+            extra_writable_dir: None,
+            workspace_root: Some(&env_ox_ws),
+        };
+        let guard_err_env = match windows::WindowsAppContainerGuard::create(
+            uuid::Uuid::new_v4(),
+            &jail_env,
+            &cmd,
+        ) {
+            Ok(_) => panic!("guard must refuse junction under %USERPROFILE%"),
+            Err(e) => e,
+        };
+        assert_eq!(guard_err_env.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            guard_err_env.to_string().contains("reparse point")
+                && guard_err_env.to_string().contains("oxideswarm")
+                && guard_err_env.to_string().contains("--workspace-root"),
+            "{guard_err_env}"
+        );
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl
+        );
+
+        // Counter-proof: with `env_userprofile = None`, neither `host_only` nor `empty_host`
+        // refuses `env_ox_ws` (proving `%USERPROFILE%` alone caused the refusal).
+        windows::validate_workspace_root_safe_with_env_home(&env_ox_ws, &host_only, None).expect(
+            "env_userprofile=None with disjoint host.user_home must prove %USERPROFILE% walk alone ran",
+        );
+        windows::validate_workspace_root_safe_with_env_home(&env_ox_ws, &empty_host, None)
+            .expect("env_userprofile=None with empty host.user_home must accept");
+        std::fs::remove_dir(&env_ox_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_bare_drive_prefix_does_not_match_home_when_cwd_is_home() {
+        use std::path::Component;
+
+        if std::env::var_os("OX_SEC18_BARE_PREFIX_CHILD").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            let root = tempfile::tempdir().unwrap();
+            let root_path = windows::normalize_win_path(root.path());
+            let fake_home = root_path.join("fake_home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "isolation::tests::test_sec18_bare_drive_prefix_does_not_match_home_when_cwd_is_home",
+                    "--nocapture",
+                ])
+                .current_dir(&fake_home)
+                .env("OX_SEC18_BARE_PREFIX_CHILD", "1")
+                .env("OX_SEC18_TEST_ROOT", &root_path)
+                .env("USERPROFILE", &fake_home)
+                .env_remove("OXIDESWARM_HOME")
+                .env_remove("RUSTY_GRID_ACL_GRANT_LOG")
+                .output()
+                .expect("spawn child test with CWD inside home");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed; 0 failed"),
+                "child bare-drive-prefix test failed:\nstatus={:?}\nstdout={stdout}\nstderr={stderr}",
+                out.status
+            );
+            return;
+        }
+
+        let root_path = PathBuf::from(std::env::var_os("OX_SEC18_TEST_ROOT").expect("test root"));
+        let fake_home = windows::normalize_win_path(&std::env::current_dir().unwrap());
+        let drive_prefix = match fake_home.components().next() {
+            Some(Component::Prefix(p)) => PathBuf::from(p.as_os_str()),
+            other => panic!("expected drive prefix in {fake_home:?}, got {other:?}"),
+        };
+        assert_eq!(
+            windows::normalize_win_path(&drive_prefix),
+            fake_home,
+            "precondition: bare drive prefix must expand to current working directory (fake_home)"
+        );
+
+        let outside_target = root_path.join("outside_target");
+        std::fs::create_dir_all(outside_target.join("ws")).unwrap();
+        let outside_junc = root_path.join("outside_junc");
+        if let Err(reason) = mklink_j(&outside_junc, &outside_target) {
+            fail_or_skip_windows_isolation_test(
+                "test_sec18_bare_drive_prefix_does_not_match_home_when_cwd_is_home",
+                &format!("mklink /J unavailable ({reason})"),
+            );
+            return;
+        }
+
+        let host = HostDirs::from_home(
+            fake_home.clone(),
+            Some(PathBuf::new()),
+            Some(PathBuf::new()),
+        );
+        let outside_ws = outside_junc.join("ws");
+        windows::validate_workspace_root_safe(&outside_ws, &host).expect(
+            "root outside home with an ancestor junction must not be treated as inside home via bare drive prefix",
+        );
+        std::fs::remove_dir(&outside_junc).unwrap();
+
+        // Meanwhile junctions inside home or targeting inside home are still refused.
+        let in_home_junc = fake_home.join("AppData").join("Local").join("oxideswarm");
+        mklink_j(&in_home_junc, &outside_target).expect("mklink /J inside home");
+        let err_inside = windows::validate_workspace_root_safe(&in_home_junc.join("ws"), &host)
+            .expect_err("junction inside home must still be refused");
+        assert!(err_inside.contains("reparse point"), "{err_inside}");
+        std::fs::remove_dir(&in_home_junc).unwrap();
+
+        let real_in_home = fake_home.join("AppData").join("Local").join("oxideswarm");
+        std::fs::create_dir_all(real_in_home.join("workspaces")).unwrap();
+        let ext_into_home = root_path.join("ext_into_home");
+        mklink_j(&ext_into_home, &real_in_home).expect("mklink /J into home");
+        let err_into =
+            windows::validate_workspace_root_safe(&ext_into_home.join("workspaces"), &host)
+                .expect_err("external junction pointing into home must still be refused");
+        assert!(err_into.contains("reparse point"), "{err_into}");
+        std::fs::remove_dir(&ext_into_home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_refuses_top_level_files_reparse_entries_and_hard_linked_ws_metadata() {
+        let _reset = HookResetGuard;
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let fake_profile = root_path.join("profile");
+        let ws_root = fake_profile
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB")
+            .join("workspaces");
+        let victim_dir = root_path.join("victim_dir");
+        let victim_file = root_path.join("victim_file.txt");
+        let sb_base = root_path.join("sandboxes");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::create_dir_all(&sb_base).unwrap();
+        std::fs::write(&victim_file, "victim-content\n").unwrap();
+        let orig_victim_file_sddl = windows::get_path_dacl_sddl(&victim_file).unwrap();
+
+        let host = HostDirs::from_home(fake_profile, Some(PathBuf::new()), Some(PathBuf::new()));
+        std::fs::write(
+            ws_root.join(".oxideswarm-usb-workspaces"),
+            "Created by an OxideSwarm USB kit install.\n",
+        )
+        .unwrap();
+        let store_lock_path = ws_root.join("store.lock");
+        let store_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&store_lock_path)
+            .unwrap();
+        store_lock.lock().unwrap();
+
+        let locks_dir = ws_root.join(".locks");
+        std::fs::create_dir_all(&locks_dir).unwrap();
+        std::fs::write(locks_dir.join("good.lock"), "").unwrap();
+
+        let ws_dir = ws_root.join("my_ws");
+        let ws_tree = ws_dir.join("tree");
+        let ws_tmp = ws_dir.join("tmp");
+        std::fs::create_dir_all(&ws_tree).unwrap();
+        std::fs::create_dir_all(&ws_tmp).unwrap();
+        let ws_state = ws_dir.join("state.json");
+        std::fs::write(&ws_state, "{}\n").unwrap();
+        let ws_lock_path = ws_dir.join("lock");
+        let ws_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&ws_lock_path)
+            .unwrap();
+        ws_lock.lock().unwrap();
+
+        windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect("valid workspace root with regular single-link metadata must pass");
+
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo ok"]);
+        cmd.current_dir(&ws_tree);
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &host,
+            protected_files: &[],
+            sandbox_base: &sb_base,
+            sandbox_dir: &ws_tree,
+            extra_writable_dir: Some(&ws_tmp),
+            workspace_root: Some(&ws_root),
+        };
+        let guard = windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd)
+            .expect(
+                "valid workspace layout (even with locked store.lock and ws lock) must succeed",
+            );
+        drop(guard);
+
+        // 1. Top-level regular file with valid workspace name (`notes.txt`), plain and hard-linked.
+        let notes = ws_root.join("notes.txt");
+        std::fs::write(&notes, "note\n").unwrap();
+        let err_notes = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("top-level regular file notes.txt must be refused");
+        assert!(
+            err_notes.contains("notes.txt") && err_notes.contains("not a directory"),
+            "{err_notes}"
+        );
+        std::fs::remove_file(&notes).unwrap();
+
+        let hl_top = ws_root.join("hl_note.txt");
+        if let Err(e) = std::fs::hard_link(&victim_file, &hl_top) {
+            fail_or_skip_windows_isolation_test(
+                "test_sec18_refuses_top_level_files_reparse_entries_and_hard_linked_ws_metadata",
+                &format!("hard_link unavailable ({e})"),
+            );
+            return;
+        }
+        let err_hl_top =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("guard must refuse top-level hard-linked file"),
+                Err(e) => e,
+            };
+        assert_eq!(err_hl_top.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err_hl_top.to_string().contains("hl_note.txt"),
+            "{err_hl_top}"
+        );
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_file).unwrap(),
+            orig_victim_file_sddl,
+            "victim file DACL must remain untouched"
+        );
+        std::fs::remove_file(&hl_top).unwrap();
+
+        // 2. Top-level `.locks` as regular file, junction, and hard-linked lock file.
+        std::fs::remove_dir_all(&locks_dir).unwrap();
+        std::fs::write(&locks_dir, "not a dir\n").unwrap();
+        let err_locks_file = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("regular file .locks must be refused");
+        assert!(
+            err_locks_file.contains(".locks") && err_locks_file.contains("not a directory"),
+            "{err_locks_file}"
+        );
+        std::fs::remove_file(&locks_dir).unwrap();
+
+        if let Err(reason) = mklink_j(&locks_dir, &victim_dir) {
+            fail_or_skip_windows_isolation_test(
+                "test_sec18_refuses_top_level_files_reparse_entries_and_hard_linked_ws_metadata",
+                &format!("mklink /J unavailable ({reason})"),
+            );
+            return;
+        }
+        let err_locks_junc = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("junction .locks must be refused");
+        assert!(
+            err_locks_junc.contains(".locks") && err_locks_junc.contains("reparse point"),
+            "{err_locks_junc}"
+        );
+        std::fs::remove_dir(&locks_dir).unwrap();
+
+        std::fs::create_dir_all(&locks_dir).unwrap();
+        let bad_lock = locks_dir.join("bad.lock");
+        std::fs::hard_link(&victim_file, &bad_lock).unwrap();
+        let err_bad_lock = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("hard-linked .locks/bad.lock must be refused");
+        assert!(
+            err_bad_lock.contains(".locks/bad.lock") && err_bad_lock.contains("nlink == 1"),
+            "{err_bad_lock}"
+        );
+        std::fs::remove_file(&bad_lock).unwrap();
+
+        // 3. Top-level junction workspace directory.
+        let junc_ws = ws_root.join("junc_ws");
+        mklink_j(&junc_ws, &victim_dir).unwrap();
+        let err_junc_ws = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("junction workspace folder must be refused");
+        assert!(
+            err_junc_ws.contains("junc_ws") && err_junc_ws.contains("reparse point"),
+            "{err_junc_ws}"
+        );
+        std::fs::remove_dir(&junc_ws).unwrap();
+
+        // 4. Hard-linked `state.json`, `lock`, and `state.json.tmp` inside `my_ws`.
+        std::fs::remove_file(&ws_state).unwrap();
+        std::fs::hard_link(&victim_file, &ws_state).unwrap();
+        let err_hl_state = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("hard-linked state.json must be refused");
+        assert!(
+            err_hl_state.contains("my_ws/state.json") && err_hl_state.contains("nlink == 1"),
+            "{err_hl_state}"
+        );
+        let guard_err_state =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("guard must refuse hard-linked state.json"),
+                Err(e) => e,
+            };
+        assert_eq!(guard_err_state.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_file).unwrap(),
+            orig_victim_file_sddl
+        );
+        std::fs::remove_file(&ws_state).unwrap();
+        std::fs::write(&ws_state, "{}\n").unwrap();
+
+        drop(ws_lock);
+        std::fs::remove_file(&ws_lock_path).unwrap();
+        std::fs::hard_link(&victim_file, &ws_lock_path).unwrap();
+        let err_hl_lock = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("hard-linked lock must be refused");
+        assert!(
+            err_hl_lock.contains("my_ws/lock") && err_hl_lock.contains("nlink == 1"),
+            "{err_hl_lock}"
+        );
+        std::fs::remove_file(&ws_lock_path).unwrap();
+        std::fs::write(&ws_lock_path, "").unwrap();
+
+        let ws_state_tmp = ws_dir.join("state.json.tmp");
+        std::fs::hard_link(&victim_file, &ws_state_tmp).unwrap();
+        let err_hl_tmp = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("hard-linked state.json.tmp must be refused");
+        assert!(
+            err_hl_tmp.contains("my_ws/state.json.tmp") && err_hl_tmp.contains("nlink == 1"),
+            "{err_hl_tmp}"
+        );
+        std::fs::remove_file(&ws_state_tmp).unwrap();
+
+        // 5. `my_ws/tmp` as file, `my_ws/state.json` as directory, extra entry in `my_ws`, and
+        //    junction at `my_ws/tree`.
+        std::fs::remove_dir_all(&ws_tmp).unwrap();
+        std::fs::write(&ws_tmp, "not a dir\n").unwrap();
+        let err_tmp_file = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("regular file my_ws/tmp must be refused");
+        assert!(
+            err_tmp_file.contains("my_ws/tmp") && err_tmp_file.contains("not a directory"),
+            "{err_tmp_file}"
+        );
+        std::fs::remove_file(&ws_tmp).unwrap();
+        std::fs::create_dir_all(&ws_tmp).unwrap();
+
+        std::fs::remove_file(&ws_state).unwrap();
+        std::fs::create_dir_all(&ws_state).unwrap();
+        let err_state_dir = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("directory my_ws/state.json must be refused");
+        assert!(
+            err_state_dir.contains("my_ws/state.json")
+                && err_state_dir.contains("not a regular file"),
+            "{err_state_dir}"
+        );
+        std::fs::remove_dir_all(&ws_state).unwrap();
+        std::fs::write(&ws_state, "{}\n").unwrap();
+
+        let extra_entry = ws_dir.join("extra.txt");
+        std::fs::write(&extra_entry, "x").unwrap();
+        let err_extra = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("unexpected entry inside my_ws must be refused");
+        assert!(
+            err_extra.contains("my_ws") && err_extra.contains("extra.txt"),
+            "{err_extra}"
+        );
+        std::fs::remove_file(&extra_entry).unwrap();
+
+        std::fs::remove_dir_all(&ws_tree).unwrap();
+        mklink_j(&ws_tree, &victim_dir).unwrap();
+        let err_tree_junc = windows::validate_workspace_root_safe(&ws_root, &host)
+            .expect_err("junction my_ws/tree must be refused");
+        assert!(
+            err_tree_junc.contains("my_ws/tree") && err_tree_junc.contains("reparse point"),
+            "{err_tree_junc}"
+        );
+        std::fs::remove_dir(&ws_tree).unwrap();
+        std::fs::create_dir_all(&ws_tree).unwrap();
+
+        // 6. Race hook right before metadata handle DACL write on `state.json` and `lock`.
+        for (target_name, race_link_name) in
+            [("state.json", "race_hl_state"), ("lock", "race_hl_lock")]
+        {
+            let target_path = ws_dir.join(target_name);
+            let orig_target_sddl = windows::get_path_dacl_sddl(&target_path).unwrap();
+            let link_dest = root_path.join(race_link_name);
+            let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let called_cb = called.clone();
+            let link_dest_cb = link_dest.clone();
+            windows::ws_root_recheck_test_hook::set_before_meta_dacl(move |dir| {
+                called_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::fs::hard_link(dir.join(target_name), &link_dest_cb)
+                    .expect("inject hard link before metadata DACL write");
+            });
+            let race_err = match windows::WindowsAppContainerGuard::create(
+                uuid::Uuid::new_v4(),
+                &jail,
+                &cmd,
+            ) {
+                Ok(_) => panic!("handle-based metadata DACL write must refuse nlink != 1"),
+                Err(e) => e,
+            };
+            assert!(
+                called.load(std::sync::atomic::Ordering::SeqCst),
+                "before_meta_dacl hook must have executed"
+            );
+            assert_eq!(race_err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(race_err.to_string().contains("nlink == 1"), "{race_err}");
+            assert_eq!(
+                windows::get_path_dacl_sddl(&link_dest).unwrap(),
+                orig_target_sddl,
+                "hard-linked race target DACL must stay untouched"
+            );
+            let _ = std::fs::remove_file(&link_dest);
+            // Reset target_name file with fresh single link for a clean next pass.
+            let _ = std::fs::remove_file(&target_path);
+            std::fs::write(&target_path, "").unwrap();
+        }
+        drop(store_lock);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_handle_dacl_write_and_prepare_lock_recheck_hooks() {
+        use windows_sys::Win32::Security::Authorization::SET_ACCESS;
+        use windows_sys::Win32::Security::{
+            WinBuiltinAdministratorsSid, WinLocalSystemSid, CONTAINER_INHERIT_ACE,
+            OBJECT_INHERIT_ACE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES,
+            FILE_READ_DATA, SYNCHRONIZE,
+        };
+
+        let _reset = HookResetGuard;
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let fake_profile = root_path.join("profile");
+        let usb_root = fake_profile
+            .join("AppData")
+            .join("Local")
+            .join("OxideSwarm-USB");
+        let usb_ws = usb_root.join("workspaces");
+        let victim = root_path.join("victim");
+        let victim_ws = victim.join("workspaces");
+        let sb_base = root_path.join("sandboxes");
+        let sb_dir = sb_base.join(".isolation-probe-sec18");
+        for dir in [&usb_ws, &victim_ws, &sb_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let orig_victim_sddl = windows::get_path_dacl_sddl(&victim_ws).unwrap();
+
+        let host = HostDirs::from_home(fake_profile, Some(PathBuf::new()), Some(PathBuf::new()));
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let mut cmd = tokio::process::Command::new(&comspec);
+        cmd.args(["/C", "echo ok"]);
+        cmd.current_dir(&sb_dir);
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &host,
+            protected_files: &[],
+            sandbox_base: &sb_base,
+            sandbox_dir: &sb_dir,
+            extra_writable_dir: None,
+            workspace_root: Some(&usb_ws),
+        };
+
+        // Probe mklink /J availability up front (creating a probe junction and deleting it).
+        let probe_junc = root_path.join("probe_junc");
+        if let Err(reason) = mklink_j(&probe_junc, &victim_ws) {
+            fail_or_skip_windows_isolation_test(
+                "test_sec18_handle_dacl_write_and_prepare_lock_recheck_hooks",
+                &format!("mklink /J unavailable ({reason})"),
+            );
+            return;
+        }
+        std::fs::remove_dir(&probe_junc).unwrap();
+
+        // A. Swap ancestor `OxideSwarm-USB` for a junction right before PREPARE_LOCK re-check.
+        let hook_a_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_a_cb = hook_a_ran.clone();
+        let usb_root_a = usb_root.clone();
+        let victim_a = victim.clone();
+        windows::ws_root_recheck_test_hook::set_before_recheck(move |_ws| {
+            hook_a_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::fs::remove_dir_all(&usb_root_a).expect("remove clean OxideSwarm-USB dir");
+            mklink_j(&usb_root_a, &victim_a).expect("swap OxideSwarm-USB to junction");
+        });
+        let err_a =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("PREPARE_LOCK re-check must catch ancestor junction swap"),
+                Err(e) => e,
+            };
+        assert!(hook_a_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(err_a.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg_a = err_a.to_string();
+        assert!(
+            msg_a.contains("reparse point")
+                && msg_a.contains("OxideSwarm-USB")
+                && msg_a.contains("--workspace-root"),
+            "{msg_a}"
+        );
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl
+        );
+        std::fs::remove_dir(&usb_root).unwrap();
+        std::fs::create_dir_all(&usb_ws).unwrap();
+
+        // B. Swap ancestor `OxideSwarm-USB` for a junction AFTER PREPARE_LOCK re-check and right
+        //    before `protect_sandbox_base`: handle check compares `GetFinalPathNameByHandleW` vs
+        //    expected lexical path and refuses before `SetSecurityInfo`.
+        let hook_b_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_b_cb = hook_b_ran.clone();
+        let usb_root_b = usb_root.clone();
+        let victim_b = victim.clone();
+        windows::ws_root_recheck_test_hook::set_before_protect(move |_ws| {
+            hook_b_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::fs::remove_dir_all(&usb_root_b).expect("remove clean OxideSwarm-USB dir");
+            mklink_j(&usb_root_b, &victim_b).expect("swap OxideSwarm-USB to junction");
+        });
+        let err_b =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("GetFinalPathNameByHandleW must catch ancestor swap"),
+                Err(e) => e,
+            };
+        assert!(hook_b_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(err_b.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg_b = err_b.to_string();
+        assert!(
+            msg_b.contains("resolved to") && msg_b.contains("lexical path"),
+            "{msg_b}"
+        );
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl
+        );
+        std::fs::remove_dir(&usb_root).unwrap();
+        std::fs::create_dir_all(&usb_ws).unwrap();
+
+        // C. Swap `workspaces` itself for a junction AFTER PREPARE_LOCK re-check and right before
+        //    `protect_sandbox_base`: `FILE_FLAG_OPEN_REPARSE_POINT` handle catches
+        //    `FILE_ATTRIBUTE_REPARSE_POINT`.
+        let hook_c_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_c_cb = hook_c_ran.clone();
+        let usb_ws_c = usb_ws.clone();
+        let victim_ws_c = victim_ws.clone();
+        windows::ws_root_recheck_test_hook::set_before_protect(move |_ws| {
+            hook_c_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::fs::remove_dir(&usb_ws_c).expect("remove clean workspaces dir");
+            mklink_j(&usb_ws_c, &victim_ws_c).expect("swap workspaces to junction");
+        });
+        let err_c =
+            match windows::WindowsAppContainerGuard::create(uuid::Uuid::new_v4(), &jail, &cmd) {
+                Ok(_) => panic!("no-follow handle must catch final reparse point"),
+                Err(e) => e,
+            };
+        assert!(hook_c_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(err_c.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err_c.to_string().contains("reparse point"), "{err_c}");
+        assert_eq!(
+            windows::get_path_dacl_sddl(&victim_ws).unwrap(),
+            orig_victim_sddl
+        );
+        std::fs::remove_dir(&usb_ws).unwrap();
+
+        // D. Handle-based `SetSecurityInfo` propagates inheritable `(OI)(CI)` ACEs onto a
+        //    pre-existing child file.
+        let prop_dir = root_path.join("prop_dir");
+        std::fs::create_dir_all(&prop_dir).unwrap();
+        let child_txt = prop_dir.join("child.txt");
+        std::fs::write(&child_txt, "hello\n").unwrap();
+
+        let user_sid = windows::OwnedSid::current_user().unwrap();
+        let system_sid = windows::OwnedSid::from_well_known(WinLocalSystemSid).unwrap();
+        let admins_sid = windows::OwnedSid::from_well_known(WinBuiltinAdministratorsSid).unwrap();
+        let toolchain_sid = windows::OwnedSid::oxideswarm_toolchain().unwrap();
+        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let rx_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | SYNCHRONIZE;
+        let entries = [
+            windows::explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            windows::explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            windows::explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            windows::explicit_access(toolchain_sid.as_psid(), rx_mask, SET_ACCESS, inherit),
+        ];
+        windows::set_protected_dacl_on_path(&prop_dir, &entries)
+            .expect("handle-based set_protected_dacl_on_path");
+        let check_mask = FILE_READ_ATTRIBUTES | FILE_READ_DATA;
+        assert!(
+            windows::dacl_already_grants_sid(&prop_dir, toolchain_sid.as_psid(), check_mask),
+            "directory itself must carry granted ACE"
+        );
+        assert!(
+            windows::dacl_already_grants_sid(&child_txt, toolchain_sid.as_psid(), check_mask),
+            "SetSecurityInfo must propagate inheritable ACE to pre-existing child file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sec18_eviction_not_found_skipped_while_bad_entries_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = windows::normalize_win_path(root.path());
+        let ws_root = root_path.join("workspaces");
+        let evicted_ws = ws_root.join("evicted_ws");
+        let active_ws = ws_root.join("active_ws");
+        std::fs::create_dir_all(active_ws.join("tree")).unwrap();
+        std::fs::create_dir_all(active_ws.join("tmp")).unwrap();
+        std::fs::write(active_ws.join("state.json"), "{}").unwrap();
+        std::fs::write(active_ws.join("lock"), "").unwrap();
+
+        // Concurrently evicted workspace dir or already-wiped entries (NotFound) must be skipped.
+        windows::validate_workspace_dir_entries_safe(&ws_root, "evicted_ws", &evicted_ws)
+            .expect("missing workspace dir removed by eviction must be skipped");
+        std::fs::remove_dir_all(active_ws.join("tree")).unwrap();
+        std::fs::remove_dir_all(active_ws.join("tmp")).unwrap();
+        std::fs::remove_file(active_ws.join("state.json")).unwrap();
+        windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect("evicted workspace entries removed between read_dir and stat must be skipped");
+
+        // Real security violations (junction or hard-linked metadata) stay refused.
+        let hardlink_outside = root_path.join("outside_state.json");
+        std::fs::write(&hardlink_outside, "{}").unwrap();
+        std::fs::hard_link(&hardlink_outside, active_ws.join("state.json")).unwrap();
+        let err_hl = windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect_err("hard-linked state.json must still be refused");
+        assert!(err_hl.contains("nlink == 1"), "{err_hl}");
+        std::fs::remove_file(active_ws.join("state.json")).unwrap();
+
+        let victim_dir = root_path.join("victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        mklink_j(&active_ws.join("tree"), &victim_dir).unwrap();
+        let err_junc = windows::validate_workspace_root_entries_safe(&ws_root)
+            .expect_err("junction tree must still be refused");
+        assert!(err_junc.contains("reparse point"), "{err_junc}");
+        std::fs::remove_dir(active_ws.join("tree")).unwrap();
     }
 
     #[test]

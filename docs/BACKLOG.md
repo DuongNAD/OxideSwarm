@@ -357,7 +357,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
-| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
+| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
@@ -1250,33 +1250,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
   `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
   owner's decision of "Done when" (the entry itself is gone) and step 2.
-
-### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
-
-- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
-  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
-  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
-    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
-    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
-    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
-    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
-  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
-    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
-  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
-    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
-    a skipped test shows as `ok`.
-- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
-  gaps. Only processes of the same user can create the links, so the impact is low.
-- **Do:**
-  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
-     and require `nlink == 1` for every file whose DACL is written.
-  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
-     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
-     `SetSecurityInfo` on that handle.
-  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
-     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
-     skips.
-- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
 
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
@@ -2426,6 +2399,7 @@ Add one dated line per finished item, newest last.
   NET-10 and APP-6 stay Planned.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
+- 2026-11-19: SEC-18 Implemented (pull request 372, open; text in the archive): `validate_workspace_root_entries_safe` and `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory `.locks`/workspace folders, and hard-linked `.locks/*` and `<ws>/{state.json,lock,state.json.tmp}` files; `open_verified_dacl_handle` and `set_protected_dacl_on_handle` verify `GetFileInformationByHandle` and `GetFinalPathNameByHandleW` against the lexical long path (`GetLongPathNameW`) before calling `SetSecurityInfo` on `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` handles; `check_chain_from_home` matches home only on `Normal` components (no bare `C:` CWD expansion); and tests prove each home walk independently, assert refusal texts, exercise `PREPARE_LOCK` / handle / metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.

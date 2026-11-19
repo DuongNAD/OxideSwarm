@@ -6438,6 +6438,186 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         );
     }
 
+    #[tokio::test]
+    async fn test_worker_with_sandbox_base_under_junction_starts_and_runs_under_fs() {
+        skip_if_duplicate_ci_pass!();
+        require_appcontainer!();
+
+        struct AclRevokeGuard(PathBuf);
+        impl Drop for AclRevokeGuard {
+            fn drop(&mut self) {
+                let _ = rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(
+                    &self.0,
+                );
+            }
+        }
+        struct JunctionGuard(PathBuf);
+        impl Drop for JunctionGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        struct SubstGuard(String);
+        impl Drop for SubstGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new(r"C:\Windows\System32\subst.exe")
+                    .args([&self.0, "/D"])
+                    .status();
+            }
+        }
+
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let temp_root = tempfile::tempdir().expect("temp junction root");
+        let _acl_guard = AclRevokeGuard(
+            temp_home
+                .path()
+                .join(".oxideswarm")
+                .join("windows_acl_grants.txt"),
+        );
+
+        let rustup_home = temp_home.path().join(".rustup");
+        let cargo_home = temp_home.path().join(".cargo");
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(temp_home.path().join(".oxideswarm")).unwrap();
+        std::fs::write(
+            temp_home.path().join(".oxideswarm").join("cluster.secret"),
+            SECRET,
+        )
+        .unwrap();
+
+        let host = HostDirs::from_home(
+            temp_home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+
+        let real_parent = temp_root.path().join("real_parent");
+        let real_sandboxes = real_parent.join("sandboxes");
+        std::fs::create_dir_all(&real_sandboxes).unwrap();
+        let junc_parent = temp_root.path().join("junc_parent");
+        let j_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junc_parent.to_string_lossy(),
+                &real_parent.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J junc_parent");
+        assert!(j_status.success());
+        let _junc_parent_guard = JunctionGuard(junc_parent.clone());
+
+        // 1. Direct caller passing `sandbox_base` under an ancestor junction:
+        //    `probe_with_config` normalises ancestor junctions before `protect_sandbox_base`,
+        //    while `SandboxConfig::ensure_usable` still refuses ancestor reparse points (design 0021).
+        let junc_sb = junc_parent.join("sandboxes");
+        rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &junc_sb,
+            &host,
+            &[],
+        )
+        .await
+        .expect(
+            "verify_isolation_support_with_config must accept sandbox_base under ancestor junction",
+        );
+
+        let junc_err = SandboxConfig::new(junc_sb)
+            .ensure_usable()
+            .await
+            .expect_err("ensure_usable must still refuse an ancestor reparse point");
+        assert!(junc_err.to_string().contains("reparse point"), "{junc_err}");
+
+        // 2. End-to-end startup check + task execution on a `SUBST` drive (`SandboxConfig::ensure_usable`,
+        //    `verify_isolation_support_with_config`, and `TaskRunner::execute_task`).
+        let drive_letter = ['Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q']
+            .into_iter()
+            .find(|ch| !Path::new(&format!("{ch}:\\")).exists())
+            .expect("free drive letter for SUBST test");
+        let drive = format!("{drive_letter}:");
+        let subst_status = std::process::Command::new(r"C:\Windows\System32\subst.exe")
+            .arg(&drive)
+            .arg(&real_parent)
+            .status()
+            .expect("subst drive");
+        assert!(subst_status.success(), "subst {drive} failed");
+        let _subst_guard = SubstGuard(drive.clone());
+
+        let subst_sb = PathBuf::from(format!("{drive}\\sandboxes_subst"));
+        let subst_cfg = SandboxConfig::new(subst_sb);
+        subst_cfg
+            .ensure_usable()
+            .await
+            .expect("ensure_usable on SUBST sandbox_base");
+
+        rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &subst_cfg.base_dir,
+            &host,
+            &[],
+        )
+        .await
+        .expect("startup self-check must accept sandbox_base on SUBST drive");
+
+        let runner_cfg = RunnerConfig::new(subst_cfg)
+            .with_isolation(IsolationLevel::Fs)
+            .with_host_dirs(host.clone());
+        let caps = WorkerCapabilities::new("feat3-subst-sb", 2, 4096, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_cfg);
+        let task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    "echo SUBST_SB_OK > out.txt & type out.txt".into(),
+                ],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success() && res.stdout_str().contains("SUBST_SB_OK"),
+            "task under SUBST sandbox base must succeed: {:?} / {} / {}",
+            res.error,
+            res.stdout_str(),
+            res.stderr_str()
+        );
+
+        // 3. A junction directly at `sandbox_base` itself must still be refused.
+        let real_sb_direct = temp_root.path().join("real_sb_direct");
+        std::fs::create_dir_all(&real_sb_direct).unwrap();
+        let junc_sb_self = temp_root.path().join("junc_sb_self");
+        let j_self_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junc_sb_self.to_string_lossy(),
+                &real_sb_direct.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J junc_sb_self");
+        assert!(j_self_status.success());
+        let _junc_self_guard = JunctionGuard(junc_sb_self.clone());
+        let direct_err = rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &junc_sb_self,
+            &host,
+            &[],
+        )
+        .await
+        .expect_err("junction directly at sandbox_base must remain refused");
+        assert!(
+            direct_err.to_string().contains("reparse point"),
+            "{direct_err}"
+        );
+    }
+
     /// BUG-18 regression test: bare `whoami` (`TaskSpec::Command { program: "whoami", .. }`)
     /// under `--isolation fs` must resolve to `%SystemRoot%\System32\whoami.exe` rather than
     /// `C:\Program Files\Git\usr\bin\whoami.exe` (`msys-2.0.dll`, which fails with
