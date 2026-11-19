@@ -686,7 +686,13 @@ mod imp {
         }
         if procs_fd >= 0 && libc::lseek(procs_fd, 0, libc::SEEK_SET) >= 0 {
             let mut buf = [0u8; 4096];
-            let n = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+            let n = loop {
+                let r = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+                if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break r;
+            };
             if n > 0 {
                 let mut pid: libc::pid_t = 0;
                 let mut has_digit = false;
@@ -879,12 +885,18 @@ mod imp {
         let mut dir_buf = [0u8; 4096];
         let mut env_buf = [0u8; 4096];
         loop {
-            let nread = libc::syscall(
-                libc::SYS_getdents64,
-                proc_fd,
-                dir_buf.as_mut_ptr().cast::<libc::c_void>(),
-                dir_buf.len(),
-            );
+            let nread = loop {
+                let n = libc::syscall(
+                    libc::SYS_getdents64,
+                    proc_fd,
+                    dir_buf.as_mut_ptr().cast::<libc::c_void>(),
+                    dir_buf.len(),
+                );
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break n;
+            };
             if nread <= 0 {
                 break;
             }
@@ -929,10 +941,17 @@ mod imp {
                 path_buf[6..6 + dec_len].copy_from_slice(&dec[..dec_len]);
                 path_buf[6 + dec_len..6 + dec_len + 9].copy_from_slice(b"/environ\0");
 
-                let env_fd = libc::open(
-                    path_buf.as_ptr().cast::<libc::c_char>(),
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                );
+                let env_fd = loop {
+                    let fd = libc::open(
+                        path_buf.as_ptr().cast::<libc::c_char>(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    break fd;
+                };
                 if env_fd < 0 {
                     continue;
                 }
@@ -947,11 +966,19 @@ mod imp {
                 let mut carry = 0usize;
                 let mut first_chunk = true;
                 loop {
-                    let r = libc::read(
-                        env_fd,
-                        env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
-                        env_buf.len() - carry,
-                    );
+                    let r = loop {
+                        let n = libc::read(
+                            env_fd,
+                            env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
+                            env_buf.len() - carry,
+                        );
+                        if n < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                            continue;
+                        }
+                        break n;
+                    };
                     if r <= 0 {
                         break;
                     }
