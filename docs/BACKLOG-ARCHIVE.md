@@ -2678,7 +2678,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All assertions remain intact, `client::tests` passes `20/20` alone and `20/20` under
   `6` busy loops, and full `rusty_grid_worker --lib` under `6` busy loops records `0` `client::tests`
   `Elapsed(())` timeouts.
-- **Implemented (2026-11-19):** Updated `crates/worker/src/client/tests.rs` as planned (keeping
+- **Implemented (2026-11-19, pull request 378, open):** Updated `crates/worker/src/client/tests.rs` as planned (keeping
   negative-assertion `50 ms` and `300 ms` waits untouched). On Windows 11 Home (12 logical threads,
   isolated env `%USERPROFILE%\ox_c_env\test60_env`), post-fix verification passed:
   - `cargo test -p rusty_grid_worker --lib --locked client::tests` (`81` tests): `20/20` passed
