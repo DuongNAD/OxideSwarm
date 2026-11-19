@@ -2690,6 +2690,46 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-67: Campaign driver tests flake on Windows log appends and macOS 0.2 s submit timeout
+
+- **Evidence:** `tests/test_campaign_driver.py` failed intermittently in the `agent bridge` CI job on
+  `master` commit `4888dd5` and pull requests 385, 388, 389, 391, and 393 across Windows and macOS
+  runners:
+  - Windows (`agent bridge (windows-latest)`, PR 393 run `44567880864`): `test_verified_run_and_privacy_scrubbing`
+    line 668 failed `AssertionError: 2 != 3` on `len(submit_calls)` while `record["summary"]["verified"] == 3`
+    already proved `benchmarks/campaigns/driver.py` completed all three units.
+  - macOS (`agent bridge (macos-latest)`, PR 393 run `44567880864`): `test_timeout_records_failed_and_cancels_task`
+    line 843 failed `KeyError: 'cancelled_on_master'`.
+- **Problem:** Both causes live in `tests/test_campaign_driver.py` (`benchmarks/campaigns/driver.py` is
+  right):
+  1. `FAKE_CLI_SOURCE` appended JSON lines to a single shared file with `open("a")` across
+     `--concurrency 2` subprocesses, which is not atomic on Windows and dropped one line cleanly while
+     `driver.py` saw all three verified completions.
+  2. `test_timeout_records_failed_and_cancels_task` passed `--submit-timeout-secs 0.2`, letting
+     `proc.communicate(timeout=0.2)` `SIGKILL` the fake Python process on loaded CI runners before
+     Python started and flushed `timeout_json` (`u001`) or `task_id=` (`u002`); without a task id in
+     stdout or stderr, `execute_submit_attempt` (`benchmarks/campaigns/driver.py:1299`) legitimately
+     left `cancelled_on_master` unset.
+- **Do:** Replace `FAKE_OXIDESWARM_LOG` append logging with `FAKE_OXIDESWARM_LOG_DIR`, writing each
+  invocation atomically via temp file + `os.replace` to `<ts_ns>-<pid>-<uuid4>.json` (and using
+  atomic writes for `.workers_calls`, `.count.<seed>`, and marker files) plus a shared chronological
+  reader `read_fake_cli_logs`; raise `--submit-timeout-secs` in
+  `test_timeout_records_failed_and_cancels_task` from `0.2` to `5`, flush `timeout_json` stdout, set
+  `u002`'s `sleep_secs` to `600.0`, raise `wait_for_file`, `proc.communicate`, and interrupt `sleep_secs`
+  in `test_interrupt_records_interrupted_cancels_and_resumes` to `60.0 s` / `600.0 s`, and attach full
+  attempt records to the assertions without asserting elapsed time.
+- **Done when:** All 13 tests in `tests/test_campaign_driver.py` keep full behaviour and cancellation
+  assertions without sub-second startup windows or shared append races, and pass `20/20` under 6 CPU
+  busy loops.
+- **Implemented (2026-11-19, pull request TBD):** Updated `tests/test_campaign_driver.py` (`driver.py`
+  unchanged) and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `b0786ed8`): `20/20` passed (`74.61 s` total, `3.64–3.84 s` per run;
+    Apple M5 starts Python under `0.2 s` while slower CI runners hit the startup race and Windows
+    non-atomic append race).
+  - After fix: `python3 tests/test_campaign_driver.py -v` passed `13/13` in `8.018 s`, and the 20-run
+    loop under 6 Python busy loops passed `20/20` (`175.50 s` total, `8.65–8.90 s` per run, `0`
+    failures).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
