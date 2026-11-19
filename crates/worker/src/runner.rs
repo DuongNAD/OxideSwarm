@@ -1325,12 +1325,16 @@ mod tests;
 
 /// Tests of exit-status mapping, the cancellation channel and the default shell; no processes of
 /// their own beyond `sh`, so they run everywhere `sh` does.
+// LV-4: cfg(unix) libc::getpgid/killpg check in outcome tests (production runner.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod outcome_tests;
 
 /// Real process trees: every test here spawns grandchildren (`sh -c` with a background `sleep`)
 /// and checks that they are gone, and that nothing unrelated is touched.
+// LV-4: cfg(unix) libc::kill process-tree probe in tests (production runner.rs stays denied).
 #[cfg(all(test, unix))]
+#[allow(unsafe_code)]
 mod process_tree_tests;
 
 #[cfg(test)]

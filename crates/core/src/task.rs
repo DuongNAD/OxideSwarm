@@ -2686,7 +2686,9 @@ impl fmt::Display for TaskStatus {
     }
 }
 
+// LV-4: cfg(windows) Windows console API probe in tests (production code in task.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
