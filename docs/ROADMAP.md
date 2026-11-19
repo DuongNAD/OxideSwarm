@@ -70,11 +70,11 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   spikes come first: a GPU inside the sandbox (R20) and a reading of Mesh-LLM (R21). The
   plan is in [design 0064](design/0064-research-of-2026-11-13-and-route.md). Q54 to Q56 are
   open.
-- Tests for large transfers and long runs (Draft, 2026-11-14): a harness that moves files of 1 to
+- Tests for large transfers and long runs (Partial, 2026-11-19): a harness that moves files of 1 to
   8 GiB and large trees between machines, and a 24-hour run under load and faults. It comes after
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
-  Q57 to Q59 are open.
+  Q57 to Q59 were decided by the owner on 2026-11-19; TEST-24 step 1 (harness and loopback record) is in pull request 374.
 - Releases (2026-11-19): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
   released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, `0.4.2` adds
   `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes, `0.4.3` closes every lane of a
@@ -718,9 +718,9 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Yes, approved by the owner and implemented in `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md)) |
-| Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Open. Recommended: yes, one run over a weekend after 0.2.0 |
-| Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Open. Recommended: decide from the records over a relay; it changes the master store and gets its own design record |
-| Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Open. Recommended: 8 GiB first; add the model's size when design 0062 names one |
+| Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now (apart from the trial cluster) |
+| Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Decided by the owner on 2026-11-19: decide from the T5 and T9 records over a relay; nothing changes before them |
+| Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Decided by the owner on 2026-11-19: 8 GiB first; add a model's size when design 0062 names one |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |

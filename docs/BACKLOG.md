@@ -500,7 +500,7 @@ The full suite must pass on a clean machine before CI can require it.
   `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
 - **Partial (2026-11-19, pull request 374):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
   `sample`, Python 3 standard library only), `benchmarks/endurance/README.md`, and
-  `tests/test_endurance_harness.py` (`11/11` passed, wired into CI `agent-bridge`), and ran
+  `tests/test_endurance_harness.py` (`14/14` passed, wired into CI `agent-bridge`), and ran
   loopback scenarios on Windows `x86_64` (`rusty-grid 0.4.3` at `a3e5b71`, Windows Defender
   real-time protection on): `7/7` passed in `2,648.17 s`
   (`benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`):

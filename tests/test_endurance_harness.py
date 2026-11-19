@@ -361,7 +361,9 @@ class SamplerAndPrivacyTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 out = endurance.result_path(d, datetime.datetime(2026, 11, 19), "loopback", osf, hw)
                 self.assertNotIn(sentinel_host, out)
-                text = endurance.write_record(out, record)
+                write_res = endurance.write_record(out, record)
+                self.assertFalse(write_res["quarantined"])
+                text = write_res["text"]
                 self.assertNotIn(sentinel_host, text)
                 self.assertNotIn(sentinel_user, text)
                 self.assertNotIn(private_ip, text)
@@ -371,6 +373,52 @@ class SamplerAndPrivacyTests(unittest.TestCase):
                     endurance.assert_record_private(json.dumps({"leak": private_ip}))
                 with self.assertRaises(ValueError):
                     endurance.assert_record_private(json.dumps({"leak": sentinel_host}))
+
+    def test_privacy_whole_token_matching_and_quarantine(self):
+        # Short tokens like 'ubuntu' or 'max' must NOT match '-Ubuntu' or 'max_cpu_seconds'
+        with mock.patch.object(socket, "gethostname", return_value="max-host.local"), \
+             mock.patch.object(endurance.platform, "node", return_value="max-host"), \
+             mock.patch.dict(os.environ, {"USERNAME": "max", "USER": "ubuntu"}), \
+             mock.patch.object(endurance.getpass, "getuser", return_value="ubuntu"):
+            benign = {
+                "os": {"version": "5.15.0-100-Ubuntu"},
+                "summary": {"max_cpu_seconds": 12.5, "max-rate": "ok"},
+            }
+            with tempfile.TemporaryDirectory() as d:
+                target = os.path.join(d, "ok.json")
+                res = endurance.write_record(target, benign)
+                self.assertFalse(res["quarantined"])
+                self.assertEqual(res["hits"], [])
+                self.assertTrue(os.path.isfile(target))
+
+                # Actual standalone leak in a nested field goes to <stem>.quarantine.json without raising
+                leaked = {
+                    "os": {"version": "5.15.0-100-Ubuntu"},
+                    "scenarios": [{"id": "T1", "error": "failed on max-host via ubuntu"}],
+                }
+                qtarget = os.path.join(d, "bad.json")
+                qres = endurance.write_record(qtarget, leaked)
+                self.assertTrue(qres["quarantined"])
+                self.assertFalse(os.path.exists(qtarget))
+                self.assertTrue(os.path.isfile(qres["path"]))
+                self.assertTrue(qres["path"].endswith(".quarantine.json"))
+                self.assertEqual(qres["hits"][0]["field"], "$.scenarios[0].error")
+
+    def test_transfer_refuses_non_loopback_and_remote_flags(self):
+        ap = endurance.build_parser()
+        ok_args = ap.parse_args(["transfer"])
+        endurance.validate_transfer_args(ok_args)
+
+        for bad_argv in (
+            ["transfer", "--link", "lan-tcp"],
+            ["transfer", "--link", "quic-relay"],
+            ["transfer", "--master", "127.0.0.1:8088"],
+            ["transfer", "--secret-file", "secret.txt"],
+            ["transfer", "--insecure"],
+        ):
+            bad_args = ap.parse_args(bad_argv)
+            with self.assertRaises(ValueError, msg="expected ValueError for %s" % bad_argv):
+                endurance.validate_transfer_args(bad_args)
 
 
 if __name__ == "__main__":

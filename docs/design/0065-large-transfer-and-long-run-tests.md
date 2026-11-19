@@ -107,8 +107,11 @@ move eight at a time.
 3. **Two machines.** The master runs on one machine, started for the run with a temporary `HOME`
    and ports that differ from any other cluster on the machine. Workers on other machines join it
    with a secret created for the run. The harness never uses `~/.oxideswarm` or the trial cluster.
-4. **Data.** Files are random bytes from a seeded generator. Both sides check them by BLAKE3
-   without keeping a second copy.
+4. **Data.** Files are random bytes from a seeded generator. Both ends check SHA-256 independently of the
+   code under test without keeping a second copy (`endurance.py` hashes at generation and the worker
+   task script hashes the staged sandbox payload again); store and cache ids (`master_blake3_ids`,
+   `worker_cache_blake3_ids`) record the matching-size object names found on disk and are not
+   recomputed in Python.
 5. **Samples.** `sample` runs on each machine. For each process the harness started, it records
    resident memory, open handles, threads and CPU time. It also records the sizes of the blob
    store, the worker cache, the sandbox base and the state directory. It reads open handles from
@@ -224,16 +227,16 @@ the binary version it ran.
 | TEST-25 | Soak harness and a first 24-hour record | `benchmarks/endurance/endurance.py` (`soak`) | A 24-hour record on a Mac and two Windows machines is committed. It passes D3, or every failed check has its own item | Planned |
 | TEST-26 | Short run on a schedule in CI | `.github/workflows/ci.yml` | The job is green on two scheduled runs | Planned |
 
-## Decisions for the owner
+## Decisions (decided by owner 2026-11-19)
 
-The right column is a recommended default, not a decision. They are listed in
+The right column records the owner's decisions of 2026-11-19, listed in
 [ROADMAP.md](../ROADMAP.md) as Q57 to Q59.
 
-| ID | Question | Recommended default |
+| ID | Question | Decision |
 |---|---|---|
-| Q57 | Does the 24-hour soak run on the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster? | Yes, one run over a weekend after 0.2.0 |
-| Q58 | If T5 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk? That is a change to the master store and needs its own design record | Decide from the T5 and T9 records over a relay. Change nothing before them |
-| Q59 | Is 8 GiB the largest file of T1, or the size of a model the owner plans to run (design 0062)? | 8 GiB first. Add the model's size when design 0062 names one |
+| Q57 | Does the 24-hour soak run on the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now |
+| Q58 | If T5 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk? That is a change to the master store and needs its own design record | Decided by the owner on 2026-11-19: decide from the T5 and T9 records over a relay; nothing changes before them |
+| Q59 | Is 8 GiB the largest file of T1, or the size of a model the owner plans to run (design 0062)? | Decided by the owner on 2026-11-19: 8 GiB first; add the model's size when design 0062 names one |
 
 ## Risks
 
@@ -250,7 +253,7 @@ The right column is a recommended default, not a decision. They are listed in
   TEST-24 to TEST-26 (Planned) and decisions Q57 to Q59.
 - 2026-11-19: TEST-24 step 1 Partial (pull request 374): added `benchmarks/endurance/endurance.py` (`transfer`,
   `throttle`, `sample`, stdlib only), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py`
-  (`11/11`, wired into CI `agent-bridge`), and Windows `x86_64` loopback record
+  (`14/14`, wired into CI `agent-bridge`), and Windows `x86_64` loopback record
   `benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`
   (`7/7` passed across `T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s`
   `50 ms` RTT with `0` worker reaps over `2,164.6 s`, and `T8`; `T1 8 GiB`, `T2 100,000` files,

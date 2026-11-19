@@ -52,29 +52,29 @@ Every run follows the rules of `benchmarks/grid/bench_grid.py`:
 - Redacts host names, user names, drive/home paths, and non-loopback IPv4 addresses before
   writing any JSON record.
 
-## Data generation and BLAKE3 verification
+## Data generation and integrity verification
 
-Python's standard library `hashlib` does not include BLAKE3. The harness avoids creating a
-second copy on disk and relies on `oxideswarm`'s own built-in BLAKE3 content addressing at both
-ends:
+Python's standard library `hashlib` does not include BLAKE3. The harness verifies bytes end-to-end
+with streaming **SHA-256** independently of the code under test, without creating a second copy on
+disk, while recording `oxideswarm`'s on-disk BLAKE3 store object names:
 
 1. **Client generation & upload (`oxideswarm submit --input`):** `endurance.py` streams seeded
    random bytes (`random.Random(seed)`) in `4 MiB` chunks directly into the payload file while
-   computing a streaming `sha256` digest. `oxideswarm submit` hashes every file with its own
+   computing a streaming `sha256` digest. Independently, `oxideswarm submit` hashes every file with
    `blake3::Hasher` (`BlobHasher`), announces the 64-hex BLAKE3 digest as the `BlobId`, and
    uploads chunks to the master.
-2. **Master & worker BLAKE3 check:** `BlobStore` on the master writes chunks under `tmp/` and
-   verifies the full uploaded BLAKE3 hash against the announced `BlobId` before renaming into
-   `<blob_dir>/objects/<hh>/<64-hex>` (`crates/master/src/blob_store.rs`). When a worker
-   fetches task inputs, `BlobClient::fetch_task_inputs` verifies the received bytes against the
-   same 64-hex BLAKE3 `BlobId` (`crates/worker/src/blob_cache.rs`). For loopback runs, the
-   harness also inspects the resulting `<hh>/<64-hex>` entries in the master blob store and
-   worker blob cache.
-3. **Worker & client end-to-end verification:** the worker task streams the materialized file or
-   tree in its sandbox without copying it, checks exact byte size and streaming `sha256` against
-   the client's expected digest, and (`T3`, `T7`) generates seeded output files whose BLAKE3 `id`
-   is returned in `submit --wait --json` `outputs[]` and verified again on download by
-   `oxideswarm submit --output-dir` plus streaming `sha256`.
+2. **Master & worker store inspection (object names, not recomputed):** `BlobStore` on the master
+   and `BlobCache` on the worker verify BLAKE3 internally inside the binary (`crates/master/src/blob_store.rs`
+   and `crates/worker/src/blob_cache.rs`). For loopback runs, the harness records the resulting
+   `<hh>/<64-hex>` entries from `<blob_dir>/objects` and `cache/blobs/objects` whose byte size
+   matches the payload (`master_blake3_ids`, `worker_cache_blake3_ids`) — it does not recompute
+   BLAKE3 in Python.
+3. **Worker & client end-to-end SHA-256 check:** the worker task script streams the materialized file
+   or tree in its sandbox without copying it and checks exact byte size and streaming `sha256`
+   against the client's expected digest independently of `oxideswarm`. For outputs (`T3`, `T7`), it
+   generates seeded output files whose BLAKE3 `id` is returned in `submit --wait --json` `outputs[]`
+   and verified again on download by `oxideswarm submit --output-dir` plus independent streaming
+   `sha256`.
 
 ## Scope and deferred runs (`TEST-24` step 1 vs step 2)
 

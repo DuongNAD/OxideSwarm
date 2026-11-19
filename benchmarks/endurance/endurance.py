@@ -759,6 +759,12 @@ def _replace_non_loopback_ipv4(m: re.Match) -> str:
     return "<ip>" + (":<port>" if port else "")
 
 
+def _whole_token_pattern(token: str) -> re.Pattern:
+    """Compile a case-insensitive whole-token matcher so short tokens do not hit substrings."""
+    escaped = re.escape(token.strip())
+    return re.compile(r"(?<![A-Za-z0-9_-])" + escaped + r"(?![A-Za-z0-9_-])", re.IGNORECASE)
+
+
 def redact_text(text: str, extra_secrets: Iterable[str] = ()) -> str:
     """Scrub host names, user names, local paths, and non-loopback IPv4 addresses."""
     if not text:
@@ -767,22 +773,27 @@ def redact_text(text: str, extra_secrets: Iterable[str] = ()) -> str:
     out = _DRIVE_PATH_RE.sub("<path>", out)
     out = _USER_UNIX_PATH_RE.sub("<path>", out)
     for tok in _sensitive_tokens(extra_secrets):
-        out = re.sub(re.escape(tok), "<redacted>", out, flags=re.IGNORECASE)
+        out = _whole_token_pattern(tok).sub("<redacted>", out)
     out = _IPV4_PORT_RE.sub(_replace_non_loopback_ipv4, out)
     return out
 
 
-def assert_record_private(record_text: str, forbidden: Iterable[str] = ()) -> None:
-    """Raise ValueError if a serialized record leaks host, user, path, or private IP."""
-    lower = record_text.lower()
-    for tok in _sensitive_tokens(forbidden):
-        if tok.lower() in lower:
-            raise ValueError("privacy check failed: record contains forbidden token (%d chars)" % len(tok))
+def _scan_string_privacy(
+    value: str,
+    field_path: str,
+    token_patterns: List[re.Pattern],
+) -> List[Dict[str, str]]:
+    hits: List[Dict[str, str]] = []
+    lower = value.lower()
+    for pat in token_patterns:
+        if pat.search(value):
+            hits.append({"field": field_path, "reason": "matched local host/user/path token"})
+            break
     if re.search(r"[a-z]:[/\\]{1,2}(?:users|documents and settings)[/\\]", lower) or re.search(
         r"/(?:users|home)/[a-z0-9_.-]+", lower
     ):
-        raise ValueError("privacy check failed: record contains a user home path")
-    for m in _IPV4_PORT_RE.finditer(record_text):
+        hits.append({"field": field_path, "reason": "matched user home path"})
+    for m in _IPV4_PORT_RE.finditer(value):
         ip = m.group(1)
         if ip in ("127.0.0.1", "0.0.0.0"):
             continue
@@ -796,16 +807,75 @@ def assert_record_private(record_text: str, forbidden: Iterable[str] = ()) -> No
             or (octets[0] == 100 and 64 <= octets[1] <= 127)
         )
         if is_rfc1918:
-            raise ValueError("privacy check failed: record contains a non-loopback IP (%s)" % ip)
+            hits.append({"field": field_path, "reason": "matched non-loopback IP (%s)" % ip})
+    return hits
 
 
-def write_record(path: str, record: Dict[str, Any], forbidden: Iterable[str] = ()) -> str:
+def find_privacy_hits(
+    obj: Any,
+    forbidden: Iterable[str] = (),
+    _path: str = "$",
+    _patterns: Optional[List[re.Pattern]] = None,
+) -> List[Dict[str, str]]:
+    """Inspect serialized JSON string values for private tokens, home paths, or non-loopback IPs."""
+    pats = _patterns if _patterns is not None else [_whole_token_pattern(t) for t in _sensitive_tokens(forbidden)]
+    hits: List[Dict[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            hits.extend(find_privacy_hits(v, forbidden=forbidden, _path="%s.%s" % (_path, k), _patterns=pats))
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj):
+            hits.extend(find_privacy_hits(v, forbidden=forbidden, _path="%s[%d]" % (_path, idx), _patterns=pats))
+    elif isinstance(obj, str):
+        hits.extend(_scan_string_privacy(obj, _path, pats))
+    return hits
+
+
+def assert_record_private(record_text: str, forbidden: Iterable[str] = ()) -> None:
+    """Raise ValueError naming the offending field(s) if a record leaks host, user, path, or private IP."""
+    try:
+        parsed = json.loads(record_text)
+    except ValueError:
+        pats = [_whole_token_pattern(t) for t in _sensitive_tokens(forbidden)]
+        hits = _scan_string_privacy(record_text, "$", pats)
+    else:
+        hits = find_privacy_hits(parsed, forbidden=forbidden)
+    if hits:
+        summary = "; ".join("%s (%s)" % (h["field"], h["reason"]) for h in hits[:5])
+        raise ValueError("privacy check failed: %s" % summary)
+
+
+def _quarantine_path(path: str) -> str:
+    abs_path = os.path.abspath(path)
+    stem, ext = os.path.splitext(abs_path)
+    cand = "%s.quarantine%s" % (stem, ext or ".json")
+    n = 1
+    while os.path.exists(cand):
+        n += 1
+        cand = "%s.quarantine-%d%s" % (stem, n, ext or ".json")
+    return cand
+
+
+def write_record(path: str, record: Dict[str, Any], forbidden: Iterable[str] = ()) -> Dict[str, Any]:
+    """Write record to `path`, or to `<stem>.quarantine.json` naming offending fields on a privacy hit."""
     text = json.dumps(record, indent=2) + "\n"
-    assert_record_private(text, forbidden=forbidden)
+    hits = find_privacy_hits(record, forbidden=forbidden)
+    if hits:
+        qpath = _quarantine_path(path)
+        os.makedirs(os.path.dirname(os.path.abspath(qpath)), exist_ok=True)
+        with open(qpath, "w", encoding="utf-8") as f:
+            f.write(text)
+        summary = "; ".join("%s (%s)" % (h["field"], h["reason"]) for h in hits)
+        print(
+            "PRIVACY WARNING: quarantined record with %d hit(s) [%s] to %s" % (len(hits), summary, qpath),
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"path": qpath, "quarantined": True, "hits": hits, "text": text}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-    return text
+    return {"path": path, "quarantined": False, "hits": [], "text": text}
 
 
 # ---------------------------------------------------------------- loopback TCP throttle proxy (D1 #6)
@@ -2492,7 +2562,34 @@ def compute_largest_file_bytes(scenarios: List[str], args: argparse.Namespace) -
 # ---------------------------------------------------------------- CLI subcommands
 
 
+def validate_transfer_args(args: argparse.Namespace) -> None:
+    """Reject unimplemented multi-machine links and remote flags in step 1 (TEST-24)."""
+    link = (getattr(args, "link", None) or "").strip().lower()
+    if link != "loopback":
+        raise ValueError(
+            "only --link loopback is supported in TEST-24 step 1 (got --link %r; two-machine links arrive in step 2)"
+            % getattr(args, "link", None)
+        )
+    bad_flags: List[str] = []
+    if getattr(args, "master", None):
+        bad_flags.append("--master")
+    if getattr(args, "secret_file", None):
+        bad_flags.append("--secret-file")
+    if getattr(args, "insecure", False):
+        bad_flags.append("--insecure")
+    if bad_flags:
+        raise ValueError(
+            "%s require two-machine mode (TEST-24 step 2) and cannot be combined with loopback step 1"
+            % ", ".join(bad_flags)
+        )
+
+
 def cmd_transfer(args: argparse.Namespace) -> int:
+    try:
+        validate_transfer_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
     binary = os.path.abspath(args.bin)
     if not os.path.isfile(binary):
         raise SystemExit("binary not found: %s" % binary)
@@ -2574,13 +2671,18 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         "power": power_state(),
         "python": platform.python_version(),
         "link": args.link,
+        "parameters": {
+            "seed": int(args.seed),
+            "sample_interval_s": float(args.sample_interval),
+        },
         "measured_rtt_ms": loopback_rtt_ms,
         "theoretical_single_blob_bound_mib_per_s": theoretical_single_blob_bound_mib_per_s(loopback_rtt_ms),
         "disk_check": disk_check,
         "verification_note": (
-            "Client streams seeded random bytes while computing SHA-256; oxideswarm computes and verifies "
-            "BLAKE3 content ids in Master BlobStore and Worker BlobCache; worker task re-reads sandbox payload(s) "
-            "and checks SHA-256 without creating a second copy."
+            "Client streams seeded random bytes while computing SHA-256 and the worker script re-reads the sandbox payload "
+            "and checks SHA-256 independently of the code under test without keeping a second copy; oxideswarm checks BLAKE3 in "
+            "Master BlobStore and Worker BlobCache, and master_blake3_ids / worker_cache_blake3_ids record matching-size store "
+            "object names on disk without recomputing BLAKE3 in Python."
         ),
         "scenarios_requested": scenarios,
         "omitted_scenarios": omitted_scenarios,
@@ -2590,17 +2692,24 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         "scenarios": results,
     }
 
+    quarantined = False
     if args.no_write:
         text = json.dumps(record, indent=2) + "\n"
         assert_record_private(text, forbidden=[work_root])
         print(text)
     else:
         out_path = args.out or result_path(os.path.join(HERE, "results"), started, args.link, os_facts, hw)
-        write_record(out_path, record, forbidden=[work_root])
-        print("wrote", out_path, flush=True)
+        write_res = write_record(out_path, record, forbidden=[work_root])
+        quarantined = bool(write_res["quarantined"])
+        if quarantined:
+            print("quarantined", write_res["path"], flush=True)
+        else:
+            print("wrote", write_res["path"], flush=True)
 
     for r in results:
         print("  %-4s %-5s %s" % (r["id"], "PASS" if r["passed"] else "FAIL", r["name"]), flush=True)
+    if quarantined:
+        return 2
     return 0 if record["all_passed"] else 1
 
 
