@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -280,24 +280,88 @@ def make_test_manifest(
 
 
 class CampaignDriverTests(unittest.TestCase):
-    def test_pilot_manifest_has_200_valid_units_and_blocker(self) -> None:
+    def test_pilot_manifest_has_200_valid_trial_units(self) -> None:
         manifest = driver.load_manifest(PILOT_MANIFEST)
         self.assertEqual(manifest["campaign_id"], "2026-11-pilot")
         self.assertEqual(len(manifest["units"]), 200)
-        self.assertFalse(manifest["workload"]["runner_ready"])
+        workload = manifest["workload"]
+        self.assertTrue(workload["runner_ready"])
+        self.assertEqual(workload["commit"], "963f436e68c7197bace3e9e7bf86bd8cd6a6601e")
+        self.assertEqual(workload["branch"], "feat/ecological-selection")
+        self.assertNotIn("blocker", workload)
+        self.assertEqual(
+            set(workload["runner_sha256"]), {"macos/aarch64", "windows/x86_64"}
+        )
         ids = [u["id"] for u in manifest["units"]]
         self.assertEqual(ids[0], "u001")
         self.assertEqual(ids[-1], "u200")
         self.assertEqual(len(set(ids)), 200)
+        # E-SEL1 confirmation seeds 760001, 761001, ..., 771001 are refused by the runner.
+        confirmation_seeds = {760001 + 1000 * i for i in range(12)}
         for u in manifest["units"]:
             self.assertEqual(u["env"]["ANIMA_DETERMINISTIC"], "1")
             self.assertEqual(u["env"]["ANIMA_USE_GPU"], "0")
+            # `--seed` and ANIMA_SIM_SEED must agree, or the runner exits 2.
+            self.assertEqual(u["env"]["ANIMA_SIM_SEED"], str(u["seed"]))
+            self.assertNotIn(u["seed"], confirmation_seeds)
             self.assertEqual(u["verify"], 1)
-            self.assertEqual(u["verify_file"], "out/smoke/verify_checksums.txt")
+            self.assertEqual(u["verify_file"], "out/trial/verify_checksums.txt")
+            self.assertEqual(u["outputs"], ["out/trial/**"])
+            self.assertEqual(u["inputs"], [])
             self.assertFalse(u["verify_any_system"])
             self.assertEqual(u["require_isolation"], "fs")
-            self.assertIn(str(u["seed"]), u["args"])
-            self.assertIn(str(u["params"]["live.founders"]), u["args"])
+            p = u["params"]
+            self.assertNotEqual(p["live.food_cap_abundant"], p["live.food_cap_scarce"])
+            self.assertEqual(
+                u["args"],
+                [
+                    "--trial", "--out", "out",
+                    "--seed", str(u["seed"]),
+                    "--founders", str(p["live.founders"]),
+                    "--food-cap-abundant", str(p["live.food_cap_abundant"]),
+                    "--food-cap-scarce", str(p["live.food_cap_scarce"]),
+                    "--duration-ticks", str(p["duration_ticks"]),
+                ],
+            )
+
+    def test_pilot_manifest_dry_run_per_system_and_placeholder_hash(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = driver.main([
+                "--manifest", str(PILOT_MANIFEST),
+                "--runner-system", "windows/x86_64",
+                "--shard", "2/2",
+                "--dry-run",
+            ])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertNotIn("workload blocker", out)
+        self.assertIn("selected=100", out)
+        self.assertIn("--verify 1 --verify-file out/trial/verify_checksums.txt", out)
+        self.assertIn("--os windows --arch x86_64", out)
+        self.assertIn("--output out/trial/**", out)
+        self.assertIn(
+            "--command ./run_esel1_experiment -- --trial --out out --seed 100001 --founders 60",
+            out,
+        )
+        self.assertNotIn("--manifest-dir", out)
+        self.assertNotIn("--input", out)
+
+        # The organiser fills runner_sha256 from their own builds: a `<fill-before-run>` placeholder,
+        # and later any binary other than those builds, is refused.
+        with tempfile.TemporaryDirectory() as d:
+            runner_bin = Path(d) / "run_esel1_experiment"
+            runner_bin.write_bytes(b"fake-runner-bytes")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc_placeholder = driver.main([
+                    "--manifest", str(PILOT_MANIFEST),
+                    "--runner", str(runner_bin),
+                    "--runner-system", "macos/aarch64",
+                    "--dry-run",
+                ])
+            self.assertEqual(rc_placeholder, 1)
+            self.assertRegex(err.getvalue(), r"<fill-before-run>|SHA-256 mismatch")
 
     def test_standin_workload_and_dry_run_manifest(self) -> None:
         dry_manifest = driver.load_manifest(DRY_RUN_MANIFEST)
@@ -350,15 +414,15 @@ class CampaignDriverTests(unittest.TestCase):
             self.assertIn(b"100001,control,", v1)
             self.assertTrue((tmp / "r1" / "smoke" / "runs.csv").exists())
 
-        # Blocked pilot manifest passes `--dry-run` with notice, refuses live run without override.
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            rc_dry = driver.main(["--manifest", str(PILOT_MANIFEST), "--dry-run"])
-        self.assertEqual(rc_dry, 0)
-        self.assertIn("workload blocker", buf.getvalue())
-
+        # A blocked manifest passes `--dry-run` with a notice and refuses a live run without override.
         with tempfile.TemporaryDirectory() as d:
             blocked_manifest = make_test_manifest(Path(d), runner_ready=False)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc_dry = driver.main(["--manifest", str(blocked_manifest), "--dry-run"])
+            self.assertEqual(rc_dry, 0)
+            self.assertIn("workload blocker", buf.getvalue())
+
             rc_live = driver.main(["--manifest", str(blocked_manifest), "--record", str(Path(d) / "r.json")])
             self.assertEqual(rc_live, 1)
 
@@ -417,6 +481,15 @@ class CampaignDriverTests(unittest.TestCase):
             spec, got = driver.verify_runner_hash(workload_ok, runner_bin, "macos/aarch64")
             self.assertEqual(got, digest)
             self.assertTrue(spec.endswith(":run_esel1_experiment"))
+
+            # A Windows worker starts only `.exe`/`.com`/`.bat`/`.cmd` files (design 0025) and
+            # resolves `./run_esel1_experiment` to `run_esel1_experiment.exe`.
+            workload_win = {"binary_name": "run_esel1_experiment", "runner_sha256": {"windows/x86_64": digest}}
+            spec_win, _ = driver.verify_runner_hash(workload_win, runner_bin, "win/amd64")
+            self.assertTrue(spec_win.endswith(":run_esel1_experiment.exe"), spec_win)
+            workload_win_exe = {"binary_name": "run_esel1_experiment.EXE", "runner_sha256": {"windows/x86_64": digest}}
+            spec_win_exe, _ = driver.verify_runner_hash(workload_win_exe, runner_bin, "windows/x86_64")
+            self.assertTrue(spec_win_exe.endswith(":run_esel1_experiment.EXE"), spec_win_exe)
 
             with self.assertRaises(ValueError):
                 driver.verify_runner_hash(

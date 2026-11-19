@@ -180,6 +180,18 @@ fn lines(result: &TaskResult) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn format_result_diag(result: &TaskResult) -> String {
+    format!(
+        "exit_code={} error={:?} elapsed_ms={} stdout={:?} stderr={:?}",
+        result.exit_code,
+        result.error,
+        result.execution_time_ms,
+        result.stdout_str(),
+        result.stderr_str()
+    )
+}
+
 #[cfg(target_os = "macos")]
 const FS_SCRIPT: &str = r#"
 echo hello > "$RUSTY_GRID_SANDBOX_DIR/allowed.txt" && echo WRITE_OK
@@ -873,7 +885,8 @@ mod macos {
         for leak in ["LEAK_SECRET", "LEAK_KEY", "LEAK_SIBLING", "LEAK_WRITE_HOME"] {
             assert!(
                 got.iter().any(|l| l == leak),
-                "without isolation {leak} must succeed (otherwise the tests below prove nothing): {got:?}"
+                "without isolation {leak} must succeed (otherwise the tests below prove nothing): lines={got:?} ({})",
+                format_result_diag(&result)
             );
         }
     }
@@ -1334,8 +1347,8 @@ echo "READ_AFTER_WRITE=$(/usr/bin/defaults read {wdomain} planted 2>/dev/null)"
         let control = run_at(IsolationLevel::Off, script, &[]).await;
         assert!(
             has(&control, "WORKER_VAR=rusty_grid_worker"),
-            "{:?}",
-            lines(&control)
+            "{}",
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &[]).await;
@@ -1418,7 +1431,11 @@ sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 
         }
         let _ = victim.kill();
         let _ = victim.wait();
-        assert!(control_ok, "the unconfined control must be able to signal");
+        assert!(
+            control_ok,
+            "the unconfined control must be able to signal ({})",
+            format_result_diag(&control)
+        );
     }
 
     /// M4: TIOCSTI. Runs the task from a process that has a controlling terminal (a pty made by
@@ -1547,7 +1564,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         assert!(
             open.stdout_str().contains("DUMMY-SECRETFILE-feat3a"),
             "{}",
-            open.stdout_str()
+            format_result_diag(&open)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run(level, true).await;
@@ -1594,7 +1611,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         assert!(
             control.stdout_str().contains("DUMMY-CACHE-feat3a"),
             "{}",
-            control.stdout_str()
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &extra).await;
@@ -1757,7 +1774,7 @@ echo END
         assert!(
             control.stdout_str().contains(SECRET),
             "the control must read the linked secret: {}",
-            control.stdout_str()
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &[]).await;
@@ -1765,7 +1782,7 @@ echo END
             assert!(
                 !result.stdout_str().contains(SECRET),
                 "{level}: the hard-linked secret became readable: {}",
-                result.stdout_str()
+                format_result_diag(&result)
             );
         }
     }
@@ -2656,7 +2673,11 @@ sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 
         }
         let _ = victim.kill();
         let _ = victim.wait();
-        assert!(control_ok, "the unconfined control must be able to signal");
+        assert!(
+            control_ok,
+            "the unconfined control must be able to signal ({})",
+            format_result_diag(&control)
+        );
     }
 
     /// A protected file (the cluster secret, the config file) inside a directory that the policy
