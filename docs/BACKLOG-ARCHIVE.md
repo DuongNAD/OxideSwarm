@@ -2690,6 +2690,34 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-62: blob_transfer_e2e: print CLI submit output on failure and harden loaded timeouts
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  (`tests/blob_transfer_e2e.rs:1073:9`) failed `1/5` runs at `assertion left == right failed: left: Some(1), right: Some(7)`
+  when the `submit --wait --timeout-secs 30` subcheck for `exit 7` exited `1`, without printing stdout/stderr.
+- **Problem:** Inside `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, synchronous
+  `std::process::Command::output()` and `std::thread::sleep` calls blocked Tokio runtime threads hosting
+  the in-process `WorkerClient`, while `rusty-grid master` kept its `10 s` default `--heartbeat-timeout-secs`,
+  `port_file`/registration polls used `20 s`, `submit` used `30–60 s`, and failing CLI assertions suppressed
+  stdout, stderr, and `master.log`.
+- **Do:** Run `rusty-grid` CLI subprocesses via `tokio::task::spawn_blocking`, replace synchronous polling
+  with `60 s` async loops, pass `--heartbeat-timeout-secs 60` to `rusty-grid master`, raise `submit`
+  `--timeout-secs` to `120`, include stdout, stderr, and `master.log` in all CLI submit failure messages,
+  and shut down the in-process worker cleanly (`stop_worker` + `60 s` join timeout).
+- **Done when:** All assertions stay intact, failure messages include full CLI and master diagnostics, and
+  `cargo test -p rusty_grid_cli --test blob_transfer_e2e --locked -- --exact cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  passes `20/20` under `6` busy loops after the fix (plus a full-binary run).
+- **Implemented (2026-11-19, pull request TBD, open):** Updated `tests/blob_transfer_e2e.rs` as planned. On a
+  10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`:
+  - Before fix (on `origin/master` `8641b67d`, with diagnostic capture added): test alone passed `20/20`
+    (`98.11 s` total, `3.61–6.98 s` per run; full binary `1/1` loaded probe `30.08 s`; reproduced `1/5`
+    in full workspace Run 5).
+  - After fix (test alone): `20/20` passed (`98.23 s` total, `3.88–6.83 s` per run).
+  Full `blob_transfer_e2e`, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+  and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
