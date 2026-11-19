@@ -49,7 +49,7 @@ pub fn persistence_wanted(name: Option<&str>, id_file_env: Option<&std::ffi::OsS
 }
 
 /// Reduces a worker name to a file-name-safe suffix (`[A-Za-z0-9._-]`, at most 64 bytes).
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.trim()
         .chars()
         .map(|c| {
@@ -63,6 +63,15 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+/// Directory for per-user OxideSwarm worker files (`OXIDESWARM_HOME` or `~/.oxideswarm`).
+pub(crate) fn default_state_dir() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+        Some(PathBuf::from(custom))
+    } else {
+        Some(home_dir()?.join(".oxideswarm"))
+    }
+}
+
 /// Where the id of a worker is stored when nothing says otherwise.
 ///
 /// `RUSTY_GRID_WORKER_ID_FILE` wins if set. Otherwise it is `~/.oxideswarm/worker_id`; a worker
@@ -74,11 +83,7 @@ pub fn default_worker_id_path(name: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(WORKER_ID_FILE_ENV).filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    let dir = if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
-        PathBuf::from(custom)
-    } else {
-        home_dir()?.join(".oxideswarm")
-    };
+    let dir = default_state_dir()?;
     let file = match name.map(sanitize_name).filter(|n| !n.is_empty()) {
         Some(n) => format!("worker_id.{n}"),
         None => "worker_id".to_string(),

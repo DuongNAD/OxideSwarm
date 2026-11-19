@@ -405,7 +405,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Partial | Out | 377 (open), (design 0095), (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
 
@@ -1895,6 +1895,14 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   task assigned while the worker is paused is handed back; `pause` ends a running task within 5 s,
   and the task completes on another worker with its retry count unchanged. The record of APP-6 lists
   the controls each contributor set.
+- **Partial (pull request #377, draft):** [Design 0095](design/0095-contributor-controls.md), the
+  worker and CLI controls (`--max-host-cpu-pct`, `--allow-hours`, `--daily-task-hours`,
+  `--pause-on-battery`, `--pause-on-metered`, `--control-file`, and
+  `oxideswarm worker pause|resume|status` with `5 s` task stop and [design 0090](design/0090-sandbox-base-refusal-hand-back.md)
+  hand-back), unit tests (`crates/worker/src/controls/tests.rs`), and 2-worker integration tests
+  (`crates/worker/tests/test_net9_contributor_controls.rs`) with injected probes and zero wire
+  changes are open in the draft pull request until the stability release; remaining work is
+  merging and recording each contributor's settings in APP-6.
 
 ### NET-10: Contribution credits per participant, display only
 
@@ -2419,3 +2427,4 @@ Add one dated line per finished item, newest last.
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: NET-9 Partial (pull request 377, open draft until the stability release; [design 0095](design/0095-contributor-controls.md)): worker-side `--max-host-cpu-pct` (`RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT`), `--allow-hours` (with boundary heartbeats), `--daily-task-hours` (in-memory), `--pause-on-battery`, `--pause-on-metered` (retaining last known state on probe timeout), `--control-file` (owner-private checks + `.watch` PID warning), and `oxideswarm worker pause|resume|status` (worker-lifetime watcher, `5 s` task stop + abort refusal fallback + [design 0090](design/0090-sandbox-base-refusal-hand-back.md) hand-back, heartbeat `101.0` hold + `state:held`, master `--max-host-cpu-pct` validated `1.0..=100.0`) implemented with zero wire changes and verified on macOS; remaining: merge after the stability release and record contributor settings in APP-6.

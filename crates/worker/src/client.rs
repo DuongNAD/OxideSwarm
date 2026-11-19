@@ -84,10 +84,20 @@ pub(in crate::client) use {
     tokio::net::TcpStream,
 };
 
+/// Signal sent to a running task coroutine when cancelling or pausing execution.
+#[derive(Debug, Clone)]
+pub enum CancelSignal {
+    /// Master cancellation or session teardown: maps to `EXIT_CODE_CANCELLED` (`130`).
+    MasterCancel(String),
+    /// Local contributor pause (`worker pause`): terminates the process tree within `5 s` and
+    /// replies with a design 0090 worker refusal so the master requeues without charging retries.
+    ContributorPause(String),
+}
+
 /// Execution handle for an actively running task on this worker.
 pub struct TaskExecutionHandle {
     pub task_id: TaskId,
-    pub cancel_tx: Option<oneshot::Sender<String>>,
+    pub cancel_tx: Option<oneshot::Sender<CancelSignal>>,
     pub abort_handle: tokio::task::AbortHandle,
     pub child_pid: Arc<AtomicU32>,
     pub started_at_epoch_sec: u64,
@@ -98,6 +108,11 @@ pub struct TaskExecutionHandle {
     /// by the worker itself (connection lost, superseded), not by the Master's `CancelTask`, and a
     /// stray exit-130 result would make the Master record the task as cancelled.
     pub suppress_result: Arc<AtomicBool>,
+    /// Set once when a terminal/cancellation result for this attempt has been dispatched (so an
+    /// abort fallback never emits a duplicate result).
+    pub result_sent: Arc<AtomicBool>,
+    /// Session data sender captured when the task was assigned (used as a fallback by abort).
+    pub outbound_tx: Option<mpsc::Sender<WorkerMessage>>,
     /// Completion of the run's task, awaited when the run is cancelled so that its process tree,
     /// sandbox directory and concurrency permit are gone before anything replaces it.
     pub join: Option<JoinHandle<()>>,
@@ -164,6 +179,14 @@ pub const MOBILE_TELEMETRY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a worker that reads its own battery / thermal state (no platform app feeding it)
 /// re-reads it.
 pub const MOBILE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+struct WatchFileGuard(PathBuf);
+
+impl Drop for WatchFileGuard {
+    fn drop(&mut self) {
+        let _ = crate::controls::remove_watch_file_if_owned(&self.0);
+    }
+}
 
 /// Aborts the wrapped task when dropped.
 struct AbortOnDrop(JoinHandle<()>);
@@ -326,6 +349,15 @@ pub struct WorkerConfig {
     pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
     /// Optional simulated link shaping and byte/disconnect instrumentation (`SCALE-1`).
     pub simulated_link: Option<crate::sim::SimulatedLinkConfig>,
+    /// Local contributor controls (`NET-9`, design 0095): CPU cap, weekly hours, daily hours,
+    /// pause on battery / metered network, and pause control file.
+    pub contributor_controls: crate::controls::ContributorControlsConfig,
+    /// Optional injected [`crate::controls::WorkerControls`] handle (used by tests to swap
+    /// clock/CPU/battery/metered probes).
+    pub controls_handle: Option<crate::controls::WorkerControlsHandle>,
+    /// Maximum time `worker pause` waits for active task process trees before aborting their
+    /// futures and emitting the design 0090 refusal (default: [`crate::controls::PAUSE_STOP_TIMEOUT`]).
+    pub pause_stop_timeout: Duration,
 }
 
 impl WorkerConfig {
@@ -384,6 +416,9 @@ impl WorkerConfig {
             rendezvous_url: None,
             fake_runner: None,
             simulated_link: None,
+            contributor_controls: crate::controls::ContributorControlsConfig::default(),
+            controls_handle: None,
+            pause_stop_timeout: crate::controls::PAUSE_STOP_TIMEOUT,
         }
     }
 
@@ -682,6 +717,28 @@ impl WorkerConfig {
         self
     }
 
+    /// Configures local contributor controls (`NET-9`, design 0095).
+    pub fn with_contributor_controls(
+        mut self,
+        controls: crate::controls::ContributorControlsConfig,
+    ) -> Self {
+        self.contributor_controls = controls;
+        self
+    }
+
+    /// Supplies a pre-built [`crate::controls::WorkerControlsHandle`] (primarily for tests with
+    /// injected clock/CPU/power/network probes).
+    pub fn with_controls_handle(mut self, handle: crate::controls::WorkerControlsHandle) -> Self {
+        self.controls_handle = Some(handle);
+        self
+    }
+
+    /// Overrides the `5 s` graceful drain window waited on local `worker pause` before aborting.
+    pub fn with_pause_stop_timeout(mut self, timeout: Duration) -> Self {
+        self.pause_stop_timeout = timeout;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -804,6 +861,8 @@ pub struct WorkerClient {
     /// Outbox for checkpoints and completed task results produced while disconnected within the
     /// session-resume grace window.
     pending_resume_outbox: Arc<std::sync::Mutex<tasks::PendingResumeOutbox>>,
+    /// Local contributor controls (`NET-9`, design 0095).
+    controls: crate::controls::WorkerControlsHandle,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
@@ -1110,6 +1169,14 @@ impl WorkerClient {
             initial_features.insert(ProtocolCapabilities::WORKSPACES);
         }
 
+        let controls = config.controls_handle.clone().unwrap_or_else(|| {
+            crate::controls::WorkerControls::new(
+                config.contributor_controls.clone(),
+                Some(mobile.clone()),
+                config.no_battery,
+            )
+        });
+
         Self {
             config,
             worker_id,
@@ -1142,6 +1209,7 @@ impl WorkerClient {
             pending_resume_outbox: Arc::new(std::sync::Mutex::new(
                 tasks::PendingResumeOutbox::with_capacity(2 * concurrency_permits.max(1)),
             )),
+            controls,
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1186,6 +1254,16 @@ impl WorkerClient {
     /// reports every change to the Master and refuses tasks on a critically low battery.
     pub fn mobile_telemetry(&self) -> MobileTelemetryHandle {
         self.mobile.clone()
+    }
+
+    /// Returns the local contributor controls handle (`NET-9`, design 0095).
+    pub fn controls(&self) -> &crate::controls::WorkerControlsHandle {
+        &self.controls
+    }
+
+    /// Refreshes blocking OS battery and metered-network probes for startup diagnostics.
+    pub fn refresh_controls_blocking(&self) {
+        self.controls.refresh_os_probes_blocking();
     }
 
     /// Convenience constructor initializing WorkerClient directly with common CLI options.
@@ -1553,6 +1631,73 @@ impl WorkerClient {
                 detect_live_mobile_status,
             ))
         });
+
+        let _watch_file_guard = self
+            .controls
+            .config()
+            .control_file
+            .as_ref()
+            .and_then(|path| match crate::controls::write_watch_file(path) {
+                Ok(_) => Some(WatchFileGuard(path.clone())),
+                Err(e) => {
+                    warn!(
+                        worker_id = %self.worker_id,
+                        path = %path.display(),
+                        error = %e,
+                        "Could not write contributor pause .watch file"
+                    );
+                    None
+                }
+            });
+
+        let _pause_watcher_guard = {
+            let worker_id = self.worker_id;
+            let controls = Arc::clone(&self.controls);
+            let active_task_table = Arc::clone(&self.active_task_table);
+            let session_data_tx = Arc::clone(&self.session_data_tx);
+            let pause_stop_timeout = self.config.pause_stop_timeout;
+            let has_control_file = controls.config().control_file.is_some();
+            let pause_notify = controls.pause_notify();
+            AbortOnDrop(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(crate::controls::CONTROL_FILE_POLL_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let initial = controls.sync_pause_file();
+                tasks::handle_pause_transition(
+                    worker_id,
+                    &active_task_table,
+                    &session_data_tx,
+                    pause_stop_timeout,
+                    initial,
+                )
+                .await;
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick(), if has_control_file => {
+                            let transition = controls.sync_pause_file();
+                            tasks::handle_pause_transition(
+                                worker_id,
+                                &active_task_table,
+                                &session_data_tx,
+                                pause_stop_timeout,
+                                transition,
+                            )
+                            .await;
+                        }
+                        _ = pause_notify.notified() => {
+                            let transition = controls.sync_pause_file();
+                            tasks::handle_pause_transition(
+                                worker_id,
+                                &active_task_table,
+                                &session_data_tx,
+                                pause_stop_timeout,
+                                transition,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }))
+        };
 
         loop {
             if *shutdown_rx.borrow() {

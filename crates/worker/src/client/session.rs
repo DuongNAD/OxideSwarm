@@ -24,7 +24,10 @@ use rusty_grid_core::task::{TaskId, TaskResult};
 
 use crate::backoff::ExponentialBackoff;
 use crate::blob_client::{upload_task_outputs, BlobClient};
-use crate::heartbeat::{current_epoch_secs, spawn_adaptive_heartbeat_task, IoClock, StampedStream};
+use crate::controls::RESOURCE_PROBE_POLL_INTERVAL;
+use crate::heartbeat::{
+    current_epoch_secs, spawn_adaptive_heartbeat_task_with_controls, IoClock, StampedStream,
+};
 use crate::runner::EXIT_CODE_GENERAL_ERROR;
 
 use super::tasks::BufferedTaskResult;
@@ -932,13 +935,32 @@ impl WorkerClient {
         let adaptive_keepalive = self
             .negotiated_features()
             .contains(ProtocolCapabilities::ADAPTIVE_KEEPALIVE);
-        let heartbeat_handle = spawn_adaptive_heartbeat_task(
+        let heartbeat_handle = spawn_adaptive_heartbeat_task_with_controls(
             worker_id,
             heartbeat_interval,
             session.control_tx.clone(),
             Arc::clone(&self.heartbeat_tracker),
             adaptive_keepalive.then(|| self.mobile.clone()),
+            Some(Arc::clone(&self.controls)),
         );
+        if self.controls.check_admission().is_err() {
+            self.controls.state_notify().notify_waiters();
+        }
+        let _controls_probe_guard = (self.controls.config().pause_on_battery
+            || self.controls.config().pause_on_metered)
+            .then(|| {
+                let ctrl = Arc::clone(&self.controls);
+                AbortOnDrop(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(RESOURCE_PROBE_POLL_INTERVAL);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticker.tick().await;
+                        let c = Arc::clone(&ctrl);
+                        let _ = tokio::task::spawn_blocking(move || c.refresh_os_probes_blocking())
+                            .await;
+                    }
+                }))
+            });
 
         let mut dead_after =
             self.dead_peer_timeout(self.current_keepalive_interval(heartbeat_interval));

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use uuid::Uuid;
 
 use rusty_grid_core::error::GridError;
@@ -420,8 +420,34 @@ pub struct MasterArgs {
     pub rendezvous: Option<String>,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkerAction {
+    /// Pause this worker locally: block new tasks and end active tasks within 5 s without failing them
+    Pause(WorkerControlArgs),
+    /// Resume a paused worker so it accepts tasks again
+    Resume(WorkerControlArgs),
+    /// Print whether a local worker is paused or active and show its control file path
+    Status(WorkerControlArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct WorkerControlArgs {
+    #[arg(long, help = "Worker node name (matches `worker --name`)")]
+    pub name: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the local pause control file (default: <OXIDESWARM_HOME>/worker_pause[.<NAME>]; env RUSTY_GRID_CONTROL_FILE, config [worker].control_file)"
+    )]
+    pub control_file: Option<PathBuf>,
+}
+
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
+    #[command(subcommand)]
+    pub action: Option<WorkerAction>,
+
     #[arg(
         long,
         help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN; for a P2P ticket use --p2p-ticket"
@@ -607,6 +633,52 @@ pub struct WorkerArgs {
         help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
     )]
     pub rendezvous: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PCT",
+        help = "Hold new tasks when host CPU usage exceeds PCT (1.0..=100.0; env RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT, config [worker].max_host_cpu_pct)"
+    )]
+    pub max_host_cpu_pct: Option<f32>,
+
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help = "Allowed weekly local-time windows, e.g. \"Mon-Fri 22:00-07:00, Sat-Sun 00:00-24:00\" (env RUSTY_GRID_ALLOW_HOURS, config [worker].allow_hours)"
+    )]
+    pub allow_hours: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "HOURS",
+        help = "Cap cumulative completed task runtime per local calendar day in hours (> 0.0; env RUSTY_GRID_DAILY_TASK_HOURS, config [worker].daily_task_hours)"
+    )]
+    pub daily_task_hours: Option<f64>,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Pause new task admission while the host runs on battery; pass --pause-on-battery=false to override env/config (env RUSTY_GRID_PAUSE_ON_BATTERY, config [worker].pause_on_battery)"
+    )]
+    pub pause_on_battery: Option<bool>,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Pause new task admission while the OS reports a metered network; pass --pause-on-metered=false to override env/config (env RUSTY_GRID_PAUSE_ON_METERED, config [worker].pause_on_metered)"
+    )]
+    pub pause_on_metered: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Local pause control file path polled every 100 ms for pause/resume (default: <OXIDESWARM_HOME>/worker_pause[.<NAME>]; env RUSTY_GRID_CONTROL_FILE, config [worker].control_file)"
+    )]
+    pub control_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone, Default)]

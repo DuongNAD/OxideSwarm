@@ -687,13 +687,17 @@ fn test_parse_worker_link_relay_derp() {
 fn test_worker_state_counts_only_connected_workers() {
     let connected = WorkerCapabilities::new("a", 4, 4096, false, false, None)
         .with_tags(vec!["state:connected".to_string()]);
+    let held = WorkerCapabilities::new("h", 4, 4096, false, false, None)
+        .with_tags(vec!["state:held".to_string()]);
     let gone = WorkerCapabilities::new("b", 4, 4096, false, false, None)
         .with_tags(vec!["state:disconnected".to_string()]);
     let untagged = WorkerCapabilities::new("c", 4, 4096, false, false, None);
     assert_eq!(worker_state(&connected), Some("connected"));
+    assert_eq!(worker_state(&held), Some("held"));
     assert_eq!(worker_state(&gone), Some("disconnected"));
     assert_eq!(worker_state(&untagged), None);
     assert!(worker_is_connected(&connected));
+    assert!(worker_is_connected(&held));
     assert!(!worker_is_connected(&gone));
     assert!(worker_is_connected(&untagged));
 }

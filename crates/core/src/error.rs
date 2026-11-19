@@ -361,6 +361,16 @@ pub fn sandbox_base_refusal(reason: impl std::fmt::Display) -> String {
     format!("{SANDBOX_BASE_REFUSAL_PREFIX}: {reason}")
 }
 
+/// Text a worker puts at the start of the failure when a local contributor control (NET-9,
+/// design 0095) blocks or interrupts a task. Contains `"rejected by worker"` so both updated and
+/// 0.4.x masters hand the task to another worker without charging an execution retry.
+pub const CONTRIBUTOR_CONTROL_REFUSAL_PREFIX: &str = "Task rejected by worker: contributor control";
+
+/// The failure text for a worker refusing or stopping a task under local contributor controls.
+pub fn contributor_control_refusal(reason: impl std::fmt::Display) -> String {
+    format!("{CONTRIBUTOR_CONTROL_REFUSAL_PREFIX}: {reason}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

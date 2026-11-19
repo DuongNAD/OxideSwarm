@@ -2,16 +2,21 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
 use rusty_grid_core::placement::{validate_user_tag, IsolationLevel};
-use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig};
+use rusty_grid_worker::{
+    default_control_file_path, is_pause_file_present, remove_pause_file, validate_daily_task_hours,
+    validate_max_host_cpu_pct, write_pause_file, AllowHoursSchedule, ContributorControlsConfig,
+    NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig,
+};
 
 use crate::config::{
     resolve_bool, resolve_opt_field, resolve_opt_string, resolve_opt_u64, resolve_opt_usize,
-    resolve_u64, resolve_usize, ConfigFile, SecretSection,
+    resolve_u64, resolve_usize, ConfigFile, SecretSection, WorkerFileConfig,
 };
 use crate::connect::{normalize_master_addr, AUTH_EXIT_CODE, DEFAULT_MASTER_ADDR};
 use crate::secret_cmd::{
@@ -20,7 +25,7 @@ use crate::secret_cmd::{
 
 use super::{
     resolve_no_battery, resolve_p2p_minimal, resolve_relay_url, resolve_wire_codec,
-    wait_for_worker_shutdown_signal, WorkerArgs, MIB,
+    wait_for_worker_shutdown_signal, WorkerAction, WorkerArgs, MIB,
 };
 
 /// Resolves `(master_addr, p2p_ticket)` from explicit CLI, env and config values without reading
@@ -118,6 +123,15 @@ pub(super) async fn run_worker(
     secret_opts: SecretOpts,
 ) -> ExitCode {
     rusty_grid_core::capabilities::suppress_windows_error_dialogs();
+    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
+    if let Some(action) = args.action {
+        return run_worker_control_action(
+            action,
+            args.name,
+            args.control_file,
+            worker_cfg.as_ref(),
+        );
+    }
     let rendezvous_url =
         match crate::connect::resolve_and_validate_rendezvous_url(args.rendezvous.as_deref()) {
             Ok(url) => url,
@@ -126,7 +140,6 @@ pub(super) async fn run_worker(
                 return ExitCode::FAILURE;
             }
         };
-    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
     let p2p_minimal = resolve_p2p_minimal();
@@ -460,7 +473,7 @@ pub(super) async fn run_worker(
     config = config
         .with_relay_url(relay_url)
         .with_rendezvous_url(rendezvous_url);
-    if let Some(n) = name {
+    if let Some(ref n) = name {
         config = config.with_name(n);
     }
     config = config.with_tags(tags);
@@ -592,7 +605,7 @@ pub(super) async fn run_worker(
     }
 
     let wire_codec = match resolve_wire_codec(
-        args.wire_codec,
+        args.wire_codec.clone(),
         worker_cfg.as_ref().and_then(|w| w.wire_codec.clone()),
     ) {
         Ok(codec) => codec,
@@ -603,7 +616,32 @@ pub(super) async fn run_worker(
     };
     config = config.with_wire_codec(wire_codec);
 
+    let controls_cfg = match resolve_contributor_controls_from(
+        ContributorControlInputs {
+            max_host_cpu_pct: args.max_host_cpu_pct,
+            allow_hours: args.allow_hours.as_deref(),
+            daily_task_hours: args.daily_task_hours,
+            pause_on_battery: args.pause_on_battery,
+            pause_on_metered: args.pause_on_metered,
+            control_file: args.control_file.as_deref(),
+        },
+        worker_cfg.as_ref(),
+        name.as_deref(),
+        |var| std::env::var(var).ok(),
+    ) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    config = config.with_contributor_controls(controls_cfg);
+
     let mut client = WorkerClient::new(config);
+    if client.controls().config().pause_on_battery || client.controls().config().pause_on_metered {
+        let ctrl = Arc::clone(client.controls());
+        let _ = tokio::task::spawn_blocking(move || ctrl.refresh_os_probes_blocking()).await;
+    }
     if let Err(e) = client.validate_isolation_config() {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
@@ -618,6 +656,13 @@ pub(super) async fn run_worker(
         client.capabilities().is_simulated_gpu,
     );
     println!("Tags: {}", client.capabilities().tags.join(", "));
+    if let Some(line) = format_controls_summary(client.controls().config()) {
+        println!("{line}");
+    }
+    for diag in client.controls().startup_diagnostics() {
+        eprintln!("Warning: {diag}");
+        tracing::warn!("{diag}");
+    }
     for notice in client.gpu_notices() {
         match notice.level {
             NoticeLevel::Info => println!("GPU: {}", notice.message),
@@ -717,6 +762,301 @@ pub(super) fn resolve_isolation_read_dirs(
     out
 }
 
+fn parse_env_bool(var: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("{var}: invalid boolean value {other:?}")),
+    }
+}
+
+fn resolve_control_file_path_from(
+    cli_path: Option<PathBuf>,
+    worker_name: Option<&str>,
+    worker_cfg: Option<&WorkerFileConfig>,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    if let Some(p) = cli_path {
+        return Some(p);
+    }
+    if let Some(env_p) = get_env("RUSTY_GRID_CONTROL_FILE") {
+        let trimmed = env_p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(cfg_p) = worker_cfg.and_then(|w| w.control_file.as_deref()) {
+        let trimmed = cfg_p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    default_control_file_path(worker_name)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ContributorControlInputs<'a> {
+    pub(super) max_host_cpu_pct: Option<f32>,
+    pub(super) allow_hours: Option<&'a str>,
+    pub(super) daily_task_hours: Option<f64>,
+    pub(super) pause_on_battery: Option<bool>,
+    pub(super) pause_on_metered: Option<bool>,
+    pub(super) control_file: Option<&'a std::path::Path>,
+}
+
+pub(super) fn resolve_contributor_controls_from(
+    cli: ContributorControlInputs<'_>,
+    worker_cfg: Option<&WorkerFileConfig>,
+    resolved_name: Option<&str>,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Result<ContributorControlsConfig, String> {
+    let max_host_cpu_pct = if let Some(v) = cli.max_host_cpu_pct {
+        Some(validate_max_host_cpu_pct(v)?)
+    } else if let Some(raw) =
+        get_env("RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT").filter(|s| !s.trim().is_empty())
+    {
+        let parsed: f32 = raw.trim().parse().map_err(|_| {
+            format!(
+                "RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT: invalid float {:?}",
+                raw.trim()
+            )
+        })?;
+        Some(validate_max_host_cpu_pct(parsed)?)
+    } else if let Some(v) = worker_cfg.and_then(|w| w.max_host_cpu_pct) {
+        Some(validate_max_host_cpu_pct(v)?)
+    } else {
+        None
+    };
+
+    let allow_hours_spec = cli
+        .allow_hours
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            get_env("RUSTY_GRID_ALLOW_HOURS")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            worker_cfg
+                .and_then(|w| w.allow_hours.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    let allow_hours = match allow_hours_spec {
+        Some(spec) => Some(AllowHoursSchedule::parse(&spec)?),
+        None => None,
+    };
+
+    let daily_task_hours = if let Some(v) = cli.daily_task_hours {
+        Some(validate_daily_task_hours(v)?)
+    } else if let Some(raw) =
+        get_env("RUSTY_GRID_DAILY_TASK_HOURS").filter(|s| !s.trim().is_empty())
+    {
+        let parsed: f64 = raw.trim().parse().map_err(|_| {
+            format!(
+                "RUSTY_GRID_DAILY_TASK_HOURS: invalid number {:?}",
+                raw.trim()
+            )
+        })?;
+        Some(validate_daily_task_hours(parsed)?)
+    } else if let Some(v) = worker_cfg.and_then(|w| w.daily_task_hours) {
+        Some(validate_daily_task_hours(v)?)
+    } else {
+        None
+    };
+
+    let pause_on_battery = if let Some(v) = cli.pause_on_battery {
+        v
+    } else if let Some(raw) =
+        get_env("RUSTY_GRID_PAUSE_ON_BATTERY").filter(|s| !s.trim().is_empty())
+    {
+        parse_env_bool("RUSTY_GRID_PAUSE_ON_BATTERY", &raw)?
+    } else {
+        worker_cfg.and_then(|w| w.pause_on_battery).unwrap_or(false)
+    };
+
+    let pause_on_metered = if let Some(v) = cli.pause_on_metered {
+        v
+    } else if let Some(raw) =
+        get_env("RUSTY_GRID_PAUSE_ON_METERED").filter(|s| !s.trim().is_empty())
+    {
+        parse_env_bool("RUSTY_GRID_PAUSE_ON_METERED", &raw)?
+    } else {
+        worker_cfg.and_then(|w| w.pause_on_metered).unwrap_or(false)
+    };
+
+    let control_file = resolve_control_file_path_from(
+        cli.control_file.map(PathBuf::from),
+        resolved_name,
+        worker_cfg,
+        &get_env,
+    );
+
+    let cfg = ContributorControlsConfig {
+        max_host_cpu_pct,
+        allow_hours,
+        daily_task_hours,
+        pause_on_battery,
+        pause_on_metered,
+        control_file,
+    };
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+fn format_controls_summary(cfg: &ContributorControlsConfig) -> Option<String> {
+    if !cfg.is_any_limit_configured() && cfg.control_file.is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(pct) = cfg.max_host_cpu_pct {
+        parts.push(format!("max_host_cpu={pct:.1}%"));
+    }
+    if let Some(ref sched) = cfg.allow_hours {
+        parts.push(format!("allow_hours=\"{}\"", sched.raw()));
+    }
+    if let Some(hours) = cfg.daily_task_hours {
+        parts.push(format!("daily_task_hours={hours:.2}h"));
+    }
+    if cfg.pause_on_battery {
+        parts.push("pause_on_battery=on".to_string());
+    }
+    if cfg.pause_on_metered {
+        parts.push("pause_on_metered=on".to_string());
+    }
+    if let Some(ref path) = cfg.control_file {
+        parts.push(format!("control_file={}", path.display()));
+    }
+    Some(format!("Contributor controls: {}", parts.join(", ")))
+}
+
+fn warn_if_no_watcher(path: &std::path::Path) -> Option<u32> {
+    match rusty_grid_worker::check_watcher_status(path) {
+        Ok(rusty_grid_worker::WatcherStatus::Watching { pid }) => Some(pid),
+        Ok(rusty_grid_worker::WatcherStatus::Stale { pid }) => {
+            eprintln!(
+                "Warning: no live worker is watching {} (stale watcher PID {pid}). If the worker runs with --name or as a service/daemon under another account, pass --name or --control-file pointing to its control file.",
+                path.display()
+            );
+            None
+        }
+        Ok(rusty_grid_worker::WatcherStatus::NotWatching) => {
+            eprintln!(
+                "Warning: no running worker is watching {}. If the worker runs with --name or as a service/daemon under another account, pass --name or --control-file pointing to its control file.",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not inspect watcher file for {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn run_worker_control_action(
+    action: WorkerAction,
+    top_name: Option<String>,
+    top_control_file: Option<PathBuf>,
+    worker_cfg: Option<&WorkerFileConfig>,
+) -> ExitCode {
+    let (ctrl_name, ctrl_file, op) = match action {
+        WorkerAction::Pause(c) => (c.name, c.control_file, "pause"),
+        WorkerAction::Resume(c) => (c.name, c.control_file, "resume"),
+        WorkerAction::Status(c) => (c.name, c.control_file, "status"),
+    };
+    let effective_name = resolve_opt_string(
+        ctrl_name.or(top_name),
+        &["RUSTY_GRID_WORKER_NAME", "RUSTY_GRID_NAME"],
+        worker_cfg.and_then(|w| w.name.clone()),
+    );
+    let Some(path) = resolve_control_file_path_from(
+        ctrl_file.or(top_control_file),
+        effective_name.as_deref(),
+        worker_cfg,
+        |var| std::env::var(var).ok(),
+    ) else {
+        eprintln!(
+            "error: cannot determine pause control file path (no home directory; pass --control-file PATH or set RUSTY_GRID_CONTROL_FILE)"
+        );
+        return ExitCode::FAILURE;
+    };
+
+    match op {
+        "pause" => match write_pause_file(&path) {
+            Ok(()) => {
+                println!("Worker paused (control file: {}).", path.display());
+                warn_if_no_watcher(&path);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: failed to write pause control file {}: {e}",
+                    path.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+        "resume" => match remove_pause_file(&path) {
+            Ok(true) => {
+                println!("Worker resumed (removed control file: {}).", path.display());
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!(
+                    "Worker is already active (no control file at {}).",
+                    path.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: failed to remove pause control file {}: {e}",
+                    path.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+        _ => match is_pause_file_present(&path) {
+            Ok(true) => {
+                if let Some(pid) = warn_if_no_watcher(&path) {
+                    println!(
+                        "Worker status: paused (control file: {}, watched by worker PID {pid})",
+                        path.display()
+                    );
+                } else {
+                    println!("Worker status: paused (control file: {})", path.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                if let Some(pid) = warn_if_no_watcher(&path) {
+                    println!(
+                        "Worker status: active (control file: {}, watched by worker PID {pid})",
+                        path.display()
+                    );
+                } else {
+                    println!("Worker status: active (control file: {})", path.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: failed to inspect pause control file {}: {e}",
+                    path.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,5 +1146,193 @@ mod tests {
         .await
         .expect("worker --master <ticket> must fail fast without attempting TCP");
         assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn resolve_contributor_controls_honors_cli_env_config_precedence_and_rejects_invalid() {
+        let cfg = WorkerFileConfig {
+            max_host_cpu_pct: Some(50.0),
+            allow_hours: Some("Mon-Fri 09:00-17:00".to_string()),
+            daily_task_hours: Some(2.0),
+            pause_on_battery: Some(false),
+            pause_on_metered: Some(true),
+            control_file: Some("/cfg/pause".to_string()),
+            ..Default::default()
+        };
+
+        // Env overrides [worker] config.
+        let env_map = |k: &str| match k {
+            "RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT" => Some("65".to_string()),
+            "RUSTY_GRID_ALLOW_HOURS" => Some("Daily 00:00-24:00".to_string()),
+            "RUSTY_GRID_DAILY_TASK_HOURS" => Some("4.5".to_string()),
+            "RUSTY_GRID_PAUSE_ON_BATTERY" => Some("1".to_string()),
+            "RUSTY_GRID_PAUSE_ON_METERED" => Some("0".to_string()),
+            "RUSTY_GRID_CONTROL_FILE" => Some("/env/pause".to_string()),
+            _ => None,
+        };
+        let resolved_env = resolve_contributor_controls_from(
+            ContributorControlInputs::default(),
+            Some(&cfg),
+            Some("w1"),
+            env_map,
+        )
+        .unwrap();
+        assert_eq!(resolved_env.max_host_cpu_pct, Some(65.0));
+        assert_eq!(
+            resolved_env.allow_hours.as_ref().unwrap().raw(),
+            "Daily 00:00-24:00"
+        );
+        assert_eq!(resolved_env.daily_task_hours, Some(4.5));
+        assert!(resolved_env.pause_on_battery);
+        assert!(!resolved_env.pause_on_metered);
+        assert_eq!(resolved_env.control_file, Some(PathBuf::from("/env/pause")));
+
+        // CLI overrides env and config.
+        let cli_ctrl_path = PathBuf::from("/cli/pause");
+        let resolved_cli = resolve_contributor_controls_from(
+            ContributorControlInputs {
+                max_host_cpu_pct: Some(80.0),
+                allow_hours: Some("Sat-Sun 10:00-18:00"),
+                daily_task_hours: Some(1.5),
+                pause_on_battery: Some(true),
+                pause_on_metered: Some(true),
+                control_file: Some(&cli_ctrl_path),
+            },
+            Some(&cfg),
+            Some("w1"),
+            env_map,
+        )
+        .unwrap();
+        assert_eq!(resolved_cli.max_host_cpu_pct, Some(80.0));
+        assert_eq!(
+            resolved_cli.allow_hours.as_ref().unwrap().raw(),
+            "Sat-Sun 10:00-18:00"
+        );
+        assert_eq!(resolved_cli.daily_task_hours, Some(1.5));
+        assert!(resolved_cli.pause_on_battery);
+        assert!(resolved_cli.pause_on_metered);
+        assert_eq!(resolved_cli.control_file, Some(cli_ctrl_path));
+
+        // Explicit `--pause-on-battery=false` / `--pause-on-metered=false` override env & config `true`.
+        let parsed_false = Cli::try_parse_from([
+            "oxideswarm",
+            "worker",
+            "--pause-on-battery=false",
+            "--pause-on-metered=false",
+        ])
+        .unwrap();
+        let Commands::Worker(false_args) = parsed_false.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(false_args.pause_on_battery, Some(false));
+        assert_eq!(false_args.pause_on_metered, Some(false));
+        let overridden_false = resolve_contributor_controls_from(
+            ContributorControlInputs {
+                pause_on_battery: false_args.pause_on_battery,
+                pause_on_metered: false_args.pause_on_metered,
+                ..Default::default()
+            },
+            Some(&cfg),
+            Some("w1"),
+            |k| match k {
+                "RUSTY_GRID_PAUSE_ON_BATTERY" | "RUSTY_GRID_PAUSE_ON_METERED" => {
+                    Some("true".to_string())
+                }
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(!overridden_false.pause_on_battery);
+        assert!(!overridden_false.pause_on_metered);
+
+        // Bare `--pause-on-battery` still sets `Some(true)` and leaves subcommand positional args intact.
+        let parsed_true =
+            Cli::try_parse_from(["oxideswarm", "worker", "--pause-on-battery"]).unwrap();
+        let Commands::Worker(true_args) = parsed_true.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(true_args.pause_on_battery, Some(true));
+        assert_eq!(true_args.pause_on_metered, None);
+
+        // Invalid values fail loudly.
+        assert!(resolve_contributor_controls_from(
+            ContributorControlInputs::default(),
+            None,
+            None,
+            |k| (k == "RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT").then(|| "bad".to_string()),
+        )
+        .is_err());
+        assert!(resolve_contributor_controls_from(
+            ContributorControlInputs::default(),
+            None,
+            None,
+            |k| (k == "RUSTY_GRID_DAILY_TASK_HOURS").then(|| "0".to_string()),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_pause_resume_status_subcommands_toggle_control_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("custom_pause");
+        let ctrl_str = ctrl_path.display().to_string();
+
+        for argv in [
+            vec![
+                "oxideswarm",
+                "worker",
+                "status",
+                "--control-file",
+                &ctrl_str,
+            ],
+            vec!["oxideswarm", "worker", "pause", "--control-file", &ctrl_str],
+            vec![
+                "oxideswarm",
+                "worker",
+                "status",
+                "--control-file",
+                &ctrl_str,
+            ],
+            vec![
+                "oxideswarm",
+                "worker",
+                "resume",
+                "--control-file",
+                &ctrl_str,
+            ],
+            vec![
+                "oxideswarm",
+                "worker",
+                "status",
+                "--control-file",
+                &ctrl_str,
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse worker control subcommand");
+            let Commands::Worker(args) = cli.command else {
+                panic!("expected Worker");
+            };
+            let code = run_worker(args, None, SecretOpts::default()).await;
+            assert_eq!(code, ExitCode::SUCCESS);
+        }
+        assert!(!ctrl_path.exists());
+
+        // Also check pause leaves file on disk until resume.
+        let cli =
+            Cli::try_parse_from(["oxideswarm", "worker", "pause", "--control-file", &ctrl_str])
+                .unwrap();
+        let Commands::Worker(args) = cli.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(
+            run_worker(args, None, SecretOpts::default()).await,
+            ExitCode::SUCCESS
+        );
+        assert!(ctrl_path.exists());
+        assert_eq!(warn_if_no_watcher(&ctrl_path), None);
+
+        rusty_grid_worker::write_watch_file(&ctrl_path).unwrap();
+        assert_eq!(warn_if_no_watcher(&ctrl_path), Some(std::process::id()));
+        assert!(rusty_grid_worker::remove_watch_file_if_owned(&ctrl_path).unwrap());
     }
 }

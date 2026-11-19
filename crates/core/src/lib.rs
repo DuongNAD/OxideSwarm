@@ -23,15 +23,19 @@ mod wire_layout_tests;
 
 pub use arbitrage::{LeaseValidationError, MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
 pub use capabilities::{
-    calculate_effective_concurrency, calculate_keepalive_interval, is_task_eligible, BatteryTier,
-    MobileCapabilities, MobileLiveStatus, ThermalTier, WorkerCapabilities,
+    calculate_effective_concurrency, calculate_keepalive_interval, is_contributor_hold_cpu_pct,
+    is_task_eligible, BatteryTier, MobileCapabilities, MobileLiveStatus, ThermalTier,
+    WorkerCapabilities, CONTRIBUTOR_HOLD_CPU_PCT,
 };
 pub use cluster_auth::{client_handshake, server_handshake, ClusterSecret};
 pub use discovery::{
     discover_master, discover_master_with_secret, MasterBeacon, DEFAULT_DISCOVERY_PORT,
     DISCOVERY_MAGIC_REQUEST,
 };
-pub use error::{sandbox_base_refusal, GridError, GridResult, SANDBOX_BASE_REFUSAL_PREFIX};
+pub use error::{
+    contributor_control_refusal, sandbox_base_refusal, GridError, GridResult,
+    CONTRIBUTOR_CONTROL_REFUSAL_PREFIX, SANDBOX_BASE_REFUSAL_PREFIX,
+};
 pub use mode::{ModeExecutionResult, WorkflowMode};
 pub use placement::Placement;
 pub use protocol::{

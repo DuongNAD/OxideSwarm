@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::{MobileCapabilities, MobileLiveStatus};
@@ -504,10 +504,110 @@ pub fn spawn_adaptive_heartbeat_task(
     tracker: Arc<HeartbeatTracker>,
     mobile: Option<MobileTelemetryHandle>,
 ) -> HeartbeatHandle {
+    spawn_adaptive_heartbeat_task_with_controls(
+        worker_id,
+        interval,
+        outbound_tx,
+        tracker,
+        mobile,
+        None,
+    )
+}
+
+fn dispatch_heartbeat(
+    worker_id: Uuid,
+    tracker: &HeartbeatTracker,
+    controls: Option<&crate::controls::WorkerControlsHandle>,
+    outbound_tx: &mpsc::Sender<WorkerMessage>,
+    last_block_control: &mut Option<&'static str>,
+) -> bool {
+    let now_sec = current_epoch_secs();
+    let active = tracker.active_tasks.load(Ordering::Relaxed);
+    let (mut cpu_usage_pct, ram_available_mb) = get_system_telemetry();
+    cpu_usage_pct = cpu_usage_pct.clamp(0.0, 100.0);
+    if let Some(ctrl) = controls {
+        ctrl.record_host_cpu_sample(cpu_usage_pct);
+        cpu_usage_pct = ctrl.host_cpu_pct().clamp(0.0, 100.0);
+        match ctrl.check_admission() {
+            Err(reason) => {
+                let control = reason.control_name();
+                if *last_block_control != Some(control) {
+                    info!(
+                        worker_id = %worker_id,
+                        control = control,
+                        reason = %reason,
+                        "Contributor control holding back new tasks"
+                    );
+                    *last_block_control = Some(control);
+                }
+                cpu_usage_pct = rusty_grid_core::CONTRIBUTOR_HOLD_CPU_PCT;
+            }
+            Ok(()) => {
+                if let Some(prev) = last_block_control.take() {
+                    info!(
+                        worker_id = %worker_id,
+                        previous_control = prev,
+                        "Contributor control cleared; accepting new tasks again"
+                    );
+                }
+            }
+        }
+    }
+
+    let msg = WorkerMessage::Heartbeat {
+        worker_id,
+        timestamp: now_sec,
+        active_tasks: active,
+        cpu_usage_pct,
+        ram_available_mb,
+    };
+
+    trace!(
+        worker_id = %worker_id,
+        timestamp = now_sec,
+        active_tasks = active,
+        cpu_usage_pct,
+        ram_available_mb,
+        "Dispatching periodic heartbeat"
+    );
+
+    match outbound_tx.try_send(msg) {
+        Ok(()) => {
+            tracker.record_sent(now_sec);
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!(worker_id = %worker_id, "Control queue full; skipping this heartbeat");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!(worker_id = %worker_id, "Outbound message channel closed; terminating heartbeat task");
+            false
+        }
+    }
+}
+
+/// Spawns the adaptive heartbeat task gated by local [`crate::controls::WorkerControls`].
+///
+/// While any contributor control blocks new tasks, heartbeats report
+/// [`rusty_grid_core::CONTRIBUTOR_HOLD_CPU_PCT`] (`101.0`) so the Master's `host_busy` gate pauses
+/// new assignments without disconnecting the worker or any wire change (even when the master's
+/// `--max-host-cpu-pct` is `100`). Changes to `controls` and `--allow-hours` window boundaries
+/// wake the loop to emit an immediate heartbeat.
+pub fn spawn_adaptive_heartbeat_task_with_controls(
+    worker_id: Uuid,
+    interval: Duration,
+    outbound_tx: mpsc::Sender<WorkerMessage>,
+    tracker: Arc<HeartbeatTracker>,
+    mobile: Option<MobileTelemetryHandle>,
+    controls: Option<crate::controls::WorkerControlsHandle>,
+) -> HeartbeatHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let tracker_clone = Arc::clone(&tracker);
+    let ctrl_notify = controls.as_ref().map(|c| c.state_notify());
 
     let join_handle = tokio::spawn(async move {
+        let mut last_block_control: Option<&'static str> = None;
         let initial_active = tracker_clone.active_tasks.load(Ordering::Relaxed);
         let mut current_interval = mobile
             .as_ref()
@@ -515,13 +615,33 @@ pub fn spawn_adaptive_heartbeat_task(
             .map(|status| status.recommended_keepalive_interval_or(initial_active, interval))
             .unwrap_or(interval);
         let mut ticker = tokio::time::interval(current_interval);
-        // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
+        // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed,
+        // except when starting already gated by contributor controls so the Master sees host_busy immediately.
         ticker.tick().await;
+        if controls
+            .as_ref()
+            .is_some_and(|c| c.check_admission().is_err())
+            && !dispatch_heartbeat(
+                worker_id,
+                &tracker_clone,
+                controls.as_ref(),
+                &outbound_tx,
+                &mut last_block_control,
+            )
+        {
+            return;
+        }
 
         loop {
+            let boundary_sleep = controls
+                .as_ref()
+                .and_then(|c| c.next_allow_hours_transition())
+                .map(|d| {
+                    d.min(Duration::from_secs(3600))
+                        .saturating_add(Duration::from_millis(50))
+                });
             tokio::select! {
                 _ = ticker.tick() => {
-                    let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
 
                     // Dynamically adapt keepalive interval based on network status and active tasks
@@ -536,35 +656,14 @@ pub fn spawn_adaptive_heartbeat_task(
                         ticker.tick().await;
                     }
 
-                    // Read current system telemetry from non-blocking background sampler
-                    let (cpu_usage_pct, ram_available_mb) = get_system_telemetry();
-
-                    let msg = WorkerMessage::Heartbeat {
+                    if !dispatch_heartbeat(
                         worker_id,
-                        timestamp: now_sec,
-                        active_tasks: active,
-                        cpu_usage_pct,
-                        ram_available_mb,
-                    };
-
-                    trace!(
-                        worker_id = %worker_id,
-                        timestamp = now_sec,
-                        active_tasks = active,
-                        cpu_usage_pct,
-                        ram_available_mb,
-                        "Dispatching periodic heartbeat"
-                    );
-
-                    match outbound_tx.try_send(msg) {
-                        Ok(()) => tracker_clone.record_sent(now_sec),
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!(worker_id = %worker_id, "Control queue full; skipping this heartbeat");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            debug!(worker_id = %worker_id, "Outbound message channel closed; terminating heartbeat task");
-                            break;
-                        }
+                        &tracker_clone,
+                        controls.as_ref(),
+                        &outbound_tx,
+                        &mut last_block_control,
+                    ) {
+                        break;
                     }
                 }
                 _ = tracker_clone.active_notify.notified() => {
@@ -596,6 +695,38 @@ pub fn spawn_adaptive_heartbeat_task(
                         current_interval = recommended;
                         ticker = tokio::time::interval(current_interval);
                         ticker.tick().await;
+                    }
+                }
+                _ = async {
+                    match &ctrl_notify {
+                        Some(n) => n.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !dispatch_heartbeat(
+                        worker_id,
+                        &tracker_clone,
+                        controls.as_ref(),
+                        &outbound_tx,
+                        &mut last_block_control,
+                    ) {
+                        break;
+                    }
+                }
+                _ = async {
+                    match boundary_sleep {
+                        Some(dur) => tokio::time::sleep(dur).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !dispatch_heartbeat(
+                        worker_id,
+                        &tracker_clone,
+                        controls.as_ref(),
+                        &outbound_tx,
+                        &mut last_block_control,
+                    ) {
+                        break;
                     }
                 }
                 _ = &mut stop_rx => {
@@ -1083,5 +1214,70 @@ mod tests {
         ));
 
         hb.stop().await;
+    }
+
+    #[test]
+    fn test_dispatch_heartbeat_sends_contributor_hold_101_when_blocked_and_clamps_real_cpu() {
+        struct FixedPower;
+        impl crate::controls::PowerProbe for FixedPower {
+            fn power_source(&self) -> crate::controls::PowerSource {
+                crate::controls::PowerSource::Ac
+            }
+        }
+        struct FixedNet;
+        impl crate::controls::NetworkCostProbe for FixedNet {
+            fn network_cost(&self) -> crate::controls::NetworkCost {
+                crate::controls::NetworkCost::Unmetered
+            }
+        }
+
+        let cpu = Arc::new(crate::controls::AtomicHostCpuProbe::new(12.5));
+        let controls = crate::controls::WorkerControls::with_probes(
+            crate::controls::ContributorControlsConfig::default(),
+            Arc::new(crate::controls::SystemClock),
+            Arc::clone(&cpu) as Arc<dyn crate::controls::HostCpuProbe>,
+            Arc::new(FixedPower),
+            Arc::new(FixedNet),
+        );
+
+        let tracker = HeartbeatTracker::new(Arc::new(AtomicUsize::new(0)));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut last_ctrl = None;
+        let wid = Uuid::new_v4();
+
+        // While open, emits normal clamped CPU reading.
+        assert!(dispatch_heartbeat(
+            wid,
+            &tracker,
+            Some(&controls),
+            &tx,
+            &mut last_ctrl
+        ));
+        match rx.try_recv().unwrap() {
+            WorkerMessage::Heartbeat { cpu_usage_pct, .. } => {
+                assert!(
+                    (0.0..=100.0).contains(&cpu_usage_pct),
+                    "got {cpu_usage_pct}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // While paused/blocked, emits CONTRIBUTOR_HOLD_CPU_PCT (101.0).
+        controls.pause();
+        assert!(dispatch_heartbeat(
+            wid,
+            &tracker,
+            Some(&controls),
+            &tx,
+            &mut last_ctrl
+        ));
+        match rx.try_recv().unwrap() {
+            WorkerMessage::Heartbeat { cpu_usage_pct, .. } => {
+                assert_eq!(cpu_usage_pct, rusty_grid_core::CONTRIBUTOR_HOLD_CPU_PCT);
+                assert_eq!(cpu_usage_pct, 101.0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
