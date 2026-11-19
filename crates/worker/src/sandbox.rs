@@ -542,7 +542,7 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
                     swept_sandboxes += 1;
                 }
                 let _ = std::fs::remove_file(&lock_path);
-                drop(lock_file);
+                release_task_lock(lock_file);
             }
             Ok(None) => {
                 // Held by a live worker / Sandbox; leave the sandbox directory untouched.
@@ -626,7 +626,7 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
                 ) {
                     let _ = std::fs::remove_file(&locked_path);
                 }
-                drop(lock_file);
+                release_task_lock(lock_file);
             }
         }
     }
@@ -1384,8 +1384,20 @@ fn open_and_try_lock_task_with(
         if lock_file_is_still_named(&lock_path, &file, &file_meta) {
             return Ok(Some((lock_path, file)));
         }
-        drop(file);
+        release_task_lock(file);
     }
+}
+
+/// Explicitly unlocks a task lock file before closing it (TEST-58).
+///
+/// On Unix, `flock` locks belong to the open file description rather than the
+/// descriptor itself: a concurrent `fork()` (for example another task spawning its
+/// process-tree lifeline supervisor) duplicates the descriptor until `exec`/`close`,
+/// so `close` alone leaves the lock held. Calling `unlock()` (`LOCK_UN`) releases
+/// the lock immediately regardless of inherited descriptors.
+fn release_task_lock(lock_file: std::fs::File) {
+    let _ = lock_file.unlock();
+    drop(lock_file);
 }
 
 /// True when `lock_path` still names the file that `file` (already locked) refers to.
@@ -1461,7 +1473,7 @@ impl Sandbox {
 
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
             let _ = tokio::fs::remove_file(&lock_path).await;
-            drop(lock_file);
+            release_task_lock(lock_file);
             return Err(SandboxError::Io { task_id, source: e });
         }
 
@@ -1618,7 +1630,9 @@ impl Sandbox {
         self.destroyed = true;
 
         if self.keep_sandboxes {
-            self.lock_file = None;
+            if let Some(lock_file) = self.lock_file.take() {
+                release_task_lock(lock_file);
+            }
             debug!(task_id = %self.task_id, path = %self.path.display(), "Sandbox retained per keep_sandboxes config");
             return Ok(());
         }
@@ -1632,7 +1646,9 @@ impl Sandbox {
                 })?;
         }
         let _ = tokio::fs::remove_file(&self.lock_path).await;
-        self.lock_file = None;
+        if let Some(lock_file) = self.lock_file.take() {
+            release_task_lock(lock_file);
+        }
         debug!(task_id = %self.task_id, "Sandbox destroyed");
         Ok(())
     }
@@ -1640,14 +1656,14 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if !self.destroyed {
-            if !self.keep_sandboxes {
-                if self.path.exists() {
-                    let _ = std::fs::remove_dir_all(&self.path);
-                }
-                let _ = std::fs::remove_file(&self.lock_path);
+        if !self.destroyed && !self.keep_sandboxes {
+            if self.path.exists() {
+                let _ = std::fs::remove_dir_all(&self.path);
             }
-            self.lock_file = None;
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+        if let Some(lock_file) = self.lock_file.take() {
+            release_task_lock(lock_file);
         }
     }
 }
@@ -1750,7 +1766,7 @@ mod tests {
                     .unwrap()
                     .expect("the sweeper takes the lock first");
                 std::fs::remove_file(&sweeper_path).unwrap();
-                drop(sweeper_file);
+                release_task_lock(sweeper_file);
             }
         })
         .unwrap()
@@ -1763,7 +1779,7 @@ mod tests {
                 .is_none(),
             "a second opener must see the lock as held"
         );
-        drop(owner);
+        release_task_lock(owner.1);
     }
 
     #[tokio::test]
@@ -2653,6 +2669,52 @@ mod tests {
                 .exists(),
             "lock file of swept retained sandbox must be removed"
         );
+    }
+
+    /// TEST-58, deterministic: `try_clone()` models a concurrent `fork()` inheriting the open lock
+    /// descriptor before `exec`/`close`. On Unix, `flock` locks live on the open file description,
+    /// so `destroy()` with `keep_sandboxes == true` must call `unlock()` (`LOCK_UN`) rather than
+    /// merely dropping the worker's own `File`; otherwise the subsequent default `ensure_usable()`
+    /// sees `WouldBlock` and leaves the retained sandbox unswept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keep_sandboxes_destroy_unlocks_even_with_inherited_lock_fd() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+
+        let keep_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(true);
+        keep_config.ensure_usable().await.unwrap();
+
+        let task_id = TaskId::new();
+        let mut sb = Sandbox::create(&keep_config, task_id).await.unwrap();
+        let sb_path = sb.path().to_path_buf();
+        let inherited_dup = sb
+            .lock_file
+            .as_ref()
+            .expect("live sandbox holds lock file")
+            .try_clone()
+            .expect("dup lock fd");
+
+        sb.destroy().await.unwrap();
+        assert!(
+            sb_path.is_dir(),
+            "destroy() with keep_sandboxes == true must retain the sandbox directory"
+        );
+
+        let default_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(false);
+        default_config.ensure_usable().await.unwrap();
+        assert!(
+            !sb_path.exists(),
+            "subsequent ensure_usable() with keep_sandboxes == false must sweep retained sandbox even while an inherited fd copy exists"
+        );
+        assert!(
+            !base_dir
+                .join(".locks")
+                .join(format!("{task_id}.lock"))
+                .exists(),
+            "lock file of swept retained sandbox must be removed"
+        );
+        drop(inherited_dup);
     }
 }
 
