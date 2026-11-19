@@ -3,9 +3,13 @@
 //! Provides TCP client networking, hardware capability detection,
 //! registration handshake, periodic heartbeat telemetry, and resilient backoff.
 
+#![deny(unsafe_code)]
+
 #[cfg(feature = "3d")]
 pub mod autorig;
 pub mod backoff;
+// LV-4: cfg(windows)/cfg(unix) volume device identity and link-count syscalls to reject hard links/reparse points.
+#[allow(unsafe_code)]
 pub mod blob_cache;
 pub mod blob_client;
 pub mod client;
@@ -15,14 +19,22 @@ pub mod gen3d;
 pub mod gpu;
 pub mod heartbeat;
 pub mod identity;
+// LV-4: OS sandbox primitives (Windows AppContainer/ACLs/Desktop/CreateProcessW, Linux namespaces/seccomp, macOS sandbox_init).
+#[allow(unsafe_code)]
 pub mod isolation;
+// LV-4: cfg(windows) Job Objects / snapshots and cfg(unix) setsid/killpg/proc_pidinfo process-tree supervision.
+#[allow(unsafe_code)]
 pub mod process_tree;
 pub mod runner;
+// LV-4: cfg(windows)/cfg(unix) symlink/reparse and file-identity checks for sandbox directories.
+#[allow(unsafe_code)]
 pub mod sandbox;
 pub mod sim;
 pub mod staging;
 #[cfg(feature = "gpu-wgpu")]
 pub mod wgpu_engine;
+// LV-4: cfg(windows) HANDLE DACL/path verification syscalls for workspace-root protection.
+#[allow(unsafe_code)]
 pub mod workspace;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};

@@ -1513,7 +1513,9 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|&c| c == '*')
 }
 
+// LV-4: cfg(unix) libc::mkfifo fixture in tests (production code in blob.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

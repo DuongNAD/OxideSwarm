@@ -3,8 +3,12 @@
 //! Provides the core primitives, relay hub, native WebSocket client,
 //! command executor, and protocol envelopes for multi-platform agent communication.
 
+#![deny(unsafe_code)]
+
 pub mod bridge;
 pub mod client;
+// LV-4: cfg(unix) libc::killpg process-group teardown and signal probe in tests.
+#[allow(unsafe_code)]
 pub mod executor;
 pub mod hub;
 pub mod protocol;

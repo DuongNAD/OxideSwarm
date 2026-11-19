@@ -1536,7 +1536,14 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
   rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
   `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
-  Do step 3 (`#![forbid(unsafe_code)]` in modules without `unsafe`) is not done.
+- **Note (2026-11-19):** Do step 3 (`win/lv-4-forbid-unsafe`): `#![forbid(unsafe_code)]` added at the
+  root of all 4 zero-`unsafe` binaries (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`), and
+  `#![deny(unsafe_code)]` at the root of all 6 library crates (`android_bridge`, `agent_mesh`,
+  `master`, `core`, `cli`, `worker`) with `#[allow(unsafe_code)]` (one-line `// LV-4:` reason on
+  each) limited to the modules/test submodules/10 `#[no_mangle]` JNI functions that require it, plus
+  `#[forbid(unsafe_code)]` on `master::store::fuzzing`; production code in `core::{blob,task}` and
+  `worker::{client,runner,staging}` stays denied. Complete module inventory is recorded in
+  [design 0058](design/0058-lasting-value.md). Open: CI Miri job run on `master`.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -2403,3 +2410,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
+- 2026-11-19: LV-4 Partial (step 3, branch `win/lv-4-forbid-unsafe`, [design 0058](design/0058-lasting-value.md)): added `#![forbid(unsafe_code)]` to all 4 zero-`unsafe` binary crate roots (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`) and `#![deny(unsafe_code)]` to all 6 library crate roots with surgical `#[allow(unsafe_code)]` + `// LV-4:` reasons on `android_bridge`'s 10 `#[no_mangle]` JNI functions, `agent_mesh::executor`, `master::store` (`store::fuzzing` `forbid`), `core::{capabilities, noise_auth, private_file}` + test-only `blob::tests`/`task::tests`, `cli::{join, mode_cli::dev_launch}`, and `worker::{blob_cache, isolation, process_tree, sandbox, workspace}` + test-only `client::tests`/`runner::{outcome_tests, process_tree_tests}`/`staging::tests`; full module inventory recorded in design 0058, zero runtime change (items unchanged: still Waiting for CI Miri run on `master`).
