@@ -19,10 +19,14 @@ import os
 import random
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from collections import namedtuple
 from unittest import mock
 
@@ -862,6 +866,684 @@ class SoakHarnessTests(unittest.TestCase):
                 min_created_epoch=1000.0,
             )
             self.assertEqual([x["pid"] for x in win_mode_posix_wd], [8001, 8002, 8004])
+
+
+class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
+    def test_secret_loading_and_control_auth_round_trip_and_rejections(self):
+        rs = endurance.remote_soak
+        for bad_name in ("", ".", "..", "win a", "../evil", "a/b", "x" * 33):
+            with self.assertRaises(ValueError):
+                rs.validate_worker_name(bad_name)
+        for good_name in ("win-a", "mac_1.box", "w0"):
+            self.assertEqual(rs.validate_worker_name(good_name), good_name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.secret")
+            with self.assertRaises(ValueError):
+                rs.load_secret_file(missing)
+            short = os.path.join(tmp, "short.secret")
+            with open(short, "w", encoding="utf-8") as f:
+                f.write("too-short\n")
+            with self.assertRaises(ValueError):
+                rs.load_secret_file(short)
+            sec_path = os.path.join(tmp, "run.secret")
+            secret_text = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(secret_text + "\n")
+            loaded_path, loaded_secret = rs.load_secret_file(sec_path)
+            self.assertEqual(loaded_secret, secret_text)
+            self.assertEqual(os.path.abspath(sec_path), loaded_path)
+
+        key = rs.derive_control_key("a1b2c3d4e5f60718293a4b5c6d7e8f90")
+        wrong_key = rs.derive_control_key("ffffffffffffffffffffffffffffffff")
+        srv = rs.SoakControlServer(
+            "127.0.0.1:0",
+            key,
+            expected_workers=["win-a", "win-b"],
+            expected_count=2,
+            sample_interval_s=5.0,
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            url = "http://%s" % srv.connect_addr
+
+            def raw_post(path, body_bytes, headers):
+                req = urllib.request.Request(url + path, data=body_bytes, method="POST", headers=headers)
+                try:
+                    with opener.open(req, timeout=5.0) as resp:
+                        return resp.status, dict(resp.headers), resp.read()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, dict(exc.headers or {}), exc.read() if exc.fp else b""
+
+            body = json.dumps({"name": "win-a"}).encode("utf-8")
+            # Missing auth headers -> 401
+            st, _h, _r = raw_post("/v1/register", body, {"Content-Type": "application/json"})
+            self.assertEqual(st, 401)
+
+            # Wrong secret key -> 401 and must NOT burn nonce in ReplayGuard
+            ts_str = "%.3f" % time.time()
+            reusable_nonce = "nonce1234567890"
+            bad_sig = rs.sign_request(wrong_key, "POST", "/v1/register", "win-a", ts_str, reusable_nonce, body)
+            st, _h, _r = raw_post(
+                "/v1/register",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": ts_str,
+                    "X-Soak-Nonce": reusable_nonce,
+                    "X-Soak-Sig": bad_sig,
+                },
+            )
+            self.assertEqual(st, 401)
+
+            # Tampered body under real signature -> 401
+            good_sig = rs.sign_request(key, "POST", "/v1/register", "win-a", ts_str, reusable_nonce, body)
+            st, _h, _r = raw_post(
+                "/v1/register",
+                b'{"name":"win-a","tampered":true}',
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": ts_str,
+                    "X-Soak-Nonce": reusable_nonce,
+                    "X-Soak-Sig": good_sig,
+                },
+            )
+            self.assertEqual(st, 401)
+
+            # Short nonce -> 401
+            short_sig = rs.sign_request(key, "POST", "/v1/register", "win-a", ts_str, "tiny", body)
+            st, _h, _r = raw_post(
+                "/v1/register",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": ts_str,
+                    "X-Soak-Nonce": "tiny",
+                    "X-Soak-Sig": short_sig,
+                },
+            )
+            self.assertEqual(st, 401)
+
+            # Expired timestamp -> 401
+            old_ts = "%.3f" % (time.time() - 400.0)
+            old_nonce = "oldnonce12345678"
+            old_sig = rs.sign_request(key, "POST", "/v1/register", "win-a", old_ts, old_nonce, body)
+            st, _h, _r = raw_post(
+                "/v1/register",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": old_ts,
+                    "X-Soak-Nonce": old_nonce,
+                    "X-Soak-Sig": old_sig,
+                },
+            )
+            self.assertEqual(st, 401)
+
+            # Valid request with reusable_nonce succeeds -> 200, replay of SAME nonce -> 401
+            st, _h, resp_raw = raw_post(
+                "/v1/register",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": ts_str,
+                    "X-Soak-Nonce": reusable_nonce,
+                    "X-Soak-Sig": good_sig,
+                },
+            )
+            self.assertEqual(st, 200)
+            reg_json = json.loads(resp_raw.decode("utf-8"))
+            self.assertEqual(reg_json["worker_name"], "win-a")
+
+            st, _h, _r = raw_post(
+                "/v1/register",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Soak-Worker": "win-a",
+                    "X-Soak-Ts": ts_str,
+                    "X-Soak-Nonce": reusable_nonce,
+                    "X-Soak-Sig": good_sig,
+                },
+            )
+            self.assertEqual(st, 401)
+
+            # Unknown worker in expected_workers allowlist -> 403
+            rogue_client = rs.SignedControlClient(url, "rogue", key)
+            st, _ = rogue_client.post("/v1/register", {"name": "rogue"})
+            self.assertEqual(st, 403)
+
+            # Disallowed op in /v1/ack -> 400
+            client_b = rs.SignedControlClient(url, "win-b", key)
+            st, reg_b = client_b.post("/v1/register", {"name": "win-b"})
+            self.assertEqual(st, 200)
+            self.assertEqual(srv.wait_for_agents(2, timeout_s=5.0), ["win-a", "win-b"])
+            st, _ = client_b.post(
+                "/v1/ack",
+                {"run_id": reg_b["run_id"], "cmd_id": "cmd1", "op": "exec_shell", "ok": True},
+            )
+            self.assertEqual(st, 400)
+
+            # Client rejects tampered response signature
+            self.assertFalse(
+                rs.verify_response(key, 200, "/v1/poll", "win-b", "1700000000.0", "respnonce1234", b"{}", "0" * 64)
+            )
+            self.assertTrue(
+                srv._replay is not None and srv._replay.check_and_record("freshnonce1234", time.time())
+            )
+            self.assertFalse(srv._replay.check_and_record("freshnonce1234", time.time()))
+        finally:
+            srv.stop()
+
+    def test_remote_soak_arg_validation_and_sample_merge(self):
+        ap = endurance.build_parser()
+        with tempfile.TemporaryDirectory() as tmp:
+            sec_path = os.path.join(tmp, "soak.secret")
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write("fedcba9876543210fedcba9876543210\n")
+
+            parsed = endurance.validate_soak_args(
+                ap.parse_args(
+                    [
+                        "soak",
+                        "--master-only",
+                        "--link",
+                        "lan-tcp",
+                        "--secret-file",
+                        sec_path,
+                        "--workers",
+                        "2",
+                        "--expect-workers",
+                        "win-a,win-b",
+                        "--duration",
+                        "24h",
+                    ]
+                )
+            )
+            self.assertTrue(parsed["master_only"])
+            self.assertEqual(parsed["link"], "lan-tcp")
+            self.assertEqual(parsed["expect_workers"], ["win-a", "win-b"])
+
+            for bad in (
+                ["soak", "--master-only", "--link", "lan-tcp"],
+                ["soak", "--master-only", "--secret-file", sec_path, "--workers", "2", "--expect-workers", "win-a"],
+                ["soak", "--master-only", "--secret-file", sec_path, "--workers", "2", "--expect-workers", "win-a,win-a"],
+                ["soak", "--master-only", "--secret-file", sec_path, "--workers", "2", "--link", "bogus"],
+            ):
+                with self.assertRaises(ValueError, msg="expected ValueError for %s" % bad):
+                    endurance.validate_soak_args(ap.parse_args(bad))
+
+            wa_ok = endurance.validate_worker_agent_args(
+                ap.parse_args(
+                    [
+                        "worker-agent",
+                        "--master",
+                        "127.0.0.1:18500",
+                        "--control",
+                        "127.0.0.1:18501",
+                        "--secret-file",
+                        sec_path,
+                        "--name",
+                        "win-a",
+                    ]
+                )
+            )
+            self.assertEqual(wa_ok["name"], "win-a")
+
+            for bad_wa in (
+                ["worker-agent", "--master", "127.0.0.1:18500", "--control", "127.0.0.1:18501", "--secret-file", sec_path, "--name", "../bad"],
+                ["worker-agent", "--master", "127.0.0.1:18500", "--control", "127.0.0.1:18501", "--secret-file", sec_path, "--name", "win-a", "--poll-interval", "0"],
+            ):
+                with self.assertRaises(ValueError):
+                    endurance.validate_worker_agent_args(ap.parse_args(bad_wa))
+
+        master_samples = [
+            {"t_s": 0.0, "processes": {"master": {"pid": 1, "rss_bytes": 100, "handles": 10}}, "dirs": {"blob_store_bytes": 10}},
+            {"t_s": 60.0, "processes": {"master": {"pid": 1, "rss_bytes": 100, "handles": 10}}, "dirs": {"blob_store_bytes": 20}},
+        ]
+        remote_samples = {
+            "win-a": [
+                {"t_s": 1.2, "processes": {"worker_win-a": {"pid": 2, "rss_bytes": 200, "handles": 20}}, "dirs": {"worker_cache_win-a_bytes": 50}},
+                {"t_s": 95.0, "processes": {"worker_win-a": {"pid": 2, "rss_bytes": 210, "handles": 21}}, "dirs": {"worker_cache_win-a_bytes": 60}},
+            ],
+            "win-b": [
+                {"t_s": 59.5, "processes": {"worker_win-b": {"pid": 3, "rss_bytes": 300, "handles": 30}}, "dirs": {"worker_cache_win-b_bytes": 70}},
+            ],
+        }
+        merged = endurance.remote_soak.merge_remote_samples(master_samples, remote_samples, sample_interval_s=60.0)
+        self.assertEqual([r["t_s"] for r in merged], [0.0, 60.0, 95.0])
+        self.assertIn("worker_win-a", merged[0]["processes"])
+        self.assertIn("worker_win-b", merged[1]["processes"])
+        disk_res = endurance.check_soak_disk_and_journal(
+            merged,
+            blob_store_limit_bytes=1000,
+            worker_cache_limit_bytes=100,
+            pinned_headroom_bytes=100,
+            idle_sandbox_entries={"win-a": ["cache"], "win-b": ["cache"]},
+            tmp_leftovers={"master_blobs_tmp": []},
+            compactions=[{"before_bytes": 200, "after_bytes": 24}],
+            idle_blob_store_bytes=20,
+            idle_worker_cache_bytes={"worker_cache_win-a_bytes": 60, "worker_cache_win-b_bytes": 70},
+        )
+        self.assertTrue(disk_res["passed"])
+
+    def test_is_worker_entry_connected_accepts_busy_and_rejects_disconnected(self):
+        fn = endurance.is_worker_entry_connected
+        self.assertTrue(fn({"name": "win-a", "tags": ["id:1", "state:connected"]}))
+        self.assertTrue(fn({"name": "win-a", "tags": ["id:1", "state:busy"]}))
+        self.assertTrue(fn({"name": "win-a", "tags": ["id:1", "state:idle"]}))
+        self.assertTrue(fn({"name": "win-a", "tags": ["id:1"]}))
+        self.assertFalse(fn({"name": "win-a", "tags": ["id:1", "state:disconnected"]}))
+        self.assertFalse(fn({"name": "win-a", "tags": ["id:1", "state:Disconnected"]}))
+        self.assertFalse(fn("not-a-dict"))
+
+    def test_remote_soak_two_mock_worker_agents_loopback(self):
+        rs = endurance.remote_soak
+        (_echo_host, echo_port), echo_close = _start_echo_server()
+        tmp_dir = tempfile.mkdtemp(prefix="ox-mock-remote-soak-")
+        agent_threads = []
+        srv = None
+        try:
+            sec_path = os.path.join(tmp_dir, "run.secret")
+            secret_text = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(secret_text + "\n")
+            fake_bin = os.path.join(tmp_dir, "oxideswarm-fake.bin")
+            with open(fake_bin, "wb") as f:
+                f.write(b"mock")
+
+            srv = rs.SoakControlServer(
+                "127.0.0.1:0",
+                rs.derive_control_key(secret_text),
+                expected_workers=["win-a", "win-b"],
+                expected_count=2,
+                sample_interval_s=0.5,
+            )
+
+            agents = {}
+
+            def fake_start_worker(agent_self):
+                p = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                agent_self._record_pid_start(p.pid)
+                with agent_self._lock:
+                    agent_self._worker_proc = p
+                    agent_self._worker_log = None
+                return int(p.pid)
+
+            orig_sh = endurance.sh
+
+            def fake_sh(cmd, timeout=10.0):
+                if cmd and cmd[0] == fake_bin:
+                    return "rusty-grid 0.4.4"
+                return orig_sh(cmd, timeout=timeout)
+
+            with (
+                mock.patch.object(rs.WorkerAgent, "_start_worker", fake_start_worker),
+                mock.patch.object(endurance, "sh", side_effect=fake_sh),
+                mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
+            ):
+                for name in ("win-a", "win-b"):
+                    w_root = os.path.join(tmp_dir, "wroot-" + name)
+                    os.makedirs(w_root, exist_ok=True)
+                    ag = rs.WorkerAgent(
+                        endurance,
+                        binary=fake_bin,
+                        master_addr="127.0.0.1:%d" % echo_port,
+                        control_addr=srv.connect_addr,
+                        secret_file=sec_path,
+                        name=name,
+                        slots=2,
+                        sample_interval_s=0.5,
+                        work_dir=w_root,
+                        poll_interval_s=0.1,
+                        connect_timeout_s=15.0,
+                    )
+                    agents[name] = ag
+                    t = threading.Thread(target=ag.run, daemon=True)
+                    t.start()
+                    agent_threads.append((t, ag))
+
+                self.assertEqual(srv.wait_for_agents(2, timeout_s=15.0), ["win-a", "win-b"])
+
+                # Unauthenticated control attempt is refused while agents are running
+                req = urllib.request.Request(
+                    "http://%s/v1/poll" % srv.connect_addr,
+                    data=b"{}",
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5.0)
+                self.assertEqual(ctx.exception.code, 401)
+                ctx.exception.close()
+
+                srv.mark_soak_started(time.monotonic())
+                time.sleep(0.8)
+
+                ack_kr = srv.dispatch_command("win-a", "kill_restart", {"down_s": 0.2}, timeout_s=15.0)
+                res_kr = ack_kr["result"]
+                self.assertGreater(res_kr["old_pid"], 0)
+                self.assertGreater(res_kr["new_pid"], 0)
+                self.assertNotEqual(res_kr["old_pid"], res_kr["new_pid"])
+                self.assertTrue(endurance.pid_alive(res_kr["new_pid"]))
+
+                ack_lc = srv.dispatch_command("win-b", "link_cut", {"down_s": 0.2}, timeout_s=15.0)
+                self.assertGreaterEqual(ack_lc["result"]["cuts"], 1)
+
+                time.sleep(0.7)
+                snap_a = srv.dispatch_command("win-a", "idle_snapshot", {}, timeout_s=15.0)["result"]
+                snap_b = srv.dispatch_command("win-b", "idle_snapshot", {}, timeout_s=15.0)["result"]
+                merged = rs.merge_remote_samples(
+                    [{"t_s": 0.0, "processes": {}, "dirs": {}}, {"t_s": 1.0, "processes": {}, "dirs": {}}],
+                    {"win-a": snap_a["samples"], "win-b": snap_b["samples"]},
+                    sample_interval_s=0.5,
+                )
+                all_roles = set()
+                for row in merged:
+                    all_roles.update(row["processes"].keys())
+                self.assertIn("worker_win-a", all_roles)
+                self.assertIn("worker_win-b", all_roles)
+
+                sh_a = srv.dispatch_command("win-a", "shutdown", {}, timeout_s=20.0)["result"]
+                sh_b = srv.dispatch_command("win-b", "shutdown", {}, timeout_s=20.0)["result"]
+                self.assertEqual(sh_a["leftover_pids"], [])
+                self.assertEqual(sh_b["leftover_pids"], [])
+                self.assertEqual(sh_a["leftover_task_trees"], [])
+                self.assertEqual(sh_b["leftover_task_trees"], [])
+
+                for t, _ag in agent_threads:
+                    t.join(timeout=15.0)
+                    self.assertFalse(t.is_alive())
+
+                endurance.assert_record_private(
+                    json.dumps({"samples": merged, "snap_a": snap_a["idle_disk_snapshot"], "snap_b": snap_b["idle_disk_snapshot"]}),
+                    forbidden=[secret_text],
+                )
+        finally:
+            for _t, ag in agent_threads:
+                ag.request_stop()
+            if srv is not None:
+                srv.stop()
+            echo_close()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@unittest.skipUnless(
+    os.environ.get("OXIDESWARM_TEST_BIN"),
+    "set OXIDESWARM_TEST_BIN to run the real-binary two-worker-agent loopback soak test",
+)
+class RemoteSoakRealBinaryTests(unittest.TestCase):
+    def test_remote_soak_two_worker_agents_real_binary(self):
+        binary = os.path.abspath(os.environ["OXIDESWARM_TEST_BIN"])
+        self.assertTrue(os.path.isfile(binary), "missing OXIDESWARM_TEST_BIN: %s" % binary)
+        base_root = os.environ.get("OXIDESWARM_TEST_ROOT")
+        test_root = tempfile.mkdtemp(prefix="ox-remote-soak-e2e-", dir=base_root or None)
+        master_proc = None
+        worker_procs = []
+        try:
+            home_dir = os.path.join(test_root, "home")
+            tmp_dir = os.path.join(test_root, "tmp")
+            work_master = os.path.join(test_root, "work-master")
+            work_a = os.path.join(test_root, "work-win-a")
+            work_b = os.path.join(test_root, "work-win-b")
+            for d in (os.path.join(home_dir, ".oxideswarm"), tmp_dir, work_master, work_a, work_b):
+                os.makedirs(d, exist_ok=True)
+
+            secret_path = os.path.join(test_root, "run.secret")
+            secret_text = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
+            with open(secret_path, "w", encoding="utf-8") as f:
+                f.write(secret_text + "\n")
+            if os.name != "nt":
+                os.chmod(secret_path, 0o600)
+
+            master_port_file = os.path.join(test_root, "master.port")
+            control_port_file = os.path.join(test_root, "control.port")
+            out_json = os.path.join(test_root, "remote_soak_record.json")
+
+            child_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("RUSTY_GRID_") and not k.startswith("OXIDESWARM_")
+            }
+            child_env.update(
+                {
+                    "HOME": home_dir,
+                    "USERPROFILE": home_dir,
+                    "OXIDESWARM_HOME": os.path.join(home_dir, ".oxideswarm"),
+                    "TEMP": tmp_dir,
+                    "TMP": tmp_dir,
+                    "TMPDIR": tmp_dir,
+                    "PYTHONUNBUFFERED": "1",
+                }
+            )
+
+            master_cmd = [
+                sys.executable,
+                "-u",
+                SCRIPT,
+                "soak",
+                "--bin",
+                binary,
+                "--worker-python",
+                sys.executable,
+                "--master-only",
+                "--master-listen",
+                "127.0.0.1:0",
+                "--master-port-file",
+                master_port_file,
+                "--control-listen",
+                "127.0.0.1:0",
+                "--control-port-file",
+                control_port_file,
+                "--secret-file",
+                secret_path,
+                "--expect-workers",
+                "win-a,win-b",
+                "--workers",
+                "2",
+                "--slots",
+                "4",
+                "--max-queue-size",
+                "8",
+                "--blob-store-mb",
+                "512",
+                "--blob-cache-mb",
+                "256",
+                "--duration",
+                "250s",
+                "--fault-scale",
+                "0.03",
+                "--load-scale",
+                "0.1",
+                "--sample-interval",
+                "1s",
+                "--register-timeout",
+                "60s",
+                "--work-dir",
+                work_master,
+                "--out",
+                out_json,
+            ]
+            master_proc = subprocess.Popen(
+                master_cmd,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            deadline = time.monotonic() + 30.0
+            master_addr = ""
+            control_addr = ""
+            while time.monotonic() < deadline:
+                if master_proc.poll() is not None:
+                    out_txt = master_proc.stdout.read() if master_proc.stdout else ""
+                    self.fail("master soak exited early (%s):\n%s" % (master_proc.returncode, out_txt))
+                if os.path.isfile(master_port_file) and os.path.isfile(control_port_file):
+                    with open(master_port_file, encoding="utf-8") as mpf:
+                        mtxt = mpf.read().strip()
+                    with open(control_port_file, encoding="utf-8") as cpf:
+                        ctxt = cpf.read().strip()
+                    if mtxt and ctxt:
+                        master_addr = mtxt
+                        control_addr = ctxt
+                        break
+                time.sleep(0.1)
+            self.assertTrue(master_addr and control_addr, "master/control port files not published in time")
+
+            for wname, wdir in (("win-a", work_a), ("win-b", work_b)):
+                wcmd = [
+                    sys.executable,
+                    "-u",
+                    SCRIPT,
+                    "worker-agent",
+                    "--bin",
+                    binary,
+                    "--master",
+                    master_addr,
+                    "--control",
+                    control_addr,
+                    "--secret-file",
+                    secret_path,
+                    "--name",
+                    wname,
+                    "--slots",
+                    "4",
+                    "--blob-cache-mb",
+                    "256",
+                    "--sample-interval",
+                    "1s",
+                    "--poll-interval",
+                    "0.25",
+                    "--work-dir",
+                    wdir,
+                ]
+                wp = subprocess.Popen(
+                    wcmd,
+                    env=child_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                worker_procs.append((wname, wp))
+
+            master_out, _ = master_proc.communicate(timeout=420.0)
+            worker_outputs = []
+            for wname, wp in worker_procs:
+                wout, _ = wp.communicate(timeout=60.0)
+                worker_outputs.append((wname, wp.returncode, wout))
+
+            raw_text = ""
+            rec = None
+            if os.path.isfile(out_json):
+                with open(out_json, encoding="utf-8") as rf:
+                    raw_text = rf.read()
+                rec = json.loads(raw_text)
+
+            diag = ""
+            if rec is not None:
+                soak_obj = rec.get("soak") or {}
+                diag = "\nfault_errors=%s\npass_checks=%s" % (
+                    json.dumps(soak_obj.get("fault_errors") or [], indent=2),
+                    json.dumps(soak_obj.get("pass_checks") or {}, indent=2),
+                )
+            worker_diag = "".join("\n[%s rc=%s] %s" % (wn, rc, wo[-500:]) for wn, rc, wo in worker_outputs)
+            for wname, rc, wout in worker_outputs:
+                self.assertEqual(rc, 0, "worker-agent %s failed:\n%s" % (wname, wout))
+
+            self.assertTrue(os.path.isfile(out_json), "missing output record JSON:\n%s%s" % (master_out, worker_diag))
+            self.assertIsNotNone(rec)
+            endurance.assert_record_private(raw_text, forbidden=[secret_text, test_root, secret_path])
+            self.assertTrue(rec["parameters"].get("master_only"))
+            self.assertEqual([w["name"] for w in rec["remote_workers"]], ["win-a", "win-b"])
+
+            checks = rec["soak"]["pass_checks"]
+            for cname in (
+                "1_accounting",
+                "2_resource_plateau",
+                "4_probe_p99",
+                "5_clean_stop",
+                "6_fault_injection",
+            ):
+                self.assertTrue(checks[cname]["passed"], "%s failed: %s\nmaster_out:\n%s%s%s" % (cname, checks[cname], master_out, diag, worker_diag))
+
+            c3 = checks["3_disk_and_journal"]
+            self.assertTrue(c3["blob_store_ok"], "blob_store_ok failed: %s" % (c3,))
+            self.assertTrue(c3["worker_cache_ok"], "worker_cache_ok failed: %s" % (c3,))
+            self.assertTrue(c3["journal_compaction_ok"], "journal_compaction_ok failed: %s" % (c3,))
+            self.assertEqual(c3["unexpected_sandbox_entries"], {}, "unexpected_sandbox_entries: %s" % (c3,))
+            non_part_leftovers = {}
+            for key, entries in (c3.get("tmp_leftovers") or {}).items():
+                if key.endswith("_cache_tmp"):
+                    bad_entries = [name for name in entries if not str(name).endswith(".part")]
+                else:
+                    bad_entries = list(entries)
+                if bad_entries:
+                    non_part_leftovers[key] = bad_entries
+            self.assertEqual(non_part_leftovers, {}, "unexpected non-.part leftovers: %s" % (non_part_leftovers,))
+            # In oxideswarm <= 0.4.4, BlobCache::open keeps tmp/*.part newer than STALE_TMP_AGE (24h)
+            # after a hard worker_kill mid-write; 3_disk_and_journal must still catch and fail on it.
+            only_worker_kill_part = (
+                (not c3["passed"])
+                and bool(c3.get("tmp_leftovers"))
+                and (not non_part_leftovers)
+            )
+            if only_worker_kill_part:
+                self.assertEqual(master_proc.returncode, 1, "strict harness must exit 1 on tmp_leftovers:\n%s" % (master_out,))
+                self.assertFalse(rec["all_passed"])
+                print(
+                    "NOTE: caught v0.4.4 BlobCache STALE_TMP_AGE .part leftover on worker_kill: %s"
+                    % (c3["tmp_leftovers"],),
+                    flush=True,
+                )
+            else:
+                self.assertTrue(c3["passed"], "3_disk_and_journal failed: %s%s" % (c3, diag))
+                self.assertTrue(rec["all_passed"], json.dumps(checks, indent=2))
+                self.assertEqual(master_proc.returncode, 0, "master soak failed:\n%s%s%s" % (master_out, diag, worker_diag))
+                print("NOTE: all 6/6 D3 checks passed cleanly", flush=True)
+
+            self.assertGreaterEqual(rec["soak"]["master_audit"]["task_api_snapshots"], 1)
+            kinds_seen = {e["kind"] for e in rec["soak"]["faults_executed"]}
+            self.assertEqual(kinds_seen, {"worker_kill", "link_cut", "queue_burst", "master_restart"})
+
+            seen_procs = set()
+            seen_dirs = set()
+            for row in rec["soak"]["samples"]:
+                seen_procs.update(row.get("processes", {}).keys())
+                seen_dirs.update(row.get("dirs", {}).keys())
+            self.assertIn("master", seen_procs)
+            self.assertIn("worker_win-a", seen_procs)
+            self.assertIn("worker_win-b", seen_procs)
+            self.assertIn("worker_cache_win-a_bytes", seen_dirs)
+            self.assertIn("worker_cache_win-b_bytes", seen_dirs)
+        finally:
+            if master_proc is not None:
+                if master_proc.poll() is None:
+                    master_proc.kill()
+                    master_proc.wait(timeout=5.0)
+                if master_proc.stdout is not None:
+                    master_proc.stdout.close()
+            for _wname, wp in worker_procs:
+                if wp.poll() is None:
+                    wp.kill()
+                    wp.wait(timeout=5.0)
+                if wp.stdout is not None:
+                    wp.stdout.close()
+            shutil.rmtree(test_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

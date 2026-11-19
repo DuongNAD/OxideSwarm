@@ -51,6 +51,10 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import remote_soak
+
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 IS_WINDOWS = os.name == "nt"
 
@@ -251,6 +255,10 @@ def percentile(values: Iterable[float], pct: float) -> float:
         return ordered[lo]
     frac = pos - lo
     return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+SOAK_QUEUE_FULL_MAX_ATTEMPTS = 12
+SOAK_QUEUE_FULL_BACKOFF_S = 2.5
 
 
 def is_queue_full_error(message: str) -> bool:
@@ -691,7 +699,7 @@ def check_soak_disk_and_journal(
         idle_worker_cache_bytes = {}
         if samples:
             for k, v in samples[-1].get("dirs", {}).items():
-                if k == "worker_cache_bytes" or k.startswith("worker_cache_w"):
+                if k == "worker_cache_bytes" or k.startswith("worker_cache_"):
                     idle_worker_cache_bytes[k] = int(v)
 
     worker_cache_peak_bytes: Dict[str, int] = {}
@@ -699,7 +707,7 @@ def check_soak_disk_and_journal(
     for row in samples:
         t_s = float(row.get("t_s", 0.0))
         for k, v in row.get("dirs", {}).items():
-            if k == "worker_cache_bytes" or k.startswith("worker_cache_w"):
+            if k == "worker_cache_bytes" or k.startswith("worker_cache_"):
                 sz = int(v)
                 worker_cache_peak_bytes[k] = max(worker_cache_peak_bytes.get(k, 0), sz)
                 if sz > int(worker_cache_limit_bytes):
@@ -2721,6 +2729,15 @@ def find_leftover_process_trees(
     return leftovers
 
 
+def is_worker_entry_connected(item: Dict[str, Any]) -> bool:
+    """Return True when a `workers --json` entry is connected (`state != disconnected`, including `busy`)."""
+    if not isinstance(item, dict):
+        return False
+    tags = item.get("tags") or []
+    state = next((str(t).split(":", 1)[1].strip().lower() for t in tags if str(t).startswith("state:")), "connected")
+    return state != "disconnected"
+
+
 class SoakCluster(EnduranceCluster):
     """Multi-worker soak cluster with --state-dir, per-worker loopback proxies, and fault injection."""
 
@@ -2983,10 +3000,10 @@ class SoakCluster(EnduranceCluster):
                 if isinstance(listed, list):
                     connected_names = set()
                     for item in listed:
-                        tags = item.get("tags") or []
-                        state = next((t.split(":", 1)[1] for t in tags if str(t).startswith("state:")), "connected")
-                        if state == "connected":
-                            connected_names.add(item.get("name"))
+                        if is_worker_entry_connected(item):
+                            name = item.get("name")
+                            if name:
+                                connected_names.add(str(name))
                     if want.issubset(connected_names):
                         return
             time.sleep(0.15)
@@ -3041,6 +3058,26 @@ class SoakCluster(EnduranceCluster):
     def cut_worker_link(self, idx: int, pause_s: float) -> None:
         if 0 <= idx < len(self.proxies):
             self.proxies[idx].cut_links(pause_s=pause_s)
+
+    def mark_soak_started(self, soak_t0: float) -> None:
+        return None
+
+    def remote_worker_metadata(self) -> List[Dict[str, Any]]:
+        return []
+
+    def collect_remote_idle_and_samples(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {}
+
+    def restart_worker_fault(self, idx: int, down_s: float) -> Tuple[int, int]:
+        wi = int(idx)
+        old_pid = self.kill_worker(wi)
+        if old_pid <= 0:
+            raise RuntimeError("worker_kill worker%d had no live PID" % wi)
+        time.sleep(float(down_s))
+        new_pid = self.start_worker(wi)
+        if new_pid <= 0:
+            raise RuntimeError("worker_kill worker%d failed to restart" % wi)
+        return old_pid, new_pid
 
     def stop_master(self, reason: str) -> Optional[Dict[str, Any]]:
         assert self.state_dir is not None
@@ -4271,15 +4308,17 @@ def _save_or_print_record(
     hw: Dict[str, Any],
     no_write: bool,
     work_root: str,
+    extra_forbidden: Iterable[str] = (),
 ) -> bool:
+    forbidden = [work_root] + [tok for tok in extra_forbidden if tok]
     quarantined = False
     if no_write:
         text = json.dumps(record, indent=2) + "\n"
-        assert_record_private(text, forbidden=[work_root])
+        assert_record_private(text, forbidden=forbidden)
         print(text)
     else:
         target = out_path or result_path(os.path.join(HERE, "results"), started, default_link, os_facts, hw)
-        write_res = write_record(target, record, forbidden=[work_root])
+        write_res = write_record(target, record, forbidden=forbidden)
         quarantined = bool(write_res["quarantined"])
         if quarantined:
             print("quarantined", write_res["path"], flush=True)
@@ -4311,13 +4350,22 @@ def validate_transfer_args(args: argparse.Namespace) -> None:
 
 
 def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
-    """Validate and parse TEST-25 step 1 soak CLI parameters."""
+    """Validate and parse TEST-25 soak CLI parameters (local loopback or `--master-only`)."""
+    master_only = bool(getattr(args, "master_only", False))
     link = (getattr(args, "link", None) or "").strip().lower()
-    if link != "loopback":
+    if master_only:
+        allowed_links = ("loopback", "lan-tcp", "lan-quic", "quic-relay")
+        if link not in allowed_links:
+            raise ValueError(
+                "--link for soak --master-only must be one of %s (got %r)"
+                % (", ".join(allowed_links), getattr(args, "link", None))
+            )
+    elif link != "loopback":
         raise ValueError(
-            "only --link loopback is supported in TEST-25 step 1 (got --link %r; multi-machine soak runs in step 2)"
+            "only --link loopback is supported without --master-only (got --link %r)"
             % getattr(args, "link", None)
         )
+
     duration_s = parse_duration_seconds(args.duration)
     sample_interval_s = parse_duration_seconds(args.sample_interval)
     fault_scale = float(args.fault_scale)
@@ -4341,7 +4389,10 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--blob-store-mb must be >= 64 (got %d)" % blob_store_mb)
     if blob_cache_mb < 32:
         raise ValueError("--blob-cache-mb must be >= 32 (got %d)" % blob_cache_mb)
-    return {
+
+    out: Dict[str, Any] = {
+        "master_only": master_only,
+        "link": link,
         "duration_s": duration_s,
         "sample_interval_s": sample_interval_s,
         "fault_scale": fault_scale,
@@ -4351,6 +4402,69 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
         "max_queue_size": max_queue_size,
         "blob_store_mb": blob_store_mb,
         "blob_cache_mb": blob_cache_mb,
+    }
+    if master_only:
+        sec_path, _sec_txt = remote_soak.load_secret_file(getattr(args, "secret_file", "") or "")
+        master_listen = str(getattr(args, "master_listen", "127.0.0.1:0") or "127.0.0.1:0").strip()
+        control_listen = str(getattr(args, "control_listen", "127.0.0.1:0") or "127.0.0.1:0").strip()
+        remote_soak.parse_host_port(master_listen, default_port=0)
+        remote_soak.parse_host_port(control_listen, default_port=0)
+        register_timeout_s = parse_duration_seconds(getattr(args, "register_timeout", "10m") or "10m")
+        raw_expect = str(getattr(args, "expect_workers", "") or "").strip()
+        expect_workers: List[str] = []
+        if raw_expect:
+            for item in raw_expect.split(","):
+                tok = item.strip()
+                if not tok:
+                    raise ValueError("--expect-workers must not contain empty names")
+                expect_workers.append(remote_soak.validate_worker_name(tok))
+            if len(set(expect_workers)) != len(expect_workers):
+                raise ValueError("--expect-workers names must be unique")
+            if len(expect_workers) != workers:
+                raise ValueError(
+                    "--expect-workers count (%d) must match --workers (%d)" % (len(expect_workers), workers)
+                )
+        out.update(
+            {
+                "secret_file": sec_path,
+                "master_listen": master_listen,
+                "control_listen": control_listen,
+                "register_timeout_s": register_timeout_s,
+                "expect_workers": expect_workers,
+            }
+        )
+    return out
+
+
+def validate_worker_agent_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Validate `worker-agent` CLI arguments."""
+    name = remote_soak.validate_worker_name(str(getattr(args, "name", "") or ""))
+    sec_path, _sec_txt = remote_soak.load_secret_file(getattr(args, "secret_file", "") or "")
+    master_addr = str(getattr(args, "master", "") or "").strip()
+    control_addr = str(getattr(args, "control", "") or "").strip()
+    remote_soak.parse_host_port(master_addr, default_port=8088)
+    remote_soak.parse_host_port(control_addr, default_port=18501)
+    slots = int(getattr(args, "slots", 4))
+    blob_cache_mb = int(getattr(args, "blob_cache_mb", 2048))
+    if slots < 1:
+        raise ValueError("--slots must be >= 1 (got %d)" % slots)
+    if blob_cache_mb < 32:
+        raise ValueError("--blob-cache-mb must be >= 32 (got %d)" % blob_cache_mb)
+    sample_interval_s = parse_duration_seconds(getattr(args, "sample_interval", "60s") or "60s")
+    connect_timeout_s = parse_duration_seconds(getattr(args, "connect_timeout", "10m") or "10m")
+    poll_interval_s = float(getattr(args, "poll_interval", 1.0))
+    if not math.isfinite(poll_interval_s) or poll_interval_s <= 0.0:
+        raise ValueError("--poll-interval must be positive (got %r)" % getattr(args, "poll_interval", None))
+    return {
+        "name": name,
+        "secret_file": sec_path,
+        "master": master_addr,
+        "control": control_addr,
+        "slots": slots,
+        "blob_cache_mb": blob_cache_mb,
+        "sample_interval_s": sample_interval_s,
+        "connect_timeout_s": connect_timeout_s,
+        "poll_interval_s": poll_interval_s,
     }
 
 
@@ -4423,7 +4537,7 @@ def _run_async_soak_task(
     status_str = ""
     res: Optional[subprocess.CompletedProcess] = None
     parsed: Optional[Dict[str, Any]] = None
-    max_attempts = 1 if kind == "queue_burst" else 3
+    max_attempts = 1 if kind == "queue_burst" else SOAK_QUEUE_FULL_MAX_ATTEMPTS
     try:
         for attempt in range(max_attempts):
             cluster.enter_submit(timeout=60.0)
@@ -4436,13 +4550,13 @@ def _run_async_soak_task(
             status_str = str((parsed or {}).get("status") or "").lower()
             if res.returncode == 0 and tid and status_str == "submitted":
                 break
-            err_field = str((parsed or {}).get("error") or "")
+            err_field = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
             if (
                 kind != "queue_burst"
                 and attempt + 1 < max_attempts
                 and is_queue_full_error(err_field)
             ):
-                time.sleep(2.5)
+                time.sleep(SOAK_QUEUE_FULL_BACKOFF_S)
                 continue
             break
 
@@ -4453,7 +4567,7 @@ def _run_async_soak_task(
                 or (res.stdout if res else "")
                 or ("exit %d" % (res.returncode if res else -1))
             )
-            cleaned = redact_text(str(msg).strip(), [work_root])
+            cleaned = _redact_for_cluster(cluster, work_root, str(msg).strip())
             rc = res.returncode if res else None
             if classify_soak_submit_error(kind, cleaned, rc) == "refusal":
                 ledger.record_submit_refusal(kind, cleaned)
@@ -4492,7 +4606,7 @@ def _run_cancel_soak_task(
     parsed: Optional[Dict[str, Any]] = None
     tid = ""
     status_str = ""
-    for attempt in range(3):
+    for attempt in range(SOAK_QUEUE_FULL_MAX_ATTEMPTS):
         cluster.enter_submit(timeout=60.0)
         try:
             res = cluster.run_client(["submit", "--json"] + cmd_args, timeout=30.0)
@@ -4503,9 +4617,9 @@ def _run_cancel_soak_task(
         status_str = str((parsed or {}).get("status") or "").lower()
         if res.returncode == 0 and tid and status_str == "submitted":
             break
-        err_field = str((parsed or {}).get("error") or "")
-        if attempt + 1 < 3 and is_queue_full_error(err_field):
-            time.sleep(2.5)
+        err_field = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
+        if attempt + 1 < SOAK_QUEUE_FULL_MAX_ATTEMPTS and is_queue_full_error(err_field):
+            time.sleep(SOAK_QUEUE_FULL_BACKOFF_S)
             continue
         break
 
@@ -4516,7 +4630,7 @@ def _run_cancel_soak_task(
             or (res.stdout if res else "")
             or ("exit %d" % (res.returncode if res else -1))
         )
-        ledger.record_submit_failure("cancel", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
+        ledger.record_submit_failure("cancel", _redact_for_cluster(cluster, work_root, str(msg).strip()), rc=(res.returncode if res else None))
         return
 
     ledger.record_submit(
@@ -4579,7 +4693,7 @@ def _run_output_soak_task(
     res: Optional[subprocess.CompletedProcess] = None
     parsed: Optional[Dict[str, Any]] = None
     tid = ""
-    for attempt in range(3):
+    for attempt in range(SOAK_QUEUE_FULL_MAX_ATTEMPTS):
         cluster.enter_submit(timeout=60.0)
         try:
             res = cluster.run_client(cmd_args, timeout=600.0)
@@ -4589,9 +4703,9 @@ def _run_output_soak_task(
         tid = str((parsed or {}).get("task_id") or "")
         if tid:
             break
-        err_field = str((parsed or {}).get("error") or "")
-        if attempt + 1 < 3 and is_queue_full_error(err_field):
-            time.sleep(2.5)
+        err_field = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
+        if attempt + 1 < SOAK_QUEUE_FULL_MAX_ATTEMPTS and is_queue_full_error(err_field):
+            time.sleep(SOAK_QUEUE_FULL_BACKOFF_S)
             continue
         break
 
@@ -4602,7 +4716,7 @@ def _run_output_soak_task(
             or (res.stdout if res else "")
             or ("exit %d" % (res.returncode if res else -1))
         )
-        ledger.record_submit_failure("output", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
+        ledger.record_submit_failure("output", _redact_for_cluster(cluster, work_root, str(msg).strip()), rc=(res.returncode if res else None))
         shutil.rmtree(out_dir, ignore_errors=True)
         return
 
@@ -4625,7 +4739,26 @@ def _run_output_soak_task(
     shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, Any]) -> Dict[str, Any]:
+def _self_module() -> Any:
+    mod = sys.modules.get(__name__)
+    if mod is None:
+        import types
+        mod = types.SimpleNamespace(**globals())
+    return mod
+
+
+def _redact_for_cluster(cluster: Any, work_root: str, text: str) -> str:
+    extra = list(getattr(cluster, "forbidden_secrets", ()) or ())
+    return redact_text(text, [work_root] + extra)
+
+
+def run_soak(
+    args: argparse.Namespace,
+    work_root: str,
+    parsed_params: Dict[str, Any],
+    *,
+    extra_forbidden_out: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     duration_s = float(parsed_params["duration_s"])
     sample_interval_s = float(parsed_params["sample_interval_s"])
     fault_scale = float(parsed_params["fault_scale"])
@@ -4669,19 +4802,43 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
     verify_re = re.compile(r"VERIFY_OK\s+\d+\s+([0-9a-f]{64})")
     ws_re = re.compile(r"WS_OK\s+([0-9a-f]{64})")
 
-    cluster = SoakCluster(
-        args.bin,
-        os.path.join(sc_dir, "cluster"),
-        workers=n_workers,
-        slots=slots,
-        blob_store_mb=blob_store_mb,
-        blob_cache_mb=blob_cache_mb,
-        max_queue_size=max_queue_size,
-        workspaces=workspaces,
-        session_resume_hold_secs=args.session_resume_hold_secs,
-        rate_mbps=args.rate_mbps,
-        delay_ms=args.delay_ms,
-    )
+    if parsed_params.get("master_only"):
+        cluster = remote_soak.create_remote_soak_cluster(
+            _self_module(),
+            binary=args.bin,
+            workdir=os.path.join(sc_dir, "cluster"),
+            workers=n_workers,
+            slots=slots,
+            blob_store_mb=blob_store_mb,
+            blob_cache_mb=blob_cache_mb,
+            max_queue_size=max_queue_size,
+            workspaces=workspaces,
+            session_resume_hold_secs=args.session_resume_hold_secs,
+            master_listen=parsed_params["master_listen"],
+            control_listen=parsed_params["control_listen"],
+            secret_file=parsed_params["secret_file"],
+            expect_workers=parsed_params.get("expect_workers") or None,
+            register_timeout_s=float(parsed_params["register_timeout_s"]),
+            sample_interval_s=sample_interval_s,
+            master_port_file=getattr(args, "master_port_file", None),
+            control_port_file=getattr(args, "control_port_file", None),
+        )
+    else:
+        cluster = SoakCluster(
+            args.bin,
+            os.path.join(sc_dir, "cluster"),
+            workers=n_workers,
+            slots=slots,
+            blob_store_mb=blob_store_mb,
+            blob_cache_mb=blob_cache_mb,
+            max_queue_size=max_queue_size,
+            workspaces=workspaces,
+            session_resume_hold_secs=args.session_resume_hold_secs,
+            rate_mbps=args.rate_mbps,
+            delay_ms=args.delay_ms,
+        )
+    if extra_forbidden_out is not None:
+        extra_forbidden_out.extend(list(getattr(cluster, "forbidden_secrets", ()) or ()))
 
     sampler: Optional[BackgroundSampler] = None
     probe_stop = threading.Event()
@@ -4690,7 +4847,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
     soak_t0 = time.monotonic()
 
     def _run_probe_once() -> None:
-        max_attempts = 3
+        max_attempts = SOAK_QUEUE_FULL_MAX_ATTEMPTS
         res: Optional[subprocess.CompletedProcess] = None
         dt_ms = 0.0
         t_now = round(time.monotonic() - soak_t0, 2)
@@ -4715,7 +4872,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                 break
             err_msg = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
             if is_queue_full_error(err_msg) and attempt + 1 < max_attempts:
-                time.sleep(2.5)
+                time.sleep(SOAK_QUEUE_FULL_BACKOFF_S)
                 continue
             break
 
@@ -4729,7 +4886,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
             ledger.record_result(tid, outcome="ok" if ok else "failed")
         else:
             msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
-            ledger.record_submit_failure("probe", redact_text(str(msg).strip(), [work_root]), rc=res.returncode)
+            ledger.record_submit_failure("probe", _redact_for_cluster(cluster, work_root, str(msg).strip()), rc=res.returncode)
         with probe_lock:
             probe_samples.append({"t_s": t_now, "latency_ms": dt_ms, "ok": bool(ok), "rc": res.returncode})
 
@@ -4833,7 +4990,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                 parsed = None
                 tid = ""
                 status_str = ""
-                for attempt in range(3):
+                for attempt in range(SOAK_QUEUE_FULL_MAX_ATTEMPTS):
                     cluster.enter_submit(timeout=60.0)
                     try:
                         res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
@@ -4844,9 +5001,9 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                     status_str = str((parsed or {}).get("status") or "").lower()
                     if res.returncode == 0 and tid and status_str == "submitted":
                         break
-                    err_field = str((parsed or {}).get("error") or "")
-                    if attempt + 1 < 3 and is_queue_full_error(err_field):
-                        time.sleep(2.5)
+                    err_field = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
+                    if attempt + 1 < SOAK_QUEUE_FULL_MAX_ATTEMPTS and is_queue_full_error(err_field):
+                        time.sleep(SOAK_QUEUE_FULL_BACKOFF_S)
                         continue
                     break
             if res is None or res.returncode != 0 or not tid or status_str != "submitted":
@@ -4856,7 +5013,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                     or (res.stdout if res else "")
                     or ("exit %d" % (res.returncode if res else -1))
                 )
-                ledger.record_submit_failure("workspace_sync", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
+                ledger.record_submit_failure("workspace_sync", _redact_for_cluster(cluster, work_root, str(msg).strip()), rc=(res.returncode if res else None))
                 return
             ledger.record_submit(tid, expected_hash=exp_sha, expected_outcome="ok", kind="workspace_sync")
             outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=300.0)
@@ -4874,13 +5031,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         try:
             if fkind == "worker_kill":
                 wi = int(widx)
-                old_pid = cluster.kill_worker(wi)
-                if old_pid <= 0:
-                    raise RuntimeError("worker_kill worker%d had no live PID" % wi)
-                time.sleep(float(ev["down_s"]))
-                new_pid = cluster.start_worker(wi)
-                if new_pid <= 0:
-                    raise RuntimeError("worker_kill worker%d failed to restart" % wi)
+                old_pid, new_pid = cluster.restart_worker_fault(wi, float(ev["down_s"]))
                 t_end = round(time.monotonic() - soak_t0, 2)
                 entry = {
                     "kind": "worker_kill",
@@ -4980,7 +5131,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                 "t_s": t_start,
                 "end_s": t_err,
                 "worker_index": widx,
-                "error": redact_text(str(exc), [work_root]),
+                "error": _redact_for_cluster(cluster, work_root, str(exc)),
             }
             with fault_lock:
                 fault_errors.append(err_entry)
@@ -4993,6 +5144,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
     try:
         cluster.start()
         soak_t0 = time.monotonic()
+        cluster.mark_soak_started(soak_t0)
         sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
         probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
         probe_thread.start()
@@ -5074,6 +5226,10 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
             probe_thread.join(timeout=60.0)
         if sampler is not None and not sampler._stop.is_set():
             samples = sampler.stop()
+        remote_samples = cluster.collect_remote_idle_and_samples()
+        if remote_samples:
+            samples = remote_soak.merge_remote_samples(samples, remote_samples, sample_interval_s)
+        remote_workers_meta = cluster.remote_worker_metadata()
         idle_snap = cluster.idle_disk_snapshot()
         cluster.snapshot_master_task_retries()
     finally:
@@ -5134,7 +5290,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         fault_errors=fault_errors,
         leftover_task_trees=leftover_trees,
     )
-    return {
+    res_out: Dict[str, Any] = {
         "passed": pass_eval["all_passed"],
         "actual_duration_s": actual_duration_s,
         "fault_plan": fault_plan,
@@ -5151,6 +5307,9 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         "resource_summary": BackgroundSampler.summarize(samples),
         "samples": samples,
     }
+    if remote_workers_meta:
+        res_out["remote_workers"] = remote_workers_meta
+    return res_out
 
 
 def cmd_transfer(args: argparse.Namespace) -> int:
@@ -5253,11 +5412,14 @@ def cmd_soak(args: argparse.Namespace) -> int:
     largest_bytes = max(100 * MIB, int(round(100 * MIB * min(1.0, parsed_params["load_scale"]))))
     work_root, disk_check = _prepare_work_root(args.work_dir, largest_bytes, keep_workdir=args.keep_workdir)
     meta = _collect_env_metadata(binary, args.rtt_ms, args.link)
+    extra_forbidden: List[str] = []
 
     try:
         print(
-            "[soak] starting duration=%.1fs fault_scale=%s load_scale=%s workers=%d slots=%d max_queue=%d"
+            "[soak] starting master_only=%s link=%s duration=%.1fs fault_scale=%s load_scale=%s workers=%d slots=%d max_queue=%d"
             % (
+                parsed_params["master_only"],
+                parsed_params["link"],
                 parsed_params["duration_s"],
                 parsed_params["fault_scale"],
                 parsed_params["load_scale"],
@@ -5267,12 +5429,35 @@ def cmd_soak(args: argparse.Namespace) -> int:
             ),
             flush=True,
         )
-        soak_res = run_soak(args, work_root, parsed_params)
+        soak_res = run_soak(args, work_root, parsed_params, extra_forbidden_out=extra_forbidden)
     finally:
         if not args.keep_workdir:
             shutil.rmtree(work_root, ignore_errors=True)
 
-    record = {
+    remote_workers = soak_res.pop("remote_workers", None)
+    params_record: Dict[str, Any] = {
+        "seed": int(args.seed),
+        "duration": str(args.duration),
+        "duration_s": float(parsed_params["duration_s"]),
+        "fault_scale": float(parsed_params["fault_scale"]),
+        "load_scale": float(parsed_params["load_scale"]),
+        "sample_interval_s": float(parsed_params["sample_interval_s"]),
+        "workers": int(parsed_params["workers"]),
+        "slots": int(parsed_params["slots"]),
+        "workspaces": bool(args.workspaces),
+        "max_queue_size": int(parsed_params["max_queue_size"]),
+        "blob_store_mb": int(parsed_params["blob_store_mb"]),
+        "blob_cache_mb": int(parsed_params["blob_cache_mb"]),
+        "session_resume_hold_secs": args.session_resume_hold_secs,
+        "rate_mbps": args.rate_mbps,
+        "delay_ms": float(args.delay_ms),
+    }
+    if parsed_params.get("master_only"):
+        params_record["master_only"] = True
+        if parsed_params.get("expect_workers"):
+            params_record["expect_workers"] = list(parsed_params["expect_workers"])
+
+    record: Dict[str, Any] = {
         "benchmark": "TEST-25 soak endurance suite",
         "date_utc": meta["started"].strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git": meta["git"],
@@ -5283,23 +5468,7 @@ def cmd_soak(args: argparse.Namespace) -> int:
         "power": power_state(),
         "python": platform.python_version(),
         "link": args.link,
-        "parameters": {
-            "seed": int(args.seed),
-            "duration": str(args.duration),
-            "duration_s": float(parsed_params["duration_s"]),
-            "fault_scale": float(parsed_params["fault_scale"]),
-            "load_scale": float(parsed_params["load_scale"]),
-            "sample_interval_s": float(parsed_params["sample_interval_s"]),
-            "workers": int(parsed_params["workers"]),
-            "slots": int(parsed_params["slots"]),
-            "workspaces": bool(args.workspaces),
-            "max_queue_size": int(parsed_params["max_queue_size"]),
-            "blob_store_mb": int(parsed_params["blob_store_mb"]),
-            "blob_cache_mb": int(parsed_params["blob_cache_mb"]),
-            "session_resume_hold_secs": args.session_resume_hold_secs,
-            "rate_mbps": args.rate_mbps,
-            "delay_ms": float(args.delay_ms),
-        },
+        "parameters": params_record,
         "measured_rtt_ms": meta["loopback_rtt_ms"],
         "disk_check": disk_check,
         "verification_note": (
@@ -5307,10 +5476,12 @@ def cmd_soak(args: argparse.Namespace) -> int:
             "or workspace marker files and check SHA-256 independently of the code under test; oxideswarm computes and verifies "
             "BLAKE3 in Master BlobStore and Worker BlobCache."
         ),
-        "note": redact_text(args.label, [work_root]),
+        "note": redact_text(args.label, [work_root] + extra_forbidden),
         "all_passed": bool(soak_res["passed"]),
         "soak": soak_res,
     }
+    if remote_workers:
+        record["remote_workers"] = remote_workers
 
     dur_label = "soak-%s-%s" % (_slug(str(args.duration)), args.link)
     quarantined = _save_or_print_record(
@@ -5322,12 +5493,53 @@ def cmd_soak(args: argparse.Namespace) -> int:
         hw=meta["hw"],
         no_write=args.no_write,
         work_root=work_root,
+        extra_forbidden=extra_forbidden,
     )
     for cname, cval in soak_res["pass_checks"].items():
         print("  %-20s %s" % (cname, "PASS" if cval.get("passed") else "FAIL"), flush=True)
     if quarantined:
         return 2
     return 0 if record["all_passed"] else 1
+
+
+def cmd_worker_agent(args: argparse.Namespace) -> int:
+    try:
+        parsed = validate_worker_agent_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    agent = remote_soak.WorkerAgent(
+        _self_module(),
+        binary=args.bin,
+        master_addr=parsed["master"],
+        control_addr=parsed["control"],
+        secret_file=parsed["secret_file"],
+        name=parsed["name"],
+        slots=parsed["slots"],
+        workspaces=bool(args.workspaces),
+        blob_cache_mb=parsed["blob_cache_mb"],
+        sample_interval_s=parsed["sample_interval_s"],
+        rate_mbps=args.rate_mbps,
+        delay_ms=float(args.delay_ms),
+        work_dir=args.work_dir,
+        keep_workdir=bool(args.keep_workdir),
+        poll_interval_s=parsed["poll_interval_s"],
+        connect_timeout_s=parsed["connect_timeout_s"],
+    )
+
+    def _on_sig(_signum: int, _frame: Any) -> None:
+        agent.request_stop()
+
+    prev_int = signal.signal(signal.SIGINT, _on_sig)
+    prev_term = None
+    if hasattr(signal, "SIGTERM"):
+        prev_term = signal.signal(signal.SIGTERM, _on_sig)
+    try:
+        return agent.run()
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        if prev_term is not None and hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, prev_term)
 
 
 def cmd_throttle(args: argparse.Namespace) -> int:
@@ -5471,12 +5683,42 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--delay-ms", type=float, default=0.0, help="Optional per-worker ThrottleProxy RTT delay in ms")
     sk.add_argument("--work-dir", help="Base directory for temporary stores, state dirs, and payloads")
     sk.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
-    sk.add_argument("--link", default="loopback", help="Link label (loopback only in step 1)")
+    sk.add_argument("--link", default="loopback", help="Link label (loopback locally; loopback|lan-tcp|lan-quic|quic-relay with --master-only)")
     sk.add_argument("--rtt-ms", type=float, help="Measured link RTT in ms")
     sk.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base PRNG seed")
     sk.add_argument("--out", help="Output JSON record path")
     sk.add_argument("--no-write", action="store_true", help="Print JSON record instead of writing file")
     sk.add_argument("--label", default="", help="Free-text note stored in the record")
+    sk.add_argument("--master-only", action="store_true", help="Run master/load/control plane only and wait for remote worker-agent nodes")
+    sk.add_argument("--master-listen", default="127.0.0.1:0", help="Master grid bind address HOST:PORT with --master-only")
+    sk.add_argument("--master-port-file", help="Optional path to write connectable master HOST:PORT")
+    sk.add_argument("--control-listen", default="127.0.0.1:0", help="Authenticated control HTTP bind address HOST:PORT with --master-only")
+    sk.add_argument("--control-port-file", help="Optional path to write connectable control HOST:PORT")
+    sk.add_argument("--secret-file", help="Run cluster secret file path (required with --master-only)")
+    sk.add_argument("--expect-workers", help="Comma-separated expected remote worker names (order matches fault rotation)")
+    sk.add_argument("--register-timeout", default="10m", help="How long to wait for remote worker-agent registration (default 10m)")
+
+    wa = sub.add_parser("worker-agent", help="Run a remote soak worker agent for `soak --master-only` (D4.3)")
+    wa.add_argument("--bin", default=default_bin, help="Path to built oxideswarm binary")
+    wa.add_argument("--master", required=True, help="Master grid HOST:PORT")
+    wa.add_argument("--control", required=True, help="Master soak control server HOST:PORT")
+    wa.add_argument("--secret-file", required=True, help="Run cluster secret file path (never pass raw secrets on CLI)")
+    wa.add_argument("--name", required=True, help="Worker node name (matches --expect-workers on master)")
+    wa.add_argument("--slots", type=int, default=4, help="Execution slots on this worker")
+    wa.add_argument(
+        "--workspaces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable persistent worker workspaces (default: on)",
+    )
+    wa.add_argument("--blob-cache-mb", type=int, default=2048, help="Worker --blob-cache-mb cap")
+    wa.add_argument("--sample-interval", default="60s", help="Local process/disk sample interval (default 60s)")
+    wa.add_argument("--rate-mbps", type=float, help="Optional local ThrottleProxy bandwidth cap in Mbit/s")
+    wa.add_argument("--delay-ms", type=float, default=0.0, help="Optional local ThrottleProxy RTT delay in ms")
+    wa.add_argument("--work-dir", help="Private worker-agent base directory (outside AppData and ~/.oxideswarm)")
+    wa.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
+    wa.add_argument("--poll-interval", type=float, default=1.0, help="Control-channel poll interval in seconds")
+    wa.add_argument("--connect-timeout", default="10m", help="Initial control registration timeout (default 10m)")
 
     th = sub.add_parser("throttle", help="Run loopback TCP throttle proxy (127.0.0.1 only)")
     th.add_argument("--listen", default="127.0.0.1:0", help="Listen address (127.0.0.1:PORT)")
@@ -5505,6 +5747,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_transfer(args)
     if args.subcommand == "soak":
         return cmd_soak(args)
+    if args.subcommand == "worker-agent":
+        return cmd_worker_agent(args)
     if args.subcommand == "throttle":
         return cmd_throttle(args)
     if args.subcommand == "sample":
