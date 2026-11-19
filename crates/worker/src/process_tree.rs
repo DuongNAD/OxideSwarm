@@ -425,6 +425,40 @@ mod imp {
         pub(super) cgroup_leaf: Option<CgroupLeaf>,
     }
 
+    impl PreparedUnix {
+        #[cfg(test)]
+        pub(super) fn lifeline_read(&self) -> Option<&OwnedFd> {
+            self.lifeline_read.as_ref()
+        }
+    }
+
+    impl Drop for PreparedUnix {
+        fn drop(&mut self) {
+            // If the command was dropped without `ProcessTree::attach` taking `lifeline_write`
+            // (for example when `cmd.spawn()` failed after `pre_exec` forked the detached
+            // supervisor), dismiss the supervisor with `b"0"` instead of letting EOF look like a
+            // worker crash and trigger `killpg` / a process-table sweep.
+            if let Some(w) = self.lifeline_write.take() {
+                dismiss_lifeline(w);
+            }
+        }
+    }
+
+    /// Writes the one-byte dismissal marker (`b"0"`) to the lifeline pipe write end and closes it
+    /// so the detached supervisor exits without signalling `task_pgid` or sweeping processes.
+    pub(super) fn dismiss_lifeline(write_fd: OwnedFd) {
+        // SAFETY: `write_fd` owns the open write end of the lifeline pipe and lives across the
+        // call; the buffer is a 1-byte static slice and the length is 1.
+        unsafe {
+            let _ = libc::write(
+                write_fd.as_raw_fd(),
+                b"0".as_ptr().cast::<libc::c_void>(),
+                1,
+            );
+        }
+        drop(write_fd);
+    }
+
     /// Metadata of an active Unix task tree stored in [`super::LIVE`] so signal handlers and
     /// [`super::ProcessTree::kill`] can terminate both the process group and any `setsid()`
     /// survivors without heap allocation.
@@ -652,7 +686,13 @@ mod imp {
         }
         if procs_fd >= 0 && libc::lseek(procs_fd, 0, libc::SEEK_SET) >= 0 {
             let mut buf = [0u8; 4096];
-            let n = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+            let n = loop {
+                let r = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+                if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break r;
+            };
             if n > 0 {
                 let mut pid: libc::pid_t = 0;
                 let mut has_digit = false;
@@ -845,12 +885,18 @@ mod imp {
         let mut dir_buf = [0u8; 4096];
         let mut env_buf = [0u8; 4096];
         loop {
-            let nread = libc::syscall(
-                libc::SYS_getdents64,
-                proc_fd,
-                dir_buf.as_mut_ptr().cast::<libc::c_void>(),
-                dir_buf.len(),
-            );
+            let nread = loop {
+                let n = libc::syscall(
+                    libc::SYS_getdents64,
+                    proc_fd,
+                    dir_buf.as_mut_ptr().cast::<libc::c_void>(),
+                    dir_buf.len(),
+                );
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break n;
+            };
             if nread <= 0 {
                 break;
             }
@@ -895,10 +941,17 @@ mod imp {
                 path_buf[6..6 + dec_len].copy_from_slice(&dec[..dec_len]);
                 path_buf[6 + dec_len..6 + dec_len + 9].copy_from_slice(b"/environ\0");
 
-                let env_fd = libc::open(
-                    path_buf.as_ptr().cast::<libc::c_char>(),
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                );
+                let env_fd = loop {
+                    let fd = libc::open(
+                        path_buf.as_ptr().cast::<libc::c_char>(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    break fd;
+                };
                 if env_fd < 0 {
                     continue;
                 }
@@ -913,11 +966,19 @@ mod imp {
                 let mut carry = 0usize;
                 let mut first_chunk = true;
                 loop {
-                    let r = libc::read(
-                        env_fd,
-                        env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
-                        env_buf.len() - carry,
-                    );
+                    let r = loop {
+                        let n = libc::read(
+                            env_fd,
+                            env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
+                            env_buf.len() - carry,
+                        );
+                        if n < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                            continue;
+                        }
+                        break n;
+                    };
                     if r <= 0 {
                         break;
                     }
@@ -1555,13 +1616,7 @@ impl TreeInner {
         #[cfg(unix)]
         if let Ok(mut lifeline) = self.lifeline_write.lock() {
             if let Some(w) = lifeline.take() {
-                use std::os::unix::io::AsRawFd;
-                // SAFETY: `w` owns the open write end of the lifeline pipe and lives across the
-                // call; the buffer is a 1-byte static string and the length is 1.
-                unsafe {
-                    let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
-                }
-                drop(w);
+                imp::dismiss_lifeline(w);
             }
         }
     }
@@ -2082,5 +2137,160 @@ mod tests {
             0,
             "forked child exit code (1=returned false, 2=kept fd closed, 3=extra fd still open)"
         );
+    }
+
+    /// BUG-33 / TEST-61: proves that `close_open_fds_macos` (on macOS) and `close_fds_except` in
+    /// the detached lifeline supervisor never touch the task child's stdout pipe or race with
+    /// concurrent short-lived spawns even with extra elevated open descriptors in the worker.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (probe_read, probe_write) = imp::create_lifeline_pipe().expect("create extra fd pipe");
+        let mut extra_fds: Vec<OwnedFd> = Vec::with_capacity(64);
+        for _ in 0..64 {
+            // SAFETY: `probe_write` is an open descriptor owned by this test; `F_DUPFD_CLOEXEC`
+            // creates an independent close-on-exec duplicate with no pointer argument.
+            let raw = unsafe { libc::fcntl(probe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                raw >= 0,
+                "F_DUPFD_CLOEXEC failed after {} extras: {}",
+                extra_fds.len(),
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+            extra_fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+
+        let mut workers = Vec::with_capacity(8);
+        for worker_idx in 0..8usize {
+            workers.push(tokio::spawn(async move {
+                for iter in 0..16usize {
+                    let mut cmd = tokio::process::Command::new("/bin/sh");
+                    cmd.args([
+                        "-c",
+                        r#"printf 'TASK_%s_%s\nEND\n' "$1" "$2""#,
+                        "sh",
+                        &worker_idx.to_string(),
+                        &iter.to_string(),
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+
+                    let mut prepared = configure_command(
+                        &mut cmd,
+                        ProcessPriority::Normal,
+                        rusty_grid_core::TaskId::new(),
+                    );
+                    let mut child = prepared.spawn(&mut cmd).expect("spawn /bin/sh");
+                    let tree = prepared.attach(&child);
+                    assert!(tree.is_tracked(), "Unix task must attach to a ProcessTree");
+
+                    let mut stdout = child.stdout.take().expect("piped stdout");
+                    let mut stderr = child.stderr.take().expect("piped stderr");
+                    let out_handle = tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        stdout.read_to_end(&mut buf).await.map(|_| buf)
+                    });
+                    let err_handle = tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        stderr.read_to_end(&mut buf).await.map(|_| buf)
+                    });
+
+                    let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+                        .await
+                        .expect("child exit timeout")
+                        .expect("wait on child");
+                    let out_bytes = tokio::time::timeout(Duration::from_secs(60), out_handle)
+                        .await
+                        .expect("stdout drain timeout")
+                        .expect("stdout reader join")
+                        .expect("stdout read");
+                    let err_bytes = tokio::time::timeout(Duration::from_secs(60), err_handle)
+                        .await
+                        .expect("stderr drain timeout")
+                        .expect("stderr reader join")
+                        .expect("stderr read");
+                    tree.kill_async(None).await;
+
+                    let expected = format!("TASK_{worker_idx}_{iter}\nEND\n");
+                    let got = String::from_utf8_lossy(&out_bytes);
+                    let err_text = String::from_utf8_lossy(&err_bytes);
+                    assert!(
+                        status.success(),
+                        "worker {worker_idx} iter {iter} failed ({status:?}): stdout={got:?} stderr={err_text:?}"
+                    );
+                    assert_eq!(
+                        got, expected,
+                        "worker {worker_idx} iter {iter} stdout mismatch (stderr={err_text:?})"
+                    );
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.await.expect("worker task joined");
+        }
+        drop(extra_fds);
+        drop(probe_write);
+        drop(probe_read);
+    }
+
+    /// TEST-61: dropping an unattached `ConfiguredCommand` (`PreparedUnix`, e.g., when
+    /// `cmd.spawn()` fails after `pre_exec` forked the supervisor) writes `b"0"` to the lifeline
+    /// pipe so the supervisor exits cleanly without signalling `task_pgid` or sweeping processes.
+    #[cfg(unix)]
+    #[test]
+    fn test_prepared_unix_drop_dismisses_lifeline_without_attach() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut cmd = tokio::process::Command::new("/nonexistent-oxideswarm-binary-test-61");
+        let prepared = configure_command(
+            &mut cmd,
+            ProcessPriority::Normal,
+            rusty_grid_core::TaskId::new(),
+        );
+        let read_ref = prepared
+            .unix
+            .lifeline_read()
+            .expect("lifeline read fd present before spawn");
+        // SAFETY: `read_ref` is an open pipe descriptor owned by `prepared`; `F_DUPFD_CLOEXEC`
+        // returns an independent duplicate that outlives `prepared`.
+        let dup_raw = unsafe { libc::fcntl(read_ref.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(
+            dup_raw >= 0,
+            "F_DUPFD_CLOEXEC on lifeline read fd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `dup_raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+        let dup_read = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+
+        drop(prepared);
+
+        let mut buf = [0u8; 2];
+        // SAFETY: `dup_read` is open and `buf` is a live 2-byte writable buffer.
+        let n = unsafe { libc::read(dup_read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(
+            n, 1,
+            "dropping unattached PreparedUnix must write 1 dismissal byte (got n={n})"
+        );
+        assert_eq!(buf[0], b'0');
+
+        let mut fail_cmd = tokio::process::Command::new("/nonexistent-oxideswarm-binary-test-61");
+        let mut fail_prepared = configure_command(
+            &mut fail_cmd,
+            ProcessPriority::Normal,
+            rusty_grid_core::TaskId::new(),
+        );
+        let err = fail_prepared
+            .spawn(&mut fail_cmd)
+            .expect_err("nonexistent binary must fail to spawn");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        drop(fail_prepared);
     }
 }
