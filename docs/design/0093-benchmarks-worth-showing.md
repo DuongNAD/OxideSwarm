@@ -238,7 +238,7 @@ names it.
 | BENCH-6 | Two networks | `benchmarks/sweep/`, `doctor --json` | A record with the Mac on a hotspot and the worker on the home LAN, and the same-day LAN control | Planned |
 | BENCH-7 | README headlines; the interconnect report by Q91 | `README.md`, `benchmarks/interconnect/`, `docs/BACKLOG.md` (LAUNCH-4) | The README's first "Measured" rows link to the records of BENCH-3 to BENCH-6; `ox-mode doc` passes | Planned |
 | BENCH-8 | Why BENCH-3 reached 0.73, not 0.85 | `benchmarks/sweep/plans/`, `benchmarks/sweep/results/` | Records that give each cause its share | Implemented (pull request 355) |
-| BENCH-9 | Process time against slot idle time through the grid | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/results/` | Records that split the per-machine cost on both machines | Partial (pull request 354, open) |
+| BENCH-9 | Process time against slot idle time through the grid | `benchmarks/sweep/bench_sweep.py`, `benchmarks/sweep/results/` | Records that split the per-machine cost on both machines | Partial (pull request 354) |
 
 ## Status log
 
@@ -259,7 +259,7 @@ names it.
   master on the same machine, either priority); on the Mac the default task priority costs 0.05 and 0.16 is
   open (BENCH-9). Q93 added. Lesson: other agents' cargo runs on a measuring machine void runs; the harness
   should watch for them (BENCH-9 step 1).
-- 2026-11-18: BENCH-9 Partial (pull request 354, open; harness in `benchmarks/sweep/bench_sweep.py`, record
+- 2026-11-18: BENCH-9 Partial (pull request 354; harness in `benchmarks/sweep/bench_sweep.py`, record
   format 2): grid runs record `task_time_sum_s`, `slot_seconds`, `utilization`, `task_time_missing`, and
   per-worker task counts, means, and medians (succeeded tasks only); local runs record per-level mean and
   median task process time, and a low-rate sampler watches for `cargo` and `rustc` processes during each run
