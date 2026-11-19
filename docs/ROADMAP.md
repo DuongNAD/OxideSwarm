@@ -373,7 +373,7 @@ Goal: the user story works between two real machines. The design record is
 | WS-3 | P2P tickets in `connect_master`, with a `STREAM_CLIENT` stream tag, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients | Implemented (W1, pull request 157; W7, pull requests 170 and 171) |
 | WS-4 | `cargo build --offline` when `Cargo.toml` is present, and a `tool:rustc` worker tag | FEAT-10 | Implemented (W8, pull request 165) |
 | WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout | Implemented (W5, pull request 168). With a workspace, the task timeout defaults to 1800 s |
-| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` | Partial. Several blobs in flight from one client (W9, pull request 160) is merged; compression is out of scope (design 0006) |
+| WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `docs/reference.md` | Partial. Several blobs in flight from one client (W9, pull request 160) is merged; compression is out of scope (design 0006) |
 | WS-7 | A guide in `docs/guides/` for offloading `cargo test` from a coding agent, with a recorded two-machine run | | Implemented. W6 (pull request 174) tests it on Linux, macOS and Windows; W10 (pull request 177) is the [guide](guides/offload-cargo-test.md), with the live run of 2026-11-09 |
 | CACHE-1 | Reuse the result of an identical task, keyed by the command, the environment and the input digests (decision Q7) | Exact repeats of a run | Planned |
 

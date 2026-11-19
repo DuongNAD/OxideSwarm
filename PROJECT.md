@@ -37,7 +37,8 @@ The repository is organized into four layers:
 OxideSwarm/
 ├── Cargo.toml                       # Workspace root (6 member crates)
 ├── Cargo.lock
-├── README.md                        # Overview, install, quick start, CLI and environment reference
+├── README.md                        # Overview, install, quick start
+├── docs/reference.md                # CLI flags, ports, environment variables, platform support, limits
 ├── PROJECT.md                       # Architecture, layout and feature inventory (this file)
 ├── CLAUDE.md                        # Architecture map for AI coding assistants
 ├── docs/ROADMAP.md                  # Direction and order of work (the roadmap)

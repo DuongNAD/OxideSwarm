@@ -984,9 +984,9 @@ fn test_read_mapreduce_script_names_map_cmd_and_reduce_cmd_flags_and_split_unc_p
 }
 
 /// Verifies that every long flag and alias in `Cli::command()` appears inside the
-/// `README.md` reference section (or summary table row) for its own subcommand.
+/// `docs/reference.md` reference section (or summary table row) for its own subcommand.
 #[test]
-fn test_every_cli_long_flag_is_documented_in_readme() {
+fn test_every_cli_long_flag_is_documented_in_reference() {
     use clap::CommandFactory;
 
     fn collect_long_flags(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, bool)>) {
@@ -1015,37 +1015,37 @@ fn test_every_cli_long_flag_is_documented_in_readme() {
     fn section_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
         let s = text
             .find(start)
-            .unwrap_or_else(|| panic!("missing heading in README.md: {start}"));
+            .unwrap_or_else(|| panic!("missing heading in docs/reference.md: {start}"));
         let rest = &text[s..];
         let e = rest
             .find(end)
-            .unwrap_or_else(|| panic!("missing heading in README.md after {start}: {end}"));
+            .unwrap_or_else(|| panic!("missing heading in docs/reference.md after {start}: {end}"));
         &rest[..e]
     }
 
-    let readme = include_str!("../../../../README.md");
+    let reference = include_str!("../../../../docs/reference.md");
     let global_sec = section_between(
-        readme,
+        reference,
         "#### Global Flags",
         "#### `oxideswarm master` Flags",
     );
     let master_sec = section_between(
-        readme,
+        reference,
         "#### `oxideswarm master` Flags",
         "#### `oxideswarm worker` Flags",
     );
     let worker_sec = section_between(
-        readme,
+        reference,
         "#### `oxideswarm worker` Flags",
         "#### `oxideswarm submit` Flags",
     );
     let submit_sec = section_between(
-        readme,
+        reference,
         "#### `oxideswarm submit` Flags",
         "#### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands",
     );
     let subcmd_table_sec = section_between(
-        readme,
+        reference,
         "#### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands",
         "#### `agent-mesh` CLI Subcommands",
     );
@@ -1063,7 +1063,9 @@ fn test_every_cli_long_flag_is_documented_in_readme() {
                 subcmd_table_sec
                     .lines()
                     .find(|line| line.starts_with(&row_prefix))
-                    .unwrap_or_else(|| panic!("missing subcommand row in README.md for `{other}`"))
+                    .unwrap_or_else(|| {
+                        panic!("missing subcommand row in docs/reference.md for `{other}`")
+                    })
             }
         }
     };
@@ -1084,7 +1086,7 @@ fn test_every_cli_long_flag_is_documented_in_readme() {
 
     assert!(
         missing.is_empty(),
-        "Every CLI long flag and alias in Cli::command() must be documented in its subcommand section of README.md; missing:\n{}",
+        "Every CLI long flag and alias in Cli::command() must be documented in its subcommand section of docs/reference.md; missing:\n{}",
         missing.join("\n")
     );
 }

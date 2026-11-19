@@ -28,7 +28,7 @@ Thank you for contributing to OxideSwarm. Before making changes, read [`CLAUDE.m
 5. **Documentation standards (`docs/README.md`)**:
    - Document only what the code currently implements. Use the fixed status vocabulary (`Implemented`, `Partial`, `Planned`, `Design only`).
    - Never commit real LAN IP addresses, hostnames, serial numbers, user paths, or credentials. Use placeholders (`<MASTER_IP>`) or RFC 5737 documentation addresses (`192.0.2.x`, `198.51.100.x`, `203.0.113.x`).
-   - Any change to behaviour, CLI flags, ports, environment variables, or defaults must update `README.md` and include a design record under `docs/design/` in the same pull request.
+   - Any change to behaviour, CLI flags, ports, environment variables, or defaults must update `docs/reference.md` and include a design record under `docs/design/` in the same pull request.
 
 ## 3. Pre-PR Verification Gates
 
