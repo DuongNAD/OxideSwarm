@@ -927,6 +927,7 @@ def evaluate_soak_pass_checks(
     expected_process_roles: Optional[Iterable[str]] = None,
     missing_remote_shutdowns: Optional[Iterable[str]] = None,
     remote_evidence_errors: Optional[List[Dict[str, Any]]] = None,
+    remote_workers: Optional[List[Dict[str, Any]]] = None,
     run_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute all five D3 item 6 pass/fail criteria plus fault completeness over soak telemetry."""
@@ -996,6 +997,17 @@ def evaluate_soak_pass_checks(
             normalized_pids.append(int(item))
     missing_shutdowns = sorted(str(w) for w in (missing_remote_shutdowns or []))
     rem_errors = list(remote_evidence_errors or [])
+    rem_verify_failures: Dict[str, int] = {}
+    for wmeta in (remote_workers or []):
+        if not isinstance(wmeta, dict):
+            continue
+        wname = str(wmeta.get("name") or "<unnamed>")
+        try:
+            sk_v = int(wmeta.get("skipped_polls_verify") or 0)
+        except (TypeError, ValueError):
+            sk_v = 0
+        if sk_v > 0:
+            rem_verify_failures[wname] = max(rem_verify_failures.get(wname, 0), sk_v)
     c5: Dict[str, Any] = {
         "leftover_pids": normalized_pids,
         "leftover_task_trees": trees,
@@ -1016,9 +1028,10 @@ def evaluate_soak_pass_checks(
         and c5["passed"]
         and c6["passed"]
         and (not rem_errors)
+        and (not rem_verify_failures)
         and (run_error is None)
     )
-    return {
+    out: Dict[str, Any] = {
         "all_passed": all_passed,
         "checks": {
             "1_accounting": c1,
@@ -1029,6 +1042,9 @@ def evaluate_soak_pass_checks(
             "6_fault_injection": c6,
         },
     }
+    if rem_verify_failures:
+        out["remote_verify_failures"] = rem_verify_failures
+    return out
 
 
 # ---------------------------------------------------------------- seeded data & verification
@@ -5195,21 +5211,17 @@ def run_soak(
     leftover_trees: List[Dict[str, Any]] = []
     remote_workers_meta: List[Dict[str, Any]] = []
     run_error: Optional[str] = None
+    started = False
+    aborted_base = False
     try:
         cluster.start()
-    except Exception:
-        cluster.stop()
-        if not getattr(args, "keep_workdir", False):
-            shutil.rmtree(sc_dir, ignore_errors=True)
-        raise
+        started = True
+        soak_t0 = time.monotonic()
+        cluster.mark_soak_started(soak_t0)
+        sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
+        probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
+        probe_thread.start()
 
-    soak_t0 = time.monotonic()
-    cluster.mark_soak_started(soak_t0)
-    sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
-    probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
-    probe_thread.start()
-
-    try:
         end_deadline = soak_t0 + duration_s
         next_fault_idx = 0
         minute_idx = 0
@@ -5282,39 +5294,62 @@ def run_soak(
             time.sleep(0.5)
         time.sleep(1.5)
     except Exception as exc:
+        if not started:
+            raise
         run_error = _redact_for_cluster(cluster, work_root, str(exc))
+    except BaseException:
+        aborted_base = True
+        raise
     finally:
         probe_stop.set()
         if probe_thread is not None:
-            probe_thread.join(timeout=60.0)
+            probe_thread.join(timeout=5.0 if aborted_base else 60.0)
         if sampler is not None and not sampler._stop.is_set():
-            samples = sampler.stop()
-        try:
-            remote_samples = cluster.collect_remote_idle_and_samples()
-            if remote_samples:
-                samples = remote_soak.merge_remote_samples(samples, remote_samples, sample_interval_s)
-        except Exception as exc:
-            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
-        try:
-            remote_workers_meta = cluster.remote_worker_metadata()
-        except Exception as exc:
-            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
-        try:
-            idle_snap = cluster.idle_disk_snapshot()
-        except Exception as exc:
-            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
-            idle_snap = {}
-        cluster.snapshot_master_task_retries()
-        cluster.stop()
-        try:
-            master_audit = cluster.audit_master_logs(expected_task_ids=ledger.submitted_task_ids())
-        except Exception as exc:
-            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
-            master_audit = {}
-        leftover = cluster.leftover_pids()
-        leftover_trees = cluster.leftover_process_trees()
-        if not getattr(args, "keep_workdir", False):
-            shutil.rmtree(sc_dir, ignore_errors=True)
+            try:
+                samples = sampler.stop()
+            except Exception as exc:
+                run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+        if (not started) or aborted_base:
+            try:
+                cluster.stop()
+            finally:
+                if not getattr(args, "keep_workdir", False):
+                    shutil.rmtree(sc_dir, ignore_errors=True)
+        else:
+            try:
+                try:
+                    remote_samples = cluster.collect_remote_idle_and_samples()
+                    if remote_samples:
+                        samples = remote_soak.merge_remote_samples(samples, remote_samples, sample_interval_s)
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                try:
+                    idle_snap = cluster.idle_disk_snapshot()
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                    idle_snap = {}
+                try:
+                    cluster.snapshot_master_task_retries()
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                try:
+                    cluster.stop()
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                try:
+                    remote_workers_meta = cluster.remote_worker_metadata()
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                try:
+                    master_audit = cluster.audit_master_logs(expected_task_ids=ledger.submitted_task_ids())
+                except Exception as exc:
+                    run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+                    master_audit = {}
+                leftover = cluster.leftover_pids()
+                leftover_trees = cluster.leftover_process_trees()
+            finally:
+                if not getattr(args, "keep_workdir", False):
+                    shutil.rmtree(sc_dir, ignore_errors=True)
 
     retry_stats = apply_master_task_retries_to_ledger(
         ledger,
@@ -5373,6 +5408,7 @@ def run_soak(
         expected_process_roles=expected_process_roles,
         missing_remote_shutdowns=missing_remote_shutdowns,
         remote_evidence_errors=remote_errors,
+        remote_workers=remote_workers_meta,
         run_error=run_error,
     )
     res_out: Dict[str, Any] = {
@@ -5396,6 +5432,8 @@ def run_soak(
         res_out["remote_workers"] = remote_workers_meta
     if remote_errors:
         res_out["remote_evidence_errors"] = remote_errors
+    if pass_eval.get("remote_verify_failures"):
+        res_out["remote_verify_failures"] = pass_eval["remote_verify_failures"]
     if run_error is not None:
         res_out["run_error"] = run_error
     return res_out

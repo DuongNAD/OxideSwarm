@@ -14,11 +14,14 @@ import copy
 import hashlib
 import hmac
 import http.server
+import io
+import ipaddress
 import json
 import math
 import os
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -43,6 +46,7 @@ MAX_CONTROL_REPLY_BYTES = 1 * MIB
 DEFAULT_REPLAY_WINDOW_S = 300.0
 DEFAULT_CONTROL_HANDLER_TIMEOUT_S = 30.0
 DEFAULT_CONTROL_MAX_CONCURRENT = 8
+DEFAULT_CONTROL_MAX_PER_SOURCE = 2
 DEFAULT_ORPHAN_TIMEOUT_S = 15.0 * 60.0
 MIN_SECRET_BYTES = 16
 MAX_SECRET_BYTES = 256
@@ -481,6 +485,66 @@ def _validate_and_match_worker_settings(
     return norm, None
 
 
+def _normalize_client_ip(client_address: Any) -> str:
+    """Normalize a socket peer tuple's IP address for per-source rate/concurrency tracking."""
+    raw = str(client_address[0]) if isinstance(client_address, (tuple, list)) and client_address else str(client_address or "")
+    host = raw.split("%", 1)[0].strip()
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host or "unknown"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ip)
+
+
+class _DeadlineSocketRawIO(io.RawIOBase):
+    """Raw socket reader enforcing a single cumulative deadline across headers and body."""
+
+    def __init__(self, sock: socket.socket, deadline_mono: float) -> None:
+        self._sock = sock
+        self._deadline = float(deadline_mono)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        rem = self._deadline - time.monotonic()
+        if rem <= 0.0:
+            raise TimeoutError("request deadline exceeded")
+        self._sock.settimeout(rem)
+        return self._sock.recv_into(b)
+
+
+def _linger_drain_close(sock: socket.socket, *, timeout_s: float = 0.05, max_bytes: int = 8192) -> None:
+    """Send TCP FIN cleanly and drain bounded unread client body bytes to avoid Windows RST."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return
+    if timeout_s <= 0.0:
+        return
+    deadline = time.monotonic() + timeout_s
+    drained = 0
+    while drained < max_bytes:
+        rem = deadline - time.monotonic()
+        if rem <= 0.0:
+            break
+        try:
+            r, _, _ = select.select([sock], [], [], rem)
+        except (OSError, ValueError):
+            break
+        if not r:
+            break
+        try:
+            chunk = sock.recv(min(4096, max_bytes - drained))
+        except OSError:
+            break
+        if not chunk:
+            break
+        drained += len(chunk)
+
+
 class SoakControlServer:
     """Authenticated HMAC-SHA256 HTTP control plane hosted by `soak --master-only`."""
 
@@ -496,6 +560,7 @@ class SoakControlServer:
         worker_settings: Optional[Dict[str, Any]] = None,
         handler_timeout_s: float = DEFAULT_CONTROL_HANDLER_TIMEOUT_S,
         max_concurrent_connections: int = DEFAULT_CONTROL_MAX_CONCURRENT,
+        max_concurrent_per_source: int = DEFAULT_CONTROL_MAX_PER_SOURCE,
     ) -> None:
         self.listen_host, self.listen_port = parse_host_port(listen_addr, default_port=0)
         self.control_key = bytes(control_key)
@@ -508,7 +573,10 @@ class SoakControlServer:
         )
         self._handler_timeout_s = max(0.05, float(handler_timeout_s))
         self._max_concurrent = max(1, int(max_concurrent_connections))
-        self._conn_sem = threading.BoundedSemaphore(self._max_concurrent)
+        self._max_per_source = max(1, int(max_concurrent_per_source))
+        self._conn_lock = threading.Lock()
+        self._active_total = 0
+        self._active_by_ip: Dict[str, int] = {}
         self.run_id = secrets.token_hex(16)
 
         self._replay = ReplayGuard(window_s=DEFAULT_REPLAY_WINDOW_S)
@@ -528,8 +596,30 @@ class SoakControlServer:
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 return
 
+            def setup(self) -> None:
+                super().setup()
+                self._deadline_mono = time.monotonic() + owner._handler_timeout_s
+                try:
+                    self.connection.settimeout(owner._handler_timeout_s)
+                except OSError:
+                    pass
+                old_rfile = self.rfile
+                self.rfile = io.BufferedReader(_DeadlineSocketRawIO(self.connection, self._deadline_mono), 8192)
+                if old_rfile is not None:
+                    try:
+                        old_rfile.close()
+                    except Exception:
+                        pass
+
+            def finish(self) -> None:
+                try:
+                    super().finish()
+                except OSError:
+                    pass
+
             def handle(self) -> None:
-                if not owner._conn_sem.acquire(blocking=False):
+                src_ip = _normalize_client_ip(self.client_address)
+                if not owner._try_acquire_conn_slot(src_ip):
                     try:
                         # Drain a bounded chunk of buffered request headers so Windows doesn't RST on close before 503 is read.
                         self.connection.settimeout(0.05)
@@ -540,10 +630,7 @@ class SoakControlServer:
                         self.connection.sendall(
                             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         )
-                        try:
-                            self.connection.shutdown(socket.SHUT_WR)
-                        except OSError:
-                            pass
+                        _linger_drain_close(self.connection, timeout_s=0.05)
                     except OSError:
                         pass
                     self.close_connection = True
@@ -553,14 +640,30 @@ class SoakControlServer:
                 except (TimeoutError, socket.timeout, ConnectionError, OSError):
                     self.close_connection = True
                 finally:
-                    owner._conn_sem.release()
+                    owner._release_conn_slot(src_ip)
 
-            def _send_unauth(self, status: int = 401) -> None:
+            def _apply_remaining_write_timeout(self) -> None:
+                rem = self._deadline_mono - time.monotonic()
+                if rem <= 0.0:
+                    raise TimeoutError("request deadline exceeded")
+                try:
+                    self.connection.settimeout(rem)
+                except OSError:
+                    pass
+
+            def _send_unauth(self, status: int = 401, *, linger: bool = True) -> None:
+                self._apply_remaining_write_timeout()
                 self.close_connection = True
                 self.send_response(status)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                rem = max(0.0, self._deadline_mono - time.monotonic())
+                _linger_drain_close(self.connection, timeout_s=min(0.05, rem) if linger else 0.0)
 
             def _send_signed(
                 self,
@@ -572,6 +675,7 @@ class SoakControlServer:
                 req_nonce: str,
                 req_run_id: str,
             ) -> None:
+                self._apply_remaining_write_timeout()
                 raw = (json.dumps(payload) + "\n").encode("utf-8")
                 ts_str = "%.3f" % time.time()
                 nonce = secrets.token_hex(16)
@@ -607,7 +711,7 @@ class SoakControlServer:
                     self._send_unauth(400)
                     return
                 if length < 0 or length > MAX_CONTROL_BODY_BYTES:
-                    self._send_unauth(413)
+                    self._send_unauth(413, linger=False)
                     return
 
                 worker_hdr = self.headers.get("X-Soak-Worker", "")
@@ -618,7 +722,7 @@ class SoakControlServer:
                     worker = validate_worker_name(worker_hdr)
                     ts_val = float(ts_hdr)
                 except ValueError:
-                    self._send_unauth(401)
+                    self._send_unauth(401, linger=(length <= 65536))
                     return
                 if (
                     not math.isfinite(ts_val)
@@ -627,7 +731,7 @@ class SoakControlServer:
                     or not isinstance(sig_hdr, str)
                     or not _HEX64_RE.match(sig_hdr.lower())
                 ):
-                    self._send_unauth(401)
+                    self._send_unauth(401, linger=(length <= 65536))
                     return
 
                 body_bytes = self.rfile.read(length) if length > 0 else b""
@@ -660,6 +764,8 @@ class SoakControlServer:
                     )
                     return
 
+                if time.monotonic() > self._deadline_mono:
+                    raise TimeoutError("request deadline exceeded")
                 req_run_id = str(body.get("run_id") or "")
                 if ("\n" in req_run_id) or ("\r" in req_run_id):
                     req_run_id = ""
@@ -683,6 +789,35 @@ class SoakControlServer:
         if self._soak_t0 is None:
             return False, 0.0
         return True, max(0.0, round(time.monotonic() - self._soak_t0, 2))
+
+    def _try_acquire_conn_slot(self, src_ip: str) -> bool:
+        with self._conn_lock:
+            if self._active_total >= self._max_concurrent:
+                return False
+            if self._active_by_ip.get(src_ip, 0) >= self._max_per_source:
+                return False
+            self._active_total += 1
+            self._active_by_ip[src_ip] = self._active_by_ip.get(src_ip, 0) + 1
+            return True
+
+    def _release_conn_slot(self, src_ip: str) -> None:
+        with self._conn_lock:
+            self._active_total = max(0, self._active_total - 1)
+            cur = self._active_by_ip.get(src_ip, 0)
+            if cur <= 1:
+                self._active_by_ip.pop(src_ip, None)
+            else:
+                self._active_by_ip[src_ip] = cur - 1
+
+    @property
+    def active_connections(self) -> int:
+        with self._conn_lock:
+            return int(self._active_total)
+
+    @property
+    def active_connections_by_source(self) -> Dict[str, int]:
+        with self._conn_lock:
+            return dict(self._active_by_ip)
 
     def _handle_authenticated(self, path: str, worker: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         with self._cond:
@@ -739,6 +874,8 @@ class SoakControlServer:
                     "samples": [],
                     "leftover_pids": [],
                     "leftover_task_trees": [],
+                    "skipped_polls_verify": 0,
+                    "skipped_polls_transport": 0,
                 }
                 self._pending_by_worker.setdefault(worker, [])
                 self._cond.notify_all()
@@ -785,6 +922,13 @@ class SoakControlServer:
                     self._pending_by_worker[worker] = [item for item in q if item.get("cmd_id") != cmd_id]
 
                 wrec = self._workers[worker]
+                if ok and op in ("idle_snapshot", "shutdown"):
+                    for cnt_key in ("skipped_polls_verify", "skipped_polls_transport"):
+                        if cnt_key in res_obj and res_obj[cnt_key] is not None:
+                            try:
+                                wrec[cnt_key] = max(int(wrec.get(cnt_key, 0)), max(0, int(res_obj[cnt_key])))
+                            except (TypeError, ValueError):
+                                pass
                 if ok and op == "idle_snapshot":
                     if isinstance(res_obj.get("samples"), list):
                         wrec["samples"] = list(res_obj["samples"])
@@ -835,6 +979,10 @@ class SoakControlServer:
             self._soak_t0 = float(soak_t0)
             self._cond.notify_all()
 
+    def registered_workers(self) -> List[str]:
+        with self._cond:
+            return sorted(self._workers.keys())
+
     def worker_metadata(self) -> List[Dict[str, Any]]:
         with self._cond:
             out: List[Dict[str, Any]] = []
@@ -848,6 +996,8 @@ class SoakControlServer:
                         "hardware": copy.deepcopy(rec["hardware"]),
                         "windows_realtime_av_enabled": rec["windows_realtime_av_enabled"],
                         "binary_version": rec["binary_version"],
+                        "skipped_polls_verify": int(rec.get("skipped_polls_verify", 0)),
+                        "skipped_polls_transport": int(rec.get("skipped_polls_transport", 0)),
                     }
                 )
             return out
@@ -860,6 +1010,8 @@ class SoakControlServer:
                     "idle_disk_snapshot": copy.deepcopy(rec["idle_disk_snapshot"]),
                     "leftover_pids": list(rec["leftover_pids"]),
                     "leftover_task_trees": copy.deepcopy(rec["leftover_task_trees"]),
+                    "skipped_polls_verify": int(rec.get("skipped_polls_verify", 0)),
+                    "skipped_polls_transport": int(rec.get("skipped_polls_transport", 0)),
                 }
                 for name, rec in self._workers.items()
             }
@@ -1099,6 +1251,8 @@ def create_remote_soak_cluster(
             self._remote_leftover_trees: List[Dict[str, Any]] = []
             self._remote_evidence_errors: List[Dict[str, Any]] = []
             self._remote_missing_shutdowns: Set[str] = set()
+            self._remote_poll_skips: Dict[str, Dict[str, int]] = {}
+            self._worker_meta_snapshot: Optional[List[Dict[str, Any]]] = None
             self.dashboard_token: str = ""
             self.forbidden_secrets: List[str] = [tok for tok in (secret_text, self._secret_file) if tok]
             super().__init__(
@@ -1334,10 +1488,46 @@ def create_remote_soak_cluster(
             if self.control_server is not None:
                 self.control_server.mark_soak_started(soak_t0)
 
+        def _record_worker_poll_skips(self, wname: str, res: Dict[str, Any]) -> None:
+            cur = self._remote_poll_skips.setdefault(
+                wname,
+                {"skipped_polls_verify": 0, "skipped_polls_transport": 0},
+            )
+            for cnt_key in ("skipped_polls_verify", "skipped_polls_transport"):
+                if cnt_key in res and res[cnt_key] is not None:
+                    try:
+                        cur[cnt_key] = max(int(cur.get(cnt_key, 0)), max(0, int(res[cnt_key])))
+                    except (TypeError, ValueError):
+                        pass
+
         def remote_worker_metadata(self) -> List[Dict[str, Any]]:
-            if self.control_server is None:
-                return []
-            return self.control_server.worker_metadata()
+            if self.control_server is not None:
+                base_meta = self.control_server.worker_metadata()
+            elif self._worker_meta_snapshot is not None:
+                base_meta = copy.deepcopy(self._worker_meta_snapshot)
+            else:
+                base_meta = []
+            out: List[Dict[str, Any]] = []
+            seen: Set[str] = set()
+            for item in base_meta:
+                row = copy.deepcopy(item)
+                wname = str(row.get("name") or "")
+                seen.add(wname)
+                sk = self._remote_poll_skips.get(wname, {})
+                for cnt_key in ("skipped_polls_verify", "skipped_polls_transport"):
+                    row[cnt_key] = max(int(row.get(cnt_key, 0) or 0), int(sk.get(cnt_key, 0) or 0))
+                out.append(row)
+            for wname in sorted(self._remote_poll_skips):
+                if wname not in seen:
+                    sk = self._remote_poll_skips[wname]
+                    out.append(
+                        {
+                            "name": wname,
+                            "skipped_polls_verify": int(sk.get("skipped_polls_verify", 0) or 0),
+                            "skipped_polls_transport": int(sk.get("skipped_polls_transport", 0) or 0),
+                        }
+                    )
+            return out
 
         def restart_worker_fault(self, idx: int, down_s: float) -> Tuple[int, int]:
             assert self.control_server is not None
@@ -1479,6 +1669,7 @@ def create_remote_soak_cluster(
                             }
                         )
                         continue
+                    self._record_worker_poll_skips(wname, res)
                     if isinstance(res.get("idle_disk_snapshot"), dict):
                         self._remote_idle_snaps[wname] = dict(res["idle_disk_snapshot"])
                     if isinstance(res.get("samples"), list):
@@ -1510,7 +1701,12 @@ def create_remote_soak_cluster(
             }
 
         def stop(self) -> None:
-            if self.control_server is not None and self.worker_names:
+            stop_targets = list(self.worker_names)
+            if self.control_server is not None and hasattr(self.control_server, "registered_workers"):
+                for wname in self.control_server.registered_workers():
+                    if wname not in stop_targets:
+                        stop_targets.append(wname)
+            if self.control_server is not None and stop_targets:
                 def _stop_one(wname: str) -> Tuple[str, bool, Dict[str, Any], Optional[str]]:
                     try:
                         ack = self.control_server.dispatch_command(wname, "shutdown", {}, timeout_s=45.0)
@@ -1518,8 +1714,8 @@ def create_remote_soak_cluster(
                     except Exception as exc:
                         return wname, False, {}, str(exc)
 
-                with ThreadPoolExecutor(max_workers=len(self.worker_names)) as pool:
-                    for wname, ok, res, err in pool.map(_stop_one, self.worker_names):
+                with ThreadPoolExecutor(max_workers=len(stop_targets)) as pool:
+                    for wname, ok, res, err in pool.map(_stop_one, stop_targets):
                         if not ok:
                             red = self.redact(err or "shutdown failed")
                             self._remote_missing_shutdowns.add(wname)
@@ -1532,6 +1728,7 @@ def create_remote_soak_cluster(
                             )
                             self._api_snapshot_errors.append("worker %s shutdown: %s" % (wname, red))
                             continue
+                        self._record_worker_poll_skips(wname, res)
                         for lp in res.get("leftover_pids") or []:
                             self._remote_leftover_pids.append({"worker": wname, "pid": int(lp)})
                         for lt in res.get("leftover_task_trees") or []:
@@ -1550,6 +1747,7 @@ def create_remote_soak_cluster(
                     else:
                         self._record_pid_exit(p.pid)
             if self.control_server is not None:
+                self._worker_meta_snapshot = self.remote_worker_metadata()
                 self.control_server.stop()
             self.procs = []
 
@@ -1848,6 +2046,12 @@ class WorkerAgent:
                 interval_s=self.sample_interval_s,
             ).start()
 
+    def _poll_skip_counts(self) -> Dict[str, int]:
+        return {
+            "skipped_polls_verify": int(self._skipped_polls_verify),
+            "skipped_polls_transport": int(self._skipped_polls_transport),
+        }
+
     def _idle_snapshot_payload(self) -> Dict[str, Any]:
         samples = self._aligned_samples()
         cache_root = os.path.join(self.sandbox_dir, "cache", "blobs")
@@ -1862,6 +2066,7 @@ class WorkerAgent:
                 "cache_tmp": list(self.base.list_tmp_entries(cache_root)),
                 "locks": locks,
             },
+            **self._poll_skip_counts(),
         }
 
     def _shutdown_payload(self) -> Dict[str, Any]:
@@ -1889,6 +2094,7 @@ class WorkerAgent:
             "samples": samples,
             "leftover_pids": sorted(set(alive)),
             "leftover_task_trees": trees,
+            **self._poll_skip_counts(),
         }
 
     def _execute_command(self, cmd: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -2071,6 +2277,8 @@ class WorkerAgent:
                     ack_session_ended = False
                     for attempt in range(5):
                         try:
+                            if cmd.get("op") in ("idle_snapshot", "shutdown") and isinstance(ack_payload.get("result"), dict):
+                                ack_payload["result"].update(self._poll_skip_counts())
                             ack_st, ack_resp = self._client.post("/v1/ack", ack_payload, timeout_s=30.0)
                             if ack_st in (400, 403):
                                 err_txt = str(ack_resp.get("error") or "")

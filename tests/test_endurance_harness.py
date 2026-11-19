@@ -872,6 +872,18 @@ class SoakHarnessTests(unittest.TestCase):
 
 
 class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
+    @staticmethod
+    def _mock_sh_for_fake_bin(fake_bin: str):
+        orig_sh = endurance.sh
+        abs_bin = os.path.abspath(fake_bin)
+
+        def _fake_sh(cmd: List[str], timeout: float = 10.0) -> str:
+            if cmd and os.path.abspath(str(cmd[0])) == abs_bin and "--version" in cmd[1:]:
+                return "rusty-grid 0.4.4"
+            return orig_sh(cmd, timeout=timeout)
+
+        return _fake_sh
+
     def test_secret_loading_and_control_auth_round_trip_and_rejections(self):
         rs = endurance.remote_soak
         for bad_name in ("", ".", "..", "win a", "../evil", "a/b", "x" * 33):
@@ -1258,6 +1270,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 expected_workers=["win-a", "win-b"],
                 expected_count=2,
                 sample_interval_s=0.5,
+                max_concurrent_per_source=4,
             )
 
             agents = {}
@@ -1275,16 +1288,9 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                     agent_self._worker_log = None
                 return int(p.pid)
 
-            orig_sh = endurance.sh
-
-            def fake_sh(cmd, timeout=10.0):
-                if cmd and cmd[0] == fake_bin:
-                    return "rusty-grid 0.4.4"
-                return orig_sh(cmd, timeout=timeout)
-
             with (
                 mock.patch.object(rs.WorkerAgent, "_start_worker", fake_start_worker),
-                mock.patch.object(endurance, "sh", side_effect=fake_sh),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
                 mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
                 mock.patch.object(endurance, "hardware", return_value={"cpu": "mock-cpu", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
                 mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1.0", "machine": "amd64"}),
@@ -1384,8 +1390,19 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             expected_workers=["win-a"],
             expected_count=1,
             sample_interval_s=5.0,
+            handler_timeout_s=30.0,
+            max_concurrent_connections=2,
+            max_concurrent_per_source=4,
+        )
+        srv_short = rs.SoakControlServer(
+            "127.0.0.1:0",
+            key,
+            expected_workers=["win-a"],
+            expected_count=1,
+            sample_interval_s=5.0,
             handler_timeout_s=0.45,
             max_concurrent_connections=2,
+            max_concurrent_per_source=2,
         )
         socks = []
         try:
@@ -1394,28 +1411,29 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 s.sendall(b"POST /v1/poll HTTP/1.1\r\nHost: 127.0.0.1\r\n")
                 socks.append(s)
 
-            # Wait until both concurrency semaphore slots are occupied by the stalled sockets
-            sem_wait_end = time.monotonic() + 5.0
-            while srv._conn_sem._value > 0 and time.monotonic() < sem_wait_end:
+            # Hold both concurrency slots on srv (30 s handler timeout) so 3rd sees 503 reliably on slow CI
+            cap_wait_end = time.monotonic() + 5.0
+            while srv.active_connections < 2 and time.monotonic() < cap_wait_end:
                 time.sleep(0.01)
-            self.assertEqual(srv._conn_sem._value, 0)
+            self.assertEqual(srv.active_connections, 2)
 
-            # 3rd concurrent connection must immediately receive 503 Service Unavailable
             s3 = socket.create_connection(("127.0.0.1", srv.port), timeout=5.0)
             socks.append(s3)
             s3.sendall(b"POST /v1/poll HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}")
             resp3 = s3.recv(1024)
             self.assertIn(b"503", resp3)
 
-            # Stalled pre-auth connections must time out and close cleanly (EOF)
-            for stalled in socks[:2]:
-                stalled.settimeout(5.0)
-                self.assertEqual(stalled.recv(1024), b"")
+            for s in socks:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            socks.clear()
 
-            free_end = time.monotonic() + 3.0
-            while srv._conn_sem._value < 2 and time.monotonic() < free_end:
-                time.sleep(0.02)
-            self.assertEqual(srv._conn_sem._value, 2)
+            free_end = time.monotonic() + 5.0
+            while srv.active_connections > 0 and time.monotonic() < free_end:
+                time.sleep(0.01)
+            self.assertEqual(srv.active_connections, 0)
 
             # Headerless request declaring huge Content-Length is rejected 401 before body arrives
             s4 = socket.create_connection(("127.0.0.1", srv.port), timeout=5.0)
@@ -1429,12 +1447,25 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             st, reg = client.post("/v1/register", {"name": "win-a", "instance_id": "inst-1"})
             self.assertEqual(st, 200)
             self.assertTrue(reg["run_id"])
+
+            # Separate short-timeout server closes a stalled pre-auth connection on timeout (EOF)
+            stalled = socket.create_connection(("127.0.0.1", srv_short.port), timeout=5.0)
+            socks.append(stalled)
+            stalled.sendall(b"POST /v1/poll HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            stalled.settimeout(5.0)
+            self.assertEqual(stalled.recv(1024), b"")
+
+            short_free_end = time.monotonic() + 3.0
+            while srv_short.active_connections > 0 and time.monotonic() < short_free_end:
+                time.sleep(0.02)
+            self.assertEqual(srv_short.active_connections, 0)
         finally:
             for s in socks:
                 try:
                     s.close()
                 except OSError:
                     pass
+            srv_short.stop()
             srv.stop()
 
     @staticmethod
@@ -1603,7 +1634,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
 
             with (
                 mock.patch.object(rs.WorkerAgent, "_start_worker", lambda s: 0),
-                mock.patch.object(endurance, "sh", return_value="rusty-grid 0.4.4"),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
                 mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
                 mock.patch.object(endurance, "hardware", return_value={"cpu": "mock", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
                 mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1", "machine": "amd64"}),
@@ -1684,7 +1715,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
 
             with (
                 mock.patch.object(rs.WorkerAgent, "_start_worker", fake_start_worker),
-                mock.patch.object(endurance, "sh", return_value="rusty-grid 0.4.4"),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
                 mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
                 mock.patch.object(endurance, "hardware", return_value={"cpu": "mock", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
                 mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1", "machine": "amd64"}),
@@ -1867,7 +1898,7 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                 mock.patch.object(endurance, "windows_realtime_av_enabled", return_value=False),
                 mock.patch.object(endurance, "build_profile", return_value="release"),
                 mock.patch.object(endurance, "measure_tcp_rtt_ms", return_value=0.1),
-                mock.patch.object(endurance, "sh", return_value="rusty-grid 0.4.4"),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
             ):
                 cl = rs.create_remote_soak_cluster(
                     endurance,
@@ -2058,6 +2089,571 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
                         register_timeout_s=10.0,
                         sample_interval_s=60.0,
                     )
+
+    @staticmethod
+    def _make_passing_soak_check_inputs():
+        times = [0.0] + [300.0 + i * 70.0 for i in range(12)] + [1900.0 + i * 70.0 for i in range(12)]
+        samples = [
+            {
+                "t_s": t,
+                "processes": {
+                    "master": {"pid": 1001, "rss_bytes": 40 * endurance.MIB, "handles": 100},
+                    "worker_win-a": {"pid": 2001, "rss_bytes": 30 * endurance.MIB, "handles": 80},
+                },
+                "dirs": {"blob_store_bytes": 10 * endurance.MIB, "worker_cache_win-a_bytes": 10 * endurance.MIB},
+            }
+            for t in times
+        ]
+        lg = endurance.TaskLedger()
+        lg.record_submit("t-ok-1", expected_outcome="ok")
+        lg.record_result("t-ok-1", outcome="ok")
+        master_audit = {
+            "unique_result_tasks": 1,
+            "multi_result_tasks": {},
+            "queue_record_errors": 0,
+            "missing_from_master_results": [],
+            "untracked_master_results": [],
+        }
+        probes = (
+            [{"t_s": 300.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+            + [{"t_s": 1520.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+        )
+        return dict(
+            ledger_audit=lg.audit(),
+            samples=samples,
+            probes=probes,
+            duration_s=2700.0,
+            blob_store_limit_bytes=256 * endurance.MIB,
+            worker_cache_limit_bytes=128 * endurance.MIB,
+            pinned_headroom_bytes=64 * endurance.MIB,
+            worker_pinned_headroom_bytes=64 * endurance.MIB,
+            idle_sandbox_entries={"win-a": ["cache", ".locks"]},
+            tmp_leftovers={"master_blobs_tmp": []},
+            compactions=[{"before_bytes": 50000, "after_bytes": 24}],
+            leftover_pids=[],
+            idle_blob_store_bytes=10 * endurance.MIB,
+            idle_worker_cache_bytes={"worker_cache_win-a_bytes": 10 * endurance.MIB},
+            master_audit=master_audit,
+            expected_process_roles=["master", "worker_win-a"],
+            missing_remote_shutdowns=[],
+        )
+
+    @staticmethod
+    def _make_mock_remote_cluster(tmp_dir: str, fake_bin: str, sec_path: str, expect_workers):
+        rs = endurance.remote_soak
+        with mock.patch.object(
+            rs.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["oxideswarm"], 0, "dash-tok-secret\n", ""),
+        ):
+            cl = rs.create_remote_soak_cluster(
+                endurance,
+                binary=fake_bin,
+                workdir=os.path.join(tmp_dir, "cl"),
+                workers=len(expect_workers),
+                slots=2,
+                blob_store_mb=256,
+                blob_cache_mb=128,
+                max_queue_size=8,
+                workspaces=False,
+                session_resume_hold_secs=None,
+                master_listen="127.0.0.1:0",
+                control_listen="127.0.0.1:0",
+                secret_file=sec_path,
+                expect_workers=list(expect_workers),
+                register_timeout_s=10.0,
+                sample_interval_s=0.5,
+            )
+        cl.start = lambda: cl  # type: ignore[method-assign]
+        cl.stop_master = lambda reason="final_stop": {"reason": reason, "before_bytes": 100, "after_bytes": 24, "shrank": True}  # type: ignore[method-assign]
+        cl.active_pids = lambda: {"master": 999}  # type: ignore[method-assign]
+        cl.audit_master_logs = lambda expected_task_ids=(): {  # type: ignore[method-assign]
+            "unique_result_tasks": len(list(expected_task_ids)),
+            "multi_result_tasks": {},
+            "queue_record_errors": 0,
+            "missing_from_master_results": [],
+            "untracked_master_results": [],
+            "failover_sweeps": 0,
+            "requeues_logged": 0,
+            "requeued_task_ids": [],
+        }
+        cl.leftover_process_trees = lambda: []  # type: ignore[method-assign]
+
+        def _fake_run_client(args_list, **_kw):
+            if args_list and args_list[0] == "status":
+                return subprocess.CompletedProcess(args_list, 0, '{"pending_tasks":0,"running_tasks":0}\n', "")
+            return subprocess.CompletedProcess(args_list, 0, '{"status":"completed","exit_code":0,"task_id":"t-mock"}\n', "")
+
+        cl.run_client = _fake_run_client  # type: ignore[method-assign]
+        return cl
+
+    def _run_common_soak_mocks(self, fake_bin: str):
+        return (
+            mock.patch.object(endurance, "check_free_space", return_value={"ok": True, "free_bytes": 100 * endurance.GIB, "required_bytes": 1 * endurance.GIB}),
+            mock.patch.object(endurance, "hardware", return_value={"cpu": "mock", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
+            mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1", "machine": "amd64"}),
+            mock.patch.object(endurance, "windows_realtime_av_enabled", return_value=False),
+            mock.patch.object(endurance, "build_profile", return_value="release"),
+            mock.patch.object(endurance, "measure_tcp_rtt_ms", return_value=0.1),
+            mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
+        )
+
+    def test_fix4_skipped_poll_counters_recorded_and_fail_all_passed(self):
+        rs = endurance.remote_soak
+        # Part 1: evaluate_soak_pass_checks accepts transport skips but fails all_passed on verify skips
+        base_kw = self._make_passing_soak_check_inputs()
+        ok_res = endurance.evaluate_soak_pass_checks(
+            remote_workers=[{"name": "win-a", "skipped_polls_verify": 0, "skipped_polls_transport": 4}],
+            **base_kw,
+        )
+        self.assertTrue(ok_res["all_passed"])
+        self.assertNotIn("remote_verify_failures", ok_res)
+
+        bad_res = endurance.evaluate_soak_pass_checks(
+            remote_workers=[{"name": "win-a", "skipped_polls_verify": 1, "skipped_polls_transport": 0}],
+            **base_kw,
+        )
+        self.assertFalse(bad_res["all_passed"])
+        self.assertEqual(bad_res.get("remote_verify_failures"), {"win-a": 1})
+
+        nameless_bad = endurance.evaluate_soak_pass_checks(
+            remote_workers=[{"skipped_polls_verify": 2}],
+            **base_kw,
+        )
+        self.assertFalse(nameless_bad["all_passed"])
+
+        # Part 2: real SoakControlServer + WorkerAgent preserve skip counters through idle_snapshot and shutdown
+        (_echo_host, echo_port), echo_close = _start_echo_server()
+        tmp = tempfile.mkdtemp(prefix="ox-fix4-cnt-")
+        srv = None
+        try:
+            sec_text = secrets.token_hex(32)
+            sec_path = os.path.join(tmp, "run.secret")
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(sec_text + "\n")
+            fake_bin = os.path.join(tmp, "fake.bin")
+            with open(fake_bin, "wb") as f:
+                f.write(b"mock")
+            srv = rs.SoakControlServer(
+                "127.0.0.1:0",
+                rs.derive_control_key(sec_text),
+                expected_workers=["win-a"],
+                expected_count=1,
+                sample_interval_s=60.0,
+            )
+            with (
+                mock.patch.object(rs.WorkerAgent, "_start_worker", lambda s: 0),
+                mock.patch.object(endurance, "sh", side_effect=self._mock_sh_for_fake_bin(fake_bin)),
+                mock.patch.object(endurance, "check_free_space", return_value={"ok": True}),
+                mock.patch.object(endurance, "hardware", return_value={"cpu": "mock", "cores": 4, "ram_bytes": 8 * endurance.GIB}),
+                mock.patch.object(endurance, "os_info", return_value={"system": "MockOS", "release": "1", "machine": "amd64"}),
+                mock.patch.object(endurance, "windows_realtime_av_enabled", return_value=False),
+            ):
+                ag = rs.WorkerAgent(
+                    endurance,
+                    binary=fake_bin,
+                    master_addr="127.0.0.1:%d" % echo_port,
+                    control_addr=srv.connect_addr,
+                    secret_file=sec_path,
+                    name="win-a",
+                    work_dir=os.path.join(tmp, "w"),
+                    poll_interval_s=0.05,
+                    connect_timeout_s=30.0,
+                    orphan_timeout_s=30.0,
+                )
+                orig_post = ag._client.post
+                idle_seen = threading.Event()
+                pre_idle_faults = iter([rs.ControlProtocolError("bad mac 1"), OSError("reset 1")])
+                post_idle_faults = iter([rs.ControlProtocolError("bad mac 2")])
+
+                def wrap_post(path, payload, timeout_s=15.0):
+                    if path == "/v1/poll":
+                        if not idle_seen.is_set():
+                            act = next(pre_idle_faults, None)
+                            if act is not None:
+                                raise act
+                        else:
+                            act = next(post_idle_faults, None)
+                            if act is not None:
+                                raise act
+                    st, resp = orig_post(path, payload, timeout_s=timeout_s)
+                    if path == "/v1/poll" and st == 200 and isinstance(resp.get("command"), dict):
+                        if resp["command"].get("op") == "idle_snapshot":
+                            idle_seen.set()
+                    return st, resp
+
+                ag._client.post = wrap_post  # type: ignore[method-assign]
+                th = threading.Thread(target=ag.run, daemon=True)
+                th.start()
+                self.assertEqual(srv.wait_for_agents(1, timeout_s=30.0), ["win-a"])
+                snap = srv.dispatch_command("win-a", "idle_snapshot", {}, timeout_s=30.0)["result"]
+                self.assertEqual(snap["skipped_polls_verify"], 1)
+                self.assertEqual(snap["skipped_polls_transport"], 1)
+                sh_res = srv.dispatch_command("win-a", "shutdown", {}, timeout_s=30.0)["result"]
+                self.assertEqual(sh_res["skipped_polls_verify"], 2)
+                self.assertEqual(sh_res["skipped_polls_transport"], 1)
+                th.join(timeout=15.0)
+                self.assertFalse(th.is_alive())
+                meta = srv.worker_metadata()
+                self.assertEqual(meta[0]["skipped_polls_verify"], 2)
+                self.assertEqual(meta[0]["skipped_polls_transport"], 1)
+        finally:
+            if srv is not None:
+                srv.stop()
+            echo_close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # Part 3: cmd_soak writes shutdown-phase counters into record["remote_workers"] and fails all_passed
+        with tempfile.TemporaryDirectory() as tmp:
+            sec_path = os.path.join(tmp, "run.secret")
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(secrets.token_hex(32) + "\n")
+            fake_bin = os.path.join(tmp, "fake.bin")
+            with open(fake_bin, "wb") as f:
+                f.write(b"mock")
+            out_json = os.path.join(tmp, "soak_cnt_record.json")
+
+            class _FakeSkipSrv:
+                def dispatch_command(self, wname, op, _payload=None, timeout_s=120.0):
+                    if op == "idle_snapshot":
+                        return {
+                            "ok": True,
+                            "result": {
+                                "samples": [],
+                                "idle_disk_snapshot": {"sandbox_entries": ["cache", ".locks"], "worker_cache_bytes": 10, "cache_tmp": [], "locks": []},
+                                "skipped_polls_verify": 0,
+                                "skipped_polls_transport": 1 if wname == "win-a" else 0,
+                            },
+                        }
+                    if op == "shutdown":
+                        return {
+                            "ok": True,
+                            "result": {
+                                "leftover_pids": [],
+                                "leftover_task_trees": [],
+                                "skipped_polls_verify": 2 if wname == "win-a" else 0,
+                                "skipped_polls_transport": 3 if wname == "win-a" else 0,
+                            },
+                        }
+                    return {"ok": True, "result": {}}
+
+                def worker_metadata(self):
+                    return [{"name": "win-a"}, {"name": "win-b"}]
+
+                def registered_workers(self):
+                    return ["win-a", "win-b"]
+
+                def mark_soak_started(self, _t0):
+                    return
+
+                def stop(self):
+                    return
+
+            patches = self._run_common_soak_mocks(fake_bin)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                cl = self._make_mock_remote_cluster(tmp, fake_bin, sec_path, ["win-a", "win-b"])
+                cl.control_server = _FakeSkipSrv()
+                cl.worker_names = ["win-a", "win-b"]
+                ap = endurance.build_parser()
+                ns = ap.parse_args(
+                    [
+                        "soak",
+                        "--bin",
+                        fake_bin,
+                        "--master-only",
+                        "--secret-file",
+                        sec_path,
+                        "--expect-workers",
+                        "win-a,win-b",
+                        "--workers",
+                        "2",
+                        "--duration",
+                        "1s",
+                        "--sample-interval",
+                        "0.5s",
+                        "--fault-scale",
+                        "0.01",
+                        "--load-scale",
+                        "0.1",
+                        "--work-dir",
+                        os.path.join(tmp, "work"),
+                        "--out",
+                        out_json,
+                    ]
+                )
+                with mock.patch.object(rs, "create_remote_soak_cluster", return_value=cl):
+                    rc_soak = endurance.cmd_soak(ns)
+            self.assertEqual(rc_soak, 1)
+            with open(out_json, encoding="utf-8") as rf:
+                rec = json.load(rf)
+            self.assertFalse(rec["all_passed"])
+            self.assertEqual(rec["soak"].get("remote_verify_failures"), {"win-a": 2})
+            by_name = {w["name"]: w for w in rec["remote_workers"]}
+            self.assertEqual(by_name["win-a"]["skipped_polls_verify"], 2)
+            self.assertEqual(by_name["win-a"]["skipped_polls_transport"], 3)
+            self.assertEqual(by_name["win-b"]["skipped_polls_verify"], 0)
+            self.assertEqual(by_name["win-b"]["skipped_polls_transport"], 0)
+
+    def test_n2_run_soak_startup_cleanup_on_keyboard_interrupt_and_sampler_error(self):
+        rs = endurance.remote_soak
+        with tempfile.TemporaryDirectory() as tmp:
+            sec_path = os.path.join(tmp, "run.secret")
+            with open(sec_path, "w", encoding="utf-8") as f:
+                f.write(secrets.token_hex(32) + "\n")
+            fake_bin = os.path.join(tmp, "fake.bin")
+            with open(fake_bin, "wb") as f:
+                f.write(b"mock")
+
+            # Case A: KeyboardInterrupt during cluster.start() wait_for_agents stops master + registered workers and deletes sc_dir
+            patches = self._run_common_soak_mocks(fake_bin)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                cl = self._make_mock_remote_cluster(tmp, fake_bin, sec_path, ["win-a", "win-b"])
+                shutdown_dispatched = []
+                stop_master_calls = []
+
+                class _StartupSrv:
+                    def registered_workers(self):
+                        return ["win-a"]
+
+                    def dispatch_command(self, wname, op, _payload=None, timeout_s=120.0):
+                        if op == "shutdown":
+                            shutdown_dispatched.append(wname)
+                            return {"ok": True, "result": {"leftover_pids": [], "leftover_task_trees": [], "skipped_polls_verify": 0, "skipped_polls_transport": 0}}
+                        return {"ok": True, "result": {}}
+
+                    def worker_metadata(self):
+                        return [{"name": "win-a"}]
+
+                    def stop(self):
+                        return
+
+                cl.control_server = _StartupSrv()
+                cl.worker_names = []  # wait_for_agents has not completed yet
+
+                def _abort_start():
+                    raise KeyboardInterrupt("user aborted during wait_for_agents")
+
+                cl.start = _abort_start  # type: ignore[method-assign]
+                cl.stop_master = lambda reason="final_stop": stop_master_calls.append(reason) or {}  # type: ignore[method-assign]
+
+                work_a = os.path.join(tmp, "work-abort")
+                os.makedirs(work_a, exist_ok=True)
+                ns_a = endurance.build_parser().parse_args(
+                    [
+                        "soak",
+                        "--bin",
+                        fake_bin,
+                        "--master-only",
+                        "--secret-file",
+                        sec_path,
+                        "--expect-workers",
+                        "win-a,win-b",
+                        "--workers",
+                        "2",
+                        "--duration",
+                        "1s",
+                        "--work-dir",
+                        work_a,
+                    ]
+                )
+                # Exercise run_soak directly with cl via create_remote_soak_cluster patch
+                with mock.patch.object(rs, "create_remote_soak_cluster", return_value=cl):
+                    with self.assertRaises(KeyboardInterrupt):
+                        endurance.run_soak(
+                            ns_a,
+                            work_a,
+                            {
+                                "duration_s": 1.0,
+                                "sample_interval_s": 0.5,
+                                "fault_scale": 0.01,
+                                "load_scale": 0.1,
+                                "workers": 2,
+                                "slots": 2,
+                                "max_queue_size": 8,
+                                "blob_store_mb": 256,
+                                "blob_cache_mb": 128,
+                                "master_only": True,
+                                "master_listen": "127.0.0.1:0",
+                                "control_listen": "127.0.0.1:0",
+                                "secret_file": sec_path,
+                                "expect_workers": ["win-a", "win-b"],
+                                "register_timeout_s": 10.0,
+                            },
+                        )
+                self.assertEqual(shutdown_dispatched, ["win-a"])
+                self.assertEqual(stop_master_calls, ["final_stop"])
+                self.assertFalse(os.path.exists(os.path.join(work_a, "soak")))
+
+                # Case B: Exception in BackgroundSampler.start after cluster.start runs full teardown & writes record with run_error
+                cl_b = self._make_mock_remote_cluster(tmp, fake_bin, sec_path, ["win-a", "win-b"])
+                stop_b_calls = []
+
+                class _SamplerFailSrv:
+                    def registered_workers(self):
+                        return ["win-a", "win-b"]
+
+                    def dispatch_command(self, wname, op, _payload=None, timeout_s=120.0):
+                        if op == "idle_snapshot":
+                            return {"ok": True, "result": {"samples": [], "idle_disk_snapshot": {"sandbox_entries": ["cache"], "worker_cache_bytes": 10, "cache_tmp": [], "locks": []}}}
+                        if op == "shutdown":
+                            return {"ok": True, "result": {"leftover_pids": [], "leftover_task_trees": []}}
+                        return {"ok": True, "result": {}}
+
+                    def worker_metadata(self):
+                        return [{"name": "win-a"}, {"name": "win-b"}]
+
+                    def mark_soak_started(self, _t0):
+                        return
+
+                    def stop(self):
+                        return
+
+                cl_b.control_server = _SamplerFailSrv()
+                cl_b.worker_names = ["win-a", "win-b"]
+                orig_stop_b = cl_b.stop
+
+                def _spy_stop_b():
+                    stop_b_calls.append(True)
+                    orig_stop_b()
+
+                cl_b.stop = _spy_stop_b  # type: ignore[method-assign]
+                out_b = os.path.join(tmp, "sampler_err_record.json")
+                ns_b = endurance.build_parser().parse_args(
+                    [
+                        "soak",
+                        "--bin",
+                        fake_bin,
+                        "--master-only",
+                        "--secret-file",
+                        sec_path,
+                        "--expect-workers",
+                        "win-a,win-b",
+                        "--workers",
+                        "2",
+                        "--duration",
+                        "1s",
+                        "--sample-interval",
+                        "0.5s",
+                        "--work-dir",
+                        os.path.join(tmp, "work-b"),
+                        "--out",
+                        out_b,
+                    ]
+                )
+                with (
+                    mock.patch.object(rs, "create_remote_soak_cluster", return_value=cl_b),
+                    mock.patch.object(endurance.BackgroundSampler, "start", side_effect=ValueError("bad ps output")),
+                ):
+                    rc_b = endurance.cmd_soak(ns_b)
+                self.assertEqual(rc_b, 1)
+                self.assertEqual(stop_b_calls, [True])
+                self.assertTrue(os.path.isfile(out_b))
+                with open(out_b, encoding="utf-8") as rf:
+                    rec_b = json.load(rf)
+                self.assertFalse(rec_b["all_passed"])
+                self.assertIn("bad ps output", rec_b["soak"].get("run_error") or "")
+
+    def test_n3_per_source_cap_and_total_request_deadline(self):
+        rs = endurance.remote_soak
+        key = rs.derive_control_key(secrets.token_hex(32))
+        # Part A: per-source cap (2) triggers 503 before global cap (4) fills
+        srv = rs.SoakControlServer(
+            "127.0.0.1:0",
+            key,
+            expected_workers=["win-a"],
+            expected_count=1,
+            sample_interval_s=5.0,
+            handler_timeout_s=30.0,
+            max_concurrent_connections=4,
+            max_concurrent_per_source=2,
+        )
+        # Part B: cumulative deadline covers both header trickle and body trickle together
+        srv_dl = rs.SoakControlServer(
+            "127.0.0.1:0",
+            key,
+            expected_workers=["win-a"],
+            expected_count=1,
+            sample_interval_s=5.0,
+            handler_timeout_s=0.6,
+            max_concurrent_connections=4,
+            max_concurrent_per_source=4,
+        )
+        socks = []
+        try:
+            for _ in range(2):
+                s = socket.create_connection(("127.0.0.1", srv.port), timeout=5.0)
+                s.sendall(b"POST /v1/poll HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+                socks.append(s)
+
+            wait_end = time.monotonic() + 5.0
+            while srv.active_connections < 2 and time.monotonic() < wait_end:
+                time.sleep(0.01)
+            self.assertEqual(srv.active_connections, 2)
+            self.assertEqual(srv.active_connections_by_source.get("127.0.0.1"), 2)
+
+            s3 = socket.create_connection(("127.0.0.1", srv.port), timeout=5.0)
+            socks.append(s3)
+            s3.sendall(b"POST /v1/poll HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}")
+            self.assertIn(b"503", s3.recv(1024))
+
+            # Another source IP is not blocked while 127.0.0.1 holds all per-source slots
+            self.assertTrue(srv._try_acquire_conn_slot("192.0.2.50"))
+            srv._release_conn_slot("192.0.2.50")
+            self.assertFalse(srv._try_acquire_conn_slot("127.0.0.1"))
+
+            def assert_trickle_aborts(initial_bytes: bytes, max_ticks: int = 20):
+                st = socket.create_connection(("127.0.0.1", srv_dl.port), timeout=5.0)
+                socks.append(st)
+                st.settimeout(2.0)
+                st.sendall(initial_bytes)
+                aborted = False
+                for _ in range(max_ticks):
+                    try:
+                        st.sendall(b"a")
+                    except OSError:
+                        aborted = True
+                        break
+                    time.sleep(0.15)
+                if not aborted:
+                    try:
+                        if st.recv(1024) == b"":
+                            aborted = True
+                    except OSError:
+                        aborted = True
+                try:
+                    st.close()
+                except OSError:
+                    pass
+                self.assertTrue(aborted, "trickle request did not time out within cumulative deadline")
+                rel_end = time.monotonic() + 3.0
+                while srv_dl.active_connections > 0 and time.monotonic() < rel_end:
+                    time.sleep(0.02)
+                self.assertEqual(srv_dl.active_connections, 0)
+
+            # Trickling header bytes (0.15s per byte < 0.6s read timeout, total > 0.6s)
+            assert_trickle_aborts(b"POST /v1/poll HTTP/1.1\r\nX-Pad: ")
+
+            # Trickling body bytes after syntactically valid headers (pre-auth read_body path)
+            sig_placeholder = secrets.token_hex(32)
+            hdrs = (
+                "POST /v1/poll HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Length: 64\r\n"
+                "X-Soak-Worker: win-a\r\n"
+                "X-Soak-Ts: %.3f\r\n"
+                "X-Soak-Nonce: reqnonce123456\r\n"
+                "X-Soak-Sig: %s\r\n\r\n"
+                % (time.time(), sig_placeholder)
+            ).encode("utf-8")
+            assert_trickle_aborts(hdrs)
+        finally:
+            for s in socks:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            srv_dl.stop()
+            srv.stop()
 
 
 @unittest.skipUnless(
