@@ -1715,6 +1715,45 @@ impl WorkloadScheduler {
         state.last_seen = Some(Instant::now());
     }
 
+    async fn collect_slot_violations(
+        &self,
+        qc: &QuotaController,
+        cached_quotas: Option<&HashMap<String, ParticipantQuota>>,
+    ) -> Vec<(TaskId, String)> {
+        self.queue
+            .queued_slot_quota_violations(|p| {
+                cached_quotas
+                    .and_then(|m| m.get(p))
+                    .map(|q| q.max_slots)
+                    .unwrap_or_else(|| qc.effective_quota(p).max_slots)
+            })
+            .await
+    }
+
+    async fn fail_unfulfillable_and_wake_waiters(&self, unfulfillable: &[(TaskId, String)]) {
+        for (task_id, reason) in unfulfillable {
+            if let Some(result) = self
+                .queue
+                .fail_unfulfillable_task(task_id, reason.clone())
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    reason = %reason,
+                    "Failing unfulfillable task"
+                );
+                if let Some(ref waiters) = self.waiters {
+                    let mut lock = waiters.write().await;
+                    if let Some(senders) = lock.remove(task_id) {
+                        for tx in senders {
+                            let _ = tx.send(result.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Performs an atomic batch scheduling pass assigning up to `max_batch_size` tasks:
     /// 1. Processes expired delayed retries in the queue.
     /// 2. Takes the active workers and what the master's own books say each one carries.
@@ -1746,13 +1785,25 @@ impl WorkloadScheduler {
             }
         }
 
+        let quota_qc = self
+            .quota_controller
+            .as_deref()
+            .filter(|qc| qc.has_any_quota_configured());
+
         // Step 2: Active workers (checked before touching the queue: no worker, nothing to clone)
         let (mut workers, registered, reg_epoch) = self.registry.scheduler_snapshot().await;
         if workers.is_empty() {
             if let Some(ref qc) = self.quota_controller {
-                qc.set_wait_reasons(HashMap::new());
+                qc.clear_wait_reasons_if_nonempty();
             }
             let mut report = ScheduleReport::default();
+            if let Some(qc) = quota_qc {
+                let violations = self.collect_slot_violations(qc, None).await;
+                if !violations.is_empty() {
+                    self.fail_unfulfillable_and_wake_waiters(&violations).await;
+                    report.unfulfillable = violations;
+                }
+            }
             for task_id in self.queue.ready_task_ids(max_batch_size).await {
                 report
                     .skipped
@@ -1815,7 +1866,9 @@ impl WorkloadScheduler {
         let mut excluded_submitters: HashSet<SubmitterId> = HashSet::new();
         let mut excluded_participants: HashSet<String> = HashSet::new();
         let mut wait_reasons: HashMap<String, String> = HashMap::new();
-        if let Some(ref qc) = self.quota_controller {
+        let mut report = ScheduleReport::default();
+        let mut unfulfillable_ids: HashSet<TaskId> = HashSet::new();
+        if let Some(qc) = quota_qc {
             let usage_map = self.queue.participant_usage().await;
             let mut weight_updates = Vec::with_capacity(usage_map.len());
             for (participant, counts) in usage_map {
@@ -1854,18 +1907,26 @@ impl WorkloadScheduler {
                 participant_usage.insert(participant, counts);
             }
             self.queue.sync_participant_weights(&weight_updates).await;
+            for (task_id, reason) in self
+                .collect_slot_violations(qc, Some(&participant_quotas))
+                .await
+            {
+                if unfulfillable_ids.insert(task_id) {
+                    report.unfulfillable.push((task_id, reason));
+                }
+            }
+        } else if let Some(ref qc) = self.quota_controller {
+            qc.clear_wait_reasons_if_nonempty();
         }
 
         // Step 3: Walk the queue
-        let mut report = ScheduleReport::default();
         let mut placements: Vec<(TaskId, usize)> = Vec::new();
         if (engine.free_slots > 0 || need_unfulfillable_sweep) && max_batch_size > 0 {
             let mut need_sweep = need_unfulfillable_sweep;
             let scan_budget = self.config.max_scan_per_pass.max(1);
             let mut ran_fair = false;
             if engine.free_slots > 0
-                && (self.queue.active_submitter_count().await > 1
-                    || self.quota_controller.is_some())
+                && (self.queue.active_submitter_count().await > 1 || quota_qc.is_some())
             {
                 ran_fair = true;
                 let mut fair_cursor = FairWalkCursor::default();
@@ -1891,22 +1952,48 @@ impl WorkloadScheduler {
                         )
                         .await;
                     let fetched = views.len();
-                    if !engine.gpu_waiting
-                        && self.config.preserve_gpu_for_gpu_tasks
-                        && views.iter().any(|v| engine.any_gpu_worker_fits_view(v))
-                    {
-                        engine.note_gpu_waiting();
-                        self.note_gpu_demand();
-                    }
-                    let mut broke_early = false;
                     fn view_participant(view: &TaskView) -> Option<&str> {
                         view.participant.as_deref().or(match &view.submitter {
                             SubmitterId::Participant(p) => Some(p.as_str()),
                             _ => None,
                         })
                     }
+                    if !engine.gpu_waiting
+                        && self.config.preserve_gpu_for_gpu_tasks
+                        && views.iter().any(|v| {
+                            let quota_blocked = quota_qc.is_some()
+                                && (excluded_submitters.contains(&v.submitter)
+                                    || view_participant(v).is_some_and(|p| {
+                                        excluded_participants.contains(p)
+                                            || participant_quotas.get(p).is_some_and(|q| {
+                                                let slots = v.requirements.cpu_cores.max(1);
+                                                let used = participant_usage
+                                                    .get(p)
+                                                    .copied()
+                                                    .unwrap_or_default();
+                                                q.max_running_tasks
+                                                    .is_some_and(|m| used.running_tasks >= m)
+                                                    || q.max_slots.is_some_and(|m| {
+                                                        slots > m
+                                                            || used
+                                                                .running_slots
+                                                                .saturating_add(slots)
+                                                                > m
+                                                    })
+                                            })
+                                    }));
+                            !quota_blocked && engine.any_gpu_worker_fits_view(v)
+                        })
+                    {
+                        engine.note_gpu_waiting();
+                        self.note_gpu_demand();
+                    }
+                    let mut broke_early = false;
                     for view in &views {
-                        if self.quota_controller.is_some() {
+                        if unfulfillable_ids.contains(&view.task_id) {
+                            continue;
+                        }
+                        if quota_qc.is_some() {
                             let participant_opt = view_participant(view);
                             if let Some(participant) = participant_opt {
                                 if excluded_submitters.contains(&view.submitter)
@@ -1960,6 +2047,17 @@ impl WorkloadScheduler {
                                     }
                                     let task_slots = view.requirements.cpu_cores.max(1);
                                     if let Some(max_slots) = quota.max_slots {
+                                        if task_slots > max_slots {
+                                            if unfulfillable_ids.insert(view.task_id) {
+                                                report.unfulfillable.push((
+                                                    view.task_id,
+                                                    format!(
+                                                        "task requires {task_slots} slot(s), exceeding participant '{participant}' max_slots={max_slots}"
+                                                    ),
+                                                ));
+                                            }
+                                            continue;
+                                        }
                                         if usage.running_slots.saturating_add(task_slots)
                                             > max_slots
                                         {
@@ -2018,7 +2116,7 @@ impl WorkloadScheduler {
                                     );
                                 }
                                 placements.push((view.task_id, idx));
-                                if self.quota_controller.is_some() {
+                                if quota_qc.is_some() {
                                     let participant_opt = view_participant(view);
                                     if let Some(participant) = participant_opt {
                                         let task_slots = view.requirements.cpu_cores.max(1);
@@ -2267,32 +2365,13 @@ impl WorkloadScheduler {
                 }
             }
         }
-        if let Some(ref qc) = self.quota_controller {
+        if let Some(qc) = quota_qc {
             qc.set_wait_reasons(wait_reasons);
         }
         self.rr_cursor
             .store(engine.rr_cursor, std::sync::atomic::Ordering::Relaxed);
-        for (task_id, reason) in &report.unfulfillable {
-            if let Some(result) = self
-                .queue
-                .fail_unfulfillable_task(task_id, reason.clone())
-                .await
-            {
-                warn!(
-                    task_id = %task_id,
-                    reason = %reason,
-                    "Failing unfulfillable task"
-                );
-                if let Some(ref waiters) = self.waiters {
-                    let mut lock = waiters.write().await;
-                    if let Some(senders) = lock.remove(task_id) {
-                        for tx in senders {
-                            let _ = tx.send(result.clone());
-                        }
-                    }
-                }
-            }
-        }
+        self.fail_unfulfillable_and_wake_waiters(&report.unfulfillable)
+            .await;
         if placements.is_empty() {
             return Ok(report);
         }

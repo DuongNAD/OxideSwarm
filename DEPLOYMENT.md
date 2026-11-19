@@ -294,16 +294,11 @@ and CLIs: an upgraded master refuses peers more than one version back before reg
 submission, whereas a newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`,
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`
 list).
-When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
-or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from 0.4.1 on, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly first (`SIGINT`
+or `SIGTERM`; on Windows `windows\oxctl.ps1 stop` from 0.4.1 on, which sends Ctrl+C and waits up to 15 s before `taskkill`; the `oxctl.ps1` of 0.3.0 and 0.4.0 ends the master with `taskkill /F` (BUG-23), so with those start the old master again in a console window on the same `--state-dir` and press Ctrl+C there) before replacing the binary across a protocol version **or store format** change: clean shutdown compacts `journal.bin` into the
 self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
-protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
-protocol version is refused at startup with a `GridError::Storage` message. `TaskStore` format `5` (which records each
-task's submitting member id for `ENROLL-1c` revocation cancellation and `ECO-9` quotas, [design 0097](docs/design/0097-per-participant-quotas.md))
-likewise upgrades cleanly from format `4` (`0.4.x`) on startup after a clean stop of the old master, while older
-uncompacted `journal.bin` records remain refused. **Rolling back** a master after it ran with format `5` needs a
-copy of `--state-dir` made before the upgrade: `0.4.x` (store format `4`) cannot open format `5`, just as `0.3.0`
-cannot open format `4`. On Windows the state directory must be on a volume that keeps file permissions (NTFS or ReFS): a master refuses one on exFAT or FAT32 at start-up, before it writes there (BUG-24).
+protocol versions and store formats automatically (`docs/design/0046-master-durability.md`, [design 0097](docs/design/0097-per-participant-quotas.md)); an uncompacted format-4 (or older) `journal.bin` — including from a crashed `0.4.x` master even at the same protocol 10 — is refused before anything is rewritten with a `GridError::Storage` message. `TaskStore` format `5` records each
+task's submitting member id for `ENROLL-1c` revocation cancellation and `ECO-9` quotas and upgrades cleanly from format `4` (`0.4.x`) on startup after that clean stop. **No downgrade without a backup:** once a master runs with format `5`, `0.4.x` (store format `4`) cannot open `--state-dir`; keep a copy of `--state-dir` made before the upgrade (just as `0.3.0` cannot open format `4`). On Windows the state directory must be on a volume that keeps file permissions (NTFS or ReFS): a master refuses one on exFAT or FAT32 at start-up, before it writes there (BUG-24).
 The `0.3.0` and `0.4.0` masters do not check this: on exFAT they start once and then refuse their own
 `members.json`. During the window, pin a task to an old or
 a new worker with an operator tag (`--tag` on the worker, `--require-tag` on `submit`) or with `--worker`:

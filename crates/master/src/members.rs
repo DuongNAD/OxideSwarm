@@ -1241,6 +1241,16 @@ impl MemberStore {
         guard.state.by_pubkey.contains_key(pubkey) && !guard.state.revoked_keys.contains(pubkey)
     }
 
+    /// Returns `true` if `member_id` belongs to a currently enrolled (non-revoked) member.
+    pub fn contains_member_id(&self, member_id: &str) -> bool {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .state
+            .by_pubkey
+            .iter()
+            .any(|(pk, entry)| entry.id == member_id && !guard.state.revoked_keys.contains(pk))
+    }
+
     /// Looks up a member entry by public key.
     pub fn get(&self, pubkey: &PublicKey) -> Option<MemberEntry> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
@@ -2233,6 +2243,47 @@ impl MemberStore {
             .state
             .member_participants
             .clone()
+    }
+
+    /// Returns the persisted per-participant quota override for `participant`, if any.
+    pub fn participant_quota_override(&self, participant: &str) -> Option<ParticipantQuota> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .participant_quotas
+            .get(participant)
+            .cloned()
+    }
+
+    /// True if `default_participant_quota` or any entry in `participant_quotas` sets any field.
+    pub fn has_any_persisted_quota(&self) -> bool {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .state
+            .default_participant_quota
+            .as_ref()
+            .is_some_and(|q| !q.is_empty())
+            || guard
+                .state
+                .participant_quotas
+                .values()
+                .any(|q| !q.is_empty())
+    }
+
+    /// True if any persisted default or override sets `priority_band`.
+    pub fn has_any_persisted_priority_band(&self) -> bool {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .state
+            .default_participant_quota
+            .as_ref()
+            .is_some_and(|q| q.priority_band.is_some())
+            || guard
+                .state
+                .participant_quotas
+                .values()
+                .any(|q| q.priority_band.is_some())
     }
 
     /// Returns a snapshot of persisted per-participant quota overrides.

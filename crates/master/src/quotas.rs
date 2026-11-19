@@ -377,10 +377,21 @@ impl QuotaController {
             Some(cli) => cli.merge_with_default(&base),
             None => base,
         };
-        match self.members.quota_overrides().get(participant) {
+        match self.members.participant_quota_override(participant) {
             Some(persisted) => persisted.merge_with_default(&after_cli),
             None => after_cli,
         }
+    }
+
+    /// True if any default quota, priority band, limit, or weight is configured in policy or `members.json`.
+    pub fn has_any_quota_configured(&self) -> bool {
+        !self.policy.default_quota.is_empty()
+            || self
+                .policy
+                .participant_overrides
+                .values()
+                .any(|q| !q.is_empty())
+            || self.members.has_any_persisted_quota()
     }
 
     /// True if any default or override specifies a `PriorityBand`.
@@ -391,18 +402,19 @@ impl QuotaController {
                 .participant_overrides
                 .values()
                 .any(|q| q.priority_band.is_some())
-            || self
-                .members
-                .default_participant_quota()
-                .is_some_and(|q| q.priority_band.is_some())
-            || self
-                .members
-                .quota_overrides()
-                .values()
-                .any(|q| q.priority_band.is_some())
+            || self.members.has_any_persisted_priority_band()
     }
 
     /// Resolves and checks task priority against the participant's configured `PriorityBand`.
+    ///
+    /// When the participant has no `priority_band` override:
+    /// - If priority bands are configured elsewhere on the cluster, unbanded HTTP/local/`agent-mesh`
+    ///   submissions default to `Normal` (`50`) and clamp any higher requested priority to `50` so
+    ///   they cannot starve `High`-band members or exceed `Normal` defaults.
+    /// - Else if members are enrolled or other quotas are active, clamp to `0` so HTTP/local/`agent-mesh`
+    ///   submissions cannot jump ahead of enrolled members at priority `0`.
+    /// - Only when neither members nor quotas/bands are configured do explicit numeric priorities
+    ///   pass through unchanged.
     pub fn resolve_submission_priority(
         &self,
         participant: &str,
@@ -425,12 +437,34 @@ impl QuotaController {
             }
             return Ok(band.default_priority());
         }
+        if self.any_priority_band_configured() {
+            let cap = PriorityBand::Normal.default_priority();
+            return Ok(requested.unwrap_or(cap).min(cap));
+        }
+        if !self.members.is_empty() || self.has_any_quota_configured() {
+            return Ok(0);
+        }
         Ok(requested.unwrap_or(0))
     }
 
     /// Replaces the current scheduler wait-reason map (`participant -> reason`).
     pub fn set_wait_reasons(&self, reasons: HashMap<String, String>) {
         *self.wait_reasons.write().unwrap_or_else(|e| e.into_inner()) = reasons;
+    }
+
+    /// Clears stored wait reasons without acquiring a write lock when already empty.
+    pub fn clear_wait_reasons_if_nonempty(&self) {
+        let nonempty = !self
+            .wait_reasons
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if nonempty {
+            self.wait_reasons
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
     }
 
     /// Returns a snapshot of the current per-participant wait reasons.
@@ -681,5 +715,73 @@ mod tests {
             .find(|r| r.participant == "team-a")
             .unwrap();
         assert_eq!(team_a_row.member_ids, vec![aid]);
+    }
+
+    #[test]
+    fn unbanded_priority_clamps_unless_cluster_unconfigured_and_quota_active_skips_empty() {
+        let kp = NodeKeypair::generate().unwrap();
+        let mid = kp.member_id();
+        let empty_members = Arc::new(MemberStore::from_entries(vec![]));
+        let bare = QuotaController::new(Arc::clone(&empty_members), QuotaPolicyConfig::default());
+        assert!(!bare.has_any_quota_configured());
+        // Completely unconfigured clusters preserve raw priority requests.
+        assert_eq!(
+            bare.resolve_submission_priority(ORGANISER_PARTICIPANT, Some(42))
+                .unwrap(),
+            42
+        );
+
+        // Once members are enrolled without bands, unbanded priorities clamp to 0.
+        let enrolled_members = Arc::new(MemberStore::from_entries(vec![MemberEntry::new(
+            "m1",
+            *kp.public_key(),
+            vec![MemberRole::Client],
+        )]));
+        let with_members =
+            QuotaController::new(Arc::clone(&enrolled_members), QuotaPolicyConfig::default());
+        assert!(!with_members.has_any_quota_configured());
+        assert_eq!(
+            with_members
+                .resolve_submission_priority(ORGANISER_PARTICIPANT, Some(99))
+                .unwrap(),
+            0
+        );
+
+        // When any priority band is configured elsewhere, unbanded traffic defaults to Normal (50)
+        // and clamps above 50 so it never starves High-band members.
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            format!("{MEMBER_PARTICIPANT_PREFIX}{mid}"),
+            ParticipantQuota {
+                priority_band: Some(PriorityBand::High),
+                ..Default::default()
+            },
+        );
+        let banded = QuotaController::new(
+            enrolled_members,
+            QuotaPolicyConfig {
+                default_quota: ParticipantQuota::default(),
+                participant_overrides: overrides,
+            },
+        );
+        assert!(banded.has_any_quota_configured());
+        assert_eq!(
+            banded
+                .resolve_submission_priority(ORGANISER_PARTICIPANT, None)
+                .unwrap(),
+            PriorityBand::Normal.default_priority()
+        );
+        assert_eq!(
+            banded
+                .resolve_submission_priority(ORGANISER_PARTICIPANT, Some(999))
+                .unwrap(),
+            PriorityBand::Normal.default_priority()
+        );
+        assert_eq!(
+            banded
+                .resolve_submission_priority(ORGANISER_PARTICIPANT, Some(25))
+                .unwrap(),
+            25
+        );
     }
 }

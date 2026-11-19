@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
+use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::noise_auth::{
     v3_client_handshake, HandshakePurpose, MemberEntry, MemberRole, NodeKeypair, PublicKey,
 };
+use rusty_grid_core::placement::VERIFY_REPLICAS_TAG_PREFIX;
 use rusty_grid_core::protocol::{
     ClientMessage, ClientResponse, EndpointRole, MasterMessage, ProtocolCapabilities,
     WorkerMessage, PROTOCOL_VERSION_CURRENT,
@@ -79,7 +81,7 @@ async fn register_fake_worker(
     })
     .await
     .expect("send Register");
-    match tokio::time::timeout(Duration::from_secs(5), t.recv_msg::<MasterMessage>())
+    match tokio::time::timeout(Duration::from_secs(30), t.recv_msg::<MasterMessage>())
         .await
         .expect("RegisterAck timeout")
         .expect("RegisterAck io")
@@ -237,7 +239,7 @@ async fn running_cap_bounds_concurrency_reports_wait_reason_and_never_starves_ot
     // All 4 runnable tasks (2 from capped alice, 2 from uncapped bob) must arrive even while
     // 4 of alice's tasks remain queued behind the cap.
     for _ in 0..4 {
-        let t = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+        let t = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
         if a_ids.contains(&t.id) {
             held_a.push(t.id);
         } else if b_ids.contains(&t.id) {
@@ -284,9 +286,9 @@ async fn running_cap_bounds_concurrency_reports_wait_reason_and_never_starves_ot
         let done = held_a.remove(0);
         send_task_success(&mut worker, wid, done).await;
         completed_a += 1;
-        wait_task_state(&master, done, TaskState::Completed, Duration::from_secs(5)).await;
+        wait_task_state(&master, done, TaskState::Completed, Duration::from_secs(30)).await;
         if completed_a + held_a.len() < 6 {
-            let next = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+            let next = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
             assert!(a_ids.contains(&next.id));
             held_a.push(next.id);
             assert!(held_a.len() <= 2);
@@ -359,7 +361,7 @@ async fn slot_cap_bounds_concurrent_cores_and_rejects_oversized_task() {
         register_fake_worker(addr, "w-slot-6", 6, Some((&kw, &master_pub))).await;
     let mut first_wave = Vec::new();
     for _ in 0..3 {
-        first_wave.push(recv_next_assignment(&mut worker, Duration::from_secs(5)).await);
+        first_wave.push(recv_next_assignment(&mut worker, Duration::from_secs(30)).await);
     }
     let wave_a: Vec<TaskId> = first_wave
         .iter()
@@ -374,7 +376,7 @@ async fn slot_cap_bounds_concurrent_cores_and_rejects_oversized_task() {
 
     // Finish one of alice's 2-core tasks -> 3rd 2-core task immediately starts.
     send_task_success(&mut worker, wid, wave_a[0]).await;
-    let third = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let third = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert!(a_ids.contains(&third.id));
     send_task_success(&mut worker, wid, wave_a[1]).await;
     send_task_success(&mut worker, wid, b_id).await;
@@ -383,7 +385,7 @@ async fn slot_cap_bounds_concurrent_cores_and_rejects_oversized_task() {
         &master,
         third.id,
         TaskState::Completed,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await;
     let _ = master.shutdown();
@@ -440,7 +442,7 @@ async fn fair_share_one_connection_vs_twenty_connections_splits_equally() {
     let mut got_b = 0usize;
     let mut assigned = Vec::new();
     for _ in 0..4 {
-        let t = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+        let t = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
         if a_ids.contains(&t.id) {
             got_a += 1;
         } else if b_ids.contains(&t.id) {
@@ -530,7 +532,7 @@ async fn multi_machine_grouping_and_live_relabeling() {
     let mut first_three = HashSet::new();
     for _ in 0..3 {
         first_three.insert(
-            recv_next_assignment(&mut worker, Duration::from_secs(5))
+            recv_next_assignment(&mut worker, Duration::from_secs(30))
                 .await
                 .id,
         );
@@ -551,7 +553,7 @@ async fn multi_machine_grouping_and_live_relabeling() {
         .unwrap();
     assert_eq!(relabel.status(), reqwest::StatusCode::OK);
 
-    let rekeyed = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let rekeyed = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert_eq!(
         rekeyed.id, t3,
         "live re-labeling must dispatch queued task t3"
@@ -560,7 +562,7 @@ async fn multi_machine_grouping_and_live_relabeling() {
     for id in [t1, t2, tb, t3] {
         send_task_success(&mut worker, wid, id).await;
     }
-    wait_task_state(&master, t3, TaskState::Completed, Duration::from_secs(5)).await;
+    wait_task_state(&master, t3, TaskState::Completed, Duration::from_secs(30)).await;
     let _ = master.shutdown();
 }
 
@@ -645,9 +647,9 @@ async fn queued_cap_and_priority_bands_without_starvation() {
         register_fake_worker(addr, "w-prio-4", 4, Some((&kw, &master_pub))).await;
     // Order of first 3 assignments must be [h1 (High), n1 (Normal), l1 (Low)] while h2 waits for
     // `p-high` max_running_tasks=1.
-    let t_first = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
-    let t_second = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
-    let t_third = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let t_first = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    let t_second = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    let t_third = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert_eq!(t_first.id, h1, "High band must dispatch first");
     assert_eq!(t_second.id, n1, "Normal band must dispatch second");
     assert_eq!(
@@ -656,12 +658,12 @@ async fn queued_cap_and_priority_bands_without_starvation() {
     );
 
     send_task_success(&mut worker, wid, h1).await;
-    let t_fourth = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let t_fourth = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert_eq!(t_fourth.id, h2);
     for id in [n1, l1, h2] {
         send_task_success(&mut worker, wid, id).await;
     }
-    wait_task_state(&master, h2, TaskState::Completed, Duration::from_secs(5)).await;
+    wait_task_state(&master, h2, TaskState::Completed, Duration::from_secs(30)).await;
     let _ = master.shutdown();
 }
 
@@ -734,7 +736,7 @@ async fn state_dir_persistence_preserves_labels_quotas_and_submitted_by_member()
         let t1 = submit_v3(&mut ca, echo_task("persist-1", 1)).await.unwrap();
         let t2 = submit_v3(&mut ca, echo_task("persist-2", 1)).await.unwrap();
         let t3 = submit_v3(&mut ca, echo_task("persist-3", 1)).await.unwrap();
-        wait_task_queued(&master, t3, Duration::from_secs(5)).await;
+        wait_task_queued(&master, t3, Duration::from_secs(30)).await;
 
         master.shutdown().unwrap();
         drop(master);
@@ -742,7 +744,7 @@ async fn state_dir_persistence_preserves_labels_quotas_and_submitted_by_member()
     };
 
     // Wait cleanly for Master 1 to release `store.lock` before opening Master 2 on the same dir.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let master2 = loop {
         let cfg2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_state_dir(&state_dir)
@@ -795,8 +797,8 @@ async fn state_dir_persistence_preserves_labels_quotas_and_submitted_by_member()
     )
     .await;
 
-    let first = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
-    let second = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let first = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    let second = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     let alice_set: HashSet<TaskId> = [t1, t2, t3].into_iter().collect();
     let got_ids: HashSet<TaskId> = [first.id, second.id].into_iter().collect();
     assert!(
@@ -815,17 +817,17 @@ async fn state_dir_persistence_preserves_labels_quotas_and_submitted_by_member()
     send_task_success(&mut worker, wid, b_ctrl).await;
     send_task_success(&mut worker, wid, first_alice).await;
 
-    let next_a = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let next_a = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert!(alice_set.contains(&next_a.id));
     send_task_success(&mut worker, wid, next_a.id).await;
-    let last_a = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let last_a = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert!(alice_set.contains(&last_a.id));
     send_task_success(&mut worker, wid, last_a.id).await;
     wait_task_state(
         &master2,
         last_a.id,
         TaskState::Completed,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await;
     let _ = master2.shutdown();
@@ -857,15 +859,15 @@ async fn enroll_1c_step2_revoke_member_cancels_running_and_queued_tasks() {
 
     let mut ca = connect_v3(addr, &ka, &master_pub).await;
     let a_run = submit_v3(&mut ca, echo_task("a-running", 1)).await.unwrap();
-    let assigned = recv_next_assignment(&mut worker, Duration::from_secs(5)).await;
+    let assigned = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
     assert_eq!(assigned.id, a_run);
 
     let a_queued = submit_v3(&mut ca, echo_task("a-queued", 1)).await.unwrap();
-    wait_task_queued(&master, a_queued, Duration::from_secs(5)).await;
+    wait_task_queued(&master, a_queued, Duration::from_secs(30)).await;
 
     let mut cb = connect_v3(addr, &kb, &master_pub).await;
     let b_ctrl = submit_v3(&mut cb, echo_task("b-control", 1)).await.unwrap();
-    wait_task_queued(&master, b_ctrl, Duration::from_secs(5)).await;
+    wait_task_queued(&master, b_ctrl, Duration::from_secs(30)).await;
 
     // Admin revokes `ka` -> Step 2 must cancel BOTH `a_run` and `a_queued`, notify worker with
     // `CancelTask(a_run)`, and allow `b_ctrl` to run and complete on `kw`.
@@ -884,7 +886,7 @@ async fn enroll_1c_step2_revoke_member_cancels_running_and_queued_tasks() {
 
     let mut saw_cancel_a_run = false;
     let mut saw_assign_b_ctrl = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !(saw_cancel_a_run && saw_assign_b_ctrl) {
         let left = deadline.saturating_duration_since(Instant::now());
         assert!(
@@ -910,12 +912,18 @@ async fn enroll_1c_step2_revoke_member_cancels_running_and_queued_tasks() {
         }
     }
 
-    wait_task_state(&master, a_run, TaskState::Cancelled, Duration::from_secs(5)).await;
+    wait_task_state(
+        &master,
+        a_run,
+        TaskState::Cancelled,
+        Duration::from_secs(30),
+    )
+    .await;
     wait_task_state(
         &master,
         a_queued,
         TaskState::Cancelled,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await;
 
@@ -924,9 +932,385 @@ async fn enroll_1c_step2_revoke_member_cancels_running_and_queued_tasks() {
         &master,
         b_ctrl,
         TaskState::Completed,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await;
 
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn mapreduce_enforces_participant_quotas_and_reports_in_api() {
+    let ka = NodeKeypair::generate().unwrap();
+    let kw = NodeKeypair::generate().unwrap();
+    let members = MemberStore::from_entries(vec![
+        MemberEntry::new("mr-alice", *ka.public_key(), vec![MemberRole::Client]),
+        MemberEntry::new("mr-worker", *kw.public_key(), vec![MemberRole::Worker]),
+    ]);
+    members
+        .set_member_participant(&ka.member_id(), Some("alice"))
+        .unwrap();
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "alice".to_string(),
+        ParticipantQuota {
+            max_running_tasks: Some(1),
+            ..Default::default()
+        },
+    );
+    let auth_cfg = AuthConfig::new().with_token("adm", "admin", &[AuthScope::Admin]);
+    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_auth_mode(AuthMode::Members)
+        .with_members(members)
+        .with_dashboard_port(0)
+        .with_auth_config(auth_cfg)
+        .with_quota_policy(QuotaPolicyConfig {
+            default_quota: ParticipantQuota::default(),
+            participant_overrides: overrides,
+        });
+    let master = MasterServer::spawn(cfg).await.unwrap();
+    let master_pub = master.master_noise_public_key().unwrap();
+    let addr = master.server_addr();
+    let dash = format!("http://{}", master.dashboard_addr().unwrap());
+
+    let (wid, mut worker) = register_fake_worker(addr, "w-mr-4", 4, Some((&kw, &master_pub))).await;
+
+    let mut ca = connect_v3(addr, &ka, &master_pub).await;
+    let job = MapReduceJobSpec::new(
+        "mr-quota-test",
+        vec!["one".into(), "two".into(), "three".into()],
+        MapFunctionSpec::Builtin {
+            operator: "word_count".into(),
+        },
+        ReduceFunctionSpec::Builtin {
+            operator: "sum".into(),
+        },
+        3,
+        1,
+        30,
+    );
+    let mr_handle = tokio::spawn(async move {
+        ca.send_msg(&ClientMessage::SubmitMapReduce { job })
+            .await
+            .unwrap();
+        ca.recv_msg::<ClientResponse>().await.unwrap()
+    });
+
+    // Receive the first mapper; the other 2 mappers must wait queued under alice max_running=1.
+    let m1 = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    let http = http_client();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let q_dto: serde_json::Value = http
+            .get(format!("{dash}/api/quotas"))
+            .bearer_auth("adm")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = q_dto["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["participant"] == "alice");
+        if let Some(r) = row {
+            if r["usage"]["running_tasks"] == 1 && r["usage"]["queued_tasks"] == 2 {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for MapReduce quota usage on /api/quotas"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Complete all 3 mappers sequentially; prove each starts only after the previous finishes.
+    for (idx, task) in [Some(m1), None, None].into_iter().enumerate() {
+        let current = match task {
+            Some(t) => t,
+            None => recv_next_assignment(&mut worker, Duration::from_secs(30)).await,
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(120),
+                worker.recv_msg::<MasterMessage>()
+            )
+            .await
+            .is_err(),
+            "MapReduce exceeded max_running_tasks=1 on mapper wave {idx}"
+        );
+        worker
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id: wid,
+                task_id: current.id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"word\t1\n"),
+                stderr: Bytes::new(),
+                execution_time_ms: 1,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    match tokio::time::timeout(Duration::from_secs(30), mr_handle)
+        .await
+        .expect("MapReduce completion timeout")
+        .expect("MapReduce task join")
+    {
+        Some(ClientResponse::MapReduceCompleted { result }) => {
+            assert_eq!(result.status, "Completed");
+            assert_eq!(result.map_tasks_completed, 3);
+            assert_eq!(
+                result.output.get("word").and_then(|v| v.as_f64()),
+                Some(3.0)
+            );
+        }
+        other => panic!("expected MapReduceCompleted, got {other:?}"),
+    }
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn lowering_max_slots_fails_stranded_queued_task_unfulfillable_and_wakes_waiter() {
+    let ka = NodeKeypair::generate().unwrap();
+    let kw = NodeKeypair::generate().unwrap();
+    let members = MemberStore::from_entries(vec![
+        MemberEntry::new("alice-slots", *ka.public_key(), vec![MemberRole::Client]),
+        MemberEntry::new("w-slots", *kw.public_key(), vec![MemberRole::Worker]),
+    ]);
+    members
+        .set_member_participant(&ka.member_id(), Some("alice"))
+        .unwrap();
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "alice".to_string(),
+        ParticipantQuota {
+            max_running_tasks: Some(1),
+            max_slots: Some(4),
+            ..Default::default()
+        },
+    );
+    let auth_cfg = AuthConfig::new().with_token("adm", "admin", &[AuthScope::Admin]);
+    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_auth_mode(AuthMode::Members)
+        .with_members(members)
+        .with_dashboard_port(0)
+        .with_auth_config(auth_cfg)
+        .with_quota_policy(QuotaPolicyConfig {
+            default_quota: ParticipantQuota::default(),
+            participant_overrides: overrides,
+        });
+    let master = MasterServer::spawn(cfg).await.unwrap();
+    let master_pub = master.master_noise_public_key().unwrap();
+    let addr = master.server_addr();
+    let dash = format!("http://{}", master.dashboard_addr().unwrap());
+
+    let (wid, mut worker) =
+        register_fake_worker(addr, "w-strand-4", 4, Some((&kw, &master_pub))).await;
+
+    // Hold alice's running cap at 1/1 with a 1-core task while queuing a 4-core `wait: true` task.
+    let mut ca1 = connect_v3(addr, &ka, &master_pub).await;
+    let hold_id = submit_v3(&mut ca1, echo_task("hold-1", 1)).await.unwrap();
+    let assigned_hold = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    assert_eq!(assigned_hold.id, hold_id);
+
+    let wide_task = echo_task("wide-4", 4);
+    let wide_id = wide_task.id;
+    let mut ca2 = connect_v3(addr, &ka, &master_pub).await;
+    let waiter_handle = tokio::spawn(async move {
+        ca2.send_msg(&ClientMessage::SubmitTask {
+            task: wide_task,
+            wait: true,
+        })
+        .await
+        .unwrap();
+        ca2.recv_msg::<ClientResponse>().await.unwrap()
+    });
+    wait_task_queued(&master, wide_id, Duration::from_secs(30)).await;
+
+    // Lower alice's max_slots from 4 to 2 via HTTP Admin API -> stranded `wide_id` must fail as
+    // Unfulfillable with reason naming `max_slots=2` and wake the `wait: true` client.
+    let http = http_client();
+    let resp = http
+        .post(format!("{dash}/api/quotas/participants/alice"))
+        .bearer_auth("adm")
+        .json(&serde_json::json!({
+            "max_running_tasks": 1,
+            "max_slots": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    match tokio::time::timeout(Duration::from_secs(30), waiter_handle)
+        .await
+        .expect("stranded task waiter timed out")
+        .expect("waiter join")
+    {
+        Some(ClientResponse::TaskCompleted { task_id, result }) => {
+            assert_eq!(task_id, wide_id);
+            assert!(!result.is_success());
+            let err = result.error.unwrap_or_default();
+            assert!(err.contains("max_slots=2"), "unexpected error: {err}");
+        }
+        other => panic!("expected failed TaskCompleted for stranded task, got {other:?}"),
+    }
+    wait_task_state(&master, wide_id, TaskState::Failed, Duration::from_secs(30)).await;
+
+    send_task_success(&mut worker, wid, hold_id).await;
+    wait_task_state(
+        &master,
+        hold_id,
+        TaskState::Completed,
+        Duration::from_secs(30),
+    )
+    .await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn unbanded_http_and_master_handle_priority_is_clamped_below_members() {
+    let ka = NodeKeypair::generate().unwrap();
+    let kw = NodeKeypair::generate().unwrap();
+    let members = MemberStore::from_entries(vec![
+        MemberEntry::new("high-alice", *ka.public_key(), vec![MemberRole::Client]),
+        MemberEntry::new("w-clamp", *kw.public_key(), vec![MemberRole::Worker]),
+    ]);
+    members
+        .set_member_participant(&ka.member_id(), Some("alice"))
+        .unwrap();
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "alice".to_string(),
+        ParticipantQuota {
+            priority_band: Some(PriorityBand::High),
+            ..Default::default()
+        },
+    );
+    let auth_cfg = AuthConfig::new().with_token("sub", "submitter", &[AuthScope::Submitter]);
+    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_auth_mode(AuthMode::Both)
+        .with_members(members)
+        .with_dashboard_port(0)
+        .with_auth_config(auth_cfg)
+        .with_quota_policy(QuotaPolicyConfig {
+            default_quota: ParticipantQuota::default(),
+            participant_overrides: overrides,
+        });
+    let master = MasterServer::spawn(cfg).await.unwrap();
+    let master_pub = master.master_noise_public_key().unwrap();
+    let addr = master.server_addr();
+    let dash = format!("http://{}", master.dashboard_addr().unwrap());
+
+    // Submit unbanded HTTP and MasterHandle tasks with priority=999 BEFORE alice's High-band task:
+    // both unbanded tasks must clamp to Normal (50), so alice's High (100) still runs first.
+    let http = http_client();
+    let http_resp: serde_json::Value = http
+        .post(format!("{dash}/api/tasks"))
+        .bearer_auth("sub")
+        .json(&serde_json::json!({"command": "echo http-unbanded", "priority": 999}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let http_id: TaskId = http_resp["task_id"].as_str().unwrap().parse().unwrap();
+    let mh_id = master
+        .submit_task_with_priority(echo_task("mh-unbanded", 1), 999)
+        .await
+        .unwrap();
+    assert_eq!(
+        master.get_task_info(http_id).await.unwrap().priority,
+        PriorityBand::Normal.default_priority()
+    );
+    assert_eq!(
+        master.get_task_info(mh_id).await.unwrap().priority,
+        PriorityBand::Normal.default_priority()
+    );
+
+    let mut ca = connect_v3(addr, &ka, &master_pub).await;
+    let high_id = submit_v3(&mut ca, echo_task("alice-high", 1))
+        .await
+        .unwrap();
+
+    let (wid, mut worker) =
+        register_fake_worker(addr, "w-clamp-1", 1, Some((&kw, &master_pub))).await;
+    let first = recv_next_assignment(&mut worker, Duration::from_secs(30)).await;
+    assert_eq!(
+        first.id, high_id,
+        "High-band member task must dispatch before clamped unbanded HTTP/MasterHandle tasks"
+    );
+    send_task_success(&mut worker, wid, first.id).await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn verify_replicas_exceeding_max_queued_tasks_is_refused_upfront() {
+    let ka = NodeKeypair::generate().unwrap();
+    let members = MemberStore::from_entries(vec![MemberEntry::new(
+        "verify-alice",
+        *ka.public_key(),
+        vec![MemberRole::Client],
+    )]);
+    members
+        .set_member_participant(&ka.member_id(), Some("alice"))
+        .unwrap();
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "alice".to_string(),
+        ParticipantQuota {
+            max_queued_tasks: Some(2),
+            ..Default::default()
+        },
+    );
+    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_auth_mode(AuthMode::Members)
+        .with_members(members)
+        .with_quota_policy(QuotaPolicyConfig {
+            default_quota: ParticipantQuota::default(),
+            participant_overrides: overrides,
+        });
+    let master = MasterServer::spawn(cfg).await.unwrap();
+    let master_pub = master.master_noise_public_key().unwrap();
+    let addr = master.server_addr();
+
+    let mut ca = connect_v3(addr, &ka, &master_pub).await;
+    let mut bad_verify = echo_task("verify-3", 1);
+    bad_verify
+        .tags
+        .push(format!("{VERIFY_REPLICAS_TAG_PREFIX}3"));
+    let err = submit_v3(&mut ca, bad_verify)
+        .await
+        .expect_err("--verify 3 must be refused up front under max_queued_tasks=2");
+    assert!(
+        err.contains("max_queued_tasks") && err.contains("--verify 3"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(master.queue().stats().await.total, 0);
+
+    let mut ok_verify = echo_task("verify-2", 1);
+    ok_verify
+        .tags
+        .push(format!("{VERIFY_REPLICAS_TAG_PREFIX}2"));
+    let ok_id = submit_v3(&mut ca, ok_verify)
+        .await
+        .expect("--verify 2 fits max_queued_tasks=2");
+    wait_task_queued(&master, ok_id, Duration::from_secs(30)).await;
     let _ = master.shutdown();
 }

@@ -138,32 +138,49 @@ pub struct MembersFile {
   preserving `Default` and `Client(Uuid)`.
 - Every v3 connection maps to `SubmitterId::Participant(participant)` at submission (and on
   journal recovery for member-submitted tasks via `QuotaController::participant_for_member`), while
-  v2 secret/unauthenticated connections under the single `"organiser"` label keep distinct
-  `SubmitterId::Client(Uuid)` fair-share buckets so separate local connections still interleave in
-  WRR while sharing the `"organiser"` quota budget. Local internal `TaskQueue::submit` tests
-  without quota context keep `SubmitterId::Default`.
+  v2 secret/unauthenticated connections under `"organiser"` keep per-connection
+  `SubmitterId::Client(Uuid)` fair-share buckets **only when no member is enrolled**
+  (`members.is_empty()`) and are attributed to `SubmitterId::Participant("organiser")` once any
+  member is enrolled so v2/HTTP connections cannot multiply weight against enrolled members. Local
+  internal `TaskQueue::submit` tests without quota context keep `SubmitterId::Default`.
 - **Priority-tiered WRR (`walk_excluding`):** `FairShareQueues::walk_excluding(cursor, limit,
   excluded)` skips excluded (running/slot-capped) participants without mutating `active_ring`, selects
   the highest ready task priority across remaining active submitters, and walks submitters at that
   tier in WRR order before falling through to lower priority tiers.
-- **Scheduler gating & no starvation (`crates/master/src/scheduler.rs`):**
-  1. Before walking ready tasks, the scheduler computes per-participant active running tasks & slots
-     (`Scheduled`, `Running`, active `adoptable_by` holds) and updates in-memory scheduling weights.
-  2. When a queued task's participant is already at `max_running_tasks` or adding `task_slots` would
-     exceed `max_slots`:
-     - The task is skipped with `ScheduleSkipReason::ParticipantQuotaReached { participant, reason }`
-       and recorded in `QuotaController`'s live wait-reason map (`GET /api/quotas` / dashboard).
-     - Participants with **all** running/slot headroom exhausted (`running >= max_running` or
-       `running_slots >= max_slots`) are passed in `excluded` to `ready_views_fair_for_participants`,
-       so even thousands of capped `High`-band tasks cannot exhaust `max_scan_per_pass` or hold
-       back worker seats from other participants.
-  3. Because the fair-share cursor scans whenever at least 2 participants have queued work **or** any
-     participant quota exclusion is active (`!excluded.is_empty()`), a single blocked high-priority
-     participant still lets uncapped work run in FIFO/WRR order.
+- **Unbanded priority clamping (`QuotaController::resolve_submission_priority`):** When the resolved
+  participant has no explicit `priority_band`, HTTP `POST /api/tasks` and `agent-mesh` priority
+  requests are clamped to `PriorityBand::Normal.default_priority()` (`50`) if any priority band is
+  configured elsewhere on the cluster (and default to `50`), or clamped to `0` if members or
+  other quotas are active without bands, preventing unbanded traffic from starving enrolled
+  members. Only completely unconfigured clusters pass arbitrary numeric priorities through unchanged.
+- **MapReduce attribution (`crates/master/src/mapreduce.rs`):** Client connections pass
+  `MapReduceAttribution` (`quota_controller`, `submitted_by_member`, `client_submitter`) to
+  `MapReduceEngine::with_attribution`, routing mappers and reducers through
+  `TaskQueue::try_submit_slot_attributed` so `max_slots`, `max_running_tasks`, `max_queued_tasks`,
+  `priority_band`, and `ENROLL-1c` cancellation apply equally to MapReduce jobs (with transient
+  `max_queued_tasks` errors retrying under the existing queue-room backoff loop).
+- **Scheduler gating, zero-overhead bypass, & no starvation (`crates/master/src/scheduler.rs`):**
+  1. When `QuotaController::has_any_quota_configured()` is `false`, the scheduler skips
+     `participant_usage()` / `sync_participant_weights()` entirely, clears any stale wait reasons only
+     if non-empty, and uses the fair walk only when `active_submitter_count() > 1`.
+  2. When quotas are configured (`quota_qc` active), Step 2.5 computes per-participant active
+     running tasks & slots across `active_sizes` (never scanning retained terminal tasks), updates
+     in-memory scheduling weights, and fails any queued tasks whose required `cpu_cores` exceed the
+     participant's current `max_slots` (e.g., after an admin lowered `max_slots`, relabeled a member,
+     or restarted with tighter `--participant-quota`) as `Unfulfillable` (`TaskState::Failed`) with
+     the quota reason, waking `wait: true` clients even with busy or zero workers.
+  3. In Step 3, `ready_views_fair_excluding` skips participants excluded by `max_running_tasks` or
+     `max_slots` so capped `High`-band tasks cannot exhaust `max_scan_per_pass` or hold back
+     uncapped work; quota-blocked GPU tasks are ignored when checking `engine.note_gpu_waiting()`, so
+     they do not hold GPU reserve slots idle; and any queued task with `task_slots > max_slots`
+     likewise fails as `Unfulfillable`.
+  4. The fair-share cursor scans via `ready_views_fair_excluding` whenever at least 2 submitters
+     have queued work **or** `quota_qc` is active (`has_any_quota_configured()`).
 - **Live re-labeling (`rekey_member_participant`):** When an admin assigns or edits a member's
-  participant label, queued tasks belonging to that member re-key cleanly between `FairShareQueues`
-  buckets (removing and reinserting their `QueueOrderKey` under the write lock) so scheduling,
-  fair share, and queued counts reflect the new participant immediately.
+  participant label, active non-terminal tasks belonging to that member (`active_sizes`) re-key
+  cleanly between `FairShareQueues` buckets (removing and reinserting their `QueueOrderKey` under
+  the write lock) so scheduling, fair share, and queued counts reflect the new participant
+  immediately.
 
 ### D4 `TaskStore` format `4 -> 5`, `ENROLL-1c` step 2, and one-version store upgrade rule
 
@@ -173,6 +190,10 @@ pub struct MembersFile {
     to `PersistedTaskEntry` and `submitted_by_member: Option<String>` to `JournalRecord::TaskSubmitted`
     (re-blessing `crates/master/tests/data/journal_layout.txt`).
   - Mirror `pub submitted_by_member: Option<String>` on `TaskEntry` (`crates/master/src/queue.rs`).
+- **Revocation write-lock race guard (`ENROLL-1c`):** `TaskQueue::submit_attributed_checked` and
+  `try_submit_slot_attributed` verify under `inner.write().await` (`MemberStore::contains_member_id`)
+  that an enrolled submitting member has not been revoked between handshake and enqueue, rejecting a
+  concurrent `SubmitTask` / `SubmitMapReduce` handler that ran after `RevokeMember`'s cancel scan.
 - **One-version & clean-shutdown store upgrade rule ([design 0083](0083-one-version-window.md) D6,
   `DEPLOYMENT.md` section 3.5):**
   - `MIN_STORE_FORMAT_VERSION` remains `1` specifically to support the clean-shutdown snapshot
@@ -182,15 +203,20 @@ pub struct MembersFile {
       protocol `10`!) and `journal.bin` contains **no uncompacted records** (header-only at `HEADER_LEN`),
       `TaskStore::open_with` deserializes the JSON snapshot cleanly (`submitted_by_member` defaults to
       `None` for pre-upgrade tasks) and rewrites `snapshot.bin` and `journal.bin` headers to
-      `STORE_FORMAT_VERSION = 5`.
+      `STORE_FORMAT_VERSION = 5`. Verified against real `v0.4.4` binary fixtures in
+      `crates/master/tests/data/store_v0_4_4_{clean,dirty}/`.
     - If `journal.bin` holds **any uncompacted records** from an older `store_format != STORE_FORMAT_VERSION`
       or older `protocol_version != PROTOCOL_VERSION_CURRENT`, `parse_journal` **refuses to open**
-      with an explicit `GridError::Storage` message instructing the operator to start the previous
-      binary and stop it cleanly (`SIGINT`/`SIGTERM`, compacting `journal.bin` into `snapshot.bin`)
-      before upgrading to store format `5`.
+      before rewriting anything, with an explicit `GridError::Storage` message instructing the operator
+      to start the previous binary and stop it cleanly (`SIGINT`/`SIGTERM`) first.
     - Future store formats (`> 5`) and `0` are refused immediately. Downgrading a format `5` store
       back to `0.4.x` (format `4`) is not supported; operators must back up `--state-dir` before
       upgrading (`DEPLOYMENT.md` 3.5).
+- **`--verify N` replica accounting (`crates/cli/src/verify.rs`):** Each `submit --verify N` (or
+  MCP `verify`) replica counts against the submitter's participant quota. The CLI and MCP server
+  attach a non-constraint `oxs:verify-replicas=<N>` tag to the initial task (`replica_task` strips
+  it from replicas) so `submit_slot_inner` refuses `N > max_queued_tasks` with `QuotaExceeded` up
+  front before running the first copy (zero wire change).
 - **`ENROLL-1c` step 2 (`RevokeMember` cancels submitted tasks):**
   - When `ClientMessage::RevokeMember` revokes `member_id` (and also on admin revoke cleanup), after
     closing connections (step 1) and taking back its workers (step 3), the master calls
@@ -252,15 +278,19 @@ pub struct MembersFile {
 
 - **Unit tests:**
   - `crates/core/src/error.rs`: `GridError::QuotaExceeded` error code and transience rules.
+  - `crates/core/src/placement.rs` & `crates/cli/src/verify.rs`: `VERIFY_REPLICAS_TAG_PREFIX` parsing and stripping from verification replicas.
   - `crates/master/src/store.rs`: format `4 -> 5` clean-shutdown JSON upgrade (`submitted_by_member`
     defaults to `None`, headers rewritten to `5`), refusal of uncompacted format-4 journal even at
-    protocol `10`, and re-blessed `tests/data/journal_layout.txt`.
-  - `crates/master/src/quotas.rs`: label validation, `"member:*"` rejection, priority bands, quota
-    spec parsing, and precedence matrix.
+    protocol `10`, real `v0.4.4` binary clean & dirty store fixtures (`tests/data/store_v0_4_4_{clean,dirty}/`),
+    and re-blessed `tests/data/journal_layout.txt`.
+  - `crates/master/src/quotas.rs`: label validation, `"member:*"` rejection, priority bands, unbanded
+    priority clamping, `has_any_quota_configured`, quota spec parsing, and precedence matrix.
   - `crates/master/src/members.rs`: participant label & quota persistence across reload, revoke cleanup,
     and legacy `members.json` load compatibility.
   - `crates/master/src/fair_share.rs`: participant-keyed WRR, priority-tier ordering, and `walk_excluding`
     skipping capped submitters without starving others.
+  - `crates/master/src/queue/recovery_tests.rs`: revocation write-lock guard (`submit_attributed_checked`)
+    refusing a revoked member ID after revoke scan.
 - **Loopback integration tests (`crates/master/tests/test_eco9_participant_quotas.rs`):**
   1. Running cap of 2 tasks never exceeded under burst submission; queued tasks wait with wait reason
      and finish once running tasks complete while uncapped participants suffer zero starvation.
@@ -277,6 +307,13 @@ pub struct MembersFile {
      and configured caps survive restart.
   7. `ENROLL-1c` step 2: `RevokeMember` cancels active queued and running tasks submitted by the revoked
      member (and notifies executing workers) while leaving other members' tasks intact.
+  8. MapReduce attribution & quota enforcement (`SubmitMapReduce` capped by `max_running_tasks` and
+     visible on `/api/quotas`).
+  9. Lowering `max_slots` fails stranded queued wide tasks as `Failed` (`Unfulfillable`) and wakes
+     `wait: true` clients.
+  10. Unbanded HTTP `POST /api/tasks` and `MasterHandle::submit_task_with_priority` clamp priority so
+      they cannot starve `High`-band members.
+  11. `--verify N` (`oxs:verify-replicas=N`) exceeding `max_queued_tasks` is refused up front.
 
 ## Work items
 
@@ -296,4 +333,4 @@ pub struct MembersFile {
 ## Status log
 
 - 2026-11-19: Claimed `design 0097` on the hub and wrote initial design record for `ECO-9` and `ENROLL-1c` step 2 on branch `mac/eco-9-participant-quotas`.
-- 2026-11-19: Implemented master participant labels/quotas (`ECO-9`), `TaskStore` format `4 -> 5` and `ENROLL-1c` step 2 revocation cancellation, master CLI/TOML flags, RBAC HTTP `/api/quotas*` + `/api/members/{member_id}/participant` endpoints, Cockpit card, and 7-test loopback suite (`test_eco9_participant_quotas` passed `3/3` consecutive runs on macOS) on draft pull request 384; protocol 11 CLI RPC fields remain deferred with `BUG-22` and `NET-10`.
+- 2026-11-19: Implemented master participant labels/quotas (`ECO-9`), `TaskStore` format `4 -> 5` and `ENROLL-1c` step 2 revocation cancellation, master CLI/TOML flags, RBAC HTTP `/api/quotas*` + `/api/members/{member_id}/participant` endpoints, Cockpit card, MapReduce attribution, lowered `max_slots` `Unfulfillable` failure, revocation write-lock guard, unbanded priority clamping, unconfigured quota controller bypass, `--verify N` upfront cap, real `v0.4.4` store fixtures, and 11-test loopback suite (`test_eco9_participant_quotas` passed `3/3` consecutive runs on macOS) on draft pull request 384; protocol 11 CLI RPC fields remain deferred with `BUG-22` and `NET-10`.

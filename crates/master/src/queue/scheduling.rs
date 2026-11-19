@@ -34,12 +34,7 @@ impl TaskQueue {
     pub(crate) async fn check_room(&self, task_bytes: usize) -> GridResult<()> {
         let inner = self.inner.read().await;
         if let Some(cap) = inner.capacity {
-            let active_count = inner
-                .tasks
-                .values()
-                .filter(|e| !e.state.is_terminal())
-                .count();
-            if active_count >= cap {
+            if inner.active_sizes.len() >= cap {
                 return Err(GridError::QueueFull { capacity: cap });
             }
         }
@@ -56,8 +51,9 @@ impl TaskQueue {
     /// Attempts to submit the task in `task_slot` with priority 0, taking ownership from
     /// `task_slot` (`*task_slot = None`) only if the task is accepted into the queue.
     ///
-    /// When the queue is full (`QueueFull` or `QueueByteLimitExceeded`), `task_slot` is left
-    /// untouched so the caller can retry after backoff without ever cloning the task payload.
+    /// When the queue is full (`QueueFull`, `QueueByteLimitExceeded`, or transient
+    /// `QuotaExceeded`), `task_slot` is left untouched so the caller can retry after backoff
+    /// without ever cloning the task payload.
     pub(crate) async fn try_submit_slot(&self, task_slot: &mut Option<Task>) -> GridResult<TaskId> {
         self.try_submit_slot_from(task_slot, SubmitterId::Default)
             .await
@@ -70,158 +66,55 @@ impl TaskQueue {
         task_slot: &mut Option<Task>,
         submitter: SubmitterId,
     ) -> GridResult<TaskId> {
-        let task_ref = task_slot
-            .as_ref()
-            .ok_or_else(|| GridError::Config("task_slot is empty".into()))?;
-        task_ref.validate().map_err(GridError::Config)?;
-        let entry_bytes = task_active_bytes(task_ref);
-
-        self.check_room(entry_bytes).await?;
-
-        let (task_id, sequence, ack) = {
-            let mut inner = self.inner.write().await;
-
-            if inner.store_closed {
-                return Err(GridError::Storage(
-                    "task store is closed (master shutting down)".into(),
-                ));
-            }
-
-            let task_ref = task_slot.as_ref().expect("task_slot checked above");
-            if let Some(existing) = inner.tasks.get(&task_ref.id) {
-                return Err(GridError::Config(format!(
-                    "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
-                    task_ref.id, existing.state
-                )));
-            }
-
-            if let Some(cap) = inner.capacity {
-                let active_count = inner
-                    .tasks
-                    .values()
-                    .filter(|e| !e.state.is_terminal())
-                    .count();
-                if active_count >= cap {
-                    return Err(GridError::QueueFull { capacity: cap });
-                }
-            }
-
-            if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
-                return Err(GridError::QueueByteLimitExceeded {
-                    task_bytes: entry_bytes,
-                    in_use_bytes: inner.active_bytes,
-                    max_bytes: inner.max_active_bytes,
-                });
-            }
-
-            let sequence = inner.next_sequence;
-            let now_instant = Instant::now();
-            let now_epoch = Utc::now().timestamp() as u64;
-
-            let ack = if inner.store.is_some() {
-                let record = JournalRecord::TaskSubmitted {
-                    task: Box::new(task_ref.clone()),
-                    priority: 0,
-                    sequence,
-                    submitted_at_utc: now_epoch,
-                    submitted_by_member: None,
-                };
-                inner.append_durable(&record)?
-            } else {
-                None
-            };
-
-            let task = task_slot.take().expect("task_slot checked above");
-            let task_id = task.id;
-            let requires_tree_v2 = task_has_tree_input(&task);
-            let task_key = crate::speed::TaskKey::for_task(&task);
-            inner.next_sequence += 1;
-
-            let entry = TaskEntry {
-                task,
-                task_key,
-                priority: 0,
-                sequence,
-                participant: match &submitter {
-                    SubmitterId::Participant(p) => Some(p.clone()),
-                    _ => None,
-                },
-                submitter,
-                submitted_by_member: None,
-                state: TaskState::Queued,
-                assigned_worker_id: None,
-                submitted_at_utc: now_epoch,
-                submitted_instant: now_instant,
-                queued_instant: now_instant,
-                scheduled_instant: None,
-                started_instant: None,
-                retry_after_instant: None,
-                retry_count: 0,
-                failover_count: 0,
-                evacuation_count: 0,
-                rejection_count: 0,
-                avoid_workers: Vec::new(),
-                assigned_session: None,
-                resumed_from_checkpoint: false,
-                adoptable_by: None,
-                fail_if_not_adopted: false,
-                pending_failover_charge: false,
-                pending_failover_reason: None,
-                retry_history: Vec::new(),
-                result: None,
-                cold_result: None,
-                error_message: None,
-                requires_tree_v2,
-            };
-
-            inner.tasks.insert(task_id, entry);
-            inner.active_sizes.insert(task_id, entry_bytes);
-            inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
-            if ack.is_none() {
-                inner.insert_ready(QueueOrderKey {
-                    priority_rev: Reverse(0),
-                    sequence,
-                    task_id,
-                });
-            }
-            inner.maybe_trigger_compaction();
-            (task_id, sequence, ack)
+        let participant = match &submitter {
+            SubmitterId::Participant(p) => Some(p.clone()),
+            _ => None,
         };
+        let requires_tree_v2 = task_slot.as_ref().is_some_and(task_has_tree_input);
+        self.submit_slot_inner(
+            task_slot,
+            true,
+            0,
+            submitter,
+            participant,
+            None,
+            None,
+            None,
+            None,
+            requires_tree_v2,
+        )
+        .await
+    }
 
-        if let Some(durable_ack) = ack {
-            let ready_key = QueueOrderKey {
-                priority_rev: Reverse(0),
-                sequence,
-                task_id,
-            };
-            let inner_arc = Arc::clone(&self.inner);
-            tokio::spawn(async move {
-                match durable_ack.await {
-                    Ok(()) => {
-                        let mut inner = inner_arc.write().await;
-                        if inner
-                            .tasks
-                            .get(&task_id)
-                            .is_some_and(|e| e.state == TaskState::Queued)
-                        {
-                            inner.insert_ready(ready_key);
-                        }
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let mut inner = inner_arc.write().await;
-                        inner.remove_ready(&ready_key);
-                        inner.remove_retained(&task_id);
-                        inner.terminal_order.retain(|id| *id != task_id);
-                        Err(err)
-                    }
-                }
-            })
-            .await
-            .map_err(|e| GridError::Storage(format!("submit ack worker cancelled: {e}")))??;
-        }
-
-        Ok(task_id)
+    /// Like [`try_submit_slot`](Self::try_submit_slot), enforcing per-participant quota limits,
+    /// submitting-member revocation verification, and participant/fair-share attribution without
+    /// consuming `task_slot` on transient queue/quota failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_submit_slot_attributed(
+        &self,
+        task_slot: &mut Option<Task>,
+        priority: u32,
+        submitter: SubmitterId,
+        participant: Option<String>,
+        submitted_by_member: Option<String>,
+        member_store: Option<&crate::server::MemberStore>,
+        max_queued_for_submitter: Option<usize>,
+        max_slots_for_submitter: Option<usize>,
+    ) -> GridResult<TaskId> {
+        let requires_tree_v2 = task_slot.as_ref().is_some_and(task_has_tree_input);
+        self.submit_slot_inner(
+            task_slot,
+            true,
+            priority,
+            submitter,
+            participant,
+            submitted_by_member,
+            member_store,
+            max_queued_for_submitter,
+            max_slots_for_submitter,
+            requires_tree_v2,
+        )
+        .await
     }
 
     /// Submits a task with explicit scheduling priority.
@@ -301,9 +194,84 @@ impl TaskQueue {
         max_slots_for_submitter: Option<usize>,
         requires_tree_v2: bool,
     ) -> GridResult<TaskId> {
-        task.validate().map_err(GridError::Config)?;
+        self.submit_attributed_checked(
+            task,
+            priority,
+            submitter,
+            participant,
+            submitted_by_member,
+            None,
+            max_queued_for_submitter,
+            max_slots_for_submitter,
+            requires_tree_v2,
+        )
+        .await
+    }
+
+    /// Like [`submit_attributed`](Self::submit_attributed), additionally verifying under the queue
+    /// write lock that `submitted_by_member` is still enrolled in `member_store` (`ENROLL-1c` race
+    /// guard) before committing the submission.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_attributed_checked(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+        participant: Option<String>,
+        submitted_by_member: Option<String>,
+        member_store: Option<&crate::server::MemberStore>,
+        max_queued_for_submitter: Option<usize>,
+        max_slots_for_submitter: Option<usize>,
+        requires_tree_v2: bool,
+    ) -> GridResult<TaskId> {
+        let mut slot = Some(task);
+        self.submit_slot_inner(
+            &mut slot,
+            false,
+            priority,
+            submitter,
+            participant,
+            submitted_by_member,
+            member_store,
+            max_queued_for_submitter,
+            max_slots_for_submitter,
+            requires_tree_v2,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_slot_inner(
+        &self,
+        task_slot: &mut Option<Task>,
+        check_room_first: bool,
+        priority: u32,
+        submitter: SubmitterId,
+        participant: Option<String>,
+        submitted_by_member: Option<String>,
+        member_store: Option<&crate::server::MemberStore>,
+        max_queued_for_submitter: Option<usize>,
+        max_slots_for_submitter: Option<usize>,
+        requires_tree_v2: bool,
+    ) -> GridResult<TaskId> {
+        let pre_ref = task_slot
+            .as_ref()
+            .ok_or_else(|| GridError::Config("task_slot is empty".into()))?;
+        pre_ref.validate().map_err(GridError::Config)?;
+        let entry_bytes = task_active_bytes(pre_ref);
         #[cfg(feature = "otel")]
-        let requires_gpu = task.requirements.gpu_required;
+        let requires_gpu = pre_ref.requirements.gpu_required;
+
+        if check_room_first {
+            self.check_room(entry_bytes).await?;
+        }
+
+        let resolved_participant_name = || {
+            participant.clone().unwrap_or_else(|| match &submitter {
+                SubmitterId::Participant(p) => p.clone(),
+                _ => crate::quotas::ORGANISER_PARTICIPANT.to_string(),
+            })
+        };
 
         let (task_id, sequence, ack) = {
             let mut inner = self.inner.write().await;
@@ -314,24 +282,30 @@ impl TaskQueue {
                 ));
             }
 
-            if let Some(existing) = inner.tasks.get(&task.id) {
+            // Re-check under write lock so an in-flight handler cannot enqueue after
+            // `RevokeMember` already ran its cancellation scan (`ENROLL-1c`).
+            if let (Some(ref mid), Some(store)) = (&submitted_by_member, member_store) {
+                if !store.contains_member_id(mid) {
+                    return Err(GridError::AuthFailed(format!(
+                        "member '{mid}' is no longer enrolled (revoked)"
+                    )));
+                }
+            }
+
+            let task_ref = task_slot.as_ref().expect("task_slot checked above");
+            if let Some(existing) = inner.tasks.get(&task_ref.id) {
                 return Err(GridError::Config(format!(
                     "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
-                    task.id, existing.state
+                    task_ref.id, existing.state
                 )));
             }
 
             let now_instant = Instant::now();
             if let Some(slot_cap) = max_slots_for_submitter {
-                let needed_slots = task.requirements.cpu_cores.max(1);
+                let needed_slots = task_ref.requirements.cpu_cores.max(1);
                 if needed_slots > slot_cap {
-                    let participant_name =
-                        participant.clone().unwrap_or_else(|| match &submitter {
-                            SubmitterId::Participant(p) => p.clone(),
-                            _ => crate::quotas::ORGANISER_PARTICIPANT.to_string(),
-                        });
                     return Err(GridError::QuotaExceeded {
-                        participant: participant_name,
+                        participant: resolved_participant_name(),
                         limit_kind: "max_slots".to_string(),
                         detail: format!(
                             "task requires {needed_slots} slot(s), exceeding participant max_slots={slot_cap}"
@@ -341,9 +315,23 @@ impl TaskQueue {
             }
 
             if let Some(queued_cap) = max_queued_for_submitter {
+                if let Some(replicas) =
+                    rusty_grid_core::placement::parse_verify_replicas_tag(&task_ref.tags)
+                {
+                    if replicas > queued_cap {
+                        return Err(GridError::QuotaExceeded {
+                            participant: resolved_participant_name(),
+                            limit_kind: "max_queued_tasks".to_string(),
+                            detail: format!(
+                                "--verify {replicas} submits {replicas} replica task(s) concurrently, exceeding participant max_queued_tasks={queued_cap}"
+                            ),
+                        });
+                    }
+                }
                 let queued_count = inner
-                    .tasks
-                    .values()
+                    .active_sizes
+                    .keys()
+                    .filter_map(|id| inner.tasks.get(id))
                     .filter(|e| {
                         let same_bucket = match &participant {
                             Some(p) => e.participant.as_deref() == Some(p.as_str()),
@@ -360,13 +348,8 @@ impl TaskQueue {
                     })
                     .count();
                 if queued_count >= queued_cap {
-                    let participant_name =
-                        participant.clone().unwrap_or_else(|| match &submitter {
-                            SubmitterId::Participant(p) => p.clone(),
-                            _ => crate::quotas::ORGANISER_PARTICIPANT.to_string(),
-                        });
                     return Err(GridError::QuotaExceeded {
-                        participant: participant_name,
+                        participant: resolved_participant_name(),
                         limit_kind: "max_queued_tasks".to_string(),
                         detail: format!(
                             "participant already has {queued_count} queued task(s) (limit: {queued_cap})"
@@ -376,17 +359,11 @@ impl TaskQueue {
             }
 
             if let Some(cap) = inner.capacity {
-                let active_count = inner
-                    .tasks
-                    .values()
-                    .filter(|e| !e.state.is_terminal())
-                    .count();
-                if active_count >= cap {
+                if inner.active_sizes.len() >= cap {
                     return Err(GridError::QueueFull { capacity: cap });
                 }
             }
 
-            let entry_bytes = task_active_bytes(&task);
             if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
                 return Err(GridError::QueueByteLimitExceeded {
                     task_bytes: entry_bytes,
@@ -400,7 +377,7 @@ impl TaskQueue {
 
             let ack = if inner.store.is_some() {
                 let record = JournalRecord::TaskSubmitted {
-                    task: Box::new(task.clone()),
+                    task: Box::new(task_ref.clone()),
                     priority,
                     sequence,
                     submitted_at_utc: now_epoch,
@@ -411,6 +388,7 @@ impl TaskQueue {
                 None
             };
 
+            let task = task_slot.take().expect("task_slot checked above");
             let task_id = task.id;
             let task_key = crate::speed::TaskKey::for_task(&task);
             inner.next_sequence += 1;
@@ -633,14 +611,18 @@ impl TaskQueue {
     }
 
     /// Computes live per-participant usage across active (`Scheduled`/`Running`/held) and waiting
-    /// (`Submitted`/`Queued`/`Retrying`) tasks (`ECO-9`, design 0097).
+    /// (`Submitted`/`Queued`/`Retrying`) tasks (`ECO-9`, design 0097). Scans only `active_sizes`.
     pub async fn participant_usage(
         &self,
     ) -> BTreeMap<String, crate::quotas::ParticipantUsageCounts> {
         let inner = self.inner.read().await;
         let now = Instant::now();
         let mut usage: BTreeMap<String, crate::quotas::ParticipantUsageCounts> = BTreeMap::new();
-        for entry in inner.tasks.values() {
+        for entry in inner
+            .active_sizes
+            .keys()
+            .filter_map(|id| inner.tasks.get(id))
+        {
             let participant = match entry.participant.as_deref() {
                 Some(p) => p,
                 None => match &entry.submitter {
@@ -671,6 +653,55 @@ impl TaskQueue {
         usage
     }
 
+    /// Finds any schedulable `Queued` task whose required `cpu_cores` now exceeds its
+    /// participant's `max_slots` (for example after an admin lowered `max_slots`, relabeled a
+    /// member, or restarted with tighter `--participant-quota`). Scans only `active_sizes`.
+    pub(crate) async fn queued_slot_quota_violations<F>(
+        &self,
+        mut max_slots_for_participant: F,
+    ) -> Vec<(TaskId, String)>
+    where
+        F: FnMut(&str) -> Option<usize>,
+    {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut cache: HashMap<String, Option<usize>> = HashMap::new();
+        let mut violations = Vec::new();
+        for entry in inner
+            .active_sizes
+            .keys()
+            .filter_map(|id| inner.tasks.get(id))
+        {
+            if entry.state != TaskState::Queued
+                || entry.adoptable_by.is_some_and(|(_, until)| now < until)
+            {
+                continue;
+            }
+            let participant = match entry.participant.as_deref() {
+                Some(p) => p,
+                None => match &entry.submitter {
+                    SubmitterId::Participant(p) => p.as_str(),
+                    _ => continue,
+                },
+            };
+            let max_slots = *cache
+                .entry(participant.to_string())
+                .or_insert_with(|| max_slots_for_participant(participant));
+            if let Some(cap) = max_slots {
+                let needed = entry.task.requirements.cpu_cores.max(1);
+                if needed > cap {
+                    violations.push((
+                        entry.task.id,
+                        format!(
+                            "task requires {needed} slot(s), exceeding participant '{participant}' max_slots={cap}"
+                        ),
+                    ));
+                }
+            }
+        }
+        violations
+    }
+
     /// Re-keys recovered non-terminal tasks into `SubmitterId::Participant` buckets after
     /// `attach_store_and_replay`, rebuilding `fair_queues` from `ready_queue`.
     pub async fn rekey_participants_from_members<F>(&self, resolve: F)
@@ -680,8 +711,12 @@ impl TaskQueue {
         let mut guard = self.inner.write().await;
         let inner = &mut *guard;
         inner.fair_queues.clear_entries_preserving_weights();
+        let active_ids: Vec<TaskId> = inner.active_sizes.keys().copied().collect();
         let mut ready_moves = Vec::new();
-        for entry in inner.tasks.values_mut() {
+        for id in active_ids {
+            let Some(entry) = inner.tasks.get_mut(&id) else {
+                continue;
+            };
             if entry.state.is_terminal() {
                 continue;
             }
@@ -709,8 +744,12 @@ impl TaskQueue {
         let mut guard = self.inner.write().await;
         let inner = &mut *guard;
         let new_sub = SubmitterId::Participant(new_participant.clone());
+        let active_ids: Vec<TaskId> = inner.active_sizes.keys().copied().collect();
         let mut ready_moves: Vec<(QueueOrderKey, SubmitterId)> = Vec::new();
-        for entry in inner.tasks.values_mut() {
+        for id in active_ids {
+            let Some(entry) = inner.tasks.get_mut(&id) else {
+                continue;
+            };
             if entry.state.is_terminal() || entry.submitted_by_member.as_deref() != Some(member_id)
             {
                 continue;

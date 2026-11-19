@@ -1096,8 +1096,15 @@ async fn run_submit_with_secret_inner(
     if let Some(ws) = workspace_ref {
         task = task.with_workspace(ws);
     }
-    let task_id = task.id;
     let verify_template = args.verify.map(|_| task.clone());
+    if let Some(replicas) = args.verify {
+        task.tags.push(format!(
+            "{}{}",
+            rusty_grid_core::placement::VERIFY_REPLICAS_TAG_PREFIX,
+            replicas
+        ));
+    }
+    let task_id = task.id;
     let wait = args.wait || args.output.is_some() || !output_globs.is_empty() || is_compile;
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 

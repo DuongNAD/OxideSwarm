@@ -2532,3 +2532,58 @@ async fn test_handle_workers_revoked_drops_checkpoints_of_tasks_last_failed_on_t
         TaskState::Queued
     );
 }
+
+#[tokio::test]
+async fn revocation_write_lock_guard_refuses_revoked_member_even_after_scan() {
+    use rusty_grid_core::noise_auth::{MemberEntry, MemberRole, NodeKeypair};
+
+    let ka = NodeKeypair::generate().unwrap();
+    let member_id = ka.member_id();
+    let members = crate::server::MemberStore::from_entries(vec![MemberEntry::new(
+        "race-alice",
+        *ka.public_key(),
+        vec![MemberRole::Client],
+    )]);
+    let queue = TaskQueue::new();
+
+    let accepted = queue
+        .submit_attributed_checked(
+            Task::new(
+                TaskSpec::command("echo", vec!["before-revoke".into()]),
+                TaskRequirements::generic(1, 32),
+            ),
+            0,
+            crate::fair_share::SubmitterId::Participant("alice".into()),
+            Some("alice".into()),
+            Some(member_id.clone()),
+            Some(&members),
+            None,
+            None,
+            false,
+        )
+        .await;
+    assert!(accepted.is_ok());
+
+    members.revoke_member(&member_id).unwrap();
+    let revoked_err = queue
+        .submit_attributed_checked(
+            Task::new(
+                TaskSpec::command("echo", vec!["post-revoke-race".into()]),
+                TaskRequirements::generic(1, 32),
+            ),
+            0,
+            crate::fair_share::SubmitterId::Participant("alice".into()),
+            Some("alice".into()),
+            Some(member_id),
+            Some(&members),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("revoked member must be refused under queue write lock");
+    assert!(
+        matches!(revoked_err, GridError::AuthFailed(_)),
+        "unexpected error: {revoked_err:?}"
+    );
+}

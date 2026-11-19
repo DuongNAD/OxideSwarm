@@ -1719,8 +1719,9 @@ impl TaskQueue {
         let target_ids: Vec<TaskId> = {
             let inner = self.inner.read().await;
             inner
-                .tasks
-                .values()
+                .active_sizes
+                .keys()
+                .filter_map(|id| inner.tasks.get(id))
                 .filter(|e| {
                     !e.state.is_terminal() && e.submitted_by_member.as_deref() == Some(member_id)
                 })

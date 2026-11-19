@@ -2478,4 +2478,58 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn v0_4_4_clean_fixture_upgrades_to_format_5_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SNAPSHOT_FILE),
+            include_bytes!("../tests/data/store_v0_4_4_clean/snapshot.bin"),
+        )
+        .unwrap();
+        std::fs::write(
+            journal_path(dir.path()),
+            include_bytes!("../tests/data/store_v0_4_4_clean/journal.bin"),
+        )
+        .unwrap();
+
+        let (store, recovery) =
+            TaskStore::open(dir.path()).expect("clean v0.4.4 store must upgrade to format 5");
+        assert!(
+            recovery.records.is_empty(),
+            "clean v0.4.4 shutdown must have header-only journal"
+        );
+        let snap = recovery.snapshot.expect("clean v0.4.4 snapshot present");
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].submitted_by_member, None);
+        drop(store);
+
+        let (_store2, recovery2) =
+            TaskStore::open(dir.path()).expect("upgraded format 5 store must reopen");
+        assert_eq!(recovery2.snapshot.unwrap().tasks.len(), 1);
+        let jpath = journal_path(dir.path());
+        let jbytes = std::fs::read(&jpath).unwrap();
+        let journal_hdr = parse_header(&jpath, JOURNAL_MAGIC, &jbytes).unwrap();
+        assert_eq!(journal_hdr.format, STORE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v0_4_4_dirty_fixture_is_refused_without_rewriting_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirty_journal = include_bytes!("../tests/data/store_v0_4_4_dirty/journal.bin");
+        std::fs::write(journal_path(dir.path()), dirty_journal).unwrap();
+
+        let err = TaskStore::open(dir.path())
+            .expect_err("uncompacted v0.4.4 format-4 journal must be refused");
+        assert!(matches!(err, GridError::Storage(_)), "unexpected: {err}");
+        assert_eq!(
+            std::fs::read(journal_path(dir.path())).unwrap().as_slice(),
+            dirty_journal.as_slice(),
+            "refused v0.4.4 dirty store must leave journal.bin untouched"
+        );
+        assert!(
+            !dir.path().join(SNAPSHOT_FILE).exists(),
+            "refused open must not create snapshot.bin"
+        );
+    }
 }

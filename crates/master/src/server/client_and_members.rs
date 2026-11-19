@@ -138,9 +138,17 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     let uploads = blob_store
         .as_ref()
         .map(|store| UploadOwner::new(Arc::clone(store)));
-    let mapreduce = MapReduceEngine::new(queue.clone(), scheduler_notify.clone(), waiters.clone())
-        .with_registry(registry.clone())
-        .with_parallelism(mapreduce_parallelism);
+    let mut mapreduce =
+        MapReduceEngine::new(queue.clone(), scheduler_notify.clone(), waiters.clone())
+            .with_registry(registry.clone())
+            .with_parallelism(mapreduce_parallelism);
+    if let Some(ref qc) = auth_ctx.quota_controller {
+        mapreduce = mapreduce.with_attribution(crate::mapreduce::MapReduceAttribution {
+            quota_controller: Arc::clone(qc),
+            submitted_by_member: v3_peer.as_ref().map(|p| p.member_id.clone()),
+            client_submitter: client_submitter.clone(),
+        });
+    }
 
     // Blob requests of this connection that are being handled, oldest first. Their replies are
     // sent in that order (the client matches them by position), and no other answer is sent
@@ -270,12 +278,13 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                                 client_submitter.clone()
                             };
                             queue
-                                .submit_attributed(
+                                .submit_attributed_checked(
                                     task,
                                     priority,
                                     submitter,
                                     Some(participant),
                                     member_id.map(str::to_string),
+                                    Some(auth_ctx.members.as_ref()),
                                     effective_quota.max_queued_tasks,
                                     effective_quota.max_slots,
                                     needs_tree_v2,

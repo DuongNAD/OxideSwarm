@@ -2225,63 +2225,25 @@ impl MasterHandle {
 
     /// Submits a task with default priority (or the `"organiser"` participant's default band priority).
     pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
-        let task_id = task.id;
-        let participant = self.quota_controller.participant_for_member(None);
-        let effective = self.quota_controller.effective_quota(&participant);
-        let priority = self
-            .quota_controller
-            .resolve_submission_priority(&participant, None)?;
-        let submitter = if !self.members.is_empty() {
-            crate::fair_share::SubmitterId::Participant(participant.clone())
-        } else {
-            crate::fair_share::SubmitterId::Default
-        };
-        let (admitted, needs_tree_v2) = self.admit(&task).await?;
-        let id = match self
-            .queue
-            .submit_attributed(
-                task,
-                priority,
-                submitter,
-                Some(participant),
-                None,
-                effective.max_queued_tasks,
-                effective.max_slots,
-                needs_tree_v2,
-            )
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                self.release_admission(&task_id, admitted).await;
-                return Err(e);
-            }
-        };
-        self.scheduler_notify.notify_one();
-        #[cfg(feature = "dashboard")]
-        if let Some(ref b_tx) = self.broadcast_tx {
-            if b_tx.receiver_count() > 0 {
-                if let Some(info) = self.queue.get_task(&id).await {
-                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                        info,
-                    ));
-                }
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                    self.queue.stats().await,
-                ));
-            }
-        }
-        Ok(id)
+        self.submit_task_inner(task, None).await
     }
 
     /// Submits a task with explicit priority (enforcing the `"organiser"` participant's quota/band).
     pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
+        self.submit_task_inner(task, Some(priority)).await
+    }
+
+    async fn submit_task_inner(
+        &self,
+        task: Task,
+        requested_priority: Option<u32>,
+    ) -> GridResult<TaskId> {
         let task_id = task.id;
         let participant = self.quota_controller.participant_for_member(None);
         let effective = self.quota_controller.effective_quota(&participant);
         let priority = self
             .quota_controller
-            .resolve_submission_priority(&participant, Some(priority))?;
+            .resolve_submission_priority(&participant, requested_priority)?;
         let submitter = if !self.members.is_empty() {
             crate::fair_share::SubmitterId::Participant(participant.clone())
         } else {
