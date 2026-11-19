@@ -2757,7 +2757,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   task timeouts to `60 s` (keeping the `400 ms` `Queued` negative check untouched).
 - **Done when:** All 5 tests keep every routing, spread, retry, and cancellation assertion with no
   wall-clock window, compile cleanly, and pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/m4_scheduling.rs` and verified on
+- **Implemented (2026-11-19, pull request 397, open):** Updated `tests/m4_scheduling.rs` and verified on
   Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` failures before the fix on macOS
   is expected because the `< 1.2 s` flake hit a 12-thread Windows laptop):
   - Before fix (`origin/master` `98570ab9`): `20/20` passed (`53.70 s` total, `2.56–3.88 s` per run).
