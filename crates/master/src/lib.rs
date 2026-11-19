@@ -1,5 +1,7 @@
 //! Master node server, worker registry, task queue, scheduler, and heartbeat reaper for `rusty_grid`.
 
+#![deny(unsafe_code)]
+
 pub mod auth;
 pub mod blob_store;
 pub mod cold_results;
@@ -20,6 +22,8 @@ pub mod scheduler;
 pub mod server;
 mod session;
 pub mod speed;
+// LV-4: cfg(unix) libc::geteuid owner check on the master state directory.
+#[allow(unsafe_code)]
 pub mod store;
 #[cfg(feature = "dashboard")]
 pub mod web_ui;

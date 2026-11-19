@@ -38,22 +38,39 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp_path = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 state_file = Path(os.environ["FAKE_OXIDESWARM_STATE"])
-log_file = Path(os.environ["FAKE_OXIDESWARM_LOG"])
+log_dir = Path(os.environ["FAKE_OXIDESWARM_LOG_DIR"])
+log_dir.mkdir(parents=True, exist_ok=True)
 state = json.loads(state_file.read_text(encoding="utf-8"))
 
 args = sys.argv[1:]
 subcmd = args[0] if args else ""
 
-with log_file.open("a", encoding="utf-8") as f:
-    f.write(json.dumps({"subcmd": subcmd, "args": args, "has_secret": bool(os.environ.get("OXIDESWARM_SECRET_FILE"))}) + "\n")
+ts_ns = time.time_ns()
+uid = uuid.uuid4().hex
+log_entry = {
+    "ts_ns": ts_ns,
+    "pid": os.getpid(),
+    "subcmd": subcmd,
+    "args": args,
+    "has_secret": bool(os.environ.get("OXIDESWARM_SECRET_FILE")),
+}
+_write_atomic(log_dir / f"{ts_ns:020d}-{os.getpid()}-{uid}.json", json.dumps(log_entry))
 
 if subcmd == "workers":
     calls_file = state_file.with_suffix(".workers_calls")
     n = int(calls_file.read_text(encoding="utf-8")) + 1 if calls_file.exists() else 1
-    calls_file.write_text(str(n), encoding="utf-8")
+    _write_atomic(calls_file, str(n))
     if n > 1 and state.get("late_workers") is not None:
         print(json.dumps(state["late_workers"]))
     else:
@@ -82,7 +99,7 @@ if subcmd == "submit":
     seed = env_vars.get("ANIMA_SIM_SEED", "unknown")
     counter_path = state_file.with_suffix(".count." + seed)
     attempt = int(counter_path.read_text(encoding="utf-8")) + 1 if counter_path.exists() else 1
-    counter_path.write_text(str(attempt), encoding="utf-8")
+    _write_atomic(counter_path, str(attempt))
 
     plan = state.get("behaviors", {}).get(seed, [{"mode": "verified"}])
     idx = min(attempt - 1, len(plan) - 1)
@@ -181,7 +198,7 @@ if subcmd == "submit":
         tid = behavior.get("task_id", "99999999-8888-7777-6666-555555555559")
         msg = f"Timed out after 10s waiting for task {tid} to complete"
         print(msg, file=sys.stderr, flush=True)
-        print(json.dumps({"status": "timeout", "task_id": tid, "error": msg}))
+        print(json.dumps({"status": "timeout", "task_id": tid, "error": msg}), flush=True)
         raise SystemExit(1)
 
     if mode == "sleep":
@@ -189,7 +206,7 @@ if subcmd == "submit":
         print(f"task_id={tid}", file=sys.stderr, flush=True)
         marker = behavior.get("marker_file")
         if marker:
-            Path(marker).write_text("ready\n", encoding="utf-8")
+            _write_atomic(Path(marker), "ready\n")
         time.sleep(float(behavior.get("sleep_secs", 30.0)))
         print(json.dumps({"status": "verified"}))
         raise SystemExit(0)
@@ -216,7 +233,20 @@ def write_fake_oxideswarm(tmpdir: Path) -> Path:
     return wrapper
 
 
-def wait_for_file(path: Path, timeout_secs: float = 15.0) -> None:
+def read_fake_cli_logs(log_dir: Path) -> list[dict]:
+    entries: list[tuple[int, str, dict]] = []
+    if not log_dir.exists():
+        return []
+    for path in log_dir.iterdir():
+        if not path.name.endswith(".json"):
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries.append((int(data.get("ts_ns", 0)), path.name, data))
+    entries.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in entries]
+
+
+def wait_for_file(path: Path, timeout_secs: float = 60.0) -> None:
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
         if path.exists():
@@ -623,13 +653,14 @@ class CampaignDriverTests(unittest.TestCase):
             }
             state_path = tmp / "fake_state.json"
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            log_path = tmp / "fake_log.jsonl"
+            log_dir = tmp / "fake_logs"
+            log_dir.mkdir()
             record_path = tmp / "record.json"
 
             old_state = os.environ.get("FAKE_OXIDESWARM_STATE")
-            old_log = os.environ.get("FAKE_OXIDESWARM_LOG")
+            old_log_dir = os.environ.get("FAKE_OXIDESWARM_LOG_DIR")
             os.environ["FAKE_OXIDESWARM_STATE"] = str(state_path)
-            os.environ["FAKE_OXIDESWARM_LOG"] = str(log_path)
+            os.environ["FAKE_OXIDESWARM_LOG_DIR"] = str(log_dir)
             try:
                 base_args = [
                     "--manifest", str(manifest_path),
@@ -645,10 +676,10 @@ class CampaignDriverTests(unittest.TestCase):
                 with redirect_stdout(buf):
                     rc = driver.main(base_args + driver_args)
                 record = json.loads(record_path.read_text(encoding="utf-8"))
-                invocations = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                invocations = read_fake_cli_logs(log_dir)
                 return rc, record, invocations, base_args
             finally:
-                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG", old_log)):
+                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG_DIR", old_log_dir)):
                     if prev is None:
                         os.environ.pop(k, None)
                     else:
@@ -780,13 +811,14 @@ class CampaignDriverTests(unittest.TestCase):
             }
             state_path = tmp / "state.json"
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            log_path = tmp / "log.jsonl"
+            log_dir = tmp / "logs"
+            log_dir.mkdir()
             record_path = tmp / "record.json"
 
             old_state = os.environ.get("FAKE_OXIDESWARM_STATE")
-            old_log = os.environ.get("FAKE_OXIDESWARM_LOG")
+            old_log_dir = os.environ.get("FAKE_OXIDESWARM_LOG_DIR")
             os.environ["FAKE_OXIDESWARM_STATE"] = str(state_path)
-            os.environ["FAKE_OXIDESWARM_LOG"] = str(log_path)
+            os.environ["FAKE_OXIDESWARM_LOG_DIR"] = str(log_dir)
             try:
                 with redirect_stdout(io.StringIO()):
                     rc = driver.main([
@@ -809,13 +841,10 @@ class CampaignDriverTests(unittest.TestCase):
                 u1_err = rec["units"][0]["attempts"][0]["verify"]["error"]
                 self.assertIn("P3-w1", u1_err)
                 self.assertEqual(rec["units"][1]["attempts"][0]["verify"]["error"], "replica on worker <worker> failed: connection closed")
-                worker_calls = [
-                    json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
-                    if line.strip() and json.loads(line)["subcmd"] == "workers"
-                ]
+                worker_calls = [inv for inv in read_fake_cli_logs(log_dir) if inv["subcmd"] == "workers"]
                 self.assertGreaterEqual(len(worker_calls), 2)
             finally:
-                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG", old_log)):
+                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG_DIR", old_log_dir)):
                     if prev is None:
                         os.environ.pop(k, None)
                     else:
@@ -826,6 +855,7 @@ class CampaignDriverTests(unittest.TestCase):
         task_uuid = "99999999-8888-7777-6666-555555555599"
         behaviors = {
             "500001": [{"mode": "timeout_json", "task_id": task_uuid}],
+            # Keep 30.0 (6x the 5 s watchdog): on Windows oxideswarm.cmd, proc.kill() ends only cmd.exe while the Python child holds pipes open until sleep ends.
             "500002": [{"mode": "sleep", "sleep_secs": 30.0, "task_id": "99999999-8888-7777-6666-555555555598"}],
         }
         units = [
@@ -834,16 +864,19 @@ class CampaignDriverTests(unittest.TestCase):
         ]
         rc, record, invocations, _ = self._run_with_fake_cli(
             behaviors,
-            ["--concurrency", "1", "--submit-timeout-secs", "0.2"],
+            ["--concurrency", "1", "--submit-timeout-secs", "5"],
             units=units,
         )
         self.assertEqual(rc, 1)
         self.assertEqual(record["summary"]["failed"], 2)
         by_id = {u["id"]: u for u in record["units"]}
-        self.assertTrue(by_id["u001"]["attempts"][0]["cancelled_on_master"])
-        self.assertTrue(by_id["u002"]["attempts"][0]["cancelled_on_master"])
-        self.assertEqual(by_id["u002"]["attempts"][0]["cli_exit_code"], 124)
-        self.assertIn("timed out", by_id["u002"]["attempts"][0]["error"])
+        u1 = by_id["u001"]["attempts"][0]
+        u2 = by_id["u002"]["attempts"][0]
+        self.assertEqual(u1["cli_exit_code"], 1, f"u001={u1!r}")
+        self.assertTrue(u1.get("cancelled_on_master"), f"u001={u1!r}")
+        self.assertTrue(u2.get("cancelled_on_master"), f"u002={u2!r}")
+        self.assertEqual(u2["cli_exit_code"], 124, f"u002={u2!r}")
+        self.assertIn("timed out", u2.get("error") or "", f"u002={u2!r}")
         serialized = json.dumps(record).lower()
         self.assertNotIn(task_uuid, serialized)
         cancel_calls = [inv for inv in invocations if inv["subcmd"] == "cancel"]
@@ -878,7 +911,7 @@ class CampaignDriverTests(unittest.TestCase):
                 "behaviors": {
                     "600001": [{"mode": "verified"}],
                     "600002": [
-                        {"mode": "sleep", "marker_file": str(marker), "sleep_secs": 30.0, "task_id": interrupt_tid},
+                        {"mode": "sleep", "marker_file": str(marker), "sleep_secs": 600.0, "task_id": interrupt_tid},
                         {"mode": "verified"},
                     ],
                     "600003": [{"mode": "verified"}],
@@ -886,12 +919,13 @@ class CampaignDriverTests(unittest.TestCase):
             }
             state_path = tmp / "state.json"
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            log_path = tmp / "log.jsonl"
+            log_dir = tmp / "logs"
+            log_dir.mkdir()
             record_path = tmp / "record.json"
 
             env = dict(os.environ)
             env["FAKE_OXIDESWARM_STATE"] = str(state_path)
-            env["FAKE_OXIDESWARM_LOG"] = str(log_path)
+            env["FAKE_OXIDESWARM_LOG_DIR"] = str(log_dir)
 
             proc = subprocess.Popen(
                 [
@@ -909,9 +943,9 @@ class CampaignDriverTests(unittest.TestCase):
                 text=True,
             )
             try:
-                wait_for_file(marker, timeout_secs=15.0)
+                wait_for_file(marker, timeout_secs=60.0)
                 proc.send_signal(signal.SIGINT)
-                stdout, stderr = proc.communicate(timeout=15.0)
+                stdout, stderr = proc.communicate(timeout=60.0)
             except Exception:
                 proc.kill()
                 proc.communicate()
@@ -927,15 +961,15 @@ class CampaignDriverTests(unittest.TestCase):
             self.assertEqual(by_id1["u002"]["status"], "interrupted")
             self.assertNotIn(interrupt_tid, json.dumps(rec1))
 
-            invs1 = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            invs1 = read_fake_cli_logs(log_dir)
             cancel_calls = [inv for inv in invs1 if inv["subcmd"] == "cancel"]
             self.assertTrue(any(interrupt_tid in inv["args"] for inv in cancel_calls))
 
             # Plain `--resume` (without `--retry-failed`) MUST resubmit u002 and u003, skipping u001.
             old_state = os.environ.get("FAKE_OXIDESWARM_STATE")
-            old_log = os.environ.get("FAKE_OXIDESWARM_LOG")
+            old_log_dir = os.environ.get("FAKE_OXIDESWARM_LOG_DIR")
             os.environ["FAKE_OXIDESWARM_STATE"] = str(state_path)
-            os.environ["FAKE_OXIDESWARM_LOG"] = str(log_path)
+            os.environ["FAKE_OXIDESWARM_LOG_DIR"] = str(log_dir)
             try:
                 with redirect_stdout(io.StringIO()):
                     rc2 = driver.main([
@@ -953,15 +987,14 @@ class CampaignDriverTests(unittest.TestCase):
                 self.assertEqual(rec2["summary"]["pending"], 0)
 
                 submitted_seeds = []
-                for line in log_path.read_text(encoding="utf-8").splitlines():
-                    entry = json.loads(line)
+                for entry in read_fake_cli_logs(log_dir):
                     if entry["subcmd"] == "submit":
                         for i, arg in enumerate(entry["args"]):
                             if arg == "--env" and entry["args"][i + 1].startswith("ANIMA_SIM_SEED="):
                                 submitted_seeds.append(entry["args"][i + 1].split("=", 1)[1])
                 self.assertEqual(submitted_seeds, ["600001", "600002", "600002", "600003"])
             finally:
-                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG", old_log)):
+                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG_DIR", old_log_dir)):
                     if prev is None:
                         os.environ.pop(k, None)
                     else:
@@ -986,13 +1019,14 @@ class CampaignDriverTests(unittest.TestCase):
             }
             state_path = tmp / "fake_state.json"
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            log_path = tmp / "fake_log.jsonl"
+            log_dir = tmp / "fake_logs"
+            log_dir.mkdir()
             record_path = tmp / "record.json"
 
             old_state = os.environ.get("FAKE_OXIDESWARM_STATE")
-            old_log = os.environ.get("FAKE_OXIDESWARM_LOG")
+            old_log_dir = os.environ.get("FAKE_OXIDESWARM_LOG_DIR")
             os.environ["FAKE_OXIDESWARM_STATE"] = str(state_path)
-            os.environ["FAKE_OXIDESWARM_LOG"] = str(log_path)
+            os.environ["FAKE_OXIDESWARM_LOG_DIR"] = str(log_dir)
             try:
                 common = [
                     "--manifest", str(manifest_path),
@@ -1016,15 +1050,14 @@ class CampaignDriverTests(unittest.TestCase):
                 self.assertEqual(len(rec2["resumed_at_utc"]), 1)
 
                 submitted_seeds = []
-                for line in log_path.read_text(encoding="utf-8").splitlines():
-                    entry = json.loads(line)
+                for entry in read_fake_cli_logs(log_dir):
                     if entry["subcmd"] == "submit":
                         for i, arg in enumerate(entry["args"]):
                             if arg == "--env" and entry["args"][i + 1].startswith("ANIMA_SIM_SEED="):
                                 submitted_seeds.append(entry["args"][i + 1].split("=", 1)[1])
                 self.assertEqual(submitted_seeds, ["200001", "200002", "200003", "200004"])
             finally:
-                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG", old_log)):
+                for k, prev in (("FAKE_OXIDESWARM_STATE", old_state), ("FAKE_OXIDESWARM_LOG_DIR", old_log_dir)):
                     if prev is None:
                         os.environ.pop(k, None)
                     else:

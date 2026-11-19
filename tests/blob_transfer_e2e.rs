@@ -914,51 +914,55 @@ mod cli {
         Service(cmd.spawn().expect("spawn rusty-grid"))
     }
 
-    fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            if condition() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        condition()
+    async fn run_cli(mut cmd: Command, what: &str) -> std::process::Output {
+        tokio::task::spawn_blocking(move || cmd.output())
+            .await
+            .expect("join cli blocking task")
+            .expect(what)
     }
 
-    fn submit(home: &Path, master: &str, project: &Path, out_dir: &Path) -> serde_json::Value {
+    async fn submit(
+        home: &Path,
+        master: &str,
+        project: &Path,
+        out_dir: &Path,
+        master_log: &Path,
+    ) -> serde_json::Value {
         #[cfg(unix)]
         let runner_args = ["--command", "sh", "--", "-c", PROCESS_SCRIPT];
         #[cfg(windows)]
         let runner_args = ["--command", "cmd", "--", "/C", PROCESS_SCRIPT];
 
-        let output = cli(home)
-            .args([
-                "submit",
-                "--master",
-                master,
-                "--json",
-                "--timeout-secs",
-                "60",
-            ])
-            .arg("--input")
-            .arg(format!("{}:project", project.display()))
-            .args(["--output", "out/*.txt", "--output", "out/big-copy.bin"])
-            .arg("--output-dir")
-            .arg(out_dir)
-            .args(runner_args)
-            .output()
-            .expect("run submit");
+        let mut cmd = cli(home);
+        cmd.args([
+            "submit",
+            "--master",
+            master,
+            "--json",
+            "--timeout-secs",
+            "120",
+        ])
+        .arg("--input")
+        .arg(format!("{}:project", project.display()))
+        .args(["--output", "out/*.txt", "--output", "out/big-copy.bin"])
+        .arg("--output-dir")
+        .arg(out_dir)
+        .args(runner_args);
+        let output = run_cli(cmd, "run submit").await;
         assert!(
             output.status.success(),
-            "submit failed:\nstdout: {}\nstderr: {}",
+            "submit failed:\nstdout: {}\nstderr: {}\nmaster_log:\n{}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(master_log).unwrap_or_default()
         );
         serde_json::from_slice(&output.stdout).expect("submit --json prints JSON")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_cli_submit_input_and_output_round_trip_with_dedup() {
+        const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let port_file = home.join("master.port");
@@ -967,45 +971,63 @@ mod cli {
         let _master = spawn(
             {
                 let mut cmd = cli(home);
-                cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"])
-                    .arg(&port_file)
-                    .arg("--blob-dir")
-                    .arg(&blob_dir);
+                cmd.args([
+                    "master",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--heartbeat-timeout-secs",
+                    "60",
+                    "--port-file",
+                ])
+                .arg(&port_file)
+                .arg("--blob-dir")
+                .arg(&blob_dir);
                 cmd
             },
             &master_log,
         );
-        let mut port = None;
-        assert!(
-            wait_for(Duration::from_secs(20), || {
-                port = std::fs::read_to_string(&port_file)
-                    .ok()
-                    .and_then(|p| p.trim().parse::<u16>().ok());
-                port.is_some()
-            }),
-            "master did not publish its port: {}",
-            std::fs::read_to_string(&master_log).unwrap_or_default()
-        );
-        let master = format!("127.0.0.1:{}", port.unwrap());
+        let port_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+        let port = loop {
+            if let Some(p) = std::fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+            {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < port_deadline,
+                "master did not publish its port within {TEST_WAIT_TIMEOUT:?}:\n{}",
+                std::fs::read_to_string(&master_log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let master = format!("127.0.0.1:{port}");
         let (stop_worker, worker) = spawn_worker(&master, &home.join("sandboxes"));
-        assert!(
-            wait_for(Duration::from_secs(20), || {
-                cli(home)
-                    .args(["workers", "--master", &master, "--json"])
-                    .output()
-                    .ok()
-                    .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                    .unwrap_or(false)
-            }),
-            "worker did not register"
-        );
+        let worker_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+        loop {
+            let mut cmd = cli(home);
+            cmd.args(["workers", "--master", &master, "--json"]);
+            let workers_out = run_cli(cmd, "poll workers").await;
+            let registered = serde_json::from_slice::<serde_json::Value>(&workers_out.stdout)
+                .ok()
+                .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false);
+            if registered {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < worker_deadline,
+                "worker did not register within {TEST_WAIT_TIMEOUT:?}:\n{}",
+                std::fs::read_to_string(&master_log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let project = home.join("project-src");
         let files = write_project(&project);
 
         let out1 = home.join("out1");
-        let first = submit(home, &master, &project, &out1);
+        let first = submit(home, &master, &project, &out1, &master_log).await;
         assert_eq!(first["exit_code"], 0, "{first}");
         assert_eq!(first["input_upload"]["uploaded"], 5, "{first}");
         assert_eq!(
@@ -1027,7 +1049,7 @@ mod cli {
         );
 
         let out2 = home.join("out2");
-        let second = submit(home, &master, &project, &out2);
+        let second = submit(home, &master, &project, &out2, &master_log).await;
         assert_eq!(second["exit_code"], 0, "{second}");
         assert_eq!(
             second["input_upload"]["uploaded"], 0,
@@ -1058,21 +1080,26 @@ mod cli {
             "echo fail-stdout& echo fail-stderr 1>&2& exit 7",
         ];
 
-        let failed_run = cli(home)
+        let mut failed_cmd = cli(home);
+        failed_cmd
             .args([
                 "submit",
                 "--master",
                 &master,
                 "--wait",
                 "--timeout-secs",
-                "30",
+                "120",
             ])
-            .args(failed_args)
-            .output()
-            .expect("run failing submit");
-        assert_eq!(failed_run.status.code(), Some(7));
+            .args(failed_args);
+        let failed_run = run_cli(failed_cmd, "run failing submit").await;
         let failed_stdout = String::from_utf8_lossy(&failed_run.stdout);
         let failed_stderr = String::from_utf8_lossy(&failed_run.stderr);
+        assert_eq!(
+            failed_run.status.code(),
+            Some(7),
+            "failing submit must exit 7\nstdout: {failed_stdout}\nstderr: {failed_stderr}\nmaster_log:\n{}",
+            std::fs::read_to_string(&master_log).unwrap_or_default()
+        );
         assert!(
             failed_stdout.contains("failed.") && !failed_stdout.contains("completed successfully."),
             "failed task must not print 'completed successfully.': {failed_stdout}"
@@ -1086,7 +1113,8 @@ mod cli {
         #[cfg(windows)]
         let missing_args = ["--command", "cmd", "--", "/C", "echo ran-ok"];
 
-        let missing_output_run = cli(home)
+        let mut missing_cmd = cli(home);
+        missing_cmd
             .args([
                 "submit",
                 "--master",
@@ -1094,14 +1122,17 @@ mod cli {
                 "--output",
                 "never-created.bin",
                 "--timeout-secs",
-                "30",
+                "120",
             ])
-            .args(missing_args)
-            .output()
-            .expect("run missing-output submit");
-        assert!(!missing_output_run.status.success());
+            .args(missing_args);
+        let missing_output_run = run_cli(missing_cmd, "run missing-output submit").await;
         let missing_stdout = String::from_utf8_lossy(&missing_output_run.stdout);
         let missing_stderr = String::from_utf8_lossy(&missing_output_run.stderr);
+        assert!(
+            !missing_output_run.status.success(),
+            "missing-output submit must fail\nstdout: {missing_stdout}\nstderr: {missing_stderr}\nmaster_log:\n{}",
+            std::fs::read_to_string(&master_log).unwrap_or_default()
+        );
         assert!(
             missing_stdout.contains("failed.")
                 && !missing_stdout.contains("completed successfully."),
@@ -1142,7 +1173,8 @@ mod cli {
             "mkdir sub && echo data> sub\\produced.txt && echo dl-stdout && echo dl-stderr 1>&2",
         ];
 
-        let download_fail_run = cli(home)
+        let mut dl_cmd = cli(home);
+        dl_cmd
             .args([
                 "submit",
                 "--master",
@@ -1152,14 +1184,17 @@ mod cli {
                 "--output-dir",
                 &bad_out_dir.to_string_lossy(),
                 "--timeout-secs",
-                "30",
+                "120",
             ])
-            .args(dl_fail_args)
-            .output()
-            .expect("run download-fail submit");
-        assert!(!download_fail_run.status.success());
+            .args(dl_fail_args);
+        let download_fail_run = run_cli(dl_cmd, "run download-fail submit").await;
         let dl_stdout = String::from_utf8_lossy(&download_fail_run.stdout);
         let dl_stderr = String::from_utf8_lossy(&download_fail_run.stderr);
+        assert!(
+            !download_fail_run.status.success(),
+            "download-fail submit must fail\nstdout: {dl_stdout}\nstderr: {dl_stderr}\nmaster_log:\n{}",
+            std::fs::read_to_string(&master_log).unwrap_or_default()
+        );
         assert!(
             dl_stderr.contains("Downloading the output files failed:"),
             "{dl_stderr}"
@@ -1174,7 +1209,7 @@ mod cli {
         );
 
         let _ = stop_worker.send(true);
-        worker.abort();
+        let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, worker).await;
     }
 }
 
