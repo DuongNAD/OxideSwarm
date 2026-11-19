@@ -2961,7 +2961,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
      skips.
 - **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
-- **Implemented (2026-11-19):** `validate_workspace_root_entries_safe` and
+- **Implemented (2026-11-19, pull request 372, open):** `validate_workspace_root_entries_safe` and
   `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory
   `.locks` / workspace folders, and hard-linked (`nNumberOfLinks != 1`) `.locks/*` and
   `<ws>/{state.json,lock,state.json.tmp}` files before any inheritable DACL rewrite runs;
