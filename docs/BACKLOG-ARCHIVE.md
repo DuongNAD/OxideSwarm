@@ -2935,6 +2935,47 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   handling (`SEC-18` tracks the remaining path-based `SetNamedSecurityInfoW` TOCTOU window, other root
   entries, and separate-walk / `RUSTY_GRID_REQUIRE_*` proof tests).
 
+### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
+
+- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
+  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
+  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
+    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
+    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
+    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
+    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
+  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
+    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
+  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
+    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
+    a skipped test shows as `ok`.
+- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
+  gaps. Only processes of the same user can create the links, so the impact is low.
+- **Do:**
+  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
+     and require `nlink == 1` for every file whose DACL is written.
+  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
+     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
+     `SetSecurityInfo` on that handle.
+  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
+     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
+     skips.
+- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
+- **Implemented (2026-11-19):** `validate_workspace_root_entries_safe` and
+  `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory
+  `.locks` / workspace folders, and hard-linked (`nNumberOfLinks != 1`) `.locks/*` and
+  `<ws>/{state.json,lock,state.json.tmp}` files before any inheritable DACL rewrite runs;
+  `open_verified_dacl_handle`, `set_protected_dacl_on_handle`, `set_protected_dacl_on_path`,
+  `set_protected_dacl_on_single_link_file_if_exists`, and `protect_sandbox_base` open every modified
+  directory and file with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, verify non-reparse
+  type and `nNumberOfLinks == 1` via `GetFileInformationByHandle`, check `GetFinalPathNameByHandleW` against
+  the lexical long path (`GetLongPathNameW`), and apply `SetSecurityInfo` on that handle (with `<ws>` and
+  metadata DACL failures propagated instead of skipped); `check_chain_from_home` matches home only on
+  `Normal` components so a bare drive prefix (`C:`) no longer resolves via CWD; and the tests in
+  `crates/worker/src/isolation.rs` prove the `host.user_home` and `%USERPROFILE%` walks independently,
+  verify bare-prefix exclusion under home CWD, assert refusal texts, exercise `PREPARE_LOCK` / handle /
+  metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
+
 ## Phase 13: the path to finished
 
 Added on 2026-11-17 from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),

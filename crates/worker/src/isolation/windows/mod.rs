@@ -19,8 +19,8 @@ mod toolchain;
 
 use super::{HostDirs, IsolationLevel, Jail};
 use acl::{
-    explicit_access, merge_entries_on_path, merge_entries_on_path_unprotected,
-    set_protected_dacl_on_path,
+    merge_entries_on_path, merge_entries_on_path_unprotected,
+    set_protected_dacl_on_single_link_file_if_exists,
 };
 use desktop::{create_per_task_desktop, CloseDesktop};
 use path::{discover_msvc_details, to_wide};
@@ -33,7 +33,10 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use toolchain::{protect_sandbox_base, validate_workspace_root_ancestors_safe};
+use toolchain::{
+    protect_sandbox_base, validate_workspace_dir_entries_safe,
+    validate_workspace_root_ancestors_safe, validate_workspace_root_entries_safe,
+};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, SET_ACCESS};
 use windows_sys::Win32::Security::Isolation::{
@@ -55,18 +58,21 @@ pub use acl::{
     get_path_dacl_sddl, oxideswarm_toolchain_sid_string, restore_path_dacl_sddl, OwnedSid,
     OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME,
 };
+pub(super) use acl::{explicit_access, set_protected_dacl_on_path};
 pub(super) use path::resolve_program;
 pub use path::{
     is_reparse_point, normalize_win_path, path_starts_with_ci, resolve_windows_msvc_env,
     worker_profile_prefix,
 };
 pub use spawn::{is_process_elevated, AppContainerChild};
-#[cfg(test)]
-pub(super) use toolchain::validate_single_link_file_info;
 pub use toolchain::{
     prepare_worker_toolchains, revoke_oxideswarm_toolchain_acls, revoke_toolchain_sid_on_tree,
     validate_protected_files_outside_toolchains, validate_sandbox_base_safe,
     validate_workspace_root_safe,
+};
+#[cfg(test)]
+pub(super) use toolchain::{
+    validate_single_link_file_info, validate_workspace_root_safe_with_env_home,
 };
 
 const HRESULT_ALREADY_EXISTS: i32 =
@@ -478,17 +484,40 @@ impl WindowsAppContainerGuard {
                 };
                 protect_sandbox_base(jail.sandbox_base, toolchain_sid.as_psid(), manifest_opt)?;
                 if let Some(ws_root) = jail.workspace_root {
+                    #[cfg(test)]
+                    ws_root_recheck_test_hook::run_before_recheck(ws_root);
                     validate_workspace_root_ancestors_safe(ws_root, jail.host)
                         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    validate_workspace_root_entries_safe(ws_root)
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    #[cfg(test)]
+                    ws_root_recheck_test_hook::run_before_protect(ws_root);
                     protect_sandbox_base(ws_root, toolchain_sid.as_psid(), manifest_opt)?;
                 }
             }
 
             let mut workspace_dirs_to_restore = Vec::new();
-            if jail.workspace_root.is_some() {
+            if let Some(ws_root) = jail.workspace_root {
                 let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
                 if let Some(ws_dir) = jail.sandbox_dir.parent() {
-                    if ws_dir.exists() && !is_reparse_point(ws_dir) {
+                    if is_reparse_point(ws_dir) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing to configure AppContainer on a reparse-point workspace directory '{}'",
+                                ws_dir.display()
+                            ),
+                        ));
+                    }
+                    if ws_dir.exists() {
+                        if path_starts_with_ci(ws_dir, ws_root) {
+                            let ws_name = ws_dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            validate_workspace_dir_entries_safe(ws_root, &ws_name, ws_dir)
+                                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                        }
                         let ws_parent_entries = [
                             owner_only_entries[0],
                             owner_only_entries[1],
@@ -501,11 +530,34 @@ impl WindowsAppContainerGuard {
                             ),
                         ];
                         set_protected_dacl_on_path(ws_dir, &ws_parent_entries)?;
+                        #[cfg(test)]
+                        ws_root_recheck_test_hook::run_before_meta_dacl(ws_dir);
+                        let owner_only_file_entries = [
+                            explicit_access(
+                                user_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                            explicit_access(
+                                system_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                            explicit_access(
+                                admins_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                        ];
                         for meta_name in ["state.json", "lock"] {
                             let meta_path = ws_dir.join(meta_name);
-                            if meta_path.exists() && !is_reparse_point(&meta_path) {
-                                let _ = set_protected_dacl_on_path(&meta_path, &owner_only_entries);
-                            }
+                            set_protected_dacl_on_single_link_file_if_exists(
+                                &meta_path,
+                                &owner_only_file_entries,
+                            )?;
                         }
                     }
                 }
@@ -909,3 +961,55 @@ pub(super) async fn probe_with_config(
 
 #[cfg(test)]
 pub(crate) use spawn::lua_test_hook;
+
+/// Test-only hooks for exercising `PREPARE_LOCK` re-check, handle verification, and metadata DACL
+/// guards in `WindowsAppContainerGuard::create_blocking` (SEC-18). Never compiled outside tests.
+#[cfg(test)]
+pub(crate) mod ws_root_recheck_test_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type HookSlot = RefCell<Option<Box<dyn FnOnce(&Path)>>>;
+
+    thread_local! {
+        static BEFORE_RECHECK: HookSlot = const { RefCell::new(None) };
+        static BEFORE_PROTECT: HookSlot = const { RefCell::new(None) };
+        static BEFORE_META_DACL: HookSlot = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_before_recheck(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_RECHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn set_before_protect(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_PROTECT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn set_before_meta_dacl(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_META_DACL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear_all() {
+        BEFORE_RECHECK.with(|slot| *slot.borrow_mut() = None);
+        BEFORE_PROTECT.with(|slot| *slot.borrow_mut() = None);
+        BEFORE_META_DACL.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    pub(super) fn run_before_recheck(path: &Path) {
+        if let Some(hook) = BEFORE_RECHECK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+
+    pub(super) fn run_before_protect(path: &Path) {
+        if let Some(hook) = BEFORE_PROTECT.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+
+    pub(super) fn run_before_meta_dacl(path: &Path) {
+        if let Some(hook) = BEFORE_META_DACL.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+}

@@ -356,7 +356,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
-| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
+| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
@@ -1232,33 +1232,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
   `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
   owner's decision of "Done when" (the entry itself is gone) and step 2.
-
-### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
-
-- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
-  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
-  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
-    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
-    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
-    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
-    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
-  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
-    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
-  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
-    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
-    a skipped test shows as `ok`.
-- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
-  gaps. Only processes of the same user can create the links, so the impact is low.
-- **Do:**
-  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
-     and require `nlink == 1` for every file whose DACL is written.
-  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
-     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
-     `SetSecurityInfo` on that handle.
-  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
-     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
-     skips.
-- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
 
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
@@ -2398,3 +2371,4 @@ Add one dated line per finished item, newest last.
   NET-10 and APP-6 stay Planned.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
+- 2026-11-19: SEC-18 Implemented (text in the archive): `validate_workspace_root_entries_safe` and `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory `.locks`/workspace folders, and hard-linked `.locks/*` and `<ws>/{state.json,lock,state.json.tmp}` files; `open_verified_dacl_handle` and `set_protected_dacl_on_handle` verify `GetFileInformationByHandle` and `GetFinalPathNameByHandleW` against the lexical long path (`GetLongPathNameW`) before calling `SetSecurityInfo` on `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` handles; `check_chain_from_home` matches home only on `Normal` components (no bare `C:` CWD expansion); and tests prove each home walk independently, assert refusal texts, exercise `PREPARE_LOCK` / handle / metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
