@@ -1,64 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" fill="none">
-  <defs>
-    <linearGradient id="icon-bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0a0e17" />
-      <stop offset="100%" stop-color="#0f172a" />
-    </linearGradient>
-
-    <linearGradient id="icon-border" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#f97316" />
-      <stop offset="100%" stop-color="#38bdf8" />
-    </linearGradient>
-
-    <linearGradient id="icon-flame" x1="0%" y1="0%" x2="100%" y2="50%">
-      <stop offset="0%" stop-color="#ff6b35" />
-      <stop offset="50%" stop-color="#f97316" />
-      <stop offset="100%" stop-color="#fbbf24" />
-    </linearGradient>
-
-    <filter id="icon-glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="6" result="blur" />
-      <feComposite in="SourceGraphic" in2="blur" operator="over" />
-    </filter>
-  </defs>
-
-  <!-- Background Card -->
-  <rect x="2" y="2" width="196" height="196" rx="40" fill="url(#icon-bg)" stroke="url(#icon-border)" stroke-width="2.5" />
-
-  <!-- Center Mesh Emblem -->
-  <g transform="translate(100, 100)">
-    <!-- Hexagon Frame -->
-    <polygon points="0,-68 59,-34 59,34 0,68 -59,34 -59,-34" fill="none" stroke="#f97316" stroke-width="2" stroke-opacity="0.4" />
-    
-    <!-- Gear Teeth Notches -->
-    <g stroke="#f97316" stroke-width="2.5" stroke-linecap="round" opacity="0.8">
-      <line x1="0" y1="-68" x2="0" y2="-76" />
-      <line x1="59" y1="-34" x2="66" y2="-38" />
-      <line x1="59" y1="34" x2="66" y2="38" />
-      <line x1="0" y1="68" x2="0" y2="76" />
-      <line x1="-59" y1="34" x2="-66" y2="38" />
-      <line x1="-59" y1="-34" x2="-66" y2="-38" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-labelledby="title">
+  <title id="title">OxideSwarm</title>
+  <style>
+    .shell { fill: #FFFFFF; stroke: #CBD5E1; stroke-width: 2; stroke-linejoin: round; }
+    .swarm { fill: #F59E0B; }
+    @media (prefers-color-scheme: dark) {
+      .shell { stroke: #64748B; }
+    }
+  </style>
+  <g transform="translate(100,108) scale(1.55) translate(-100,-105)">
+    <path class="shell" d="M66,95 L76,85 L88,97 L100,83 L112,97 L124,85 L134,95 C138,115 134,152 100,152 C66,152 62,115 66,95 Z"/>
+    <g transform="translate(-6,-14) rotate(-14,100,95)">
+      <path class="shell" d="M66,95 L76,85 L88,97 L100,83 L112,97 L124,85 L134,95 C130,67 116,59 100,59 C84,59 70,67 66,95 Z"/>
     </g>
-
-    <!-- Connectors -->
-    <line x1="0" y1="0" x2="0" y2="-48" stroke="#38bdf8" stroke-width="2" />
-    <line x1="0" y1="0" x2="44" y2="-22" stroke="#10b981" stroke-width="2" />
-    <line x1="0" y1="0" x2="44" y2="24" stroke="#f59e0b" stroke-width="2" />
-    <line x1="0" y1="0" x2="0" y2="48" stroke="#a855f7" stroke-width="2" />
-    <line x1="0" y1="0" x2="-44" y2="24" stroke="#ec4899" stroke-width="2" />
-    <line x1="0" y1="0" x2="-44" y2="-22" stroke="#06b6d4" stroke-width="2" />
-
-    <!-- Worker Nodes -->
-    <circle cx="0" cy="-48" r="6" fill="#0f172a" stroke="#38bdf8" stroke-width="2" />
-    <circle cx="44" cy="-22" r="6" fill="#0f172a" stroke="#10b981" stroke-width="2" />
-    <circle cx="44" cy="24" r="5" fill="#0f172a" stroke="#f59e0b" stroke-width="2" />
-    <circle cx="0" cy="48" r="6" fill="#0f172a" stroke="#a855f7" stroke-width="2" />
-    <circle cx="-44" cy="24" r="5" fill="#0f172a" stroke="#ec4899" stroke-width="2" />
-    <circle cx="-44" cy="-22" r="5" fill="#0f172a" stroke="#06b6d4" stroke-width="2" />
-
-    <!-- Center Master Node -->
-    <circle cx="0" cy="0" r="16" fill="#1e1b4b" stroke="url(#icon-flame)" stroke-width="2.5" filter="url(#icon-glow)" />
-    <circle cx="0" cy="0" r="9" fill="url(#icon-flame)" />
-    <circle cx="0" cy="0" r="3.5" fill="#ffffff" />
+    <g class="swarm">
+      <circle cx="120" cy="70" r="6"/>
+      <circle cx="132" cy="58" r="4.5"/>
+      <circle cx="142" cy="49" r="3.5"/>
+      <circle cx="110" cy="60" r="3"/>
+    </g>
   </g>
 </svg>
