@@ -57,7 +57,7 @@ These parts were checked and need no rework:
 6. Follow the wire rule in `CLAUDE.md`: a new variant or field goes into the public enum, both
    mirror enums and all four `From` impls.
 7. A change to behaviour, a CLI flag, a port, an environment variable or a default updates
-   `README.md` and gets a design record, in the same pull request.
+   `docs/reference.md` and gets a design record, in the same pull request.
 8. Never read or write the real `~/.oxideswarm`. Give child processes a temporary `HOME` and
    `USERPROFILE` with `Command::env`.
 9. Do not write "verified on hardware" without a dated record of the run.
@@ -2393,3 +2393,5 @@ Add one dated line per finished item, newest last.
   Q97 open. The recorded join from another network stays in ENROLL-1.
 - 2026-11-19: Q94 to Q97 decided by the owner at the recommended answers; design 0094 Accepted. ECO-9, NET-9,
   NET-10 and APP-6 stay Planned.
+- 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
+  BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.

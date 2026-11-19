@@ -7,7 +7,8 @@ before adding or changing a document.
 
 | Document | Scope | Audience |
 |---|---|---|
-| [README.md](../README.md) | Overview, quickstart, CLI reference, ports, environment variables | Users |
+| [README.md](../README.md) | Overview: what it does, install, quick start, adding machines, status and limits | Users |
+| [reference.md](reference.md) | Reference: install details, cluster set-up, troubleshooting, platform support, the full status and limits, CLI flags, ports, environment variables, Agent Mesh summary, development and tests | Users, contributors |
 | [guides/two-machine-cluster.md](guides/two-machine-cluster.md) | Runbook: a macOS machine and a Windows machine as one cluster, verified with `oxideswarm doctor` | Users |
 | [guides/add-a-machine.md](guides/add-a-machine.md) | Runbook: add machines via pairing code (`JOIN-2`) or a USB setup kit (`USB-1`) | Users |
 | [guides/self-hosted-relay.md](guides/self-hosted-relay.md) | Runbook: run a self-hosted `iroh-relay` server and point master, worker, and clients at it with `--relay-url` | Users |
@@ -129,7 +130,7 @@ draft that design 0039 replaced before it merged.
 
 | Type | Location | Purpose | Required sections |
 |---|---|---|---|
-| Reference | `README.md`, `docs/SECURITY.md`, READMEs next to the scripts they describe | What exists and how to call it | Free, but one topic per document |
+| Reference | `docs/reference.md`, `docs/SECURITY.md`, READMEs next to the scripts they describe | What exists and how to call it | Free, but one topic per document |
 | Guide | `docs/guides/<slug>.md` | One task from start to finish, with a check that it worked | Goal, Prerequisites, Steps, Verify, Troubleshooting |
 | Design record | `docs/design/NNNN-<slug>.md`, numbered in order | Why and how a change is made, and its work items | See the template below |
 | Backlog | `docs/BACKLOG.md` | Open work in execution order | Index table; per item: Evidence, Problem, Do, Done when |
@@ -144,7 +145,7 @@ draft that design 0039 replaced before it merged.
    `powershell`, `text`), runs on one machine, and the line above it says which machine.
 4. **Placeholders in angle brackets:** `<MASTER_IP>`, `<TICKET>`, `<USER>`. Never a real private IP,
    hostname, secret or ticket.
-5. **One source of truth.** Ports, environment variables and CLI flags are listed in `README.md`.
+5. **One source of truth.** Ports, environment variables and CLI flags are listed in `docs/reference.md`.
    Other documents link there instead of copying the tables.
 6. **Nothing that drifts silently:** no item counts in headings, no performance number without the
    script that measured it.
@@ -155,7 +156,7 @@ draft that design 0039 replaced before it merged.
    Implemented when every work item in its table is Implemented.
 8. **Headings** in sentence case, without emoji; numbered only in long reference documents.
 9. **Code and documentation land together.** A change to the wire protocol, a CLI flag, a port, an
-   environment variable or a default updates the `README.md` reference in the same change (commit,
+   environment variable or a default updates the `docs/reference.md` reference in the same change (commit,
    or pull request for a multi-commit branch), `CLAUDE.md` when the architecture map changes, and
    gets a design record when it changes behaviour.
    A pull request that bumps `PROTOCOL_VERSION_CURRENT` says "wire change" in its description, and a release follows within 48 hours (design 0076 D1).

@@ -7,14 +7,14 @@ Run user GPU command workloads (CUDA, OptiX, Metal, `wgpu`, Blender Cycles, and 
 ## Prerequisites
 
 - A running OxideSwarm master and cluster authentication (`--secret-file`, `OXIDESWARM_SECRET_FILE`, or the default cluster secret file; under `--isolation fs` / `fs+net`, passing the secret via `--secret` or `OXIDESWARM_SECRET` is refused).
-- An `oxideswarm` binary built with `--features gpu-wgpu` on GPU workers so the worker enables native GPU compute (`cargo build --release --locked -p rusty_grid_cli --bin oxideswarm --features gpu-wgpu`; see [README.md](../../README.md#build-from-source)).
+- An `oxideswarm` binary built with `--features gpu-wgpu` on GPU workers so the worker enables native GPU compute (`cargo build --release --locked -p rusty_grid_cli --bin oxideswarm --features gpu-wgpu`; see [docs/reference.md](../reference.md#build-from-source)).
 - Host GPU drivers and any workload runtimes installed on the worker (for example NVIDIA drivers and CUDA Toolkit, Blender, Python with PyTorch CUDA on Windows/Linux, or macOS Metal with PyTorch MPS).
 
 ## Steps
 
 ### 1. Start the GPU worker with narrow runtime allowlists
 
-When all external tools live under system or `/opt` paths outside `$HOME`, `--isolation fs` runs `wgpu` Metal (macOS) and native Vulkan/CUDA/OptiX (Windows) directly. When a Python or ML runtime lives inside your home folder or another non-standard directory (such as `~/.pyenv/versions/<PY_VER>` on macOS or `%LOCALAPPDATA%\Programs\Python\Python311` on Windows), pass `--isolation-read-dir <DIR>` (repeatable; alias `--allow-read-dir`, env `RUSTY_GRID_ISOLATION_READ_DIRS`, config `[worker].isolation_read_dirs`; see [design 0074](../design/0074-external-runtime-allowlist-and-gpu-workloads.md) and [README.md](../../README.md#oxideswarm-worker-flags)).
+When all external tools live under system or `/opt` paths outside `$HOME`, `--isolation fs` runs `wgpu` Metal (macOS) and native Vulkan/CUDA/OptiX (Windows) directly. When a Python or ML runtime lives inside your home folder or another non-standard directory (such as `~/.pyenv/versions/<PY_VER>` on macOS or `%LOCALAPPDATA%\Programs\Python\Python311` on Windows), pass `--isolation-read-dir <DIR>` (repeatable; alias `--allow-read-dir`, env `RUSTY_GRID_ISOLATION_READ_DIRS`, config `[worker].isolation_read_dirs`; see [design 0074](../design/0074-external-runtime-allowlist-and-gpu-workloads.md) and [docs/reference.md](../reference.md#oxideswarm-worker-flags)).
 
 Broad home directories, `%APPDATA%`, `%LOCALAPPDATA%`, `~/.ssh`, `~/.oxideswarm`, sandbox bases, workspace roots, Cargo credential dirs, and symlinks or NTFS junctions are refused at start-up. On Windows, AppContainer read grants are recorded in `<OXIDESWARM_HOME>\windows_acl_grants.txt` (or `<user_home>\.oxideswarm\windows_acl_grants.txt`) so `windows/revoke-isolation-acls.ps1` can remove them later.
 
