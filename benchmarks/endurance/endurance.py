@@ -2604,10 +2604,10 @@ def find_leftover_process_trees(
     *,
     ignore_pids: Optional[Iterable[int]] = None,
     min_created_epoch: Optional[float] = None,
+    root_pid_windows: Optional[Dict[int, List[Dict[str, Optional[float]]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Find any live processes descended from started PIDs or referencing `workdir` in argv."""
     ignored = {int(p) for p in (ignore_pids or ())}
-    roots = {int(p) for p in root_pids if int(p) > 0} - ignored
     by_pid: Dict[int, Dict[str, Any]] = {}
     children: Dict[int, List[Dict[str, Any]]] = {}
     for row in proc_table:
@@ -2619,28 +2619,71 @@ def find_leftover_process_trees(
         children.setdefault(ppid, []).append(dict(row))
 
     found: Dict[int, str] = {}
-    queue_pids: List[int] = []
-    for rpid in sorted(roots):
-        if rpid in by_pid:
-            created = by_pid[rpid].get("created_epoch")
-            if min_created_epoch is None or created is None or float(created) >= float(min_created_epoch) - 2.0:
-                found[rpid] = "started_pid_alive"
-        queue_pids.append(rpid)
+    bfs_queue: List[Tuple[int, Optional[float]]] = []
 
-    visited: Set[int] = set(queue_pids)
-    while queue_pids:
-        cur = queue_pids.pop(0)
+    if root_pid_windows is not None:
+        all_roots = sorted(int(p) for p in root_pid_windows if int(p) > 0 and int(p) not in ignored)
+        for rpid in all_roots:
+            windows = list(root_pid_windows.get(rpid) or ())
+            if rpid in by_pid:
+                r_created = by_pid[rpid].get("created_epoch")
+                still_ours = any(
+                    w.get("end_epoch") is None
+                    and (
+                        r_created is None
+                        or w.get("start_epoch") is None
+                        or float(r_created) >= float(w["start_epoch"]) - 2.0
+                    )
+                    for w in windows
+                )
+                if still_ours:
+                    found[rpid] = "started_pid_alive"
+            for ch in children.get(rpid, ()):
+                cpid = int(ch.get("pid") or 0)
+                if cpid <= 0 or cpid in ignored:
+                    continue
+                c_created = ch.get("created_epoch")
+                if c_created is not None:
+                    matched_window = any(
+                        (w.get("start_epoch") is None or float(c_created) >= float(w["start_epoch"]) - 2.0)
+                        and (w.get("end_epoch") is None or float(c_created) <= float(w["end_epoch"]) + 1.0)
+                        for w in windows
+                    )
+                else:
+                    matched_window = any(w.get("end_epoch") is None for w in windows) or (rpid not in by_pid)
+                if not matched_window:
+                    continue
+                found.setdefault(cpid, "descendant_of_started_pid")
+                bfs_queue.append((cpid, float(c_created) if c_created is not None else None))
+    else:
+        roots = {int(p) for p in root_pids if int(p) > 0} - ignored
+        for rpid in sorted(roots):
+            r_created: Optional[float] = None
+            if rpid in by_pid:
+                raw_c = by_pid[rpid].get("created_epoch")
+                r_created = float(raw_c) if raw_c is not None else None
+                if min_created_epoch is None or r_created is None or r_created >= float(min_created_epoch) - 2.0:
+                    found[rpid] = "started_pid_alive"
+            bfs_queue.append((rpid, r_created if r_created is not None else min_created_epoch))
+
+    visited: Set[int] = {pid for pid, _ in bfs_queue}
+    while bfs_queue:
+        cur, cur_created = bfs_queue.pop(0)
         for ch in children.get(cur, ()):
             cpid = int(ch.get("pid") or 0)
             if cpid <= 0 or cpid in ignored:
                 continue
             created = ch.get("created_epoch")
-            if min_created_epoch is not None and created is not None and float(created) < float(min_created_epoch) - 2.0:
-                continue
+            c_epoch = float(created) if created is not None else None
+            if c_epoch is not None:
+                if min_created_epoch is not None and c_epoch < float(min_created_epoch) - 2.0:
+                    continue
+                if cur_created is not None and c_epoch < cur_created - 2.0:
+                    continue
             found.setdefault(cpid, "descendant_of_started_pid")
             if cpid not in visited:
                 visited.add(cpid)
-                queue_pids.append(cpid)
+                bfs_queue.append((cpid, c_epoch))
 
     wd_norm = os.path.normcase(os.path.abspath(workdir)) if workdir else ""
     wd_slash = wd_norm.replace("\\", "/") if wd_norm else ""
@@ -2714,7 +2757,8 @@ class SoakCluster(EnduranceCluster):
         self._worker_down: Set[int] = set()
         self._tracked_clients_lock = threading.Lock()
         self._tracked_clients: Set[subprocess.Popen] = set()
-        self._all_started_pids: Set[int] = set()
+        self._pid_windows_lock = threading.Lock()
+        self._started_pid_windows: Dict[int, List[Dict[str, Optional[float]]]] = {}
         self._start_epoch_s: float = time.time()
         self.dashboard_addr: str = ""
         self._master_task_stats: Dict[str, Dict[str, int]] = {}
@@ -2722,6 +2766,24 @@ class SoakCluster(EnduranceCluster):
         self._api_snapshot_errors: List[str] = []
         self._unclean_pids: List[int] = []
         self.compactions: List[Dict[str, Any]] = []
+
+    def _record_pid_start(self, pid: int) -> None:
+        now = time.time()
+        with self._pid_windows_lock:
+            self._started_pid_windows.setdefault(int(pid), []).append(
+                {"start_epoch": now, "end_epoch": None}
+            )
+
+    def _record_pid_exit(self, pid: int) -> None:
+        now = time.time()
+        with self._pid_windows_lock:
+            windows = self._started_pid_windows.get(int(pid))
+            if windows and windows[-1].get("end_epoch") is None:
+                windows[-1]["end_epoch"] = now
+
+    def _snapshot_pid_windows(self) -> Dict[int, List[Dict[str, Optional[float]]]]:
+        with self._pid_windows_lock:
+            return {pid: [dict(w) for w in wins] for pid, wins in self._started_pid_windows.items()}
 
     def current_master_addr(self) -> str:
         with self._addr_lock:
@@ -2780,7 +2842,7 @@ class SoakCluster(EnduranceCluster):
             env=self._build_env(os.path.join(self.workdir, "home-" + home_name)),
             **kw,
         )
-        self._all_started_pids.add(int(p.pid))
+        self._record_pid_start(p.pid)
         return p, log
 
     def _start_master_locked(self) -> None:
@@ -2947,6 +3009,8 @@ class SoakCluster(EnduranceCluster):
                 p.wait(timeout=10.0)
             if pid_alive(pid):
                 self._unclean_pids.append(pid)
+            else:
+                self._record_pid_exit(pid)
             try:
                 log.close()
             except Exception:
@@ -2990,6 +3054,8 @@ class SoakCluster(EnduranceCluster):
                         p.wait(timeout=5.0)
             if pid_alive(pid):
                 self._unclean_pids.append(pid)
+            else:
+                self._record_pid_exit(pid)
             after_bytes = dir_bytes(journal_path)
             try:
                 log.close()
@@ -3084,7 +3150,7 @@ class SoakCluster(EnduranceCluster):
             env=self.client_env,
             **kw,
         )
-        self._all_started_pids.add(int(p.pid))
+        self._record_pid_start(p.pid)
         with self._tracked_clients_lock:
             self._tracked_clients.add(p)
         try:
@@ -3100,6 +3166,8 @@ class SoakCluster(EnduranceCluster):
                 (stderr or "") + "\n[harness] client timed out after %.1f s" % timeout,
             )
         finally:
+            if p.poll() is not None and not pid_alive(p.pid):
+                self._record_pid_exit(p.pid)
             with self._tracked_clients_lock:
                 self._tracked_clients.discard(p)
 
@@ -3156,12 +3224,14 @@ class SoakCluster(EnduranceCluster):
 
     def leftover_process_trees(self) -> List[Dict[str, Any]]:
         table = _list_system_processes()
+        pid_windows = self._snapshot_pid_windows()
         return find_leftover_process_trees(
             table,
-            self._all_started_pids,
+            pid_windows.keys(),
             self.workdir,
             ignore_pids={os.getpid()},
             min_created_epoch=self._start_epoch_s,
+            root_pid_windows=pid_windows,
         )
 
     def stop(self) -> None:
@@ -3178,6 +3248,8 @@ class SoakCluster(EnduranceCluster):
                         p.wait(timeout=5.0)
                 if pid_alive(pid):
                     self._unclean_pids.append(pid)
+                else:
+                    self._record_pid_exit(pid)
                 try:
                     log.close()
                 except Exception:
@@ -3190,8 +3262,10 @@ class SoakCluster(EnduranceCluster):
                 if p.poll() is None:
                     p.kill()
                     p.wait(timeout=5.0)
-                    if pid_alive(p.pid):
-                        self._unclean_pids.append(p.pid)
+                if pid_alive(p.pid):
+                    self._unclean_pids.append(p.pid)
+                else:
+                    self._record_pid_exit(p.pid)
         self.procs = []
 
     def leftover_pids(self) -> List[int]:
@@ -4810,7 +4884,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
             elif fkind == "link_cut":
                 wi = int(widx)
                 cluster.cut_worker_link(wi, pause_s=float(ev["down_s"]))
-                t_end = round(time.monotonic() - soak_t0, 2)
+                t_end = max(round(time.monotonic() - soak_t0, 2), round(t_start + float(ev["down_s"]), 2))
                 entry = {
                     "kind": "link_cut",
                     "seq": seq,
@@ -4840,11 +4914,11 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                     "ok": True,
                 }
             elif fkind == "queue_burst":
-                total_burst = max_queue_size + 8
+                total_burst = max_queue_size + 16
                 b_args = [
                     "--timeout-secs",
                     "120",
-                ] + _worker_python_args(args.worker_python, _WORKER_SOAK_SLEEP_SRC, ["2.5"])
+                ] + _worker_python_args(args.worker_python, _WORKER_SOAK_SLEEP_SRC, ["5.0"])
                 with burst_restart_lock:
                     t_start = round(time.monotonic() - soak_t0, 2)
                     with ThreadPoolExecutor(max_workers=24) as bpool:

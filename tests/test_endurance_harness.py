@@ -793,6 +793,32 @@ class SoakHarnessTests(unittest.TestCase):
         )
         self.assertEqual([x["pid"] for x in leftovers], [5000, 5001, 5002])
 
+        # With per-PID lifetime windows: OS PID reuse after an exited client/worker does NOT false-positive,
+        # while a real task child spawned BEFORE worker exit IS still caught alongside un-exited roots.
+        reused_table = [
+            {"pid": 3001, "ppid": 1, "cmd": "chrome.exe", "created_epoch": 2000.0},
+            {"pid": 3002, "ppid": 3001, "cmd": "chrome-helper.exe", "created_epoch": 2001.0},
+            {"pid": 4001, "ppid": 1, "cmd": "unrelated-reused-after-worker-kill.exe", "created_epoch": 2500.0},
+            {"pid": 4002, "ppid": 4001, "cmd": "sleep-escaped-during-worker-life.exe", "created_epoch": 1400.0},
+            {"pid": 4003, "ppid": 4002, "cmd": "grandchild.exe", "created_epoch": 1401.0},
+            {"pid": 4004, "ppid": 4001, "cmd": "unrelated-child-after-reuse.exe", "created_epoch": 2505.0},
+            {"pid": 5005, "ppid": 1, "cmd": "oxideswarm.exe still-alive", "created_epoch": 1200.0},
+        ]
+        pid_windows = {
+            3001: [{"start_epoch": 1100.0, "end_epoch": 1101.0}],  # exited client, later reused by Chrome
+            4001: [{"start_epoch": 1000.0, "end_epoch": 1500.0}],  # killed worker whose child 4002 escaped at 1400s
+            5005: [{"start_epoch": 1200.0, "end_epoch": None}],    # worker never exited cleanly
+        }
+        windowed = endurance.find_leftover_process_trees(
+            reused_table,
+            pid_windows.keys(),
+            workdir=r"C:\ox_tmp\soak\run1",
+            ignore_pids={99999},
+            min_created_epoch=1000.0,
+            root_pid_windows=pid_windows,
+        )
+        self.assertEqual([x["pid"] for x in windowed], [4002, 4003, 5005])
+
 
 if __name__ == "__main__":
     unittest.main()
