@@ -45,6 +45,8 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -249,6 +251,20 @@ def percentile(values: Iterable[float], pct: float) -> float:
     return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
 
 
+def is_queue_full_error(message: str) -> bool:
+    """Return True strictly for master queue-capacity rejections (GridError::QueueFull)."""
+    low = (message or "").lower()
+    return ("task queue is full" in low) or ("queue is full" in low)
+
+
+def classify_soak_submit_error(kind: str, message: str, returncode: Optional[int] = None) -> str:
+    """Classify a non-ok submit: only queue-full during queue_burst counts as a refusal."""
+    _ = returncode
+    if kind == "queue_burst" and is_queue_full_error(message):
+        return "refusal"
+    return "failure"
+
+
 class TaskLedger:
     """Tracks submitted tasks and verifies exactly-once terminal accounting."""
 
@@ -258,6 +274,11 @@ class TaskLedger:
         self._results: Dict[str, List[Dict[str, Any]]] = {}
         self._retries: Dict[str, int] = {}
         self._refusals: List[Dict[str, str]] = []
+        self._submit_failures: List[Dict[str, Any]] = []
+
+    def submitted_task_ids(self) -> Set[str]:
+        with self._lock:
+            return set(self._submitted.keys())
 
     def record_submit(
         self,
@@ -298,9 +319,25 @@ class TaskLedger:
         with self._lock:
             self._retries[task_id] = self._retries.get(task_id, 0) + int(count)
 
+    def set_task_retries(self, task_id: str, count: int) -> None:
+        """Record observed total retry count for a task (idempotent across snapshots)."""
+        if count <= 0:
+            return
+        with self._lock:
+            prev = self._retries.get(task_id, 0)
+            if int(count) > prev:
+                self._retries[task_id] = int(count)
+
     def record_submit_refusal(self, kind: str, reason: str) -> None:
         with self._lock:
             self._refusals.append({"kind": str(kind), "reason": str(reason)})
+
+    def record_submit_failure(self, kind: str, reason: str, rc: Optional[int] = None) -> None:
+        with self._lock:
+            entry: Dict[str, Any] = {"kind": str(kind), "reason": str(reason)}
+            if rc is not None:
+                entry["rc"] = int(rc)
+            self._submit_failures.append(entry)
 
     def audit(self) -> Dict[str, Any]:
         with self._lock:
@@ -361,9 +398,17 @@ class TaskLedger:
                     untracked_results.append(tid)
 
             refusals_by_kind: Dict[str, int] = {}
+            refusal_reason_counts: Dict[str, int] = {}
             for r in self._refusals:
                 rk = str(r.get("kind") or "generic")
+                rr = str(r.get("reason") or "")
                 refusals_by_kind[rk] = refusals_by_kind.get(rk, 0) + 1
+                refusal_reason_counts[rr] = refusal_reason_counts.get(rr, 0) + 1
+
+            submit_failures_by_kind: Dict[str, int] = {}
+            for sf in self._submit_failures:
+                sk = str(sf.get("kind") or "generic")
+                submit_failures_by_kind[sk] = submit_failures_by_kind.get(sk, 0) + 1
 
             ok = (
                 not lost
@@ -371,6 +416,7 @@ class TaskLedger:
                 and not hash_mismatches
                 and not unexpected_outcomes
                 and not untracked_results
+                and not self._submit_failures
             )
             return {
                 "submitted": len(self._submitted),
@@ -384,6 +430,11 @@ class TaskLedger:
                 "retried_tasks": len(self._retries),
                 "refusals": len(self._refusals),
                 "refusals_by_kind": refusals_by_kind,
+                "refusal_reason_counts": refusal_reason_counts,
+                "refusals_detail": list(self._refusals),
+                "submit_failures_count": len(self._submit_failures),
+                "submit_failures_by_kind": submit_failures_by_kind,
+                "submit_failures": list(self._submit_failures),
                 "outcome_counts": outcome_counts,
                 "by_kind": by_kind,
                 "ok": ok,
@@ -506,14 +557,63 @@ def split_soak_windows(
     return base, late, "short_run_early_vs_late"
 
 
+def summarize_process_lifetimes(samples: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group sample rows into contiguous per-PID process lifetimes for each role."""
+    ordered = sorted(samples, key=lambda r: float(r.get("t_s", 0.0)))
+    series_map: Dict[str, List[Dict[str, Any]]] = {}
+    active_by_role: Dict[str, Tuple[Optional[int], Dict[str, Any]]] = {}
+
+    for row in ordered:
+        t_s = float(row.get("t_s", 0.0))
+        for role, stats in row.get("processes", {}).items():
+            if role == "client":
+                continue
+            pid_raw = stats.get("pid")
+            pid = int(pid_raw) if pid_raw is not None else None
+            rss = int(stats.get("rss_bytes", 0))
+            handles = int(stats.get("handles", 0))
+            cur = active_by_role.get(role)
+            if cur is None or cur[0] != pid:
+                entry: Dict[str, Any] = {
+                    "pid": pid,
+                    "generation": len(series_map.get(role, [])),
+                    "first_t_s": t_s,
+                    "last_t_s": t_s,
+                    "samples": 1,
+                    "first_rss_bytes": rss,
+                    "peak_rss_bytes": rss,
+                    "last_rss_bytes": rss,
+                    "rss_delta_bytes": 0,
+                    "first_handles": handles,
+                    "peak_handles": handles,
+                    "last_handles": handles,
+                    "handles_delta": 0,
+                }
+                series_map.setdefault(role, []).append(entry)
+                active_by_role[role] = (pid, entry)
+            else:
+                entry = cur[1]
+                entry["last_t_s"] = t_s
+                entry["samples"] += 1
+                entry["peak_rss_bytes"] = max(entry["peak_rss_bytes"], rss)
+                entry["last_rss_bytes"] = rss
+                entry["rss_delta_bytes"] = rss - entry["first_rss_bytes"]
+                entry["peak_handles"] = max(entry["peak_handles"], handles)
+                entry["last_handles"] = handles
+                entry["handles_delta"] = handles - entry["first_handles"]
+
+    return series_map
+
+
 def check_soak_resource_plateau(
     samples: List[Dict[str, Any]],
     duration_s: float,
 ) -> Dict[str, Any]:
     """Design 0065 D3 #6.2: memory within max(10%, 32 MiB) and handles within 10% across baseline vs late."""
     base_rows, late_rows, mode = split_soak_windows(samples, duration_s)
+    lifetimes = summarize_process_lifetimes(samples)
     if not base_rows or not late_rows:
-        return {"mode": mode, "roles": {}, "passed": False, "reason": "insufficient_samples"}
+        return {"mode": mode, "roles": {}, "process_lifetimes": lifetimes, "passed": False, "reason": "insufficient_samples"}
 
     roles_seen: Set[str] = set()
     for row in base_rows:
@@ -523,7 +623,7 @@ def check_soak_resource_plateau(
         late_roles.update(row.get("processes", {}).keys())
     roles = sorted(r for r in (roles_seen & late_roles) if r != "client")
     if not roles:
-        return {"mode": mode, "roles": {}, "passed": False, "reason": "no_common_process_roles"}
+        return {"mode": mode, "roles": {}, "process_lifetimes": lifetimes, "passed": False, "reason": "no_common_process_roles"}
 
     role_checks: Dict[str, Any] = {}
     all_ok = True
@@ -532,13 +632,19 @@ def check_soak_resource_plateau(
         l_rss = [row["processes"][role]["rss_bytes"] for row in late_rows if role in row.get("processes", {})]
         b_h = [row["processes"][role]["handles"] for row in base_rows if role in row.get("processes", {})]
         l_h = [row["processes"][role]["handles"] for row in late_rows if role in row.get("processes", {})]
+        b_pids = sorted({int(row["processes"][role]["pid"]) for row in base_rows if role in row.get("processes", {}) and row["processes"][role].get("pid") is not None})
+        l_pids = sorted({int(row["processes"][role]["pid"]) for row in late_rows if role in row.get("processes", {}) and row["processes"][role].get("pid") is not None})
         mem = check_memory_plateau(statistics.mean(b_rss), statistics.mean(l_rss))
         hnd = check_handle_plateau(statistics.mean(b_h), statistics.mean(l_h))
         role_ok = bool(mem["passed"] and hnd["passed"])
         all_ok = all_ok and role_ok
+        same_pid = bool(b_pids and l_pids and b_pids == l_pids and len(b_pids) == 1)
         role_checks[role] = {
             "baseline_samples": len(b_rss),
             "late_samples": len(l_rss),
+            "baseline_pids": b_pids,
+            "late_pids": l_pids,
+            "same_process": same_pid,
             "memory": mem,
             "handles": hnd,
             "passed": role_ok,
@@ -549,6 +655,7 @@ def check_soak_resource_plateau(
         "baseline_window_s": [base_rows[0]["t_s"], base_rows[-1]["t_s"]],
         "late_window_s": [late_rows[0]["t_s"], late_rows[-1]["t_s"]],
         "roles": role_checks,
+        "process_lifetimes": lifetimes,
         "passed": all_ok,
     }
 
@@ -563,6 +670,7 @@ def check_soak_disk_and_journal(
     compactions: List[Dict[str, Any]],
     idle_blob_store_bytes: Optional[int] = None,
     idle_worker_cache_bytes: Optional[Dict[str, int]] = None,
+    worker_pinned_headroom_bytes: int = 0,
 ) -> Dict[str, Any]:
     """Design 0065 D3 #6.3: store/cache bounds, idle sandboxes hold cache only, journal shrinks on compaction."""
     blob_peaks = [
@@ -583,7 +691,22 @@ def check_soak_disk_and_journal(
             for k, v in samples[-1].get("dirs", {}).items():
                 if k == "worker_cache_bytes" or k.startswith("worker_cache_w"):
                     idle_worker_cache_bytes[k] = int(v)
-    cache_ok = all(int(v) <= int(worker_cache_limit_bytes) for v in idle_worker_cache_bytes.values())
+
+    worker_cache_peak_bytes: Dict[str, int] = {}
+    worker_cache_over_base_limit_samples: Dict[str, List[Dict[str, Any]]] = {}
+    for row in samples:
+        t_s = float(row.get("t_s", 0.0))
+        for k, v in row.get("dirs", {}).items():
+            if k == "worker_cache_bytes" or k.startswith("worker_cache_w"):
+                sz = int(v)
+                worker_cache_peak_bytes[k] = max(worker_cache_peak_bytes.get(k, 0), sz)
+                if sz > int(worker_cache_limit_bytes):
+                    worker_cache_over_base_limit_samples.setdefault(k, []).append({"t_s": t_s, "bytes": sz})
+
+    cache_idle_ok = all(int(v) <= int(worker_cache_limit_bytes) for v in idle_worker_cache_bytes.values())
+    cache_peak_limit = int(worker_cache_limit_bytes) + int(worker_pinned_headroom_bytes)
+    cache_peak_ok = all(int(v) <= cache_peak_limit for v in worker_cache_peak_bytes.values())
+    cache_ok = cache_idle_ok and cache_peak_ok
 
     unexpected_sandbox_entries = {
         w: sorted(e for e in entries if e not in ("cache", ".locks"))
@@ -605,8 +728,13 @@ def check_soak_disk_and_journal(
         "blob_store_limit_bytes": int(blob_store_limit_bytes),
         "pinned_headroom_bytes": int(pinned_headroom_bytes),
         "blob_store_ok": bool(store_peak_ok and store_idle_ok),
+        "worker_cache_peak_bytes": worker_cache_peak_bytes,
+        "worker_cache_over_base_limit_samples": worker_cache_over_base_limit_samples,
         "worker_cache_idle_bytes": dict(idle_worker_cache_bytes),
         "worker_cache_limit_bytes": int(worker_cache_limit_bytes),
+        "worker_pinned_headroom_bytes": int(worker_pinned_headroom_bytes),
+        "worker_cache_peak_ok": bool(cache_peak_ok),
+        "worker_cache_idle_ok": bool(cache_idle_ok),
         "worker_cache_ok": bool(cache_ok),
         "unexpected_sandbox_entries": unexpected_sandbox_entries,
         "tmp_leftovers": non_empty_tmp,
@@ -617,21 +745,72 @@ def check_soak_disk_and_journal(
     }
 
 
+def _fault_interval_s(fault: Dict[str, Any], pad_s: float = 15.0) -> Tuple[float, float]:
+    start = float(fault.get("t_s", fault.get("at_s", 0.0)))
+    if "end_s" in fault and fault["end_s"] is not None:
+        end = float(fault["end_s"])
+    else:
+        dur = float(fault.get("down_s") or fault.get("pause_s") or 0.0)
+        end = start + dur
+    return start, max(start, end) + float(pad_s)
+
+
+def probe_overlaps_fault(
+    probe: Dict[str, Any],
+    faults: Iterable[Dict[str, Any]],
+    pad_s: float = 15.0,
+) -> bool:
+    """Return True if a probe's execution interval [t_s, t_s + latency] overlaps any fault window."""
+    p_start = float(probe.get("t_s", 0.0))
+    p_end = p_start + max(0.0, float(probe.get("latency_ms", 0.0)) / 1000.0)
+    for f in faults:
+        f_start, f_end = _fault_interval_s(f, pad_s=pad_s)
+        if p_end >= f_start and p_start <= f_end:
+            return True
+    return False
+
+
 def check_soak_probe_p99(
     probes: List[Dict[str, Any]],
     duration_s: float,
     max_ratio: float = 1.5,
+    faults: Optional[Iterable[Dict[str, Any]]] = None,
+    fault_pad_s: float = 15.0,
+    min_samples_per_window: int = 10,
 ) -> Dict[str, Any]:
-    """Design 0065 D3 #6.4: probe p99 latency in last window <= 1.5x baseline window."""
+    """Design 0065 D3 #6.4: clean non-fault probe p99 in late window <= 1.5x baseline window."""
+    fault_list = list(faults) if faults is not None else []
     ok_probes = [p for p in probes if p.get("ok") and p.get("latency_ms") is not None]
-    base_rows, late_rows, mode = split_soak_windows(ok_probes, duration_s)
-    if not base_rows or not late_rows:
+    if fault_list:
+        clean_probes = [p for p in ok_probes if not probe_overlaps_fault(p, fault_list, pad_s=fault_pad_s)]
+    else:
+        clean_probes = list(ok_probes)
+    excluded_fault_probes = len(ok_probes) - len(clean_probes)
+
+    eff_dur = max(float(duration_s), max((float(p.get("t_s", 0.0)) for p in ok_probes), default=0.0))
+    ordered = sorted(clean_probes, key=lambda r: float(r.get("t_s", 0.0)))
+    if duration_s >= 3.0 * 3600.0:
+        mode = "hour2_vs_last_hour"
+        base_rows = [r for r in ordered if 3600.0 <= float(r.get("t_s", 0.0)) < 7200.0]
+        late_rows = [r for r in ordered if float(r.get("t_s", 0.0)) >= duration_s - 3600.0]
+    else:
+        mode = "short_run_early_vs_late"
+        base_rows = [r for r in ordered if 0.10 * eff_dur <= float(r.get("t_s", 0.0)) < 0.50 * eff_dur]
+        late_rows = [r for r in ordered if float(r.get("t_s", 0.0)) >= 0.55 * eff_dur]
+
+    if len(base_rows) < int(min_samples_per_window) or len(late_rows) < int(min_samples_per_window):
         return {
             "mode": mode,
             "total_probes": len(probes),
             "ok_probes": len(ok_probes),
+            "excluded_fault_probes": excluded_fault_probes,
+            "fault_windows_used": len(fault_list),
+            "fault_pad_s": float(fault_pad_s),
+            "min_samples_required": int(min_samples_per_window),
+            "baseline_count": len(base_rows),
+            "late_count": len(late_rows),
             "passed": False,
-            "reason": "insufficient_probes",
+            "reason": "insufficient_probes_per_window",
         }
     base_p99 = percentile([float(r["latency_ms"]) for r in base_rows], 99.0)
     late_p99 = percentile([float(r["latency_ms"]) for r in late_rows], 99.0)
@@ -640,6 +819,10 @@ def check_soak_probe_p99(
         "mode": mode,
         "total_probes": len(probes),
         "ok_probes": len(ok_probes),
+        "excluded_fault_probes": excluded_fault_probes,
+        "fault_windows_used": len(fault_list),
+        "fault_pad_s": float(fault_pad_s),
+        "min_samples_required": int(min_samples_per_window),
         "baseline_count": len(base_rows),
         "late_count": len(late_rows),
         "baseline_p99_ms": round(base_p99, 3),
@@ -647,6 +830,38 @@ def check_soak_probe_p99(
         "ratio": ratio_res["ratio"],
         "max_ratio": max_ratio,
         "passed": bool(ratio_res["passed"] and len(ok_probes) == len(probes)),
+    }
+
+
+def check_soak_faults(
+    fault_plan: List[Dict[str, Any]],
+    faults_executed: List[Dict[str, Any]],
+    fault_errors: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Verify every planned fault executed cleanly with zero silent or unhandled failures."""
+    errors = list(fault_errors or [])
+    planned_keys = sorted(
+        (str(e.get("kind")), int(e.get("seq", -1)), e.get("worker_index"))
+        for e in fault_plan
+    )
+    executed_ok = [e for e in faults_executed if e.get("ok", True)]
+    executed_keys = sorted(
+        (str(e.get("kind")), int(e.get("seq", -1)), e.get("worker_index"))
+        for e in executed_ok
+    )
+    ok = (
+        len(errors) == 0
+        and len(faults_executed) == len(fault_plan)
+        and len(executed_ok) == len(fault_plan)
+        and planned_keys == executed_keys
+    )
+    return {
+        "planned_count": len(fault_plan),
+        "executed_count": len(faults_executed),
+        "ok_count": len(executed_ok),
+        "error_count": len(errors),
+        "errors": errors,
+        "passed": bool(ok),
     }
 
 
@@ -665,14 +880,51 @@ def evaluate_soak_pass_checks(
     leftover_pids: List[int],
     idle_blob_store_bytes: Optional[int] = None,
     idle_worker_cache_bytes: Optional[Dict[str, int]] = None,
-    master_duplicate_executions: int = 0,
+    worker_pinned_headroom_bytes: int = 0,
+    master_audit: Optional[Dict[str, Any]] = None,
+    fault_plan: Optional[List[Dict[str, Any]]] = None,
+    faults_executed: Optional[List[Dict[str, Any]]] = None,
+    fault_errors: Optional[List[Dict[str, Any]]] = None,
+    leftover_task_trees: Optional[List[Dict[str, Any]]] = None,
+    min_probe_samples_per_window: int = 10,
 ) -> Dict[str, Any]:
-    """Compute all five D3 item 6 pass/fail criteria over recorded soak telemetry."""
-    c1_ok = bool(ledger_audit.get("ok")) and int(master_duplicate_executions) == 0
+    """Compute all five D3 item 6 pass/fail criteria plus fault completeness over soak telemetry."""
+    submitted = int(ledger_audit.get("submitted", 0))
+    if master_audit is not None:
+        multi_result = dict(master_audit.get("multi_result_tasks") or {})
+        unique_result_tasks = int(master_audit.get("unique_result_tasks", 0))
+        queue_record_errors = int(master_audit.get("queue_record_errors", 0))
+        missing_master_results = list(master_audit.get("missing_from_master_results") or [])
+        untracked_master_results = list(master_audit.get("untracked_master_results") or [])
+        master_evidence_present = True
+        master_ok = (
+            len(multi_result) == 0
+            and unique_result_tasks == submitted
+            and queue_record_errors == 0
+            and not missing_master_results
+            and not untracked_master_results
+        )
+    else:
+        multi_result = {}
+        unique_result_tasks = 0
+        queue_record_errors = 0
+        missing_master_results = []
+        untracked_master_results = []
+        master_evidence_present = False
+        master_ok = False
+
+    c1_ok = bool(ledger_audit.get("ok")) and master_ok
     c1 = {
         "passed": c1_ok,
         "ledger": ledger_audit,
-        "master_duplicate_executions": int(master_duplicate_executions),
+        "master_evidence_present": master_evidence_present,
+        "master_duplicate_executions": len(multi_result),
+        "master_multi_result_tasks": multi_result,
+        "master_unique_result_tasks": unique_result_tasks,
+        "master_expected_submitted": submitted,
+        "master_queue_record_errors": queue_record_errors,
+        "master_missing_results": missing_master_results,
+        "master_untracked_results": untracked_master_results,
     }
     c2 = check_soak_resource_plateau(samples, duration_s)
     c3 = check_soak_disk_and_journal(
@@ -685,13 +937,29 @@ def evaluate_soak_pass_checks(
         compactions=compactions,
         idle_blob_store_bytes=idle_blob_store_bytes,
         idle_worker_cache_bytes=idle_worker_cache_bytes,
+        worker_pinned_headroom_bytes=worker_pinned_headroom_bytes,
     )
-    c4 = check_soak_probe_p99(probes, duration_s)
+    faults_for_p99 = faults_executed if faults_executed is not None else (fault_plan or [])
+    c4 = check_soak_probe_p99(
+        probes,
+        duration_s,
+        faults=faults_for_p99,
+        min_samples_per_window=min_probe_samples_per_window,
+    )
+    trees = list(leftover_task_trees or [])
     c5 = {
         "leftover_pids": [int(p) for p in leftover_pids],
-        "passed": len(leftover_pids) == 0,
+        "leftover_task_trees": trees,
+        "passed": len(leftover_pids) == 0 and len(trees) == 0,
     }
-    all_passed = bool(c1["passed"] and c2["passed"] and c3["passed"] and c4["passed"] and c5["passed"])
+    if fault_plan is not None or faults_executed is not None or fault_errors is not None:
+        c6 = check_soak_faults(list(fault_plan or []), list(faults_executed or []), fault_errors)
+    else:
+        c6 = {"planned_count": 0, "executed_count": 0, "ok_count": 0, "error_count": 0, "errors": [], "passed": True}
+
+    all_passed = bool(
+        c1["passed"] and c2["passed"] and c3["passed"] and c4["passed"] and c5["passed"] and c6["passed"]
+    )
     return {
         "all_passed": all_passed,
         "checks": {
@@ -700,6 +968,7 @@ def evaluate_soak_pass_checks(
             "3_disk_and_journal": c3,
             "4_probe_p99": c4,
             "5_clean_stop": c5,
+            "6_fault_injection": c6,
         },
     }
 
@@ -1659,7 +1928,9 @@ def sample_processes(pid_map: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
                 pass
         for role, pid in clean_map.items():
             if pid in by_pid:
-                results[role] = by_pid[pid]
+                entry = dict(by_pid[pid])
+                entry["pid"] = int(pid)
+                results[role] = entry
         return results
 
     if sysname == "Darwin":
@@ -1677,6 +1948,7 @@ def sample_processes(pid_map: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
             lsof_out = sh(["lsof", "-n", "-P", "-p", str(pid)], timeout=10.0)
             handles = max(0, len(lsof_out.splitlines()) - 1) if lsof_out else 0
             results[role] = {
+                "pid": int(pid),
                 "rss_bytes": rss_bytes,
                 "handles": handles,
                 "threads": threads,
@@ -1716,6 +1988,7 @@ def sample_processes(pid_map: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
                     cpu_s = round((utime + stime) / clk_tck, 3)
             handles = len(os.listdir(os.path.join(proc_dir, "fd")))
             results[role] = {
+                "pid": int(pid),
                 "rss_bytes": rss_bytes,
                 "handles": handles,
                 "threads": threads,
@@ -2131,51 +2404,265 @@ _REAPER_FAILOVER_RE = re.compile(
     r"Reaper triggered task failover reassignment.*?\bcount=(\d+)"
     r"|\bcount=(\d+).*?Reaper triggered task failover reassignment"
 )
+_ORPHAN_REQUEUE_RE = re.compile(r"Re-enqueued orphaned tasks for reassignment")
+_EVACUATED_REQUEUE_RE = re.compile(r"Processed evacuated tasks from draining worker")
+_COUNT_FIELD_RE = re.compile(r"\bcount=(\d+)\b")
+_TASK_ID_TAG_RE = re.compile(r"TaskId\(([0-9a-f-]+)\)")
+_DEBUG_LINE_RE = re.compile(r"(?:^|\s)DEBUG(?:\s|$)")
 
 
-def audit_master_log_texts(log_texts: Iterable[str]) -> Dict[str, Any]:
-    """Parse master log generations (stripping ANSI escapes) for results, failovers, and queue errors."""
+def audit_master_log_texts(
+    log_texts: Iterable[str],
+    expected_task_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Parse master log generations (stripping ANSI escapes) for results, failovers, requeues, and errors."""
     texts = list(log_texts)
     recv_counts: Dict[str, int] = {}
     failovers = 0
+    superseded_failovers = 0
     reaper_failovers = 0
-    requeues = 0
+    orphan_requeues = 0
+    evacuations_logged = 0
+    requeued_task_ids: Set[str] = set()
+    evacuated_task_ids: Set[str] = set()
     stale_ignored = 0
     late_ignored = 0
     queue_record_errors = 0
+    has_debug_logs = False
+
     for raw in texts:
         txt = _ANSI_ESCAPE_RE.sub("", raw or "")
         for ln in txt.splitlines():
+            if _DEBUG_LINE_RE.search(ln):
+                has_debug_logs = True
             m = _MASTER_RESULT_RE.search(ln)
             if m:
                 tid = m.group(1) or m.group(2)
                 recv_counts[tid] = recv_counts.get(tid, 0) + 1
             if "Worker disconnected; executing failover sweep" in ln:
                 failovers += 1
+            if "Worker re-registered while its previous session was live; failing over the superseded session" in ln:
+                superseded_failovers += 1
             rm = _REAPER_FAILOVER_RE.search(ln)
             if rm:
                 reaper_failovers += int(rm.group(1) or rm.group(2) or 0)
-            if "Requeuing" in ln or "Scheduling retry" in ln or "state=Retrying" in ln:
-                requeues += 1
+            if _ORPHAN_REQUEUE_RE.search(ln):
+                cm = _COUNT_FIELD_RE.search(ln)
+                ids = _TASK_ID_TAG_RE.findall(ln)
+                orphan_requeues += int(cm.group(1)) if cm else max(1, len(ids))
+                requeued_task_ids.update(ids)
+            if _EVACUATED_REQUEUE_RE.search(ln):
+                cm = _COUNT_FIELD_RE.search(ln)
+                ids = _TASK_ID_TAG_RE.findall(ln)
+                evacuations_logged += int(cm.group(1)) if cm else max(1, len(ids))
+                evacuated_task_ids.update(ids)
             if "Ignored result from a worker/session that does not own the task" in ln:
+                has_debug_logs = True
                 stale_ignored += 1
             if "Ignoring result for terminal task" in ln:
+                has_debug_logs = True
                 late_ignored += 1
             if "Failed to record task result in queue" in ln:
                 queue_record_errors += 1
+
     multi_result = {tid: cnt for tid, cnt in recv_counts.items() if cnt > 1}
-    return {
+    missing_from_master: List[str] = []
+    untracked_master: List[str] = []
+    if expected_task_ids is not None:
+        exp_set = set(expected_task_ids)
+        seen_set = set(recv_counts.keys())
+        missing_from_master = sorted(exp_set - seen_set)
+        untracked_master = sorted(seen_set - exp_set)
+
+    out: Dict[str, Any] = {
         "master_generations": len(texts),
         "result_messages_logged": sum(recv_counts.values()),
         "unique_result_tasks": len(recv_counts),
         "multi_result_tasks": multi_result,
         "failover_sweeps": failovers,
+        "superseded_failovers": superseded_failovers,
         "reaper_failovers": reaper_failovers,
-        "requeues_logged": requeues + reaper_failovers,
-        "stale_results_ignored": stale_ignored,
-        "late_results_ignored": late_ignored,
+        "orphan_requeues": orphan_requeues,
+        "evacuations_logged": evacuations_logged,
+        "requeues_logged": orphan_requeues + reaper_failovers,
+        "requeued_task_ids": sorted(requeued_task_ids),
+        "evacuated_task_ids": sorted(evacuated_task_ids),
+        "stale_late_results_measured": has_debug_logs,
+        "stale_results_ignored": stale_ignored if has_debug_logs else None,
+        "late_results_ignored": late_ignored if has_debug_logs else None,
         "queue_record_errors": queue_record_errors,
     }
+    if not has_debug_logs:
+        out["stale_late_results_note"] = (
+            "Ignored stale/late results are logged at DEBUG level in crates/master/src "
+            "and are not measured under default INFO logging"
+        )
+    if expected_task_ids is not None:
+        out["missing_from_master_results"] = missing_from_master
+        out["untracked_master_results"] = untracked_master
+    return out
+
+
+def apply_master_task_retries_to_ledger(
+    ledger: TaskLedger,
+    master_task_stats: Dict[str, Dict[str, int]],
+    fallback_requeued_task_ids: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Populate TaskLedger retries from master /api/tasks telemetry (or INFO log task IDs)."""
+    if master_task_stats:
+        failovers_total = 0
+        evacuations_total = 0
+        retried_tasks = 0
+        retries_total = 0
+        for tid, st in master_task_stats.items():
+            rc = int(st.get("retry_count", 0))
+            fc = int(st.get("failover_count", 0))
+            ec = int(st.get("evacuation_count", 0))
+            failovers_total += fc
+            evacuations_total += ec
+            if rc > 0:
+                ledger.set_task_retries(tid, rc)
+                retried_tasks += 1
+                retries_total += rc
+        return {
+            "source": "master_task_api",
+            "tasks_observed": len(master_task_stats),
+            "retried_tasks": retried_tasks,
+            "retries_total": retries_total,
+            "failovers_total": failovers_total,
+            "evacuations_total": evacuations_total,
+        }
+
+    fb_ids = sorted(set(fallback_requeued_task_ids))
+    for tid in fb_ids:
+        ledger.set_task_retries(tid, 1)
+    return {
+        "source": "master_info_logs",
+        "tasks_observed": len(fb_ids),
+        "retried_tasks": len(fb_ids),
+        "retries_total": len(fb_ids),
+        "failovers_total": len(fb_ids),
+        "evacuations_total": 0,
+    }
+
+
+def _list_system_processes() -> List[Dict[str, Any]]:
+    """Read-only snapshot of running OS processes (pid, ppid, cmd, created_epoch)."""
+    sysname = platform.system()
+    out: List[Dict[str, Any]] = []
+    if sysname == "Windows":
+        ps_cmd = (
+            "$me = $PID; "
+            "$out = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $me } | "
+            "ForEach-Object { $c = 0; if ($_.CreationDate) { try { $c = [int64]([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() } catch {} }; "
+            "[pscustomobject]@{pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; cmd=$_.CommandLine; created_epoch=$c} }); "
+            "ConvertTo-Json -InputObject $out -Compress"
+        )
+        raw = sh(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=20.0)
+        if not raw:
+            return out
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return out
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and "pid" in item:
+                    out.append(
+                        {
+                            "pid": int(item.get("pid") or 0),
+                            "ppid": int(item.get("ppid") or 0),
+                            "cmd": str(item.get("cmd") or ""),
+                            "created_epoch": float(item.get("created_epoch") or 0.0) or None,
+                        }
+                    )
+        return out
+
+    ps_out = sh(["ps", "-eo", "pid=,ppid=,args="], timeout=10.0)
+    if not ps_out:
+        return out
+    for line in ps_out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        cmd = parts[2] if len(parts) > 2 else ""
+        out.append({"pid": pid, "ppid": ppid, "cmd": cmd, "created_epoch": None})
+    return out
+
+
+def find_leftover_process_trees(
+    proc_table: Iterable[Dict[str, Any]],
+    root_pids: Iterable[int],
+    workdir: str,
+    *,
+    ignore_pids: Optional[Iterable[int]] = None,
+    min_created_epoch: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Find any live processes descended from started PIDs or referencing `workdir` in argv."""
+    ignored = {int(p) for p in (ignore_pids or ())}
+    roots = {int(p) for p in root_pids if int(p) > 0} - ignored
+    by_pid: Dict[int, Dict[str, Any]] = {}
+    children: Dict[int, List[Dict[str, Any]]] = {}
+    for row in proc_table:
+        pid = int(row.get("pid") or 0)
+        if pid <= 0 or pid in ignored:
+            continue
+        ppid = int(row.get("ppid") or 0)
+        by_pid[pid] = dict(row)
+        children.setdefault(ppid, []).append(dict(row))
+
+    found: Dict[int, str] = {}
+    queue_pids: List[int] = []
+    for rpid in sorted(roots):
+        if rpid in by_pid:
+            created = by_pid[rpid].get("created_epoch")
+            if min_created_epoch is None or created is None or float(created) >= float(min_created_epoch) - 2.0:
+                found[rpid] = "started_pid_alive"
+        queue_pids.append(rpid)
+
+    visited: Set[int] = set(queue_pids)
+    while queue_pids:
+        cur = queue_pids.pop(0)
+        for ch in children.get(cur, ()):
+            cpid = int(ch.get("pid") or 0)
+            if cpid <= 0 or cpid in ignored:
+                continue
+            created = ch.get("created_epoch")
+            if min_created_epoch is not None and created is not None and float(created) < float(min_created_epoch) - 2.0:
+                continue
+            found.setdefault(cpid, "descendant_of_started_pid")
+            if cpid not in visited:
+                visited.add(cpid)
+                queue_pids.append(cpid)
+
+    wd_norm = os.path.normcase(os.path.abspath(workdir)) if workdir else ""
+    wd_slash = wd_norm.replace("\\", "/") if wd_norm else ""
+    if wd_norm:
+        for pid, row in by_pid.items():
+            cmd_norm = os.path.normcase(str(row.get("cmd") or ""))
+            if wd_norm in cmd_norm or (wd_slash and wd_slash in cmd_norm):
+                found.setdefault(pid, "cmdline_references_workdir")
+
+    redact_paths = [workdir] if workdir else []
+    leftovers: List[Dict[str, Any]] = []
+    for pid in sorted(found):
+        row = by_pid[pid]
+        leftovers.append(
+            {
+                "pid": pid,
+                "ppid": int(row.get("ppid") or 0),
+                "reason": found[pid],
+                "cmd": redact_text(str(row.get("cmd") or "")[:240], redact_paths),
+            }
+        )
+    return leftovers
 
 
 class SoakCluster(EnduranceCluster):
@@ -2227,6 +2714,12 @@ class SoakCluster(EnduranceCluster):
         self._worker_down: Set[int] = set()
         self._tracked_clients_lock = threading.Lock()
         self._tracked_clients: Set[subprocess.Popen] = set()
+        self._all_started_pids: Set[int] = set()
+        self._start_epoch_s: float = time.time()
+        self.dashboard_addr: str = ""
+        self._master_task_stats: Dict[str, Dict[str, int]] = {}
+        self._api_snapshots_taken: int = 0
+        self._api_snapshot_errors: List[str] = []
         self._unclean_pids: List[int] = []
         self.compactions: List[Dict[str, Any]] = []
 
@@ -2239,8 +2732,8 @@ class SoakCluster(EnduranceCluster):
         while self._master_restarting.is_set() and time.monotonic() < deadline:
             time.sleep(0.1)
 
-    def enter_sync_submit(self) -> None:
-        deadline = time.monotonic() + 60.0
+    def enter_submit(self, timeout: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout
         with self._sync_cond:
             while self._master_restarting.is_set():
                 rem = deadline - time.monotonic()
@@ -2249,10 +2742,16 @@ class SoakCluster(EnduranceCluster):
                 self._sync_cond.wait(timeout=min(0.25, rem))
             self._active_sync_submits += 1
 
-    def exit_sync_submit(self) -> None:
+    def exit_submit(self) -> None:
         with self._sync_cond:
             self._active_sync_submits = max(0, self._active_sync_submits - 1)
             self._sync_cond.notify_all()
+
+    def enter_sync_submit(self) -> None:
+        self.enter_submit(timeout=60.0)
+
+    def exit_sync_submit(self) -> None:
+        self.exit_submit()
 
     def active_pids(self) -> Dict[str, int]:
         out: Dict[str, int] = {}
@@ -2281,6 +2780,7 @@ class SoakCluster(EnduranceCluster):
             env=self._build_env(os.path.join(self.workdir, "home-" + home_name)),
             **kw,
         )
+        self._all_started_pids.add(int(p.pid))
         return p, log
 
     def _start_master_locked(self) -> None:
@@ -2339,6 +2839,16 @@ class SoakCluster(EnduranceCluster):
                         self.master_addr = addr
                         self.master_host = host
                         self.master_port = int(pstr)
+                    dash_deadline = time.monotonic() + 5.0
+                    self.dashboard_addr = ""
+                    while time.monotonic() < dash_deadline:
+                        if os.path.exists(dash_file) and os.path.getsize(dash_file) > 0:
+                            with open(dash_file, encoding="utf-8", errors="replace") as df:
+                                dtxt = df.read().strip()
+                            if dtxt:
+                                self.dashboard_addr = dtxt if ":" in dtxt else "127.0.0.1:" + dtxt
+                                break
+                        time.sleep(0.05)
                     return
             time.sleep(0.05)
         raise RuntimeError("master did not publish its port within 30 s")
@@ -2497,6 +3007,43 @@ class SoakCluster(EnduranceCluster):
             self.compactions.append(comp)
             return comp
 
+    def snapshot_master_task_retries(self) -> int:
+        """Query the live master /api/tasks dashboard API to record per-task retry and failover counts."""
+        if not self.dashboard_addr:
+            return 0
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        limit = 1000
+        offset = 0
+        seen_in_pass = 0
+        try:
+            for _page in range(25):
+                url = "http://%s/api/tasks?limit=%d&offset=%d" % (self.dashboard_addr, limit, offset)
+                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                with opener.open(req, timeout=10.0) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(payload, list) or not payload:
+                    break
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    tid = str(item.get("task_id") or "")
+                    if not tid:
+                        continue
+                    seen_in_pass += 1
+                    prev = self._master_task_stats.get(tid, {})
+                    self._master_task_stats[tid] = {
+                        "retry_count": max(int(prev.get("retry_count", 0)), int(item.get("retry_count", 0) or 0)),
+                        "failover_count": max(int(prev.get("failover_count", 0)), int(item.get("failover_count", 0) or 0)),
+                        "evacuation_count": max(int(prev.get("evacuation_count", 0)), int(item.get("evacuation_count", 0) or 0)),
+                    }
+                if len(payload) < limit:
+                    break
+                offset += len(payload)
+            self._api_snapshots_taken += 1
+        except Exception as exc:
+            self._api_snapshot_errors.append(redact_text(str(exc), [self.workdir]))
+        return seen_in_pass
+
     def restart_master(self) -> Dict[str, Any]:
         with self._sync_cond:
             self._master_restarting.set()
@@ -2504,6 +3051,7 @@ class SoakCluster(EnduranceCluster):
             while self._active_sync_submits > 0 and time.monotonic() < wait_deadline:
                 self._sync_cond.wait(timeout=0.2)
         try:
+            self.snapshot_master_task_retries()
             comp = self.stop_master("scheduled_restart")
             with self._lifecycle_lock:
                 self._start_master_locked()
@@ -2536,6 +3084,7 @@ class SoakCluster(EnduranceCluster):
             env=self.client_env,
             **kw,
         )
+        self._all_started_pids.add(int(p.pid))
         with self._tracked_clients_lock:
             self._tracked_clients.add(p)
         try:
@@ -2599,8 +3148,21 @@ class SoakCluster(EnduranceCluster):
             "tmp_leftovers": tmp_leftovers,
         }
 
-    def audit_master_logs(self) -> Dict[str, Any]:
-        return audit_master_log_texts(self.read_log("master-%d" % gen) for gen in range(self._master_gen))
+    def audit_master_logs(self, expected_task_ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        return audit_master_log_texts(
+            (self.read_log("master-%d" % gen) for gen in range(self._master_gen)),
+            expected_task_ids=expected_task_ids,
+        )
+
+    def leftover_process_trees(self) -> List[Dict[str, Any]]:
+        table = _list_system_processes()
+        return find_leftover_process_trees(
+            table,
+            self._all_started_pids,
+            self.workdir,
+            ignore_pids={os.getpid()},
+            min_created_epoch=self._start_epoch_s,
+        )
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -3769,16 +4331,49 @@ def _run_async_soak_task(
     hash_extractor: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
     cleanup_paths: Iterable[str] = (),
     work_root: str = "",
-) -> None:
+) -> str:
+    tid = ""
+    status_str = ""
+    res: Optional[subprocess.CompletedProcess] = None
+    parsed: Optional[Dict[str, Any]] = None
+    max_attempts = 1 if kind == "queue_burst" else 3
     try:
-        res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
-        parsed = extract_json_payload(res.stdout)
-        tid = str((parsed or {}).get("task_id") or "")
-        status_str = str((parsed or {}).get("status") or "").lower()
-        if res.returncode != 0 or not tid or status_str != "submitted":
-            msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
-            ledger.record_submit_refusal(kind, redact_text(str(msg).strip(), [work_root]))
-            return
+        for attempt in range(max_attempts):
+            cluster.enter_submit(timeout=60.0)
+            try:
+                res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
+            finally:
+                cluster.exit_submit()
+            parsed = extract_json_payload(res.stdout)
+            tid = str((parsed or {}).get("task_id") or "")
+            status_str = str((parsed or {}).get("status") or "").lower()
+            if res.returncode == 0 and tid and status_str == "submitted":
+                break
+            err_field = str((parsed or {}).get("error") or "")
+            if (
+                kind != "queue_burst"
+                and attempt + 1 < max_attempts
+                and is_queue_full_error(err_field)
+            ):
+                time.sleep(2.5)
+                continue
+            break
+
+        if res is None or res.returncode != 0 or not tid or status_str != "submitted":
+            msg = (
+                (parsed or {}).get("error")
+                or (res.stderr if res else "")
+                or (res.stdout if res else "")
+                or ("exit %d" % (res.returncode if res else -1))
+            )
+            cleaned = redact_text(str(msg).strip(), [work_root])
+            rc = res.returncode if res else None
+            if classify_soak_submit_error(kind, cleaned, rc) == "refusal":
+                ledger.record_submit_refusal(kind, cleaned)
+                return "refusal"
+            ledger.record_submit_failure(kind, cleaned, rc=rc)
+            return "failure"
+
         ledger.record_submit(tid, expected_hash=expected_hash, expected_outcome="ok", kind=kind)
     finally:
         for p in cleanup_paths:
@@ -3792,6 +4387,7 @@ def _run_async_soak_task(
     got_hash = hash_extractor(term_json) if (hash_extractor and term_json and outcome == "ok") else None
     wid = str(term_json.get("worker_id")) if term_json and term_json.get("worker_id") else None
     ledger.record_result(tid, actual_hash=got_hash, outcome=outcome, worker_id=wid)
+    return "completed"
 
 
 def _run_cancel_soak_task(
@@ -3801,18 +4397,41 @@ def _run_cancel_soak_task(
     sleep_s: float,
     work_root: str,
 ) -> None:
-    cluster.wait_if_restarting(timeout=30.0)
     cmd_args = [
         "--timeout-secs",
         "60",
     ] + _worker_python_args(worker_python, _WORKER_SOAK_SLEEP_SRC, [str(sleep_s)])
-    res = cluster.run_client(["submit", "--json"] + cmd_args, timeout=30.0)
-    parsed = extract_json_payload(res.stdout)
-    tid = str((parsed or {}).get("task_id") or "")
-    if res.returncode != 0 or not tid:
-        msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
-        ledger.record_submit_refusal("cancel", redact_text(str(msg).strip(), [work_root]))
+    res: Optional[subprocess.CompletedProcess] = None
+    parsed: Optional[Dict[str, Any]] = None
+    tid = ""
+    status_str = ""
+    for attempt in range(3):
+        cluster.enter_submit(timeout=60.0)
+        try:
+            res = cluster.run_client(["submit", "--json"] + cmd_args, timeout=30.0)
+        finally:
+            cluster.exit_submit()
+        parsed = extract_json_payload(res.stdout)
+        tid = str((parsed or {}).get("task_id") or "")
+        status_str = str((parsed or {}).get("status") or "").lower()
+        if res.returncode == 0 and tid and status_str == "submitted":
+            break
+        err_field = str((parsed or {}).get("error") or "")
+        if attempt + 1 < 3 and is_queue_full_error(err_field):
+            time.sleep(2.5)
+            continue
+        break
+
+    if res is None or res.returncode != 0 or not tid or status_str != "submitted":
+        msg = (
+            (parsed or {}).get("error")
+            or (res.stderr if res else "")
+            or (res.stdout if res else "")
+            or ("exit %d" % (res.returncode if res else -1))
+        )
+        ledger.record_submit_failure("cancel", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
         return
+
     ledger.record_submit(
         tid,
         expected_outcome="cancelled",
@@ -3820,9 +4439,10 @@ def _run_cancel_soak_task(
         allowed_outcomes=("cancelled",),
     )
 
-    # Wait briefly for task to start running before cancelling
-    wait_deadline = time.monotonic() + 10.0
+    # Wait until task is running on a worker so CancelTask reaches the worker and produces a worker result
+    wait_deadline = time.monotonic() + 60.0
     while time.monotonic() < wait_deadline:
+        cluster.wait_if_restarting(timeout=30.0)
         st_res = cluster.run_client(["status", "--task-id", tid, "--json"], timeout=15.0)
         st_json = extract_json_payload(st_res.stdout)
         st_val = str((st_json or {}).get("state") or (st_json or {}).get("status") or "").lower()
@@ -3830,21 +4450,15 @@ def _run_cancel_soak_task(
             break
         time.sleep(0.2)
 
-    cancelled = False
     for _ in range(3):
         cluster.wait_if_restarting(timeout=30.0)
         c_res = cluster.run_client(["cancel", tid, "--json"], timeout=15.0)
         c_json = extract_json_payload(c_res.stdout)
         if c_res.returncode == 0 and (c_json or {}).get("cancelled"):
-            cancelled = True
             break
         time.sleep(0.3)
 
-    if not cancelled:
-        # Task may have already completed or hit master restart; still wait to verify terminal state
-        outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=60.0)
-    else:
-        outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=60.0)
+    outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=60.0)
     wid = str(term_json.get("worker_id")) if term_json and term_json.get("worker_id") else None
     ledger.record_result(tid, outcome=outcome, worker_id=wid)
 
@@ -3860,32 +4474,48 @@ def _run_output_soak_task(
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     exp_sha = expected_seeded_sha256(size_bytes, seed)
-    cluster.enter_sync_submit()
-    try:
-        cmd_args = [
-            "submit",
-            "--output",
-            "out.bin",
-            "--output-dir",
-            out_dir,
-            "--timeout-secs",
-            "600",
-            "--wait",
-            "--json",
-        ] + _worker_python_args(
-            worker_python,
-            _WORKER_GEN_OUTPUT_SRC,
-            ["out.bin", str(size_bytes), str(seed), "-"],
-        )
-        res = cluster.run_client(cmd_args, timeout=600.0)
-    finally:
-        cluster.exit_sync_submit()
+    cmd_args = [
+        "submit",
+        "--output",
+        "out.bin",
+        "--output-dir",
+        out_dir,
+        "--timeout-secs",
+        "600",
+        "--wait",
+        "--json",
+    ] + _worker_python_args(
+        worker_python,
+        _WORKER_GEN_OUTPUT_SRC,
+        ["out.bin", str(size_bytes), str(seed), "-"],
+    )
+    res: Optional[subprocess.CompletedProcess] = None
+    parsed: Optional[Dict[str, Any]] = None
+    tid = ""
+    for attempt in range(3):
+        cluster.enter_submit(timeout=60.0)
+        try:
+            res = cluster.run_client(cmd_args, timeout=600.0)
+        finally:
+            cluster.exit_submit()
+        parsed = extract_json_payload(res.stdout)
+        tid = str((parsed or {}).get("task_id") or "")
+        if tid:
+            break
+        err_field = str((parsed or {}).get("error") or "")
+        if attempt + 1 < 3 and is_queue_full_error(err_field):
+            time.sleep(2.5)
+            continue
+        break
 
-    parsed = extract_json_payload(res.stdout)
-    tid = str((parsed or {}).get("task_id") or "")
-    if not tid:
-        msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
-        ledger.record_submit_refusal("output", redact_text(str(msg).strip(), [work_root]))
+    if res is None or not tid:
+        msg = (
+            (parsed or {}).get("error")
+            or (res.stderr if res else "")
+            or (res.stdout if res else "")
+            or ("exit %d" % (res.returncode if res else -1))
+        )
+        ledger.record_submit_failure("output", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
         shutil.rmtree(out_dir, ignore_errors=True)
         return
 
@@ -3942,6 +4572,9 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
 
     fault_plan = plan_soak_faults(duration_s, fault_scale=fault_scale, n_workers=n_workers)
     fault_events_log: List[Dict[str, Any]] = []
+    fault_errors: List[Dict[str, Any]] = []
+    fault_lock = threading.Lock()
+    burst_restart_lock = threading.Lock()
     probe_samples: List[Dict[str, Any]] = []
     probe_lock = threading.Lock()
     ledger = TaskLedger()
@@ -3966,19 +4599,20 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
     sampler: Optional[BackgroundSampler] = None
     probe_stop = threading.Event()
     probe_thread: Optional[threading.Thread] = None
-    fault_threads: List[threading.Thread] = []
+    fault_threads: List[Tuple[Dict[str, Any], threading.Thread]] = []
     soak_t0 = time.monotonic()
 
     def _run_probe_once() -> None:
         max_attempts = 3
-        t_now = round(time.monotonic() - soak_t0, 2)
         res: Optional[subprocess.CompletedProcess] = None
         dt_ms = 0.0
+        t_now = round(time.monotonic() - soak_t0, 2)
         parsed: Optional[Dict[str, Any]] = None
         for attempt in range(max_attempts):
             if cluster._master_restarting.is_set():
                 return
-            cluster.enter_sync_submit()
+            cluster.enter_submit(timeout=60.0)
+            t_now = round(time.monotonic() - soak_t0, 2)
             t_sub = time.perf_counter()
             try:
                 res = cluster.run_client(
@@ -3987,14 +4621,13 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                 )
                 dt_ms = round((time.perf_counter() - t_sub) * 1000.0, 3)
             finally:
-                cluster.exit_sync_submit()
+                cluster.exit_submit()
 
             parsed = extract_json_payload(res.stdout)
             if res.returncode == 0:
                 break
-            err_low = str((parsed or {}).get("error") or res.stderr or res.stdout or "").lower()
-            is_queue_full = "queue" in err_low and ("full" in err_low or "capacity" in err_low)
-            if is_queue_full and attempt + 1 < max_attempts:
+            err_msg = str((parsed or {}).get("error") or res.stderr or res.stdout or "")
+            if is_queue_full_error(err_msg) and attempt + 1 < max_attempts:
                 time.sleep(2.5)
                 continue
             break
@@ -4007,6 +4640,9 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         if tid:
             ledger.record_submit(tid, expected_outcome="ok", kind="probe")
             ledger.record_result(tid, outcome="ok" if ok else "failed")
+        else:
+            msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
+            ledger.record_submit_failure("probe", redact_text(str(msg).strip(), [work_root]), rc=res.returncode)
         with probe_lock:
             probe_samples.append({"t_s": t_now, "latency_ms": dt_ms, "ok": bool(ok), "rc": res.returncode})
 
@@ -4106,13 +4742,34 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                     "--timeout-secs",
                     "180",
                 ] + _worker_python_args(args.worker_python, _WORKER_SOAK_WS_SRC, ["sync_marker.txt"])
-                res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
-            parsed = extract_json_payload(res.stdout)
-            tid = str((parsed or {}).get("task_id") or "")
-            status_str = str((parsed or {}).get("status") or "").lower()
-            if res.returncode != 0 or not tid or status_str != "submitted":
-                msg = (parsed or {}).get("error") or res.stderr or res.stdout or ("exit %d" % res.returncode)
-                ledger.record_submit_refusal("workspace_sync", redact_text(str(msg).strip(), [work_root]))
+                res = None
+                parsed = None
+                tid = ""
+                status_str = ""
+                for attempt in range(3):
+                    cluster.enter_submit(timeout=60.0)
+                    try:
+                        res = cluster.run_client(["submit", "--json"] + submit_args, timeout=120.0)
+                    finally:
+                        cluster.exit_submit()
+                    parsed = extract_json_payload(res.stdout)
+                    tid = str((parsed or {}).get("task_id") or "")
+                    status_str = str((parsed or {}).get("status") or "").lower()
+                    if res.returncode == 0 and tid and status_str == "submitted":
+                        break
+                    err_field = str((parsed or {}).get("error") or "")
+                    if attempt + 1 < 3 and is_queue_full_error(err_field):
+                        time.sleep(2.5)
+                        continue
+                    break
+            if res is None or res.returncode != 0 or not tid or status_str != "submitted":
+                msg = (
+                    (parsed or {}).get("error")
+                    or (res.stderr if res else "")
+                    or (res.stdout if res else "")
+                    or ("exit %d" % (res.returncode if res else -1))
+                )
+                ledger.record_submit_failure("workspace_sync", redact_text(str(msg).strip(), [work_root]), rc=(res.returncode if res else None))
                 return
             ledger.record_submit(tid, expected_hash=exp_sha, expected_outcome="ok", kind="workspace_sync")
             outcome, term_json = _wait_for_soak_result(cluster, tid, timeout_s=300.0)
@@ -4124,76 +4781,128 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
 
     def _trigger_fault(ev: Dict[str, Any]) -> None:
         fkind = ev["kind"]
+        seq = int(ev.get("seq", -1))
+        widx = ev.get("worker_index")
         t_start = round(time.monotonic() - soak_t0, 2)
-        if fkind == "worker_kill":
-            widx = int(ev["worker_index"])
-            old_pid = cluster.kill_worker(widx)
-            time.sleep(float(ev["down_s"]))
-            new_pid = cluster.start_worker(widx)
-            fault_events_log.append(
-                {
+        try:
+            if fkind == "worker_kill":
+                wi = int(widx)
+                old_pid = cluster.kill_worker(wi)
+                if old_pid <= 0:
+                    raise RuntimeError("worker_kill worker%d had no live PID" % wi)
+                time.sleep(float(ev["down_s"]))
+                new_pid = cluster.start_worker(wi)
+                if new_pid <= 0:
+                    raise RuntimeError("worker_kill worker%d failed to restart" % wi)
+                t_end = round(time.monotonic() - soak_t0, 2)
+                entry = {
                     "kind": "worker_kill",
+                    "seq": seq,
+                    "planned_at_s": ev.get("at_s"),
                     "t_s": t_start,
-                    "worker_index": widx,
+                    "end_s": t_end,
+                    "worker_index": wi,
                     "old_pid": old_pid,
                     "new_pid": new_pid,
                     "down_s": ev["down_s"],
+                    "ok": True,
                 }
-            )
-        elif fkind == "link_cut":
-            widx = int(ev["worker_index"])
-            cluster.cut_worker_link(widx, pause_s=float(ev["down_s"]))
-            fault_events_log.append(
-                {
+            elif fkind == "link_cut":
+                wi = int(widx)
+                cluster.cut_worker_link(wi, pause_s=float(ev["down_s"]))
+                t_end = round(time.monotonic() - soak_t0, 2)
+                entry = {
                     "kind": "link_cut",
+                    "seq": seq,
+                    "planned_at_s": ev.get("at_s"),
                     "t_s": t_start,
-                    "worker_index": widx,
+                    "end_s": t_end,
+                    "worker_index": wi,
                     "pause_s": ev["down_s"],
+                    "ok": True,
                 }
-            )
-        elif fkind == "master_restart":
-            comp = cluster.restart_master()
-            fault_events_log.append(
-                {
+            elif fkind == "master_restart":
+                with burst_restart_lock:
+                    t_start = round(time.monotonic() - soak_t0, 2)
+                    comp = cluster.restart_master()
+                    if not comp or int(comp.get("exit_code", -1)) != 0 or cluster.master_port <= 0:
+                        raise RuntimeError("master_restart failed: %r" % (comp,))
+                    t_end = round(time.monotonic() - soak_t0, 2)
+                entry = {
                     "kind": "master_restart",
+                    "seq": seq,
+                    "planned_at_s": ev.get("at_s"),
                     "t_s": t_start,
+                    "end_s": t_end,
+                    "worker_index": None,
                     "compaction": comp,
                     "new_master_port": cluster.master_port,
+                    "ok": True,
                 }
-            )
-        elif fkind == "queue_burst":
-            total_burst = max_queue_size + 8
-            b_args = [
-                "--timeout-secs",
-                "120",
-            ] + _worker_python_args(args.worker_python, _WORKER_SOAK_SLEEP_SRC, ["2.5"])
-            with ThreadPoolExecutor(max_workers=24) as bpool:
-                futs = [
-                    bpool.submit(
-                        _run_async_soak_task,
-                        cluster,
-                        ledger,
-                        b_args,
-                        kind="queue_burst",
-                        work_root=work_root,
-                    )
-                    for _ in range(total_burst)
-                ]
-                for bf in futs:
-                    bf.result()
-            fault_events_log.append(
-                {
+            elif fkind == "queue_burst":
+                total_burst = max_queue_size + 8
+                b_args = [
+                    "--timeout-secs",
+                    "120",
+                ] + _worker_python_args(args.worker_python, _WORKER_SOAK_SLEEP_SRC, ["2.5"])
+                with burst_restart_lock:
+                    t_start = round(time.monotonic() - soak_t0, 2)
+                    with ThreadPoolExecutor(max_workers=24) as bpool:
+                        futs = [
+                            bpool.submit(
+                                _run_async_soak_task,
+                                cluster,
+                                ledger,
+                                b_args,
+                                kind="queue_burst",
+                                work_root=work_root,
+                            )
+                            for _ in range(total_burst)
+                        ]
+                        outcomes = [bf.result() for bf in futs]
+                    t_end = round(time.monotonic() - soak_t0, 2)
+                b_completed = sum(1 for o in outcomes if o == "completed")
+                b_refused = sum(1 for o in outcomes if o == "refusal")
+                b_failed = sum(1 for o in outcomes if o == "failure")
+                if b_failed > 0:
+                    raise RuntimeError("queue_burst recorded %d non-queue-full submit failures" % b_failed)
+                entry = {
                     "kind": "queue_burst",
+                    "seq": seq,
+                    "planned_at_s": ev.get("at_s"),
                     "t_s": t_start,
+                    "end_s": t_end,
+                    "worker_index": None,
                     "burst_size": total_burst,
                     "max_queue_size": max_queue_size,
+                    "accepted": b_completed,
+                    "refused": b_refused,
+                    "failed": b_failed,
+                    "ok": True,
                 }
-            )
+            else:
+                raise ValueError("unknown fault kind: %r" % (fkind,))
+            with fault_lock:
+                fault_events_log.append(entry)
+        except Exception as exc:
+            t_err = round(time.monotonic() - soak_t0, 2)
+            err_entry = {
+                "kind": fkind,
+                "seq": seq,
+                "planned_at_s": ev.get("at_s"),
+                "t_s": t_start,
+                "end_s": t_err,
+                "worker_index": widx,
+                "error": redact_text(str(exc), [work_root]),
+            }
+            with fault_lock:
+                fault_errors.append(err_entry)
 
     samples: List[Dict[str, Any]] = []
     idle_snap: Dict[str, Any] = {}
     master_audit: Dict[str, Any] = {}
     leftover: List[int] = []
+    leftover_trees: List[Dict[str, Any]] = []
     try:
         cluster.start()
         soak_t0 = time.monotonic()
@@ -4226,7 +4935,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                             next_fault_idx += 1
                             ft = threading.Thread(target=_trigger_fault, args=(ev,), daemon=True)
                             ft.start()
-                            fault_threads.append(ft)
+                            fault_threads.append((ev, ft))
                         else:
                             break
                     if time.monotonic() >= end_deadline:
@@ -4242,14 +4951,24 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
                         next_fault_idx += 1
                         ft = threading.Thread(target=_trigger_fault, args=(ev,), daemon=True)
                         ft.start()
-                        fault_threads.append(ft)
+                        fault_threads.append((ev, ft))
                     time.sleep(0.25)
 
                 minute_idx += 1
 
             # Wait for any scheduled fault threads still finishing (with remaining budget)
-            for ft in fault_threads:
+            for ev, ft in fault_threads:
                 ft.join(timeout=120.0)
+                if ft.is_alive():
+                    with fault_lock:
+                        fault_errors.append(
+                            {
+                                "kind": ev.get("kind"),
+                                "seq": ev.get("seq"),
+                                "planned_at_s": ev.get("at_s"),
+                                "error": "fault thread did not finish within 120s join timeout",
+                            }
+                        )
             for fut in pending_futures:
                 fut.result()
 
@@ -4269,6 +4988,7 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         if sampler is not None and not sampler._stop.is_set():
             samples = sampler.stop()
         idle_snap = cluster.idle_disk_snapshot()
+        cluster.snapshot_master_task_retries()
     finally:
         probe_stop.set()
         if probe_thread is not None:
@@ -4276,16 +4996,35 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         if sampler is not None and not sampler._stop.is_set():
             samples = sampler.stop()
         cluster.stop()
-        master_audit = cluster.audit_master_logs()
+        master_audit = cluster.audit_master_logs(expected_task_ids=ledger.submitted_task_ids())
         leftover = cluster.leftover_pids()
-        shutil.rmtree(sc_dir, ignore_errors=True)
+        leftover_trees = cluster.leftover_process_trees()
+        if not getattr(args, "keep_workdir", False):
+            shutil.rmtree(sc_dir, ignore_errors=True)
+
+    retry_stats = apply_master_task_retries_to_ledger(
+        ledger,
+        cluster._master_task_stats if cluster._api_snapshots_taken > 0 else {},
+        fallback_requeued_task_ids=master_audit.get("requeued_task_ids", ()),
+    )
+    master_audit["task_api_snapshots"] = cluster._api_snapshots_taken
+    master_audit["task_api_errors"] = list(cluster._api_snapshot_errors)
+    master_audit["task_api_tasks_observed"] = retry_stats["tasks_observed"]
+    master_audit["task_api_retries_total"] = retry_stats["retries_total"]
+    master_audit["task_api_retried_tasks"] = retry_stats["retried_tasks"]
+    master_audit["task_api_failovers_total"] = retry_stats["failovers_total"]
+    master_audit["task_api_evacuations_total"] = retry_stats["evacuations_total"]
+    master_audit["retries_source"] = retry_stats["source"]
 
     ledger_audit = ledger.audit()
     ledger_audit["master_failover_sweeps"] = master_audit.get("failover_sweeps", 0)
     ledger_audit["master_requeues_logged"] = master_audit.get("requeues_logged", 0)
+    ledger_audit["master_failovers_total"] = retry_stats["failovers_total"]
+    ledger_audit["retries_source"] = retry_stats["source"]
 
     # Pinned headroom covers one minute of concurrent new-input/reused/output blobs in flight
     pinned_headroom = int((5 * 100 + 2 * 50) * MIB * min(1.0, load_scale) + 128 * MIB)
+    worker_pinned_headroom = int((slots * 100 + 2 * 50) * MIB * min(1.0, load_scale) + 64 * MIB)
     actual_duration_s = round(time.monotonic() - soak_t0, 2)
     pass_eval = evaluate_soak_pass_checks(
         ledger_audit=ledger_audit,
@@ -4301,13 +5040,19 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
         leftover_pids=leftover,
         idle_blob_store_bytes=idle_snap.get("idle_blob_store_bytes"),
         idle_worker_cache_bytes=idle_snap.get("idle_worker_cache_bytes"),
-        master_duplicate_executions=int(master_audit.get("queue_record_errors", 0)),
+        worker_pinned_headroom_bytes=worker_pinned_headroom,
+        master_audit=master_audit,
+        fault_plan=fault_plan,
+        faults_executed=fault_events_log,
+        fault_errors=fault_errors,
+        leftover_task_trees=leftover_trees,
     )
     return {
         "passed": pass_eval["all_passed"],
         "actual_duration_s": actual_duration_s,
         "fault_plan": fault_plan,
         "faults_executed": fault_events_log,
+        "fault_errors": fault_errors,
         "master_audit": master_audit,
         "compactions": cluster.compactions,
         "pass_checks": pass_eval["checks"],
