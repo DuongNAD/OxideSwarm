@@ -854,9 +854,13 @@ class TokenBucket:
                 return
             now = time.monotonic()
             elapsed = max(0.0, now - self._last)
-            # Keep tiny idle burst credit so short transfers stay well within +-10%.
+            # Keep tiny idle burst credit so short transfers stay within +-10%, while preserving
+            # recently earned oversleep forgiveness between active chunks.
             max_credit = float(max(1024, min(4096, int(self._rate_bps * 0.02))))
-            self._tokens = min(max_credit, self._tokens + elapsed * self._rate_bps)
+            if elapsed >= 0.5:
+                self._tokens = min(max_credit, self._tokens + elapsed * self._rate_bps)
+            else:
+                self._tokens = max(self._tokens, min(max_credit, self._tokens + elapsed * self._rate_bps))
             self._last = now
             self._tokens -= float(nbytes)
             while self._tokens < 0.0 and not self._closed and self._rate_bps is not None:

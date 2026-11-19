@@ -70,6 +70,10 @@ def _start_echo_server():
             except OSError:
                 break
             c.settimeout(0.5)
+            try:
+                c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             conns.append(c)
             threading.Thread(target=handle, args=(c,), daemon=True).start()
 
@@ -199,15 +203,51 @@ class ThrottleProxyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             endurance.ThrottleProxy("127.0.0.1", 8088, listen_host="0.0.0.0")
 
+    def test_token_bucket_preserves_oversleep_and_caps_idle_credit(self):
+        clock = [0.0]
+
+        def fake_monotonic():
+            return clock[0]
+
+        class FakeCondition:
+            def __init__(self, lock):
+                self._lock = lock
+
+            def wait(self, timeout=None):
+                # Simulate a 3x timer oversleep inside wait(), then advance the clock.
+                clock[0] += (timeout or 0.0) * 3.0
+
+            def notify_all(self):
+                pass
+
+        with (
+            mock.patch.object(endurance.time, "monotonic", side_effect=fake_monotonic),
+            mock.patch.object(endurance.threading, "Condition", FakeCondition),
+        ):
+            bucket = endurance.TokenBucket(500_000.0)  # 4.0 Mbit/s
+            # Long idle before starting must still cap idle burst credit small (<= 4096 B).
+            clock[0] = 60.0
+            bucket.consume(17_500)
+            t_after_first = clock[0]
+            # Next active chunk arrives 1 ms later: previously earned oversleep credit covers it
+            # without forcing an extra wait on every chunk.
+            clock[0] += 0.001
+            bucket.consume(17_500)
+            self.assertAlmostEqual(clock[0], t_after_first + 0.001, places=6)
+
     def test_echo_integrity_rate_accuracy_and_cut_links(self):
         (echo_host, echo_port), close_echo = _start_echo_server()
         proxy = endurance.ThrottleProxy(echo_host, echo_port, rate_mbps=4.0, delay_ms=0.0).start()
         try:
-            payload = random.Random(1234).randbytes(512 * endurance.KIB)
+            payload = random.Random(1234).randbytes(1 * endurance.MIB)
             expected_sha = hashlib.sha256(payload).hexdigest()
 
-            sock = socket.create_connection((proxy.listen_host, proxy.port), timeout=10.0)
-            sock.settimeout(10.0)
+            sock = socket.create_connection((proxy.listen_host, proxy.port), timeout=15.0)
+            sock.settimeout(15.0)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             received = bytearray()
 
             def _recv_all():
@@ -221,13 +261,13 @@ class ThrottleProxyTests(unittest.TestCase):
             t0 = time.perf_counter()
             rt.start()
             sock.sendall(payload)
-            rt.join(timeout=15.0)
+            rt.join(timeout=20.0)
             dt = time.perf_counter() - t0
             sock.close()
 
             self.assertEqual(len(received), len(payload))
             self.assertEqual(hashlib.sha256(bytes(received)).hexdigest(), expected_sha)
-            # 512 KiB = 4.194 Mbit; 4.0 Mbit/s => ~1.049 s. Enforce +-10% (3.6..4.4 Mbit/s).
+            # 1 MiB = 8.389 Mbit; 4.0 Mbit/s => ~2.097 s. Enforce +-10% (3.6..4.4 Mbit/s).
             measured_mbps = (len(payload) * 8.0) / (dt * 1_000_000.0)
             self.assertGreaterEqual(measured_mbps, 3.6, f"rate too slow: {measured_mbps:.3f} Mbps ({dt:.3f}s)")
             self.assertLessEqual(measured_mbps, 4.4, f"rate too fast: {measured_mbps:.3f} Mbps ({dt:.3f}s)")
@@ -235,6 +275,10 @@ class ThrottleProxyTests(unittest.TestCase):
             # Verify cut_links interrupts an active connection
             s2 = socket.create_connection((proxy.listen_host, proxy.port), timeout=5.0)
             s2.settimeout(3.0)
+            try:
+                s2.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             s2.sendall(b"ping")
             self.assertEqual(s2.recv(4), b"ping")
             proxy.cut_links(pause_s=0.3)
