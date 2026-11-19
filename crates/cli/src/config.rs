@@ -14,6 +14,7 @@
 
 use rusty_grid_core::error::{GridError, GridResult};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Where a [`ConfigFile`] was read from. Not part of the configuration: every two values compare
@@ -123,6 +124,17 @@ pub struct MasterFileConfig {
     pub secret: Option<SecretText>,
     /// Maximum tasks placed in a single scheduling batch (`master --max-batch-size`).
     pub max_batch_size: Option<usize>,
+    /// Default concurrent running/scheduled task limit per participant (`ECO-9`).
+    pub default_participant_max_running: Option<usize>,
+    /// Default concurrent slot limit per participant (`ECO-9`).
+    pub default_participant_max_slots: Option<usize>,
+    /// Default waiting task limit per participant (`ECO-9`).
+    pub default_participant_max_queued: Option<usize>,
+    /// Default priority band (`low`, `normal`, or `high`) per participant (`ECO-9`).
+    pub default_participant_priority: Option<String>,
+    /// Per-participant quota overrides keyed by participant label or `member:<id>` (`ECO-9`).
+    #[serde(default)]
+    pub participant_quotas: BTreeMap<String, rusty_grid_master::quotas::ParticipantQuota>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1088,5 +1100,38 @@ isolation_read_dirs = ["/opt/cuda", "/opt/pyenv/versions/3.11.8"]
                 "/opt/pyenv/versions/3.11.8".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn test_master_config_parses_participant_quotas_from_toml() {
+        use rusty_grid_master::quotas::PriorityBand;
+
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+[master]
+default_participant_max_running = 2
+default_participant_max_slots = 8
+default_participant_max_queued = 16
+default_participant_priority = "normal"
+
+[master.participant_quotas.alice]
+max_running_tasks = 4
+max_slots = 12
+priority_band = "high"
+fair_share_weight = 3
+"#,
+        )
+        .expect("parse quota toml");
+
+        let m = parsed.master.expect("master section");
+        assert_eq!(m.default_participant_max_running, Some(2));
+        assert_eq!(m.default_participant_max_slots, Some(8));
+        assert_eq!(m.default_participant_max_queued, Some(16));
+        assert_eq!(m.default_participant_priority.as_deref(), Some("normal"));
+        let alice = m.participant_quotas.get("alice").expect("alice override");
+        assert_eq!(alice.max_running_tasks, Some(4));
+        assert_eq!(alice.max_slots, Some(12));
+        assert_eq!(alice.priority_band, Some(PriorityBand::High));
+        assert_eq!(alice.fair_share_weight, Some(3));
     }
 }

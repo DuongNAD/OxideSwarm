@@ -34,6 +34,7 @@ use rusty_grid_core::{
 use crate::blob_store::BlobStore;
 use crate::member_connections::MemberConnections;
 use crate::queue::TaskQueue;
+use crate::quotas::QuotaController;
 use crate::registry::WorkerRegistry;
 
 use super::client_and_members::ENROLL_CONFIRM_TIMEOUT_SECS;
@@ -53,6 +54,8 @@ pub(crate) struct MasterAuthContext {
     pub member_connections: MemberConnections,
     pub p2p_ticket: Option<String>,
     pub enroll_confirm_timeout: Duration,
+    /// Per-participant quota controller (`ECO-9`, design 0097).
+    pub quota_controller: Option<Arc<QuotaController>>,
 }
 
 impl Default for MasterAuthContext {
@@ -67,6 +70,7 @@ impl Default for MasterAuthContext {
             member_connections: MemberConnections::default(),
             p2p_ticket: None,
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+            quota_controller: None,
         }
     }
 }

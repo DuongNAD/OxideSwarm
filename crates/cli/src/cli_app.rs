@@ -418,6 +418,41 @@ pub struct MasterArgs {
         help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
     )]
     pub rendezvous: Option<String>,
+
+    #[arg(
+        long = "default-participant-max-running",
+        value_name = "N",
+        help = "Default cap on concurrently running/scheduled tasks per participant (>= 1; env RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_RUNNING)"
+    )]
+    pub default_participant_max_running: Option<usize>,
+
+    #[arg(
+        long = "default-participant-max-slots",
+        value_name = "N",
+        help = "Default cap on concurrently held CPU-core slots per participant (>= 1; env RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_SLOTS)"
+    )]
+    pub default_participant_max_slots: Option<usize>,
+
+    #[arg(
+        long = "default-participant-max-queued",
+        value_name = "N",
+        help = "Default cap on queued/waiting tasks per participant (>= 1; env RUSTY_GRID_DEFAULT_PARTICIPANT_MAX_QUEUED)"
+    )]
+    pub default_participant_max_queued: Option<usize>,
+
+    #[arg(
+        long = "default-participant-priority",
+        value_name = "BAND",
+        help = "Default priority band for participants without an explicit override: low, normal, or high (env RUSTY_GRID_DEFAULT_PARTICIPANT_PRIORITY)"
+    )]
+    pub default_participant_priority: Option<String>,
+
+    #[arg(
+        long = "participant-quota",
+        value_name = "PARTICIPANT:SPEC",
+        help = "Per-participant quota override (repeatable; e.g. alice:running=2,slots=8,queued=16,priority=high,weight=3 or member:<id>:running=1)"
+    )]
+    pub participant_quotas: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]

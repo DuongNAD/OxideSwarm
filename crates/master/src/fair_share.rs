@@ -1,12 +1,13 @@
-//! Per-submitter Weighted Round-Robin (WRR) fair-share queue ordering (`design 0050` D2.4).
+//! Per-submitter Weighted Round-Robin (WRR) fair-share queue ordering (`design 0050` D2.4,
+//! `design 0097` D3).
 //!
-//! Each queued task belongs to a [`SubmitterId`] (by default the client TCP/QUIC connection UUID
-//! assigned on accept, or [`SubmitterId::Default`] for internal callers without a session id). When
-//! two or more submitters have queued work simultaneously, [`FairShareQueues`] yields tasks across
-//! active submitters in weighted round-robin order while preserving `(Reverse(priority), sequence)`
-//! order within each submitter's own `BTreeSet<QueueOrderKey>`.
+//! Each queued task belongs to a [`SubmitterId`] (resolved to [`SubmitterId::Participant`] for
+//! ECO-9 participant-keyed fair share, [`SubmitterId::Client`] for per-connection tests, or
+//! [`SubmitterId::Default`] for internal callers without attribution). [`FairShareQueues`] yields
+//! tasks across active non-excluded submitters in priority-tiered WRR order while preserving
+//! `(Reverse(priority), sequence)` order within each submitter's own `BTreeSet<QueueOrderKey>`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 
 use uuid::Uuid;
@@ -14,18 +15,21 @@ use uuid::Uuid;
 use crate::queue::QueueOrderKey;
 
 /// Identifies who submitted a queued task for scheduling fair-share accounting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum SubmitterId {
     /// Internal / unattributed callers (`submit`, `submit_with_priority`).
     #[default]
     Default,
-    /// Per-client connection identity (or explicit caller token).
+    /// Per-client connection identity (used by legacy/direct connection fair-share tests).
     Client(Uuid),
+    /// Participant identity grouping all connections and keys of one participant (`ECO-9`, design 0097).
+    Participant(String),
 }
 
 #[derive(Debug, Default)]
 struct SubmitterQueue {
     weight: u32,
+    remaining: u32,
     keys: BTreeSet<QueueOrderKey>,
     in_ring: bool,
 }
@@ -54,15 +58,17 @@ impl FairShareQueues {
         let clamped = weight.max(1);
         let entry = self
             .submitters
-            .entry(submitter)
+            .entry(submitter.clone())
             .or_insert_with(|| SubmitterQueue {
                 weight: clamped,
+                remaining: clamped,
                 keys: BTreeSet::new(),
                 in_ring: false,
             });
         entry.weight = clamped;
+        entry.remaining = entry.remaining.min(clamped).max(1);
         if self.active_ring.front() == Some(&submitter) {
-            self.head_remaining = self.head_remaining.min(clamped).max(1);
+            self.head_remaining = entry.remaining;
         }
     }
 
@@ -72,37 +78,46 @@ impl FairShareQueues {
     }
 
     #[inline]
-    fn weight_of(&self, submitter: SubmitterId) -> u32 {
+    fn weight_of(&self, submitter: &SubmitterId) -> u32 {
         self.submitters
-            .get(&submitter)
+            .get(submitter)
             .map_or(1, |s| s.weight.max(1))
+    }
+
+    #[inline]
+    fn remaining_of(&self, submitter: &SubmitterId) -> u32 {
+        self.submitters
+            .get(submitter)
+            .map_or(1, |s| s.remaining.max(1))
     }
 
     /// Inserts `key` under `submitter`.
     pub(crate) fn insert(&mut self, submitter: SubmitterId, key: QueueOrderKey) {
         let entry = self
             .submitters
-            .entry(submitter)
+            .entry(submitter.clone())
             .or_insert_with(|| SubmitterQueue {
                 weight: 1,
+                remaining: 1,
                 keys: BTreeSet::new(),
                 in_ring: false,
             });
         entry.keys.insert(key);
         if !entry.in_ring {
             entry.in_ring = true;
+            entry.remaining = entry.weight.max(1);
             let was_empty = self.active_ring.is_empty();
-            let weight = entry.weight.max(1);
+            let remaining = entry.remaining;
             self.active_ring.push_back(submitter);
             if was_empty {
-                self.head_remaining = weight;
+                self.head_remaining = remaining;
             }
         }
     }
 
     /// Removes `key` from `submitter`'s ready set (falling back to scanning all submitters if
     /// needed), dropping the submitter from `active_ring` if its set becomes empty.
-    pub(crate) fn remove(&mut self, submitter: SubmitterId, key: &QueueOrderKey) -> bool {
+    pub(crate) fn remove(&mut self, submitter: &SubmitterId, key: &QueueOrderKey) -> bool {
         if Self::remove_from_submitter(
             &mut self.submitters,
             &mut self.active_ring,
@@ -115,7 +130,8 @@ impl FairShareQueues {
         let other_ids: Vec<SubmitterId> = self
             .submitters
             .iter()
-            .filter_map(|(&id, sq)| (id != submitter && sq.keys.contains(key)).then_some(id))
+            .filter(|&(id, sq)| id != submitter && sq.keys.contains(key))
+            .map(|(id, _)| id.clone())
             .collect();
         let mut removed = false;
         for id in other_ids {
@@ -123,7 +139,7 @@ impl FairShareQueues {
                 &mut self.submitters,
                 &mut self.active_ring,
                 &mut self.head_remaining,
-                id,
+                &id,
                 key,
             ) {
                 removed = true;
@@ -136,10 +152,10 @@ impl FairShareQueues {
         submitters: &mut HashMap<SubmitterId, SubmitterQueue>,
         active_ring: &mut VecDeque<SubmitterId>,
         head_remaining: &mut u32,
-        submitter: SubmitterId,
+        submitter: &SubmitterId,
         key: &QueueOrderKey,
     ) -> bool {
-        let Some(entry) = submitters.get_mut(&submitter) else {
+        let Some(entry) = submitters.get_mut(submitter) else {
             return false;
         };
         if !entry.keys.remove(key) {
@@ -147,13 +163,14 @@ impl FairShareQueues {
         }
         if entry.keys.is_empty() && entry.in_ring {
             entry.in_ring = false;
-            let was_front = active_ring.front() == Some(&submitter);
-            active_ring.retain(|&s| s != submitter);
+            entry.remaining = entry.weight.max(1);
+            let was_front = active_ring.front() == Some(submitter);
+            active_ring.retain(|s| s != submitter);
             if was_front {
                 *head_remaining = active_ring
                     .front()
                     .and_then(|next| submitters.get(next))
-                    .map_or(0, |s| s.weight.max(1));
+                    .map_or(0, |s| s.remaining.max(1));
             }
         }
         true
@@ -164,49 +181,95 @@ impl FairShareQueues {
         for s in self.submitters.values_mut() {
             s.keys.clear();
             s.in_ring = false;
+            s.remaining = s.weight.max(1);
         }
         self.active_ring.clear();
         self.head_remaining = 0;
     }
 
-    /// Advances the persistent WRR ring when a task belonging to `submitter` was scheduled.
-    pub(crate) fn on_scheduled(&mut self, submitter: SubmitterId) {
+    /// Advances the persistent WRR ring when a task belonging to `submitter` was scheduled, even
+    /// when another excluded or lower-priority submitter sits at the front of `active_ring`.
+    pub(crate) fn on_scheduled(&mut self, submitter: &SubmitterId) {
         if self.active_ring.is_empty() {
             self.head_remaining = 0;
             return;
         }
-        if self.active_ring.front() == Some(&submitter) {
-            if self.head_remaining > 1 {
-                self.head_remaining -= 1;
-            } else {
-                if self.active_ring.len() > 1 {
-                    if let Some(front) = self.active_ring.pop_front() {
-                        self.active_ring.push_back(front);
+        if let Some(pos) = self.active_ring.iter().position(|s| s == submitter) {
+            if let Some(entry) = self.submitters.get_mut(submitter) {
+                if entry.remaining > 1 {
+                    entry.remaining -= 1;
+                } else {
+                    entry.remaining = entry.weight.max(1);
+                    if self.active_ring.len() > 1 {
+                        if let Some(moved) = self.active_ring.remove(pos) {
+                            self.active_ring.push_back(moved);
+                        }
                     }
                 }
-                self.head_remaining = self
-                    .active_ring
-                    .front()
-                    .map_or(0, |&next| self.weight_of(next));
             }
         }
+        self.head_remaining = self
+            .active_ring
+            .front()
+            .map_or(0, |front| self.remaining_of(front));
+    }
+
+    fn next_key_for(
+        &self,
+        sub: &SubmitterId,
+        last_yielded: &HashMap<SubmitterId, QueueOrderKey>,
+    ) -> Option<QueueOrderKey> {
+        self.submitters.get(sub).and_then(|sq| {
+            let start = match last_yielded.get(sub) {
+                Some(prev) => Bound::Excluded(*prev),
+                None => Bound::Unbounded,
+            };
+            sq.keys.range((start, Bound::Unbounded)).next().copied()
+        })
     }
 
     /// Walks up to `limit` queued `(QueueOrderKey, SubmitterId)` pairs across active submitters
-    /// in weighted round-robin order without mutating `active_ring`. Updates `cursor` so
-    /// subsequent pages continue seamlessly until all submitters are exhausted.
+    /// in weighted round-robin order without mutating `active_ring`.
+    #[cfg(test)]
     pub(crate) fn walk(
         &self,
         cursor: &mut FairWalkCursor,
         limit: usize,
+    ) -> Vec<(QueueOrderKey, SubmitterId)> {
+        self.walk_excluding(cursor, limit, &HashSet::new())
+    }
+
+    /// Walks up to `limit` queued `(QueueOrderKey, SubmitterId)` pairs across active submitters
+    /// not in `excluded`, serving higher-priority work first with weighted round-robin within each
+    /// priority tier (`ECO-9`, design 0097 D3).
+    pub(crate) fn walk_excluding(
+        &self,
+        cursor: &mut FairWalkCursor,
+        limit: usize,
+        excluded: &HashSet<SubmitterId>,
     ) -> Vec<(QueueOrderKey, SubmitterId)> {
         if limit == 0 || self.active_ring.is_empty() {
             return Vec::new();
         }
         if !cursor.started {
             cursor.started = true;
-            cursor.ring = self.active_ring.clone();
-            cursor.head_remaining = self.head_remaining.max(1);
+            cursor.ring = self
+                .active_ring
+                .iter()
+                .filter(|s| !excluded.contains(*s))
+                .cloned()
+                .collect();
+            cursor.head_remaining = cursor
+                .ring
+                .front()
+                .map_or(1, |front| self.remaining_of(front));
+        } else if !excluded.is_empty() {
+            let old_front = cursor.ring.front().cloned();
+            cursor.ring.retain(|s| !excluded.contains(s));
+            if cursor.ring.front() != old_front.as_ref() {
+                cursor.head_remaining =
+                    cursor.ring.front().map_or(1, |front| self.weight_of(front));
+            }
         }
         if cursor.ring.is_empty() {
             return Vec::new();
@@ -214,32 +277,54 @@ impl FairShareQueues {
         let mut out = Vec::with_capacity(limit.min(512));
 
         while out.len() < limit && !cursor.ring.is_empty() {
-            let sub = *cursor.ring.front().unwrap();
-            let next_key = self.submitters.get(&sub).and_then(|sq| {
-                let start = match cursor.last_yielded.get(&sub) {
-                    Some(prev) => Bound::Excluded(*prev),
-                    None => Bound::Unbounded,
-                };
-                sq.keys.range((start, Bound::Unbounded)).next().copied()
-            });
-
-            match next_key {
-                Some(key) => {
-                    out.push((key, sub));
-                    cursor.last_yielded.insert(sub, key);
-                    cursor.head_remaining = cursor.head_remaining.saturating_sub(1);
-                    if cursor.head_remaining == 0 {
-                        cursor.ring.pop_front();
-                        cursor.ring.push_back(sub);
-                        cursor.head_remaining =
-                            cursor.ring.front().map_or(1, |&next| self.weight_of(next));
+            // Drop any submitter whose queued keys are now exhausted for this pass.
+            let mut max_priority: Option<u32> = None;
+            let mut empty_subs = false;
+            for sub in &cursor.ring {
+                match self.next_key_for(sub, &cursor.last_yielded) {
+                    Some(k) => {
+                        let p = k.priority_rev.0;
+                        max_priority = Some(max_priority.map_or(p, |cur| cur.max(p)));
                     }
+                    None => empty_subs = true,
                 }
-                None => {
-                    cursor.ring.pop_front();
+            }
+            if empty_subs {
+                let old_front = cursor.ring.front().cloned();
+                let last_yielded = &cursor.last_yielded;
+                cursor
+                    .ring
+                    .retain(|sub| self.next_key_for(sub, last_yielded).is_some());
+                if cursor.ring.front() != old_front.as_ref() {
                     cursor.head_remaining =
-                        cursor.ring.front().map_or(0, |&next| self.weight_of(next));
+                        cursor.ring.front().map_or(1, |front| self.weight_of(front));
                 }
+            }
+            let Some(target_priority) = max_priority else {
+                break;
+            };
+            if cursor.ring.is_empty() {
+                break;
+            }
+
+            let sub = cursor.ring.front().unwrap().clone();
+            let Some(key) = self.next_key_for(&sub, &cursor.last_yielded) else {
+                continue;
+            };
+            if key.priority_rev.0 < target_priority {
+                cursor.ring.pop_front();
+                cursor.ring.push_back(sub);
+                cursor.head_remaining = cursor.ring.front().map_or(1, |next| self.weight_of(next));
+                continue;
+            }
+
+            out.push((key, sub.clone()));
+            cursor.last_yielded.insert(sub.clone(), key);
+            cursor.head_remaining = cursor.head_remaining.saturating_sub(1);
+            if cursor.head_remaining == 0 {
+                cursor.ring.pop_front();
+                cursor.ring.push_back(sub);
+                cursor.head_remaining = cursor.ring.front().map_or(1, |next| self.weight_of(next));
             }
         }
         out
@@ -267,10 +352,10 @@ mod tests {
         let b = SubmitterId::Client(Uuid::new_v4());
 
         for seq in 0..4 {
-            fq.insert(a, key(0, seq));
+            fq.insert(a.clone(), key(0, seq));
         }
         for seq in 4..6 {
-            fq.insert(b, key(0, seq));
+            fq.insert(b.clone(), key(0, seq));
         }
 
         let mut cursor = FairWalkCursor::default();
@@ -281,7 +366,14 @@ mod tests {
             .collect();
         assert_eq!(
             walked,
-            vec![(0, a), (4, b), (1, a), (5, b), (2, a), (3, a),]
+            vec![
+                (0, a.clone()),
+                (4, b.clone()),
+                (1, a.clone()),
+                (5, b),
+                (2, a.clone()),
+                (3, a),
+            ]
         );
     }
 
@@ -290,14 +382,14 @@ mod tests {
         let mut fq = FairShareQueues::default();
         let a = SubmitterId::Client(Uuid::new_v4());
         let b = SubmitterId::Client(Uuid::new_v4());
-        fq.set_weight(a, 3);
-        fq.set_weight(b, 1);
+        fq.set_weight(a.clone(), 3);
+        fq.set_weight(b.clone(), 1);
 
         for seq in 0..5 {
-            fq.insert(a, key(0, seq));
+            fq.insert(a.clone(), key(0, seq));
         }
         for seq in 5..8 {
-            fq.insert(b, key(0, seq));
+            fq.insert(b.clone(), key(0, seq));
         }
 
         let mut cursor = FairWalkCursor::default();
@@ -324,15 +416,82 @@ mod tests {
         assert_eq!(
             combined,
             vec![
-                (0, a),
-                (1, a),
-                (2, a),
-                (5, b),
-                (3, a),
+                (0, a.clone()),
+                (1, a.clone()),
+                (2, a.clone()),
+                (5, b.clone()),
+                (3, a.clone()),
                 (4, a),
-                (6, b),
+                (6, b.clone()),
                 (7, b),
             ]
         );
+    }
+
+    #[test]
+    fn participant_priority_tiers_and_exclusion_avoid_starvation() {
+        let mut fq = FairShareQueues::default();
+        let high = SubmitterId::Participant("high-team".into());
+        let normal = SubmitterId::Participant("normal-team".into());
+        let low = SubmitterId::Participant("low-team".into());
+        fq.set_weight(high.clone(), 2);
+        fq.set_weight(normal.clone(), 2);
+        fq.set_weight(low.clone(), 1);
+
+        fq.insert(low.clone(), key(0, 1));
+        fq.insert(normal.clone(), key(50, 2));
+        fq.insert(normal.clone(), key(50, 3));
+        fq.insert(high.clone(), key(100, 4));
+        fq.insert(high.clone(), key(100, 5));
+
+        // When none excluded, high yields first, then normal, then low.
+        let mut cursor = FairWalkCursor::default();
+        let seqs: Vec<u64> = fq
+            .walk(&mut cursor, 10)
+            .into_iter()
+            .map(|(k, _)| k.sequence)
+            .collect();
+        assert_eq!(seqs, vec![4, 5, 2, 3, 1]);
+
+        // Excluding capped `high` immediately yields `normal` then `low` without returning `high`.
+        let mut excluded = HashSet::new();
+        excluded.insert(high);
+        let mut cursor_ex = FairWalkCursor::default();
+        let seqs_ex: Vec<(u64, SubmitterId)> = fq
+            .walk_excluding(&mut cursor_ex, 10, &excluded)
+            .into_iter()
+            .map(|(k, s)| (k.sequence, s))
+            .collect();
+        assert_eq!(seqs_ex, vec![(2, normal.clone()), (3, normal), (1, low)]);
+    }
+
+    #[test]
+    fn non_front_on_scheduled_rotates_even_when_front_is_excluded() {
+        let mut fq = FairShareQueues::default();
+        let capped_front = SubmitterId::Participant("capped".into());
+        let a = SubmitterId::Participant("alice".into());
+        let b = SubmitterId::Participant("bob".into());
+
+        // `capped` enters first so it sits at front of `active_ring`.
+        fq.insert(capped_front.clone(), key(100, 1));
+        for seq in 2..6 {
+            fq.insert(a.clone(), key(50, seq));
+        }
+        for seq in 6..10 {
+            fq.insert(b.clone(), key(50, seq));
+        }
+
+        let mut excluded = HashSet::new();
+        excluded.insert(capped_front);
+
+        let mut picked = Vec::new();
+        for _ in 0..4 {
+            let mut cursor = FairWalkCursor::default();
+            let (k, s) = fq.walk_excluding(&mut cursor, 1, &excluded).pop().unwrap();
+            assert!(fq.remove(&s, &k));
+            fq.on_scheduled(&s);
+            picked.push(s);
+        }
+        assert_eq!(picked, vec![a.clone(), b.clone(), a, b]);
     }
 }

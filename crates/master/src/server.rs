@@ -79,6 +79,7 @@ use crate::queue::{
     QueueStats, TaskInfo, TaskQueue, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
     DEFAULT_MAX_TERMINAL_TASKS,
 };
+use crate::quotas::{QuotaController, QuotaPolicyConfig};
 #[cfg(not(feature = "dashboard"))]
 use crate::reaper::spawn_reaper_with_queue;
 use crate::reaper::ReaperConfig;
@@ -225,6 +226,8 @@ pub struct ServerConfig {
     pub members: Arc<MemberStore>,
     /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
     members_explicit: bool,
+    /// Per-participant default and override quota policy (`ECO-9`, design 0097).
+    pub quota_policy: QuotaPolicyConfig,
 }
 
 impl Default for ServerConfig {
@@ -282,6 +285,7 @@ impl Default for ServerConfig {
             local_node_key_path: None,
             members: Arc::new(MemberStore::new()),
             members_explicit: false,
+            quota_policy: QuotaPolicyConfig::default(),
         }
     }
 }
@@ -598,6 +602,12 @@ impl ServerConfig {
         self.members_explicit = true;
         self
     }
+
+    /// Configures per-participant default and override quota policy (`ECO-9`, design 0097).
+    pub fn with_quota_policy(mut self, policy: QuotaPolicyConfig) -> Self {
+        self.quota_policy = policy;
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -658,6 +668,8 @@ pub struct MasterServer {
     pub p2p_ticket: Option<String>,
     /// The blob store, when `ServerConfig::blob_store` names one.
     blob_store: Option<Arc<BlobStore>>,
+    /// Per-participant quota controller (`ECO-9`, design 0097).
+    quota_controller: Arc<QuotaController>,
 }
 
 impl MasterServer {
@@ -683,6 +695,7 @@ impl MasterServer {
         scheduler_notify: Arc<tokio::sync::Notify>,
         waiters: WaiterMap,
     ) -> GridResult<Self> {
+        config.quota_policy.validate().map_err(GridError::Config)?;
         #[cfg(feature = "p2p")]
         rusty_grid_core::transport::resolve_p2p_relay_mode(
             config.p2p_minimal_preset,
@@ -706,6 +719,10 @@ impl MasterServer {
             }
         }
         config.members.set_auth_mode(config.auth_mode);
+        let quota_controller = Arc::new(QuotaController::new(
+            Arc::clone(&config.members),
+            config.quota_policy.clone(),
+        ));
         if config.master_noise_key_path.is_none()
             && !config.ephemeral_key
             && config.auth_mode.allows_members()
@@ -787,6 +804,9 @@ impl MasterServer {
             queue
                 .attach_store_and_replay(store, recovered, config.session_resume_hold)
                 .await?;
+            queue
+                .rekey_participants_from_members(|mid| quota_controller.participant_for_member(mid))
+                .await;
             if let Some(ref bstore) = blob_store {
                 queue.repin_recovered_blobs(bstore).await;
             }
@@ -943,6 +963,7 @@ impl MasterServer {
             broadcast_tx: None,
             p2p_ticket,
             blob_store,
+            quota_controller,
         })
     }
 
@@ -1019,6 +1040,7 @@ impl MasterServer {
             .copied();
         let auth_mode = server.config.auth_mode;
         let members = Arc::clone(&server.config.members);
+        let quota_controller = Arc::clone(&server.quota_controller);
 
         #[cfg(feature = "dashboard")]
         let (dashboard_server_opt, broadcast_tx) = if enable_web_ui
@@ -1086,7 +1108,8 @@ impl MasterServer {
                 queue.clone(),
                 scheduler_notify.clone(),
             )
-            .with_waiters(Arc::clone(&waiters)),
+            .with_waiters(Arc::clone(&waiters))
+            .with_quota_controller(Arc::clone(&quota_controller)),
         );
 
         // 1. Spawn TCP server accept loop
@@ -1265,6 +1288,7 @@ impl MasterServer {
             auth_mode,
             members,
             blob_store: blob_store.clone(),
+            quota_controller,
         };
 
         // Pins of finished tasks are released here when no result released them (failover out of
@@ -1714,6 +1738,7 @@ impl MasterServer {
             member_connections: crate::member_connections::MemberConnections::default(),
             p2p_ticket: self.p2p_ticket.clone(),
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+            quota_controller: Some(Arc::clone(&self.quota_controller)),
         };
         if auth_ctx.auth_mode.allows_members() {
             spawn_member_store_resync(Arc::clone(&auth_ctx.members), shutdown_rx.clone());
@@ -2090,6 +2115,7 @@ pub struct MasterHandle {
     auth_mode: AuthMode,
     members: Arc<MemberStore>,
     blob_store: Option<Arc<BlobStore>>,
+    quota_controller: Arc<QuotaController>,
 }
 
 impl MasterHandle {
@@ -2106,6 +2132,11 @@ impl MasterHandle {
     /// Returns the enrolled [`MemberStore`] for this master.
     pub fn members(&self) -> &Arc<MemberStore> {
         &self.members
+    }
+
+    /// Returns the master's [`QuotaController`] (`ECO-9`, design 0097).
+    pub fn quota_controller(&self) -> &Arc<QuotaController> {
+        &self.quota_controller
     }
 
     /// The blob store of task inputs and output files, if this master runs one.
@@ -2192,13 +2223,32 @@ impl MasterHandle {
             .and_then(rusty_grid_core::transport::inspect_connection_paths)
     }
 
-    /// Submits a task with default priority (0).
+    /// Submits a task with default priority (or the `"organiser"` participant's default band priority).
     pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
         let task_id = task.id;
+        let participant = self.quota_controller.participant_for_member(None);
+        let effective = self.quota_controller.effective_quota(&participant);
+        let priority = self
+            .quota_controller
+            .resolve_submission_priority(&participant, None)?;
+        let submitter = if !self.members.is_empty() {
+            crate::fair_share::SubmitterId::Participant(participant.clone())
+        } else {
+            crate::fair_share::SubmitterId::Default
+        };
         let (admitted, needs_tree_v2) = self.admit(&task).await?;
         let id = match self
             .queue
-            .submit_with_priority_and_tree_v2(task, 0, needs_tree_v2)
+            .submit_attributed(
+                task,
+                priority,
+                submitter,
+                Some(participant),
+                None,
+                effective.max_queued_tasks,
+                effective.max_slots,
+                needs_tree_v2,
+            )
             .await
         {
             Ok(id) => id,
@@ -2224,13 +2274,32 @@ impl MasterHandle {
         Ok(id)
     }
 
-    /// Submits a task with explicit priority.
+    /// Submits a task with explicit priority (enforcing the `"organiser"` participant's quota/band).
     pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
         let task_id = task.id;
+        let participant = self.quota_controller.participant_for_member(None);
+        let effective = self.quota_controller.effective_quota(&participant);
+        let priority = self
+            .quota_controller
+            .resolve_submission_priority(&participant, Some(priority))?;
+        let submitter = if !self.members.is_empty() {
+            crate::fair_share::SubmitterId::Participant(participant.clone())
+        } else {
+            crate::fair_share::SubmitterId::Default
+        };
         let (admitted, needs_tree_v2) = self.admit(&task).await?;
         let id = match self
             .queue
-            .submit_with_priority_and_tree_v2(task, priority, needs_tree_v2)
+            .submit_attributed(
+                task,
+                priority,
+                submitter,
+                Some(participant),
+                None,
+                effective.max_queued_tasks,
+                effective.max_slots,
+                needs_tree_v2,
+            )
             .await
         {
             Ok(id) => id,

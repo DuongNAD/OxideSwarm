@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::quotas::{validate_participant_label, validate_quota_target, ParticipantQuota};
 use rusty_grid_core::noise_auth::{
     default_oxideswarm_dir, derive_pairing_code, verify_enroll_proof, verify_pairing_code, KEY_LEN,
 };
@@ -160,6 +161,15 @@ pub struct MembersFile {
     /// Public keys of revoked members that are permanently refused re-enrollment (design 0051 G4).
     #[serde(default)]
     pub revoked_keys: Vec<PublicKey>,
+    /// Optional participant label per enrolled member ID (`ECO-9`, design 0097 D1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub member_participants: BTreeMap<String, String>,
+    /// Per-participant quota overrides persisted by an admin (`ECO-9`, design 0097 D1/D2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub participant_quotas: BTreeMap<String, ParticipantQuota>,
+    /// Cluster-wide default participant quota persisted by an admin (`ECO-9`, design 0097 D1/D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_participant_quota: Option<ParticipantQuota>,
 }
 
 impl Default for MembersFile {
@@ -172,6 +182,9 @@ impl Default for MembersFile {
             worker_last_seq: BTreeMap::new(),
             v2_worker_seq: BTreeMap::new(),
             revoked_keys: Vec::new(),
+            member_participants: BTreeMap::new(),
+            participant_quotas: BTreeMap::new(),
+            default_participant_quota: None,
         }
     }
 }
@@ -286,6 +299,9 @@ struct PersistentMemberState {
     v2_worker_seq: BTreeMap<Uuid, u64>,
     next_worker_seq: u64,
     revoked_keys: HashSet<PublicKey>,
+    member_participants: BTreeMap<String, String>,
+    participant_quotas: BTreeMap<String, ParticipantQuota>,
+    default_participant_quota: Option<ParticipantQuota>,
 }
 
 impl PersistentMemberState {
@@ -302,6 +318,9 @@ impl PersistentMemberState {
             worker_last_seq: self.worker_last_seq.clone(),
             v2_worker_seq: self.v2_worker_seq.clone(),
             revoked_keys,
+            member_participants: self.member_participants.clone(),
+            participant_quotas: self.participant_quotas.clone(),
+            default_participant_quota: self.default_participant_quota.clone(),
         }
     }
 
@@ -362,6 +381,8 @@ impl PersistentMemberState {
         for wid in &pruned {
             self.worker_last_seq.remove(wid);
         }
+        self.member_participants
+            .retain(|mid, _| member_ids.contains(mid.as_str()));
         pruned
     }
 
@@ -393,7 +414,7 @@ struct MemberStoreInner {
 enum AdminMutationPlan<T, R> {
     NoOp(R),
     Persist {
-        staged: PersistentMemberState,
+        staged: Box<PersistentMemberState>,
         token: T,
     },
 }
@@ -1120,6 +1141,53 @@ impl MemberStore {
             guard.state.next_worker_seq = seq;
             guard.state.worker_owners = parsed.worker_owners;
             guard.state.revoked_keys = parsed.revoked_keys.into_iter().collect();
+            let mut member_participants = BTreeMap::new();
+            for (raw_member_id, raw_label) in parsed.member_participants {
+                let member_id = raw_member_id.trim().to_ascii_lowercase();
+                let label = validate_participant_label(&raw_label).map_err(|e| {
+                    GridError::Config(format!(
+                        "invalid member_participants entry for '{raw_member_id}' in {}: {e}",
+                        source_path.display()
+                    ))
+                })?;
+                member_participants.insert(member_id, label);
+            }
+            let mut participant_quotas = BTreeMap::new();
+            for (raw_target, quota) in parsed.participant_quotas {
+                let target = validate_quota_target(&raw_target).map_err(|e| {
+                    GridError::Config(format!(
+                        "invalid participant_quotas key '{raw_target}' in {}: {e}",
+                        source_path.display()
+                    ))
+                })?;
+                quota
+                    .validate(&format!(
+                        "participant '{target}' in {}",
+                        source_path.display()
+                    ))
+                    .map_err(GridError::Config)?;
+                if !quota.is_empty() {
+                    participant_quotas.insert(target, quota);
+                }
+            }
+            let default_participant_quota = match parsed.default_participant_quota {
+                Some(q) => {
+                    q.validate(&format!(
+                        "default_participant_quota in {}",
+                        source_path.display()
+                    ))
+                    .map_err(GridError::Config)?;
+                    if q.is_empty() {
+                        None
+                    } else {
+                        Some(q)
+                    }
+                }
+                None => None,
+            };
+            guard.state.member_participants = member_participants;
+            guard.state.participant_quotas = participant_quotas;
+            guard.state.default_participant_quota = default_participant_quota;
             // A claim whose owner is no member (left by a registration that landed right after a
             // revocation in an older release) would lock its worker id for ever.
             let orphans = guard.state.prune_non_member_claims();
@@ -1249,7 +1317,7 @@ impl MemberStore {
                 let mut staged = guard.state.clone();
                 apply_host_admin(&mut staged, name.clone());
                 Ok(AdminMutationPlan::Persist {
-                    staged,
+                    staged: Box::new(staged),
                     token: name,
                 })
             },
@@ -1314,7 +1382,7 @@ impl MemberStore {
                 staged.prune_inactive_invites(now, &guard.active_approval_invites);
                 staged.invites.push(record.clone());
                 Ok(AdminMutationPlan::Persist {
-                    staged,
+                    staged: Box::new(staged),
                     token: record,
                 })
             },
@@ -1356,7 +1424,10 @@ impl MemberStore {
                     .find(|i| i.invite_id == id)
                     .ok_or_else(|| GridError::Config(format!("unknown invite '{target}'")))?;
                 inv.revoked = true;
-                Ok(AdminMutationPlan::Persist { staged, token: id })
+                Ok(AdminMutationPlan::Persist {
+                    staged: Box::new(staged),
+                    token: id,
+                })
             },
             |guard, id, _| {
                 if let Some(inv) = guard.state.invites.iter_mut().find(|i| i.invite_id == id) {
@@ -1515,7 +1586,7 @@ impl MemberStore {
                         now,
                     );
                     Ok(AdminMutationPlan::Persist {
-                        staged,
+                        staged: Box::new(staged),
                         token: (inv_id, clean_name, roles, entry),
                     })
                 },
@@ -1804,7 +1875,7 @@ impl MemberStore {
                     .insert(pending_info.public_key, entry.clone());
 
                 Ok(AdminMutationPlan::Persist {
-                    staged,
+                    staged: Box::new(staged),
                     token: (id, approval_id, pending_info, gen_before, tracker, entry),
                 })
             },
@@ -2113,7 +2184,7 @@ impl MemberStore {
                 entry.name = clean.clone();
                 let updated = entry.clone();
                 Ok(AdminMutationPlan::Persist {
-                    staged,
+                    staged: Box::new(staged),
                     token: (pubkey, clean, updated),
                 })
             },
@@ -2139,6 +2210,173 @@ impl MemberStore {
                     }
                 }
                 updated
+            },
+        )
+    }
+
+    /// Returns the explicit participant label assigned to `member_id`, if any.
+    pub fn participant_for_member(&self, member_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .member_participants
+            .get(&member_id.trim().to_ascii_lowercase())
+            .cloned()
+    }
+
+    /// Returns a snapshot of `member_id -> participant_label` overrides.
+    pub fn member_participants(&self) -> BTreeMap<String, String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .member_participants
+            .clone()
+    }
+
+    /// Returns a snapshot of persisted per-participant quota overrides.
+    pub fn quota_overrides(&self) -> BTreeMap<String, ParticipantQuota> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .participant_quotas
+            .clone()
+    }
+
+    /// Returns the persisted cluster default participant quota override, if any.
+    pub fn default_participant_quota(&self) -> Option<ParticipantQuota> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .default_participant_quota
+            .clone()
+    }
+
+    /// Assigns (`Some`) or clears (`None`) the participant label for an enrolled member and
+    /// persists `members.json`. Returns `(member_id, normalized_label)`.
+    pub fn set_member_participant(
+        &self,
+        target: &str,
+        label: Option<&str>,
+    ) -> GridResult<(String, Option<String>)> {
+        let normalized = label
+            .map(validate_participant_label)
+            .transpose()
+            .map_err(GridError::Config)?;
+        self.run_admin_mutation(
+            |guard| {
+                let id = resolve_id_prefix_or_name(
+                    target,
+                    guard
+                        .state
+                        .by_pubkey
+                        .values()
+                        .map(|m| (m.id.as_str(), m.name.as_str())),
+                    "member",
+                )?;
+                let mut staged = guard.state.clone();
+                if let Some(ref lbl) = normalized {
+                    staged.member_participants.insert(id.clone(), lbl.clone());
+                } else {
+                    staged.member_participants.remove(&id);
+                }
+                Ok(AdminMutationPlan::Persist {
+                    staged: Box::new(staged),
+                    token: (id, normalized.clone()),
+                })
+            },
+            |guard, (id, lbl), _| {
+                if let Some(ref lbl) = lbl {
+                    guard
+                        .state
+                        .member_participants
+                        .insert(id.clone(), lbl.clone());
+                } else {
+                    guard.state.member_participants.remove(&id);
+                }
+                (id, lbl)
+            },
+        )
+    }
+
+    /// Sets (`Some` non-empty) or clears (`None` / empty) a persisted per-participant quota override.
+    pub fn set_participant_quota(
+        &self,
+        participant: &str,
+        quota: Option<ParticipantQuota>,
+    ) -> GridResult<(String, Option<ParticipantQuota>)> {
+        let target = validate_quota_target(participant).map_err(GridError::Config)?;
+        let stored = match quota {
+            Some(q) => {
+                q.validate(&format!("participant '{target}'"))
+                    .map_err(GridError::Config)?;
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q)
+                }
+            }
+            None => None,
+        };
+        self.run_admin_mutation(
+            |guard| {
+                let mut staged = guard.state.clone();
+                if let Some(ref q) = stored {
+                    staged.participant_quotas.insert(target.clone(), q.clone());
+                } else {
+                    staged.participant_quotas.remove(&target);
+                }
+                Ok(AdminMutationPlan::Persist {
+                    staged: Box::new(staged),
+                    token: (target.clone(), stored.clone()),
+                })
+            },
+            |guard, (target, q), _| {
+                if let Some(ref q) = q {
+                    guard
+                        .state
+                        .participant_quotas
+                        .insert(target.clone(), q.clone());
+                } else {
+                    guard.state.participant_quotas.remove(&target);
+                }
+                (target, q)
+            },
+        )
+    }
+
+    /// Sets (`Some` non-empty) or clears (`None` / empty) the persisted default participant quota.
+    pub fn set_default_participant_quota(
+        &self,
+        quota: Option<ParticipantQuota>,
+    ) -> GridResult<Option<ParticipantQuota>> {
+        let stored = match quota {
+            Some(q) => {
+                q.validate("default_participant_quota")
+                    .map_err(GridError::Config)?;
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q)
+                }
+            }
+            None => None,
+        };
+        self.run_admin_mutation(
+            |guard| {
+                let mut staged = guard.state.clone();
+                staged.default_participant_quota = stored.clone();
+                Ok(AdminMutationPlan::Persist {
+                    staged: Box::new(staged),
+                    token: stored.clone(),
+                })
+            },
+            |guard, q, _| {
+                guard.state.default_participant_quota = q.clone();
+                q
             },
         )
     }
@@ -2188,9 +2426,10 @@ impl MemberStore {
                 for wid in &owned_workers {
                     staged.worker_last_seq.remove(wid);
                 }
+                staged.member_participants.remove(&removed.id);
                 staged.prune_non_member_claims();
                 Ok(AdminMutationPlan::Persist {
-                    staged,
+                    staged: Box::new(staged),
                     token: (pubkey, removed),
                 })
             },
@@ -2213,6 +2452,7 @@ impl MemberStore {
                 for wid in &owned_workers {
                     guard.state.worker_last_seq.remove(wid);
                 }
+                guard.state.member_participants.remove(&removed.id);
                 let orphans = guard.state.prune_non_member_claims();
                 if !orphans.is_empty() {
                     tracing::warn!(
@@ -4857,5 +5097,146 @@ mod non_member_claim_tests {
             vec![member_wid]
         );
         assert!(!on_disk.worker_last_seq.contains_key(&orphan_wid));
+    }
+
+    #[test]
+    fn legacy_members_json_loads_with_empty_quota_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = NodeKeypair::generate().unwrap();
+        let legacy_json = serde_json::json!({
+            "version": MEMBERS_FILE_VERSION,
+            "members": [MemberEntry::new("alice", *member.public_key(), vec![MemberRole::Client])]
+        });
+        let path = dir.path().join(MEMBERS_FILE_NAME);
+        std::fs::write(&path, legacy_json.to_string().as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let loaded = MemberStore::load_file(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.member_participants().is_empty());
+        assert!(loaded.quota_overrides().is_empty());
+        assert_eq!(loaded.default_participant_quota(), None);
+    }
+
+    #[test]
+    fn participant_label_set_clear_rename_and_reserved_prefix_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = NodeKeypair::generate().unwrap();
+        let path = dir.path().join(MEMBERS_FILE_NAME);
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "alice-laptop",
+            *alice.public_key(),
+            vec![MemberRole::Client],
+        )])
+        .with_save_path(path.clone());
+
+        assert!(matches!(
+            store.set_member_participant("alice-laptop", Some("member:spoof")),
+            Err(GridError::Config(_))
+        ));
+        assert!(matches!(
+            store.set_member_participant("alice-laptop", Some("   ")),
+            Err(GridError::Config(_))
+        ));
+
+        let (mid, label) = store
+            .set_member_participant("alice-laptop", Some("Lab_Alpha"))
+            .unwrap();
+        assert_eq!(mid, alice.member_id());
+        assert_eq!(label.as_deref(), Some("lab_alpha"));
+
+        let reloaded = MemberStore::load_file(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .participant_for_member(&alice.member_id())
+                .as_deref(),
+            Some("lab_alpha")
+        );
+
+        // Renaming the member's display name preserves the participant assignment keyed by member_id.
+        reloaded
+            .rename_member(&alice.member_id(), "alice-desk")
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .participant_for_member(&alice.member_id())
+                .as_deref(),
+            Some("lab_alpha")
+        );
+
+        let (_, cleared) = reloaded.set_member_participant("alice-desk", None).unwrap();
+        assert_eq!(cleared, None);
+        let reloaded_after_clear = MemberStore::load_file(&path).unwrap();
+        assert_eq!(
+            reloaded_after_clear.participant_for_member(&alice.member_id()),
+            None
+        );
+    }
+
+    #[test]
+    fn quota_overrides_and_default_persist_and_revoke_cleans_participant() {
+        use crate::quotas::{ParticipantQuota, PriorityBand};
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice = NodeKeypair::generate().unwrap();
+        let path = dir.path().join(MEMBERS_FILE_NAME);
+        let store = MemberStore::from_entries(vec![MemberEntry::new(
+            "alice",
+            *alice.public_key(),
+            vec![MemberRole::Client],
+        )])
+        .with_save_path(path.clone());
+
+        store
+            .set_member_participant("alice", Some("team-a"))
+            .unwrap();
+        let default_q = ParticipantQuota {
+            max_running_tasks: Some(2),
+            ..Default::default()
+        };
+        let team_q = ParticipantQuota {
+            max_running_tasks: Some(4),
+            max_slots: Some(8),
+            max_queued_tasks: Some(16),
+            priority_band: Some(PriorityBand::High),
+            fair_share_weight: Some(3),
+        };
+        store
+            .set_default_participant_quota(Some(default_q.clone()))
+            .unwrap();
+        store
+            .set_participant_quota("TEAM-A", Some(team_q.clone()))
+            .unwrap();
+
+        let reloaded = MemberStore::load_file(&path).unwrap();
+        assert_eq!(reloaded.default_participant_quota(), Some(default_q));
+        assert_eq!(reloaded.quota_overrides().get("team-a"), Some(&team_q));
+        assert_eq!(
+            reloaded
+                .participant_for_member(&alice.member_id())
+                .as_deref(),
+            Some("team-a")
+        );
+
+        // Revoking a member drops its participant assignment from memory and members.json,
+        // while keeping participant-level quota policies intact.
+        reloaded.revoke_member(&alice.member_id()).unwrap();
+        assert!(reloaded
+            .participant_for_member(&alice.member_id())
+            .is_none());
+        let after_revoke = MemberStore::load_file(&path).unwrap();
+        assert!(after_revoke.member_participants().is_empty());
+        assert_eq!(after_revoke.quota_overrides().get("team-a"), Some(&team_q));
+
+        // Clearing overrides removes them cleanly.
+        after_revoke.set_participant_quota("team-a", None).unwrap();
+        after_revoke.set_default_participant_quota(None).unwrap();
+        let after_clear = MemberStore::load_file(&path).unwrap();
+        assert!(after_clear.quota_overrides().is_empty());
+        assert_eq!(after_clear.default_participant_quota(), None);
     }
 }

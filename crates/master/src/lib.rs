@@ -13,6 +13,7 @@ pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod queue;
+pub mod quotas;
 pub mod reaper;
 pub mod registry;
 pub mod rendezvous;
@@ -46,6 +47,13 @@ pub use queue::{
     ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo, TaskQueue,
     TaskState, TaskStatusDetail, TaskView, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
     DEFAULT_MAX_TERMINAL_TASKS,
+};
+pub use quotas::{
+    parse_participant_quota_spec, validate_participant_label, validate_quota_target,
+    MemberParticipantDto, ParticipantQuota, ParticipantQuotaStatusDto, ParticipantUsageCounts,
+    PriorityBand, QuotaController, QuotaPolicyConfig, QuotasSnapshotDto,
+    MAX_PARTICIPANT_LABEL_CHARS, MEMBER_PARTICIPANT_PREFIX,
+    ORGANISER_PARTICIPANT as QUOTA_ORGANISER_PARTICIPANT,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
 pub use registry::{

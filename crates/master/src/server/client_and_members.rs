@@ -14,8 +14,8 @@ use rusty_grid_core::noise_auth::{AuthenticatedV3Peer, HandshakePurpose};
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, ClientMessage, ClientResponse, ProtocolError,
 };
-use rusty_grid_core::task::{TaskId, TaskStatus};
-use rusty_grid_core::{GridError, GridResult, MessageTransport, WorkerCapabilities};
+use rusty_grid_core::task::{TaskId, TaskResult, TaskStatus};
+use rusty_grid_core::{GridError, GridResult, MasterMessage, MessageTransport, WorkerCapabilities};
 
 use crate::blob_store::BlobStore;
 use crate::mapreduce::MapReduceEngine;
@@ -258,10 +258,39 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     None
                 };
 
-                if let Err(e) = queue
-                    .submit_from_with_tree_v2(task, 0, client_submitter, needs_tree_v2)
-                    .await
-                {
+                let submit_res = if let Some(ref qc) = auth_ctx.quota_controller {
+                    let member_id = v3_peer.as_ref().map(|p| p.member_id.as_str());
+                    let participant = qc.participant_for_member(member_id);
+                    let effective_quota = qc.effective_quota(&participant);
+                    match qc.resolve_submission_priority(&participant, None) {
+                        Ok(priority) => {
+                            let submitter = if member_id.is_some() || !auth_ctx.members.is_empty() {
+                                crate::fair_share::SubmitterId::Participant(participant.clone())
+                            } else {
+                                client_submitter.clone()
+                            };
+                            queue
+                                .submit_attributed(
+                                    task,
+                                    priority,
+                                    submitter,
+                                    Some(participant),
+                                    member_id.map(str::to_string),
+                                    effective_quota.max_queued_tasks,
+                                    effective_quota.max_slots,
+                                    needs_tree_v2,
+                                )
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    queue
+                        .submit_from_with_tree_v2(task, 0, client_submitter.clone(), needs_tree_v2)
+                        .await
+                };
+
+                if let Err(e) = submit_res {
                     // Validation failure, queue full, or a task id that is already in use: tell the
                     // client why, keep the connection, and take back the waiter registered above
                     // (it must never be resolved by the result of another task with the same id).
@@ -1316,6 +1345,73 @@ where
                     let closed_worker_sessions =
                         closed.iter().filter(|lane| lane.is_worker()).count();
 
+                    // Step 2 (`ENROLL-1c`, design 0051 D5): cancel every non-terminal task
+                    // submitted by this member before taking back its own workers, so its running
+                    // tasks stop directly instead of failing over onto remaining workers.
+                    let cancel_reason = "Submitting member revoked by admin";
+                    let cancelled_submitted = queue
+                        .cancel_tasks_submitted_by(&entry.id, cancel_reason)
+                        .await;
+                    if !cancelled_submitted.is_empty() {
+                        for (task_id, outcome) in &cancelled_submitted {
+                            if let Some(worker_id) = outcome.worker_to_notify {
+                                let msg = MasterMessage::CancelTask {
+                                    task_id: *task_id,
+                                    reason: Some(cancel_reason.to_string()),
+                                };
+                                if let Err(e) = registry.send_to_worker(&worker_id, msg).await {
+                                    debug!(
+                                        task_id = %task_id,
+                                        worker_id = %worker_id,
+                                        error = %e,
+                                        "Could not deliver CancelTask for revoked member task"
+                                    );
+                                }
+                            }
+                            let result = outcome.result.clone().unwrap_or_else(|| {
+                                TaskResult::failure(
+                                    outcome.worker_to_notify.unwrap_or_else(Uuid::nil),
+                                    *task_id,
+                                    130,
+                                    "",
+                                    "",
+                                    0,
+                                    Some(cancel_reason.to_string()),
+                                )
+                            });
+                            let mut lock = waiters.write().await;
+                            if let Some(senders) = lock.remove(task_id) {
+                                for tx in senders {
+                                    let _ = tx.send(result.clone());
+                                }
+                            }
+                            drop(lock);
+                            #[cfg(feature = "dashboard")]
+                            if let Some(b_tx) = broadcast_tx {
+                                if b_tx.receiver_count() > 0 {
+                                    if let Some(info) = queue.get_task(task_id).await {
+                                        let _ = b_tx.send(
+                                            crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                                                info,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(feature = "dashboard")]
+                        if let Some(b_tx) = broadcast_tx {
+                            if b_tx.receiver_count() > 0 {
+                                let _ = b_tx.send(
+                                    crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                                        queue.stats().await,
+                                    ),
+                                );
+                            }
+                        }
+                        scheduler_notify.notify_one();
+                    }
+
                     // Step 3: take the member's workers out of service and requeue their tasks at
                     // once, without the resume hold and without their checkpoints. The store's
                     // claims and the registry's owners together cover every worker id the member
@@ -1346,6 +1442,7 @@ where
                         member_id = %entry.id,
                         name = %entry.name,
                         disconnected_sessions,
+                        cancelled_submitted = cancelled_submitted.len(),
                         worker_sessions = closed_worker_sessions,
                         client_connections = disconnected_sessions - closed_worker_sessions,
                         worker_ids = worker_ids.len(),

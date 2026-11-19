@@ -380,6 +380,7 @@ mod middleware {
                 if p.starts_with("/api/status")
                     || p.starts_with("/api/workers")
                     || p.starts_with("/api/tasks")
+                    || p.starts_with("/api/quotas")
                     || p.starts_with("/ws")
                     || p.starts_with("/api/stream")
                     || p.starts_with("/api/modes") =>
@@ -387,7 +388,13 @@ mod middleware {
                 Some(AuthScope::Observer)
             }
             (&Method::POST, p) if p.starts_with("/api/tasks") => Some(AuthScope::Submitter),
-            (&Method::POST, p) if p.starts_with("/api/modes/run") => Some(AuthScope::Admin),
+            (&Method::POST, p)
+                if p.starts_with("/api/modes/run")
+                    || p.starts_with("/api/quotas")
+                    || p.starts_with("/api/members") =>
+            {
+                Some(AuthScope::Admin)
+            }
             (&Method::GET, _) => Some(AuthScope::Observer),
             _ => Some(AuthScope::Admin),
         }
@@ -982,6 +989,7 @@ mod tests {
                 "/api/workers",
                 "/api/tasks",
                 "/api/tasks/00000000-0000-0000-0000-000000000000",
+                "/api/quotas",
                 "/ws",
                 "/api/stream",
                 "/api/stream/sse",
@@ -1006,6 +1014,18 @@ mod tests {
             );
             assert_eq!(
                 route_required_scope(&Method::POST, "/api/modes/run"),
+                Some(AuthScope::Admin)
+            );
+            assert_eq!(
+                route_required_scope(&Method::POST, "/api/quotas/default"),
+                Some(AuthScope::Admin)
+            );
+            assert_eq!(
+                route_required_scope(&Method::POST, "/api/quotas/participants/alice"),
+                Some(AuthScope::Admin)
+            );
+            assert_eq!(
+                route_required_scope(&Method::POST, "/api/members/abc123/participant"),
                 Some(AuthScope::Admin)
             );
             assert_eq!(

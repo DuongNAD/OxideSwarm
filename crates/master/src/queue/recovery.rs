@@ -364,6 +364,7 @@ impl TaskQueue {
                     priority,
                     sequence,
                     submitted_at_utc,
+                    submitted_by_member,
                 } => {
                     max_seq = max_seq.max(sequence.saturating_add(1));
                     let task_id = task.id;
@@ -387,6 +388,7 @@ impl TaskQueue {
                             result: None,
                             cold_result: None,
                             error_message: None,
+                            submitted_by_member,
                         },
                     );
                 }
@@ -647,6 +649,8 @@ impl TaskQueue {
                     result: p.result,
                     error_message: p.error_message,
                     submitter: SubmitterId::Default,
+                    participant: None,
+                    submitted_by_member: p.submitted_by_member,
                     cold_result: p.cold_result,
                     requires_tree_v2,
                 };

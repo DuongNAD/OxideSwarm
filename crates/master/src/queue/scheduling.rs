@@ -1,7 +1,7 @@
 //! Task submission, ready-view paging, assigned load tracking, and batch scheduling.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -124,6 +124,7 @@ impl TaskQueue {
                     priority: 0,
                     sequence,
                     submitted_at_utc: now_epoch,
+                    submitted_by_member: None,
                 };
                 inner.append_durable(&record)?
             } else {
@@ -141,7 +142,12 @@ impl TaskQueue {
                 task_key,
                 priority: 0,
                 sequence,
+                participant: match &submitter {
+                    SubmitterId::Participant(p) => Some(p.clone()),
+                    _ => None,
+                },
                 submitter,
+                submitted_by_member: None,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
@@ -263,6 +269,38 @@ impl TaskQueue {
         submitter: SubmitterId,
         requires_tree_v2: bool,
     ) -> GridResult<TaskId> {
+        let participant = match &submitter {
+            SubmitterId::Participant(p) => Some(p.clone()),
+            _ => None,
+        };
+        self.submit_attributed(
+            task,
+            priority,
+            submitter,
+            participant,
+            None,
+            None,
+            None,
+            requires_tree_v2,
+        )
+        .await
+    }
+
+    /// Submits a task with participant attribution, submitting member ID (for `ENROLL-1c`
+    /// revocation cancellation), and atomic admission-time quota checks (`max_queued_tasks` and
+    /// single-task `max_slots`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_attributed(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+        participant: Option<String>,
+        submitted_by_member: Option<String>,
+        max_queued_for_submitter: Option<usize>,
+        max_slots_for_submitter: Option<usize>,
+        requires_tree_v2: bool,
+    ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
         #[cfg(feature = "otel")]
         let requires_gpu = task.requirements.gpu_required;
@@ -281,6 +319,60 @@ impl TaskQueue {
                     "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
                     task.id, existing.state
                 )));
+            }
+
+            let now_instant = Instant::now();
+            if let Some(slot_cap) = max_slots_for_submitter {
+                let needed_slots = task.requirements.cpu_cores.max(1);
+                if needed_slots > slot_cap {
+                    let participant_name =
+                        participant.clone().unwrap_or_else(|| match &submitter {
+                            SubmitterId::Participant(p) => p.clone(),
+                            _ => crate::quotas::ORGANISER_PARTICIPANT.to_string(),
+                        });
+                    return Err(GridError::QuotaExceeded {
+                        participant: participant_name,
+                        limit_kind: "max_slots".to_string(),
+                        detail: format!(
+                            "task requires {needed_slots} slot(s), exceeding participant max_slots={slot_cap}"
+                        ),
+                    });
+                }
+            }
+
+            if let Some(queued_cap) = max_queued_for_submitter {
+                let queued_count = inner
+                    .tasks
+                    .values()
+                    .filter(|e| {
+                        let same_bucket = match &participant {
+                            Some(p) => e.participant.as_deref() == Some(p.as_str()),
+                            None => e.submitter == submitter,
+                        };
+                        same_bucket
+                            && match e.state {
+                                TaskState::Submitted | TaskState::Retrying => true,
+                                TaskState::Queued => {
+                                    e.adoptable_by.is_none_or(|(_, until)| now_instant >= until)
+                                }
+                                _ => false,
+                            }
+                    })
+                    .count();
+                if queued_count >= queued_cap {
+                    let participant_name =
+                        participant.clone().unwrap_or_else(|| match &submitter {
+                            SubmitterId::Participant(p) => p.clone(),
+                            _ => crate::quotas::ORGANISER_PARTICIPANT.to_string(),
+                        });
+                    return Err(GridError::QuotaExceeded {
+                        participant: participant_name,
+                        limit_kind: "max_queued_tasks".to_string(),
+                        detail: format!(
+                            "participant already has {queued_count} queued task(s) (limit: {queued_cap})"
+                        ),
+                    });
+                }
             }
 
             if let Some(cap) = inner.capacity {
@@ -304,7 +396,6 @@ impl TaskQueue {
             }
 
             let sequence = inner.next_sequence;
-            let now_instant = Instant::now();
             let now_epoch = Utc::now().timestamp() as u64;
 
             let ack = if inner.store.is_some() {
@@ -313,6 +404,7 @@ impl TaskQueue {
                     priority,
                     sequence,
                     submitted_at_utc: now_epoch,
+                    submitted_by_member: submitted_by_member.clone(),
                 };
                 inner.append_durable(&record)?
             } else {
@@ -329,6 +421,8 @@ impl TaskQueue {
                 priority,
                 sequence,
                 submitter,
+                participant,
+                submitted_by_member,
                 state: TaskState::Queued,
                 assigned_worker_id: None,
                 submitted_at_utc: now_epoch,
@@ -493,6 +587,8 @@ impl TaskQueue {
                 view.required_features.insert(ProtocolCapabilities::TREE_V2);
             }
             view.avoid = entry.avoid_workers.clone();
+            view.submitter = entry.submitter.clone();
+            view.participant = entry.participant.clone();
             view.queued_for = now.saturating_duration_since(entry.queued_instant);
             views.push(view);
             if views.len() >= limit {
@@ -525,12 +621,139 @@ impl TaskQueue {
             .set_weight(submitter, weight);
     }
 
+    /// Batch-updates fair-share scheduling weights under a single write lock.
+    pub async fn sync_participant_weights(&self, weights: &[(SubmitterId, u32)]) {
+        if weights.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        for (submitter, weight) in weights {
+            inner.fair_queues.set_weight(submitter.clone(), *weight);
+        }
+    }
+
+    /// Computes live per-participant usage across active (`Scheduled`/`Running`/held) and waiting
+    /// (`Submitted`/`Queued`/`Retrying`) tasks (`ECO-9`, design 0097).
+    pub async fn participant_usage(
+        &self,
+    ) -> BTreeMap<String, crate::quotas::ParticipantUsageCounts> {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut usage: BTreeMap<String, crate::quotas::ParticipantUsageCounts> = BTreeMap::new();
+        for entry in inner.tasks.values() {
+            let participant = match entry.participant.as_deref() {
+                Some(p) => p,
+                None => match &entry.submitter {
+                    SubmitterId::Participant(p) => p.as_str(),
+                    _ => continue,
+                },
+            };
+            let counts = usage.entry(participant.to_string()).or_default();
+            match entry.state {
+                TaskState::Scheduled | TaskState::Running => {
+                    counts.running_tasks += 1;
+                    counts.running_slots = counts
+                        .running_slots
+                        .saturating_add(entry.task.requirements.cpu_cores.max(1));
+                }
+                TaskState::Queued if entry.adoptable_by.is_some_and(|(_, until)| now < until) => {
+                    counts.running_tasks += 1;
+                    counts.running_slots = counts
+                        .running_slots
+                        .saturating_add(entry.task.requirements.cpu_cores.max(1));
+                }
+                TaskState::Submitted | TaskState::Queued | TaskState::Retrying => {
+                    counts.queued_tasks += 1;
+                }
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled => {}
+            }
+        }
+        usage
+    }
+
+    /// Re-keys recovered non-terminal tasks into `SubmitterId::Participant` buckets after
+    /// `attach_store_and_replay`, rebuilding `fair_queues` from `ready_queue`.
+    pub async fn rekey_participants_from_members<F>(&self, resolve: F)
+    where
+        F: Fn(Option<&str>) -> String,
+    {
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+        inner.fair_queues.clear_entries_preserving_weights();
+        let mut ready_moves = Vec::new();
+        for entry in inner.tasks.values_mut() {
+            if entry.state.is_terminal() {
+                continue;
+            }
+            let p = resolve(entry.submitted_by_member.as_deref());
+            let sub = SubmitterId::Participant(p.clone());
+            entry.participant = Some(p);
+            entry.submitter = sub.clone();
+            let key = QueueOrderKey {
+                priority_rev: Reverse(entry.priority),
+                sequence: entry.sequence,
+                task_id: entry.task.id,
+            };
+            if inner.ready_queue.contains(&key) {
+                ready_moves.push((sub, key));
+            }
+        }
+        ready_moves.sort_by_key(|(_, k)| *k);
+        for (sub, key) in ready_moves {
+            inner.fair_queues.insert(sub, key);
+        }
+    }
+
+    /// Live-rekeys all non-terminal tasks of `member_id` after an admin participant label change.
+    pub async fn rekey_member_participant(&self, member_id: &str, new_participant: String) {
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+        let new_sub = SubmitterId::Participant(new_participant.clone());
+        let mut ready_moves: Vec<(QueueOrderKey, SubmitterId)> = Vec::new();
+        for entry in inner.tasks.values_mut() {
+            if entry.state.is_terminal() || entry.submitted_by_member.as_deref() != Some(member_id)
+            {
+                continue;
+            }
+            entry.participant = Some(new_participant.clone());
+            if entry.submitter == new_sub {
+                continue;
+            }
+            let old_sub = std::mem::replace(&mut entry.submitter, new_sub.clone());
+            let key = QueueOrderKey {
+                priority_rev: Reverse(entry.priority),
+                sequence: entry.sequence,
+                task_id: entry.task.id,
+            };
+            if inner.ready_queue.contains(&key) {
+                ready_moves.push((key, old_sub));
+            }
+        }
+        ready_moves.sort_by_key(|(k, _)| *k);
+        for (key, old_sub) in ready_moves {
+            inner.fair_queues.remove(&old_sub, &key);
+            inner.fair_queues.insert(new_sub.clone(), key);
+        }
+    }
+
     /// Scheduling views of up to `limit` queued tasks walking across active submitters in
     /// weighted round-robin order using `cursor`.
+    #[cfg(test)]
     pub(crate) async fn ready_views_fair(
         &self,
         cursor: &mut FairWalkCursor,
         limit: usize,
+    ) -> Vec<TaskView> {
+        self.ready_views_fair_excluding(cursor, limit, &HashSet::new())
+            .await
+    }
+
+    /// Priority-tiered WRR scheduling views skipping submitters present in `excluded`.
+    pub(crate) async fn ready_views_fair_excluding(
+        &self,
+        cursor: &mut FairWalkCursor,
+        limit: usize,
+        excluded: &HashSet<SubmitterId>,
     ) -> Vec<TaskView> {
         if limit == 0 {
             return Vec::new();
@@ -544,7 +767,9 @@ impl TaskQueue {
         let mut views = Vec::with_capacity(limit.min(512));
         while views.len() < limit {
             let remaining = limit - views.len();
-            let batch = inner.fair_queues.walk(cursor, remaining);
+            let batch = inner
+                .fair_queues
+                .walk_excluding(cursor, remaining, excluded);
             if batch.is_empty() {
                 break;
             }
@@ -561,6 +786,8 @@ impl TaskQueue {
                     view.required_features.insert(ProtocolCapabilities::TREE_V2);
                 }
                 view.avoid = entry.avoid_workers.clone();
+                view.submitter = entry.submitter.clone();
+                view.participant = entry.participant.clone();
                 view.queued_for = now.saturating_duration_since(entry.queued_instant);
                 views.push(view);
             }
@@ -869,7 +1096,7 @@ impl TaskQueue {
                     let entry = inner.tasks.get_mut(&key.task_id)?;
                     mark_entry_scheduled(entry, worker_id, None, now, &policy, &metrics)
                 };
-                inner.fair_queues.on_scheduled(submitter);
+                inner.fair_queues.on_scheduled(&submitter);
                 inner.track_adoption_hold(key.task_id, false);
 
                 inner
@@ -943,7 +1170,7 @@ impl TaskQueue {
                 let entry = inner.tasks.get_mut(task_id)?;
                 mark_entry_scheduled(entry, worker_id, None, now, &policy, &metrics)
             };
-            inner.fair_queues.on_scheduled(submitter);
+            inner.fair_queues.on_scheduled(&submitter);
             inner.track_adoption_hold(*task_id, false);
 
             inner
@@ -1087,7 +1314,7 @@ impl TaskQueue {
                     scheduled.push((task_id, worker_id, task));
                 }
                 if let Some(submitter) = dispatched_submitter {
-                    inner.fair_queues.on_scheduled(submitter);
+                    inner.fair_queues.on_scheduled(&submitter);
                 }
             }
 
