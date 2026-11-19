@@ -13,8 +13,8 @@ Establishes the base of the shared protocol 11 train: bumps `PROTOCOL_VERSION_CU
 - [Design 0083](0083-one-version-window.md) keeps a one-version compatibility window (`PROTOCOL_VERSION_MIN_COMPATIBLE = PROTOCOL_VERSION_CURRENT - 1`) governed by golden layout files (`crates/core/src/wire_layout_tests.rs`, `crates/core/src/window_tests.rs`).
 - Today, three open items need additive wire changes on `ClientMessage` / `ClientResponse`:
   - `BUG-22`: `TaskQueue::cluster_buckets` (`crates/master/src/queue.rs`) adds cancelled tasks into `failed_tasks` in `ClientResponse::ClusterStatus` (`crates/core/src/protocol.rs`), while the web dashboard (`crates/master/src/web_ui.rs`) and `/metrics` already count `failed` and `cancelled` separately.
-  - `NET-10` ([Design 0096](0096-contribution-credits.md), Option B on draft pull request 379): deferred CLI display-only credit RPC/fields.
-  - `ECO-9` ([Design 0097](0097-per-participant-quotas.md), draft pull request 384): deferred remote participant label, quota, and priority fields.
+  - `NET-10` (Design 0096, Option B on [draft pull request 379](https://github.com/DuongNAD/OxideSwarm/pull/379)): deferred CLI display-only credit RPC/fields.
+  - `ECO-9` (Design 0097, [draft pull request 384](https://github.com/DuongNAD/OxideSwarm/pull/384)): deferred remote participant label, quota usage, and priority fields.
 - Rather than spending separate protocol bumps (`11`, `12`, `13`) back-to-back during the stability release cycle, all three share protocol version `11`.
 
 ## Goals
@@ -50,17 +50,28 @@ Establishes the base of the shared protocol 11 train: bumps `PROTOCOL_VERSION_CU
 
 The fields below are **Planned** and must be added by their own pull requests on top of protocol `11` (not implemented in this base pull request):
 
-- **`NET-10` ([Design 0096](0096-contribution-credits.md), draft pull request 379) — Planned:**
+- **`NET-10` (Design 0096, [draft pull request 379](https://github.com/DuongNAD/OxideSwarm/pull/379)) — Planned:**
   - Display-only contribution credits (`ran_for_others`, `used_from_others`, `self_run` across `24h`, `7d`, and `all_time` windows covering tasks, core-ms/core-s, and GPU-ms/GPU-s; strictly non-monetary with no signed net or `"balance"` / `"debited"` wording):
     - Remote query/response variants appended last: `ClientMessage::ListCredits` and `ClientResponse::CreditsList`.
     - Optional trailing credit summary fields appended to `ClientResponse::ClusterStatus` and `ClientResponse::MembersList`.
-  - That pull request must extend `ClientResponse::for_peer(10)` and the v10 legacy mirrors so v10 peers drop trailing fields cleanly, and must refresh `crates/core/tests/data/wire_layout.txt` under `# protocol_version: 11`.
-- **`ECO-9` ([Design 0097](0097-per-participant-quotas.md), draft pull request 384) — Planned:**
+  - That pull request must extend `ClientResponse::for_peer(version)` and the v10 legacy mirrors so v10 peers reset/drop trailing fields cleanly, and must refresh `crates/core/tests/data/wire_layout.txt` under `# protocol_version: 11`.
+- **`ECO-9` (Design 0097, [draft pull request 384](https://github.com/DuongNAD/OxideSwarm/pull/384)) — Planned:**
   - `MemberEntry::participant: Option<String>` inside `ClientResponse::MembersList` (for `oxideswarm members list`).
-  - Trailing per-participant quota usage and wait-reason fields appended to `ClientResponse::ClusterStatus`: `running_tasks`, `running_slots`, `queued_tasks`, `priority_band`, `fair_share_weight`, and `wait_reason`.
+  - Trailing nested participant quota usage field (for example `participant_usage: Option<...>`, holding per-participant `running_tasks`, `running_slots`, `queued_tasks`, `priority_band`, `fair_share_weight`, and `wait_reason`, avoiding collision with `ClusterStatus.running_tasks`) appended to `ClientResponse::ClusterStatus`.
   - Remote admin `ClientMessage` and `ClientResponse` variants appended last for `oxideswarm members label`, `oxideswarm invite --participant`, and `oxideswarm quotas`.
-  - Optional priority field on `ClientMessage::SubmitTask`.
-  - That pull request must extend `ClientResponse::for_peer(10)` and the v10 legacy mirrors so protocol `10` peers omit trailing fields cleanly, and must refresh `crates/core/tests/data/wire_layout.txt` under `# protocol_version: 11`.
+  - Task submission priority encoded as a task extension ([Design 0082](0082-task-extension-slot.md)) rather than a typed field on `ClientMessage::SubmitTask`.
+  - That pull request must extend `ClientResponse::for_peer(version)` and the v10 legacy mirrors (including `MembersList` and a v10 mirror of `MemberEntry`) so protocol `10` peers omit/reset trailing fields cleanly, and must refresh `crates/core/tests/data/wire_layout.txt` under `# protocol_version: 11`.
+
+### D2.1 Guardrails for NET-10 and ECO-9 follow-on pull requests
+
+When `NET-10` and `ECO-9` land their wire additions on top of protocol `11`, both pull requests must satisfy all six rules below:
+
+1. **Use constants, not literal `11`, and handle every changed variant:** `ClientResponse::for_peer` (`crates/core/src/protocol.rs:881`) and `serialize_client_response_for_peer` (`crates/core/src/protocol/client_resp_mirrors.rs:1473`) currently check `< 11` literally and special-case only `ClusterStatus`. Replace literal `11` with `PROTOCOL_VERSION_CURRENT` (and `PROTOCOL_VERSION_MIN_COMPATIBLE`) and handle every changed variant (`ClusterStatus`, `MembersList`, etc.).
+2. **Reset trailing `ClusterStatus` fields in `for_peer(10)`:** Every new trailing `ClusterStatus` field added by `NET-10` or `ECO-9` must be reset by `ClientResponse::for_peer(10)` to the exact default that a v10 reader (`deserialize_message_as_v10`) produces (`None`, empty, `0`, etc.); otherwise `window_tests.rs` D7.2's `read == resp.for_peer(10)` check fails.
+3. **`MembersList` v10 legacy mirror and positional indices:** When `ECO-9` (or `NET-10`) modifies `ClientResponse::MembersList` / `MemberEntry`, `LegacyV10BinaryClientResponse` and `HumanLegacyV10ClientResponse` need a `MembersList` variant that lists every preceding variant up to `MembersList`'s positional bincode index, together with a v10 mirror of `MemberEntry` without `participant`, an extended tag check in `deserialize_message_as_v10`, and `MembersList` entries in `DIFFERS_FROM_PREVIOUS` (`crates/core/src/window_tests.rs`).
+4. **Avoid `ClusterStatus.running_tasks` name collision:** `ClientResponse::ClusterStatus` already has a top-level `running_tasks: usize` field. `ECO-9` must nest per-participant quota usage (e.g., `participant_usage: Option<...>`) or rename its fields rather than introducing a duplicate top-level `running_tasks` name.
+5. **Carry `SubmitTask` priority as a task extension ([Design 0082](0082-task-extension-slot.md)):** Do not add a typed priority field to `ClientMessage::SubmitTask`; a typed field would require re-introducing a v10 `SubmitTask` decoder and the stamp-decides-layout logic that this base pull request removed.
+6. **Variant ordering, bincode attribute rule, and frozen baseline:** Append new `ClientMessage` and `ClientResponse` variants strictly last; never use `#[serde(skip_serializing_if)]` on `Option` fields of `Binary*` mirror structs/enums; and keep `crates/core/tests/data/wire_layout_previous.txt` pinned verbatim to `v0.4.4`.
 
 ### D3 Serving v10 peers across the 10..=11 window
 
@@ -77,7 +88,7 @@ The fields below are **Planned** and must be added by their own pull requests on
 ### D4 Golden wire layout and cross-version tests
 
 - `crates/core/tests/data/wire_layout_previous.txt` is promoted verbatim (LF line endings) from release `v0.4.4`'s `crates/core/tests/data/wire_layout.txt` (`# protocol_version: 10`, `# protocol_version_min_compatible: 9`).
-- `crates/core/tests/data/wire_layout.txt` is regenerated for `# protocol_version: 11` and `# protocol_version_min_compatible: 10`, with `wire_layout_tests.rs` setting `ClusterStatus` fixture counts to `failed_tasks: 0, cancelled_tasks: 1` so both fields remain distinct and non-zero.
+- `crates/core/tests/data/wire_layout.txt` is regenerated for `# protocol_version: 11` and `# protocol_version_min_compatible: 10`, with `wire_layout_tests.rs` setting the `ClusterStatus` sample to `failed_tasks: 0, cancelled_tasks: 1` deliberately so the folded v10 sum (`0 + 1 = 1`) equals `v0.4.4`'s recorded `1` (`window_tests.rs` D7.2 can therefore compare the folded v10 bytes directly against `wire_layout_previous.txt`).
 - `crates/core/src/window_tests.rs` sets `PREVIOUS = 10` (`DIFFERS_FROM_PREVIOUS` = `ClusterStatus`, `Hello`) and replays `wire_layout_previous.txt` against `serialize_v10_client_message`, `deserialize_message_as_v10`, and `serialize_message_for_peer`.
 - `tests/window_v10_peers.rs` (registered in `crates/master/Cargo.toml`, replacing `tests/window_v9_peers.rs`) exercises v10 workers, v10 JSON/bincode clients, `(failed: 1, cancelled: 1)` on v11 vs `(failed: 2)` folded on v10, and v9 refusal.
 
@@ -116,9 +127,10 @@ The fields below are **Planned** and must be added by their own pull requests on
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` (protocol 11 base) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/client_msg_mirrors.rs`, `crates/core/src/protocol/worker_master_mirrors.rs`, `crates/core/src/protocol/codec.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/src/window_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/core/tests/data/wire_layout_previous.txt`, `crates/master/src/queue.rs`, `crates/master/src/server/client_and_members.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/session.rs`, `crates/cli/src/cli_app/tasks.rs`, `crates/cli/src/mcp/status.rs`, `tests/window_v10_peers.rs`, `crates/cli/tests/test_status_cancelled_tasks.rs` | `1` failed and `1` cancelled task report `1` and `1` across `ClusterStatus`, `status --json`, `status`, and MCP `status`, v10 peers fold cleanly, and protocol 11 merges and releases | Partial |
-| NET-10 (wire follow-on) | Protocol 11 remote `ListCredits` / summary fields ([Design 0096](0096-contribution-credits.md)) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/codec.rs`, `crates/master/`, `crates/cli/` | Follow-on PR adds `NET-10` wire variants/fields on protocol `11`, extends `for_peer(10)`, refreshes `wire_layout.txt`, and passes CLI/cross-version tests | Planned |
-| ECO-9 (wire follow-on) | Protocol 11 participant/quota/priority CLI wire fields ([Design 0097](0097-per-participant-quotas.md)) | `crates/core/src/protocol.rs`, `crates/core/src/noise_auth.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/codec.rs`, `crates/master/`, `crates/cli/` | Follow-on PR adds `MemberEntry::participant`, `ClusterStatus` quota/wait fields, admin RPCs, and priority on protocol `11`, extends `for_peer(10)`, and passes tests | Planned |
+| NET-10 (wire follow-on) | Protocol 11 remote `ListCredits` / summary fields (Design 0096, [draft PR #379](https://github.com/DuongNAD/OxideSwarm/pull/379)) | `crates/core/src/protocol.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/codec.rs`, `crates/master/`, `crates/cli/` | Follow-on PR adds `NET-10` wire variants/fields on protocol `11`, extends `for_peer(10)`, refreshes `wire_layout.txt`, and passes CLI/cross-version tests | Planned |
+| ECO-9 (wire follow-on) | Protocol 11 participant/quota/priority CLI wire fields (Design 0097, [draft PR #384](https://github.com/DuongNAD/OxideSwarm/pull/384)) | `crates/core/src/protocol.rs`, `crates/core/src/noise_auth.rs`, `crates/core/src/protocol/client_resp_mirrors.rs`, `crates/core/src/protocol/codec.rs`, `crates/master/`, `crates/cli/` | Follow-on PR adds `MemberEntry::participant`, nested `ClusterStatus` participant usage/wait fields, admin RPCs, and priority task extension on protocol `11`, extends `for_peer(10)`, and passes tests | Planned |
 
 ## Status log
 
 - 2026-11-19: Claimed `design 0098` on the hub and wrote initial draft for the protocol `11` train base on branch `win/protocol-11-train` (`BUG-22` implemented on draft pull request; `NET-10` and `ECO-9` wire additions **Planned** on the same protocol `11` train).
+- 2026-11-19: Applied review fixes for draft PR #386: replaced links to draft-only designs 0096 and 0097 with PR URLs, clarified why `wire_layout_tests.rs` sets `failed_tasks: 0, cancelled_tasks: 1` for D7.2 folded byte comparison with `v0.4.4`, added `D2.1` guardrails for `NET-10` and `ECO-9` (use constants not literal `11`, reset trailing fields in `for_peer(10)`, `MembersList` legacy mirror + positional indices + `DIFFERS_FROM_PREVIOUS`, nest participant usage to avoid `running_tasks` collision, encode `SubmitTask` priority as a design 0082 task extension, append new variants last without `skip_serializing_if` on `Binary*`, keep `wire_layout_previous.txt` pinned at `v0.4.4`), and updated `CHANGELOG.md` for `0.3.0`/protocol 9 refusal and master-first upgrade order.

@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Wire change (protocol 11)
-- Bumped `PROTOCOL_VERSION_CURRENT` to `11` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `10` ([design 0098](docs/design/0098-protocol-11-train.md)), promoting release `v0.4.4`'s wire layout to `crates/core/tests/data/wire_layout_previous.txt` and preparing the shared protocol `11` train for Planned `NET-10` and `ECO-9` follow-on wire pull requests.
+- Bumped `PROTOCOL_VERSION_CURRENT` to `11` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `10` ([design 0098](docs/design/0098-protocol-11-train.md)), promoting release `v0.4.4`'s wire layout to `crates/core/tests/data/wire_layout_previous.txt` and preparing the shared protocol `11` train for Planned `NET-10` and `ECO-9` follow-on wire pull requests. `0.3.0` (`protocol 9`) workers and clients are now refused outside the `10..=11` window; operators must upgrade any remaining `proto:9` peers to `0.4.x` (`proto:10`) first, then upgrade and restart the master before rolling `proto:10` workers and clients (`DEPLOYMENT.md` section 3.5).
 - `BUG-22`: Added `cancelled_tasks: usize` to `ClientResponse::ClusterStatus`, `oxideswarm status`, `oxideswarm status --json`, and MCP `status` so cancelled tasks are counted apart from `failed_tasks` (while folding `cancelled_tasks` into `failed_tasks` for protocol `10` peers).
 
 ### Security
