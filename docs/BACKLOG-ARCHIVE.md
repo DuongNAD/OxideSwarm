@@ -2791,6 +2791,43 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   beacon only with `--master auto:<PORT>`. `crates/cli/tests/discovery_port_e2e.rs` runs two masters at
   once, one with the beacon off.
 
+### SEC-17: Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files
+
+- **Evidence:** Read in the review of pull request 352 (BUG-32). `path_starts_with_ci` canonicalises both
+  paths (`normalize_win_path`), so a junction in an ancestor folder (for example
+  `AppData\Local\OxideSwarm-USB` pointing elsewhere) is followed, and `is_reparse_point` checks only the
+  last folder (`crates/worker/src/isolation/windows/mod.rs`, `toolchain.rs`). `SetNamedSecurityInfoW`
+  then rewrites the DACL of the target. The same holds for the allowed entries that existed before
+  BUG-32, so it is not a regression. The marker `.oxideswarm-usb-workspaces` and `store.lock` are not
+  checked for hard links.
+- **Problem:** Only processes of the same user can create such a junction or link, and the
+  `oxideswarm.toolchain` capability gets only non-inherited traverse, so the impact is low. But the rule
+  "the worker rewrites a DACL only on its own folders" depends on it.
+- **Do:**
+  1. Before the rewrite, refuse a reparse point in every folder from the user home to the workspace
+     root.
+  2. Require `nlink == 1` for the marker and `store.lock` (`windows_file_identity`,
+     `crates/worker/src/blob_cache.rs`).
+  3. Add tests with a junction in an ancestor folder and with a hard-linked marker. Where the host
+     cannot create them, skip with a printed reason.
+- **Done when:** Those tests pass on `windows-latest` in CI.
+- **Implemented (2026-11-19, pull request 360, open):** `validate_workspace_root_safe` (and a second
+  `validate_workspace_root_ancestors_safe` check under `PREPARE_LOCK` right before `protect_sandbox_base`)
+  refuses `--workspace-root` itself and any symlink or NTFS junction along the raw, lexical, or canonical
+  paths whenever `--workspace-root` is under or resolves into `host.user_home` or `%USERPROFILE%`
+  (covering `BUG-32` USB-kit roots, pre-`BUG-32` allowed roots, redirected user home / `AppData\Local`
+  junctions with the `--workspace-root` target workaround documented in the refusal message,
+  `CHANGELOG.md`, and [design 0033](design/0033-os-level-task-isolation.md), and external junctions above
+  or pointing into home, while leaving roots completely outside home without an ancestor check), and
+  `check_single_link_regular_file` / `validate_single_link_file_info` open `.oxideswarm-usb-workspaces` and
+  `store.lock` with `FILE_FLAG_OPEN_REPARSE_POINT` and read `nNumberOfLinks == 1` directly from
+  `GetFileInformationByHandle` (so ReFS / Dev Drive / network volumes with zero volume serial or 64-bit file
+  index stay accepted and read failures report the OS cause); unit tests in
+  `crates/worker/src/isolation.rs` cover ancestor junctions, home/`AppData\Local` junctions and target
+  workarounds, external junctions above and into home, `nlink != 1` hard links, and zero-serial/index
+  handling (`SEC-18` tracks the remaining path-based `SetNamedSecurityInfoW` TOCTOU window, other root
+  entries, and separate-walk / `RUSTY_GRID_REQUIRE_*` proof tests).
+
 ## Phase 13: the path to finished
 
 Added on 2026-11-17 from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),

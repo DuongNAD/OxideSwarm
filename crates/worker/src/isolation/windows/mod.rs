@@ -33,7 +33,7 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use toolchain::protect_sandbox_base;
+use toolchain::{protect_sandbox_base, validate_workspace_root_ancestors_safe};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, SET_ACCESS};
 use windows_sys::Win32::Security::Isolation::{
@@ -61,6 +61,8 @@ pub use path::{
     worker_profile_prefix,
 };
 pub use spawn::{is_process_elevated, AppContainerChild};
+#[cfg(test)]
+pub(super) use toolchain::validate_single_link_file_info;
 pub use toolchain::{
     prepare_worker_toolchains, revoke_oxideswarm_toolchain_acls, revoke_toolchain_sid_on_tree,
     validate_protected_files_outside_toolchains, validate_sandbox_base_safe,
@@ -476,6 +478,8 @@ impl WindowsAppContainerGuard {
                 };
                 protect_sandbox_base(jail.sandbox_base, toolchain_sid.as_psid(), manifest_opt)?;
                 if let Some(ws_root) = jail.workspace_root {
+                    validate_workspace_root_ancestors_safe(ws_root, jail.host)
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                     protect_sandbox_base(ws_root, toolchain_sid.as_psid(), manifest_opt)?;
                 }
             }
