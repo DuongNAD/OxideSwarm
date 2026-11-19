@@ -84,3 +84,38 @@ directory.
 
 `tests/test_bench_sweep.py` covers the helpers, W1 and the local half of the harness without a binary. The CI job
 `agent bridge` runs it on Linux, macOS and Windows.
+
+## Task process time and slot use (record format 2, BENCH-9)
+
+From `record_format: 2`, every record adds process timing and slot utilization alongside the format-1 throughput
+and latency metrics (`--local-results` still accepts format-1 local records; those fields return `None`):
+
+| Scope | Field | Meaning |
+|---|---|---|
+| Local run and level | `task_time_mean_s`, `task_time_median_s` | Mean and median wall-clock seconds around `subprocess.run` over succeeded local tasks in that run or across measured runs at that parallelism level |
+| Grid run | `task_time_sum_s` | Sum of worker-reported `execution_time_ms / 1000` over all tasks in the run that returned a time (includes failed tasks, since their slots were occupied) |
+| Grid run | `task_time_missing` | Count of tasks in the run without a numeric `execution_time_ms` |
+| Grid run | `slot_seconds` | `total_slots * wall_s` — total slot-seconds the cluster offered during the run |
+| Grid run | `utilization` | `task_time_sum_s / slot_seconds` (fraction of offered slot-seconds spent inside task execution, or `null` when every row lacks `execution_time_ms`) |
+| Grid run and `grid` | `per_worker.<label>` | `tasks` (all rows for `<label>`), plus `mean_s` and `median_s` of worker-reported execution time over succeeded tasks (`checksum != null`) per neutral worker label (`worker-1`, `worker-2`, ...; across measured runs at top-level `grid.per_worker`) |
+| Grid `grid` | `utilization` | `summarize` (`median`, `min`, `max`, `runs`) of per-run `utilization` across the measured runs (`null` if no run had a timed task) |
+| Local and grid run | `competing_processes` | Low-rate background sampler (every 2 s) watching for `cargo` / `rustc` process names on the harness host only (a `cargo` run on a remote worker machine is not visible to it); records `watched`, `interval_s`, `samples`, `detections`, and `sightings` (`utc`, `processes` base names only) |
+
+Grid runs also print a second summary line right below the unchanged first summary line:
+
+```text
+slot utilization <pct> % (median of <runs>); mean task time: worker-1 <x> s, ...
+```
+
+**What these numbers show.** Comparing a worker label's grid `mean_s` (or `median_s`) with that machine's local
+`task_time_mean_s` at the same parallelism separates **per-task process slowdown** (for instance below-normal worker
+priority, CPU contention on the host, or thermal throttling) from **slot idle time** (`1 - utilization`).
+
+**What these numbers do not show.** `execution_time_ms` starts at the top of the worker's runner
+(`crates/worker/src/runner.rs`, `start_time`), so it includes `Sandbox::create` and staged/blob input placement
+into the sandbox (`crates/worker/src/runner/workloads.rs`) in addition to the child process, whereas fetching missing
+blobs from the master, harvesting artifacts and collecting output blobs, destroying the sandbox, uploading outputs,
+and sending `TaskResult` back sit outside `execution_time_ms`. `utilization` does not split non-execution
+slot-seconds among those stages, client `submit` CLI startup, master dispatch, or end-of-sweep tail drain. Both
+`execution_time_ms` and local `task_time_s` measure wall-clock seconds (including interpreter startup), not kernel
+user+sys CPU seconds.

@@ -13,6 +13,7 @@ import os
 import platform
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -151,18 +152,162 @@ class HelperTests(unittest.TestCase):
 
     def test_local_record_must_match_workload_and_units(self) -> None:
         sha = bench_sweep.file_sha256(bench_sweep.WORKLOAD)
-        rec = {"workload": {"units_per_task": 1000, "sha256": sha},
-               "local": {"best": {"tasks_per_s": {"median": 7.5}}},
-               "machine": {"os": {"system": "Darwin", "machine": "arm64"}, "hardware": {"cores": 10}}}
+        rec_v1 = {"record_format": 1,
+                  "workload": {"units_per_task": 1000, "sha256": sha},
+                  "local": {"best": {"parallelism": 10, "tasks_per_s": {"median": 7.5}}},
+                  "machine": {"os": {"system": "Darwin", "machine": "arm64"}, "hardware": {"cores": 10}}}
+        rec_v2 = {"record_format": 2,
+                  "workload": {"units_per_task": 1000, "sha256": sha},
+                  "local": {"best": {"parallelism": 10, "tasks_per_s": {"median": 7.5},
+                                     "task_time_mean_s": 1.32, "task_time_median_s": 1.31}},
+                  "machine": {"os": {"system": "Darwin", "machine": "arm64"}, "hardware": {"cores": 10}}}
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "mac.json")
-            Path(path).write_text(json.dumps(rec))
+            Path(path).write_text(json.dumps(rec_v1))
             got = bench_sweep.load_local_record(path, 1000, sha)
             self.assertEqual((got["best_tasks_per_s"], got["os"], got["cores"]), (7.5, "Darwin", 10))
+            self.assertEqual(got["best_parallelism"], 10)
+            self.assertIsNone(got["best_task_time_mean_s"])
+            self.assertIsNone(got["best_task_time_median_s"])
+
+            Path(path).write_text(json.dumps(rec_v2))
+            got_v2 = bench_sweep.load_local_record(path, 1000, sha)
+            self.assertEqual(got_v2["best_task_time_mean_s"], 1.32)
+            self.assertEqual(got_v2["best_task_time_median_s"], 1.31)
+
             with self.assertRaises(ValueError):
                 bench_sweep.load_local_record(path, 2000, sha)
             with self.assertRaises(ValueError):
                 bench_sweep.load_local_record(path, 1000, "0" * 64)
+
+    def test_summarize_task_times_and_local_run(self) -> None:
+        self.assertEqual(bench_sweep.summarize_task_times([]), {"tasks": 0, "mean_s": None, "median_s": None})
+        self.assertEqual(
+            bench_sweep.summarize_task_times([1.0, 2.0, 6.0]),
+            {"tasks": 3, "mean_s": 3.0, "median_s": 2.0},
+        )
+        rows = [
+            {"seed": 0, "checksum": "a" * 64, "task_time_s": 1.0},
+            {"seed": 1, "checksum": "b" * 64, "task_time_s": 3.0},
+            # Failed task excluded from task_time mean/median even if subprocess duration was recorded.
+            {"seed": 2, "checksum": None, "task_time_s": 99.0},
+        ]
+        summary = bench_sweep.summarize_local_run(rows, 2, 4.0)
+        self.assertEqual(summary["parallelism"], 2)
+        self.assertEqual(summary["tasks"], 3)
+        self.assertEqual(summary["wall_s"], 4.0)
+        self.assertAlmostEqual(summary["tasks_per_s"], 0.75)
+        self.assertEqual(summary["failed_tasks"], 1)
+        self.assertEqual(summary["task_time_mean_s"], 2.0)
+        self.assertEqual(summary["task_time_median_s"], 2.0)
+        with self.assertRaises(ValueError):
+            bench_sweep.summarize_local_run([], 1, 1.0)
+
+    def test_summarize_grid_run_and_detail_line(self) -> None:
+        rows = [
+            {"seed": 0, "checksum": "a" * 64, "worker": "worker-1", "submit_to_result_s": 2.1, "execution_time_ms": 1500},
+            {"seed": 1, "checksum": "b" * 64, "worker": "worker-1", "submit_to_result_s": 2.3, "execution_time_ms": 2500},
+            # Failed worker row: included in task_time_sum_s & tasks count, excluded from per_worker mean/median.
+            {"seed": 2, "checksum": None, "worker": "worker-1", "submit_to_result_s": 0.6, "execution_time_ms": 500},
+            {"seed": 3, "checksum": "c" * 64, "worker": "worker-2", "submit_to_result_s": 1.8, "execution_time_ms": 1200},
+            {"seed": 4, "checksum": None, "worker": None, "submit_to_result_s": 5.0, "execution_time_ms": None},
+        ]
+        # total_slots=10 differs from len(rows)=5 (ensures slot_seconds uses total_slots, not concurrency/task count).
+        run = bench_sweep.summarize_grid_run(rows, wall_s=4.0, total_slots=10)
+        self.assertEqual(run["tasks"], 5)
+        self.assertEqual(run["wall_s"], 4.0)
+        self.assertAlmostEqual(run["tasks_per_s"], 1.25)
+        self.assertEqual(run["failed_tasks"], 2)
+        self.assertEqual(run["tasks_per_worker"], {"worker-1": 3, "worker-2": 1, "none": 1})
+        self.assertAlmostEqual(run["submit_to_result_p50_s"], 2.1)
+        self.assertAlmostEqual(run["submit_to_result_max_s"], 5.0)
+        # Sum includes failed worker-1 500 ms slot time: (1.5 + 2.5 + 0.5 + 1.2) = 5.7 s
+        self.assertAlmostEqual(run["task_time_sum_s"], 5.7)
+        self.assertEqual(run["task_time_missing"], 1)
+        self.assertAlmostEqual(run["slot_seconds"], 40.0)
+        self.assertAlmostEqual(run["utilization"], 0.1425)
+        self.assertEqual(
+            run["per_worker"],
+            {
+                "none": {"tasks": 1, "mean_s": None, "median_s": None},
+                "worker-1": {"tasks": 3, "mean_s": 2.0, "median_s": 2.0},
+                "worker-2": {"tasks": 1, "mean_s": 1.2, "median_s": 1.2},
+            },
+        )
+        grid = {
+            "utilization": bench_sweep.summarize([run["utilization"], 0.17, 0.25]),
+            "per_worker": run["per_worker"],
+        }
+        line = bench_sweep.format_grid_detail_line(grid)
+        self.assertEqual(
+            line,
+            "slot utilization 17.0 % (median of 3); mean task time: none n/a, worker-1 2.000 s, worker-2 1.200 s",
+        )
+
+        # When every row lacks execution_time_ms, task_time_missing == len(rows) and utilization is None.
+        all_missing = [
+            {"seed": 0, "checksum": None, "worker": "worker-1", "submit_to_result_s": 1.0, "execution_time_ms": None},
+            {"seed": 1, "checksum": None, "worker": "worker-1", "submit_to_result_s": 2.0, "execution_time_ms": None},
+        ]
+        missing_run = bench_sweep.summarize_grid_run(all_missing, wall_s=2.0, total_slots=4)
+        self.assertEqual(missing_run["task_time_missing"], 2)
+        self.assertEqual(missing_run["task_time_sum_s"], 0.0)
+        self.assertIsNone(missing_run["utilization"])
+        self.assertEqual(
+            bench_sweep.format_grid_detail_line({"utilization": None, "per_worker": missing_run["per_worker"]}),
+            "slot utilization n/a (median of 0); mean task time: worker-1 n/a",
+        )
+        with self.assertRaises(ValueError):
+            bench_sweep.summarize_grid_run([], 1.0, 2)
+        with self.assertRaises(ValueError):
+            bench_sweep.summarize_grid_run(rows, 0.0, 2)
+        with self.assertRaises(ValueError):
+            bench_sweep.summarize_grid_run(rows, 1.0, 0)
+
+    def test_process_sampler_parses_names_only_and_records_sightings(self) -> None:
+        unix_ps = "/usr/bin/python3\n/Users/example/.cargo/bin/cargo\nrustc\n/bin/sh\n"
+        self.assertEqual(bench_sweep.parse_watched_processes(unix_ps, is_windows=False), ["cargo", "rustc"])
+
+        win_tasklist = (
+            '"python.exe","101","Console","1","12,000 K"\r\n'
+            '"cargo.exe","202","Console","1","45,000 K"\r\n'
+            '"clang.exe","303","Console","1","10,000 K"\r\n'
+        )
+        self.assertEqual(bench_sweep.parse_watched_processes(win_tasklist, is_windows=True), ["cargo"])
+
+        replies = iter([[], ["cargo"], ["cargo", "rustc"]])
+        sampler = bench_sweep.ProcessSampler(
+            probe_fn=lambda: next(replies, []),
+            now_fn=lambda: "2026-11-18T22:10:00Z",
+        )
+        sampler._poll_once()
+        sampler._poll_once()
+        sampler._poll_once()
+        summary = sampler.summary()
+        self.assertEqual(summary["watched"], ["cargo", "rustc"])
+        self.assertEqual(summary["interval_s"], 2.0)
+        self.assertEqual(summary["samples"], 3)
+        self.assertEqual(summary["detections"], 2)
+        self.assertEqual(
+            summary["sightings"],
+            [
+                {"utc": "2026-11-18T22:10:00Z", "processes": ["cargo"]},
+                {"utc": "2026-11-18T22:10:00Z", "processes": ["cargo", "rustc"]},
+            ],
+        )
+
+        deadline = time.monotonic() + 10.0
+        with bench_sweep.ProcessSampler(
+            interval_s=0.05,
+            probe_fn=lambda: ["cargo"],
+            now_fn=lambda: "2026-11-18T22:10:00Z",
+        ) as live:
+            while live.summary()["samples"] < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            live_summary = live.summary()
+        self.assertGreaterEqual(live_summary["samples"], 1)
+        self.assertGreaterEqual(live_summary["detections"], 1)
+        self.assertIsNone(live._thread)
 
 
 class LocalRunTests(unittest.TestCase):
@@ -174,6 +319,12 @@ class LocalRunTests(unittest.TestCase):
         for lvl in local["levels"]:
             self.assertEqual(lvl["warmup"]["tasks"], 3)
             self.assertEqual(len(lvl["runs"]), 1)
+            self.assertGreater(lvl["task_time_mean_s"], 0)
+            self.assertGreater(lvl["task_time_median_s"], 0)
+            self.assertGreater(lvl["runs"][0]["task_time_mean_s"], 0)
+            self.assertGreater(lvl["runs"][0]["task_time_median_s"], 0)
+            self.assertEqual(lvl["runs"][0]["competing_processes"]["watched"], ["cargo", "rustc"])
+            self.assertGreaterEqual(lvl["runs"][0]["competing_processes"]["samples"], 1)
         self.assertEqual(sums, {s: workload_cpu.run(s, 200) for s in (0, 1, 2)})
         self.assertIn(local["best"]["parallelism"], (1, 2))
 
@@ -187,15 +338,19 @@ class LocalRunTests(unittest.TestCase):
                                        "--runs", "1", "--bin", os.path.join(d, "absent")])
             self.assertEqual(rc, 0)
             rec = json.loads(out.getvalue())
+            self.assertEqual(rec["record_format"], 2)
             self.assertEqual(rec["cluster"]["mode"], "local only")
             self.assertIsNone(rec["grid"])
             self.assertIsNone(rec["scaling"])
             self.assertEqual(rec["failed_tasks"], 0)
             self.assertEqual(rec["workload"]["units_per_task"], 100)
+            self.assertGreater(rec["local"]["best"]["task_time_mean_s"], 0)
+            self.assertGreater(rec["local"]["best"]["task_time_median_s"], 0)
             path = os.path.join(d, "local.json")
             Path(path).write_text(json.dumps(rec))
             other = bench_sweep.load_local_record(path, 100, rec["workload"]["sha256"])
             self.assertGreater(other["best_tasks_per_s"], 0)
+            self.assertEqual(other["best_task_time_mean_s"], rec["local"]["best"]["task_time_mean_s"])
         self.assertIn("local only", err.getvalue())
 
     def test_main_refuses_a_record_without_a_plan_and_a_missing_binary(self) -> None:
