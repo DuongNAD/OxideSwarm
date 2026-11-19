@@ -224,7 +224,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | In | (design 0065) |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
@@ -257,6 +257,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
 | TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented | In | 361 (open) |
+| TEST-58 | Find why the keep_sandboxes sweep test fails on macOS | P2 | S |  |  | Implemented |  | 366 (open) |
 | TEST-57 | m2 capability stress test: wait for reconnects by condition, not a fixed 1.8 s window | P2 | S |  |  | Implemented |  | 365 (open) |
 | TEST-59 | Zero-duration task test: drop the 100 ms wall-clock window | P2 | S |  |  | Implemented |  | 365 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
@@ -368,6 +369,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 |
 | BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 |
 | BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 |
+| BUG-33 | macOS: the lifeline supervisor closes descriptors one by one up to the soft limit for every task | P2 | S |  |  | Implemented |  | 367 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Implemented |  | 323, 325, 331, (design 0088) |
@@ -405,7 +407,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376 (open), (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -504,6 +506,22 @@ The full suite must pass on a clean machine before CI can require it.
   4. For every failed check, open an item or write a failing regression test (rule 4).
 - **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
   `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
+- **Partial (2026-11-19, pull request 374):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
+  `sample`, Python 3 standard library only), `benchmarks/endurance/README.md`, and
+  `tests/test_endurance_harness.py` (`14/14` passed, wired into CI `agent-bridge`), and ran
+  loopback scenarios on Windows `x86_64` (`rusty-grid 0.4.3` at `a3e5b71`, Windows Defender
+  real-time protection on): `7/7` passed in `2,648.17 s`
+  (`benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`):
+  `T1` (`1 GiB` `10.033 s`, `3 GiB` `67.899 s`; peak RSS delta `-3.9 MiB` master / `-2.8 MiB`
+  worker / `+0.64 MiB` client vs `128 MiB` bound), `T2` (`20,000` files, `173,998,510 B`,
+  `233.124 s`, `20,001` blobs stored), `T3` (`1,000 MiB` output `10.757 s` ok; `1,100 MiB`
+  refused naming `--output-limit-mb`), `T4` (second `3 GiB` submit uploaded `0` blobs / `0 B`),
+  `T6` (`64 MiB` fetch cut via loopback proxy recovered cleanly in `4.440 s`, `0` `.part`
+  leftovers), `T7` (`256 MiB` in + `256 MiB` out over `2.0 Mbit/s` / `50 ms` RTT TCP finished in
+  `2,164.622 s` with `worker_reaped = false`), and `T8` (`--blob-store-mb 64` refused `72 MiB`
+  and concurrent `40 + 40 MiB` uploads naming `--blob-store-mb`, `0` tmp leftovers). `T1 (8 GiB)`,
+  `T2 (100,000 files)`, `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` links
+  remain for step 2.
 
 ### TEST-25: Run a cluster for 24 hours under load and faults
 
@@ -1908,6 +1926,15 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   (`doctor` check C7), the hours online, the tasks run, the credits shown and the controls set; the
   verification result of every task, with each mismatch explained; and what each participant found
   hard. It is the exit check of Stage 1 in design 0094.
+- **Partial (2026-11-19, pull request 376, open; item stays `Planned`):** Steps 1 and 4 done: committed
+  the campaign sheet and one-page participant guide (`benchmarks/campaigns/2026-11-pilot/README.md`), the
+  200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`, noting the
+  Anima Engine runner blocker and switching `--verify-file` to deterministic `out/smoke/verify_checksums.txt`),
+  `dry_run_manifest.json` + `standin_workload.py` for step 2 on `0.4.4`, the standard-library Python driver
+  (`benchmarks/campaigns/driver.py`), and `tests/test_campaign_driver.py` (wired in
+  `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local loopback
+  cluster on `dry_run_manifest.json`. Steps 2 (dry run) and 3 (pilot run, blocked on the Anima Engine
+  runner update as well as `NET-9` and `NET-10`) remain **Planned**.
 
 ## Status log
 
@@ -2365,6 +2392,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-57 and TEST-59 added and Implemented (pull request 365, open): `test_capability_queries_under_connect_disconnect_stress` (`tests/m2_challenger_2_stress.rs`) polls every `50 ms` up to `60 s` until `registrations >= 16` and each query count `> 50` instead of a fixed `1.8 s` sleep, and `test_tier2_bva_zero_duration_builtin_task_instant_completion` (`tests/e2e_cluster.rs`) checks task outcome, `0 ms` builtin stdout, and worker `execution_time_ms` while printing elapsed time instead of asserting `< 100 ms`; each passed `50/50` on Windows (`25` alone + `25` under 12 CPU busy loops); texts in the archive.
 - 2026-11-19: SEC-17 Implemented (pull request 360, open; text in the archive): `validate_workspace_root_safe` and a second `validate_workspace_root_ancestors_safe` check under `PREPARE_LOCK` right before `protect_sandbox_base` refuse reparse points on `--workspace-root` and along any raw, lexical, or canonical ancestor when `--workspace-root` is under or resolves into `host.user_home` or `%USERPROFILE%` (including external junctions above or pointing into home, while roots outside home keep no ancestor check and redirected home / `AppData\Local` junctions document the `--workspace-root` target workaround), and `.oxideswarm-usb-workspaces` and `store.lock` read `nNumberOfLinks == 1` directly from `GetFileInformationByHandle` (so ReFS / Dev Drive / network volumes stay accepted); remaining path-based `SetNamedSecurityInfoW` TOCTOU window and extra entries move to SEC-18.
 - 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
+- 2026-11-19: TEST-58 Implemented (pull request 366, open): `Sandbox::destroy`, `Drop for Sandbox`, and the sweep/retry lock-release paths in `crates/worker/src/sandbox.rs` now call `File::unlock()` (`LOCK_UN` on Unix) via `release_task_lock` before closing the descriptor, because a concurrent `fork()` (`process_tree.rs` `pre_exec` lifeline supervisor) inherits an open-file-description duplicate on which `close` alone leaves the `flock` held (`2/50` failures before the fix alongside concurrent `runner::*` tests; deterministic `test_keep_sandboxes_destroy_unlocks_even_with_inherited_lock_fd` fails before and passes after; `0/200` alone, `0/200` `sandbox::tests`, `0/200` concurrent with `runner::*`, and `0/20` full `rusty_grid_worker --lib`); text in the archive.
 - 2026-11-19: Phase 19 added from design 0094 (Draft): ECO-9, NET-9, NET-10 and APP-6, Planned and Out; Q94 to
   Q97 open. The recorded join from another network stays in ENROLL-1.
 - 2026-11-19: Q94 to Q97 decided by the owner at the recommended answers; design 0094 Accepted. ECO-9, NET-9,
@@ -2372,3 +2400,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: SEC-18 Implemented (pull request 372, open; text in the archive): `validate_workspace_root_entries_safe` and `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory `.locks`/workspace folders, and hard-linked `.locks/*` and `<ws>/{state.json,lock,state.json.tmp}` files; `open_verified_dacl_handle` and `set_protected_dacl_on_handle` verify `GetFileInformationByHandle` and `GetFinalPathNameByHandleW` against the lexical long path (`GetLongPathNameW`) before calling `SetSecurityInfo` on `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` handles; `check_chain_from_home` matches home only on `Normal` components (no bare `C:` CWD expansion); and tests prove each home walk independently, assert refusal texts, exercise `PREPARE_LOCK` / handle / metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
+- 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
+- 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
