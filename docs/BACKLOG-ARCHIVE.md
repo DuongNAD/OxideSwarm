@@ -1932,6 +1932,21 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   the tests set it to empty, and a new test sets it to 8088 and still sees `[SPLIT-BRAIN MASTER]`.
   The whole file passed (45, then 53 tests with pull request 261) with a real master on 8088.
 
+### TEST-31: Remove the race in the detached-grandchild Blender probe test
+
+- **Evidence:** Failed once on the ubuntu unit tests (pull request 238, before 2026-11-16).
+- **Problem:** The test in `crates/core/src/capabilities.rs` (script near line 3737) kills the
+  process group before the grandchild has called `setsid`, so the grandchild may still be in the
+  group.
+- **Do:** Have the script write a second file after `setsid`, and wait for it before the kill.
+- **Done when:** The test passes 200 times in a loop on Linux.
+- **Partial (2026-11-16, pull request 265):** the grandchild writes a ready marker after `setsid`
+  and the child waits for it (at most 5 s) before it exits; the Unix timeouts were widened
+  (2.5 s, 4 s, 10 s) because under load the script had not written its PID file within 800 ms.
+  50 local runs on macOS passed (30 with 12 CPU-burning processes). The 200-run loop on Linux of
+  "Done when" is not done.
+- **Implemented (2026-11-19, pull request 363, open):** Passed 200/200 runs (0 failures; 1,343.1 s elapsed across the two batches; plus a 1/1 smoke run beforehand in 6.65 s) on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `Python 3.11.2`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`): 100 alone runs (100/100 passed, 668.84 s) and 100 runs under 6 Python busy loops on 10 logical cores (about 60 %, 100/100 passed, 674.26 s). Together with the macOS runs (pull request 265), "Done when" passes on both Unix hosts.
+
 ### TEST-32: Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath`
 
 - **Evidence:** Reproduced 5 of 5 times on Windows (smoke test, finding F2).
