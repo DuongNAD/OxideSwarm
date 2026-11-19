@@ -248,7 +248,7 @@ The right column is a recommended default, not a decision. They are listed in
 - 2026-11-14: Draft created at the owner's request, after a progress check found that no test
   moves more than a few MiB through the blob path or runs for hours. It builds nothing. It adds
   TEST-24 to TEST-26 (Planned) and decisions Q57 to Q59.
-- 2026-11-19: TEST-24 step 1 Partial: added `benchmarks/endurance/endurance.py` (`transfer`,
+- 2026-11-19: TEST-24 step 1 Partial (pull request 374): added `benchmarks/endurance/endurance.py` (`transfer`,
   `throttle`, `sample`, stdlib only), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py`
   (`11/11`, wired into CI `agent-bridge`), and Windows `x86_64` loopback record
   `benchmarks/endurance/results/2026-11-19-loopback-windows-amd64-intel-core-i5-14600kf.json`

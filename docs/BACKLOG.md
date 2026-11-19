@@ -224,7 +224,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | (design 0065) |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
@@ -498,7 +498,7 @@ The full suite must pass on a clean machine before CI can require it.
   4. For every failed check, open an item or write a failing regression test (rule 4).
 - **Done when:** The records of T1 to T9 for loopback and for two machines are committed under
   `benchmarks/endurance/results/`, and every failed check has its own item or regression test.
-- **Partial (2026-11-19):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
+- **Partial (2026-11-19, pull request 374):** Added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`,
   `sample`, Python 3 standard library only), `benchmarks/endurance/README.md`, and
   `tests/test_endurance_harness.py` (`11/11` passed, wired into CI `agent-bridge`), and ran
   loopback scenarios on Windows `x86_64` (`rusty-grid 0.4.3` at `a3e5b71`, Windows Defender
@@ -2265,4 +2265,4 @@ Add one dated line per finished item, newest last.
   46 Out.
 - 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
 - 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
-- 2026-11-19: TEST-24 Partial (step 1, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 217 items, 146 Implemented, 18 Partial and 53 Planned; 25 open items In, 46 Out.
+- 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 217 items, 146 Implemented, 18 Partial and 53 Planned; 25 open items In, 46 Out.
