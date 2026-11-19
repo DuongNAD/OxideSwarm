@@ -2520,8 +2520,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
 - **Implemented (2026-11-19, pull request 365):** Polls `registry.counts()` and all four atomic
   query counters every `50 ms` up to `60 s` in `tests/m2_challenger_2_stress.rs` and prints
-  `stress_elapsed` and counts on completion or deadline expiry. On `DESKTOP-3EPV830` (`rustc 1.98.1`,
-  isolated `C:\ox_tmp\test-57-59`), `cargo test --locked -p rusty_grid_master --test m2_challenger_2_stress test_capability_queries_under_connect_disconnect_stress -- --exact`
+  `stress_elapsed` and counts on completion or deadline expiry. On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`,
+  a private folder), `cargo test --locked -p rusty_grid_master --test m2_challenger_2_stress test_capability_queries_under_connect_disconnect_stress -- --exact`
   passed `50/50` (`0` failures): `25/25` alone (wall `5.0398 / 5.1959 / 6.0501 s`, libtest
   `0.85 / 0.86 / 1.01 s`) and `25/25` under 12 CPU busy loops (`82.0%` host CPU; wall
   `5.6473 / 5.8747 / 6.6347 s`, libtest `1.00 / 1.02 / 1.45 s`). Workspace `cargo +1.96.0 fmt --all -- --check`
@@ -2541,7 +2541,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `50/50` (`25` alone and `25` under 12 CPU busy loops on 20 logical cores) on Windows.
 - **Implemented (2026-11-19, pull request 365):** Updated
   `test_tier2_bva_zero_duration_builtin_task_instant_completion` in `tests/e2e_cluster.rs` as planned.
-  On `DESKTOP-3EPV830` (`rustc 1.98.1`, isolated `C:\ox_tmp\test-57-59`),
+  On a Windows x86_64 machine (20 logical cores, `rustc 1.98.1`, a private folder),
   `cargo test --locked -p rusty_grid_cli --test e2e_cluster test_tier2_bva_zero_duration_builtin_task_instant_completion -- --exact`
   passed `50/50` (`0` failures): `25/25` alone (wall `6.5930 / 6.8475 / 9.2592 s`, libtest
   `0.58 / 0.60 / 1.15 s`) and `25/25` under 12 CPU busy loops (`90.0–97.0%` host CPU; wall
