@@ -129,10 +129,15 @@ pub fn command_in_own_process_group<S: AsRef<std::ffi::OsStr>>(
     cmd
 }
 
-/// Returns `true` if `pid` is present in `sys` and not in `ProcessStatus::Zombie`.
+/// Returns `true` if `pid` is present in `sys` and neither `Zombie` nor `Dead`.
 pub fn is_pid_alive(sys: &sysinfo::System, pid: u32) -> bool {
     sys.process(sysinfo::Pid::from(pid as usize))
-        .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+        .is_some_and(|p| {
+            !matches!(
+                p.status(),
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            )
+        })
 }
 
 /// Synchronously polls `pids_file` until `expected_count` distinct PIDs have been recorded.
@@ -213,10 +218,18 @@ pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duratio
     }
 
     sys.refresh_processes();
+    let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
         .copied()
         .filter(|&pid| is_pid_alive(sys, pid))
+        .collect();
+    let details: Vec<String> = survivors
+        .iter()
+        .map(|&pid| match sys.process(sysinfo::Pid::from(pid as usize)) {
+            Some(p) => format!("({pid}, {:?}, {:?})", p.status(), p.name()),
+            None => format!("({pid}, vanished)"),
+        })
         .collect();
 
     for &pid in &survivors {
@@ -227,8 +240,8 @@ pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duratio
 
     assert!(
         survivors.is_empty(),
-        "Orphaned descendant processes survived termination: {:?}",
-        survivors
+        "Orphaned descendant processes survived termination after {elapsed:?} (timeout {timeout:?}): {:?}",
+        details
     );
 }
 
@@ -246,10 +259,18 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
     }
 
     sys.refresh_processes();
+    let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
         .copied()
         .filter(|&pid| is_pid_alive(&sys, pid))
+        .collect();
+    let details: Vec<String> = survivors
+        .iter()
+        .map(|&pid| match sys.process(sysinfo::Pid::from(pid as usize)) {
+            Some(p) => format!("({pid}, {:?}, {:?})", p.status(), p.name()),
+            None => format!("({pid}, vanished)"),
+        })
         .collect();
 
     for &pid in &survivors {
@@ -260,8 +281,8 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
 
     assert!(
         survivors.is_empty(),
-        "Orphaned descendant processes survived termination: {:?}",
-        survivors
+        "Orphaned descendant processes survived termination after {elapsed:?} (timeout {timeout:?}): {:?}",
+        details
     );
 }
 
