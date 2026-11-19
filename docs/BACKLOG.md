@@ -1820,7 +1820,7 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
 
 ## Phase 18: 0.5.0, language model serving across machines
 
-Draft, added on 2026-11-19. The owner approved that day that the coordinator prepares release `0.5.0`
+Draft, added on 2026-11-19 (pull request 368). The owner approved that day that the coordinator prepares release `0.5.0`
 beside the stability release. The items come from
 [design 0038](design/0038-large-language-model-inference.md) (LLM-1 to LLM-5),
 [design 0056](design/0056-frontier-program.md) (LLM-6 to LLM-8, R14),
@@ -2702,7 +2702,7 @@ Add one dated line per finished item, newest last.
   46 Out.
 - 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
 - 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
-- 2026-11-19: Phase 18 added as a draft (draft pull request, not merged), from designs 0038, 0056, 0061,
+- 2026-11-19: Phase 18 added as a draft (pull request 368, draft), from designs 0038, 0056, 0061,
   0062, 0064 and 0067, at the coordinator's request after the owner approved on 2026-11-19 that release
   `0.5.0` is prepared beside the stability release: R21, APP-1, R22 (Partial: one record, pull request
   254), R14 to R18, FEAT-9b and LLM-1 to LLM-14, all Planned except R22 and all Out. No item is built
