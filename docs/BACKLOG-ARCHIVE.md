@@ -2444,6 +2444,51 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `crates/core/src/private_file.rs`; the full `rusty_grid_worker` lib suite passes on Windows 11
   Home.
 
+### TEST-56: Cut the time of `workspace tests (windows-latest)` without losing coverage
+
+- **Evidence:** `OxideSwarm_Agent_Hub` `test_runs/win2_test29_2026-11-19.md` (sections 4 and 5): across
+  35 completed `workspace tests (windows-latest)` CI jobs created on 2026-11-18, 34 passed (1
+  unrelated Dependabot `sysinfo` compile failure; 0 lost), with total job durations min `1,424 s`
+  (`23.7 min`), median `1,812.5 s` (`30.2 min`), max `2,586 s` (`43.1 min`), and Step 8 max `2,216 s`
+  (`36.9 min`).
+- **Problem:** Four test/workflow bottlenecks inflated Windows CI wall time: `test_dev_mode_watch_and_aliases`
+  ran `cargo check --workspace` over the whole repository twice; `serialization_benchmark` and
+  `serialization_benchmark_multi_size` ran thousands of `opt-level=0` loops and wall-clock throughput
+  asserts by default; `blob_upload_pipelining_e2e` and `blob_transfer_e2e` created/copied `10,000`
+  and `4,000` tiny files on NTFS; and Step 8 re-ran all 30 Windows `test_feat3_os_isolation` tests in
+  parallel after Step 7 had already executed them serially (`--test-threads=1`).
+- **Do:** Make the four targeted optimizations in order (`workflow_modes_test` single workspace check;
+  `OXIDESWARM_RUN_BENCHMARKS=1` gating on the serialization benchmarks; `1,600`-file `#[cfg(windows)]`
+  counts in the two blob e2e tests; and step-scoped `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8`
+  deduplication in Step 8 without `cargo-nextest` or new CI actions), then measure both local
+  binaries and the PR's `workspace tests (windows-latest)` job time.
+- **Done when:** The PR's `workspace tests (windows-latest)` job is faster than the `30.2 min` median
+  baseline with no test removed.
+- **Implemented (2026-11-19, pull request 361, open):**
+  1. `tests/workflow_modes_test.rs`: keeps `run_watch_check(&root)` once on the real workspace root
+     and exercises the `Dev` `"reload"` alias on a minimal 2-file temporary crate (`Cargo.toml` +
+     `src/lib.rs`). Local `workflow_modes_test` (21 tests): `59.08 s -> 29.98 s` `libtest`
+     (`64.80 s -> 37.23 s` warm wall-clock).
+  2. `crates/core/tests/serialization_benchmark.rs` and `serialization_benchmark_multi_size.rs`: keep
+     every round-trip, payload-size, and wire-discriminator assertion unconditional with compact
+     default iterations (`5`/`25` and `[20, 10, 5, 2]`), gating full loops (`5,000` and
+     `[2000, 1000, 500, 50]`) and wall-clock assertions behind `OXIDESWARM_RUN_BENCHMARKS=1`. Local:
+     `23.84 s -> 0.14 s` (`74.48 s -> 2.72 s` wall) and `37.64 s -> 1.77 s` (`47.75 s -> 4.14 s`
+     wall); both pass with `OXIDESWARM_RUN_BENCHMARKS=1` (`23.89 s` and `35.79 s` `libtest`).
+  3. `tests/blob_upload_pipelining_e2e.rs` and `tests/blob_transfer_e2e.rs`: keep `10,000` and `4,000`
+     under `#[cfg(not(windows))]` and use `1,600` under `#[cfg(windows)]` (`100x`
+     `MAX_IN_FLIGHT_REQUESTS = 16` with `proxy.peak() > 1`; `1,600 KiB` > `1 MiB` worker cache by
+     `576 KiB`). Local: `14.09 s -> 2.02 s` (`141.70 s -> 7.56 s` wall) and `68.73 s -> 30.19 s`
+     (`87.03 s -> 35.49 s` wall, 11/11 passed; pin test `64.34 s -> 28.43 s` `libtest`).
+  4. `crates/worker/tests/test_feat3_os_isolation.rs`, `.github/workflows/ci.yml`, and
+     `tests/test_launcher_scripts.py`: sets `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8` ONLY on
+     Windows CI Step 8 (never containing `"OXIDE"`, so `test_sec5_version_probes_strip_secrets` stays
+     clean) so all 30 `#[cfg(windows)]` tests print `skipped:` in Step 8 after Step 7 runs them
+     serially, while newly added binaries or unannotated tests still run; statically guarded in
+     `test_windows_ci_feat3_dedup_cannot_drop_step7_or_new_tests`. Local Step 8 mode: `66.85 s ->
+     0.00 s` `libtest` (`123.72 s -> 3.83 s` wall, 30/30 `skipped:`).
+  - **PR #361 CI result (`44437998772`, `windows-latest` job `135271584175`, green across all 3 OSes):** total job duration `1,416 s` (`23.60 min`, vs `30.2 min` median / `43.1 min` max baseline — `-6.6 min`), with Step 7 in `165 s` (`2.75 min`) and Step 8 in `1,149 s` (`19.15 min`).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with

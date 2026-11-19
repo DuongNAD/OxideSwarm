@@ -4,6 +4,11 @@
 //! - Measurable reduction in payload size (e.g. ~66% to ~78% on binary data buffers)
 //! - Measurable improvement in serialization and deserialization throughput
 //! - Bit-for-bit lossless roundtrip deserialization equivalence
+//!
+//! By default `cargo test` runs small iteration counts and skips the wall-clock timing
+//! comparison under `opt-level=0`, keeping correctness, payload-size, and framed wire
+//! assertions active. Set `OXIDESWARM_RUN_BENCHMARKS=1` to run the full 5,000-iteration
+//! benchmark loops and enforce timing assertions.
 
 use std::time::Instant;
 use uuid::Uuid;
@@ -11,10 +16,18 @@ use uuid::Uuid;
 use rusty_grid_core::protocol::{deserialize_message, serialize_message, MasterMessage, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 
-const BENCH_ITERATIONS: usize = 5_000;
+fn run_full_benchmarks() -> bool {
+    matches!(
+        std::env::var("OXIDESWARM_RUN_BENCHMARKS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
 
 #[test]
 fn test_task_spec_and_result_benchmark() {
+    let full_bench = run_full_benchmarks();
+    let warmup_iters: usize = if full_bench { 500 } else { 5 };
+    let bench_iters: usize = if full_bench { 5_000 } else { 25 };
     let worker_id = Uuid::new_v4();
     let task_id = TaskId::new();
 
@@ -61,21 +74,21 @@ fn test_task_spec_and_result_benchmark() {
     );
 
     // Warm-up
-    for _ in 0..500 {
+    for _ in 0..warmup_iters {
         let _ = bincode::serialize(&gpu_spec).unwrap();
         let _ = serde_json::to_vec(&gpu_spec).unwrap();
     }
 
     // Benchmark Bincode serialization
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _ = bincode::serialize(&gpu_spec).unwrap();
     }
     let bincode_ser_time = start.elapsed();
 
     // Benchmark JSON serialization
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _ = serde_json::to_vec(&gpu_spec).unwrap();
     }
     let json_ser_time = start.elapsed();
@@ -83,27 +96,29 @@ fn test_task_spec_and_result_benchmark() {
     let ser_speedup = json_ser_time.as_nanos() as f64 / bincode_ser_time.as_nanos().max(1) as f64;
     println!(
         "Bincode Ser Time: {:?} ({} iters)",
-        bincode_ser_time, BENCH_ITERATIONS
+        bincode_ser_time, bench_iters
     );
     println!(
         "JSON Ser Time:    {:?} ({} iters)",
-        json_ser_time, BENCH_ITERATIONS
+        json_ser_time, bench_iters
     );
     println!("Ser Speedup:      {:.2}x", ser_speedup);
-    assert!(
-        bincode_ser_time <= json_ser_time,
-        "Bincode serialization must be faster than or equal to JSON"
-    );
+    if full_bench {
+        assert!(
+            bincode_ser_time <= json_ser_time,
+            "Bincode serialization must be faster than or equal to JSON"
+        );
+    }
 
     // Benchmark Deserialization
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _: TaskSpec = bincode::deserialize(&bincode_gpu_bytes).unwrap();
     }
     let bincode_de_time = start.elapsed();
 
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _: TaskSpec = serde_json::from_slice(&json_gpu_bytes).unwrap();
     }
     let json_de_time = start.elapsed();
@@ -111,11 +126,11 @@ fn test_task_spec_and_result_benchmark() {
     let de_speedup = json_de_time.as_nanos() as f64 / bincode_de_time.as_nanos().max(1) as f64;
     println!(
         "Bincode De Time:  {:?} ({} iters)",
-        bincode_de_time, BENCH_ITERATIONS
+        bincode_de_time, bench_iters
     );
     println!(
         "JSON De Time:     {:?} ({} iters)",
-        json_de_time, BENCH_ITERATIONS
+        json_de_time, bench_iters
     );
     println!("De Speedup:       {:.2}x", de_speedup);
 
@@ -139,19 +154,19 @@ fn test_task_spec_and_result_benchmark() {
     assert!(bincode_res_bytes.len() <= json_res_bytes.len());
 
     // Warm-up
-    for _ in 0..500 {
+    for _ in 0..warmup_iters {
         let _ = bincode::serialize(&task_result).unwrap();
         let _ = serde_json::to_vec(&task_result).unwrap();
     }
 
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _ = bincode::serialize(&task_result).unwrap();
     }
     let bincode_res_ser_time = start.elapsed();
 
     let start = Instant::now();
-    for _ in 0..BENCH_ITERATIONS {
+    for _ in 0..bench_iters {
         let _ = serde_json::to_vec(&task_result).unwrap();
     }
     let json_res_ser_time = start.elapsed();

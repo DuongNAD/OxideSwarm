@@ -170,6 +170,7 @@ BENCH-3, TEST-23 and TEST-41 Partial; BUG-29 to BUG-32, BENCH-8, ADOPT-2 and TES
 BUG-32 and TEST-55 added. With MAINT-2 (pull requests 323, 325 and 331) and TEST-29 Implemented, SEC-16 Partial
 and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 Planned; 26 open items are In and
 46 are Out.
+Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged): 216 distinct items, 144 Implemented, 18 Partial and 54 Planned; 26 remaining open items are In and 46 are Out.
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
 "Pull requests" lists them by number, "(open)" marks one
@@ -255,6 +256,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
+| TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented | In | 361 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -2294,6 +2296,14 @@ Add one dated line per finished item, newest last.
   352. SEC-16 Partial: its cause is on record on both Windows machines, and none of the foreign grants is
   OxideSwarm's. Counted from the rows: 215 items, 143 Implemented, 18 Partial and 54 Planned; 26 open items In,
   46 Out.
+- 2026-11-19: TEST-56 added and Implemented (pull request 361, open): `workflow_modes_test` runs
+  `run_watch_check` on the full repo once (`reload` alias tested on a minimal temp crate),
+  `serialization_benchmark` and `serialization_benchmark_multi_size` run compact default loops and gate full
+  benchmarks and `opt-level=0` timing checks behind `OXIDESWARM_RUN_BENCHMARKS=1`, the two blob e2e tests
+  use `1,600` files under `#[cfg(windows)]`, and Windows CI Step 8 sets
+  `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8` so the 30 AppContainer tests print `skipped:` after Step 7
+  (`workspace tests (windows-latest)` `1,416 s` / `23.60 min` vs `30.2 min` median baseline); text in the
+  archive.
 - 2026-11-19: BENCH-9 row and texts updated after pull request 354 merged (duplicate rows and count lines from the
   merge removed). SEC-18 added from the review of pull request 360. BUG-22: owner decision recorded (next planned
   wire change). Counted from the rows: 216 items, 143 Implemented, 19 Partial and 54 Planned; 27 open items In,
