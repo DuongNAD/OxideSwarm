@@ -407,7 +407,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376, (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376, 383 (open), (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -1962,7 +1962,7 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local loopback
   cluster on `dry_run_manifest.json`. Steps 2 (dry run) and 3 (pilot run, blocked on the Anima Engine
   runner update as well as `NET-9` and `NET-10`) remain **Planned**.
-- **Partial, runner ready (2026-11-19; item stays `Planned`):** the runner is ready (Anima Engine pull
+- **Partial, runner ready (2026-11-19, pull request 383, open; item stays `Planned`):** the runner is ready (Anima Engine pull
   request 167, merge commit `963f436e` on `feat/ecological-selection`): `run_esel1_experiment --trial`
   takes the seed and the four grid parameters, stages no files, and writes a deterministic
   `out/trial/verify_checksums.txt`. The sheet and `manifest.json` pin that commit with `runner_ready: true`
@@ -2437,4 +2437,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
-- 2026-11-19: APP-6 stays Partial (item stays `Planned`): the runner is ready (Anima Engine pull request 167, merge commit `963f436e`); the pilot sheet and `manifest.json` moved to `run_esel1_experiment --trial` with `runner_ready: true` and `out/trial/verify_checksums.txt`, and record the owner's exception to Anima Engine rule `QĐ-OXS` for this pilot; steps 2 and 3 remain Planned.
+- 2026-11-19: APP-6 stays Partial (item stays `Planned`, pull request 383, open): the runner is ready (Anima Engine pull request 167, merge commit `963f436e`); the pilot sheet and `manifest.json` moved to `run_esel1_experiment --trial` with `runner_ready: true` and `out/trial/verify_checksums.txt`, and record the owner's exception to Anima Engine rule `QĐ-OXS` for this pilot; steps 2 and 3 remain Planned.
