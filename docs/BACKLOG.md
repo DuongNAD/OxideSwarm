@@ -57,7 +57,7 @@ These parts were checked and need no rework:
 6. Follow the wire rule in `CLAUDE.md`: a new variant or field goes into the public enum, both
    mirror enums and all four `From` impls.
 7. A change to behaviour, a CLI flag, a port, an environment variable or a default updates
-   `README.md` and gets a design record, in the same pull request.
+   `docs/reference.md` and gets a design record, in the same pull request.
 8. Never read or write the real `~/.oxideswarm`. Give child processes a temporary `HOME` and
    `USERPROFILE` with `Command::env`.
 9. Do not write "verified on hardware" without a dated record of the run.

@@ -6,7 +6,7 @@ marked "not implemented".
 
 To check that a release archive is intact and was built by this repository's workflow, and from which commit,
 compare it with `SHA256SUMS` and run `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm`
-([README, Install](../README.md#install)).
+([reference, Install](reference.md#install)).
 
 ## 1. In one paragraph
 
