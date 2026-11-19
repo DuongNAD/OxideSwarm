@@ -26,6 +26,11 @@
 - **Isolates tasks.** With `worker --isolation fs`, a task can write only its own sandbox and cannot
   read the cluster secret, on macOS, Linux and Windows.
 
+**Measured (2026-11-18):** a Mac and a Windows PC together ran the CPU workload W1 1.37 times as fast
+as the faster machine alone (0.73 of their combined local throughput), and all 360 results matched the
+local runs ([record](benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json),
+[method](benchmarks/sweep/README.md)).
+
 ## Install
 
 Download the archive for your system and `SHA256SUMS` from the
