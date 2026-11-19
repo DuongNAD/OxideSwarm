@@ -2582,9 +2582,13 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   tests in the same `rusty_grid_worker` test process concurrently spawn child tasks via
   `crates/worker/src/process_tree.rs` (`pre_exec` double-forks a detached lifeline supervisor), the forked
   children inherit duplicate descriptors pointing to the open file description (`O_CLOEXEC` only closes on
-  `execve`, not `fork`). On macOS (`RLIMIT_NOFILE = 1,048,575`, no `close_range`), each detached supervisor
-  closes up to `1,048,575` descriptors (`process_tree.rs:691-732`, `1034-1050`), widening the window during
-  which the child holds the inherited lock descriptor. Because `Sandbox::destroy` (`keep_sandboxes == true`
+  `execve`, not `fork`). On developer shells with `ulimit -n` at `1,048,576` (not macOS's default: `launchd`
+  defaults to `256` and `packaging/macos/com.oxideswarm.worker.plist` sets `65,536`), each detached
+  supervisor closes descriptors in ascending order (`0, 1, 2, ...`) up to `1,048,575` (`process_tree.rs:691-732`,
+  `1034-1050`); while ascending `close` drops the low-numbered lock fd early, iterating up to the soft limit
+  burns CPU across cores and widens the scheduling window during which newly forked children still hold the
+  inherited lock descriptor (confirmed by the PR 366 review run on `f0989363`: `4/30` failures at soft limit
+  `1,048,576`, `0/30` at `1,024`, and `0/40` after the fix). Because `Sandbox::destroy` (`keep_sandboxes == true`
   and `false`) and `Drop for Sandbox` only set `self.lock_file = None` (`close(fd)`) without calling
   `File::unlock()` (`LOCK_UN`), `close` left the `flock` held until the last child closed its duplicate,
   causing `sweep_leftover_sandboxes_sync` -> `open_and_try_lock_task` -> `try_lock()` to see `WouldBlock`
@@ -2600,9 +2604,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `Sandbox::destroy`, `Drop for Sandbox`, `Sandbox::create` error cleanup, `open_and_try_lock_task_with`,
   and `sweep_leftover_sandboxes_sync`, plus deterministic unit test
   `sandbox::tests::test_keep_sandboxes_destroy_unlocks_even_with_inherited_lock_fd` (confirmed to fail before
-  the fix at `sandbox.rs:2690:9` and pass after). Also confirmed the `process_tree.rs` macOS `max_nofile`
-  close-loop amplifier (left out of scope for this PR). Post-fix verification on Apple Silicon (10 cores,
-  private `HOME`): `0/200` failures alone, `0/200` across `sandbox::tests::`, `0/200` alongside the six
+  the fix at `sandbox.rs:2690:9` and pass after). The `process_tree.rs` macOS ascending close-loop CPU/wall
+  burn is tracked separately as `BUG-33`. Post-fix verification on Apple Silicon (10 cores, private `HOME`): `0/200` failures alone, `0/200` across `sandbox::tests::`, `0/200` alongside the six
   concurrent `runner::*` tests, and `0/20` across the full `rusty_grid_worker --lib` binary (304 tests/run).
 
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
