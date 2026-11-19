@@ -375,7 +375,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Implemented |  | 323, 325, 331, (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
-| ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR TBD), (design 0059) |
+| ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR 393), (design 0059) |
 | ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
@@ -1410,7 +1410,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
      people the owner has not helped before.
 - **Done when:** "Study records" holds at least three sessions of the first round with measures
   M15 to M17. The item is Partial from then until the second round is recorded.
-- **Status (2026-11-19, Planned):** study kit ready (PR TBD): `docs/study/2026-11-adopt-1/` (English and Vietnamese participant guide, facilitator sheet, consent template, and round-one record procedure), `scripts/study_timer.py` (`P1`–`P5` labels only, standard library), and `tests/test_study_timer.py` (wired into CI `agent-bridge`); no session has run yet and nothing in the kit is a result.
+- **Status (2026-11-19, Planned):** study kit ready (PR 393): `docs/study/2026-11-adopt-1/` (English and Vietnamese participant guide, facilitator sheet, consent template, and round-one record procedure), `scripts/study_timer.py` (`P1`–`P5` labels only, standard library), and `tests/test_study_timer.py` (wired into CI `agent-bridge`); no session has run yet and nothing in the kit is a result.
 
 ### ADOPT-3: Install scripts and the scripted time to first result
 
@@ -2415,4 +2415,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
 - 2026-11-19: APP-6 stays Partial (item stays `Planned`, pull request 383, open): the runner is ready (Anima Engine pull request 167, merge commit `963f436e`); the pilot sheet and `manifest.json` moved to `run_esel1_experiment --trial` with `runner_ready: true` and `out/trial/verify_checksums.txt`, and record the owner's exception to Anima Engine rule `QĐ-OXS` for this pilot; steps 2 and 3 remain Planned.
-- 2026-11-19: ADOPT-1 stays `Planned` (study kit ready, pull request TBD, open): added `docs/study/2026-11-adopt-1/` (English/Vietnamese participant guide, facilitator sheet, consent template, and round-one record guide), `scripts/study_timer.py`, and `tests/test_study_timer.py` (CI `agent-bridge`); no round-one session has run yet.
+- 2026-11-19: ADOPT-1 stays `Planned` (study kit ready, pull request 393, open): added `docs/study/2026-11-adopt-1/` (English/Vietnamese participant guide, facilitator sheet, consent template, and round-one record guide), `scripts/study_timer.py`, and `tests/test_study_timer.py` (CI `agent-bridge`); no round-one session has run yet.
