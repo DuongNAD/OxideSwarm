@@ -406,7 +406,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | TBD (open), (design 0096), (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | (design 0094) |
 
 ## Phase 0: integrate open work
@@ -1905,6 +1905,13 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   used match the run times of their tasks, contributed minus used sums to zero over all
   participants, the numbers survive a master restart with `--state-dir`, and the ledger stays within
   its bound.
+- **Design (2026-11-19, pull request #TBD, draft):** [Design 0096](design/0096-contribution-credits.md)
+  covers the bounded ledger, shared `UsageRecord` envelope with LLM-10, double-entry zero-sum
+  conservation, rollover compaction, and Q96/Q39 display-only rules. Showing credits in
+  `oxideswarm members list` and `oxideswarm status` requires a `ClientResponse` wire change (at
+  protocol `10`, `MembersList` and `ClusterStatus` carry fixed positional bincode fields with no
+  credit slots), so implementation stops at the design record awaiting coordinator decision on
+  bundling with BUG-22 and ECO-9.
 
 ### APP-6: Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified
 
@@ -2402,3 +2409,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: NET-10 Planned ([design 0096](design/0096-contribution-credits.md), draft pull request TBD): wrote design record (`crates/master/src/credits.rs` bounded append-only ledger sharing `UsageRecord` with LLM-10, double-entry zero-sum accounting, rollover compaction); stopped before code because showing credits in `oxideswarm members list` / `oxideswarm status` requires a `ClientResponse` wire change, awaiting coordinator decision on bundling with BUG-22 and ECO-9.
