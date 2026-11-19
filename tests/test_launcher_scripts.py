@@ -3563,6 +3563,69 @@ public class Program {
             )
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_windows_ci_feat3_dedup_cannot_drop_step7_or_new_tests(self):
+        ci_text = read(os.path.join(ROOT, ".github", "workflows", "ci.yml"))
+        step7_marker = "- name: Windows AppContainer isolation tests (--test-threads=1 --nocapture)"
+        step8_marker = "- name: cargo test --workspace --locked --no-fail-fast"
+        diag_marker = "- name: Diagnostics after the workspace tests"
+        self.assertIn(step7_marker, ci_text)
+        self.assertIn(step8_marker, ci_text)
+        self.assertIn(diag_marker, ci_text)
+
+        step7_idx = ci_text.index(step7_marker)
+        step8_idx = ci_text.index(step8_marker)
+        diag_idx = ci_text.index(diag_marker, step8_idx)
+        self.assertLess(step7_idx, step8_idx)
+
+        step7_block = ci_text[step7_idx:step8_idx]
+        step8_block = ci_text[step8_idx:diag_idx]
+
+        self.assertIn("matrix.os == 'windows-latest'", step7_block)
+        self.assertIn(
+            "cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --test-threads=1 --nocapture",
+            step7_block,
+        )
+        # Skip variable may only exist as an uncommented env entry inside Step 8 and never globally or in Step 7.
+        non_comment_ci = "\n".join(
+            line for line in ci_text.splitlines() if not line.lstrip().startswith("#")
+        )
+        step7_non_comment = "\n".join(
+            line for line in step7_block.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertEqual(non_comment_ci.count("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8"), 1)
+        self.assertNotIn("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8", step7_non_comment)
+        self.assertIn(
+            "OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8: ${{ matrix.os == 'windows-latest' && '1' || '' }}",
+            step8_block,
+        )
+
+        run_line = next(
+            (line.strip() for line in step8_block.splitlines() if line.strip().startswith("run:")),
+            "",
+        )
+        self.assertIn("cargo test --workspace --locked --no-fail-fast", run_line)
+        self.assertNotIn("--exclude", run_line)
+        self.assertNotIn("--skip", run_line)
+
+        iso_text = read(
+            os.path.join(ROOT, "crates", "worker", "tests", "test_feat3_os_isolation.rs")
+        )
+        win_start = iso_text.index("#[cfg(windows)]\nmod windows {")
+        fallback_start = iso_text.index(
+            "#[cfg(not(any(target_os = \"macos\", target_os = \"linux\", windows)))]",
+            win_start,
+        )
+        win_mod = iso_text[win_start:fallback_start]
+        tests = list(re.finditer(r"(?m)^    async fn (test_[A-Za-z0-9_]+)\(\)\s*\{", win_mod))
+        self.assertGreaterEqual(len(tests), 30)
+        for m in tests:
+            body_head = win_mod[m.end() : m.end() + 120]
+            self.assertIn(
+                "skip_if_duplicate_ci_pass!();",
+                body_head,
+                f"Windows isolation test {m.group(1)} must start with skip_if_duplicate_ci_pass!();",
+            )
+
 
 class WindowsOxctlStopTests(unittest.TestCase):
     """BUG-23: windows/oxctl.ps1 asks a tracked process to stop with a console Ctrl+C first.

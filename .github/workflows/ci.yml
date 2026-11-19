@@ -193,9 +193,14 @@ jobs:
       # TEST-29: windows-latest twice lost its runner at the 60-minute mark here, with no log left.
       # The step stops at 45 minutes, so the job ends (and keeps its log) before that mark; the wrapper
       # prints a heartbeat line with the last output line once a minute and keeps a copy of the output
-      # for the diagnostics step below. The command and what it tests are unchanged.
+      # for the diagnostics step below. The command and what it tests are unchanged; TEST-56 sets
+      # step-scoped OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1 only here on Windows so the 30 tests
+      # already run serially in the step above print a skip notice while any newly added target or
+      # test function still compiles and runs.
       - name: cargo test --workspace --locked --no-fail-fast
         timeout-minutes: 45
+        env:
+          OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8: ${{ matrix.os == 'windows-latest' && '1' || '' }}
         run: python scripts/ci_heartbeat.py --log "${{ runner.temp }}/workspace-tests.log" --interval 60 -- cargo test --workspace --locked --no-fail-fast
       - name: Diagnostics after the workspace tests (process tree, memory, output tail)
         if: always() && runner.os == 'Windows'

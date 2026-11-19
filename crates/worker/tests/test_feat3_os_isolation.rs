@@ -10,6 +10,13 @@
 //! `RUSTY_GRID_REQUIRE_APPCONTAINER=1` (set in CI) likewise turns any missing host precondition
 //! into a failure via `cannot_run`.
 //!
+//! `OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1` (set ONLY on Windows CI's Step 8
+//! `cargo test --workspace` invocation after Step 7 has already executed
+//! `test_feat3_os_isolation` serially with `--test-threads=1 --nocapture`) lets the existing
+//! `#[cfg(windows)]` AppContainer tests return early with a printed `skipped:` notice so Step 8
+//! still builds and executes the target without repeating the AppContainer run. Any newly added
+//! test target or unannotated test still runs normally.
+//!
 //! Every test uses a temporary `HOME` / `USERPROFILE` (with a dummy `.oxideswarm/cluster.secret`
 //! and `.ssh/test_key`), its own sandbox base and loopback ports; nothing touches the developer's
 //! real `~/.oxideswarm`. The real Rust toolchain is only read.
@@ -3041,6 +3048,31 @@ mod windows {
         eprintln!("skipped: {why}");
     }
 
+    /// Windows CI runs `test_feat3_os_isolation` serially in its own step (`--test-threads=1`)
+    /// before `cargo test --workspace` (Step 8). Step 8 sets
+    /// `OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1` on itself so these already-run Windows tests
+    /// print a skip notice without excluding the binary or masking any newly added target or test.
+    fn skip_duplicate_ci_workspace_pass() -> bool {
+        if matches!(
+            std::env::var("OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            eprintln!(
+                "skipped: already executed in Windows AppContainer isolation step (OXIDESWARM_SKIP_FEAT3_OS_ISOLATION_STEP8=1)"
+            );
+            return true;
+        }
+        false
+    }
+
+    macro_rules! skip_if_duplicate_ci_pass {
+        () => {
+            if skip_duplicate_ci_workspace_pass() {
+                return;
+            }
+        };
+    }
+
     fn win_task(rig: &Rig, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
         let mut env = rig.env();
         for (k, v) in extra_env {
@@ -3121,6 +3153,7 @@ function Compile-CSharp([string]$code) {
 
     #[tokio::test]
     async fn test_off_leaves_the_owners_files_readable_as_a_control() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Off, false);
         let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
         let got = lines(&result);
@@ -3136,6 +3169,7 @@ function Compile-CSharp([string]$code) {
 
     #[tokio::test]
     async fn test_fs_confines_a_task_to_its_sandbox() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let rig = Rig::new(level, false);
@@ -3161,6 +3195,7 @@ function Compile-CSharp([string]$code) {
 
     #[tokio::test]
     async fn test_fs_holds_when_the_sandbox_base_lives_inside_the_denied_home() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, true);
         let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
         assert!(
@@ -3173,6 +3208,7 @@ function Compile-CSharp([string]$code) {
 
     #[tokio::test]
     async fn test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes() {
+        skip_if_duplicate_ci_pass!();
         let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
         let script = r#"
 [Console]::Out.WriteLine('TASK_STARTED')
@@ -3281,6 +3317,7 @@ for ($i = 0; $i -lt 300; $i++) {
 
     #[tokio::test]
     async fn test_environment_is_moved_into_the_sandbox_and_ipc_sockets_are_removed() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let task = win_cmd_task(
             &rig,
@@ -3339,6 +3376,7 @@ for ($i = 0; $i -lt 300; $i++) {
 
     #[tokio::test]
     async fn test_fs_net_refuses_tcp_connections_and_fs_allows_them() {
+        skip_if_duplicate_ci_pass!();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
@@ -3895,6 +3933,7 @@ try {
 
     #[tokio::test]
     async fn test_cargo_build_offline_works_under_fs() {
+        skip_if_duplicate_ci_pass!();
         let staged = staged_toolchain();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let mut rig = Rig::new(level, false);
@@ -3968,6 +4007,7 @@ try {
 
     #[tokio::test]
     async fn test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home() {
+        skip_if_duplicate_ci_pass!();
         let staged = staged_toolchain();
         let mut rig = Rig::new(IsolationLevel::Fs, false);
         rig.host.user_home = staged.user_home.clone();
@@ -4052,6 +4092,7 @@ try {
 
     #[tokio::test]
     async fn test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it() {
+        skip_if_duplicate_ci_pass!();
         let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
 
         // Cancellation.
@@ -4102,6 +4143,7 @@ try {
 
     #[tokio::test]
     async fn test_self_check_accepts_both_levels_on_windows() {
+        skip_if_duplicate_ci_pass!();
         let base = tempfile::tempdir().unwrap();
         for level in [
             IsolationLevel::Off,
@@ -4120,6 +4162,7 @@ try {
 
     #[tokio::test]
     async fn test_a_missing_program_fails_the_task_with_a_clear_message() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let task = Task::new(
             TaskSpec::command("no-such-program-feat3", vec![]),
@@ -4137,6 +4180,7 @@ try {
 
     #[tokio::test]
     async fn test_worker_only_environment_variables_do_not_reach_a_confined_task() {
+        skip_if_duplicate_ci_pass!();
         assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
         let script = r#"echo TASK_STARTED& (if defined CARGO_PKG_NAME (echo WORKER_VAR=%CARGO_PKG_NAME%) else (echo WORKER_VAR=unset))& (if defined PATH (echo PATH_SET=yes) else (echo PATH_SET=no))& (if defined T_BASE (echo TASK_VAR=yes) else (echo TASK_VAR=no))& (if defined RUSTY_GRID_TASK_ID (echo ID=yes) else (echo ID=no))"#;
         let control_rig = Rig::new(IsolationLevel::Off, false);
@@ -4178,6 +4222,7 @@ try {
     /// (`\Sessions\<id>\AppContainerNamedObjects\<TaskAppContainerSid>`).
     #[tokio::test]
     async fn test_host_named_pipes_cannot_be_connected_to_under_fs() {
+        skip_if_duplicate_ci_pass!();
         let pipe_name = format!(
             "oxideswarm-feat3-pipe-{}-{}",
             std::process::id(),
@@ -4339,6 +4384,7 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     /// processes.
     #[tokio::test]
     async fn test_a_task_cannot_signal_or_inspect_foreign_processes() {
+        skip_if_duplicate_ci_pass!();
         let mut victim = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
             .args(["/C", "ping -n 120 127.0.0.1 >nul"])
             .spawn()
@@ -4504,6 +4550,7 @@ try {{
     /// with `CREATE_NEW_CONSOLE`.
     #[tokio::test]
     async fn test_console_and_terminal_injection_is_blocked() {
+        skip_if_duplicate_ci_pass!();
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         let mut console_helper = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
@@ -4593,6 +4640,7 @@ public static class WinConsoleProbe {{
     /// by a confined AppContainer task, while `HKLM` system keys remain readable.
     #[tokio::test]
     async fn test_registry_of_the_owner_is_neither_read_nor_written() {
+        skip_if_duplicate_ci_pass!();
         let pid = std::process::id();
         let read_key = format!(r"HKCU\Software\OxideSwarmFeat3Read_{pid}");
         let write_key = format!(r"HKCU\Software\OxideSwarmFeat3Write_{pid}");
@@ -4680,6 +4728,7 @@ public static class WinConsoleProbe {{
     /// `Fs` and `FsNet` cannot read it, then restores the clipboard.
     #[tokio::test]
     async fn test_clipboard_is_not_readable() {
+        skip_if_duplicate_ci_pass!();
         let marker = format!("feat3c-clip-marker-{}", rusty_grid_core::TaskId::new().0);
         let clip_helper = format!(
             r#"{WIN_CSHARP_HELPER}
@@ -4861,6 +4910,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     /// `%LOCALAPPDATA%\Packages\oxideswarm.task.<worker8>.<run_token>` when each attempt finishes.
     #[tokio::test]
     async fn test_appcontainer_profile_is_deleted_on_cleanup() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let task = win_cmd_task(
             &rig,
@@ -4968,6 +5018,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     ///    the worker refuses to start at `verify_isolation_support_with_config`.
     #[tokio::test]
     async fn test_a_secret_file_outside_the_home_is_unreadable_to_a_task() {
+        skip_if_duplicate_ci_pass!();
         let outside = tempfile::tempdir().unwrap();
         let etc_dir =
             rusty_grid_worker::isolation::windows::normalize_win_path(outside.path()).join("etc");
@@ -5131,6 +5182,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     /// and `<base>/other_task` are NOT modified and the task CANNOT read files inside them.
     #[tokio::test]
     async fn test_attack_task_chosen_cargo_and_rustup_home_never_modifies_dacls_or_leaks() {
+        skip_if_duplicate_ci_pass!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let rig = Rig::new(level, false);
             rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
@@ -5215,6 +5267,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     /// that does run (`TASK_STARTED`) cannot read `secret.txt`.
     #[tokio::test]
     async fn test_attack_task_chosen_program_path_never_modifies_dacl_or_leaks_sibling_secret() {
+        skip_if_duplicate_ci_pass!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let rig = Rig::new(level, false);
             let custom_dir =
@@ -5301,6 +5354,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     ///    neither `.ssh`'s nor `cluster.secret`'s DACL is modified.
     #[tokio::test]
     async fn test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret() {
+        skip_if_duplicate_ci_pass!();
         let script = format!(
             r#"{WIN_CSHARP_HELPER}
 [Console]::Out.WriteLine('TASK_STARTED')
@@ -5592,6 +5646,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
     ///    subsequent task on the same `TaskRunner` cannot read either secret.
     #[tokio::test]
     async fn test_attack_secret_replaced_by_rename_stays_unreadable_and_revoke_cleans_up() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let orig_base_sddl = rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&rig.base)
             .expect("orig_base_sddl");
@@ -5741,6 +5796,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
     /// lists every recorded ACL grant and `SDDL|` restore entry without modifying DACLs on disk.
     #[tokio::test]
     async fn test_revoke_isolation_acls_script_dry_run_lists_recorded_grants() {
+        skip_if_duplicate_ci_pass!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let cargo_cred = rig.host.cargo_home.join("credentials.toml");
         std::fs::write(&cargo_cred, "token = \"dryrun-test\"").unwrap();
@@ -6289,6 +6345,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
     #[tokio::test]
     async fn test_confined_workspace_task_writes_own_tree_and_tmp_but_not_other_workspaces() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         assert_windows_workspace_confinement(IsolationLevel::Off, false).await;
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
@@ -6299,6 +6356,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
     #[tokio::test]
     async fn test_workspace_tree_swap_is_denied_and_never_touches_victim() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             assert_windows_workspace_tree_swap_regression(level).await;
@@ -6307,6 +6365,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
     #[tokio::test]
     async fn test_worker_with_default_sandbox_base_inside_user_home_starts_and_runs_under_fs() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         let temp_home = tempfile::tempdir().expect("temp home");
         let rustup_home = temp_home.path().join(".rustup");
@@ -6385,6 +6444,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
     /// `0xC0000142` / `STATUS_DLL_INIT_FAILURE` inside a Windows AppContainer) and exit 0.
     #[tokio::test]
     async fn test_bare_whoami_succeeds_under_isolation_fs() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         let rig = Rig::new(IsolationLevel::Fs, false);
         let mut env = HashMap::new();
@@ -6440,6 +6500,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
     /// `../decoy.exe` must be refused without ever spawning an executable outside the sandbox.
     #[tokio::test]
     async fn test_windows_relative_staged_executables_across_isolation_modes() {
+        skip_if_duplicate_ci_pass!();
         use rusty_grid_core::task::StagedFile;
 
         let bin_dir = tempfile::tempdir().expect("bin_dir");
@@ -6585,6 +6646,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
     #[tokio::test]
     async fn test_extra_read_only_dir_inside_home_is_readable_while_secrets_stay_denied() {
+        skip_if_duplicate_ci_pass!();
         require_appcontainer!();
         let temp_home = tempfile::tempdir().expect("temp home");
         let outside = tempfile::tempdir().expect("outside");
