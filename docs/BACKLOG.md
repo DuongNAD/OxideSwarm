@@ -408,7 +408,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376 (open), (design 0094) |
+| APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376, 383 (open), (design 0094) |
 
 ## Phase 0: integrate open work
 
@@ -1927,7 +1927,7 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   (`doctor` check C7), the hours online, the tasks run, the credits shown and the controls set; the
   verification result of every task, with each mismatch explained; and what each participant found
   hard. It is the exit check of Stage 1 in design 0094.
-- **Partial (2026-11-19, pull request 376, open; item stays `Planned`):** Steps 1 and 4 done: committed
+- **Partial (2026-11-19, pull request 376, merged; item stays `Planned`):** Steps 1 and 4 done: committed
   the campaign sheet and one-page participant guide (`benchmarks/campaigns/2026-11-pilot/README.md`), the
   200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`, noting the
   Anima Engine runner blocker and switching `--verify-file` to deterministic `out/smoke/verify_checksums.txt`),
@@ -1936,6 +1936,14 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local loopback
   cluster on `dry_run_manifest.json`. Steps 2 (dry run) and 3 (pilot run, blocked on the Anima Engine
   runner update as well as `NET-9` and `NET-10`) remain **Planned**.
+- **Partial, runner ready (2026-11-19, pull request 383, open; item stays `Planned`):** the runner is ready (Anima Engine pull
+  request 167, merge commit `963f436e` on `feat/ecological-selection`): `run_esel1_experiment --trial`
+  takes the seed and the four grid parameters, stages no files, and writes a deterministic
+  `out/trial/verify_checksums.txt`. The sheet and `manifest.json` pin that commit with `runner_ready: true`
+  and `--verify-file out/trial/verify_checksums.txt`; the organiser fills in the per-system runner hashes
+  before the dry run. The owner allowed this pilot on invited participants' machines as an exception to
+  Anima Engine's rule `QĐ-OXS` (2026-11-19). `driver.py` stages a `windows/...` runner as
+  `run_esel1_experiment.exe`. Steps 2 and 3 remain **Planned** (step 3 waits for `NET-9` and `NET-10`).
 
 ## Status log
 
@@ -2405,3 +2413,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
+- 2026-11-19: APP-6 stays Partial (item stays `Planned`, pull request 383, open): the runner is ready (Anima Engine pull request 167, merge commit `963f436e`); the pilot sheet and `manifest.json` moved to `run_esel1_experiment --trial` with `runner_ready: true` and `out/trial/verify_checksums.txt`, and record the owner's exception to Anima Engine rule `QĐ-OXS` for this pilot; steps 2 and 3 remain Planned.
