@@ -518,7 +518,7 @@ async fn test_m5_mapreduce_worker_crash_during_map_phase_rescheduled() {
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-1", 2, false);
-    let _w2 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-2", 2, false);
+    let w2 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-2", 2, false);
 
     wait_for_workers(&master, 2).await;
 
@@ -550,36 +550,38 @@ done"#;
     let master_clone = master.clone();
     let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
-    // Wait up to TEST_WAIT_TIMEOUT until a map task is actively running on W1, then terminate W1
-    let mut aborted = false;
+    // Wait up to TEST_WAIT_TIMEOUT until a map task is actively running on either worker, then terminate that worker
+    let mut aborted_worker = None;
     let start = Instant::now();
     while start.elapsed() < TEST_WAIT_TIMEOUT {
         if job_fut.is_finished() {
             break;
         }
         let tasks = master.list_tasks().await.unwrap_or_default();
-        if tasks
-            .iter()
-            .any(|t| t.assigned_worker_id == Some(w1.worker_id) && t.state == TaskState::Running)
-        {
-            w1.abort();
-            aborted = true;
+        if let Some(victim) = [&w1, &w2].into_iter().find(|worker| {
+            tasks.iter().any(|t| {
+                t.assigned_worker_id == Some(worker.worker_id) && t.state == TaskState::Running
+            })
+        }) {
+            victim.abort();
+            aborted_worker = Some(victim.worker_id);
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    if !aborted {
+    if aborted_worker.is_none() {
         let summary = task_summary(&master).await;
         panic!(
-            "did not observe a Running map task on w1 ({}) within {}s (job_finished={}); tasks={summary:?}",
+            "did not observe a Running map task on either worker ({}, {}) within {}s (job_finished={}); tasks={summary:?}",
             w1.worker_id,
+            w2.worker_id,
             TEST_WAIT_TIMEOUT.as_secs(),
             job_fut.is_finished()
         );
     }
 
-    // Await job completion — worker 2 should take over and complete the job
+    // Await job completion — the surviving worker should take over and complete the job
     let res = await_mapreduce_handle(&master, job_fut, "map_fault_tolerance_job").await;
 
     assert_eq!(res.status, "Completed");
@@ -613,7 +615,7 @@ async fn test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-redcrash-1", 2, false);
-    let _w2 = spawn_test_worker(master_addr.clone(), "worker-redcrash-2", 2, false);
+    let w2 = spawn_test_worker(master_addr.clone(), "worker-redcrash-2", 2, false);
 
     wait_for_workers(&master, 2).await;
 
@@ -648,8 +650,8 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
     let master_clone = master.clone();
     let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
-    // Wait up to TEST_WAIT_TIMEOUT until map tasks have completed and a reduce task is Running on W1
-    let mut aborted = false;
+    // Wait up to TEST_WAIT_TIMEOUT until map tasks have completed and a reduce task is Running on either worker
+    let mut crash_pair = None;
     let start = Instant::now();
     while start.elapsed() < TEST_WAIT_TIMEOUT {
         if job_fut.is_finished() {
@@ -660,26 +662,33 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
             .iter()
             .filter(|tk| tk.state == TaskState::Completed)
             .count();
-        let w1_running_reduce = tasks
-            .iter()
-            .any(|t| t.assigned_worker_id == Some(w1.worker_id) && t.state == TaskState::Running);
-        if completed_count >= 2 && w1_running_reduce {
-            w1.abort();
-            aborted = true;
-            break;
+        if completed_count >= 2 {
+            if let Some((victim, survivor)) = [(&w1, &w2), (&w2, &w1)].into_iter().find(|(v, _)| {
+                tasks.iter().any(|t| {
+                    t.assigned_worker_id == Some(v.worker_id) && t.state == TaskState::Running
+                })
+            }) {
+                victim.abort();
+                crash_pair = Some((victim.worker_id, survivor.worker_id));
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if !aborted {
-        let summary = task_summary(&master).await;
-        panic!(
-            "did not observe >= 2 completed map tasks and a Running reduce task on w1 ({}) within {}s (job_finished={}); tasks={summary:?}",
-            w1.worker_id,
-            TEST_WAIT_TIMEOUT.as_secs(),
-            job_fut.is_finished()
-        );
-    }
+    let (aborted_worker_id, survivor_worker_id) = match crash_pair {
+        Some(pair) => pair,
+        None => {
+            let summary = task_summary(&master).await;
+            panic!(
+                "did not observe >= 2 completed map tasks and a Running reduce task on either worker ({}, {}) within {}s (job_finished={}); tasks={summary:?}",
+                w1.worker_id,
+                w2.worker_id,
+                TEST_WAIT_TIMEOUT.as_secs(),
+                job_fut.is_finished()
+            );
+        }
+    };
 
     let res = await_mapreduce_handle(&master, job_fut, "reduce_fault_tolerance_job").await;
 
@@ -698,16 +707,57 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
     assert_eq!(get_count("retained"), 1);
     assert_eq!(get_count("verification"), 1);
 
-    // Verify empirical contract: Map phase was NOT re-run!
-    // Exactly 2 map tasks were ever created and completed without being re-executed.
+    // Verify empirical contract: Map phase was NOT re-run (intermediate outputs retained), and
+    // the interrupted reduce task was retried and completed on the surviving worker.
+    // A master retry reuses the task id, so 7 total tasks (2 map + 5 reduce) proves no map recomputation.
     let tasks = master.list_tasks().await.unwrap_or_default();
-    let map_tasks: Vec<_> = tasks
+    let summary: Vec<TaskSummaryRow> = tasks
         .iter()
-        .filter(|t| t.exit_code == Some(0) && t.retry_count == 0)
+        .map(|t| {
+            (
+                t.task_id,
+                t.state,
+                t.assigned_worker_id,
+                t.retry_count,
+                t.failover_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        tasks.len(),
+        7,
+        "Expected 7 total tasks (2 map + 5 reduce; map phase must not re-run); tasks={summary:?}"
+    );
+    let retried_reduces: Vec<TaskSummaryRow> = tasks
+        .iter()
+        .filter(|t| t.failover_count >= 1 && t.state == TaskState::Completed)
+        .map(|t| {
+            (
+                t.task_id,
+                t.state,
+                t.assigned_worker_id,
+                t.retry_count,
+                t.failover_count,
+            )
+        })
         .collect();
     assert!(
-        map_tasks.len() >= 2,
-        "Expected at least 2 map tasks completed with retry_count == 0"
+        !retried_reduces.is_empty(),
+        "Expected at least one Completed reduce task with failover_count >= 1; tasks={summary:?}"
+    );
+    assert!(
+        retried_reduces.iter().all(|(_, _, assigned, _, _)| {
+            *assigned != Some(aborted_worker_id) && *assigned == Some(survivor_worker_id)
+        }),
+        "Expected retried reduce tasks to complete on surviving worker {survivor_worker_id} (not aborted {aborted_worker_id}); retried={retried_reduces:?}"
+    );
+    let unretried_completed_count = tasks
+        .iter()
+        .filter(|t| t.exit_code == Some(0) && t.retry_count == 0)
+        .count();
+    assert!(
+        unretried_completed_count >= 2,
+        "Expected at least 2 tasks completed with retry_count == 0; tasks={summary:?}"
     );
 
     let _ = master.shutdown();
