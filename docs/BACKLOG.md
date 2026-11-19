@@ -353,7 +353,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
-| SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Planned | In |  |
+| SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
@@ -1223,27 +1223,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
   `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
   owner's decision of "Done when" (the entry itself is gone) and step 2.
-
-### SEC-17: Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files
-
-- **Evidence:** Read in the review of pull request 352 (BUG-32). `path_starts_with_ci` canonicalises both
-  paths (`normalize_win_path`), so a junction in an ancestor folder (for example
-  `AppData\Local\OxideSwarm-USB` pointing elsewhere) is followed, and `is_reparse_point` checks only the
-  last folder (`crates/worker/src/isolation/windows/mod.rs`, `toolchain.rs`). `SetNamedSecurityInfoW`
-  then rewrites the DACL of the target. The same holds for the allowed entries that existed before
-  BUG-32, so it is not a regression. The marker `.oxideswarm-usb-workspaces` and `store.lock` are not
-  checked for hard links.
-- **Problem:** Only processes of the same user can create such a junction or link, and the
-  `oxideswarm.toolchain` capability gets only non-inherited traverse, so the impact is low. But the rule
-  "the worker rewrites a DACL only on its own folders" depends on it.
-- **Do:**
-  1. Before the rewrite, refuse a reparse point in every folder from the user home to the workspace
-     root.
-  2. Require `nlink == 1` for the marker and `store.lock` (`windows_file_identity`,
-     `crates/worker/src/blob_cache.rs`).
-  3. Add tests with a junction in an ancestor folder and with a hard-linked marker. Where the host
-     cannot create them, skip with a printed reason.
-- **Done when:** Those tests pass on `windows-latest` in CI.
 
 ### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
 
@@ -2248,4 +2227,5 @@ Add one dated line per finished item, newest last.
   wire change). Counted from the rows: 216 items, 143 Implemented, 19 Partial and 54 Planned; 27 open items In,
   46 Out.
 - 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
+- 2026-11-19: SEC-17 Implemented (pull request 360, open; text in the archive): `validate_workspace_root_safe` and a second `validate_workspace_root_ancestors_safe` check under `PREPARE_LOCK` right before `protect_sandbox_base` refuse reparse points on `--workspace-root` and along any raw, lexical, or canonical ancestor when `--workspace-root` is under or resolves into `host.user_home` or `%USERPROFILE%` (including external junctions above or pointing into home, while roots outside home keep no ancestor check and redirected home / `AppData\Local` junctions document the `--workspace-root` target workaround), and `.oxideswarm-usb-workspaces` and `store.lock` read `nNumberOfLinks == 1` directly from `GetFileInformationByHandle` (so ReFS / Dev Drive / network volumes stay accepted); remaining path-based `SetNamedSecurityInfoW` TOCTOU window and extra entries move to SEC-18.
 - 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
