@@ -855,7 +855,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state (`--max-pending-handshakes`; default `64`) |
 | `RUSTY_GRID_AUTH` | Master | Peer admission mode (`--auth`, `[master].auth`: `secret`, `members`, or `both`; default `both`, [design 0051](docs/design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret (`--insecure`) |
-| `RUSTY_GRID_DASHBOARD_PORT` | Master & `ox-mode` | HTTP listener port for embedded web dashboard on Master (`--dashboard-port`; default `8080`) and target dashboard port for `ox-mode dev status` (`--port`) |
+| `RUSTY_GRID_DASHBOARD_PORT` | Master & `ox-mode` | HTTP listener port for embedded web dashboard on Master (`--dashboard-port`; default `8080`) and target dashboard port for `ox-mode dev status` (`--port`; for a dev cluster, drop `--port` and this variable so `dev status` reads the real port from `.dev_cluster.json`) |
 | `OXIDE_SWARM_DASHBOARD_PORT` | Master | Alternative alias for dashboard HTTP port |
 | `RUSTY_GRID_DASHBOARD_PORT_FILE` | Master | File path where bound dashboard HTTP port is written (`--dashboard-port-file`) |
 | `OXIDE_SWARM_DASHBOARD_PORT_FILE` | Master | Alternative alias for dashboard port file |
@@ -993,14 +993,16 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 
 # Development Mode (Live-reload file watcher and local dev cluster):
 ./ox-mode dev watch
-./ox-mode dev cluster   # binds 127.0.0.1:9090 and 127.0.0.1:8080 (or falls back to free ephemeral ports recorded in .dev_cluster.json)
-./ox-mode dev status    # probes the dashboard port from .dev_cluster.json (or --port / 8080)
+./ox-mode dev cluster   # binds OS-picked loopback ports (127.0.0.1:0), prints the dashboard URL, and records them in .dev_cluster.json
+./ox-mode dev status    # probes the dashboard port from .dev_cluster.json (drop --port / RUSTY_GRID_DASHBOARD_PORT for a dev cluster)
 ./ox-mode dev stop
 
 # Research & Performance Profiling Mode:
 ./ox-mode research bench
 ./ox-mode research distributed
 ```
+
+A local dev cluster no longer binds the dashboard on `8080`: `./ox-mode dev cluster` prints the dashboard URL and writes the real port to `.dev_cluster.json`, so drop `--port` and `RUSTY_GRID_DASHBOARD_PORT` when running `./ox-mode dev status` against a dev cluster.
 
 ## Development
 

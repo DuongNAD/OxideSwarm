@@ -493,43 +493,27 @@ fn write_cluster_tracking_files(
     fs::write(json_file, json_str)
 }
 
-/// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking,
-/// verifying that all children stay alive and both workers appear in `/api/status`.
-pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
-    let pid_file = workspace_root.join(".dev_cluster.pids");
-    let json_file = workspace_root.join(".dev_cluster.json");
-    if pid_file.exists() || json_file.exists() {
-        let stop_res = stop_local_dev_cluster(workspace_root).await;
-        if !stop_res.success {
-            let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
-            res.success = false;
-            res.exit_code = stop_res.exit_code.or(Some(1));
-            res.stderr = format!(
-                "Failed to stop existing dev cluster before launch: {}",
-                if stop_res.stderr.is_empty() {
-                    &stop_res.stdout
-                } else {
-                    &stop_res.stderr
-                }
-            );
-            return res;
-        }
+fn read_bound_port(path: &Path, requested: u16) -> Option<u16> {
+    let port = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p > 0)?;
+    if requested == 0 || port == requested {
+        Some(port)
+    } else {
+        None
     }
-    let master_tcp_port = std::net::TcpListener::bind("127.0.0.1:9090")
-        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(9090);
-    let web_ui_port = std::net::TcpListener::bind("127.0.0.1:8080")
-        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(8080);
-    launch_local_dev_cluster_with_ports(workspace_root, master_tcp_port, web_ui_port).await
 }
 
-/// Spawns local dev cluster on the specified `master_tcp_port` and `web_ui_port`,
-/// calling `try_wait()` on each child and polling `/api/status` until both workers register.
+/// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background on OS-picked loopback
+/// ports (`127.0.0.1:0`) with PID tracking and port-file readiness checks before workers start.
+pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
+    launch_local_dev_cluster_with_ports(workspace_root, 0, 0).await
+}
+
+/// Spawns local dev cluster on the specified `master_tcp_port` and `web_ui_port` (either or both
+/// may be `0` to let the master pick ephemeral loopback ports and report them via port files),
+/// waiting for both port files before spawning workers and polling `/api/status` until both register.
 pub async fn launch_local_dev_cluster_with_ports(
     workspace_root: &Path,
     master_tcp_port: u16,
@@ -537,7 +521,7 @@ pub async fn launch_local_dev_cluster_with_ports(
 ) -> ModeExecutionResult {
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
     let start = Instant::now();
-    if master_tcp_port == web_ui_port {
+    if master_tcp_port != 0 && master_tcp_port == web_ui_port {
         // TEST-43: the master would take the port for its grid listener, fail to bind its dashboard
         // there, keep running without it, and the wait below would end after 8 s with no reason.
         res.success = false;
@@ -550,6 +534,7 @@ pub async fn launch_local_dev_cluster_with_ports(
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
+    let master_port_file = workspace_root.join(".dev_cluster.master_port");
     let dash_port_file = workspace_root.join(".dev_cluster.dashboard_port");
     if pid_file.exists() || json_file.exists() {
         let stop_res = stop_local_dev_cluster(workspace_root).await;
@@ -568,6 +553,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             return res;
         }
     }
+    let _ = fs::remove_file(&master_port_file);
     let _ = fs::remove_file(&dash_port_file);
 
     // When workspace_root is a temporary/non-workspace directory (e.g. during integration tests),
@@ -647,7 +633,6 @@ pub async fn launch_local_dev_cluster_with_ports(
     let mut master_cmd = Command::new(&target_bin);
     if let Some(ref home_dir) = isolated_home {
         let cfg_path = home_dir.join("rusty-grid.toml");
-        let blob_dir = home_dir.join("blobs");
         master_cmd
             .env("HOME", home_dir)
             .env("USERPROFILE", home_dir)
@@ -656,28 +641,23 @@ pub async fn launch_local_dev_cluster_with_ports(
             .env_remove("RUSTY_GRID_CONFIG")
             .arg("--config")
             .arg(&cfg_path);
-        master_cmd.args([
-            "master",
-            "--listen",
-            &format!("127.0.0.1:{}", master_tcp_port),
-            "--web-ui-addr",
-            &format!("127.0.0.1:{}", web_ui_port),
-            "--dashboard-port-file",
-        ]);
-        master_cmd.arg(&dash_port_file);
-        master_cmd.args(["--ephemeral-key", "--discovery-port", "0", "--blob-dir"]); // BUG-26
-        master_cmd.arg(&blob_dir);
-    } else {
-        master_cmd.args([
-            "master",
-            "--listen",
-            &format!("127.0.0.1:{}", master_tcp_port),
-            "--web-ui-addr",
-            &format!("127.0.0.1:{}", web_ui_port),
-            "--dashboard-port-file",
-        ]);
-        master_cmd.arg(&dash_port_file);
-        master_cmd.args(["--ephemeral-key", "--discovery-port", "0"]); // BUG-26
+    }
+    master_cmd.args([
+        "master",
+        "--listen",
+        &format!("127.0.0.1:{}", master_tcp_port),
+        "--port-file",
+    ]);
+    master_cmd.arg(&master_port_file);
+    master_cmd.args([
+        "--web-ui-addr",
+        &format!("127.0.0.1:{}", web_ui_port),
+        "--dashboard-port-file",
+    ]);
+    master_cmd.arg(&dash_port_file);
+    master_cmd.args(["--ephemeral-key", "--discovery-port", "0"]); // BUG-26
+    if let Some(ref home_dir) = isolated_home {
+        master_cmd.arg("--blob-dir").arg(home_dir.join("blobs"));
     }
     let master_log = master_log_path(workspace_root);
     let (master_out, master_err) = master_log_stdio(&master_log);
@@ -702,6 +682,7 @@ pub async fn launch_local_dev_cluster_with_ports(
                 &mut [],
                 &pid_file,
                 &json_file,
+                &master_port_file,
                 &dash_port_file,
                 isolated_home.as_deref(),
             );
@@ -726,6 +707,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             &mut [&mut master_child],
             &pid_file,
             &json_file,
+            &master_port_file,
             &dash_port_file,
             isolated_home.as_deref(),
         );
@@ -740,23 +722,100 @@ pub async fn launch_local_dev_cluster_with_ports(
         return res;
     }
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    if let Ok(Some(status)) = master_child.try_wait() {
-        cleanup_failed_cluster_launch(
-            &mut [&mut master_child],
-            &pid_file,
-            &json_file,
-            &dash_port_file,
-            isolated_home.as_deref(),
-        );
-        res.duration_ms = start.elapsed().as_millis() as u64;
-        res.success = false;
-        res.exit_code = Some(1);
-        res.stderr = format!(
-            "Master process exited immediately with {status} (port 127.0.0.1:{master_tcp_port} or 127.0.0.1:{web_ui_port} may already be in use)"
-        );
-        return res;
+    // Wait for both `--port-file` and `--dashboard-port-file` before spawning workers so port `0`
+    // resolves to real OS-picked loopback ports without bind-and-drop (TEST-52).
+    let port_deadline = Instant::now() + Duration::from_secs(8);
+    let mut resolved_ports: Option<(u16, u16)> = None;
+    while Instant::now() < port_deadline {
+        match master_child.try_wait() {
+            Ok(Some(status)) => {
+                cleanup_failed_cluster_launch(
+                    &mut [&mut master_child],
+                    &pid_file,
+                    &json_file,
+                    &master_port_file,
+                    &dash_port_file,
+                    isolated_home.as_deref(),
+                );
+                res.duration_ms = start.elapsed().as_millis() as u64;
+                res.success = false;
+                res.exit_code = Some(1);
+                let exit_msg = match (master_tcp_port, web_ui_port) {
+                    (0, 0) => format!(
+                        "Master process exited immediately with {status} before writing its port files; see the log below"
+                    ),
+                    (0, wp) => format!(
+                        "Master process exited immediately with {status} before writing its port files (port 127.0.0.1:{wp} may already be in use; see the log below)"
+                    ),
+                    (mp, 0) => format!(
+                        "Master process exited immediately with {status} before writing its port files (port 127.0.0.1:{mp} may already be in use; see the log below)"
+                    ),
+                    (mp, wp) => format!(
+                        "Master process exited immediately with {status} (port 127.0.0.1:{mp} or 127.0.0.1:{wp} may already be in use)"
+                    ),
+                };
+                res.stderr = with_master_log_tail(exit_msg, &master_log);
+                return res;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                cleanup_failed_cluster_launch(
+                    &mut [&mut master_child],
+                    &pid_file,
+                    &json_file,
+                    &master_port_file,
+                    &dash_port_file,
+                    isolated_home.as_deref(),
+                );
+                res.duration_ms = start.elapsed().as_millis() as u64;
+                res.success = false;
+                res.exit_code = Some(1);
+                res.stderr = with_master_log_tail(
+                    format!("Failed to check status of Master: {e}"),
+                    &master_log,
+                );
+                return res;
+            }
+        }
+        if let (Some(mp), Some(wp)) = (
+            read_bound_port(&master_port_file, master_tcp_port),
+            read_bound_port(&dash_port_file, web_ui_port),
+        ) {
+            resolved_ports = Some((mp, wp));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    let (actual_master_port, actual_web_ui_port) = match resolved_ports {
+        Some(ports) => ports,
+        None => {
+            let reason = if read_bound_port(&master_port_file, master_tcp_port).is_none() {
+                format!(
+                    "Master port file ({}) did not appear within 8s for 127.0.0.1:{master_tcp_port}",
+                    master_port_file.display()
+                )
+            } else {
+                format!(
+                    "Dashboard port file ({}) did not appear within 8s for 127.0.0.1:{web_ui_port}",
+                    dash_port_file.display()
+                )
+            };
+            cleanup_failed_cluster_launch(
+                &mut [&mut master_child],
+                &pid_file,
+                &json_file,
+                &master_port_file,
+                &dash_port_file,
+                isolated_home.as_deref(),
+            );
+            res.duration_ms = start.elapsed().as_millis() as u64;
+            res.success = false;
+            res.exit_code = Some(1);
+            res.stderr = with_master_log_tail(reason, &master_log);
+            return res;
+        }
+    };
 
     let mut w1_cmd = Command::new(&target_bin);
     if let Some(ref home_dir) = isolated_home {
@@ -774,7 +833,7 @@ pub async fn launch_local_dev_cluster_with_ports(
         w1_cmd.args([
             "worker",
             "--master",
-            &format!("127.0.0.1:{}", master_tcp_port),
+            &format!("127.0.0.1:{}", actual_master_port),
             "--name",
             "dev-worker-cpu-1",
             "--cores",
@@ -789,7 +848,7 @@ pub async fn launch_local_dev_cluster_with_ports(
         w1_cmd.args([
             "worker",
             "--master",
-            &format!("127.0.0.1:{}", master_tcp_port),
+            &format!("127.0.0.1:{}", actual_master_port),
             "--name",
             "dev-worker-cpu-1",
             "--cores",
@@ -820,6 +879,7 @@ pub async fn launch_local_dev_cluster_with_ports(
                 &mut [&mut master_child],
                 &pid_file,
                 &json_file,
+                &master_port_file,
                 &dash_port_file,
                 isolated_home.as_deref(),
             );
@@ -835,8 +895,8 @@ pub async fn launch_local_dev_cluster_with_ports(
         &pid_file,
         &json_file,
         master_pid,
-        master_tcp_port,
-        web_ui_port,
+        actual_master_port,
+        actual_web_ui_port,
         &spawned_pids,
         &pid_start_times,
     ) {
@@ -844,6 +904,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             &mut [&mut master_child, &mut w1_child],
             &pid_file,
             &json_file,
+            &master_port_file,
             &dash_port_file,
             isolated_home.as_deref(),
         );
@@ -874,7 +935,7 @@ pub async fn launch_local_dev_cluster_with_ports(
         w2_cmd.args([
             "worker",
             "--master",
-            &format!("127.0.0.1:{}", master_tcp_port),
+            &format!("127.0.0.1:{}", actual_master_port),
             "--name",
             "dev-worker-sim-gpu-2",
             "--cores",
@@ -890,7 +951,7 @@ pub async fn launch_local_dev_cluster_with_ports(
         w2_cmd.args([
             "worker",
             "--master",
-            &format!("127.0.0.1:{}", master_tcp_port),
+            &format!("127.0.0.1:{}", actual_master_port),
             "--name",
             "dev-worker-sim-gpu-2",
             "--cores",
@@ -922,6 +983,7 @@ pub async fn launch_local_dev_cluster_with_ports(
                 &mut [&mut master_child, &mut w1_child],
                 &pid_file,
                 &json_file,
+                &master_port_file,
                 &dash_port_file,
                 isolated_home.as_deref(),
             );
@@ -937,8 +999,8 @@ pub async fn launch_local_dev_cluster_with_ports(
         &pid_file,
         &json_file,
         master_pid,
-        master_tcp_port,
-        web_ui_port,
+        actual_master_port,
+        actual_web_ui_port,
         &spawned_pids,
         &pid_start_times,
     ) {
@@ -946,6 +1008,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             &mut [&mut master_child, &mut w1_child, &mut w2_child],
             &pid_file,
             &json_file,
+            &master_port_file,
             &dash_port_file,
             isolated_home.as_deref(),
         );
@@ -968,11 +1031,10 @@ pub async fn launch_local_dev_cluster_with_ports(
     } else {
         resolve_dashboard_bearer_token()
     };
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut cluster_ready = false;
-    let mut failure_reason = format!(
-        "Dashboard port file ({}) did not appear within 8s for 127.0.0.1:{web_ui_port}",
-        dash_port_file.display()
+    let failure_reason = format!(
+        "Timed out waiting for master on http://127.0.0.1:{actual_web_ui_port}/api/status and both workers to register on 127.0.0.1:{actual_master_port}"
     );
 
     while Instant::now() < deadline {
@@ -999,6 +1061,7 @@ pub async fn launch_local_dev_cluster_with_ports(
                 &mut [&mut master_child, &mut w1_child, &mut w2_child],
                 &pid_file,
                 &json_file,
+                &master_port_file,
                 &dash_port_file,
                 isolated_home.as_deref(),
             );
@@ -1009,22 +1072,8 @@ pub async fn launch_local_dev_cluster_with_ports(
             return res;
         }
 
-        // Never poll or send the dashboard Admin token to `web_ui_port` until `--dashboard-port-file`
-        // proves that our spawned Master actually bound `web_ui_port`.
-        let dashboard_bound = fs::read_to_string(&dash_port_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            == Some(web_ui_port);
-        if !dashboard_bound {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
-        failure_reason = format!(
-            "Timed out waiting for master on http://127.0.0.1:{web_ui_port}/api/status and both workers to register on 127.0.0.1:{master_tcp_port}"
-        );
-
-        if let Ok((status_code, body)) = http_get_local_status(web_ui_port, bearer_token.as_deref())
+        if let Ok((status_code, body)) =
+            http_get_local_status(actual_web_ui_port, bearer_token.as_deref())
         {
             if (200..300).contains(&status_code) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -1052,6 +1101,7 @@ pub async fn launch_local_dev_cluster_with_ports(
             &mut [&mut master_child, &mut w1_child, &mut w2_child],
             &pid_file,
             &json_file,
+            &master_port_file,
             &dash_port_file,
             isolated_home.as_deref(),
         );
@@ -1077,13 +1127,14 @@ pub async fn launch_local_dev_cluster_with_ports(
         &pid_file,
         &json_file,
         master_pid,
-        master_tcp_port,
-        web_ui_port,
+        actual_master_port,
+        actual_web_ui_port,
         &spawned_pids,
         &pid_start_times,
     );
     register_spawned_cluster_children(vec![master_child, w1_child, w2_child]);
 
+    let _ = fs::remove_file(&master_port_file);
     let _ = fs::remove_file(&dash_port_file);
 
     res.duration_ms = start.elapsed().as_millis() as u64;
@@ -1091,17 +1142,20 @@ pub async fn launch_local_dev_cluster_with_ports(
     res.exit_code = Some(0);
     res.stdout = format!(
         "=== Local Development Cluster Launched ===\nMaster Coordinator : tcp://127.0.0.1:{} (PID: {})\nWeb UI Dashboard   : http://127.0.0.1:{}\nWorker 1 (CPU Node) : dev-worker-cpu-1 (4 Cores, 8 GB RAM)\nWorker 2 (Sim GPU)  : dev-worker-sim-gpu-2 (8 Cores, 16 GB RAM, --simulate-gpu)\nPID tracking files : {}\n                     {}\n\nRun `ox-mode dev status` to inspect cluster health.\nRun `ox-mode dev stop` to shut down the cluster cleanly.\n",
-        master_tcp_port,
+        actual_master_port,
         master_pid,
-        web_ui_port,
+        actual_web_ui_port,
         pid_file.display(),
         json_file.display()
     );
 
     res = res.with_metric("master_pid", master_pid);
-    res = res.with_metric("master_tcp", format!("127.0.0.1:{}", master_tcp_port));
-    res = res.with_metric("web_ui_url", format!("http://127.0.0.1:{}", web_ui_port));
-    res = res.with_metric("web_ui_port", web_ui_port);
+    res = res.with_metric("master_tcp", format!("127.0.0.1:{}", actual_master_port));
+    res = res.with_metric(
+        "web_ui_url",
+        format!("http://127.0.0.1:{}", actual_web_ui_port),
+    );
+    res = res.with_metric("web_ui_port", actual_web_ui_port);
 
     res
 }
@@ -1274,10 +1328,12 @@ where
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
+    let master_port_file = workspace_root.join(".dev_cluster.master_port");
     let dash_port_file = workspace_root.join(".dev_cluster.dashboard_port");
     let isolated_home = workspace_root.join(".dev_cluster_home");
 
     if !pid_file.exists() && !json_file.exists() {
+        let _ = fs::remove_file(&master_port_file);
         let _ = fs::remove_file(&dash_port_file);
         let _ = fs::remove_dir_all(&isolated_home);
         res.success = true;
@@ -1438,6 +1494,7 @@ where
     if res.success {
         let _ = fs::remove_file(&pid_file);
         let _ = fs::remove_file(&json_file);
+        let _ = fs::remove_file(&master_port_file);
         let _ = fs::remove_file(&dash_port_file);
         let _ = fs::remove_dir_all(&isolated_home);
     }
@@ -1624,5 +1681,43 @@ pub(super) async fn run_dev_menu(workspace_root: &Path) {
             render_execution_result(&res);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_bound_port;
+
+    #[test]
+    fn test_read_bound_port_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port_file = dir.path().join("bound.port");
+
+        // Missing file -> None
+        assert_eq!(read_bound_port(&port_file, 0), None);
+
+        // Empty and whitespace-only ("partial") -> None
+        for raw in ["", "   \n"] {
+            std::fs::write(&port_file, raw).expect("write empty/partial");
+            assert_eq!(read_bound_port(&port_file, 0), None, "raw={raw:?}");
+            assert_eq!(read_bound_port(&port_file, 8080), None, "raw={raw:?}");
+        }
+
+        // Zero -> None
+        std::fs::write(&port_file, "0\n").expect("write zero");
+        assert_eq!(read_bound_port(&port_file, 0), None);
+        assert_eq!(read_bound_port(&port_file, 8080), None);
+
+        // Non-numeric / out-of-range -> None
+        for raw in ["abc\n", "123abc", "70000", "-1"] {
+            std::fs::write(&port_file, raw).expect("write non-numeric");
+            assert_eq!(read_bound_port(&port_file, 0), None, "raw={raw:?}");
+        }
+
+        // Valid port: accepted for requested == 0 or matching requested, rejected on mismatch
+        std::fs::write(&port_file, " 45123 \n").expect("write valid port");
+        assert_eq!(read_bound_port(&port_file, 0), Some(45123));
+        assert_eq!(read_bound_port(&port_file, 45123), Some(45123));
+        assert_eq!(read_bound_port(&port_file, 45124), None);
     }
 }

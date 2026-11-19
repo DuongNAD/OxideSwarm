@@ -892,13 +892,6 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
     let held_web_port = web_listener.local_addr().expect("local_addr").port();
     let _ = web_listener.set_nonblocking(true);
 
-    // Picked while `web_listener` is held, so it cannot be the same port (TEST-43).
-    // Bind-and-drop kept (TEST-52): `launch_local_dev_cluster_with_ports` cannot take port 0.
-    let free_master_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master port");
-        l.local_addr().expect("local_addr").port()
-    };
-
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
     let captured = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -920,8 +913,7 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
         }
     });
 
-    let res =
-        launch_local_dev_cluster_with_ports(temp.path(), free_master_port, held_web_port).await;
+    let res = launch_local_dev_cluster_with_ports(temp.path(), 0, held_web_port).await;
     stop_flag.store(true, Ordering::Relaxed);
     let _ = listener_handle.join();
     let _ = stop_local_dev_cluster(temp.path()).await;
@@ -1019,26 +1011,12 @@ async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
     );
 }
 
-/// Two different free loopback ports (TEST-43). Both listeners stay open until both ports are known:
-/// a port picked and closed one line earlier can be handed out again by the next bind, and then the
-/// master took that one port for its grid listener and could not bind its dashboard on it.
-/// Bind-and-drop kept (TEST-52): `launch_local_dev_cluster_with_ports` cannot take port 0.
-fn two_free_ports() -> (u16, u16) {
-    let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first ephemeral port");
-    let second = std::net::TcpListener::bind("127.0.0.1:0").expect("bind second ephemeral port");
-    (
-        first.local_addr().expect("local_addr").port(),
-        second.local_addr().expect("local_addr").port(),
-    )
-}
-
+// Note (TEST-52): production `launch_local_dev_cluster` passes `(0, 0)` only; explicit non-zero
+// port conflict and held-port handling are covered by the same-port and held-port tests below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling() {
-    let (master_tcp_port, web_ui_port) = two_free_ports();
-
     let temp = tempfile::tempdir().expect("tempdir");
-    let launch_res =
-        launch_local_dev_cluster_with_ports(temp.path(), master_tcp_port, web_ui_port).await;
+    let launch_res = launch_local_dev_cluster_with_ports(temp.path(), 0, 0).await;
     assert!(
         launch_res.success,
         "in-process dev cluster launch must succeed, got stderr: {}",
@@ -1060,6 +1038,24 @@ async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handlin
     let json_str = std::fs::read_to_string(&json_file).expect("read .dev_cluster.json");
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).expect("parse .dev_cluster.json");
+    let recorded_web_port = json_val
+        .get("web_ui_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let recorded_master_port = json_val
+        .get("master_tcp")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.rsplit(':').next())
+        .and_then(|p| p.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        recorded_web_port > 0 && recorded_master_port > 0,
+        "ephemeral launch must record non-zero master and web ports, got: {json_val}"
+    );
+    assert_ne!(
+        recorded_master_port, recorded_web_port,
+        "master and web ports must differ, got: {json_val}"
+    );
     let start_times = json_val
         .get("pid_start_times")
         .and_then(|v| v.as_object())
@@ -1212,7 +1208,7 @@ fn test_dev_cluster_cross_process_launch_then_stop_via_ox_mode_cli() {
 #[tokio::test]
 async fn test_dev_cluster_refuses_one_port_for_master_and_dashboard() {
     // TEST-43: one port for both used to start a master without a dashboard and fail after 8 s.
-    let (port, _) = two_free_ports();
+    let port = 9091u16;
     let temp = tempfile::tempdir().expect("tempdir");
     let res = launch_local_dev_cluster_with_ports(temp.path(), port, port).await;
     assert!(
@@ -1235,14 +1231,9 @@ async fn test_dev_cluster_fails_when_port_is_held() {
     let held_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind held tcp port for master");
     let held_port = held_listener.local_addr().expect("local_addr").port();
-    // Never bound (TEST-52): the master fails on the held grid port before it binds the dashboard.
-    let free_web_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral web port");
-        l.local_addr().expect("local_addr").port()
-    };
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let res = launch_local_dev_cluster_with_ports(temp.path(), held_port, free_web_port).await;
+    let res = launch_local_dev_cluster_with_ports(temp.path(), held_port, 0).await;
     let json_exists_after_launch = temp.path().join(".dev_cluster.json").exists();
     let pids_exist_after_launch = temp.path().join(".dev_cluster.pids").exists();
     // Always run cleanup in case a regression left child processes behind.
