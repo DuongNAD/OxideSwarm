@@ -1,6 +1,6 @@
 # 0096: Contribution credits per participant, display only (NET-10)
 
-Status: Draft (stops after the design record; draft pull request 379 open awaiting coordinator decision on bundling the `ClientResponse` wire change with BUG-22 and ECO-9)
+Status: Accepted (Option B implemented on draft pull request 379; Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9)
 Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
@@ -11,9 +11,12 @@ others and their tasks used over the last day, the last week, and all time (`NET
 [design 0094](0094-road-to-a-shared-research-grid.md)). Every entry credits the runner and debits the
 submitter by the same amount, is strictly display-only (Q96), and shares one record format with
 model-tunnel usage records (`LLM-10`, `LLM-11` of [design 0061](0061-first-application-model-tunnel.md)).
-Showing credits in `oxideswarm members list` and `oxideswarm status` requires a wire change to
-`ClientResponse` (`ClientMessage`/`ClientResponse` bincode layouts are frozen at protocol `10`), so
-implementation stops here pending coordinator approval on wire-change bundling.
+
+Per coordinator decision (2026-11-19, **Option B**), the master ledger, `GET /api/credits`
+(`AuthScope::Observer`), `--max-credit-records` / `--max-credit-bytes`, and the dashboard
+"Contribution Credits (Display Only)" panel ship with zero wire or store-format change on draft pull
+request 379 (holding as a draft for post-stability merge). Wire change: deferred to the protocol 11
+train with BUG-22 and ECO-9.
 
 ## Context
 
@@ -227,9 +230,10 @@ under [design 0076](0076-protocol-compatibility-and-release-train.md) and
 
 ## Compatibility
 
-- **Design-only right now:** Changes protocol version (`10`), store format (`4`), and `Cargo.lock`
-  **not at all**.
-- **At implementation time (under Option A or C):**
+- **Option B on draft pull request 379:** Keeps protocol version (`10`), `TaskStore` format (`4`),
+  and `Cargo.lock` completely unchanged (`--max-credit-records` / `--max-credit-bytes`,
+  `crates/master/src/credits.rs`, `GET /api/credits`, and `dashboard.html` only).
+- **Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9:**
   - Bumps `PROTOCOL_VERSION_CURRENT` to `11`, updates both `HumanClient*` and `BinaryClient*`
     mirrors + all four `From` impls, refreshes `crates/core/tests/data/wire_layout.txt` (and moves
     v10 layout to `wire_layout_previous.txt` if keeping the `10..=11` window), and updates
@@ -279,13 +283,18 @@ Once approved for implementation:
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| NET-10 | Contribution credits per participant, display only (Stage 1 of design 0094) | `crates/master/src/credits.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/dashboard.html`, `crates/core/src/protocol.rs`, `crates/cli/src/members_cmd.rs`, `crates/cli/src/cli_app/tasks.rs`, `docs/reference.md` | On a 2-participant loopback cluster, contributed/used core-seconds match task run times, net sums to zero, survive master `--state-dir` restart, stay within ledger bounds, and render in CLI and dashboard | Planned |
+| NET-10 | Contribution credits per participant, display only (Stage 1 of design 0094, Option B) | `crates/master/src/credits.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/dashboard.html`, `crates/cli/src/cli_app.rs`, `docs/reference.md` | Master ledger, `--state-dir` persistence + compaction, `GET /api/credits`, dashboard table, and 2-participant loopback conservation/restart tests pass (CLI `ClientResponse` fields deferred to protocol 11 with `BUG-22` and `ECO-9`) | Partial |
 
-## Open decisions
+## Decisions (resolved 2026-11-19)
 
-- **Wire-change bundling (for coordinator):** Choose between **Option A** (bundle `NET-10` `ClientResponse` fields / `ListCredits` with `BUG-22` and `ECO-9` into protocol `11`), **Option B** (build master ledger + `/api/credits` dashboard view first with zero wire change, defer CLI fields to protocol `11`), or **Option C** (hold implementation until post-stability `BUG-22` + `ECO-9` + store format `5` train).
-- **Dashboard unauthenticated loopback view:** Confirm whether `/api/credits` follows `/api/status`'s exact `AuthScope::Observer` rule (recommended yes, since participant labels reveal cluster usage activity).
+- **Wire-change bundling:** Decided **Option B** — ship the master ledger, `GET /api/credits`, and the
+  dashboard card first with zero wire or store-format change on draft pull request 379 (held as draft
+  until post-stability merge). Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9.
+- **Dashboard RBAC:** `/api/credits` requires `AuthScope::Observer` (matching `/api/status`), and
+  all mutating methods on `/api/credits` remain rejected (`405 Method Not Allowed` for Admins, `403`
+  for Observers).
 
 ## Status log
 
 - 2026-11-19: Claimed `design 0096` on the hub and wrote initial `Draft` design for `NET-10` on branch `mac/net-10-contribution-credits` (draft pull request 379). Verified that showing credits in `oxideswarm members list` and `oxideswarm status` requires a `ClientResponse` wire change (`PROTOCOL_VERSION_CURRENT` currently `10`), and stopped before Rust/wire implementation awaiting coordinator decision.
+- 2026-11-19: Implemented Option B on draft pull request 379 (`crates/master/src/credits.rs`, `--max-credit-records` / `--max-credit-bytes`, `GET /api/credits` behind `AuthScope::Observer`, and `dashboard.html` panel, zero wire change); Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9.

@@ -379,6 +379,7 @@ mod middleware {
             (&Method::GET, p)
                 if p.starts_with("/api/status")
                     || p.starts_with("/api/workers")
+                    || p.starts_with("/api/credits")
                     || p.starts_with("/api/tasks")
                     || p.starts_with("/ws")
                     || p.starts_with("/api/stream")
@@ -980,6 +981,7 @@ mod tests {
             for path in [
                 "/api/status",
                 "/api/workers",
+                "/api/credits",
                 "/api/tasks",
                 "/api/tasks/00000000-0000-0000-0000-000000000000",
                 "/ws",
@@ -1010,6 +1012,10 @@ mod tests {
             );
             assert_eq!(
                 route_required_scope(&Method::POST, "/api/unknown"),
+                Some(AuthScope::Admin)
+            );
+            assert_eq!(
+                route_required_scope(&Method::POST, "/api/credits"),
                 Some(AuthScope::Admin)
             );
             // Anything unexpected needs Admin rather than slipping through.

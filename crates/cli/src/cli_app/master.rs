@@ -407,6 +407,22 @@ async fn run_master_inner(
         master_cfg.as_ref().and_then(|m| m.max_retained_mb),
         (rusty_grid_master::queue::DEFAULT_MAX_TERMINAL_BYTES / (1024 * 1024)) as u64,
     );
+    let max_credit_records = resolve_usize(
+        args.max_credit_records,
+        &["RUSTY_GRID_MAX_CREDIT_RECORDS"],
+        master_cfg.as_ref().and_then(|m| m.max_credit_records),
+        rusty_grid_master::DEFAULT_MAX_CREDIT_RECORDS,
+    );
+    let max_credit_bytes = resolve_u64(
+        args.max_credit_bytes,
+        &["RUSTY_GRID_MAX_CREDIT_BYTES"],
+        master_cfg.as_ref().and_then(|m| m.max_credit_bytes),
+        rusty_grid_master::DEFAULT_MAX_CREDIT_BYTES,
+    );
+    if max_credit_bytes == 0 {
+        eprintln!("--max-credit-bytes must be greater than 0");
+        return ExitCode::FAILURE;
+    }
     let mapreduce_parallelism = resolve_usize(
         args.mapreduce_parallelism,
         &["RUSTY_GRID_MAPREDUCE_PARALLELISM"],
@@ -480,6 +496,8 @@ async fn run_master_inner(
         .with_max_terminal_bytes(
             usize::try_from(max_retained_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
         )
+        .with_max_credit_records(max_credit_records)
+        .with_max_credit_bytes(max_credit_bytes)
         .with_mapreduce_parallelism(mapreduce_parallelism)
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);

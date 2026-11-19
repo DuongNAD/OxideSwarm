@@ -290,6 +290,9 @@ impl TaskQueue {
             task_key,
             timeout_secs,
             resumed_from_checkpoint,
+            cpu_cores,
+            gpu_reserved,
+            submitted_by_member,
         ) = {
             let entry = inner
                 .tasks
@@ -310,6 +313,9 @@ impl TaskQueue {
                 entry.task_key,
                 entry.task.requirements.timeout_secs,
                 entry.resumed_from_checkpoint,
+                entry.task.requirements.cpu_cores.max(1),
+                entry.task.requirements.requires_gpu_or_vram() || entry.task.spec.requires_gpu(),
+                entry.submitted_by_member.clone(),
             )
         };
 
@@ -330,6 +336,9 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    cpu_cores,
+                    gpu_reserved,
+                    submitted_by_member,
                 },
                 None,
             ));
@@ -377,6 +386,9 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    cpu_cores,
+                    gpu_reserved,
+                    submitted_by_member,
                 },
                 None,
             ));
@@ -602,6 +614,9 @@ impl TaskQueue {
                 task_key,
                 timeout_secs,
                 resumed_from_checkpoint,
+                cpu_cores,
+                gpu_reserved,
+                submitted_by_member,
             },
             ack,
         ))

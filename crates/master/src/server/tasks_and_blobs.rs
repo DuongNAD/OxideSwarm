@@ -14,10 +14,12 @@ use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus
 use rusty_grid_core::{GridResult, MasterMessage, MessageTransport, WorkerMessage};
 
 use crate::blob_store::BlobStore;
-use crate::queue::{ResultDisposition, TaskQueue, TaskState};
+use crate::credits::{CreditsLedger, TaskUsageInput};
+use crate::queue::{ResultDisposition, ResultOutcome, TaskQueue, TaskState};
 use crate::registry::WorkerRegistry;
 
 use super::handshakes::AbortOnDrop;
+use super::members::MemberStore;
 use super::WaiterMap;
 
 /// Dashboard broadcast channel type, so signatures stay readable.
@@ -513,11 +515,73 @@ pub(super) async fn apply_task_result(
         session_id,
         result,
         blob_store,
+        None,
+        None,
         false,
         #[cfg(feature = "dashboard")]
         broadcast_tx,
     )
     .await;
+}
+
+async fn prepare_terminal_credit(
+    credits: Option<&Arc<CreditsLedger>>,
+    registry: &WorkerRegistry,
+    members: Option<&Arc<MemberStore>>,
+    worker_id: Uuid,
+    task_id: TaskId,
+    outcome: &ResultOutcome,
+    result: &TaskResult,
+) -> Option<(Arc<CreditsLedger>, TaskUsageInput)> {
+    if outcome.rejected {
+        return None;
+    }
+    let ledger = credits?;
+    let credited_member_id = match registry.worker_owner(&worker_id).await {
+        Some(mid) => Some(mid),
+        None => members.and_then(|m| m.worker_owner(&worker_id)),
+    };
+    Some((
+        Arc::clone(ledger),
+        TaskUsageInput {
+            task_id,
+            worker_id,
+            duration_ms: result.execution_time_ms,
+            cpu_cores: outcome.cpu_cores,
+            gpu_reserved: outcome.gpu_reserved,
+            is_gpu_executed: result.is_gpu_executed,
+            exit_code: result.exit_code,
+            verified: None,
+            credited_member_id,
+            debited_member_id: outcome.submitted_by_member.clone(),
+            credited_label: None,
+            debited_label: None,
+        },
+    ))
+}
+
+async fn commit_terminal_credit(
+    credit_entry: Option<(Arc<CreditsLedger>, TaskUsageInput)>,
+    task_id: TaskId,
+) {
+    if let Some((ledger, input)) = credit_entry {
+        if let Err(err) = ledger.record_task_async(input).await {
+            warn!(
+                task_id = %task_id.0,
+                error = %err,
+                "Failed to record contribution credit for terminal task"
+            );
+        }
+    }
+}
+
+async fn notify_result_waiters(waiters: &WaiterMap, task_id: TaskId, result: TaskResult) {
+    let mut lock = waiters.write().await;
+    if let Some(senders) = lock.remove(&task_id) {
+        for tx in senders {
+            let _ = tx.send(result.clone());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -530,6 +594,8 @@ async fn apply_task_result_inner(
     session_id: Option<u64>,
     mut result: TaskResult,
     blob_store: Option<&Arc<BlobStore>>,
+    credits: Option<&Arc<CreditsLedger>>,
+    members: Option<&Arc<MemberStore>>,
     spawn_waiter_ack: bool,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
@@ -628,6 +694,10 @@ async fn apply_task_result_inner(
                 });
             }
         }
+        let credit_entry = prepare_terminal_credit(
+            credits, registry, members, worker_id, task_id, &outcome, &result,
+        )
+        .await;
         if let Some(store) = blob_store {
             store.unpin_task(&task_id).await;
         }
@@ -647,35 +717,23 @@ async fn apply_task_result_inner(
                             "Failed to sync TaskTerminal journal record for task result"
                         );
                     }
+                    commit_terminal_credit(credit_entry, task_id).await;
                     if let Some(ack_token) = ack_token {
                         ack_registry
                             .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
                     }
-                    {
-                        let mut lock = waiters.write().await;
-                        if let Some(senders) = lock.remove(&task_id) {
-                            for tx in senders {
-                                let _ = tx.send(result.clone());
-                            }
-                        }
-                    }
+                    notify_result_waiters(&waiters, task_id, result).await;
                     cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
+                commit_terminal_credit(credit_entry, task_id).await;
                 if let Some(ack_token) = ack_token {
                     registry
                         .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
                 }
-                {
-                    let mut lock = waiters.write().await;
-                    if let Some(senders) = lock.remove(&task_id) {
-                        for tx in senders {
-                            let _ = tx.send(result.clone());
-                        }
-                    }
-                }
+                notify_result_waiters(waiters, task_id, result).await;
                 queue.spawn_cold_maintenance().await;
             }
         } else {
@@ -688,19 +746,13 @@ async fn apply_task_result_inner(
                     );
                 }
             }
+            commit_terminal_credit(credit_entry, task_id).await;
             if let Some(ack_token) = ack_token {
                 registry
                     .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
             }
-            {
-                let mut lock = waiters.write().await;
-                if let Some(senders) = lock.remove(&task_id) {
-                    for tx in senders {
-                        let _ = tx.send(result.clone());
-                    }
-                }
-            }
+            notify_result_waiters(waiters, task_id, result).await;
             queue.spawn_cold_maintenance().await;
         }
     } else if let Some(ack_token) = ack_token {
@@ -982,6 +1034,8 @@ pub(crate) async fn handle_session_task_message(
     worker_id: Uuid,
     session_id: u64,
     blob_store: Option<&Arc<BlobStore>>,
+    credits: Option<&Arc<CreditsLedger>>,
+    members: Option<&Arc<MemberStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     match msg {
@@ -1044,6 +1098,8 @@ pub(crate) async fn handle_session_task_message(
             let scheduler_notify = Arc::clone(scheduler_notify);
             let waiters = Arc::clone(waiters);
             let blob_store = blob_store.cloned();
+            let credits = credits.cloned();
+            let members = members.cloned();
             #[cfg(feature = "dashboard")]
             let broadcast_tx = broadcast_tx.cloned();
             let _ = tokio::spawn(async move {
@@ -1056,6 +1112,8 @@ pub(crate) async fn handle_session_task_message(
                     Some(session_id),
                     result,
                     blob_store.as_ref(),
+                    credits.as_ref(),
+                    members.as_ref(),
                     true,
                     #[cfg(feature = "dashboard")]
                     broadcast_tx.as_ref(),

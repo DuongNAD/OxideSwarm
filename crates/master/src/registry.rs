@@ -709,6 +709,12 @@ impl WorkerRegistry {
         Ok(())
     }
 
+    /// Returns the enrolled OXS-AUTH v3 `member_id` that registered `worker_id`, if any.
+    pub async fn worker_owner(&self, worker_id: &Uuid) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.owner_member_ids.get(worker_id).cloned().flatten()
+    }
+
     /// Returns the set of `worker_id`s that currently have a live (`Connected` or `Busy`) session.
     pub async fn live_worker_ids(&self) -> HashSet<Uuid> {
         let inner = self.inner.read().await;

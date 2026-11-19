@@ -225,6 +225,10 @@ pub struct ServerConfig {
     pub members: Arc<MemberStore>,
     /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
     members_explicit: bool,
+    /// Maximum raw records retained by the contribution credits ledger (`NET-10`, design 0096).
+    pub max_credit_records: usize,
+    /// Combined byte budget for the contribution credits snapshot + journal (`NET-10`, design 0096).
+    pub max_credit_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -282,6 +286,8 @@ impl Default for ServerConfig {
             local_node_key_path: None,
             members: Arc::new(MemberStore::new()),
             members_explicit: false,
+            max_credit_records: crate::credits::DEFAULT_MAX_CREDIT_RECORDS,
+            max_credit_bytes: crate::credits::DEFAULT_MAX_CREDIT_BYTES,
         }
     }
 }
@@ -598,6 +604,18 @@ impl ServerConfig {
         self.members_explicit = true;
         self
     }
+
+    /// Sets the maximum retained records in the contribution credits ledger before rollover.
+    pub fn with_max_credit_records(mut self, max_records: usize) -> Self {
+        self.max_credit_records = max_records;
+        self
+    }
+
+    /// Sets the maximum disk/memory byte budget for the contribution credits ledger.
+    pub fn with_max_credit_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_credit_bytes = max_bytes;
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -658,6 +676,8 @@ pub struct MasterServer {
     pub p2p_ticket: Option<String>,
     /// The blob store, when `ServerConfig::blob_store` names one.
     blob_store: Option<Arc<BlobStore>>,
+    /// Bounded display-only contribution credits ledger (`NET-10`, design 0096).
+    credits: Arc<crate::credits::CreditsLedger>,
 }
 
 impl MasterServer {
@@ -752,6 +772,22 @@ impl MasterServer {
             Some((store, recovered))
         } else {
             None
+        };
+
+        let credits_config = crate::credits::CreditsConfig {
+            max_records: config.max_credit_records,
+            max_bytes: config.max_credit_bytes,
+        };
+        let credits = if let Some(ref state_dir) = config.state_dir {
+            let state_dir_clone = state_dir.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::credits::CreditsLedger::open(&state_dir_clone, credits_config)
+            })
+            .await
+            .map_err(|e| GridError::Config(format!("Credits ledger start-up failed: {e}")))??;
+            Arc::new(opened)
+        } else {
+            Arc::new(crate::credits::CreditsLedger::in_memory(credits_config))
         };
 
         let effective_blob_store = config.blob_store.clone().or_else(|| {
@@ -943,6 +979,7 @@ impl MasterServer {
             broadcast_tx: None,
             p2p_ticket,
             blob_store,
+            credits,
         })
     }
 
@@ -1011,6 +1048,7 @@ impl MasterServer {
         let p2p_active_conns = Arc::clone(&server.p2p_active_conns);
         let p2p_ticket = server.p2p_ticket.clone();
         let blob_store = server.blob_store.clone();
+        let credits = Arc::clone(&server.credits);
         let master_noise_public_key = server
             .config
             .master_noise_key
@@ -1265,6 +1303,7 @@ impl MasterServer {
             auth_mode,
             members,
             blob_store: blob_store.clone(),
+            credits,
         };
 
         // Pins of finished tasks are released here when no result released them (failover out of
@@ -1734,6 +1773,7 @@ impl MasterServer {
             let p2p_mapreduce_parallelism = self.config.mapreduce_parallelism;
             let p2p_limits = limits.clone();
             let p2p_blob_store = self.blob_store.clone();
+            let p2p_credits = Arc::clone(&self.credits);
             let p2p_auth_ctx = auth_ctx.clone();
 
             tokio::spawn(async move {
@@ -1766,6 +1806,7 @@ impl MasterServer {
                             let c_conns = Arc::clone(&p2p_conns);
                             let c_secret = p2p_secret.clone();
                             let c_blob_store = p2p_blob_store.clone();
+                            let c_credits = Arc::clone(&p2p_credits);
                             let c_auth_ctx = p2p_auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let c_bcast = p2p_broadcast_tx.clone();
@@ -1874,6 +1915,7 @@ impl MasterServer {
                                             c_auth_ctx,
                                             Some(handshake_permit),
                                             c_blob_store,
+                                            Some(c_credits),
                                             #[cfg(feature = "dashboard")]
                                             c_bcast,
                                             #[cfg(feature = "p2p")]
@@ -1901,6 +1943,7 @@ impl MasterServer {
                                             Some(handshake_permit),
                                             p2p_mapreduce_parallelism,
                                             c_blob_store,
+                                            Some(c_credits),
                                             #[cfg(feature = "dashboard")]
                                             c_bcast,
                                             #[cfg(feature = "p2p")]
@@ -1960,6 +2003,7 @@ impl MasterServer {
                             let conn_secret = self.config.cluster_secret.clone();
                             let conn_mapreduce_parallelism = self.config.mapreduce_parallelism;
                             let conn_blob_store = self.blob_store.clone();
+                            let conn_credits = Arc::clone(&self.credits);
                             let conn_auth_ctx = auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let conn_broadcast_tx = self.broadcast_tx.clone();
@@ -1987,6 +2031,7 @@ impl MasterServer {
                                     Some(handshake_permit),
                                     conn_mapreduce_parallelism,
                                     conn_blob_store,
+                                    Some(conn_credits),
                                     #[cfg(feature = "dashboard")]
                                     conn_broadcast_tx,
                                     #[cfg(feature = "p2p")]
@@ -2090,6 +2135,7 @@ pub struct MasterHandle {
     auth_mode: AuthMode,
     members: Arc<MemberStore>,
     blob_store: Option<Arc<BlobStore>>,
+    credits: Arc<crate::credits::CreditsLedger>,
 }
 
 impl MasterHandle {
@@ -2106,6 +2152,11 @@ impl MasterHandle {
     /// Returns the enrolled [`MemberStore`] for this master.
     pub fn members(&self) -> &Arc<MemberStore> {
         &self.members
+    }
+
+    /// Returns the bounded display-only contribution credits ledger for this master.
+    pub fn credits(&self) -> &Arc<crate::credits::CreditsLedger> {
+        &self.credits
     }
 
     /// The blob store of task inputs and output files, if this master runs one.

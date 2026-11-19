@@ -132,6 +132,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     >,
 ) -> GridResult<()> {
     let client_submitter = crate::fair_share::SubmitterId::Client(Uuid::new_v4());
+    let submitted_by_member = v3_peer.as_ref().map(|p| p.member_id.clone());
     let mut next_msg = Some(first_msg);
     let mut first_iteration = true;
     // Uploads this connection leaves unfinished are dropped when it ends.
@@ -140,7 +141,8 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
         .map(|store| UploadOwner::new(Arc::clone(store)));
     let mapreduce = MapReduceEngine::new(queue.clone(), scheduler_notify.clone(), waiters.clone())
         .with_registry(registry.clone())
-        .with_parallelism(mapreduce_parallelism);
+        .with_parallelism(mapreduce_parallelism)
+        .with_submitted_by_member(submitted_by_member.clone());
 
     // Blob requests of this connection that are being handled, oldest first. Their replies are
     // sent in that order (the client matches them by position), and no other answer is sent
@@ -259,7 +261,13 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 };
 
                 if let Err(e) = queue
-                    .submit_from_with_tree_v2(task, 0, client_submitter, needs_tree_v2)
+                    .submit_from_with_tree_v2_and_member(
+                        task,
+                        0,
+                        client_submitter,
+                        needs_tree_v2,
+                        submitted_by_member.clone(),
+                    )
                     .await
                 {
                     // Validation failure, queue full, or a task id that is already in use: tell the

@@ -133,6 +133,7 @@ async fn test_attach_store_and_replay_recovers_all_d2_5_states_and_preserves_cou
                     task_key: submitted_key,
                     priority: 0,
                     submitter: SubmitterId::Default,
+                    submitted_by_member: None,
                     sequence: seq,
                     state: TaskState::Submitted,
                     assigned_worker_id: None,

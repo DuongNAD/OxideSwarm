@@ -124,6 +124,7 @@ pub struct MapReduceEngine {
     waiters: WaiterMap,
     registry: Option<WorkerRegistry>,
     parallelism: usize,
+    submitted_by_member: Option<String>,
     #[cfg(test)]
     cancel_abandoned_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -141,6 +142,7 @@ impl MapReduceEngine {
             waiters,
             registry: None,
             parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
+            submitted_by_member: None,
             #[cfg(test)]
             cancel_abandoned_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -159,6 +161,12 @@ impl MapReduceEngine {
     /// by a job with many reduce keys.
     pub fn with_parallelism(mut self, parallelism: usize) -> Self {
         self.parallelism = parallelism.max(1);
+        self
+    }
+
+    /// Records the authenticated v3 submitting member id on every map/reduce subtask.
+    pub fn with_submitted_by_member(mut self, member_id: Option<String>) -> Self {
+        self.submitted_by_member = member_id;
         self
     }
 
@@ -428,7 +436,15 @@ impl MapReduceEngine {
         let wait_start = Instant::now();
         let mut backoff = Duration::from_millis(25);
         loop {
-            match self.queue.try_submit_slot(&mut task_slot).await {
+            match self
+                .queue
+                .try_submit_slot_from_with_member(
+                    &mut task_slot,
+                    crate::fair_share::SubmitterId::Default,
+                    self.submitted_by_member.clone(),
+                )
+                .await
+            {
                 Ok(_) => {
                     guard.armed = true;
                     break;

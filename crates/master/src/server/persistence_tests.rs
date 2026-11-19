@@ -1371,6 +1371,8 @@ async fn test_worker_session_50_results_batch_in_group_commit() {
             worker_id,
             session_id,
             handle.blob_store.as_ref(),
+            None,
+            None,
             #[cfg(feature = "dashboard")]
             None,
         )
@@ -1607,6 +1609,8 @@ async fn rvb_hundred_results_one_session() {
             w,
             sid,
             h.blob_store.as_ref(),
+            None,
+            None,
             #[cfg(feature = "dashboard")]
             None,
         )

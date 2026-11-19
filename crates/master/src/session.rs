@@ -41,11 +41,12 @@ use rusty_grid_core::{
 };
 
 use crate::blob_store::BlobStore;
+use crate::credits::CreditsLedger;
 use crate::liveness::{RxClock, StampedStream};
 use crate::member_connections::{MemberConnectionGuard, MemberLane};
 use crate::queue::TaskQueue;
 use crate::registry::{HeartbeatOutcome, WorkerRegistry};
-use crate::server::members::MEMBER_NO_LONGER_ENROLLED;
+use crate::server::members::{MemberStore, MEMBER_NO_LONGER_ENROLLED};
 #[cfg(feature = "dashboard")]
 use crate::server::DashboardTx;
 #[cfg(feature = "p2p")]
@@ -505,6 +506,8 @@ pub(crate) struct WorkerSession<
     scheduler_notify: Arc<tokio::sync::Notify>,
     waiters: WaiterMap,
     blob_store: Option<Arc<BlobStore>>,
+    credits: Option<Arc<CreditsLedger>>,
+    members: Arc<MemberStore>,
     shutdown_rx: watch::Receiver<bool>,
     #[cfg(feature = "dashboard")]
     broadcast_tx: Option<DashboardTx>,
@@ -535,6 +538,7 @@ impl<
         auth_ctx: MasterAuthContext,
         handshake_permit: Option<OwnedSemaphorePermit>,
         blob_store: Option<Arc<BlobStore>>,
+        credits: Option<Arc<CreditsLedger>>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
     ) -> GridResult<()> {
         // 1. Cluster authentication + handshake watchdog (Slowloris defense)
@@ -740,6 +744,7 @@ impl<
                 shutdown_rx,
                 abort_handle,
                 blob_store,
+                credits,
                 &auth_ctx,
                 v3_peer.as_ref(),
                 #[cfg(feature = "dashboard")]
@@ -790,6 +795,7 @@ impl<
         shutdown_rx: watch::Receiver<bool>,
         abort_handle: Option<AbortHandle>,
         blob_store: Option<Arc<BlobStore>>,
+        credits: Option<Arc<CreditsLedger>>,
         auth_ctx: &MasterAuthContext,
         v3_peer: Option<&rusty_grid_core::noise_auth::AuthenticatedV3Peer>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
@@ -1373,6 +1379,8 @@ impl<
             scheduler_notify,
             waiters,
             blob_store,
+            credits,
+            members: Arc::clone(&auth_ctx.members),
             shutdown_rx,
             #[cfg(feature = "dashboard")]
             broadcast_tx,
@@ -1609,6 +1617,8 @@ impl<
                     worker_id,
                     session_id,
                     self.blob_store.as_ref(),
+                    self.credits.as_ref(),
+                    Some(&self.members),
                     #[cfg(feature = "dashboard")]
                     self.broadcast_tx.as_ref(),
                 )
@@ -1854,6 +1864,7 @@ mod tests {
                 MasterAuthContext::default(),
                 None,
                 blob_store,
+                None,
                 #[cfg(feature = "dashboard")]
                 None,
             )
