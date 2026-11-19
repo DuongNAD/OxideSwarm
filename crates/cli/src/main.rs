@@ -8,6 +8,8 @@
 //! - `oxideswarm workers`: Inspects active worker nodes advertising capabilities.
 //! - `oxideswarm mapreduce`: Orchestrates in-memory distributed map-reduce jobs.
 
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 /// Stack size for the thread that runs the CLI's top-level future. `run_cli` builds one large

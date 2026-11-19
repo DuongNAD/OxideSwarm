@@ -8,6 +8,8 @@
 //! Running in-process produces 0 child processes for the worker loop itself, ensuring immunity
 //! against the Android 12+ Phantom Process Killer (PPK) and W^X execution restrictions.
 
+#![deny(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -728,6 +730,8 @@ fn string_to_jstring<'local>(env: &mut EnvUnowned<'local>, value: &str) -> jstri
 // JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
 // ==============================================================================
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorker<
     'local,
@@ -774,6 +778,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 }
 
 /// Hands the app's writable sandbox directory to the worker; call it before `nativeStartWorker`.
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetSandboxDir<
     'local,
@@ -794,6 +800,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 }
 
 /// Sets the shared cluster secret before starting the worker.
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetClusterSecret<
     'local,
@@ -813,6 +821,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     }
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetry<
     'local,
@@ -830,6 +840,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     }
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
     'local,
@@ -872,6 +884,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     }
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStopWorker<
     'local,
@@ -886,6 +900,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     }
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeIsRunning<
     'local,
@@ -900,6 +916,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     }
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeGetWorkerStatus<
     'local,
@@ -911,6 +929,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     string_to_jstring(&mut env, &status)
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeDiscoverMaster<
     'local,
@@ -923,6 +943,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     string_to_jstring(&mut env, &status)
 }
 
+// LV-4: JNI C ABI export requires an unmangled symbol (`unsafe_code`).
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
     'local,

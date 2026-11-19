@@ -3,6 +3,8 @@
 //! Provides CLI subcommands to start the WebSocket Relay Hub, run a node client,
 //! query active node inventory, and route commands/payloads across nodes.
 
+#![forbid(unsafe_code)]
+
 use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand};
