@@ -819,6 +819,50 @@ class SoakHarnessTests(unittest.TestCase):
         )
         self.assertEqual([x["pid"] for x in windowed], [4002, 4003, 5005])
 
+        posix_table = [
+            {"pid": 8001, "ppid": 1, "cmd": "python3 /tmp/ox_soak/run1/worker.py", "created_epoch": 1050.0},
+            {"pid": 8002, "ppid": 1, "cmd": r"python3 /tmp/ox_soak\run1\child.py", "created_epoch": 1051.0},
+            {"pid": 8003, "ppid": 1, "cmd": "python3 /tmp/ox_soak/other/worker.py", "created_epoch": 1052.0},
+            {"pid": 8004, "ppid": 1, "cmd": "python3 /TMP/OX_SOAK/RUN1/worker.py", "created_epoch": 1053.0},
+        ]
+        posix_leftovers = endurance.find_leftover_process_trees(
+            posix_table,
+            root_pids=set(),
+            workdir="/tmp/ox_soak/run1",
+            ignore_pids=set(),
+            min_created_epoch=1000.0,
+        )
+        expected_posix = [8001, 8002, 8004] if endurance.IS_WINDOWS else [8001, 8002]
+        self.assertEqual([x["pid"] for x in posix_leftovers], expected_posix)
+
+        with mock.patch.object(endurance, "IS_WINDOWS", False):
+            posix_mode_win_wd = endurance.find_leftover_process_trees(
+                proc_table,
+                root_pids={2001},
+                workdir=r"C:\ox_tmp\soak\run1",
+                ignore_pids={99999},
+                min_created_epoch=1000.0,
+            )
+            self.assertEqual([x["pid"] for x in posix_mode_win_wd], [5000, 5001, 5002])
+            posix_mode_posix_wd = endurance.find_leftover_process_trees(
+                posix_table,
+                root_pids=set(),
+                workdir="/tmp/ox_soak/run1",
+                ignore_pids=set(),
+                min_created_epoch=1000.0,
+            )
+            self.assertEqual([x["pid"] for x in posix_mode_posix_wd], [8001, 8002])
+
+        with mock.patch.object(endurance, "IS_WINDOWS", True):
+            win_mode_posix_wd = endurance.find_leftover_process_trees(
+                posix_table,
+                root_pids=set(),
+                workdir="/tmp/ox_soak/run1",
+                ignore_pids=set(),
+                min_created_epoch=1000.0,
+            )
+            self.assertEqual([x["pid"] for x in win_mode_posix_wd], [8001, 8002, 8004])
+
 
 if __name__ == "__main__":
     unittest.main()

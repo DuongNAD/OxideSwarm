@@ -30,8 +30,10 @@ import getpass
 import hashlib
 import json
 import math
+import ntpath
 import os
 import platform
+import posixpath
 import queue
 import random
 import re
@@ -2685,12 +2687,23 @@ def find_leftover_process_trees(
                 visited.add(cpid)
                 bfs_queue.append((cpid, c_epoch))
 
-    wd_norm = os.path.normcase(os.path.abspath(workdir)) if workdir else ""
-    wd_slash = wd_norm.replace("\\", "/") if wd_norm else ""
-    if wd_norm:
+    wd_cmp = ""
+    if workdir:
+        if posixpath.isabs(workdir):
+            wd_raw = posixpath.normpath(workdir)
+        elif ntpath.isabs(workdir):
+            wd_raw = ntpath.normpath(workdir)
+        else:
+            wd_raw = os.path.abspath(workdir)
+        wd_cmp = wd_raw.replace("\\", "/")
+        if IS_WINDOWS:
+            wd_cmp = wd_cmp.lower()
+    if wd_cmp:
         for pid, row in by_pid.items():
-            cmd_norm = os.path.normcase(str(row.get("cmd") or ""))
-            if wd_norm in cmd_norm or (wd_slash and wd_slash in cmd_norm):
+            cmd_cmp = str(row.get("cmd") or "").replace("\\", "/")
+            if IS_WINDOWS:
+                cmd_cmp = cmd_cmp.lower()
+            if wd_cmp in cmd_cmp:
                 found.setdefault(pid, "cmdline_references_workdir")
 
     redact_paths = [workdir] if workdir else []
