@@ -618,12 +618,23 @@ def summarize_process_lifetimes(samples: List[Dict[str, Any]]) -> Dict[str, List
 def check_soak_resource_plateau(
     samples: List[Dict[str, Any]],
     duration_s: float,
+    expected_roles: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Design 0065 D3 #6.2: memory within max(10%, 32 MiB) and handles within 10% across baseline vs late."""
     base_rows, late_rows, mode = split_soak_windows(samples, duration_s)
     lifetimes = summarize_process_lifetimes(samples)
+    expected_list = [str(r) for r in expected_roles] if expected_roles is not None else []
     if not base_rows or not late_rows:
-        return {"mode": mode, "roles": {}, "process_lifetimes": lifetimes, "passed": False, "reason": "insufficient_samples"}
+        out_fail: Dict[str, Any] = {
+            "mode": mode,
+            "roles": {},
+            "process_lifetimes": lifetimes,
+            "passed": False,
+            "reason": "insufficient_samples",
+        }
+        if expected_list:
+            out_fail["missing_roles"] = expected_list
+        return out_fail
 
     roles_seen: Set[str] = set()
     for row in base_rows:
@@ -632,8 +643,18 @@ def check_soak_resource_plateau(
     for row in late_rows:
         late_roles.update(row.get("processes", {}).keys())
     roles = sorted(r for r in (roles_seen & late_roles) if r != "client")
+    missing_roles = [r for r in expected_list if r not in roles]
     if not roles:
-        return {"mode": mode, "roles": {}, "process_lifetimes": lifetimes, "passed": False, "reason": "no_common_process_roles"}
+        out_empty: Dict[str, Any] = {
+            "mode": mode,
+            "roles": {},
+            "process_lifetimes": lifetimes,
+            "passed": False,
+            "reason": "no_common_process_roles",
+        }
+        if missing_roles:
+            out_empty["missing_roles"] = missing_roles
+        return out_empty
 
     role_checks: Dict[str, Any] = {}
     all_ok = True
@@ -660,7 +681,9 @@ def check_soak_resource_plateau(
             "passed": role_ok,
         }
 
-    return {
+    if missing_roles:
+        all_ok = False
+    res: Dict[str, Any] = {
         "mode": mode,
         "baseline_window_s": [base_rows[0]["t_s"], base_rows[-1]["t_s"]],
         "late_window_s": [late_rows[0]["t_s"], late_rows[-1]["t_s"]],
@@ -668,6 +691,10 @@ def check_soak_resource_plateau(
         "process_lifetimes": lifetimes,
         "passed": all_ok,
     }
+    if missing_roles:
+        res["missing_roles"] = missing_roles
+        res["reason"] = "missing_expected_process_roles"
+    return res
 
 
 def check_soak_disk_and_journal(
@@ -887,7 +914,7 @@ def evaluate_soak_pass_checks(
     idle_sandbox_entries: Dict[str, List[str]],
     tmp_leftovers: Dict[str, List[str]],
     compactions: List[Dict[str, Any]],
-    leftover_pids: List[int],
+    leftover_pids: List[Any],
     idle_blob_store_bytes: Optional[int] = None,
     idle_worker_cache_bytes: Optional[Dict[str, int]] = None,
     worker_pinned_headroom_bytes: int = 0,
@@ -897,6 +924,10 @@ def evaluate_soak_pass_checks(
     fault_errors: Optional[List[Dict[str, Any]]] = None,
     leftover_task_trees: Optional[List[Dict[str, Any]]] = None,
     min_probe_samples_per_window: int = 10,
+    expected_process_roles: Optional[Iterable[str]] = None,
+    missing_remote_shutdowns: Optional[Iterable[str]] = None,
+    remote_evidence_errors: Optional[List[Dict[str, Any]]] = None,
+    run_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute all five D3 item 6 pass/fail criteria plus fault completeness over soak telemetry."""
     submitted = int(ledger_audit.get("submitted", 0))
@@ -936,7 +967,7 @@ def evaluate_soak_pass_checks(
         "master_missing_results": missing_master_results,
         "master_untracked_results": untracked_master_results,
     }
-    c2 = check_soak_resource_plateau(samples, duration_s)
+    c2 = check_soak_resource_plateau(samples, duration_s, expected_roles=expected_process_roles)
     c3 = check_soak_disk_and_journal(
         samples,
         blob_store_limit_bytes=blob_store_limit_bytes,
@@ -957,18 +988,35 @@ def evaluate_soak_pass_checks(
         min_samples_per_window=min_probe_samples_per_window,
     )
     trees = list(leftover_task_trees or [])
-    c5 = {
-        "leftover_pids": [int(p) for p in leftover_pids],
+    normalized_pids: List[Any] = []
+    for item in leftover_pids:
+        if isinstance(item, dict):
+            normalized_pids.append({"worker": str(item.get("worker") or ""), "pid": int(item["pid"])})
+        else:
+            normalized_pids.append(int(item))
+    missing_shutdowns = sorted(str(w) for w in (missing_remote_shutdowns or []))
+    rem_errors = list(remote_evidence_errors or [])
+    c5: Dict[str, Any] = {
+        "leftover_pids": normalized_pids,
         "leftover_task_trees": trees,
-        "passed": len(leftover_pids) == 0 and len(trees) == 0,
+        "passed": len(normalized_pids) == 0 and len(trees) == 0 and len(missing_shutdowns) == 0,
     }
+    if missing_shutdowns or missing_remote_shutdowns is not None:
+        c5["missing_remote_shutdowns"] = missing_shutdowns
     if fault_plan is not None or faults_executed is not None or fault_errors is not None:
         c6 = check_soak_faults(list(fault_plan or []), list(faults_executed or []), fault_errors)
     else:
         c6 = {"planned_count": 0, "executed_count": 0, "ok_count": 0, "error_count": 0, "errors": [], "passed": True}
 
     all_passed = bool(
-        c1["passed"] and c2["passed"] and c3["passed"] and c4["passed"] and c5["passed"] and c6["passed"]
+        c1["passed"]
+        and c2["passed"]
+        and c3["passed"]
+        and c4["passed"]
+        and c5["passed"]
+        and c6["passed"]
+        and (not rem_errors)
+        and (run_error is None)
     )
     return {
         "all_passed": all_passed,
@@ -4354,7 +4402,7 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
     master_only = bool(getattr(args, "master_only", False))
     link = (getattr(args, "link", None) or "").strip().lower()
     if master_only:
-        allowed_links = ("loopback", "lan-tcp", "lan-quic", "quic-relay")
+        allowed_links = ("loopback", "lan-tcp")
         if link not in allowed_links:
             raise ValueError(
                 "--link for soak --master-only must be one of %s (got %r)"
@@ -4452,6 +4500,7 @@ def validate_worker_agent_args(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--blob-cache-mb must be >= 32 (got %d)" % blob_cache_mb)
     sample_interval_s = parse_duration_seconds(getattr(args, "sample_interval", "60s") or "60s")
     connect_timeout_s = parse_duration_seconds(getattr(args, "connect_timeout", "10m") or "10m")
+    orphan_timeout_s = parse_duration_seconds(getattr(args, "orphan_timeout", "15m") or "15m")
     poll_interval_s = float(getattr(args, "poll_interval", 1.0))
     if not math.isfinite(poll_interval_s) or poll_interval_s <= 0.0:
         raise ValueError("--poll-interval must be positive (got %r)" % getattr(args, "poll_interval", None))
@@ -4464,6 +4513,7 @@ def validate_worker_agent_args(args: argparse.Namespace) -> Dict[str, Any]:
         "blob_cache_mb": blob_cache_mb,
         "sample_interval_s": sample_interval_s,
         "connect_timeout_s": connect_timeout_s,
+        "orphan_timeout_s": orphan_timeout_s,
         "poll_interval_s": poll_interval_s,
     }
 
@@ -4820,6 +4870,8 @@ def run_soak(
             expect_workers=parsed_params.get("expect_workers") or None,
             register_timeout_s=float(parsed_params["register_timeout_s"]),
             sample_interval_s=sample_interval_s,
+            rate_mbps=args.rate_mbps,
+            delay_ms=float(args.delay_ms),
             master_port_file=getattr(args, "master_port_file", None),
             control_port_file=getattr(args, "control_port_file", None),
         )
@@ -5139,16 +5191,25 @@ def run_soak(
     samples: List[Dict[str, Any]] = []
     idle_snap: Dict[str, Any] = {}
     master_audit: Dict[str, Any] = {}
-    leftover: List[int] = []
+    leftover: List[Any] = []
     leftover_trees: List[Dict[str, Any]] = []
+    remote_workers_meta: List[Dict[str, Any]] = []
+    run_error: Optional[str] = None
     try:
         cluster.start()
-        soak_t0 = time.monotonic()
-        cluster.mark_soak_started(soak_t0)
-        sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
-        probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
-        probe_thread.start()
+    except Exception:
+        cluster.stop()
+        if not getattr(args, "keep_workdir", False):
+            shutil.rmtree(sc_dir, ignore_errors=True)
+        raise
 
+    soak_t0 = time.monotonic()
+    cluster.mark_soak_started(soak_t0)
+    sampler = BackgroundSampler(cluster.active_pids, cluster.dir_map(), interval_s=sample_interval_s).start()
+    probe_thread = threading.Thread(target=_probe_loop, name="soak-probe", daemon=True)
+    probe_thread.start()
+
+    try:
         end_deadline = soak_t0 + duration_s
         next_fault_idx = 0
         minute_idx = 0
@@ -5220,26 +5281,36 @@ def run_soak(
                 break
             time.sleep(0.5)
         time.sleep(1.5)
-
+    except Exception as exc:
+        run_error = _redact_for_cluster(cluster, work_root, str(exc))
+    finally:
         probe_stop.set()
         if probe_thread is not None:
             probe_thread.join(timeout=60.0)
         if sampler is not None and not sampler._stop.is_set():
             samples = sampler.stop()
-        remote_samples = cluster.collect_remote_idle_and_samples()
-        if remote_samples:
-            samples = remote_soak.merge_remote_samples(samples, remote_samples, sample_interval_s)
-        remote_workers_meta = cluster.remote_worker_metadata()
-        idle_snap = cluster.idle_disk_snapshot()
+        try:
+            remote_samples = cluster.collect_remote_idle_and_samples()
+            if remote_samples:
+                samples = remote_soak.merge_remote_samples(samples, remote_samples, sample_interval_s)
+        except Exception as exc:
+            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+        try:
+            remote_workers_meta = cluster.remote_worker_metadata()
+        except Exception as exc:
+            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+        try:
+            idle_snap = cluster.idle_disk_snapshot()
+        except Exception as exc:
+            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+            idle_snap = {}
         cluster.snapshot_master_task_retries()
-    finally:
-        probe_stop.set()
-        if probe_thread is not None:
-            probe_thread.join(timeout=5.0)
-        if sampler is not None and not sampler._stop.is_set():
-            samples = sampler.stop()
         cluster.stop()
-        master_audit = cluster.audit_master_logs(expected_task_ids=ledger.submitted_task_ids())
+        try:
+            master_audit = cluster.audit_master_logs(expected_task_ids=ledger.submitted_task_ids())
+        except Exception as exc:
+            run_error = run_error or _redact_for_cluster(cluster, work_root, str(exc))
+            master_audit = {}
         leftover = cluster.leftover_pids()
         leftover_trees = cluster.leftover_process_trees()
         if not getattr(args, "keep_workdir", False):
@@ -5265,6 +5336,16 @@ def run_soak(
     ledger_audit["master_failovers_total"] = retry_stats["failovers_total"]
     ledger_audit["retries_source"] = retry_stats["source"]
 
+    expected_process_roles = (
+        cluster.expected_sample_roles() if hasattr(cluster, "expected_sample_roles") else None
+    )
+    missing_remote_shutdowns = (
+        cluster.missing_remote_shutdowns() if hasattr(cluster, "missing_remote_shutdowns") else None
+    )
+    remote_errors = (
+        cluster.remote_evidence_errors() if hasattr(cluster, "remote_evidence_errors") else []
+    )
+
     # Pinned headroom covers one minute of concurrent new-input/reused/output blobs in flight
     pinned_headroom = int((5 * 100 + 2 * 50) * MIB * min(1.0, load_scale) + 128 * MIB)
     worker_pinned_headroom = int((slots * 100 + 2 * 50) * MIB * min(1.0, load_scale) + 64 * MIB)
@@ -5289,6 +5370,10 @@ def run_soak(
         faults_executed=fault_events_log,
         fault_errors=fault_errors,
         leftover_task_trees=leftover_trees,
+        expected_process_roles=expected_process_roles,
+        missing_remote_shutdowns=missing_remote_shutdowns,
+        remote_evidence_errors=remote_errors,
+        run_error=run_error,
     )
     res_out: Dict[str, Any] = {
         "passed": pass_eval["all_passed"],
@@ -5309,6 +5394,10 @@ def run_soak(
     }
     if remote_workers_meta:
         res_out["remote_workers"] = remote_workers_meta
+    if remote_errors:
+        res_out["remote_evidence_errors"] = remote_errors
+    if run_error is not None:
+        res_out["run_error"] = run_error
     return res_out
 
 
@@ -5525,6 +5614,7 @@ def cmd_worker_agent(args: argparse.Namespace) -> int:
         keep_workdir=bool(args.keep_workdir),
         poll_interval_s=parsed["poll_interval_s"],
         connect_timeout_s=parsed["connect_timeout_s"],
+        orphan_timeout_s=parsed["orphan_timeout_s"],
     )
 
     def _on_sig(_signum: int, _frame: Any) -> None:
@@ -5683,7 +5773,7 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--delay-ms", type=float, default=0.0, help="Optional per-worker ThrottleProxy RTT delay in ms")
     sk.add_argument("--work-dir", help="Base directory for temporary stores, state dirs, and payloads")
     sk.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
-    sk.add_argument("--link", default="loopback", help="Link label (loopback locally; loopback|lan-tcp|lan-quic|quic-relay with --master-only)")
+    sk.add_argument("--link", default="loopback", help="Link label (loopback locally; loopback|lan-tcp with --master-only)")
     sk.add_argument("--rtt-ms", type=float, help="Measured link RTT in ms")
     sk.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base PRNG seed")
     sk.add_argument("--out", help="Output JSON record path")
@@ -5719,6 +5809,11 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
     wa.add_argument("--poll-interval", type=float, default=1.0, help="Control-channel poll interval in seconds")
     wa.add_argument("--connect-timeout", default="10m", help="Initial control registration timeout (default 10m)")
+    wa.add_argument(
+        "--orphan-timeout",
+        default="15m",
+        help="Stop worker and exit non-zero after this duration without an authenticated 200 poll (default 15m)",
+    )
 
     th = sub.add_parser("throttle", help="Run loopback TCP throttle proxy (127.0.0.1 only)")
     th.add_argument("--listen", default="127.0.0.1:0", help="Listen address (127.0.0.1:PORT)")

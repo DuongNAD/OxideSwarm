@@ -23,6 +23,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import warnings
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 KIB = 1024
@@ -37,11 +39,26 @@ MIB = 1024 * 1024
 
 ALLOWED_CONTROL_OPS = frozenset({"kill_restart", "link_cut", "idle_snapshot", "shutdown"})
 MAX_CONTROL_BODY_BYTES = 32 * MIB
+MAX_CONTROL_REPLY_BYTES = 1 * MIB
 DEFAULT_REPLAY_WINDOW_S = 300.0
+DEFAULT_CONTROL_HANDLER_TIMEOUT_S = 30.0
+DEFAULT_CONTROL_MAX_CONCURRENT = 8
+DEFAULT_ORPHAN_TIMEOUT_S = 15.0 * 60.0
+MIN_SECRET_BYTES = 16
+MAX_SECRET_BYTES = 256
 
 _WORKER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_HEX_TEXT_RE = re.compile(r"^[0-9A-Fa-f]+$")
+
+
+class ControlProtocolError(RuntimeError):
+    """Raised when the peer violates control-channel authentication, bounds, or framing."""
+
+
+class ControlBusyError(OSError):
+    """Raised on transient HTTP 503 overload from the control server."""
 
 
 def validate_worker_name(name: str) -> str:
@@ -53,18 +70,87 @@ def validate_worker_name(name: str) -> str:
     return name
 
 
+def _warn_if_secret_readable_by_others(abs_path: str) -> None:
+    """Warn (read-only) when a secret file grants access beyond owner/administrators."""
+    if os.name != "nt":
+        try:
+            mode = stat.S_IMODE(os.stat(abs_path).st_mode)
+        except OSError:
+            return
+        if mode & 0o077 != 0:
+            warnings.warn(
+                "cluster secret file '%s' is accessible by group/others (mode=%04o); run `chmod 600` on it"
+                % (abs_path, mode),
+                UserWarning,
+                stacklevel=3,
+            )
+        return
+
+    try:
+        res = subprocess.run(
+            ["icacls", abs_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+        )
+    except Exception:
+        return
+    if res.returncode != 0 or not res.stdout:
+        return
+    broad_principals = (
+        "everyone",
+        "builtin\\users",
+        "nt authority\\authenticated users",
+        "builtin\\guests",
+        "nt authority\\anonymous logon",
+    )
+    low = res.stdout.lower()
+    if any(p in low for p in broad_principals):
+        warnings.warn(
+            "cluster secret file '%s' may be readable by other local accounts; restrict its NTFS DACL" % abs_path,
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def parse_cluster_secret_text(text: str, source: str = "<secret>") -> str:
+    """Parse secret text identically to Rust `ClusterSecret::load_file`: first non-empty non-`#` hex line."""
+    line = None
+    for raw_ln in text.splitlines():
+        cand = raw_ln.strip()
+        if cand and not cand.startswith("#"):
+            line = cand
+            break
+    if line is None:
+        raise ValueError("cluster secret file '%s' is empty" % source)
+    if len(line) % 2 != 0 or not _HEX_TEXT_RE.match(line):
+        raise ValueError(
+            "cluster secret file '%s' is invalid: must be an even number of hexadecimal characters" % source
+        )
+    raw = bytes.fromhex(line)
+    if len(raw) < MIN_SECRET_BYTES:
+        raise ValueError(
+            "cluster secret is too short: need at least %d bytes (%d hex characters)"
+            % (MIN_SECRET_BYTES, MIN_SECRET_BYTES * 2)
+        )
+    if len(raw) > MAX_SECRET_BYTES:
+        raise ValueError("cluster secret is too long: at most %d bytes are supported" % MAX_SECRET_BYTES)
+    return line.lower()
+
+
 def load_secret_file(path: str) -> Tuple[str, str]:
-    """Read a trimmed cluster secret from `path` without logging or exposing the secret."""
+    """Read a cluster secret from `path` matching `ClusterSecret::load_file`, warning on wide permissions."""
     if not path or not str(path).strip():
         raise ValueError("--secret-file is required")
     abs_path = os.path.abspath(str(path))
     if not os.path.isfile(abs_path):
         raise ValueError("secret file does not exist or is not a regular file: %s" % abs_path)
+    _warn_if_secret_readable_by_others(abs_path)
     with open(abs_path, "r", encoding="utf-8") as f:
-        secret_text = f.read().strip()
-    if len(secret_text) < 16:
-        raise ValueError("secret file must contain at least 16 characters (%s)" % abs_path)
-    return abs_path, secret_text
+        text = f.read()
+    return abs_path, parse_cluster_secret_text(text, abs_path)
 
 
 def parse_host_port(addr: str, default_port: int = 0) -> Tuple[str, int]:
@@ -154,11 +240,18 @@ def canonical_response_bytes(
     ts: str,
     nonce: str,
     body_bytes: bytes,
+    req_nonce: str,
+    run_id: str,
 ) -> bytes:
-    for part in (path, worker, ts, nonce):
+    for part in (path, worker, ts, nonce, req_nonce):
         if not _header_token_ok(part):
             raise ValueError("invalid header token in response signature")
-    prefix = ("RESP\n%d\n%s\n%s\n%s\n%s\n" % (int(status), path, worker, ts, nonce)).encode("utf-8")
+    if not isinstance(run_id, str) or ("\n" in run_id) or ("\r" in run_id):
+        raise ValueError("invalid run_id in response signature")
+    prefix = (
+        "RESP\n%d\n%s\n%s\n%s\n%s\n%s\n%s\n"
+        % (int(status), path, worker, ts, nonce, req_nonce, run_id)
+    ).encode("utf-8")
     return prefix + body_bytes
 
 
@@ -202,8 +295,10 @@ def sign_response(
     ts: str,
     nonce: str,
     body_bytes: bytes,
+    req_nonce: str,
+    run_id: str,
 ) -> str:
-    msg = canonical_response_bytes(status, path, worker, ts, nonce, body_bytes)
+    msg = canonical_response_bytes(status, path, worker, ts, nonce, body_bytes, req_nonce, run_id)
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
@@ -216,11 +311,13 @@ def verify_response(
     nonce: str,
     body_bytes: bytes,
     sig: str,
+    req_nonce: str,
+    run_id: str,
 ) -> bool:
     if not isinstance(sig, str) or not _HEX64_RE.match(sig.lower()):
         return False
     try:
-        expected = sign_response(key, status, path, worker, ts, nonce, body_bytes)
+        expected = sign_response(key, status, path, worker, ts, nonce, body_bytes, req_nonce, run_id)
     except ValueError:
         return False
     return hmac.compare_digest(expected, sig.lower())
@@ -308,15 +405,80 @@ def merge_remote_samples(
     return merged
 
 
-class _ThreadingHTTPServerV4(socketserver.ThreadingMixIn, http.server.HTTPServer):
+class _SoakThreadingMixin(socketserver.ThreadingMixIn):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        _exc_t, exc, _tb = sys.exc_info()
+        if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+            return
+        super().handle_error(request, client_address)
 
-class _ThreadingHTTPServerV6(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+class _ThreadingHTTPServerV4(_SoakThreadingMixin, http.server.HTTPServer):
+    pass
+
+
+class _ThreadingHTTPServerV6(_SoakThreadingMixin, http.server.HTTPServer):
     address_family = socket.AF_INET6
-    daemon_threads = True
-    allow_reuse_address = True
+
+
+def _validate_and_match_worker_settings(
+    got: Any,
+    expected: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if got is None and expected is None:
+        return {}, None
+    if not isinstance(got, dict):
+        return None, "missing settings object"
+    required = ("slots", "blob_cache_mb", "workspaces", "rate_mbps", "delay_ms")
+    missing = [k for k in required if k not in got]
+    if missing:
+        return None, "missing settings fields: %s" % ", ".join(missing)
+    try:
+        g_slots = int(got["slots"])
+        g_cache = int(got["blob_cache_mb"])
+        if not isinstance(got["workspaces"], bool):
+            return None, "workspaces must be boolean"
+        g_ws = bool(got["workspaces"])
+        g_rate = None if got["rate_mbps"] is None else float(got["rate_mbps"])
+        g_delay = float(got["delay_ms"])
+    except (TypeError, ValueError):
+        return None, "non-numeric worker settings"
+    if g_slots < 1 or g_cache < 32:
+        return None, "out-of-range slots/blob_cache_mb"
+    if g_rate is not None and (not math.isfinite(g_rate) or g_rate <= 0.0):
+        return None, "invalid rate_mbps"
+    if not math.isfinite(g_delay) or g_delay < 0.0:
+        return None, "invalid delay_ms"
+
+    norm = {
+        "slots": g_slots,
+        "blob_cache_mb": g_cache,
+        "workspaces": g_ws,
+        "rate_mbps": g_rate,
+        "delay_ms": g_delay,
+    }
+    if expected is not None:
+        mismatches: List[str] = []
+        if g_slots != int(expected["slots"]):
+            mismatches.append("slots=%r (expected %r)" % (g_slots, int(expected["slots"])))
+        if g_cache != int(expected["blob_cache_mb"]):
+            mismatches.append("blob_cache_mb=%r (expected %r)" % (g_cache, int(expected["blob_cache_mb"])))
+        if g_ws is not bool(expected["workspaces"]):
+            mismatches.append("workspaces=%r (expected %r)" % (g_ws, bool(expected["workspaces"])))
+        e_rate = None if expected.get("rate_mbps") is None else float(expected["rate_mbps"])
+        if (g_rate is None) != (e_rate is None) or (
+            g_rate is not None and e_rate is not None and abs(g_rate - e_rate) > 1e-6
+        ):
+            mismatches.append("rate_mbps=%r (expected %r)" % (g_rate, e_rate))
+        e_delay = float(expected.get("delay_ms", 0.0))
+        if abs(g_delay - e_delay) > 1e-6:
+            mismatches.append("delay_ms=%r (expected %r)" % (g_delay, e_delay))
+        if mismatches:
+            return None, "; ".join(mismatches)
+    return norm, None
 
 
 class SoakControlServer:
@@ -331,6 +493,9 @@ class SoakControlServer:
         expected_count: int = 2,
         sample_interval_s: float = 60.0,
         port_file: Optional[str] = None,
+        worker_settings: Optional[Dict[str, Any]] = None,
+        handler_timeout_s: float = DEFAULT_CONTROL_HANDLER_TIMEOUT_S,
+        max_concurrent_connections: int = DEFAULT_CONTROL_MAX_CONCURRENT,
     ) -> None:
         self.listen_host, self.listen_port = parse_host_port(listen_addr, default_port=0)
         self.control_key = bytes(control_key)
@@ -338,6 +503,12 @@ class SoakControlServer:
         self.expected_count = max(1, int(expected_count))
         self.sample_interval_s = float(sample_interval_s)
         self.port_file = port_file
+        self.expected_settings: Optional[Dict[str, Any]] = (
+            dict(worker_settings) if worker_settings is not None else None
+        )
+        self._handler_timeout_s = max(0.05, float(handler_timeout_s))
+        self._max_concurrent = max(1, int(max_concurrent_connections))
+        self._conn_sem = threading.BoundedSemaphore(self._max_concurrent)
         self.run_id = secrets.token_hex(16)
 
         self._replay = ReplayGuard(window_s=DEFAULT_REPLAY_WINDOW_S)
@@ -352,9 +523,37 @@ class SoakControlServer:
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            timeout = owner._handler_timeout_s
 
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 return
+
+            def handle(self) -> None:
+                if not owner._conn_sem.acquire(blocking=False):
+                    try:
+                        # Drain a bounded chunk of buffered request headers so Windows doesn't RST on close before 503 is read.
+                        self.connection.settimeout(0.05)
+                        try:
+                            self.connection.recv(8192)
+                        except OSError:
+                            pass
+                        self.connection.sendall(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        try:
+                            self.connection.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                    except OSError:
+                        pass
+                    self.close_connection = True
+                    return
+                try:
+                    super().handle()
+                except (TimeoutError, socket.timeout, ConnectionError, OSError):
+                    self.close_connection = True
+                finally:
+                    owner._conn_sem.release()
 
             def _send_unauth(self, status: int = 401) -> None:
                 self.close_connection = True
@@ -363,16 +562,37 @@ class SoakControlServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
-            def _send_signed(self, status: int, path: str, worker: str, payload: Dict[str, Any]) -> None:
+            def _send_signed(
+                self,
+                status: int,
+                path: str,
+                worker: str,
+                payload: Dict[str, Any],
+                *,
+                req_nonce: str,
+                req_run_id: str,
+            ) -> None:
                 raw = (json.dumps(payload) + "\n").encode("utf-8")
                 ts_str = "%.3f" % time.time()
                 nonce = secrets.token_hex(16)
-                sig = sign_response(owner.control_key, status, path, worker, ts_str, nonce, raw)
+                sig = sign_response(
+                    owner.control_key,
+                    status,
+                    path,
+                    worker,
+                    ts_str,
+                    nonce,
+                    raw,
+                    req_nonce,
+                    req_run_id,
+                )
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.send_header("X-Soak-Ts", ts_str)
                 self.send_header("X-Soak-Nonce", nonce)
+                self.send_header("X-Soak-Req-Nonce", req_nonce)
+                self.send_header("X-Soak-Run-Id", req_run_id)
                 self.send_header("X-Soak-Sig", sig)
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -389,10 +609,6 @@ class SoakControlServer:
                 if length < 0 or length > MAX_CONTROL_BODY_BYTES:
                     self._send_unauth(413)
                     return
-                body_bytes = self.rfile.read(length) if length > 0 else b""
-                if len(body_bytes) != length:
-                    self._send_unauth(400)
-                    return
 
                 worker_hdr = self.headers.get("X-Soak-Worker", "")
                 ts_hdr = self.headers.get("X-Soak-Ts", "")
@@ -404,8 +620,19 @@ class SoakControlServer:
                 except ValueError:
                     self._send_unauth(401)
                     return
-                if not _NONCE_RE.match(nonce_hdr):
+                if (
+                    not math.isfinite(ts_val)
+                    or abs(time.time() - ts_val) > owner._replay.window_s
+                    or not _NONCE_RE.match(nonce_hdr)
+                    or not isinstance(sig_hdr, str)
+                    or not _HEX64_RE.match(sig_hdr.lower())
+                ):
                     self._send_unauth(401)
+                    return
+
+                body_bytes = self.rfile.read(length) if length > 0 else b""
+                if len(body_bytes) != length:
+                    self._send_unauth(400)
                     return
 
                 path = self.path.split("?", 1)[0]
@@ -420,14 +647,24 @@ class SoakControlServer:
                 try:
                     body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
                 except (UnicodeDecodeError, ValueError):
-                    self._send_signed(400, path, worker, {"error": "invalid JSON body"})
+                    self._send_signed(400, path, worker, {"error": "invalid JSON body"}, req_nonce=nonce_hdr, req_run_id="")
                     return
                 if not isinstance(body, dict):
-                    self._send_signed(400, path, worker, {"error": "JSON body must be an object"})
+                    self._send_signed(
+                        400,
+                        path,
+                        worker,
+                        {"error": "JSON body must be an object"},
+                        req_nonce=nonce_hdr,
+                        req_run_id="",
+                    )
                     return
 
+                req_run_id = str(body.get("run_id") or "")
+                if ("\n" in req_run_id) or ("\r" in req_run_id):
+                    req_run_id = ""
                 status, resp = owner._handle_authenticated(path, worker, body)
-                self._send_signed(status, path, worker, resp)
+                self._send_signed(status, path, worker, resp, req_nonce=nonce_hdr, req_run_id=req_run_id)
 
         srv_cls = _ThreadingHTTPServerV6 if ":" in self.listen_host.strip("[]") else _ThreadingHTTPServerV4
         self._httpd = srv_cls((self.listen_host.strip("[]"), self.listen_port), _Handler)
@@ -453,10 +690,45 @@ class SoakControlServer:
             if path == "/v1/register":
                 if self.expected_workers and worker not in self.expected_workers:
                     return 403, {"error": "worker %r not in expected_workers" % (worker,)}
-                if worker not in self._workers and len(self._workers) >= self.expected_count:
+                instance_id = body.get("instance_id")
+                if (
+                    not isinstance(instance_id, str)
+                    or not instance_id
+                    or len(instance_id) > 128
+                    or ("\n" in instance_id)
+                    or ("\r" in instance_id)
+                ):
+                    return 400, {"error": "missing or invalid instance_id"}
+
+                settings_norm, settings_err = _validate_and_match_worker_settings(
+                    body.get("settings"),
+                    self.expected_settings,
+                )
+                if settings_err is not None or settings_norm is None:
+                    return 400, {"error": "worker settings rejected for %r: %s" % (worker, settings_err)}
+
+                existing = self._workers.get(worker)
+                if existing is not None:
+                    if existing.get("instance_id") != instance_id:
+                        return 403, {"error": "worker %r is already registered by another live instance" % (worker,)}
+                    existing["last_seen_monotonic"] = time.monotonic()
+                    self._cond.notify_all()
+                    return 200, {
+                        "run_id": self.run_id,
+                        "worker_name": worker,
+                        "instance_id": instance_id,
+                        "sample_interval_s": self.sample_interval_s,
+                        "soak_running": soak_running,
+                        "elapsed_s": elapsed_s,
+                        "settings": copy.deepcopy(existing["settings"]),
+                    }
+
+                if len(self._workers) >= self.expected_count:
                     return 403, {"error": "all %d worker slots are already registered" % self.expected_count}
                 self._workers[worker] = {
                     "name": worker,
+                    "instance_id": instance_id,
+                    "settings": settings_norm,
                     "os": body.get("os") if isinstance(body.get("os"), dict) else {},
                     "hardware": body.get("hardware") if isinstance(body.get("hardware"), dict) else {},
                     "windows_realtime_av_enabled": body.get("windows_realtime_av_enabled"),
@@ -473,9 +745,11 @@ class SoakControlServer:
                 return 200, {
                     "run_id": self.run_id,
                     "worker_name": worker,
+                    "instance_id": instance_id,
                     "sample_interval_s": self.sample_interval_s,
                     "soak_running": soak_running,
                     "elapsed_s": elapsed_s,
+                    "settings": copy.deepcopy(settings_norm),
                 }
 
             if worker not in self._workers:
@@ -569,6 +843,7 @@ class SoakControlServer:
                 out.append(
                     {
                         "name": rec["name"],
+                        "settings": copy.deepcopy(rec.get("settings") or {}),
                         "os": copy.deepcopy(rec["os"]),
                         "hardware": copy.deepcopy(rec["hardware"]),
                         "windows_realtime_av_enabled": rec["windows_realtime_av_enabled"],
@@ -648,20 +923,51 @@ class SoakControlServer:
 
 
 class SignedControlClient:
-    """Signed HTTP client used by `WorkerAgent` that rejects unauthenticated server replies."""
+    """Signed HTTP client used by `WorkerAgent` that rejects unauthenticated or oversized replies."""
 
-    def __init__(self, base_url: str, worker_name: str, control_key: bytes, extra_secrets: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        worker_name: str,
+        control_key: bytes,
+        extra_secrets: Iterable[str] = (),
+        *,
+        max_reply_bytes: int = MAX_CONTROL_REPLY_BYTES,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.worker_name = validate_worker_name(worker_name)
         self.control_key = bytes(control_key)
         self.extra_secrets = tuple(extra_secrets)
+        self.max_reply_bytes = max(64, int(max_reply_bytes))
         self._resp_replay = ReplayGuard(window_s=DEFAULT_REPLAY_WINDOW_S)
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _read_capped_reply(self, fp: Any, headers: Any, path: str) -> bytes:
+        raw_cl = headers.get("Content-Length") if headers is not None else None
+        if raw_cl is not None:
+            try:
+                cl = int(raw_cl)
+            except ValueError as exc:
+                raise ControlProtocolError("invalid Content-Length on %s reply" % path) from exc
+            if cl < 0 or cl > self.max_reply_bytes:
+                raise ControlProtocolError(
+                    "control server reply Content-Length %d exceeds %d-byte cap on %s"
+                    % (cl, self.max_reply_bytes, path)
+                )
+        if fp is None:
+            return b""
+        data = fp.read(self.max_reply_bytes + 1)
+        if len(data) > self.max_reply_bytes:
+            raise ControlProtocolError(
+                "control server reply exceeded %d-byte cap on %s" % (self.max_reply_bytes, path)
+            )
+        return data
 
     def post(self, path: str, payload: Dict[str, Any], timeout_s: float = 15.0) -> Tuple[int, Dict[str, Any]]:
         body_bytes = json.dumps(payload).encode("utf-8")
         ts_str = "%.3f" % time.time()
         nonce = secrets.token_hex(16)
+        req_run_id = str(payload.get("run_id") or "")
         sig = sign_request(self.control_key, "POST", path, self.worker_name, ts_str, nonce, body_bytes)
         req = urllib.request.Request(
             self.base_url + path,
@@ -681,32 +987,62 @@ class SignedControlClient:
         try:
             with self._opener.open(req, timeout=timeout_s) as resp:
                 status = int(resp.status)
-                resp_headers = resp.headers
-                resp_raw = resp.read()
+                resp_headers = resp.headers or {}
+                resp_raw = self._read_capped_reply(resp, resp_headers, path)
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
             resp_headers = exc.headers or {}
-            resp_raw = exc.read() if exc.fp is not None else b""
+            try:
+                if status == 503:
+                    raise ControlBusyError("control server busy (503) on %s" % path)
+                resp_raw = self._read_capped_reply(exc.fp, resp_headers, path)
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
 
         if status == 401:
-            raise RuntimeError("control server rejected authentication (401) on %s" % path)
+            raise ControlProtocolError("control server rejected authentication (401) on %s" % path)
 
         r_ts = resp_headers.get("X-Soak-Ts", "")
         r_nonce = resp_headers.get("X-Soak-Nonce", "")
+        r_req_nonce = resp_headers.get("X-Soak-Req-Nonce", "")
+        r_run_id = resp_headers.get("X-Soak-Run-Id") or ""
         r_sig = resp_headers.get("X-Soak-Sig", "")
+        if r_req_nonce != nonce:
+            raise ControlProtocolError("control server reply X-Soak-Req-Nonce mismatch on %s" % path)
+        if r_run_id != req_run_id:
+            raise ControlProtocolError("control server reply X-Soak-Run-Id mismatch on %s" % path)
         try:
             r_ts_val = float(r_ts)
         except ValueError as exc:
-            raise RuntimeError("control server reply missing valid X-Soak-Ts on %s" % path) from exc
+            raise ControlProtocolError("control server reply missing valid X-Soak-Ts on %s" % path) from exc
 
-        if not verify_response(self.control_key, status, path, self.worker_name, r_ts, r_nonce, resp_raw, r_sig):
-            raise RuntimeError("control server response HMAC verification failed on %s" % path)
+        if not verify_response(
+            self.control_key,
+            status,
+            path,
+            self.worker_name,
+            r_ts,
+            r_nonce,
+            resp_raw,
+            r_sig,
+            nonce,
+            req_run_id,
+        ):
+            raise ControlProtocolError("control server response HMAC verification failed on %s" % path)
         if not self._resp_replay.check_and_record("srv:%s:%s" % (self.worker_name, r_nonce), r_ts_val):
-            raise RuntimeError("control server response replay/timestamp check failed on %s" % path)
+            raise ControlProtocolError("control server response replay/timestamp check failed on %s" % path)
 
-        parsed = json.loads(resp_raw.decode("utf-8")) if resp_raw else {}
+        try:
+            parsed = json.loads(resp_raw.decode("utf-8")) if resp_raw else {}
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ControlProtocolError("control server reply had invalid JSON on %s" % path) from exc
         if not isinstance(parsed, dict):
-            raise RuntimeError("control server reply was not a JSON object")
+            raise ControlProtocolError("control server reply was not a JSON object")
+        if status == 200 and req_run_id and "run_id" in parsed and str(parsed["run_id"]) != req_run_id:
+            raise ControlProtocolError("control server reply run_id payload mismatch on %s" % path)
         return status, parsed
 
 
@@ -728,6 +1064,8 @@ def create_remote_soak_cluster(
     expect_workers: Optional[List[str]],
     register_timeout_s: float,
     sample_interval_s: float,
+    rate_mbps: Optional[float] = None,
+    delay_ms: float = 0.0,
     master_port_file: Optional[str] = None,
     control_port_file: Optional[str] = None,
 ) -> Any:
@@ -746,16 +1084,23 @@ def create_remote_soak_cluster(
             self._expect_workers = list(expect_workers or [])
             self._register_timeout_s = float(register_timeout_s)
             self._sample_interval_s = float(sample_interval_s)
+            self._expected_worker_settings = {
+                "slots": int(slots),
+                "blob_cache_mb": int(blob_cache_mb),
+                "workspaces": bool(workspaces),
+                "rate_mbps": float(rate_mbps) if rate_mbps is not None else None,
+                "delay_ms": float(delay_ms),
+            }
             self._fixed_listen_addr: Optional[str] = None
             self.worker_names: List[str] = []
-            self.dashboard_token: str = self._resolve_dashboard_token(binary, self._secret_file)
-            self.forbidden_secrets: List[str] = [
-                tok for tok in (secret_text, self.dashboard_token, self._secret_file) if tok
-            ]
             self.control_server: Optional[SoakControlServer] = None
             self._remote_idle_snaps: Dict[str, Dict[str, Any]] = {}
             self._remote_leftover_pids: List[Dict[str, Any]] = []
             self._remote_leftover_trees: List[Dict[str, Any]] = []
+            self._remote_evidence_errors: List[Dict[str, Any]] = []
+            self._remote_missing_shutdowns: Set[str] = set()
+            self.dashboard_token: str = ""
+            self.forbidden_secrets: List[str] = [tok for tok in (secret_text, self._secret_file) if tok]
             super().__init__(
                 binary,
                 workdir,
@@ -769,27 +1114,33 @@ def create_remote_soak_cluster(
                 rate_mbps=None,
                 delay_ms=0.0,
             )
+            token_env = self._build_env(os.path.join(self.workdir, "home-secret"))
+            self.dashboard_token = self._resolve_dashboard_token(binary, self._secret_file, token_env)
+            self.forbidden_secrets = [
+                tok for tok in (secret_text, self.dashboard_token, self._secret_file) if tok
+            ]
 
         @staticmethod
-        def _resolve_dashboard_token(bin_path: str, sec_path: str) -> str:
-            env = dict(os.environ)
+        def _resolve_dashboard_token(bin_path: str, sec_path: str, private_env: Dict[str, str]) -> str:
+            env = dict(private_env)
             env.pop("OXIDESWARM_SECRET", None)
             env["OXIDESWARM_SECRET_FILE"] = sec_path
-            try:
-                res = subprocess.run(
-                    [bin_path, "secret", "show", "--secret-file", sec_path, "--dashboard-token"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=env,
-                    timeout=10.0,
+            res = subprocess.run(
+                [bin_path, "secret", "show", "--secret-file", sec_path, "--dashboard-token"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                timeout=10.0,
+            )
+            tok = res.stdout.strip()
+            if res.returncode != 0 or not tok:
+                detail = base_module.redact_text((res.stderr or res.stdout or "").strip(), [sec_path])
+                raise RuntimeError(
+                    "failed to resolve dashboard token (rc=%s): %s" % (res.returncode, detail)
                 )
-                if res.returncode == 0:
-                    return res.stdout.strip()
-            except Exception:
-                pass
-            return ""
+            return tok
 
         def _build_env(self, home: str) -> Dict[str, str]:
             env = super()._build_env(home)
@@ -968,6 +1319,7 @@ def create_remote_soak_cluster(
                 expected_count=self.n_workers,
                 sample_interval_s=self._sample_interval_s,
                 port_file=self._control_port_file,
+                worker_settings=self._expected_worker_settings,
             )
             with self._lifecycle_lock:
                 self._start_master_locked()
@@ -1091,17 +1443,42 @@ def create_remote_soak_cluster(
                 "snapshot_bin_bytes": os.path.join(self.state_dir, "snapshot.bin"),
             }
 
+        def expected_sample_roles(self) -> List[str]:
+            names = list(self._expect_workers) if self._expect_workers else list(self.worker_names)
+            return ["master"] + ["worker_%s" % w for w in names]
+
+        def missing_remote_shutdowns(self) -> List[str]:
+            missing = set(self._remote_missing_shutdowns)
+            if self._expect_workers:
+                missing.update(w for w in self._expect_workers if w not in self.worker_names)
+            return sorted(missing)
+
+        def remote_evidence_errors(self) -> List[Dict[str, Any]]:
+            return list(self._remote_evidence_errors)
+
         def collect_remote_idle_and_samples(self) -> Dict[str, List[Dict[str, Any]]]:
             if self.control_server is None or not self.worker_names:
                 return {}
             out: Dict[str, List[Dict[str, Any]]] = {}
 
-            def _pull_one(wname: str) -> Tuple[str, Dict[str, Any]]:
-                ack = self.control_server.dispatch_command(wname, "idle_snapshot", {}, timeout_s=120.0)
-                return wname, dict(ack.get("result") or {})
+            def _pull_one(wname: str) -> Tuple[str, Dict[str, Any], Optional[str]]:
+                try:
+                    ack = self.control_server.dispatch_command(wname, "idle_snapshot", {}, timeout_s=120.0)
+                    return wname, dict(ack.get("result") or {}), None
+                except Exception as exc:
+                    return wname, {}, str(exc)
 
             with ThreadPoolExecutor(max_workers=len(self.worker_names)) as pool:
-                for wname, res in pool.map(_pull_one, self.worker_names):
+                for wname, res, err in pool.map(_pull_one, self.worker_names):
+                    if err is not None:
+                        self._remote_evidence_errors.append(
+                            {
+                                "worker": wname,
+                                "phase": "idle_snapshot",
+                                "error": self.redact(err),
+                            }
+                        )
+                        continue
                     if isinstance(res.get("idle_disk_snapshot"), dict):
                         self._remote_idle_snaps[wname] = dict(res["idle_disk_snapshot"])
                     if isinstance(res.get("samples"), list):
@@ -1114,7 +1491,7 @@ def create_remote_soak_cluster(
                 "master_blobs_tmp": base_module.list_tmp_entries(self.blob_dir),
             }
             worker_caches: Dict[str, int] = {}
-            for wname in self.worker_names:
+            for wname in (self._expect_workers or self.worker_names):
                 rs = self._remote_idle_snaps.get(wname)
                 if not rs:
                     sandbox_entries[wname] = ["missing_remote_idle_snapshot"]
@@ -1134,16 +1511,26 @@ def create_remote_soak_cluster(
 
         def stop(self) -> None:
             if self.control_server is not None and self.worker_names:
-                def _stop_one(wname: str) -> Optional[Dict[str, Any]]:
+                def _stop_one(wname: str) -> Tuple[str, bool, Dict[str, Any], Optional[str]]:
                     try:
                         ack = self.control_server.dispatch_command(wname, "shutdown", {}, timeout_s=45.0)
-                        return dict(ack.get("result") or {})
+                        return wname, True, dict(ack.get("result") or {}), None
                     except Exception as exc:
-                        return {"shutdown_error": self.redact(str(exc)), "leftover_pids": []}
+                        return wname, False, {}, str(exc)
 
                 with ThreadPoolExecutor(max_workers=len(self.worker_names)) as pool:
-                    for wname, res in zip(self.worker_names, pool.map(_stop_one, self.worker_names)):
-                        if not res:
+                    for wname, ok, res, err in pool.map(_stop_one, self.worker_names):
+                        if not ok:
+                            red = self.redact(err or "shutdown failed")
+                            self._remote_missing_shutdowns.add(wname)
+                            self._remote_evidence_errors.append(
+                                {
+                                    "worker": wname,
+                                    "phase": "shutdown",
+                                    "error": red,
+                                }
+                            )
+                            self._api_snapshot_errors.append("worker %s shutdown: %s" % (wname, red))
                             continue
                         for lp in res.get("leftover_pids") or []:
                             self._remote_leftover_pids.append({"worker": wname, "pid": int(lp)})
@@ -1151,8 +1538,6 @@ def create_remote_soak_cluster(
                             row = dict(lt)
                             row["worker"] = wname
                             self._remote_leftover_trees.append(row)
-                        if res.get("shutdown_error"):
-                            self._api_snapshot_errors.append("worker %s shutdown: %s" % (wname, res["shutdown_error"]))
 
             self.stop_master("final_stop")
             with self._tracked_clients_lock:
@@ -1168,18 +1553,29 @@ def create_remote_soak_cluster(
                 self.control_server.stop()
             self.procs = []
 
-        def leftover_pids(self) -> List[int]:
-            alive = list(self._unclean_pids)
+        def leftover_pids(self) -> List[Dict[str, Any]]:
+            items: List[Dict[str, Any]] = []
+            seen: Set[Tuple[str, int]] = set()
+
+            def _add(role: str, pid: int) -> None:
+                key = (role, int(pid))
+                if key not in seen:
+                    seen.add(key)
+                    items.append({"worker": role, "pid": int(pid)})
+
+            for pid in self._unclean_pids:
+                _add("master", int(pid))
             with self._lifecycle_lock:
                 if self._master_entry is not None and self._master_entry[1].poll() is None:
-                    alive.append(self._master_entry[1].pid)
+                    _add("master", int(self._master_entry[1].pid))
             with self._tracked_clients_lock:
                 for p in self._tracked_clients:
                     if p.poll() is None:
-                        alive.append(p.pid)
+                        _add("master", int(p.pid))
             for item in self._remote_leftover_pids:
-                alive.append(int(item["pid"]))
-            return sorted(set(alive))
+                _add(str(item.get("worker") or ""), int(item["pid"]))
+            items.sort(key=lambda r: (r["worker"], r["pid"]))
+            return items
 
         def leftover_process_trees(self) -> List[Dict[str, Any]]:
             local = super().leftover_process_trees()
@@ -1210,6 +1606,7 @@ class WorkerAgent:
         keep_workdir: bool = False,
         poll_interval_s: float = 1.0,
         connect_timeout_s: float = 600.0,
+        orphan_timeout_s: float = DEFAULT_ORPHAN_TIMEOUT_S,
     ) -> None:
         self.base = base_module
         self.binary = os.path.abspath(binary)
@@ -1231,6 +1628,8 @@ class WorkerAgent:
         self.keep_workdir = bool(keep_workdir)
         self.poll_interval_s = max(0.1, float(poll_interval_s))
         self.connect_timeout_s = max(5.0, float(connect_timeout_s))
+        self.orphan_timeout_s = max(0.1, float(orphan_timeout_s))
+        self._instance_id = secrets.token_hex(16)
 
         self.work_root, _disk_check = self.base._prepare_work_root(
             work_dir,
@@ -1263,6 +1662,10 @@ class WorkerAgent:
         self._sampler: Optional[Any] = None
         self._sampler_t0_offset = 0.0
         self._run_id = ""
+        self._last_auth_200_mono: float = time.monotonic()
+        self._skipped_polls_verify: int = 0
+        self._skipped_polls_transport: int = 0
+        self._executed_cmds: Dict[str, Tuple[bool, Dict[str, Any], Optional[str]]] = {}
         self._client = SignedControlClient(self.control_url, self.name, self.control_key)
 
     def _worker_env(self) -> Dict[str, str]:
@@ -1541,6 +1944,14 @@ class WorkerAgent:
 
             reg_payload = {
                 "name": self.name,
+                "instance_id": self._instance_id,
+                "settings": {
+                    "slots": int(self.slots),
+                    "blob_cache_mb": int(self.blob_cache_mb),
+                    "workspaces": bool(self.workspaces),
+                    "rate_mbps": float(self.rate_mbps) if self.rate_mbps is not None else None,
+                    "delay_ms": float(self.delay_ms),
+                },
                 "os": self.base.os_info(),
                 "hardware": self.base.hardware(),
                 "windows_realtime_av_enabled": self.base.windows_realtime_av_enabled(),
@@ -1552,6 +1963,7 @@ class WorkerAgent:
                     status, resp = self._client.post("/v1/register", reg_payload, timeout_s=15.0)
                     if status == 200 and resp.get("run_id"):
                         self._run_id = str(resp["run_id"])
+                        self._last_auth_200_mono = time.monotonic()
                         if resp.get("sample_interval_s"):
                             self.sample_interval_s = max(0.5, float(resp["sample_interval_s"]))
                         self._ensure_sampler_started(
@@ -1560,53 +1972,135 @@ class WorkerAgent:
                         )
                         break
                     if status in (400, 403):
-                        raise RuntimeError("registration rejected (%d): %s" % (status, resp.get("error")))
-                except urllib.error.URLError:
-                    pass
-                except OSError:
-                    pass
+                        raise RuntimeError(
+                            "registration rejected (%d): %s" % (status, self._redact(str(resp.get("error") or "")))
+                        )
+                except ControlProtocolError as exc:
+                    self._skipped_polls_verify += 1
+                    print(
+                        "[worker-agent %s] registration verify failure (skipped #%d): %s"
+                        % (self.name, self._skipped_polls_verify, self._redact(str(exc))),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except (ControlBusyError, urllib.error.URLError, OSError):
+                    self._skipped_polls_transport += 1
                 if time.monotonic() >= deadline:
                     raise RuntimeError("worker-agent %s failed to register within %.0f s" % (self.name, self.connect_timeout_s))
                 self._stop_event.wait(0.5)
 
             while not self._stop_event.is_set():
+                if (time.monotonic() - self._last_auth_200_mono) >= self.orphan_timeout_s:
+                    sh = self._shutdown_payload()
+                    print(
+                        "[worker-agent %s] orphan timeout after %.1fs with no authenticated 200 poll; "
+                        "worker stopped (leftover_pids=%s leftover_trees=%d skipped_verify=%d skipped_transport=%d)"
+                        % (
+                            self.name,
+                            self.orphan_timeout_s,
+                            sh["leftover_pids"],
+                            len(sh["leftover_task_trees"]),
+                            self._skipped_polls_verify,
+                            self._skipped_polls_transport,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 1
                 try:
                     status, resp = self._client.post("/v1/poll", {"run_id": self._run_id}, timeout_s=15.0)
-                except (OSError, urllib.error.URLError):
+                except ControlProtocolError as exc:
+                    self._skipped_polls_verify += 1
+                    print(
+                        "[worker-agent %s] poll verify failure (skipped #%d): %s"
+                        % (self.name, self._skipped_polls_verify, self._redact(str(exc))),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     self._stop_event.wait(self.poll_interval_s)
                     continue
+                except (ControlBusyError, OSError, urllib.error.URLError):
+                    self._skipped_polls_transport += 1
+                    self._stop_event.wait(self.poll_interval_s)
+                    continue
+                if status in (400, 403):
+                    sh = self._shutdown_payload()
+                    print(
+                        "[worker-agent %s] control session ended (%d: %s); clean shutdown "
+                        "(leftover_pids=%s leftover_trees=%d skipped_verify=%d skipped_transport=%d)"
+                        % (
+                            self.name,
+                            status,
+                            self._redact(str(resp.get("error") or "")),
+                            sh["leftover_pids"],
+                            len(sh["leftover_task_trees"]),
+                            self._skipped_polls_verify,
+                            self._skipped_polls_transport,
+                        ),
+                        flush=True,
+                    )
+                    return 0
                 if status != 200:
                     self._stop_event.wait(self.poll_interval_s)
                     continue
+                self._last_auth_200_mono = time.monotonic()
                 self._ensure_sampler_started(
                     bool(resp.get("soak_running")),
                     float(resp.get("elapsed_s") or 0.0),
                 )
                 cmd = resp.get("command")
                 if isinstance(cmd, dict) and cmd.get("cmd_id"):
-                    ok, res_obj, err = self._execute_command(cmd)
+                    cmd_id = str(cmd["cmd_id"])
+                    if cmd_id in self._executed_cmds:
+                        ok, res_obj, err = self._executed_cmds[cmd_id]
+                    else:
+                        ok, res_obj, err = self._execute_command(cmd)
+                        if len(self._executed_cmds) >= 4096:
+                            oldest_cmd = next(iter(self._executed_cmds))
+                            del self._executed_cmds[oldest_cmd]
+                        self._executed_cmds[cmd_id] = (ok, res_obj, err)
                     ack_payload = {
                         "run_id": self._run_id,
-                        "cmd_id": cmd["cmd_id"],
+                        "cmd_id": cmd_id,
                         "op": cmd.get("op"),
                         "ok": ok,
                         "result": res_obj,
                         "error": err,
                     }
-                    last_ack_exc: Optional[Exception] = None
+                    ack_delivered = False
+                    ack_session_ended = False
                     for attempt in range(5):
                         try:
-                            self._client.post("/v1/ack", ack_payload, timeout_s=30.0)
-                            last_ack_exc = None
-                            break
-                        except (OSError, urllib.error.URLError) as exc:
-                            last_ack_exc = exc
-                            if attempt + 1 < 5:
-                                time.sleep(1.0)
-                    if last_ack_exc is not None:
-                        raise last_ack_exc
+                            ack_st, ack_resp = self._client.post("/v1/ack", ack_payload, timeout_s=30.0)
+                            if ack_st in (400, 403):
+                                err_txt = str(ack_resp.get("error") or "")
+                                if ack_st == 403 or "mismatch" in err_txt.lower():
+                                    ack_session_ended = True
+                                    break
+                            if ack_st == 200:
+                                self._last_auth_200_mono = time.monotonic()
+                                ack_delivered = True
+                                break
+                        except ControlProtocolError as exc:
+                            self._skipped_polls_verify += 1
+                            print(
+                                "[worker-agent %s] ack verify failure (skipped #%d): %s"
+                                % (self.name, self._skipped_polls_verify, self._redact(str(exc))),
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        except (ControlBusyError, OSError, urllib.error.URLError):
+                            self._skipped_polls_transport += 1
+                        if attempt + 1 < 5:
+                            time.sleep(1.0)
+                    if ack_session_ended:
+                        if cmd.get("op") != "shutdown":
+                            self._shutdown_payload()
+                        return 0
                     if cmd.get("op") == "shutdown":
                         break
+                    if not ack_delivered:
+                        self._stop_event.wait(self.poll_interval_s)
                 else:
                     self._stop_event.wait(self.poll_interval_s)
             return 0

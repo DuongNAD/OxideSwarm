@@ -167,15 +167,15 @@ For the three-machine 24-hour soak (design 0065 D4.3: one Mac master plus two Wi
 
 ### Control-channel security model
 
-1. **Out-of-band run secret only:** generate a fresh run secret (`oxideswarm secret generate --out <RUN_SECRET_FILE>`) and copy that file by hand to each remote worker machine. The secret never travels over the hub, in a PR, in a commit, or in CLI arguments; the harness accepts `--secret-file <PATH>` only.
-2. **Domain-separated mutual HMAC-SHA256 authentication:** both sides derive a dedicated key via `HMAC-SHA256(secret, "oxideswarm-endurance-control-v1")`. Every request (`X-Soak-Worker`, `X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Sig`) and every server response (`X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Sig`) is verified over canonical bytes (`method`, `path` / `status`, `worker`, timestamp, nonce, raw body bytes) with `hmac.compare_digest` before JSON parsing.
-3. **Replay protection and body bounds:** requests older than 300 s or carrying a reused nonce are rejected (`401`), HMAC verification runs before recording nonces (preventing unauthenticated replay-cache poisoning), and request bodies are bounded to 32 MiB (`413`).
-4. **Fixed 4-op command allowlist:** `worker-agent` accepts only verified responses from `SoakControlServer` and executes only `kill_restart`, `link_cut`, `idle_snapshot`, and `shutdown` — never arbitrary shell commands or unauthenticated requests.
+1. **Out-of-band run secret only:** generate a fresh run secret (`oxideswarm secret generate --out <RUN_SECRET_FILE>`) and copy that file by hand to each remote worker machine. Because holders of this secret can also submit and execute tasks on the connected Windows workers, restrict the file permissions (`chmod 600` on macOS/Linux; owner-only NTFS DACL on Windows) and delete `<RUN_SECRET_FILE>` from every machine once the run finishes. The secret never travels over the hub, in a PR, in a commit, or in CLI arguments; the harness accepts `--secret-file <PATH>` only (parsed like Rust `ClusterSecret::load_file`: first non-empty non-`#` hex line).
+2. **Domain-separated mutual HMAC-SHA256 authentication:** both sides derive a dedicated key via `HMAC-SHA256(secret, "oxideswarm-endurance-control-v1")`. Every request (`X-Soak-Worker`, `X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Sig`) and every server response (`X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Req-Nonce`, `X-Soak-Run-Id`, `X-Soak-Sig`) is verified over canonical bytes (`method` / `status`, `path`, `worker`, timestamp, nonce, request nonce, `run_id`, and raw body bytes) with `hmac.compare_digest` before JSON parsing, and `worker-agent` deduplicates executed `cmd_id` values so a retried/replayed command is re-acked without executing twice.
+3. **Replay protection, clock skew, and DoS bounds:** requests whose timestamp differs from the server's clock by more than `300 s` or carry a reused nonce are rejected (`401`), so the clocks of the master and worker machines **must agree within `300 s`** (otherwise `401` causes the agent to skip polls until `--orphan-timeout` fires and exits non-zero). HMAC verification runs before recording nonces (preventing unauthenticated replay-cache poisoning). The control server sets a `30 s` socket timeout per handler, caps concurrent connections at `8` (answering `503`), validates auth headers and timestamps before reading request bodies (bounded at `32 MiB`, `413`), and `SignedControlClient` rejects replies above `1 MiB` before verification.
+4. **Fixed 4-op command allowlist & orphan safety:** `worker-agent` accepts only verified responses bound to its request nonce and `run_id` from `SoakControlServer`, checks settings/instance identity at registration, and executes only `kill_restart`, `link_cut`, `idle_snapshot`, and `shutdown` — never arbitrary shell commands or unauthenticated requests. If the agent goes `--orphan-timeout` (default `15m`) without an authenticated `200` control poll (or receives `400 run_id mismatch` / `403 not registered`), it stops its child worker cleanly and exits.
 5. **Privacy scrubbing:** the secret text, derived dashboard bearer token, `--secret-file` path, local work directories, hostnames, user names, and non-loopback IPv4 addresses are redacted before error logging or writing any JSON record.
 
 ### Three-machine 24-hour commands (design 0065 D4.3)
 
-Use your own non-trial ports (never `8080`, `8087`, `8088`, `8089`), a dedicated `--secret-file`, and pass `--worker-python python` when the master OS (`python3`) differs from Windows workers (`python`):
+Use your own non-trial ports (never `8080`, `8087`, `8088`, `8089`), bind `--master-listen` and `--control-listen` directly to the master's LAN or Tailscale IP address rather than `0.0.0.0` so no extra interfaces are exposed, use a dedicated `<RUN_SECRET_FILE>`, ensure host clocks agree within `300 s`, and pass `--worker-python python` when the master OS (`python3`) differs from Windows workers (`python`):
 
 Master machine (macOS):
 
@@ -184,8 +184,8 @@ python3 benchmarks/endurance/endurance.py soak \
   --bin <MAC_OXIDESWARM_BIN> \
   --worker-python python \
   --master-only \
-  --master-listen 0.0.0.0:18500 \
-  --control-listen 0.0.0.0:18501 \
+  --master-listen <MAC_LAN_OR_TAILSCALE_IP>:18500 \
+  --control-listen <MAC_LAN_OR_TAILSCALE_IP>:18501 \
   --secret-file <RUN_SECRET_FILE> \
   --expect-workers win-a,win-b \
   --workers 2 --slots 4 --max-queue-size 64 \
