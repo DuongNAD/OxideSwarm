@@ -692,8 +692,8 @@ mod imp {
     /// Closes every open descriptor of the calling macOS process except those in `keep` by asking
     /// the kernel for the open descriptor list (`proc_pidinfo(PROC_PIDLISTFDS)`) into a fixed
     /// stack buffer. Returns `true` when all non-kept open descriptors are closed, or `false` if
-    /// `proc_pidinfo` fails or the list stays larger than the buffer so the caller falls back to
-    /// [`close_fds_range_fallback`].
+    /// `proc_pidinfo` fails or descriptors remain after 8 full rounds (about 8,184 descriptors)
+    /// so the caller falls back to [`close_fds_range_fallback`].
     ///
     /// # Safety
     ///
@@ -701,7 +701,7 @@ mod imp {
     /// lifeline supervisor before `_exit`. Uses a fixed stack buffer and raw `getpid`,
     /// `proc_pidinfo`, and `close` system calls only (no heap allocation, no locks).
     #[cfg(target_os = "macos")]
-    unsafe fn close_open_fds_macos(keep: &[libc::c_int]) -> bool {
+    pub(super) unsafe fn close_open_fds_macos(keep: &[libc::c_int]) -> bool {
         const BUF_CAP: usize = 1024;
         const MAX_ROUNDS: usize = 8;
 
@@ -720,7 +720,7 @@ mod imp {
                 buf_bytes,
             );
             if ret <= 0 {
-                return round > 0 && ret == 0 && keep.is_empty();
+                return false;
             }
             let count = ((ret as usize) / entry_bytes).min(BUF_CAP);
             let mut closed_any = false;
@@ -789,8 +789,9 @@ mod imp {
     ///
     /// On macOS, queries the open descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed
     /// stack buffer and closes only those, falling back to [`close_fds_range_fallback`] if the
-    /// call fails or the buffer is too small. On Linux, uses `SYS_close_range` with the bounded
-    /// loop as fallback; on Android and other Unixes, uses the bounded loop up to `max_nofile`.
+    /// call fails or descriptors remain after 8 full rounds. On Linux, uses `SYS_close_range` with
+    /// the bounded loop as fallback; on Android and other Unixes, uses the bounded loop up to
+    /// `max_nofile`.
     ///
     /// # Safety
     ///
@@ -798,9 +799,9 @@ mod imp {
     /// Rust code that owns descriptors (it ends with `_exit`). The function closes descriptors
     /// that `OwnedFd`, `File` and the runtime own, so in any other process those owners would
     /// later use or close a number that is closed or reused. `max_nofile` bounds the fallback
-    /// loop. Only async-signal-safe system calls (`getpid`, `proc_pidinfo` on macOS,
-    /// `SYS_close_range` on Linux, and `close`) and a fixed stack buffer are used; nothing is
-    /// allocated or locked.
+    /// loop. Each call (`getpid`, `proc_pidinfo` on macOS, `SYS_close_range` on Linux, and
+    /// `close`) is a raw system-call wrapper that allocates nothing and takes no lock, and only a
+    /// fixed stack buffer is used.
     unsafe fn close_fds_except(keep: &[libc::c_int], max_nofile: libc::c_int) {
         #[cfg(target_os = "macos")]
         if close_open_fds_macos(keep) {
@@ -1866,6 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn test_supervisor_closes_high_numbered_fd() {
         use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::ExitStatusExt;
         use std::time::{Duration, Instant};
 
         // SAFETY: `rlim` is a live `rlimit` written by `getrlimit`.
@@ -1960,7 +1962,125 @@ mod tests {
             "supervisor must close high-numbered descriptor (fd {high_raw} >= {target_fd}) promptly"
         );
 
+        // Prove the detached supervisor is still alive after closing `high_write`: drop the
+        // lifeline write end without writing `b"0"` so the supervisor wakes on EOF and kills the
+        // task child.
+        let lifeline = tree
+            .inner
+            .as_ref()
+            .expect("tracked ProcessTree has inner")
+            .lifeline_write
+            .lock()
+            .expect("lifeline_write lock")
+            .take();
+        assert!(lifeline.is_some(), "lifeline write end must be held");
+        drop(lifeline);
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("supervisor must kill task child once lifeline closes without dismissal")
+            .expect("wait on task child");
+        assert!(
+            !status.success() && matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+            "supervisor-killed task child must exit via SIGTERM or SIGKILL, got {status:?}"
+        );
+
         tree.kill_async(child.id()).await;
-        let _ = child.wait().await;
+    }
+
+    /// BUG-33: with ~1,500 open descriptors (exceeding one 1,024-entry `PROC_PIDLISTFDS` pass),
+    /// `close_open_fds_macos` in a forked child keeps the kept fd, closes the rest, and returns
+    /// `true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_close_open_fds_macos_returns_true_with_1500_open_fds() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+        // SAFETY: `rlim` is a live `rlimit` initialized before and written by `getrlimit`/`setrlimit`.
+        let soft_limit = unsafe {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim), 0);
+            if rlim.rlim_cur < 1600 {
+                rlim.rlim_cur = 2048.min(rlim.rlim_max);
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &rlim), 0);
+            }
+            rlim.rlim_cur
+        };
+        assert!(
+            soft_limit >= 1600,
+            "RLIMIT_NOFILE ({soft_limit}) too small for 1500-fd test"
+        );
+
+        let (keep_read, keep_write) = imp::create_lifeline_pipe().expect("create keep pipe");
+        let mut extras: Vec<OwnedFd> = Vec::with_capacity(1_500);
+        for _ in 0..1_500 {
+            // SAFETY: `keep_write` is a live descriptor; `F_DUPFD_CLOEXEC` creates a new owned fd.
+            let raw = unsafe { libc::fcntl(keep_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                raw >= 0,
+                "F_DUPFD_CLOEXEC failed after {} extras: {}",
+                extras.len(),
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+            extras.push(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+
+        let keep_raw = keep_read.as_raw_fd();
+        let keep = [keep_raw];
+        let closed_sample_raw = extras.last().expect("non-empty extras").as_raw_fd();
+
+        // SAFETY: `fork()` creates a child that immediately calls only raw non-allocating syscalls
+        // (`imp::close_open_fds_macos`, `libc::fcntl`, `libc::_exit`) and never returns to Rust.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: freshly forked child performing only raw syscalls before `_exit`.
+            unsafe {
+                let ok = imp::close_open_fds_macos(&keep);
+                let kept_open = libc::fcntl(keep_raw, libc::F_GETFD) >= 0;
+                let sample_closed = libc::fcntl(closed_sample_raw, libc::F_GETFD) < 0;
+                libc::_exit(if !ok {
+                    1
+                } else if !kept_open {
+                    2
+                } else if !sample_closed {
+                    3
+                } else {
+                    0
+                });
+            }
+        }
+
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `status` is a live `c_int` written by `waitpid` for valid child `pid`.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "waitpid failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        drop(extras);
+        drop(keep_write);
+        drop(keep_read);
+
+        assert!(
+            libc::WIFEXITED(status),
+            "forked child did not exit normally (status={status:#x})"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "forked child exit code (1=returned false, 2=kept fd closed, 3=extra fd still open)"
+        );
     }
 }
