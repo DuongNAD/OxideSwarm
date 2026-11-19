@@ -1,7 +1,7 @@
 # 0054: An open compute network (long-term vision)
 
 Status: Draft (vision; the owner's long-term goal of 2026-11-10; decisions Q14 to Q18 are open)
-Created: 2026-11-10    Updated: 2026-11-11
+Created: 2026-11-10    Updated: 2026-11-19
 
 ## Summary
 
@@ -217,3 +217,9 @@ Fuzzing covers every parser of network input.
 - 2026-11-11: [Design 0061](0061-first-application-model-tunnel.md) proposes usage records
   and a balance per member inside one cluster (LLM-10, LLM-11), under the rule of D6. It keeps
   model traffic inside clusters of people who trust each other. Q14 and Q16 stay open.
+- 2026-11-19: The owner stated the ultimate goal: the people who use OxideSwarm pool their machines
+  to research one problem together. [Design 0094](0094-road-to-a-shared-research-grid.md) (Draft)
+  orders the stages of this record as research campaigns: H0 and H2 in its Stage 2, H1, H3 and H4
+  in its Stage 3, and a Stage 1 of trusted circles before them (ECO-9, NET-9, NET-10, APP-6). The
+  public pool becomes campaigns with one submitter each, and that record recommends credits that
+  only display (Q96). The design of this record is unchanged.
