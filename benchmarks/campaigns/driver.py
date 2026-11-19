@@ -3,17 +3,25 @@
 benchmarks/campaigns/driver.py - research campaign sweep driver (`APP-6`, design 0094).
 
 Standard-library-only Python driver that reads a campaign manifest, refuses any
-secret inputs (`.env`, `.secret`, `invite.oxs`), optionally verifies the runner
-binary SHA-256 against the manifest, submits each work unit with:
+secret inputs (`.env`, `.env.*`, `*.secret`, `invite.oxs`, including inside
+directory inputs), optionally verifies the runner binary SHA-256 against the
+manifest, pins `(os, arch)` from `--runner-system`, submits each work unit with:
 
   oxideswarm submit --json --wait --verify <N> [--verify-file <PATH>] ...
 
-When a unit reports a verification mismatch (exit code 4 or `verify.status ==
-"mismatch"`), the driver reruns that unit once with the same verification flags
-and records both attempts. It writes one atomic JSON record per run with
-per-participant-label counts and zero personal names, hostnames, raw worker
-names, worker UUIDs, IP addresses, or secrets, and supports `--resume` after an
-interrupt without resubmitting completed units as well as `--dry-run`.
+When a unit reports a verification mismatch (`verify.status == "mismatch"`),
+the driver reruns that unit once with the same verification flags and records
+both attempts. A task's own non-zero exit code (even exit code `4` without
+`verify.status == "mismatch"`) is recorded as `failed`, not `mismatch`.
+
+Interrupted units (`SIGINT`/`SIGTERM`, subprocess signal exit) are recorded as
+`status = "interrupted"` (not `failed`), any known `task_id` is cancelled on the
+master (or tracked in `<record>.orphans.json` for cancellation on `--resume`),
+and plain `--resume` resubmits every `interrupted`, `verify_error`,
+`mismatch_rerun_failed`, and pending unit (`--retry-failed` also retries
+`failed`). All JSON records scrub personal names, hostnames, `--master` hosts,
+CLI hints, raw worker names (including late joiners), worker UUIDs, IP
+addresses, and `oxs1-*` secrets.
 """
 
 from __future__ import annotations
@@ -34,7 +42,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 RECORD_FORMAT = 1
 FINISHED_STATUSES_DEFAULT = frozenset({"verified", "verified_on_rerun", "mismatch_persisted"})
@@ -43,7 +52,20 @@ IPV6_BRACKET_RE = re.compile(r"\[[0-9a-fA-F:]+\](?::\d+)?")
 UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
+TASK_ID_LINE_RE = re.compile(
+    r"(?:task[_ ]id\s*[:=]\s*|waiting for task\s+|task\s+)"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+    re.IGNORECASE,
+)
 OXS_TOKEN_RE = re.compile(r"oxs1-[A-Za-z0-9:._=-]+")
+URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s)>'\"\\]+", re.IGNORECASE)
+REPLICA_WORKER_RE = re.compile(r"(replica on worker\s+)(\S+)(\s+failed\b)", re.IGNORECASE)
+NOTE_FIRST_WORKER_RE = re.compile(
+    r"(Note:\s+worker\s+)(\S+)(\s+that ran the first copy)", re.IGNORECASE
+)
+WORKER_LABEL_LINE_RE = re.compile(r"(Worker:\s+)([^\s(]+)")
+MASTER_AT_RE = re.compile(r"(\bMaster\s+at\s+)([^\s),;]+)")
+MASTER_PAREN_RE = re.compile(r"(\(Master:\s*)([^)]+)(\))")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 FORBIDDEN_INPUT_EXACT = frozenset({".env", "cluster.secret", "invite.oxs"})
@@ -51,6 +73,66 @@ FORBIDDEN_INPUT_EXACT = frozenset({".env", "cluster.secret", "invite.oxs"})
 
 def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_os(value: str) -> str:
+    """Match `crates/core/src/placement.rs::normalize_os`."""
+    lower = value.strip().lower()
+    if lower in ("mac", "darwin", "osx", "macosx"):
+        return "macos"
+    if lower in ("win", "win32", "win64"):
+        return "windows"
+    return lower
+
+
+def normalize_arch(value: str) -> str:
+    """Match `crates/core/src/placement.rs::normalize_arch`."""
+    lower = value.strip().lower()
+    if lower in ("amd64", "x64", "x86-64"):
+        return "x86_64"
+    if lower == "arm64":
+        return "aarch64"
+    if lower in ("i386", "i686"):
+        return "x86"
+    return lower
+
+
+def parse_system_key(system: str) -> tuple[str, str]:
+    """Parse and normalize `<os>/<arch>` (for example `macos/aarch64`)."""
+    raw = system.strip()
+    if "/" not in raw:
+        raise ValueError(f"--runner-system must have the form <os>/<arch>, got {system!r}")
+    os_raw, arch_raw = raw.split("/", 1)
+    if not os_raw.strip() or not arch_raw.strip() or "/" in arch_raw:
+        raise ValueError(f"--runner-system must have the form <os>/<arch>, got {system!r}")
+    return normalize_os(os_raw), normalize_arch(arch_raw)
+
+
+def parse_shard_spec(spec: str) -> tuple[int, int]:
+    """Parse a 1-based `K/N` shard specification."""
+    raw = spec.strip()
+    if "/" not in raw:
+        raise ValueError(f"--shard must have the form K/N (for example 1/2), got {spec!r}")
+    k_s, n_s = raw.split("/", 1)
+    try:
+        k = int(k_s)
+        n = int(n_s)
+    except ValueError as exc:
+        raise ValueError(f"--shard must have integer K/N, got {spec!r}") from exc
+    if n < 1 or k < 1 or k > n:
+        raise ValueError(f"--shard requires 1 <= K <= N, got {spec!r}")
+    return k, n
+
+
+def slice_shard(units: list[dict[str, Any]], index: int, total: int) -> list[dict[str, Any]]:
+    """Return contiguous 1-based slice `index` of `total` partitions."""
+    if total == 1:
+        return list(units)
+    n = len(units)
+    base, rem = divmod(n, total)
+    start = (index - 1) * base + min(index - 1, rem)
+    end = start + base + (1 if index <= rem else 0)
+    return list(units[start:end])
 
 
 def file_sha256(path: str | os.PathLike[str]) -> str:
@@ -78,22 +160,43 @@ def _input_spec_parts(spec: str) -> tuple[str, str]:
     return local, sandbox
 
 
-def is_forbidden_input_spec(spec: str) -> bool:
-    """Return True if an `--input` spec points to `.env`, `.env.*`, `*.secret`, or `invite.oxs`."""
-    local, sandbox = _input_spec_parts(spec.strip())
-    for candidate in (local, sandbox):
-        if not candidate:
-            continue
-        norm = candidate.replace("\\", "/").rstrip("/")
-        base = os.path.basename(norm).lower()
-        if not base:
-            continue
-        if base in FORBIDDEN_INPUT_EXACT or base.startswith(".env.") or base.endswith(".secret"):
+def is_forbidden_filename(name: str) -> bool:
+    """Return True if a filename/component matches `.env`, `.env.*`, `*.secret`, or `invite.oxs`."""
+    base = name.strip().lower()
+    if not base:
+        return False
+    return base in FORBIDDEN_INPUT_EXACT or base.startswith(".env.") or base.endswith(".secret")
+
+
+def _path_has_forbidden_component(path_str: str) -> bool:
+    norm = path_str.replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    for part in norm.split("/"):
+        if is_forbidden_filename(part):
             return True
     return False
 
 
-def validate_no_secret_inputs(specs: list[str], context: str) -> None:
+def is_forbidden_input_spec(spec: str) -> bool:
+    """Return True if an `--input` spec names `.env`, `.env.*`, `*.secret`, or `invite.oxs`."""
+    local, sandbox = _input_spec_parts(spec.strip())
+    return any(bool(cand) and _path_has_forbidden_component(cand) for cand in (local, sandbox))
+
+
+def _resolve_local_input_path(local: str, base_dir: str | None) -> str:
+    if os.path.isabs(local) or base_dir is None:
+        return os.path.normpath(local)
+    return os.path.normpath(os.path.join(base_dir, local))
+
+
+def validate_no_secret_inputs(
+    specs: list[str],
+    context: str,
+    *,
+    base_dir: str | None = None,
+) -> None:
+    """Validate `--input` specs lexically AND by walking existing local directories recursively."""
     for spec in specs:
         if not isinstance(spec, str) or not spec.strip():
             raise ValueError(f"{context}: input spec must be a non-empty string")
@@ -101,15 +204,74 @@ def validate_no_secret_inputs(specs: list[str], context: str) -> None:
             raise ValueError(
                 f"{context}: refused secret/credential input spec {spec!r} (.env, *.secret, invite.oxs)"
             )
+        local, _ = _input_spec_parts(spec.strip())
+        local_path = _resolve_local_input_path(local, base_dir)
+        if os.path.islink(local_path):
+            target_name = os.path.basename(os.path.realpath(local_path))
+            if is_forbidden_filename(target_name):
+                raise ValueError(
+                    f"{context}: refused symlinked secret input {spec!r} -> {target_name!r}"
+                )
+        if os.path.isdir(local_path):
+            seen_dirs: set[tuple[int, int]] = set()
+            for dirpath, dirnames, filenames in os.walk(local_path, followlinks=True):
+                try:
+                    st = os.stat(dirpath)
+                    key = (st.st_dev, st.st_ino)
+                    if key in seen_dirs:
+                        dirnames[:] = []
+                        continue
+                    seen_dirs.add(key)
+                except OSError:
+                    dirnames[:] = []
+                    continue
+
+                for dname in dirnames:
+                    full_d = os.path.join(dirpath, dname)
+                    rel_d = os.path.relpath(full_d, local_path)
+                    if is_forbidden_filename(dname):
+                        raise ValueError(
+                            f"{context}: directory input {spec!r} contains forbidden directory {rel_d!r}"
+                        )
+                    if os.path.islink(full_d) and is_forbidden_filename(
+                        os.path.basename(os.path.realpath(full_d))
+                    ):
+                        raise ValueError(
+                            f"{context}: directory input {spec!r} symlinks secret target at {rel_d!r}"
+                        )
+
+                for fname in filenames:
+                    full_f = os.path.join(dirpath, fname)
+                    rel_f = os.path.relpath(full_f, local_path)
+                    if is_forbidden_filename(fname):
+                        raise ValueError(
+                            f"{context}: directory input {spec!r} contains forbidden file {rel_f!r}"
+                        )
+                    if os.path.islink(full_f) and is_forbidden_filename(
+                        os.path.basename(os.path.realpath(full_f))
+                    ):
+                        raise ValueError(
+                            f"{context}: directory input {spec!r} symlinks secret file at {rel_f!r}"
+                        )
 
 
-def _format_template(value: Any, unit_id: str, seed: Any) -> Any:
+def _format_template(
+    value: Any,
+    unit_id: str,
+    seed: Any,
+    params: dict[str, Any] | None = None,
+) -> Any:
     if isinstance(value, str):
-        return value.replace("{unit_id}", unit_id).replace("{seed}", "" if seed is None else str(seed))
+        out = value.replace("{unit_id}", unit_id).replace("{seed}", "" if seed is None else str(seed))
+        if params:
+            for k, v in params.items():
+                if v is not None and not isinstance(v, (dict, list)):
+                    out = out.replace("{" + str(k) + "}", str(v))
+        return out
     if isinstance(value, list):
-        return [_format_template(item, unit_id, seed) for item in value]
+        return [_format_template(item, unit_id, seed, params) for item in value]
     if isinstance(value, dict):
-        return {str(k): _format_template(v, unit_id, seed) for k, v in value.items()}
+        return {str(k): _format_template(v, unit_id, seed, params) for k, v in value.items()}
     return value
 
 
@@ -165,7 +327,7 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise ValueError("manifest.units must be a non-empty list")
 
     default_inputs = _require_str_list(defaults.get("inputs"), "defaults.inputs")
-    validate_no_secret_inputs(default_inputs, "defaults.inputs")
+    validate_no_secret_inputs(default_inputs, "defaults.inputs", base_dir=manifest_dir)
 
     default_command = defaults.get("command")
     default_args = _require_str_list(defaults.get("args"), "defaults.args")
@@ -178,8 +340,8 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise ValueError("defaults.verify_file must be a string or null")
     default_verify_any = bool(defaults.get("verify_any_system", False))
     default_isolation = defaults.get("require_isolation")
-    default_os = defaults.get("os")
-    default_arch = defaults.get("arch")
+    default_os = normalize_os(defaults["os"]) if isinstance(defaults.get("os"), str) and defaults["os"].strip() else None
+    default_arch = normalize_arch(defaults["arch"]) if isinstance(defaults.get("arch"), str) and defaults["arch"].strip() else None
     default_timeout = defaults.get("timeout_secs", 1800)
     if default_timeout is not None:
         default_timeout = _as_positive_int(default_timeout, "defaults.timeout_secs", minimum=1)
@@ -200,6 +362,10 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
         seen_ids.add(unit_id)
 
         seed = u.get("seed")
+        params = u.get("params")
+        if params is not None and not isinstance(params, dict):
+            raise ValueError(f"unit {unit_id!r}.params must be an object")
+
         command = u.get("command", default_command)
         if not isinstance(command, str) or not command.strip():
             raise ValueError(f"unit {unit_id!r}: command must be a non-empty string")
@@ -210,7 +376,7 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             else list(default_args)
         )
         extra_args = _require_str_list(u.get("extra_args"), f"unit {unit_id!r}.extra_args")
-        args = _format_template(base_args + extra_args, unit_id, seed)
+        args = _format_template(base_args + extra_args, unit_id, seed, params)
 
         unit_inputs = (
             _require_str_list(u.get("inputs"), f"unit {unit_id!r}.inputs")
@@ -218,8 +384,8 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             else list(default_inputs)
         )
         extra_inputs = _require_str_list(u.get("extra_inputs"), f"unit {unit_id!r}.extra_inputs")
-        merged_inputs = _format_template(unit_inputs + extra_inputs, unit_id, seed)
-        validate_no_secret_inputs(merged_inputs, f"unit {unit_id!r}.inputs")
+        merged_inputs = _format_template(unit_inputs + extra_inputs, unit_id, seed, params)
+        validate_no_secret_inputs(merged_inputs, f"unit {unit_id!r}.inputs", base_dir=manifest_dir)
 
         resolved_inputs: list[str] = []
         for spec in merged_inputs:
@@ -233,11 +399,11 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             if "outputs" in u
             else list(default_outputs)
         )
-        outputs = _format_template(outputs, unit_id, seed)
+        outputs = _format_template(outputs, unit_id, seed, params)
 
         env = dict(default_env)
         env.update(_require_str_dict(u.get("env"), f"unit {unit_id!r}.env"))
-        env = _format_template(env, unit_id, seed)
+        env = _format_template(env, unit_id, seed, params)
         if "ANIMA_SIM_SEED" not in env and seed is not None:
             env["ANIMA_SIM_SEED"] = str(seed)
 
@@ -250,7 +416,7 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
         if verify_file is not None:
             if not isinstance(verify_file, str):
                 raise ValueError(f"unit {unit_id!r}.verify_file must be a string or null")
-            verify_file = _format_template(verify_file, unit_id, seed)
+            verify_file = _format_template(verify_file, unit_id, seed, params)
         if not outputs and not verify_file:
             raise ValueError(f"unit {unit_id!r}: --verify needs outputs or verify_file")
 
@@ -261,8 +427,10 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             if "require_tags" in u
             else list(default_tags)
         )
-        os_target = u.get("os", default_os)
-        arch_target = u.get("arch", default_arch)
+        raw_os = u.get("os", default_os)
+        raw_arch = u.get("arch", default_arch)
+        os_target = normalize_os(raw_os) if isinstance(raw_os, str) and raw_os.strip() else None
+        arch_target = normalize_arch(raw_arch) if isinstance(raw_arch, str) and raw_arch.strip() else None
         timeout_secs = u.get("timeout_secs", default_timeout)
         if timeout_secs is not None:
             timeout_secs = _as_positive_int(
@@ -273,10 +441,6 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             if "mismatch_retries" in u
             else default_mismatch_retries
         )
-
-        params = u.get("params")
-        if params is not None and not isinstance(params, dict):
-            raise ValueError(f"unit {unit_id!r}.params must be an object")
 
         normalized_units.append({
             "id": unit_id,
@@ -307,6 +471,36 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
     }
 
 
+def apply_unit_overrides(
+    units: list[dict[str, Any]],
+    *,
+    pin_os: str | None = None,
+    pin_arch: str | None = None,
+    command_override: str | None = None,
+    command_prefix_inputs: list[str] | None = None,
+) -> None:
+    """Apply CLI `(os, arch)` pin and `--command` overrides to units in place."""
+    for u in units:
+        if pin_os:
+            if u.get("os") and normalize_os(u["os"]) != pin_os:
+                raise ValueError(
+                    f"unit {u['id']!r} specifies os={u['os']!r}, conflicting with pinned os={pin_os!r}"
+                )
+            u["os"] = pin_os
+        if pin_arch:
+            if u.get("arch") and normalize_arch(u["arch"]) != pin_arch:
+                raise ValueError(
+                    f"unit {u['id']!r} specifies arch={u['arch']!r}, conflicting with pinned arch={pin_arch!r}"
+                )
+            u["arch"] = pin_arch
+        if command_override:
+            u["command"] = command_override
+        if command_prefix_inputs:
+            u["inputs"] = list(command_prefix_inputs) + [
+                s for s in u["inputs"] if s not in command_prefix_inputs
+            ]
+
+
 def verify_runner_hash(
     workload: dict[str, Any],
     runner_path: str | os.PathLike[str],
@@ -316,7 +510,9 @@ def verify_runner_hash(
     runner_abs = os.path.abspath(runner_path)
     if not os.path.isfile(runner_abs):
         raise ValueError(f"runner binary does not exist: {runner_abs}")
-    if is_forbidden_input_spec(runner_abs):
+    if is_forbidden_input_spec(runner_abs) or is_forbidden_filename(
+        os.path.basename(os.path.realpath(runner_abs))
+    ):
         raise ValueError(f"refused forbidden runner path: {runner_abs}")
 
     hashes = workload.get("runner_sha256")
@@ -324,7 +520,9 @@ def verify_runner_hash(
         raise ValueError("manifest.workload.runner_sha256 must map <os>/<arch> to SHA-256 hex")
     if not runner_system:
         raise ValueError("--runner requires --runner-system <os>/<arch> (for example macos/aarch64)")
-    expected = hashes.get(runner_system)
+    sys_os, sys_arch = parse_system_key(runner_system)
+    norm_key = f"{sys_os}/{sys_arch}"
+    expected = hashes.get(runner_system) or hashes.get(norm_key)
     if not isinstance(expected, str) or not SHA256_HEX_RE.match(expected.strip().lower()):
         raise ValueError(
             f"manifest.workload.runner_sha256[{runner_system!r}] must be a 64-char SHA-256 hex digest, got {expected!r}"
@@ -332,7 +530,7 @@ def verify_runner_hash(
     actual = file_sha256(runner_abs).lower()
     if actual != expected.strip().lower():
         raise ValueError(
-            f"runner SHA-256 mismatch for {runner_system}: expected {expected.strip().lower()}, got {actual}"
+            f"runner SHA-256 mismatch for {norm_key}: expected {expected.strip().lower()}, got {actual}"
         )
     sandbox_name = workload.get("binary_name") or os.path.basename(runner_abs)
     return f"{runner_abs}:{sandbox_name}", actual
@@ -375,13 +573,21 @@ class WorkerDirectory:
         self,
         workers_json: list[dict[str, Any]] | None = None,
         participant_map: dict[str, str] | None = None,
+        *,
+        refresh_callback: Callable[[], list[dict[str, Any]] | None] | None = None,
+        min_refresh_interval_s: float = 1.0,
     ) -> None:
         self._lock = threading.Lock()
         self._participant_map = dict(participant_map or {})
         self._by_raw: dict[str, dict[str, Any]] = {}
         self._records: list[dict[str, Any]] = []
         self._secret_map: dict[str, str] = {}
+        self._known_labels: set[str] = set()
         self._per_participant_seq: dict[str, int] = {}
+        self._refresh_callback = refresh_callback
+        self._min_refresh_interval_s = min_refresh_interval_s
+        # Allow the first unknown-worker or error refresh immediately after startup.
+        self._last_refresh_mono = 0.0
 
         # Always scrub local machine/user names out of free-form diagnostic strings.
         host = platform.node() or ""
@@ -396,13 +602,104 @@ class WorkerDirectory:
         if len(home_dir) >= 3 and home_dir not in ("/", "\\"):
             self._secret_map[home_dir] = "<home>"
 
+        self._ingest_workers_locked(workers_json or [])
+
+    def set_refresh_callback(
+        self, callback: Callable[[], list[dict[str, Any]] | None] | None
+    ) -> None:
+        with self._lock:
+            self._refresh_callback = callback
+
+    def add_secret(self, raw: str | None, replacement: str) -> None:
+        if not raw or not isinstance(raw, str):
+            return
+        val = raw.strip()
+        if len(val) < 2 or val.lower() == "auto":
+            return
+        with self._lock:
+            self._secret_map.setdefault(val, replacement)
+
+    def register_endpoint_secrets(
+        self,
+        *,
+        master: str | None = None,
+        relay_url: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Register master and relay hosts so they can never leak into `record.json`."""
+        env_src = env if env is not None else os.environ
+        master_candidates = [
+            master,
+            env_src.get("OXIDESWARM_MASTER"),
+            env_src.get("RUSTY_GRID_MASTER"),
+            env_src.get("RUSTY_GRID_MASTER_ADDR"),
+        ]
+        for m in master_candidates:
+            if not m or not isinstance(m, str):
+                continue
+            val = m.strip()
+            if not val or val.lower() == "auto" or val.lower().startswith("auto:"):
+                continue
+            self.add_secret(val, "<master>")
+            host_only = val.rsplit(":", 1)[0].strip("[]") if ":" in val else val.strip("[]")
+            if len(host_only) >= 2 and host_only.lower() not in ("localhost", "127.0.0.1", "::1"):
+                self.add_secret(host_only, "<master>")
+
+        relay_candidates = [
+            relay_url,
+            env_src.get("OXIDESWARM_RELAY_URL"),
+            env_src.get("RUSTY_GRID_RELAY_URL"),
+        ]
+        for r in relay_candidates:
+            if not r or not isinstance(r, str):
+                continue
+            val = r.strip()
+            if len(val) < 4:
+                continue
+            self.add_secret(val, "<relay>")
+            parsed = urlparse(val)
+            if parsed.hostname and parsed.hostname.lower() not in ("localhost", "127.0.0.1", "::1"):
+                self.add_secret(parsed.hostname, "<relay>")
+
+    def _ingest_workers_locked(self, workers_json: list[dict[str, Any]]) -> None:
         ordered = sorted(
-            workers_json or [],
+            workers_json,
             key=lambda w: (str(w.get("name") or ""), str(w.get("id") or "")),
         )
         for w in ordered:
             if isinstance(w, dict):
                 self._register_locked(w)
+
+    def refresh_workers(self, workers_json: list[dict[str, Any]]) -> None:
+        """Merge newly discovered workers without renumbering existing worker labels."""
+        with self._lock:
+            self._ingest_workers_locked(workers_json)
+            self._last_refresh_mono = time.monotonic()
+
+    def maybe_refresh(self, *, force: bool = False) -> bool:
+        """Invoke the configured refresh callback at most once per `min_refresh_interval_s`."""
+        with self._lock:
+            cb = self._refresh_callback
+            if cb is None:
+                return False
+            now = time.monotonic()
+            if not force and (now - self._last_refresh_mono) < self._min_refresh_interval_s:
+                return False
+            self._last_refresh_mono = now
+        try:
+            fresh = cb()
+        except Exception:
+            return False
+        if isinstance(fresh, list):
+            self.refresh_workers(fresh)
+            return True
+        return False
+
+    def has_worker(self, raw_id: str | None = None, raw_name: str | None = None) -> bool:
+        with self._lock:
+            return any(
+                key and key in self._by_raw for key in (raw_id, raw_name)
+            )
 
     def _resolve_participant_locked(
         self, raw_id: str | None, raw_name: str | None, tags: list[str]
@@ -451,6 +748,7 @@ class WorkerDirectory:
             "has_gpu": worker.get("has_gpu"),
         }
         self._records.append(info)
+        self._known_labels.add(worker_label)
         for key in (raw_id, raw_name):
             if key:
                 self._by_raw[key] = info
@@ -489,12 +787,37 @@ class WorkerDirectory:
     def scrub(self, text: str | None) -> str:
         with self._lock:
             secret_map = dict(self._secret_map)
-        return scrub_text(text, secret_map)
+            known_labels = set(self._known_labels)
+        return scrub_text(text, secret_map, known_labels=known_labels)
 
 
-def scrub_text(text: str | None, secret_map: dict[str, str]) -> str:
-    """Replace raw worker names, UUIDs, host/user strings, IP addresses, and oxs1 tokens."""
+def strip_cli_hints(text: str | None) -> str:
+    """Drop interactive CLI lines that repeat `--master` hosts or replica worker lists."""
+    if not text:
+        return ""
+    kept: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        lower = s.lower()
+        if lower.startswith("hint:"):
+            continue
+        if lower.startswith("verifying on ") and "other worker(s):" in lower:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def scrub_text(
+    text: str | None,
+    secret_map: dict[str, str],
+    *,
+    known_labels: set[str] | None = None,
+) -> str:
+    """Replace worker names (known & unknown), `--master` hosts, UUIDs, IPs, URLs, and `oxs1-*` tokens."""
     out = text or ""
+    labels = known_labels or set()
     for raw in sorted(secret_map, key=len, reverse=True):
         if len(raw) < 2:
             continue
@@ -502,6 +825,25 @@ def scrub_text(text: str | None, secret_map: dict[str, str]) -> str:
             out = re.sub(r"(?<![\w-])%s(?![\w-])" % re.escape(raw), secret_map[raw], out)
         else:
             out = out.replace(raw, secret_map[raw])
+
+    def _redact_worker(prefix_group: str, candidate: str, suffix_group: str) -> str:
+        clean = candidate.rstrip(":.,;)")
+        if clean in labels or clean in ("<worker>", "<id>"):
+            return prefix_group + candidate + suffix_group
+        return prefix_group + "<worker>" + suffix_group
+
+    out = REPLICA_WORKER_RE.sub(
+        lambda m: _redact_worker(m.group(1), m.group(2), m.group(3)), out
+    )
+    out = NOTE_FIRST_WORKER_RE.sub(
+        lambda m: _redact_worker(m.group(1), m.group(2), m.group(3)), out
+    )
+    out = WORKER_LABEL_LINE_RE.sub(
+        lambda m: _redact_worker(m.group(1), m.group(2), ""), out
+    )
+    out = MASTER_AT_RE.sub(lambda m: m.group(1) + "<master>", out)
+    out = MASTER_PAREN_RE.sub(lambda m: m.group(1) + "<master>" + m.group(3), out)
+    out = URL_RE.sub("<url>", out)
     out = UUID_RE.sub("<id>", out)
     out = OXS_TOKEN_RE.sub("<token>", out)
     out = IPV4_RE.sub("<address>", out)
@@ -513,6 +855,8 @@ def sanitize_doctor(doc: dict[str, Any] | None, directory: WorkerDirectory) -> d
     """Sanitize `oxideswarm doctor --json` output without hostnames, worker names, UUIDs, or IPs."""
     if not isinstance(doc, dict):
         return {"workers": [], "checks": []}
+    if doc.get("master"):
+        directory.add_secret(str(doc["master"]), "<master>")
     workers_out: list[dict[str, Any]] = []
     for w in doc.get("workers") or []:
         if not isinstance(w, dict):
@@ -547,7 +891,7 @@ def sanitize_doctor(doc: dict[str, Any] | None, directory: WorkerDirectory) -> d
             "name": c.get("name"),
             "outcome": c.get("outcome"),
             "worker_label": worker_label,
-            "detail": directory.scrub(str(c.get("detail") or "")),
+            "detail": directory.scrub(strip_cli_hints(str(c.get("detail") or ""))),
         })
     return {"workers": workers_out, "checks": checks_out}
 
@@ -563,7 +907,7 @@ def sanitize_verify_report(
     if status == "error":
         return {
             "status": "error",
-            "error": directory.scrub(str(raw_verify.get("error") or "")),
+            "error": directory.scrub(strip_cli_hints(str(raw_verify.get("error") or ""))),
         }
     workers_out: list[dict[str, Any]] = []
     for w in raw_verify.get("workers") or []:
@@ -606,6 +950,46 @@ def sanitize_verify_report(
         "compared": list(raw_verify.get("compared") or []),
         "differing": differing_out,
     }
+
+
+def _collect_doc_worker_refs(doc: dict[str, Any] | None) -> list[tuple[str | None, str | None]]:
+    refs: list[tuple[str | None, str | None]] = []
+    if not isinstance(doc, dict):
+        return refs
+    wid = str(doc.get("worker_id") or "").strip() or None
+    wname = str(doc.get("worker_name") or "").strip() or None
+    if wid or wname:
+        refs.append((wid, wname))
+    verify = doc.get("verify")
+    if isinstance(verify, dict):
+        for w in verify.get("workers") or []:
+            if isinstance(w, dict):
+                r_id = str(w.get("id") or "").strip() or None
+                r_name = str(w.get("name") or "").strip() or None
+                if r_id or r_name:
+                    refs.append((r_id, r_name))
+        for diff in verify.get("differing") or []:
+            if isinstance(diff, dict):
+                for entry in diff.get("workers") or []:
+                    if isinstance(entry, dict):
+                        r_name = str(entry.get("worker") or "").strip() or None
+                        if r_name:
+                            refs.append((None, r_name))
+    return refs
+
+
+def extract_task_id(doc: dict[str, Any] | None, stdout: str, stderr: str) -> str | None:
+    """Extract task UUID from `submit --json` output or timeout diagnostics if present."""
+    if isinstance(doc, dict):
+        tid = doc.get("task_id")
+        if isinstance(tid, str) and UUID_RE.fullmatch(tid.strip()):
+            return tid.strip()
+    for text in (stdout, stderr):
+        if text:
+            m = TASK_ID_LINE_RE.search(text)
+            if m:
+                return m.group(1)
+    return None
 
 
 def build_submit_command(
@@ -675,10 +1059,15 @@ def classify_attempt(
     cli_exit_code: int,
     doc: dict[str, Any] | None,
     expected_verify: int,
+    *,
+    interrupted: bool = False,
 ) -> str:
+    """Classify one `submit` invocation without confusing a task exit code 4 with mismatch."""
+    if interrupted or cli_exit_code < 0 or cli_exit_code in (130, 143):
+        return "interrupted"
     verify = doc.get("verify") if isinstance(doc, dict) else None
     v_status = verify.get("status") if isinstance(verify, dict) else None
-    if cli_exit_code == 4 or v_status == "mismatch":
+    if v_status == "mismatch":
         return "mismatch"
     if v_status == "error":
         return "verify_error"
@@ -686,6 +1075,92 @@ def classify_attempt(
         if isinstance(doc, dict) and doc.get("exit_code", 0) == 0 and not doc.get("error"):
             return "verified"
     return "failed"
+
+
+def cancel_task_on_master(
+    binary: str,
+    task_id: str,
+    sub_env: dict[str, str],
+    *,
+    master: str | None = None,
+    relay_url: str | None = None,
+    config_file: str | None = None,
+    insecure: bool = False,
+) -> bool:
+    """Best-effort `oxideswarm cancel <task_id> --json` for interrupted/timed-out attempts."""
+    cmd = [binary, "cancel"]
+    if master:
+        cmd.extend(["--master", master])
+    if relay_url:
+        cmd.extend(["--relay-url", relay_url])
+    if config_file:
+        cmd.extend(["--config", config_file])
+    if insecure:
+        cmd.append("--insecure")
+    cmd.extend([task_id, "--json"])
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=sub_env,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+class _ActiveProcRegistry:
+    """Thread-safe tracker allowing the interrupt handler to terminate active child groups."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[int, tuple[subprocess.Popen[str], threading.Event]] = {}
+
+    def register(self, proc: subprocess.Popen[str], aborted_event: threading.Event) -> None:
+        with self._lock:
+            self._entries[id(proc)] = (proc, aborted_event)
+
+    def unregister(self, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._entries.pop(id(proc), None)
+
+    def terminate_all(self) -> int:
+        with self._lock:
+            snapshot = list(self._entries.values())
+        count = 0
+        for proc, aborted_event in snapshot:
+            if proc.poll() is not None:
+                continue
+            aborted_event.set()
+            count += 1
+            try:
+                if os.name != "nt" and hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except OSError:
+                pass
+        for proc, _ in snapshot:
+            if proc.poll() is not None:
+                continue
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name != "nt" and hasattr(os, "killpg"):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except OSError:
+                    pass
+        return count
+
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 def execute_submit_attempt(
@@ -703,8 +1178,12 @@ def execute_submit_attempt(
     base_output_dir: str | None = None,
     extra_inputs: list[str] | None = None,
     require_isolation_override: str | None = None,
+    proc_registry: _ActiveProcRegistry | None = None,
+    force_stop_event: threading.Event | None = None,
+    submit_timeout_override: float | None = None,
+    orphan_recorder: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Invoke `oxideswarm submit` once and return a sanitized attempt record."""
+    """Invoke `oxideswarm submit` once in its own session and return a sanitized attempt record."""
     attempt_out_dir = (
         os.path.join(base_output_dir, unit["id"], f"attempt-{attempt_num}")
         if base_output_dir
@@ -726,35 +1205,78 @@ def execute_submit_attempt(
     )
     started_utc = utc_now_iso()
     t0 = time.perf_counter()
-    timeout_limit = (unit.get("timeout_secs") or 1800) * (1 + unit.get("verify", 1)) + 180
+    if submit_timeout_override is not None:
+        timeout_limit = float(submit_timeout_override)
+    else:
+        unit_to = unit.get("timeout_secs") or 1800
+        margin = min(180, max(2, unit_to))
+        timeout_limit = unit_to * (1 + unit.get("verify", 1)) + margin
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": sub_env,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    aborted_event = threading.Event()
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    cli_rc = 1
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    if proc_registry is not None:
+        proc_registry.register(proc, aborted_event)
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=sub_env,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_limit,
-        )
-        cli_rc = proc.returncode
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-    except subprocess.TimeoutExpired as exc:
-        cli_rc = 124
-        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = (
-            exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        ) + f"\nsubprocess timed out after {timeout_limit}s"
+        if force_stop_event is not None and force_stop_event.is_set():
+            aborted_event.set()
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_limit)
+            cli_rc = proc.returncode if proc.returncode is not None else 1
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                if os.name != "nt" and hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except OSError:
+                pass
+            stdout_rem, stderr_rem = proc.communicate()
+            stdout = stdout_rem or ""
+            stderr = (stderr_rem or "") + f"\nsubprocess timed out after {timeout_limit}s"
+            cli_rc = 124
+    finally:
+        if proc_registry is not None:
+            proc_registry.unregister(proc)
 
     dt = round(time.perf_counter() - t0, 4)
     doc = None
-    if stdout.strip():
+    if stdout and stdout.strip():
         try:
             parsed = json.loads(stdout)
             if isinstance(parsed, dict):
                 doc = parsed
         except ValueError:
             doc = None
+
+    was_interrupted = aborted_event.is_set() or cli_rc < 0 or cli_rc in (130, 143)
+    outcome = classify_attempt(cli_rc, doc, unit["verify"], interrupted=was_interrupted)
+
+    # Refresh `WorkerDirectory` if a late-joining worker appears or before scrubbing errors.
+    unknown_ref = any(not directory.has_worker(rid, rname) for rid, rname in _collect_doc_worker_refs(doc))
+    if unknown_ref or outcome in ("failed", "verify_error"):
+        directory.maybe_refresh()
 
     primary_label, primary_participant = (
         directory.ensure_worker(
@@ -765,18 +1287,43 @@ def execute_submit_attempt(
         else (None, None)
     )
     sanitized_verify = sanitize_verify_report(doc.get("verify") if doc else None, directory)
-    outcome = classify_attempt(cli_rc, doc, unit["verify"])
+
+    is_timeout = timed_out or (isinstance(doc, dict) and doc.get("status") == "timeout")
+    cancelled_on_master: bool | None = None
+    if outcome == "interrupted" or is_timeout:
+        tid = extract_task_id(doc, stdout, stderr)
+        if tid:
+            ok = cancel_task_on_master(
+                binary,
+                tid,
+                sub_env,
+                master=master,
+                relay_url=relay_url,
+                config_file=config_file,
+                insecure=insecure,
+            )
+            cancelled_on_master = ok
+            if not ok and orphan_recorder is not None:
+                orphan_recorder(unit["id"], tid)
+        elif outcome == "interrupted":
+            print(
+                f"warning: [{unit['id']}] interrupted before submit printed task_id; "
+                "check `oxideswarm status` before --resume if an orphaned task may still be queued or running",
+                file=sys.stderr,
+                flush=True,
+            )
 
     error_parts = []
     if doc and doc.get("error"):
-        error_parts.append(str(doc["error"]))
+        error_parts.append(strip_cli_hints(str(doc["error"])))
     if doc and doc.get("artifact_save_error"):
         error_parts.append(f"artifact_save_error: {doc['artifact_save_error']}")
-    if outcome in ("failed", "verify_error") and stderr.strip():
-        error_parts.append(stderr.strip()[:600])
-    error_text = directory.scrub(" | ".join(error_parts)) if error_parts else None
+    cleaned_stderr = strip_cli_hints(stderr)
+    if outcome in ("failed", "verify_error", "interrupted") and cleaned_stderr.strip():
+        error_parts.append(cleaned_stderr.strip()[:600])
+    error_text = directory.scrub(" | ".join(p for p in error_parts if p)) if error_parts else None
 
-    return {
+    attempt_rec: dict[str, Any] = {
         "attempt": attempt_num,
         "reason": reason,
         "started_at_utc": started_utc,
@@ -791,6 +1338,9 @@ def execute_submit_attempt(
         "verify": sanitized_verify,
         "error": error_text,
     }
+    if cancelled_on_master is not None:
+        attempt_rec["cancelled_on_master"] = cancelled_on_master
+    return attempt_rec
 
 
 def run_unit_with_mismatch_rerun(
@@ -798,26 +1348,36 @@ def run_unit_with_mismatch_rerun(
     unit: dict[str, Any],
     directory: WorkerDirectory,
     sub_env: dict[str, str],
+    *,
+    stop_event: threading.Event | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Run one work unit; on verification mismatch, rerun once and record both attempts."""
+    """Run one work unit; on verification mismatch, rerun once unless interrupted."""
     attempts: list[dict[str, Any]] = []
     a1 = execute_submit_attempt(binary, unit, 1, "initial", directory, sub_env, **kwargs)
     attempts.append(a1)
 
-    if a1["outcome"] == "verified":
+    if a1["outcome"] == "interrupted":
+        status = "interrupted"
+        had_mismatch = False
+        needs_investigation = False
+    elif a1["outcome"] == "verified":
         status = "verified"
         had_mismatch = False
         needs_investigation = False
     elif a1["outcome"] == "mismatch":
         had_mismatch = True
         needs_investigation = True
-        if unit.get("mismatch_retries", 1) >= 1:
+        if stop_event is not None and stop_event.is_set():
+            status = "interrupted"
+        elif unit.get("mismatch_retries", 1) >= 1:
             a2 = execute_submit_attempt(
                 binary, unit, 2, "mismatch_rerun", directory, sub_env, **kwargs
             )
             attempts.append(a2)
-            if a2["outcome"] == "verified":
+            if a2["outcome"] == "interrupted":
+                status = "interrupted"
+            elif a2["outcome"] == "verified":
                 status = "verified_on_rerun"
             elif a2["outcome"] == "mismatch":
                 status = "mismatch_persisted"
@@ -853,6 +1413,7 @@ def compute_summary(unit_records: list[dict[str, Any]], units_total: int) -> dic
         "mismatch_rerun_failed": 0,
         "verify_error": 0,
         "failed": 0,
+        "interrupted": 0,
     }
     total_attempts = 0
     total_mismatch_attempts = 0
@@ -867,6 +1428,7 @@ def compute_summary(unit_records: list[dict[str, Any]], units_total: int) -> dic
             total_attempts += 1
             if a.get("outcome") == "mismatch":
                 total_mismatch_attempts += 1
+    not_recorded = max(0, units_total - len(unit_records))
     return {
         "units_total": units_total,
         "units_recorded": len(unit_records),
@@ -876,7 +1438,8 @@ def compute_summary(unit_records: list[dict[str, Any]], units_total: int) -> dic
         "mismatch_rerun_failed": counts["mismatch_rerun_failed"],
         "verify_error": counts["verify_error"],
         "failed": counts["failed"],
-        "pending": max(0, units_total - len(unit_records)),
+        "interrupted": counts["interrupted"],
+        "pending": not_recorded + counts["interrupted"] + counts["verify_error"] + counts["mismatch_rerun_failed"],
         "total_attempts": total_attempts,
         "total_mismatch_attempts": total_mismatch_attempts,
         "units_needing_investigation": needs_investigation,
@@ -996,13 +1559,53 @@ def atomic_write_json(path: str | os.PathLike[str], payload: dict[str, Any]) -> 
         raise
 
 
+def _orphans_sidecar_path(record_path: str | os.PathLike[str]) -> str:
+    return os.path.abspath(record_path) + ".orphans.json"
+
+
+def _load_orphans(record_path: str | os.PathLike[str]) -> dict[str, list[str]]:
+    sidecar = _orphans_sidecar_path(record_path)
+    if not os.path.exists(sidecar):
+        return {}
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, list[str]] = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, list):
+                tids = [t for t in v if isinstance(t, str) and UUID_RE.fullmatch(t)]
+                if tids:
+                    out[k] = tids
+        return out
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_orphans(record_path: str | os.PathLike[str], orphans: dict[str, list[str]]) -> None:
+    sidecar = _orphans_sidecar_path(record_path)
+    if not orphans:
+        try:
+            os.unlink(sidecar)
+        except OSError:
+            pass
+        return
+    atomic_write_json(sidecar, orphans)
+
+
 def load_resume_units(
     record_path: str | os.PathLike[str],
     campaign_id: str,
     *,
     retry_failed: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Load completed units from an existing record file for `--resume`."""
+    """Load completed units from an existing record file for `--resume`.
+
+    Always excludes `interrupted`, `verify_error`, and `mismatch_rerun_failed`
+    so a plain `--resume` resubmits them automatically. Excludes `failed` when
+    `retry_failed=True`.
+    """
     with open(record_path, encoding="utf-8") as f:
         existing = json.load(f)
     if not isinstance(existing, dict):
@@ -1041,14 +1644,13 @@ def _base_cluster_args(args: argparse.Namespace) -> list[str]:
     return out
 
 
-def fetch_cluster_facts(
-    args: argparse.Namespace,
+def fetch_workers_list(
+    binary: str,
+    common_args: list[str],
     sub_env: dict[str, str],
-    participant_map: dict[str, str],
-) -> tuple[WorkerDirectory, dict[str, Any] | None]:
-    common = _base_cluster_args(args)
+) -> list[dict[str, Any]]:
     r_workers = subprocess.run(
-        [args.bin, "workers", *common, "--json"],
+        [binary, "workers", *common_args, "--json"],
         capture_output=True,
         text=True,
         env=sub_env,
@@ -1057,12 +1659,29 @@ def fetch_cluster_facts(
     )
     if r_workers.returncode != 0:
         raise RuntimeError(
-            f"`oxideswarm workers --json` failed (exit {r_workers.returncode}): {r_workers.stderr.strip()}"
+            f"`oxideswarm workers --json` failed (exit {r_workers.returncode}): {strip_cli_hints(r_workers.stderr).strip()}"
         )
     workers_raw = json.loads(r_workers.stdout)
     if not isinstance(workers_raw, list):
         raise RuntimeError("`oxideswarm workers --json` did not return a list")
-    directory = WorkerDirectory(workers_raw, participant_map)
+    return workers_raw
+
+
+def fetch_cluster_facts(
+    args: argparse.Namespace,
+    sub_env: dict[str, str],
+    participant_map: dict[str, str],
+) -> tuple[WorkerDirectory, dict[str, Any] | None]:
+    common = _base_cluster_args(args)
+    workers_raw = fetch_workers_list(args.bin, common, sub_env)
+    directory = WorkerDirectory(
+        workers_raw,
+        participant_map,
+        refresh_callback=lambda: fetch_workers_list(args.bin, common, sub_env),
+    )
+    directory.register_endpoint_secrets(
+        master=args.master, relay_url=args.relay_url, env=sub_env
+    )
 
     doctor_data: dict[str, Any] | None = None
     if not args.skip_doctor:
@@ -1084,8 +1703,9 @@ def fetch_cluster_facts(
         if isinstance(doc_parsed, dict):
             doctor_data = sanitize_doctor(doc_parsed, directory)
         else:
+            cleaned = strip_cli_hints(r_doc.stderr).strip()[:200]
             doctor_data = {
-                "error": directory.scrub(f"doctor exited {r_doc.returncode}: {r_doc.stderr.strip()[:200]}")
+                "error": directory.scrub(f"doctor exited {r_doc.returncode}: {cleaned}")
             }
     return directory, doctor_data
 
@@ -1114,6 +1734,7 @@ def _build_record_payload(
     }
     if runner_sha256:
         workload_rec["runner_sha256"] = runner_sha256
+    if runner_system:
         workload_rec["runner_system"] = runner_system
     return {
         "record_format": RECORD_FORMAT,
@@ -1148,7 +1769,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--secret-file", help="Cluster secret file (passed via OXIDESWARM_SECRET_FILE)")
     ap.add_argument("--insecure", action="store_true", help="Pass --insecure to oxideswarm subcommands")
     ap.add_argument("--runner", help="Local runner binary path; verified against manifest SHA-256 and staged")
-    ap.add_argument("--runner-system", help="OS/arch key in workload.runner_sha256 (e.g. macos/aarch64)")
+    ap.add_argument(
+        "--runner-system",
+        help="OS/arch key (e.g. macos/aarch64); pins every submitted unit with --os/--arch",
+    )
+    ap.add_argument("--os", dest="target_os", help="Explicitly pin every unit with `submit --os <OS>`")
+    ap.add_argument("--arch", dest="target_arch", help="Explicitly pin every unit with `submit --arch <ARCH>`")
+    ap.add_argument(
+        "--shard",
+        help="Run a disjoint 1-based slice K/N of manifest units (e.g. 1/2 for macOS, 2/2 for Windows)",
+    )
+    ap.add_argument("--command", dest="command_override", help="Override unit command (e.g. /usr/bin/python3)")
+    ap.add_argument(
+        "--extra-input",
+        action="append",
+        default=[],
+        help="Additional --input LOCAL[:SANDBOX] spec (repeatable; secret-checked)",
+    )
     ap.add_argument("--participants", help="JSON file mapping worker names or IDs to P1..P5 labels")
     ap.add_argument("--output-dir", help="Local directory where verified unit outputs are saved")
     ap.add_argument("--record", help="Output JSON record path (default: <manifest_dir>/results/<date>-campaign.json)")
@@ -1157,7 +1794,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--expect-workers", type=int, help="Pass --expect-workers N to `doctor --json`")
     ap.add_argument("--skip-doctor", action="store_true", help="Skip `oxideswarm doctor --json` before running")
     ap.add_argument("--require-isolation", help="Override `defaults.require_isolation` for every unit")
-    ap.add_argument("--resume", action="store_true", help="Skip units already completed in --record")
+    ap.add_argument(
+        "--interrupt-grace-secs",
+        type=float,
+        default=5.0,
+        help="Seconds to let in-flight units finish on first Ctrl-C before terminating (default: 5.0)",
+    )
+    ap.add_argument(
+        "--submit-timeout-secs",
+        type=float,
+        help="Override driver wait watchdog timeout in seconds for each `submit` child process",
+    )
+    ap.add_argument(
+        "--allow-blocked-workload",
+        action="store_true",
+        help="Allow live run even when manifest.workload.runner_ready is false",
+    )
+    ap.add_argument("--resume", action="store_true", help="Skip completed units in --record (always resubmits interrupted/verify_error)")
     ap.add_argument("--retry-failed", action="store_true", help="With --resume, also retry units in state `failed`")
     ap.add_argument("--dry-run", action="store_true", help="Validate manifest and print planned commands without running")
     return ap.parse_args(argv)
@@ -1171,20 +1824,61 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit is not None and args.limit < 1:
         print("error: --limit must be >= 1", file=sys.stderr)
         return 2
+    if args.interrupt_grace_secs < 0:
+        print("error: --interrupt-grace-secs must be >= 0", file=sys.stderr)
+        return 2
+    if args.submit_timeout_secs is not None and args.submit_timeout_secs <= 0:
+        print("error: --submit-timeout-secs must be > 0", file=sys.stderr)
+        return 2
 
     try:
         manifest = load_manifest(args.manifest)
         participant_map = load_participant_map(args.participants)
+
+        pin_os = normalize_os(args.target_os) if args.target_os else None
+        pin_arch = normalize_arch(args.target_arch) if args.target_arch else None
+        normalized_runner_system: str | None = None
+        if args.runner_system:
+            sys_os, sys_arch = parse_system_key(args.runner_system)
+            if pin_os and pin_os != sys_os:
+                raise ValueError(f"--os {pin_os!r} conflicts with --runner-system {args.runner_system!r}")
+            if pin_arch and pin_arch != sys_arch:
+                raise ValueError(f"--arch {pin_arch!r} conflicts with --runner-system {args.runner_system!r}")
+            pin_os, pin_arch = sys_os, sys_arch
+            normalized_runner_system = f"{sys_os}/{sys_arch}"
+
+        validate_no_secret_inputs(list(args.extra_input), "--extra-input", base_dir=os.getcwd())
         extra_inputs: list[str] = []
+        for spec in args.extra_input:
+            local, sandbox = _input_spec_parts(spec.strip())
+            if not os.path.isabs(local):
+                local = os.path.normpath(os.path.abspath(local))
+            extra_inputs.append(f"{local}:{sandbox}" if sandbox else local)
+
         runner_sha256: str | None = None
         if args.runner:
             runner_spec, runner_sha256 = verify_runner_hash(
                 manifest["workload"], args.runner, args.runner_system
             )
             extra_inputs.append(runner_spec)
+
+        apply_unit_overrides(
+            manifest["units"],
+            pin_os=pin_os,
+            pin_arch=pin_arch,
+            command_override=args.command_override,
+        )
+
+        selected_units = list(manifest["units"])
+        if args.shard:
+            shard_idx, shard_total = parse_shard_spec(args.shard)
+            selected_units = slice_shard(selected_units, shard_idx, shard_total)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    workload_ready = manifest["workload"].get("runner_ready", True)
+    blocker_msg = manifest["workload"].get("blocker") or "manifest marks workload.runner_ready = false"
 
     record_path = args.record or _default_record_path(args.manifest)
     retained: dict[str, dict[str, Any]] = {}
@@ -1204,18 +1898,22 @@ def main(argv: list[str] | None = None) -> int:
         started_at = existing.get("started_at_utc") or started_at
         resumed_at = list(existing.get("resumed_at_utc") or []) + [utc_now_iso()]
 
-    pending_units = [u for u in manifest["units"] if u["id"] not in retained]
+    pending_units = [u for u in selected_units if u["id"] not in retained]
     if args.limit is not None:
         pending_units = pending_units[: args.limit]
 
     if args.dry_run:
         print(
             f"[dry-run] campaign={manifest['campaign_id']} total={len(manifest['units'])} "
-            f"resumed_skipped={len(retained)} scheduled={len(pending_units)} "
+            f"selected={len(selected_units)} resumed_skipped={len(retained)} scheduled={len(pending_units)} "
             f"concurrency={args.concurrency}"
         )
+        if pin_os or pin_arch:
+            print(f"[dry-run] system_pin={pin_os or '*'}/{pin_arch or '*'}")
         if runner_sha256:
-            print(f"[dry-run] runner verified ({args.runner_system}): sha256={runner_sha256}")
+            print(f"[dry-run] runner verified ({normalized_runner_system}): sha256={runner_sha256}")
+        if workload_ready is False:
+            print(f"[dry-run] workload blocker: {blocker_msg}")
         for u in pending_units[:3]:
             preview = build_submit_command(
                 args.bin,
@@ -1235,6 +1933,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[dry-run] ... ({len(pending_units) - 3} more unit(s))")
         return 0
 
+    if workload_ready is False and not args.allow_blocked_workload:
+        print(f"error: workload is blocked: {blocker_msg}", file=sys.stderr)
+        return 1
+
     sub_env = _cluster_env(args.secret_file)
     try:
         directory, doctor_data = fetch_cluster_facts(args, sub_env, participant_map)
@@ -1242,11 +1944,45 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    unit_order = [u["id"] for u in manifest["units"]]
+    orphan_lock = threading.Lock()
+    orphans_by_unit = _load_orphans(record_path) if args.resume else {}
+
+    def record_orphan(unit_id: str, task_id: str) -> None:
+        with orphan_lock:
+            tids = orphans_by_unit.setdefault(unit_id, [])
+            if task_id not in tids:
+                tids.append(task_id)
+            _save_orphans(record_path, orphans_by_unit)
+
+    if args.resume and orphans_by_unit:
+        for uid in [u["id"] for u in pending_units]:
+            tids = orphans_by_unit.pop(uid, [])
+            remaining_tids = []
+            for tid in tids:
+                if not cancel_task_on_master(
+                    args.bin,
+                    tid,
+                    sub_env,
+                    master=args.master,
+                    relay_url=args.relay_url,
+                    config_file=args.config,
+                    insecure=args.insecure,
+                ):
+                    remaining_tids.append(tid)
+            if remaining_tids:
+                orphans_by_unit[uid] = remaining_tids
+        _save_orphans(record_path, orphans_by_unit)
+
+    unit_order = [u["id"] for u in selected_units]
     units_by_id: dict[str, dict[str, Any]] = dict(retained)
     state_lock = threading.Lock()
     stop_event = threading.Event()
+    force_stop_event = threading.Event()
+    signal_notify_event = threading.Event()
+    all_done_event = threading.Event()
     received_signal = [0]
+    signal_count = [0]
+    proc_registry = _ActiveProcRegistry()
 
     def flush_checkpoint(finished_at: str | None = None, interrupted: bool = False) -> dict[str, Any]:
         payload = _build_record_payload(
@@ -1260,19 +1996,36 @@ def main(argv: list[str] | None = None) -> int:
             finished_at=finished_at,
             interrupted=interrupted,
             runner_sha256=runner_sha256,
-            runner_system=args.runner_system,
+            runner_system=normalized_runner_system,
         )
         atomic_write_json(record_path, payload)
         return payload
 
     def handle_signal(signum: int, _frame: Any) -> None:
         received_signal[0] = signum
+        signal_count[0] += 1
         stop_event.set()
-        signal.signal(signum, signal.SIG_DFL)
+        if signal_count[0] >= 2 or args.interrupt_grace_secs <= 0:
+            force_stop_event.set()
+        signal_notify_event.set()
+        if signal_count[0] >= 3:
+            signal.signal(signum, signal.SIG_DFL)
+
+    def interrupt_watcher() -> None:
+        signal_notify_event.wait()
+        if all_done_event.is_set():
+            return
+        if not force_stop_event.is_set() and args.interrupt_grace_secs > 0:
+            force_stop_event.wait(timeout=args.interrupt_grace_secs)
+        if not all_done_event.is_set():
+            force_stop_event.set()
+            proc_registry.terminate_all()
 
     prev_sigint = signal.getsignal(signal.SIGINT)
     prev_sigterm = signal.getsignal(signal.SIGTERM)
+    watcher_thread = threading.Thread(target=interrupt_watcher, daemon=True)
     if threading.current_thread() is threading.main_thread():
+        watcher_thread.start()
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
 
@@ -1287,6 +2040,7 @@ def main(argv: list[str] | None = None) -> int:
                 unit,
                 directory,
                 sub_env,
+                stop_event=stop_event,
                 master=args.master,
                 relay_url=args.relay_url,
                 config_file=args.config,
@@ -1294,6 +2048,10 @@ def main(argv: list[str] | None = None) -> int:
                 base_output_dir=args.output_dir,
                 extra_inputs=extra_inputs,
                 require_isolation_override=args.require_isolation,
+                proc_registry=proc_registry,
+                force_stop_event=force_stop_event,
+                submit_timeout_override=args.submit_timeout_secs,
+                orphan_recorder=record_orphan,
             )
             with state_lock:
                 units_by_id[unit["id"]] = rec
@@ -1308,12 +2066,19 @@ def main(argv: list[str] | None = None) -> int:
             for fut in concurrent.futures.as_completed(futures):
                 fut.result()
 
-        interrupted = stop_event.is_set()
+        interrupted = stop_event.is_set() or any(
+            r.get("status") == "interrupted" for r in units_by_id.values()
+        )
         final_payload = flush_checkpoint(
             finished_at=None if interrupted else utc_now_iso(),
             interrupted=interrupted,
         )
     finally:
+        all_done_event.set()
+        force_stop_event.set()
+        signal_notify_event.set()
+        if watcher_thread.is_alive():
+            watcher_thread.join(timeout=2.0)
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT, prev_sigint)
             signal.signal(signal.SIGTERM, prev_sigterm)
@@ -1323,11 +2088,13 @@ def main(argv: list[str] | None = None) -> int:
 
     scheduled_ids = {u["id"] for u in pending_units}
     scheduled_records = [units_by_id[uid] for uid in unit_order if uid in scheduled_ids and uid in units_by_id]
+    if any(r["status"] == "interrupted" for r in scheduled_records):
+        return 130
     if any(r["status"] in ("mismatch_persisted", "mismatch_rerun_failed") for r in scheduled_records):
         return 4
     if any(r["status"] in ("failed", "verify_error") for r in scheduled_records):
         return 1
-    if final_payload["summary"]["pending"] > 0 and args.limit is None:
+    if final_payload["summary"]["pending"] > 0 and args.limit is None and not args.shard:
         return 1
     return 0
 

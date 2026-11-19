@@ -1939,11 +1939,13 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   hard. It is the exit check of Stage 1 in design 0094.
 - **Partial (2026-11-19, pull request 376, open; item stays `Planned`):** Steps 1 and 4 done: committed
   the campaign sheet and one-page participant guide (`benchmarks/campaigns/2026-11-pilot/README.md`), the
-  200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`), the
-  standard-library Python driver (`benchmarks/campaigns/driver.py`), and `tests/test_campaign_driver.py`
-  (wired in `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local
-  loopback cluster with a deterministic stand-in command. Steps 2 (dry run) and 3 (pilot run) remain
-  **Planned**.
+  200-unit deterministic CPU manifest (`benchmarks/campaigns/2026-11-pilot/manifest.json`, noting the
+  Anima Engine runner blocker and switching `--verify-file` to deterministic `out/smoke/verify_checksums.txt`),
+  `dry_run_manifest.json` + `standin_workload.py` for step 2 on `0.4.4`, the standard-library Python driver
+  (`benchmarks/campaigns/driver.py`), and `tests/test_campaign_driver.py` (wired in
+  `.github/workflows/ci.yml`), verified against a fake `oxideswarm` and on a 2-worker local loopback
+  cluster on `dry_run_manifest.json`. Steps 2 (dry run) and 3 (pilot run, blocked on the Anima Engine
+  runner update as well as `NET-9` and `NET-10`) remain **Planned**.
 
 ## Status log
 
@@ -2409,4 +2411,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: Release 0.4.4 prepared (no wire change: protocol 10, store format 4): the Windows USB kit fixes BUG-29 to
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
-- 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
+- 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.

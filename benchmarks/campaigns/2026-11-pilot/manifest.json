@@ -5,8 +5,11 @@
     "name": "anima-engine-esel1",
     "binary_name": "run_esel1_experiment",
     "commit": "7a825cc56135df83d5a513ecf59fe3b2e9f1dd92",
+    "smoke_record_commit": "a3734c3",
     "deterministic": true,
     "gpu": false,
+    "runner_ready": false,
+    "blocker": "Anima-Engine commit 7a825cc run_esel1_experiment only runs --smoke at T_smoke ticks, ignores ANIMA_SIM_SEED (live_experiment.rs:1679), exits 2 without manifests/esel1-preregistration.json, and writes wall-clock timings into out/smoke/checksums.sha256. Update run_esel1_experiment in Anima-Engine to accept --seed, --founders, --food-cap-abundant, --food-cap-scarce, and --duration-ticks and write deterministic out/smoke/verify_checksums.txt, and stage manifests/ via --extra-input <LOCAL_MANIFESTS_DIR>:manifests. Until then, run APP-6 step 2 (dry run) against dry_run_manifest.json and standin_workload.py.",
     "runner_sha256": {
       "macos/aarch64": "<fill-before-run>",
       "windows/x86_64": "<fill-before-run>"
@@ -15,11 +18,20 @@
   "defaults": {
     "command": "./run_esel1_experiment",
     "args": [
-      "--smoke",
       "--manifest-dir",
       "manifests",
       "--out",
-      "out"
+      "out",
+      "--seed",
+      "{seed}",
+      "--founders",
+      "{live.founders}",
+      "--food-cap-abundant",
+      "{live.food_cap_abundant}",
+      "--food-cap-scarce",
+      "{live.food_cap_scarce}",
+      "--duration-ticks",
+      "{duration_ticks}"
     ],
     "inputs": [],
     "outputs": [
@@ -30,12 +42,15 @@
       "ANIMA_USE_GPU": "0"
     },
     "verify": 1,
-    "verify_file": "out/smoke/checksums.sha256",
+    "verify_file": "out/smoke/verify_checksums.txt",
     "verify_any_system": false,
     "require_isolation": "fs",
     "require_tags": [],
     "timeout_secs": 1800,
-    "mismatch_retries": 1
+    "mismatch_retries": 1,
+    "required_external_inputs": [
+      "manifests/esel1-preregistration.json"
+    ]
   },
   "grid_summary": {
     "founders": [
