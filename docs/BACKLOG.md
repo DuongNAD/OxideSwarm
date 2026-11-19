@@ -165,16 +165,14 @@ After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68
 Recounted on 2026-11-18 after pull requests 299 to 318 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
 TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
 pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
-Then TEST-52 (pull request 320, Partial) and DOC-11 (pull request 322): 202 items, 127 Implemented, 16 Partial and
-59 Planned; 30 open items are In and 45 are Out.
-Recounted on 2026-11-18 with ADOPT-2 Implemented (pull request 350, open; its `Line` value `In` stays until merged) after BUG-29 to BUG-31 (pull request 341), LV-1, LV-18, TEST-53, ENROLL-1c, BUG-27, BUG-28, TEST-35, LV-4, and LV-5: 210 items, 138 Implemented, 16 Partial and 56 Planned; 27 remaining open items are In and 45 are Out.
-Recounted on 2026-11-19 after BUG-32, BENCH-8, TEST-55, and BENCH-9 Partial (pull request 354, open): 214 items, 141 Implemented, 19 Partial and 54 Planned; 27 remaining open items are In and 46 are Out.
 Recounted on 2026-11-19 from the rows, after pull requests 340 to 359 (354 still open): LV-4, LV-5, LV-15,
 BENCH-3, TEST-23 and TEST-41 Partial; BUG-29 to BUG-32, BENCH-8, ADOPT-2 and TEST-55 Implemented; BENCH-8, BENCH-9,
 BUG-32 and TEST-55 added. With MAINT-2 (pull requests 323, 325 and 331) and TEST-29 Implemented, SEC-16 Partial
 and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 Planned; 26 open items are In and
 46 are Out.
 Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged): 216 distinct items, 144 Implemented, 18 Partial and 54 Planned; 26 remaining open items are In and 46 are Out.
+Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
+27 open items are In and 46 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -356,6 +354,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Planned | In |  |
+| SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Planned | In |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
@@ -399,10 +398,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
-| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355 (open), (design 0093) |
-| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354 (open), (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
-| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Planned | Out | (design 0093) |
+| BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
 
 ## Phase 0: integrate open work
 
@@ -1262,6 +1259,33 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      cannot create them, skip with a printed reason.
 - **Done when:** Those tests pass on `windows-latest` in CI.
 
+### SEC-18: Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk
+
+- **Evidence:** Read in the review of pull request 360 (SEC-17), 2026-11-19
+  (`OxideSwarm_Agent_Hub` `test_runs/review_pr360.md`, items 5 and 6).
+  - Any top-level regular file of the workspace root whose name passes `validate_workspace_name`, or a
+    file named `.locks`, is accepted without a type or `nlink` check (`toolchain.rs`), and
+    `SetNamedSecurityInfoW` pushes the root's inheritable entries onto it, so a hard link changes the
+    DACL of the file it is linked to. `<ws>\state.json` and `<ws>\lock` get a protected DACL written
+    directly (`crates/worker/src/isolation/windows/mod.rs`) with only a reparse check.
+  - The DACL is written by path (`protect_sandbox_base`, `acl.rs`), so a folder swapped for a junction
+    between the check and the write is followed (the window that SEC-17 narrows but cannot close).
+  - On CI the test's temporary folder sits under the real `%USERPROFILE%`, so the SEC-17 tests pass even
+    without the `host.user_home` walk; the guard assertion checks only `ErrorKind::PermissionDenied`, and
+    a skipped test shows as `ok`.
+- **Problem:** The rule "the worker rewrites a DACL only on its own folders and files" still has these
+  gaps. Only processes of the same user can create the links, so the impact is low.
+- **Do:**
+  1. Refuse, or skip without rewriting, every top-level entry that is not a folder the worker made,
+     and require `nlink == 1` for every file whose DACL is written.
+  2. Write the DACL through a handle: open the root with `FILE_FLAG_BACKUP_SEMANTICS` and
+     `FILE_FLAG_OPEN_REPARSE_POINT`, compare `GetFinalPathNameByHandleW` with the lexical path, and call
+     `SetSecurityInfo` on that handle.
+  3. Make the tests prove each walk on its own (a home that is not an ancestor of `%USERPROFILE%` in the
+     test), assert the refusal text, and add a `RUSTY_GRID_REQUIRE_*` switch so CI fails when a test
+     skips.
+- **Done when:** Those tests pass on `windows-latest` in CI with the switch set.
+
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
 - **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
@@ -1356,6 +1380,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   which is a wire change. Under the one-version window (design 0083) a protocol 9 client would also need
   its own encoding of that response, and design 0076 allows one wire change per release, so BUG-22 waits
   for the next wire change after 0.4.0.
+- **Owner decision (2026-11-19):** no protocol bump for BUG-22 alone; it goes into the next planned wire
+  change.
 
 ## Phase 13: the path to finished
 
@@ -1823,12 +1849,12 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
 - **Done when:** The records split the per-machine cost into process time and idle time on both machines,
   and this section names the cause of the LAN cost on Windows and of the open 0.16 on the Mac, or the change
   that closes them.
-- **Partial (2026-11-18, pull request 354, open):** Step 1 implemented (`benchmarks/sweep/bench_sweep.py`,
+- **Partial (2026-11-18, pull request 354):** Step 1 implemented (`benchmarks/sweep/bench_sweep.py`,
   record format 2): grid runs record `task_time_sum_s`, `task_time_missing`, `slot_seconds`, `utilization`, and
   per-worker `tasks`, `mean_s`, and `median_s` (over succeeded tasks); local runs record `task_time_mean_s` and
   `task_time_median_s` per run and level; and a low-rate sampler watches for `cargo` / `rustc` during each run
   (`competing_processes`). Steps 2 and 3 (the live runs on Windows and Mac under a committed plan, and debug-log
-  round-trip breakdown if idle slots remain) are next once PR 354 merges.
+  round-trip breakdown if idle slots remain) are next.
 
 ## Status log
 
@@ -2261,7 +2287,7 @@ Add one dated line per finished item, newest last.
   in `crates/worker/src/sandbox.rs` uses `BUILTIN\Guests` (`S-1-5-32-546`) instead of
   `BUILTIN\Remote Desktop Users` (`S-1-5-32-555`, absent on Windows Home), so `cargo test -p rusty_grid_worker --lib`
   passes in full on Windows 11 Home; text in the archive.
-- 2026-11-18: BENCH-9 Partial (pull request 354, open): `bench_sweep.py` record format 2 adds task process timing, slot utilization, `task_time_missing`, succeeded per-worker means/medians, and `cargo`/`rustc` process sampling (step 1); live runs of steps 2 and 3 remain.
+- 2026-11-18: BENCH-9 Partial (pull request 354): `bench_sweep.py` record format 2 adds task process timing, slot utilization, `task_time_missing`, succeeded per-worker means/medians, and `cargo`/`rustc` process sampling (step 1); live runs of steps 2 and 3 remain.
 - 2026-11-19: Rows brought up to date after pull requests 340 to 359 (354 still open): "(open)" dropped for
   LV-4, LV-5, BUG-29 to BUG-32, BENCH-3, LV-15, BENCH-8, ADOPT-2, TEST-23, TEST-41 and TEST-55, and ADOPT-2's Line
   cleared. MAINT-2 Implemented (pull requests 323, 325 and 331; the allowlist has no entry). TEST-29 Implemented:
@@ -2278,3 +2304,7 @@ Add one dated line per finished item, newest last.
   `RUSTY_GRID_SKIP_FEAT3_OS_ISOLATION_STEP8` so the 30 AppContainer tests print `skipped:` after Step 7
   (`workspace tests (windows-latest)` `1,416 s` / `23.60 min` vs `30.2 min` median baseline); text in the
   archive.
+- 2026-11-19: BENCH-9 row and texts updated after pull request 354 merged (duplicate rows and count lines from the
+  merge removed). SEC-18 added from the review of pull request 360. BUG-22: owner decision recorded (next planned
+  wire change). Counted from the rows: 216 items, 143 Implemented, 19 Partial and 54 Planned; 27 open items In,
+  46 Out.
