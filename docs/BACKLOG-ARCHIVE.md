@@ -2721,7 +2721,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All 13 tests in `tests/test_campaign_driver.py` keep full behaviour and cancellation
   assertions without sub-second startup windows or shared append races, and pass `20/20` under 6 CPU
   busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `tests/test_campaign_driver.py` (`driver.py`
+- **Implemented (2026-11-19, pull request 394, open):** Updated `tests/test_campaign_driver.py` (`driver.py`
   unchanged) and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
   - Before fix (`origin/master` `b0786ed8`): `20/20` passed (`74.61 s` total, `3.64–3.84 s` per run;
     Apple M5 starts Python under `0.2 s` while slower CI runners hit the startup race and Windows
