@@ -225,7 +225,7 @@ the binary version it ran.
 |---|---|---|---|---|
 | TEST-24 | Large-transfer harness and first records | `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` | Records of T1 to T9 are committed for loopback and for two machines over LAN and a relay. Every failed check has its own item or regression test | Partial |
 | TEST-25 | Soak harness and a first 24-hour record | `benchmarks/endurance/endurance.py` (`soak`) | A 24-hour record on a Mac and two Windows machines is committed. It passes D3, or every failed check has its own item | Planned |
-| TEST-26 | Short run on a schedule in CI | `.github/workflows/ci.yml` | The job is green on two scheduled runs | Planned |
+| TEST-26 | Short run on a schedule in CI | `.github/workflows/ci.yml` | The job is green on two scheduled runs | Partial |
 
 ## Decisions (decided by owner 2026-11-19)
 
@@ -258,3 +258,8 @@ The right column records the owner's decisions of 2026-11-19, listed in
   (`7/7` passed across `T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s`
   `50 ms` RTT with `0` worker reaps over `2,164.6 s`, and `T8`; `T1 8 GiB`, `T2 100,000` files,
   `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` remain for step 2).
+- 2026-11-19: TEST-26 Partial (branch `win/test-26-ci-endurance`, D4.2): added scheduled (`cron: "17 3 * * 1"`)
+  and `workflow_dispatch` job `endurance` on `ubuntu-latest` to `.github/workflows/ci.yml` (never on
+  pull requests, not a required check; pinned action commits) running `transfer` (`T1` `1 GiB`, `T2`
+  `20,000` files, `T4`, `T6`, `T7`, `T8`) and `45m` `soak` and uploading `endurance-records`; static
+  checks added in `tests/test_endurance_harness.py`; stays Partial until two scheduled runs pass.

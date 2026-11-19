@@ -226,7 +226,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
-| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
@@ -551,6 +551,15 @@ The full suite must pass on a clean machine before CI can require it.
   loopback and a soak of 45 minutes, and uploads the JSON record as an artifact. It is not a
   required check.
 - **Done when:** The job is green on two scheduled runs.
+- **Partial (2026-11-19, branch `win/test-26-ci-endurance`):** Added the `endurance` job on
+  `ubuntu-latest` (`timeout-minutes: 150`, pinned action commit SHAs) to
+  `.github/workflows/ci.yml` for `schedule` (`cron: "17 3 * * 1"`) and `workflow_dispatch` only
+  (never on pull requests, not a required check). It builds `target/release/oxideswarm`, selects
+  the larger of `/mnt` and `$RUNNER_TEMP`, runs `endurance.py transfer` (`T1,T2,T4,T6,T7,T8`,
+  `--t1-sizes-gib 1 --t2-files 20000`) and `endurance.py soak` (`--duration 45m`), and uploads
+  `endurance-records` (`transfer-loopback.json` and `soak-45m-loopback.json`, `if: always()`).
+  Static checks in `tests/test_endurance_harness.py` (`EnduranceCiWorkflowTests`) verify trigger,
+  pins, commands, and upload step. Stays Partial until green on two scheduled runs.
 
 ## Phase 3: make the documents true
 
@@ -2419,3 +2428,4 @@ Add one dated line per finished item, newest last.
   BUG-32, SEC-17, ADOPT-2, LV-5 build provenance, TEST-52 and test fixes; approved by the owner in chat.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: TEST-26 Partial (branch `win/test-26-ci-endurance`, [design 0065](design/0065-large-transfer-and-long-run-tests.md) D4.2): added scheduled (`17 3 * * 1`) and `workflow_dispatch` `endurance` job on `ubuntu-latest` to `.github/workflows/ci.yml` (`T1` `1 GiB`, `T2` `20,000` files, `T4`, `T6`, `T7`, `T8`, and `45m` soak, uploading `endurance-records`; pinned action commits; static check in `tests/test_endurance_harness.py`); stays Partial until green on two scheduled runs. Counted from the rows: 225 items, 151 Implemented, 19 Partial and 55 Planned; 24 open items In, 50 Out.

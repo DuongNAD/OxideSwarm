@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import tempfile
@@ -419,6 +420,51 @@ class SamplerAndPrivacyTests(unittest.TestCase):
             bad_args = ap.parse_args(bad_argv)
             with self.assertRaises(ValueError, msg="expected ValueError for %s" % bad_argv):
                 endurance.validate_transfer_args(bad_args)
+
+
+class EnduranceCiWorkflowTests(unittest.TestCase):
+    """Static checks for TEST-26 scheduled/dispatch `endurance` job in .github/workflows/ci.yml."""
+
+    @staticmethod
+    def _extract_endurance_block():
+        ci_path = os.path.join(HERE, "..", ".github", "workflows", "ci.yml")
+        with open(ci_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        start = None
+        for idx, ln in enumerate(lines):
+            if ln.strip() == "endurance:" and ln.startswith("  "):
+                start = idx
+                break
+        if start is None:
+            raise AssertionError("endurance job block not found in .github/workflows/ci.yml")
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            ln = lines[idx]
+            if ln and not ln.startswith("  #") and re.match(r"^  [a-zA-Z0-9_-]+:\s*$", ln):
+                end = idx
+                break
+        return "\n".join(lines[start:end])
+
+    def test_endurance_ci_job_schedule_dispatch_pins_and_commands(self):
+        block = self._extract_endurance_block()
+        self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", block)
+        self.assertIn("runs-on: ubuntu-latest", block)
+
+        uses_lines = [ln.strip() for ln in block.splitlines() if "uses:" in ln]
+        self.assertGreaterEqual(len(uses_lines), 5)
+        for uline in uses_lines:
+            self.assertRegex(
+                uline,
+                r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+v?[0-9]",
+                msg="expected 40-hex pinned SHA + tag comment in %s" % uline,
+            )
+
+        self.assertIn("--scenarios T1,T2,T4,T6,T7,T8", block)
+        self.assertIn("--t1-sizes-gib 1", block)
+        self.assertIn("--t2-files 20000", block)
+        self.assertRegex(block, r"endurance\.py\s+soak\b")
+        self.assertIn("--duration 45m", block)
+        self.assertRegex(block, r"if:\s*always\(\)\s*\n\s*uses:\s*actions/upload-artifact@[0-9a-f]{40}\s+#")
 
 
 if __name__ == "__main__":

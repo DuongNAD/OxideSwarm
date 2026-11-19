@@ -6,7 +6,7 @@ on:
   pull_request:
   # Weekly run so that RustSec advisories published against an unchanged Cargo.lock still show up
   # and the ignored live Iroh DERP relay P2P tests run against the public relay network.
-  # Only the audit, p2p-wan-relay, fuzz and miri jobs run on the schedule.
+  # Only the audit, p2p-wan-relay, endurance, fuzz and miri jobs run on the schedule.
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -407,6 +407,72 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo test -p rusty_grid_cli --test test_p2p_wan_fallback --locked -- --ignored
+
+  # TEST-26 (design 0065 D4.2): short endurance transfer + 45-minute loopback soak on schedule and manual dispatch.
+  endurance:
+    name: endurance (loopback)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@3cfd829add0beb9cf7406e52147d74ad3db19d01 # 1.96.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Build oxideswarm release binary
+        run: cargo build --release --locked --bin oxideswarm
+      - name: Prepare isolated endurance work and output directories
+        shell: bash
+        run: |
+          work_dir="${RUNNER_TEMP}/ox-endurance"
+          if [ -d /mnt ]; then
+            mnt_kb=$(df -Pk /mnt | awk 'NR==2 {print $4}')
+            tmp_kb=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+            if [ "${mnt_kb:-0}" -gt "${tmp_kb:-0}" ]; then
+              work_dir="/mnt/ox-endurance"
+              sudo mkdir -p "$work_dir"
+              sudo chown "$(id -u):$(id -g)" "$work_dir"
+            fi
+          fi
+          mkdir -p "$work_dir" "${RUNNER_TEMP}/endurance-results"
+          df -h
+          echo "ENDURANCE_WORK_DIR=${work_dir}" >> "$GITHUB_ENV"
+          echo "ENDURANCE_RESULTS_DIR=${RUNNER_TEMP}/endurance-results" >> "$GITHUB_ENV"
+      - name: Run short transfer suite (T1 1 GiB, T2 20k, T4, T6, T7, T8)
+        shell: bash
+        run: |
+          python3 benchmarks/endurance/endurance.py transfer \
+            --bin target/release/oxideswarm \
+            --scenarios T1,T2,T4,T6,T7,T8 \
+            --t1-sizes-gib 1 \
+            --t2-files 20000 \
+            --work-dir "$ENDURANCE_WORK_DIR" \
+            --out "$ENDURANCE_RESULTS_DIR/transfer-loopback.json"
+      - name: Run 45-minute loopback soak
+        shell: bash
+        run: |
+          python3 benchmarks/endurance/endurance.py soak \
+            --bin target/release/oxideswarm \
+            --duration 45m \
+            --fault-scale 0.25 \
+            --load-scale 1.0 \
+            --sample-interval 60s \
+            --workers 3 \
+            --slots 4 \
+            --max-queue-size 64 \
+            --work-dir "$ENDURANCE_WORK_DIR" \
+            --out "$ENDURANCE_RESULTS_DIR/soak-45m-loopback.json"
+      - name: Upload endurance JSON records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: endurance-records
+          path: ${{ runner.temp }}/endurance-results
+          if-no-files-found: warn
 
   # LV-1, LV-18: libFuzzer targets of fuzz/ (cargo-fuzz needs a nightly toolchain: dated, so that a
   # new nightly cannot turn CI red on an unchanged tree). Pull requests and pushes: 60 s per target;
