@@ -406,15 +406,32 @@ fn test_research_mode_distributed_and_report() {
 fn test_dev_mode_watch_and_aliases() {
     let root = find_workspace_root();
 
-    // 1. Test watch check
+    // 1. Test watch check once on the real workspace root.
     let watch_res = run_watch_check(&root);
     assert!(watch_res.success, "Watch check should succeed");
     assert!(watch_res.metrics.contains_key("watchable_files"));
     assert!(watch_res.metrics.contains_key("watchable_dirs"));
 
-    // 2. Test execute_mode_action with aliases
-    let reload_res = execute_mode_action(WorkflowMode::Dev, "reload", &root);
-    assert!(reload_res.success);
+    // 2. Test execute_mode_action with aliases: exercise the Dev `reload` alias on a minimal
+    // temporary crate so CI does not run `cargo check --workspace` over the whole repo twice.
+    let tiny = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tiny.path().join("src")).expect("create tiny src");
+    std::fs::write(
+        tiny.path().join("Cargo.toml"),
+        "[package]\nname = \"tiny_watch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .expect("write tiny Cargo.toml");
+    std::fs::write(tiny.path().join("src").join("lib.rs"), "pub fn ok() {}\n")
+        .expect("write tiny lib.rs");
+
+    let reload_res = execute_mode_action(WorkflowMode::Dev, "reload", tiny.path());
+    assert!(reload_res.success, "Dev reload alias should succeed");
+    assert_eq!(reload_res.mode, WorkflowMode::Dev);
+    assert_eq!(reload_res.action, "watch");
+    assert_eq!(
+        reload_res.metrics.get("watchable_files"),
+        Some(&serde_json::json!(2))
+    );
 
     let update_res = execute_mode_action(WorkflowMode::Doc, "update", &root);
     assert!(update_res.success);
