@@ -855,7 +855,8 @@ class CampaignDriverTests(unittest.TestCase):
         task_uuid = "99999999-8888-7777-6666-555555555599"
         behaviors = {
             "500001": [{"mode": "timeout_json", "task_id": task_uuid}],
-            "500002": [{"mode": "sleep", "sleep_secs": 600.0, "task_id": "99999999-8888-7777-6666-555555555598"}],
+            # Keep 30.0 (6x the 5 s watchdog): on Windows oxideswarm.cmd, proc.kill() ends only cmd.exe while the Python child holds pipes open until sleep ends.
+            "500002": [{"mode": "sleep", "sleep_secs": 30.0, "task_id": "99999999-8888-7777-6666-555555555598"}],
         }
         units = [
             {"id": "u001", "seed": 500001, "params": {"n0": 30}, "timeout_secs": 10},

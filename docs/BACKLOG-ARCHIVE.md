@@ -2714,10 +2714,13 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   invocation atomically via temp file + `os.replace` to `<ts_ns>-<pid>-<uuid4>.json` (and using
   atomic writes for `.workers_calls`, `.count.<seed>`, and marker files) plus a shared chronological
   reader `read_fake_cli_logs`; raise `--submit-timeout-secs` in
-  `test_timeout_records_failed_and_cancels_task` from `0.2` to `5`, flush `timeout_json` stdout, set
-  `u002`'s `sleep_secs` to `600.0`, raise `wait_for_file`, `proc.communicate`, and interrupt `sleep_secs`
-  in `test_interrupt_records_interrupted_cancels_and_resumes` to `60.0 s` / `600.0 s`, and attach full
-  attempt records to the assertions without asserting elapsed time.
+  `test_timeout_records_failed_and_cancels_task` from `0.2` to `5`, flush `timeout_json` stdout, keep
+  `u002`'s `sleep_secs` at `30.0` (six times the `5 s` watchdog) rather than `600.0` because
+  `driver.py`'s Windows `proc.kill()` ends only the `.cmd` wrapper (`oxideswarm.cmd`) and does not
+  reach its child processes (leaving stdout/stderr pipes open until sleep ends; fine for the pilot,
+  which runs `oxideswarm.exe` directly), raise `wait_for_file`, `proc.communicate`, and interrupt
+  `sleep_secs` in `test_interrupt_records_interrupted_cancels_and_resumes` to `60.0 s` / `600.0 s`,
+  and attach full attempt records to the assertions without asserting elapsed time.
 - **Done when:** All 13 tests in `tests/test_campaign_driver.py` keep full behaviour and cancellation
   assertions without sub-second startup windows or shared append races, and pass `20/20` under 6 CPU
   busy loops.
@@ -2726,8 +2729,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - Before fix (`origin/master` `b0786ed8`): `20/20` passed (`74.61 s` total, `3.64–3.84 s` per run;
     Apple M5 starts Python under `0.2 s` while slower CI runners hit the startup race and Windows
     non-atomic append race).
-  - After fix: `python3 tests/test_campaign_driver.py -v` passed `13/13` in `8.018 s`, and the 20-run
-    loop under 6 Python busy loops passed `20/20` (`175.50 s` total, `8.65–8.90 s` per run, `0`
+  - After fix: `python3 tests/test_campaign_driver.py -v` passed `13/13` in `8.054 s`, and the 20-run
+    loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
