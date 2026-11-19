@@ -252,7 +252,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-49 | Wait for the master by condition in the sched2 runtime test | P2 | S |  |  | Implemented |  | 301 |
 | TEST-50 | Wait for the dashboard banner lines before asserting in cli_dashboard_policy_e2e | P2 | S |  |  | Implemented |  | 315 |
 | TEST-51 | Let the run_master unit tests pick their own port instead of bind-and-drop | P2 | S |  |  | Implemented |  | 318 |
-| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
+| TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Implemented |  | 320, 364 (open) |
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
@@ -1307,54 +1307,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
 - **Partial (2026-11-19, pull request 363, open):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
 
-### TEST-52: Let the remaining tests pick ports through the process that binds them, not bind-and-drop
-
-- **Evidence:** Found while fixing TEST-51 (pull request 318): six more test files pick a port by binding
-  `127.0.0.1:0`, reading the port and dropping the socket, and then hand that port to a master, a worker portal or
-  a dev cluster that binds it later. The TEST-51 failure (`Address already in use`, run `44209756700`) shows that
-  another test can take such a port in between. None of the six has failed in CI so far.
-- **Problem:** The same race as TEST-51 wherever the process that binds the port is told a number instead of
-  picking one.
-- **Do:** Where the product can pick the port and report it (port 0 with a port file, or a bound-address
-  accessor), let it, and wait by condition with a 30 s bound. Where it cannot, keep the pick, give the reason in a
-  one-line comment at the site, and name the product change that would remove it.
-- **Done when:** Every site is changed or carries its reason, and each changed test binary passes 20 runs in a row
-  under CPU load.
-- **Partial (2026-11-18, pull request 320):**
-  - Changed: both Web UI tests of `tests/m1_challenger_2_stress.rs` start the dashboard on `127.0.0.1:0` and read
-    `MasterHandle::dashboard_addr()`. The reuse test spawns the second master on the same port again until it holds
-    it (30 s bound, the "must be freed upon master shutdown" message kept) instead of binding a probe listener and
-    dropping it first; its reachability waits are 30 s bounds (were 3 s). The portal part of
-    `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` (`crates/worker/src/client/tests.rs`)
-    binds on `portal_bind_addr_for_target(0, ..)`, asserts that the listener is on 127.0.0.1 and runs `run_portal`
-    on it, as `portal_fixture` already does; its 600 ms connect loop is gone, because the listener is bound before
-    the portal runs. It no longer goes through `spawn_worker_redirection_portal_with_secret`, which is that bind
-    followed by `run_portal`. Every assertion is kept.
-  - Kept, with the reason at the site: `crates/cli/tests/discovery_port_e2e.rs` (the TCP ports, because
-    `ServerConfig::new` turns the beacon off for listen port 0 and `--discovery-port N` does not turn it back on,
-    so a master whose beacon the test checks needs a fixed listen port; the UDP ports, because `--discovery-port 0`
-    turns the beacon off and the master never publishes the port its beacon binds),
-    `crates/master/src/server/tests.rs` and `tests/cluster_auth_e2e.rs` (the discovery UDP port, same reason), and
-    `two_free_ports` and `free_master_port` in `tests/workflow_modes_test.rs` (`launch_local_dev_cluster_with_ports`
-    gives the master port to its workers as `--master 127.0.0.1:<port>` and accepts the dashboard only when its
-    port file holds the port it was given, so neither can be 0). `free_web_port` there is never bound: the master
-    fails on the held grid port before it binds its dashboard, so a reused port cannot change that test's outcome.
-    `test_dev_cluster_refuses_one_port_for_master_and_dashboard` binds its port in no process either.
-  - Product changes that would remove the rest (not made here, each changes behaviour or a flag and needs a design
-    record): let the dev cluster take 0 for both ports (master on `--listen 127.0.0.1:0 --port-file`, workers
-    started once the port is read, the dashboard port taken from `--dashboard-port-file`), which would also remove
-    the bind-and-drop in `launch_local_dev_cluster` (`crates/cli/src/mode_cli.rs`); bind the discovery socket before
-    `MasterServer::spawn_with_config` returns and publish its address on `MasterHandle` and in a port file, with a
-    way to ask for an ephemeral beacon port; let an explicit `--discovery-port N` start the beacon of a master that
-    listens on port 0.
-  - Not in this item (fixed ports, a different pattern): `test_beacon_of_a_master_with_a_loopback_dashboard_advertises_no_dashboard`
-    in `crates/master/src/server/tests.rs` (UDP 18091) and `tests/discovery_integration.rs` (29003, 29004, 29006,
-    each with a 150 ms sleep before the first connect).
-  - On an Apple Silicon Mac (10 cores), next to 4 spinning `yes` processes, 20 runs in a row of each test binary
-    the item touches passed 20 of 20: `m1_challenger_2_stress`, the `rusty_grid_worker` lib, the `rusty_grid_master`
-    lib, `cluster_auth_e2e`, `discovery_port_e2e` and `workflow_modes_test` (120 of 120). The old code was not
-    looped, and the race has not been reproduced locally.
-
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
 - **Evidence:** Reproduced once (smoke test, finding F6). After 9 failed and 2 cancelled tasks,
@@ -2296,3 +2248,4 @@ Add one dated line per finished item, newest last.
   wire change). Counted from the rows: 216 items, 143 Implemented, 19 Partial and 54 Planned; 27 open items In,
   46 Out.
 - 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
+- 2026-11-19: TEST-52 Implemented (pull request 364, open, owner decision 2026-11-19): option (a) moves `ox-mode dev cluster` (`launch_local_dev_cluster` / `launch_local_dev_cluster_with_ports`) and `tests/workflow_modes_test.rs` onto port `0` with `--port-file` and `--dashboard-port-file` (20/20 under 6 CPU busy loops on 10 cores, `692.74 s`); options (b) and (c) are declined so `--discovery-port 0` still means "beacon off" ([design 0084](design/0084-discovery-beacon-port.md)) and the four `// Bind-and-drop kept (TEST-52)` discovery sites stay accepted; text in the archive.
