@@ -225,7 +225,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
-| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
+| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
@@ -541,6 +541,26 @@ The full suite must pass on a clean machine before CI can require it.
      own ports (Q57).
 - **Done when:** The 24-hour record is committed. It passes the checks of D3, or every failed
   check has its own item or regression test.
+- **Partial (2026-11-19, step 1, pull request 381):** Added `soak` subcommand
+  of D3 to `benchmarks/endurance/endurance.py` (`--duration`, `--fault-scale`, `--load-scale`,
+  `--sample-interval`, `--workers`, `--slots`, `--workspaces`, `--max-queue-size`, `--state-dir`
+  master restart, worker kill/restart, `ThrottleProxy` link cuts, queue-cap burst, `TaskLedger`
+  + master `/api/tasks` + log evidence audit, D3 item 6 checks + fault-completeness check), unit
+  tests in `tests/test_endurance_harness.py` (`20/20` passed), and one 45-minute Windows `x86_64`
+  loopback record on `rusty-grid 0.4.4` at `4c11a45`
+  (`benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json`):
+  all `6/6` checks passed in `2,704.22 s` across `2,185` submitted and unique master-logged tasks
+  (`1,350` `noop`, `225` `new_input`, `225` `reused_input`, `90` `output`, `45` `workspace_sync`,
+  `45` `cancel`, `45` `probe`, `160` `queue_burst`; `2,140` `ok`, `45` `cancelled`, `0`
+  lost/duplicate/hash mismatch/submit failure/queue errors; `4` retries/orphan requeues reported by
+  `/api/tasks` and master `INFO` logs; debug-only stale/late counts unmeasured at `INFO`), `16/16`
+  injected faults (`8` worker kills, `5` link cuts, `2` queue bursts, `1` master restart), per-process
+  master RSS `16.0 -> 35.5 MiB` (gen 0) and `29.2 -> 40.3 MiB` (gen 1) and worker RSS
+  `15.2–31.7 MiB`, `journal.bin` shrinking `1,525,821 -> 24 B` and `801,453 -> 24 B`, idle stores
+  and mid-run worker cache (`<= 2,125.0 MiB` peak during pinned work, `<= 2,030.0 MiB` idle) within
+  bounds, fault-excluded clean probe p99 `130.85 -> 146.51 ms` (`14`/`16` samples, ratio `1.1197`),
+  and `0` leftover PIDs or task process trees. The 24-hour 3-machine run (Mac master + two Windows
+  workers, Q57) remains for step 2.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -2427,6 +2447,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: SEC-18 Implemented (pull request 372, open; text in the archive): `validate_workspace_root_entries_safe` and `validate_workspace_dir_entries_safe` refuse unexpected top-level files, reparse entries, non-directory `.locks`/workspace folders, and hard-linked `.locks/*` and `<ws>/{state.json,lock,state.json.tmp}` files; `open_verified_dacl_handle` and `set_protected_dacl_on_handle` verify `GetFileInformationByHandle` and `GetFinalPathNameByHandleW` against the lexical long path (`GetLongPathNameW`) before calling `SetSecurityInfo` on `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` handles; `check_chain_from_home` matches home only on `Normal` components (no bare `C:` CWD expansion); and tests prove each home walk independently, assert refusal texts, exercise `PREPARE_LOCK` / handle / metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
 - 2026-11-19: TEST-24 Partial (step 1, pull request 374, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `benchmarks/endurance/endurance.py` (`transfer`, `throttle`, `sample`), `benchmarks/endurance/README.md`, `tests/test_endurance_harness.py` (CI `agent-bridge`), and Windows `x86_64` loopback record (`T1` `1`/`3 GiB`, `T2` `20,000` files, `T3`, `T4`, `T6`, `T7` `2 Mbit/s` / `50 ms`, `T8`: `7/7` passed in `2,648.17 s`; `T5`, `T9`, `T1 8 GiB`, `T2 100k`, and two-machine links remain for step 2). Counted from the rows: 216 items, 146 Implemented, 18 Partial and 52 Planned; 24 open items In, 46 Out.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
+- 2026-11-19: TEST-25 Partial (step 1, pull request 381, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `soak` subcommand of D3 to `benchmarks/endurance/endurance.py`, unit tests in `tests/test_endurance_harness.py` (`20/20`), and 45-minute Windows `x86_64` loopback record `benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json` at `4c11a45` (`6/6` checks passed over `2,704.22 s` across `2,185` submitted and unique master-logged tasks, `0` multi-result tasks, `0` submit failures, `4` retries/orphan requeues from `/api/tasks` + master `INFO` logs [debug-only stale/late counts unmeasured at `INFO`], `16/16` injected faults, master per-process RSS `16.0 -> 35.5 MiB` / `29.2 -> 40.3 MiB`, `journal.bin` compaction `1,525,821 -> 24 B` / `801,453 -> 24 B`, idle stores within `4 GiB` / `2 GiB` bounds and mid-run worker cache `<= 2,125.0 MiB`, fault-excluded clean probe p99 `130.85 -> 146.51 ms` [ratio `1.1197`], `0` leftover PIDs or task process trees; 24-hour 3-machine run remains for step 2, awaiting an owner date). Counted from the rows: 225 items, 151 Implemented, 19 Partial and 55 Planned; 24 open items In, 50 Out.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
 - 2026-11-19: LV-4 Partial (step 3, branch `win/lv-4-forbid-unsafe`, [design 0058](design/0058-lasting-value.md)): added `#![forbid(unsafe_code)]` to all 4 zero-`unsafe` binary crate roots (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`) and `#![deny(unsafe_code)]` to all 6 library crate roots with surgical `#[allow(unsafe_code)]` + `// LV-4:` reasons on `android_bridge`'s 10 `#[no_mangle]` JNI functions, `agent_mesh::executor`, `master::store` (`store::fuzzing` `forbid`), `core::{capabilities, noise_auth, private_file}` + test-only `blob::tests`/`task::tests`, `cli::{join, mode_cli::dev_launch}`, and `worker::{blob_cache, isolation, process_tree, sandbox, workspace}` + test-only `client::tests`/`runner::{outcome_tests, process_tree_tests}`/`staging::tests`; full module inventory recorded in design 0058, zero runtime change (items unchanged: still Waiting for CI Miri run on `master`).
