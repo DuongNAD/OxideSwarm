@@ -2708,7 +2708,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All assertions stay intact, failure messages include full CLI and master diagnostics, and
   `cargo test -p rusty_grid_cli --test blob_transfer_e2e --locked -- --exact cli::test_cli_submit_input_and_output_round_trip_with_dedup`
   passes `20/20` under `6` busy loops after the fix (plus a full-binary run).
-- **Implemented (2026-11-19, pull request TBD, open):** Updated `tests/blob_transfer_e2e.rs` as planned. On a
+- **Implemented (2026-11-19, pull request 390, open):** Updated `tests/blob_transfer_e2e.rs` as planned. On a
   10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
   `HOME`:
   - Before fix (on `origin/master` `8641b67d`, with diagnostic capture added): test alone passed `20/20`
