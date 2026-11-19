@@ -231,7 +231,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented |  | 263 |
-| TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | In | 265 |
+| TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Implemented |  | 265, 363 (open) |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented |  | 267 |
 | TEST-33 | Make the worker-churn stress test deterministic on Windows | P2 | S |  |  | Implemented |  | 286, 289 |
 | TEST-34 | Show and fix the Agent Mesh simulation Suite 2 failure on macOS | P2 | S |  |  | Implemented |  | 277 |
@@ -241,7 +241,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented |  | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented |  | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359 |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359, 363 (open) |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented |  | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented |  | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented |  | 304 |
@@ -1194,20 +1194,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
 - **Done when:** Each pull request shows a table row of a real release one protocol back.
 
-### TEST-31: Remove the race in the detached-grandchild Blender probe test
-
-- **Evidence:** Failed once on the ubuntu unit tests (pull request 238, before 2026-11-16).
-- **Problem:** The test in `crates/core/src/capabilities.rs` (script near line 3737) kills the
-  process group before the grandchild has called `setsid`, so the grandchild may still be in the
-  group.
-- **Do:** Have the script write a second file after `setsid`, and wait for it before the kill.
-- **Done when:** The test passes 200 times in a loop on Linux.
-- **Partial (2026-11-16, pull request 265):** the grandchild writes a ready marker after `setsid`
-  and the child waits for it (at most 5 s) before it exits; the Unix timeouts were widened
-  (2.5 s, 4 s, 10 s) because under load the script had not written its PID file within 800 ms.
-  50 local runs on macOS passed (30 with 12 CPU-burning processes). The 200-run loop on Linux of
-  "Done when" is not done.
-
 ### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
 
 - **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
@@ -1319,6 +1305,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
   under TEST-23.
 - **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
+- **Partial (2026-11-19, pull request 363, open):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
 
 ### TEST-52: Let the remaining tests pick ports through the process that binds them, not bind-and-drop
 
@@ -2308,3 +2295,4 @@ Add one dated line per finished item, newest last.
   merge removed). SEC-18 added from the review of pull request 360. BUG-22: owner decision recorded (next planned
   wire change). Counted from the rows: 216 items, 143 Implemented, 19 Partial and 54 Planned; 27 open items In,
   46 Out.
+- 2026-11-19: TEST-31 Implemented (text in the archive) and TEST-41 Partial (pull request 363, open): on Linux (`aarch64`, `Linux 7.0.14-linuxkit`, Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1`, 10 cores) at `ccafa90`, TEST-31 passed `200/200` (`100` alone + `100` under `6` busy loops, `0` failures, `1,343.1 s`), and TEST-41 passed `200/200` runs / `2,400` rounds (`ran_twice=0` everywhere; `40` alone default + `40` alone `RV158_ZERO=1` + `60` under `6` busy loops default + `60` under `6` busy loops `RV158_ZERO=1`, `1,697.06 s`), meeting the 200-run part of "Done when" on Linux and Windows while closing without a named cause stays with the owner.
