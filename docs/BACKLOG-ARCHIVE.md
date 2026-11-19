@@ -2819,7 +2819,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All 3 tests keep every latency/FIFO/impairment, fake-runner cancellation/timeout,
   100-worker registration, 200-task burst, mass-disconnect convergence, and 50-task post-reconnect
   assertion, and pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-19, pull request TBD):** Updated `crates/worker/tests/scale1_simulated_worker.rs`
+- **Implemented (2026-11-19, pull request 401, open):** Updated `crates/worker/tests/scale1_simulated_worker.rs`
   and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures
   before the fix is expected since the `5 s` flake occurred on a 12-thread Windows laptop):
   - Before fix (`origin/master` `d321d97f`): `20/20` passed (`37.29 s` total, `1.72–3.59 s` per run).
