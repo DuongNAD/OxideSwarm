@@ -91,6 +91,14 @@ impl CountingProxy {
 /// and the master ends up holding every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ten_thousand_small_files_upload_with_requests_pipelined() {
+    // On Windows NTFS, 10,000 tiny files add heavy metadata and Defender overhead in CI.
+    // 1,600 files across 100 subdirectories is still 100x MAX_IN_FLIGHT_REQUESTS (16), keeping
+    // pipelined frames in flight while cutting Windows wall time; Linux and macOS stay at 10,000.
+    #[cfg(not(windows))]
+    const FILE_COUNT: u32 = 10_000;
+    #[cfg(windows)]
+    const FILE_COUNT: u32 = 1_600;
+
     let store_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_blob_store(store_dir.path(), 256 * 1024 * 1024);
@@ -99,13 +107,13 @@ async fn test_ten_thousand_small_files_upload_with_requests_pipelined() {
     let local = tempfile::tempdir().unwrap();
     let project = local.path().join("many");
     std::fs::create_dir_all(&project).unwrap();
-    for i in 0..10_000u32 {
+    for i in 0..FILE_COUNT {
         let dir = project.join(format!("d{:02}", i % 100));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("f{i}.txt")), format!("file number {i}\n")).unwrap();
     }
     let prepared = scan_inputs(&[format!("{}:many", project.display())]).unwrap();
-    assert_eq!(prepared.files, 10_000);
+    assert_eq!(prepared.files, FILE_COUNT as usize);
 
     let proxy = CountingProxy::start(&master_addr).await;
     let connection = BlobConnection::connect(&proxy.addr, None).await.unwrap();

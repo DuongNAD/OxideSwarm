@@ -673,11 +673,19 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
     };
     cluster.wait_for_worker().await;
 
-    // Prepare 4000 distinct 1 KiB files (4 MiB total > 1 MiB worker blob cache).
+    // Prepare 1 KiB output files exceeding the 1 MiB (1,024 KiB) worker blob cache.
+    // On Windows, 1,600 files (1,600 KiB / 1.56 MiB total) exceed the cache by 576 KiB so
+    // unpinned blobs would still be evicted under concurrent churn, while cutting NTFS/xcopy
+    // setup and collection overhead in CI; Linux and macOS keep the full 4,000-file (4 MiB) run.
+    #[cfg(not(windows))]
+    const PINNED_OUTPUT_FILES: u32 = 4_000;
+    #[cfg(windows)]
+    const PINNED_OUTPUT_FILES: u32 = 1_600;
+
     let template_dir = tempfile::tempdir().unwrap();
     let src_out = template_dir.path().join("out");
     std::fs::create_dir_all(&src_out).unwrap();
-    for i in 0..4000u32 {
+    for i in 0..PINNED_OUTPUT_FILES {
         let mut buf = vec![0u8; 1024];
         for chunk in buf.chunks_exact_mut(4) {
             chunk.copy_from_slice(&i.to_le_bytes());
@@ -770,10 +778,10 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
 
     assert!(
         result.is_success(),
-        "4000-file task failed: {:?}",
+        "{PINNED_OUTPUT_FILES}-file task failed: {:?}",
         result.error
     );
-    assert_eq!(result.outputs.len(), 4000);
+    assert_eq!(result.outputs.len(), PINNED_OUTPUT_FILES as usize);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
