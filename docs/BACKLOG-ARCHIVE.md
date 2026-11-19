@@ -1890,6 +1890,36 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   syncs for 1,000 submissions) fails if every submission commits alone. 20 of 20 local runs
   passed, one of them with 12 CPU-burning processes.
 
+### TEST-29: Find why `workspace tests (windows-latest)` loses its runner at 60 minutes
+
+- **Evidence:** Reproduced twice on 2026-11-16: pull request 251 at `72b05c5` (job
+  `133129128530`) and pull request 256 at `ede7d01` (job `133256035744`). GitHub annotated both
+  "The hosted runner lost communication with the server". Reruns of the same heads passed in
+  about 30 minutes.
+- **Problem:** Some test hangs or starves the runner until the job limit. Nothing in the log says
+  which.
+- **Do:** Find the test: per-test timeouts, a step timeout below the job limit that prints the
+  running tests, or running the suite under the Windows agent. Then fix it.
+- **Done when:** The job finishes in its usual time on ten runs in a row, or the test that hung is
+  fixed and named here.
+- **Partial (2026-11-17, pull request 283):** investigated on a Windows 11 machine with toolchain
+  1.96.0 (`OxideSwarm_Agent_Hub` `test_runs/win_test29_2026-11-17.md`). In both lost jobs steps 1 to 7
+  had succeeded and step 8 (`cargo test --workspace`) was still running. Three CI-like runs found no
+  hang and no memory or handle exhaustion, only three timing flakes under CPU starvation (TEST-36 to
+  TEST-38). The cause of the runner loss is not known. The workspace step now stops at
+  `timeout-minutes: 45`, prints a heartbeat line with the last output line once a minute
+  (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the
+  last 120 lines of the test output, so the next occurrence names the running test.
+- **Implemented (2026-11-19, pull request 358):** The job finished in its usual time on far more than ten runs
+  in a row. Read through the GitHub API for the CI runs created on 2026-11-18 (UTC): in their latest attempt, 82
+  `workspace tests (windows-latest)` jobs passed (median 30.3 min, longest 43.6 min), one failed to compile (a
+  Dependabot bump of `sysinfo`), 31 were cancelled by a newer push and five were still queued. No attempt lost its
+  runner; the one failed earlier attempt (run `44308601329`, attempt 1) failed the stress test
+  `test_capability_queries_under_connect_disconnect_stress` after 33 min. A count of 35 of these jobs on the
+  Windows machine gave the same picture (34 passed, median 30.2 min, longest 43.1 min). The cause of the two
+  losses of 2026-11-16 stays unknown, and the diagnostics of pull request 283 stay. Making the job faster is
+  TEST-56.
+
 ### TEST-30: Stop `test_agent_bridge.py` from depending on the host's open ports
 
 - **Evidence:** Reproduced on a machine where a real master listens on port 8088.
@@ -2407,7 +2437,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `BUILTIN\Users`, `ANONYMOUS LOGON`, and `ALL APPLICATION PACKAGES` and every assertion of
   [design 0021](design/0021-private-default-sandbox-base.md).
 - **Done when:** `cargo test -p rusty_grid_worker --lib --locked` passes in full on Windows 11 Home.
-- **Implemented (2026-11-19, pull request 356, open):** Replaced `SID_REMOTE_DESKTOP_USERS` with
+- **Implemented (2026-11-19, pull request 356):** Replaced `SID_REMOTE_DESKTOP_USERS` with
   `SID_GUESTS` (`BUILTIN\Guests`) in
   `s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
   (`crates/worker/src/sandbox.rs`), keeping the in-memory `SID_REMOTE_DESKTOP_USERS` coverage in
@@ -2654,6 +2684,40 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `test_windows_installer_watches_the_worker_and_keeps_its_log`,
   `test_windows_task_folders_stay_in_the_install_folder_unless_isolation_needs_temp`, and the Windows test above.
 
+### BUG-32: Allow the USB kit's workspace root under -Isolation fs
+
+- **Evidence:** Reproduced live on 2026-11-18 on a Windows 11 laptop (`win2/bug-32-workspace-root-fs`
+  over `origin/master` `d90e1e5`): a worker started with `--isolation fs --workspaces` and
+  `--workspace-root <profile>\AppData\Local\OxideSwarm-USB\workspaces` exited at startup with
+  `refusing to rewrite the DACL of user folder '...' as workspace_root`, and passing a
+  `%TEMP%\...\workspaces` root holding `.oxideswarm-usb-workspaces` also exited at startup with
+  `containing non-workspace entry '.oxideswarm-usb-workspaces'` (`validate_workspace_root_safe`,
+  `crates/worker/src/isolation/windows/toolchain.rs`).
+- **Problem:** Under `-Isolation fs` with `--workspaces`, `packaging/usb/install.ps1` passes
+  `--workspace-root <install>\workspaces` (or `<install>\usb-kit\workspaces` when updating a
+  legacy `%LOCALAPPDATA%\OxideSwarm` install) and creates `.oxideswarm-usb-workspaces` inside it.
+  The worker's `validate_workspace_root_safe` rejected both the USB kit paths under `%LOCALAPPDATA%`
+  and the marker file.
+- **Do:** Statically allow `<home>\AppData\Local\OxideSwarm-USB\workspaces` and
+  `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` in `is_allowed_under_home`, accept
+  `.oxideswarm-usb-workspaces` only when `std::fs::symlink_metadata` confirms a regular non-reparse
+  file, refuse custom `-InstallRoot` paths inside `%USERPROFILE%` under `-Isolation fs` with
+  workspaces before installing in `packaging/usb/install.ps1`, and cover both in tests.
+- **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction/upper-case-name
+  markers and sibling/`workspaces-evil`/`..`-escape user-profile paths are refused, `install.ps1` refuses
+  custom profile roots before creating directories and installs cleanly in `<LOCALAPPDATA>\OxideSwarm-USB`
+  under `-Isolation fs` with workspaces, `uninstall.ps1` requires `.oxideswarm-usb-workspaces` to be a
+  regular file (`-PathType Leaf`), and the worker/isolation/launcher checks pass on Windows (with known
+  unrelated host caveats recorded separately).
+- **Implemented (2026-11-19, pull request 352):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
+  and `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` to `is_allowed_under_home` and accepted
+  regular non-reparse lowercase `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
+  `validate_workspace_root_safe` (`crates/worker/src/isolation/windows/toolchain.rs`); added unit
+  tests in `crates/worker/src/isolation.rs` (including `workspaces-evil`, `workspaces\..\other`, and
+  `.OXIDESWARM-USB-WORKSPACES`); added the pre-install profile check in `packaging/usb/install.ps1`
+  and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
+  `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
@@ -2690,6 +2754,42 @@ Order:
 
 Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it says otherwise.
 
+### MAINT-2: Bring the last three files under the size cap
+
+- **Evidence:** `scripts/rust-file-size-allowlist.txt` lists three files whose production part
+  (every line before the first `#[cfg(test)]`) exceeds 3,000 lines: `crates/worker/src/isolation.rs`
+  (5,346), `crates/cli/src/mcp.rs` (3,692) and `crates/cli/src/mode_cli.rs` (3,240). MAINT-1 split
+  six other files and left these at their size. `isolation.rs` holds the macOS code in an inline
+  `mod macos` and the Windows code in an inline `pub mod windows`. Only the Linux code is in a file
+  of its own (`crates/worker/src/isolation/linux.rs`). It also holds 125 of the 290 lines of `crates/*/src`
+  that contain `unsafe`.
+- **Problem:** The code that confines a task is the hardest file to review, and it is the largest
+  production file. Two platforms cannot be changed without a merge conflict in one file.
+- **Do:** One pull request per file. Move code, and change no behaviour, no public name and no
+  message text.
+  1. `isolation.rs`: move `mod macos` to `isolation/macos.rs` and `pub mod windows` to
+     `isolation/windows.rs`, beside `isolation/linux.rs`. Keep the shared types, the level
+     parsing and the start-up check in `isolation.rs`. Do LV-4 for these files in the same pull
+     request or the next one, so each `unsafe` site is read once.
+  2. `mcp.rs`: move each tool (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`,
+     `workspaces`) to a file under `crates/cli/src/mcp/`, and keep the JSON-RPC loop in `mcp.rs`.
+  3. `mode_cli.rs`: move each workflow mode (`test`, `dev`, `doc`, `research`) to a file under
+     `crates/cli/src/mode_cli/`.
+  4. After each split, delete the file's line from the allowlist.
+- **Done when:** The allowlist has no entry, `ox-mode test size` passes,
+  `cargo test -p rusty_grid_worker --test test_feat3_os_isolation` passes on Linux, macOS and
+  Windows, `cargo test -p rusty_grid_cli --test mcp_server_e2e` passes, and
+  `crates/core/tests/data/wire_layout.txt` is unchanged.
+- **Progress:** step 1 (`isolation.rs`): pull request 331.
+- **Progress:** step 3 (`mode_cli.rs`): pull request 325.
+- **Progress:** step 2 (`mcp.rs`): pull request 323.
+- **Implemented (2026-11-18, pull requests 323, 325 and 331):** `scripts/rust-file-size-allowlist.txt` has no
+  entry: each pull request deleted its file's line. At `master` `74a46c72` the production parts are 1,077 lines
+  (`isolation.rs`, beside `isolation/macos.rs` and `isolation/windows/`), 1,708 (`mcp.rs`, beside
+  `crates/cli/src/mcp/`) and 394 (`mode_cli.rs`, beside `crates/cli/src/mode_cli/`). Each pull request passed
+  every CI check, `ox-mode test size` and the workspace tests on Linux, macOS and Windows among them, and none
+  changed `crates/core/tests/data/wire_layout.txt`.
+
 ### DOC-11: Make the backlog show open work first
 
 - **Evidence:** This file has more than 3,600 lines. Its Index has 178 rows after this phase, and
@@ -2713,6 +2813,37 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   open item has "In" or "Out", `python3 tests/test_m1_challenger_hygiene.py` reports no broken
   link, and a line count in the pull request shows that the two files together hold the item
   texts unchanged.
+
+### ADOPT-2: Run summary in `submit --wait`, its JSON output and the MCP results
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D5. `submit --wait` prints
+  `Execution Time` per task (`crates/cli/src/cli_app/submit.rs`). No line or JSON field gives the
+  time the caller waited, the sum of the task times or the number of machines: a search for
+  `waited_ms` and `task_time_sum_ms` in `crates/cli/src` finds nothing.
+- **Problem:** A user cannot see what the grid cost or gained on a run without a stopwatch.
+- **Do:** As D5 of design 0059, for one task first:
+  1. After a waited run, print the two lines of D5 (`Tasks:` and `Waited:`) next to
+     `Execution Time`. `Waited` is measured on the client, and the sum adds
+     `TaskResult::execution_time_ms`.
+  2. Add `waited_ms`, `task_time_sum_ms` and `machines` to the JSON output of `submit` and to the
+     result of the MCP tools `submit` and `task_result` (`crates/cli/src/mcp.rs`).
+  3. Print no ratio and no percentage, and never call the sum the time on the user's machine.
+  4. Update `README.md` and `CHANGELOG.md`. The values come from fields that exist, so the wire
+     format does not change.
+- **Done when:** The ADOPT-2 tests of the test plan of design 0059 pass: the unit cases (no task,
+  one task, one failed task, two tasks on one worker), a waited run on loopback that prints both
+  lines and carries the three fields under `--json`, and `mcp_server_e2e` finds the fields while
+  standard output stays JSON-RPC only.
+- **Status (2026-11-18, Implemented):** Pull request 350: adds `crates/cli/src/run_summary.rs`
+  (with the four unit cases of design 0059 plus a two-worker case), prints the two D5 summary lines
+  after `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines`
+  to `submit --json` and the MCP `submit` and `task_result` tools (covering the submitted task only,
+  before `--verify` replicas; for a task submitted in the same MCP
+  session, `task_result` measures `waited_ms` from `submit` to the `task_result` reply so it
+  includes caller time between calls and increases on repeat queries, and returns `null` when that
+  session did not record the submission), covers loopback CLI and MCP runs in
+  `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
+  `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
 
 ## Phase 15: coordination between agents
 
@@ -2817,3 +2948,61 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   (W1, a SHA-256 chain whose checksum depends only on seed and units) and `benchmarks/sweep/README.md`;
   `tests/test_bench_sweep.py` (16 helper tests) runs in the CI job `agent-bridge`. The quick run passed on
   Windows loopback (8 of 8 checksums).
+
+### BENCH-8: Find why the two-machine W1 sweep reached 73 % efficiency, not 85 %
+
+- **Evidence:** BENCH-3's record `benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json`: efficiency
+  0.73 (median run 53.7 s against 39.4 s for the sum of both machines alone); runs 2.48, 2.23 and 2.23
+  tasks/s. The Windows worker took 60, 70 and 70 of the 120 tasks; the sum of the local rates gives it 64.
+  `submit_to_result_p50_s` is 10.9 to 12.2 s, while a task under full load takes about 7.1 s on the Mac
+  (10 / 1.412) and 12.3 s on Windows (20 / 1.631).
+- **Problem:** The plan expected at least 0.85, and the record does not say where the rest went. Three causes
+  fit and none is tested:
+  1. Few waves: the plan sized tasks at about 3 s from one process on the Mac, but under full load a task
+     takes 7 to 12 s, so 120 tasks are about four waves on 30 slots. When the queue runs dry, the Mac waits
+     while the last Windows tasks run, up to one Windows task length (12 s against a 39 s ideal).
+  2. No queue for the scheduler: the harness keeps as many submits in flight as there are slots (30), so the
+     master never holds a waiting task and the speed-aware placement of design 0060 never has a choice.
+  3. Per-task overhead: one CLI process per task (BENCH-1 (a): 26 to 69 ms on loopback), the LAN round trip,
+     the sandbox and the Python start; BENCH-5 measures it.
+- **Do:** With the same two workers and units, under a plan committed first: (a) 480 tasks instead of 120;
+  (b) 120 tasks with `--client-concurrency 120`; (c) each worker alone through the grid (BENCH-3's controls).
+  Compare each with the record above; if (b) helps, look at the placement of the last tasks in the master
+  log.
+- **Done when:** The records are committed and this section names the cause or causes with their share of
+  the gap, or the change that closes it.
+- **Implemented (2026-11-18, pull request 355):** Plan
+  `benchmarks/sweep/plans/2026-11-18-bench-8-w1-efficiency-gap.json`, committed before the first run, with
+  two amendments committed before the steps they add. Same units, release 0.4.3, master for the run on the
+  Mac; nine records in `benchmarks/sweep/results/` (`2026-11-18-w1-*`), every checksum equal.
+
+  | Step | Record | Tasks/s | Efficiency |
+  |---|---|---|---|
+  | BENCH-3: both, 120 tasks, 30 in flight | `w1-two-machines-lan` | 2.233 | 0.734 |
+  | (b) both, 120 tasks, 120 in flight | `w1-two-machines-lan-cc120` | 2.349 | 0.772 |
+  | (a) both, 480 tasks, 30 in flight | `w1-two-machines-lan-480` | 2.301 | 0.756 |
+  | (c) Mac worker alone, master on the same Mac | `w1-mac-worker-only-lan` | 1.108 | 0.785 |
+  | 4b: the same, `--task-priority normal` | `w1-mac-worker-only-normal-priority-lan` | 1.180 | 0.836 |
+  | (c) Windows worker alone, master on the Mac over the LAN | `w1-win-worker-only-lan` | 1.269 | 0.778 |
+  | 1c: Windows alone, master on the same machine | `w1-win-loopback-default-priority` | 1.535 | 0.941 |
+  | 1d: the same, `--task-priority normal` | `w1-win-loopback-normal-priority` | 1.539 | 0.944 |
+
+  Efficiency of a one-worker step is against that machine alone. Findings:
+  1. Combining the machines costs little: both through the grid against the sum of each worker alone
+     through the grid (1.108 + 1.269 = 2.377 tasks/s) is 0.94 for BENCH-3, 0.99 for (b) and 0.97 for (a).
+  2. Causes 1 and 2 are below the plan's 0.05 threshold: (a) adds 0.022 and (b) adds 0.038 to BENCH-3's
+     0.734. The Windows worker took 60 to 70 of 120 tasks in (b) and 300 to 320 of 480 in (a).
+  3. Cause 3 is the gap: each worker alone through the grid reaches about 0.78 of its machine alone.
+     - Windows: with the master on the same machine it reaches 0.94 with either priority, so the default
+       below-normal priority costs nothing there, and the master on another machine over the home LAN costs
+       0.16 (median submit-to-result 15.3 to 17.7 s against 12.0 to 13.8 s, about 3 s more per task).
+     - Mac: the master is on the same Mac, so the LAN is not involved. `--task-priority normal` adds 0.051,
+       at the threshold; the other 0.16 is open. In both Mac steps the warm-up run was faster than the
+       measured runs (1.19 then 1.11, and 1.42 then 1.18 tasks/s), which the heat of a fanless machine under
+       seven minutes of full load could explain; not tested. BENCH-9 splits the cost with per-task times;
+       Q93 asks whether the default priority should change.
+  Deviations: step 1b (the Windows worker with `--task-priority normal` over the LAN) was run once and is
+  void, because the worker restarted during its runs; a second attempt was refused because a cargo test of
+  another project had started on the Mac. Amendment 2 replaced it with 1c and 1d on the Windows machine
+  alone. Steps 2 and 3 ended their grid runs before that cargo test started. A second attempt of 4b was
+  needed for the same reason; the void records are not committed.

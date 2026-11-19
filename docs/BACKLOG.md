@@ -165,9 +165,11 @@ After VERIFY-1 (pull request 296): 191 items, 110 Implemented, 13 Partial and 68
 Recounted on 2026-11-18 after pull requests 299 to 318 (BUG-25, BUG-26, TEST-23 Partial, TEST-27, TEST-42 to
 TEST-51, CI-1 Partial, VERIFY-2, BENCH-2; Phase 17 from design 0093 added; TEST-32 corrected to Implemented by
 pull request 267; APP-4 Partial): 201 items, 126 Implemented, 15 Partial and 60 Planned.
-Then TEST-52 (pull request 320, Partial) and DOC-11 (pull request 322): 202 items, 127 Implemented, 16 Partial and
-59 Planned; 30 open items are In and 45 are Out.
-Recounted on 2026-11-18 with ADOPT-2 Implemented (pull request 350, open; its `Line` value `In` stays until merged) after BUG-29 to BUG-31 (pull request 341), LV-1, LV-18, TEST-53, ENROLL-1c, BUG-27, BUG-28, TEST-35, LV-4, and LV-5: 210 items, 138 Implemented, 16 Partial and 56 Planned; 27 remaining open items are In and 45 are Out.
+Recounted on 2026-11-19 from the rows, after pull requests 340 to 359 (354 still open): LV-4, LV-5, LV-15,
+BENCH-3, TEST-23 and TEST-41 Partial; BUG-29 to BUG-32, BENCH-8, ADOPT-2 and TEST-55 Implemented; BENCH-8, BENCH-9,
+BUG-32 and TEST-55 added. With MAINT-2 (pull requests 323, 325 and 331) and TEST-29 Implemented, SEC-16 Partial
+and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 Planned; 26 open items are In and
+46 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -218,13 +220,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented |  | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
-| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 (open) |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Planned | In | (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Planned | In | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
-| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Partial | In | 283 |
+| TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
 | TEST-30 | Stop `test_agent_bridge.py` from depending on the host's open ports | P2 | S |  |  | Implemented |  | 263 |
 | TEST-31 | Remove the race in the detached-grandchild Blender probe test | P2 | S |  |  | Partial | In | 265 |
 | TEST-32 | Make the cancel-during-upload worker test independent of `NoDefaultCurrentDirectoryInExePath` | P2 | S |  |  | Implemented |  | 267 |
@@ -236,7 +238,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented |  | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented |  | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359 (open) |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented |  | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented |  | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented |  | 304 |
@@ -250,7 +252,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-52 | Let the remaining tests pick ports through the process that binds them, not bind-and-drop | P2 | S |  |  | Partial | In | 320 |
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
-| TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 (open) |
+| TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -338,7 +340,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-7 | Open protocol specification, conformance tests and a steward | P3 | L | NET-6 | Yes | Planned | Out | (design 0054) |
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
-| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342 (open), (design 0058) |
+| LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342, (design 0058) |
 | LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
@@ -346,7 +348,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
-| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Planned | In |  |
+| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
+| SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Planned | In |  |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
 | BUG-23 | Stop the Windows master gracefully in `oxctl.ps1` | P2 | S |  |  | Implemented |  | 282 |
 | BUG-24 | Let a master restart with `--state-dir` on a file system without permissions | P2 | S |  |  | Implemented |  | 284 |
@@ -354,23 +357,23 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-26 | Keep the `ox-mode dev cluster` master off the default discovery port | P3 | S |  |  | Implemented |  | 311 |
 | BUG-27 | Compute the result acknowledgement token only when result resume is on | P3 | S |  |  | Implemented |  | 332 |
 | BUG-28 | Refuse a P2P ticket passed to `worker --master` with a `--p2p-ticket` hint | P2 | S |  |  | Implemented |  | 334 |
-| BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 (open) |
-| BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 (open) |
-| BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 (open) |
-| BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 (open) |
+| BUG-29 | Offer in the USB installer's folder menu only drives whose root the install accepts | P2 | S |  |  | Implemented |  | 341 |
+| BUG-30 | Let the USB uninstaller remove an install from a kit older than the workspaces marker | P2 | S |  |  | Implemented |  | 341 |
+| BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 |
+| BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
 | CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
-| MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Planned | In | (design 0088) |
+| MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Implemented |  | 323, 325, 331, (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | (design 0059) |
-| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented | In | 350 (open), (design 0059) |
+| ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | In | (design 0056) |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
-| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340 (open), (design 0058) |
-| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351 (open), (design 0058) |
+| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
+| LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
 | LAUNCH-2 | Install and run from the README alone on clean machines | P1 | S | LAUNCH-1 |  | Planned | Out |  |
@@ -385,12 +388,12 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | VERIFY-2 | Replicas of `submit --verify` on the same operating system and architecture by default (`--verify-any-system` for any) | P1 | S | VERIFY-1 |  | Implemented |  | 312, (design 0089) |
 | APP-5 | Guide: Anima Engine sweeps on OxideSwarm, with a recorded run | P2 | S | APP-4, VERIFY-1 |  | Planned | Out | (design 0089) |
 | BENCH-2 | The method and the sweep harness for benchmark records | P1 | M |  |  | Implemented |  | 314, (design 0093) |
-| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Partial | Out | 349 (open), (design 0093) |
+| BENCH-3 | Sweep scaling: the fastest machine alone, each machine through the grid, both | P1 | M | BENCH-2 | Q90 | Partial | Out | 349, (design 0093) |
 | BENCH-4 | Offload against local work, with the laptop's own CPU time | P2 | S | BENCH-2 | Q92 | Planned | Out | (design 0093) |
 | BENCH-5 | Per-task overhead and the break-even task length on a LAN | P2 | S | BENCH-2 |  | Planned | Out | (design 0093) |
 | BENCH-6 | Two networks: link kind, latency, transfer rate and a sweep | P1 | S | BENCH-3, BENCH-5 | Yes | Planned | Out | (design 0093) |
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
-| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355 (open), (design 0093) |
+| BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Planned | Out | (design 0093) |
 
 ## Phase 0: integrate open work
@@ -1186,27 +1189,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
 - **Done when:** Each pull request shows a table row of a real release one protocol back.
 
-### TEST-29: Find why `workspace tests (windows-latest)` loses its runner at 60 minutes
-
-- **Evidence:** Reproduced twice on 2026-11-16: pull request 251 at `72b05c5` (job
-  `133129128530`) and pull request 256 at `ede7d01` (job `133256035744`). GitHub annotated both
-  "The hosted runner lost communication with the server". Reruns of the same heads passed in
-  about 30 minutes.
-- **Problem:** Some test hangs or starves the runner until the job limit. Nothing in the log says
-  which.
-- **Do:** Find the test: per-test timeouts, a step timeout below the job limit that prints the
-  running tests, or running the suite under the Windows agent. Then fix it.
-- **Done when:** The job finishes in its usual time on ten runs in a row, or the test that hung is
-  fixed and named here.
-- **Partial (2026-11-17, pull request 283):** investigated on a Windows 11 machine with toolchain
-  1.96.0 (`OxideSwarm_Agent_Hub` `test_runs/win_test29_2026-11-17.md`). In both lost jobs steps 1 to 7
-  had succeeded and step 8 (`cargo test --workspace`) was still running. Three CI-like runs found no
-  hang and no memory or handle exhaustion, only three timing flakes under CPU starvation (TEST-36 to
-  TEST-38). The cause of the runner loss is not known. The workspace step now stops at
-  `timeout-minutes: 45`, prints a heartbeat line with the last output line once a minute
-  (`scripts/ci_heartbeat.py`), and an `if: always()` step prints the process tree, memory and the
-  last 120 lines of the test output, so the next occurrence names the running test.
-
 ### TEST-31: Remove the race in the detached-grandchild Blender probe test
 
 - **Evidence:** Failed once on the ubuntu unit tests (pull request 238, before 2026-11-16).
@@ -1239,6 +1221,38 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   2. Decide whether the worker's error message should suggest a fix.
 - **Done when:** The cause is written here, and the owner has decided what to do with the entry.
   This needs the owner's machine.
+- **Note (2026-11-18):** On the second Windows machine (a laptop), the foreign write grants on `%TEMP%`
+  come from the Codex CLI sandbox (its capability SIDs, recorded in `%USERPROFILE%\.codex\cap_sid`) and
+  from one deleted local account. No OxideSwarm SID appears on any inspected folder. OxideSwarm's only
+  capability SID (`DeriveCapabilitySidsFromName("oxideswarm.toolchain")`) has the sub-authority 1024,
+  which the SID of this item lacks, so that SID is not OxideSwarm's either.
+- **Partial (2026-11-19, pull request 358):** The cause is on record on both Windows machines. A read-only check on the
+  case machine matched the SID of this item to the AppContainer of the Claude Desktop app's MSIX package
+  (through the AppContainer mappings and `DeriveAppContainerSidFromAppContainerName`): it belongs to that
+  package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
+  `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
+  owner's decision of "Done when" (the entry itself is gone) and step 2.
+
+### SEC-17: Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files
+
+- **Evidence:** Read in the review of pull request 352 (BUG-32). `path_starts_with_ci` canonicalises both
+  paths (`normalize_win_path`), so a junction in an ancestor folder (for example
+  `AppData\Local\OxideSwarm-USB` pointing elsewhere) is followed, and `is_reparse_point` checks only the
+  last folder (`crates/worker/src/isolation/windows/mod.rs`, `toolchain.rs`). `SetNamedSecurityInfoW`
+  then rewrites the DACL of the target. The same holds for the allowed entries that existed before
+  BUG-32, so it is not a regression. The marker `.oxideswarm-usb-workspaces` and `store.lock` are not
+  checked for hard links.
+- **Problem:** Only processes of the same user can create such a junction or link, and the
+  `oxideswarm.toolchain` capability gets only non-inherited traverse, so the impact is low. But the rule
+  "the worker rewrites a DACL only on its own folders" depends on it.
+- **Do:**
+  1. Before the rewrite, refuse a reparse point in every folder from the user home to the workspace
+     root.
+  2. Require `nlink == 1` for the marker and `store.lock` (`windows_file_identity`,
+     `crates/worker/src/blob_cache.rs`).
+  3. Add tests with a junction in an ancestor folder and with a hard-linked marker. Where the host
+     cannot create them, skip with a printed reason.
+- **Done when:** Those tests pass on `windows-latest` in CI.
 
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
@@ -1335,40 +1349,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   its own encoding of that response, and design 0076 allows one wire change per release, so BUG-22 waits
   for the next wire change after 0.4.0.
 
-### BUG-32: Allow the USB kit's workspace root under -Isolation fs
-
-- **Evidence:** Reproduced live on 2026-11-18 on a Windows 11 laptop (`win2/bug-32-workspace-root-fs`
-  over `origin/master` `d90e1e5`): a worker started with `--isolation fs --workspaces` and
-  `--workspace-root <profile>\AppData\Local\OxideSwarm-USB\workspaces` exited at startup with
-  `refusing to rewrite the DACL of user folder '...' as workspace_root`, and passing a
-  `%TEMP%\...\workspaces` root holding `.oxideswarm-usb-workspaces` also exited at startup with
-  `containing non-workspace entry '.oxideswarm-usb-workspaces'` (`validate_workspace_root_safe`,
-  `crates/worker/src/isolation/windows/toolchain.rs`).
-- **Problem:** Under `-Isolation fs` with `--workspaces`, `packaging/usb/install.ps1` passes
-  `--workspace-root <install>\workspaces` (or `<install>\usb-kit\workspaces` when updating a
-  legacy `%LOCALAPPDATA%\OxideSwarm` install) and creates `.oxideswarm-usb-workspaces` inside it.
-  The worker's `validate_workspace_root_safe` rejected both the USB kit paths under `%LOCALAPPDATA%`
-  and the marker file.
-- **Do:** Statically allow `<home>\AppData\Local\OxideSwarm-USB\workspaces` and
-  `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` in `is_allowed_under_home`, accept
-  `.oxideswarm-usb-workspaces` only when `std::fs::symlink_metadata` confirms a regular non-reparse
-  file, refuse custom `-InstallRoot` paths inside `%USERPROFILE%` under `-Isolation fs` with
-  workspaces before installing in `packaging/usb/install.ps1`, and cover both in tests.
-- **Done when:** Both paths and the regular marker file are accepted, directory/symlink/junction/upper-case-name
-  markers and sibling/`workspaces-evil`/`..`-escape user-profile paths are refused, `install.ps1` refuses
-  custom profile roots before creating directories and installs cleanly in `<LOCALAPPDATA>\OxideSwarm-USB`
-  under `-Isolation fs` with workspaces, `uninstall.ps1` requires `.oxideswarm-usb-workspaces` to be a
-  regular file (`-PathType Leaf`), and the worker/isolation/launcher checks pass on Windows (with known
-  unrelated host caveats recorded separately).
-- **Implemented (2026-11-19, pull request 352, open):** Added `<home>\AppData\Local\OxideSwarm-USB\workspaces`
-  and `<home>\AppData\Local\OxideSwarm\usb-kit\workspaces` to `is_allowed_under_home` and accepted
-  regular non-reparse lowercase `.oxideswarm-usb-workspaces` files (`symlink_metadata`) in
-  `validate_workspace_root_safe` (`crates/worker/src/isolation/windows/toolchain.rs`); added unit
-  tests in `crates/worker/src/isolation.rs` (including `workspaces-evil`, `workspaces\..\other`, and
-  `.OXIDESWARM-USB-WORKSPACES`); added the pre-install profile check in `packaging/usb/install.ps1`
-  and `-PathType Leaf` marker check in `packaging/usb/uninstall.ps1`; and covered default-root
-  `-Isolation fs` + workspaces install/uninstall plus refusal cases in `tests/test_launcher_scripts.py`.
-
 ## Phase 13: the path to finished
 
 Added on 2026-11-17 from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),
@@ -1454,36 +1434,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
     priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
     test, 1 never acquired. The exit check of Q80 is read from its last line.
 
-### MAINT-2: Bring the last three files under the size cap
-
-- **Evidence:** `scripts/rust-file-size-allowlist.txt` lists three files whose production part
-  (every line before the first `#[cfg(test)]`) exceeds 3,000 lines: `crates/worker/src/isolation.rs`
-  (5,346), `crates/cli/src/mcp.rs` (3,692) and `crates/cli/src/mode_cli.rs` (3,240). MAINT-1 split
-  six other files and left these at their size. `isolation.rs` holds the macOS code in an inline
-  `mod macos` and the Windows code in an inline `pub mod windows`. Only the Linux code is in a file
-  of its own (`crates/worker/src/isolation/linux.rs`). It also holds 125 of the 290 lines of `crates/*/src`
-  that contain `unsafe`.
-- **Problem:** The code that confines a task is the hardest file to review, and it is the largest
-  production file. Two platforms cannot be changed without a merge conflict in one file.
-- **Do:** One pull request per file. Move code, and change no behaviour, no public name and no
-  message text.
-  1. `isolation.rs`: move `mod macos` to `isolation/macos.rs` and `pub mod windows` to
-     `isolation/windows.rs`, beside `isolation/linux.rs`. Keep the shared types, the level
-     parsing and the start-up check in `isolation.rs`. Do LV-4 for these files in the same pull
-     request or the next one, so each `unsafe` site is read once.
-  2. `mcp.rs`: move each tool (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`,
-     `workspaces`) to a file under `crates/cli/src/mcp/`, and keep the JSON-RPC loop in `mcp.rs`.
-  3. `mode_cli.rs`: move each workflow mode (`test`, `dev`, `doc`, `research`) to a file under
-     `crates/cli/src/mode_cli/`.
-  4. After each split, delete the file's line from the allowlist.
-- **Done when:** The allowlist has no entry, `ox-mode test size` passes,
-  `cargo test -p rusty_grid_worker --test test_feat3_os_isolation` passes on Linux, macOS and
-  Windows, `cargo test -p rusty_grid_cli --test mcp_server_e2e` passes, and
-  `crates/core/tests/data/wire_layout.txt` is unchanged.
-- **Progress:** step 1 (`isolation.rs`): pull request 331.
-- **Progress:** step 3 (`mode_cli.rs`): pull request 325.
-- **Progress:** step 2 (`mcp.rs`): pull request 323.
-
 ### ADOPT-1: A study of first use, in two rounds
 
 - **Evidence:** [Design 0059](design/0059-first-users.md), D4. The owner decided on 2026-11-11 to
@@ -1507,37 +1457,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
      people the owner has not helped before.
 - **Done when:** "Study records" holds at least three sessions of the first round with measures
   M15 to M17. The item is Partial from then until the second round is recorded.
-
-### ADOPT-2: Run summary in `submit --wait`, its JSON output and the MCP results
-
-- **Evidence:** [Design 0059](design/0059-first-users.md), D5. `submit --wait` prints
-  `Execution Time` per task (`crates/cli/src/cli_app/submit.rs`). No line or JSON field gives the
-  time the caller waited, the sum of the task times or the number of machines: a search for
-  `waited_ms` and `task_time_sum_ms` in `crates/cli/src` finds nothing.
-- **Problem:** A user cannot see what the grid cost or gained on a run without a stopwatch.
-- **Do:** As D5 of design 0059, for one task first:
-  1. After a waited run, print the two lines of D5 (`Tasks:` and `Waited:`) next to
-     `Execution Time`. `Waited` is measured on the client, and the sum adds
-     `TaskResult::execution_time_ms`.
-  2. Add `waited_ms`, `task_time_sum_ms` and `machines` to the JSON output of `submit` and to the
-     result of the MCP tools `submit` and `task_result` (`crates/cli/src/mcp.rs`).
-  3. Print no ratio and no percentage, and never call the sum the time on the user's machine.
-  4. Update `README.md` and `CHANGELOG.md`. The values come from fields that exist, so the wire
-     format does not change.
-- **Done when:** The ADOPT-2 tests of the test plan of design 0059 pass: the unit cases (no task,
-  one task, one failed task, two tasks on one worker), a waited run on loopback that prints both
-  lines and carries the three fields under `--json`, and `mcp_server_e2e` finds the fields while
-  standard output stays JSON-RPC only.
-- **Status (2026-11-18, Implemented):** Pull request 350 (open): adds `crates/cli/src/run_summary.rs`
-  (with the four unit cases of design 0059 plus a two-worker case), prints the two D5 summary lines
-  after `Execution Time` in `submit --wait`, adds `waited_ms`, `task_time_sum_ms`, and `machines`
-  to `submit --json` and the MCP `submit` and `task_result` tools (covering the submitted task only,
-  before `--verify` replicas; for a task submitted in the same MCP
-  session, `task_result` measures `waited_ms` from `submit` to the `task_result` reply so it
-  includes caller time between calls and increases on repeat queries, and returns `null` when that
-  session did not record the submission), covers loopback CLI and MCP runs in
-  `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
-  `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
 
 ### ADOPT-3: Install scripts and the scripted time to first result
 
@@ -1685,7 +1604,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** The guide exists and is in the index of `docs/README.md`. Proof run V3 is
   recorded with its date in the status log of design 0058. Until a second person has cut a
   release, the item is Partial.
-- **Note (2026-11-18):** Pull request 351 (open) adds `docs/guides/cut-a-release.md`
+- **Note (2026-11-18):** Pull request 351 adds `docs/guides/cut-a-release.md`
   (covering wire-change rules, release PR preparation, owner merge and `v*` tag push, `SHA256SUMS`
   and `gh attestation verify` checks, isolated macOS and Windows loopback smoke checks, and the step
   2 accounts and workflow-permissions skeleton table) and adds it to `docs/README.md`. Confirming
@@ -1873,64 +1792,6 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   its record. Handle the interconnect report by Q91 (default: unlink it from the README and keep the file
   with its header).
 - **Done when:** The first "Measured" rows link to the records, and `ox-mode doc` passes.
-
-### BENCH-8: Find why the two-machine W1 sweep reached 73 % efficiency, not 85 %
-
-- **Evidence:** BENCH-3's record `benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.json`: efficiency
-  0.73 (median run 53.7 s against 39.4 s for the sum of both machines alone); runs 2.48, 2.23 and 2.23
-  tasks/s. The Windows worker took 60, 70 and 70 of the 120 tasks; the sum of the local rates gives it 64.
-  `submit_to_result_p50_s` is 10.9 to 12.2 s, while a task under full load takes about 7.1 s on the Mac
-  (10 / 1.412) and 12.3 s on Windows (20 / 1.631).
-- **Problem:** The plan expected at least 0.85, and the record does not say where the rest went. Three causes
-  fit and none is tested:
-  1. Few waves: the plan sized tasks at about 3 s from one process on the Mac, but under full load a task
-     takes 7 to 12 s, so 120 tasks are about four waves on 30 slots. When the queue runs dry, the Mac waits
-     while the last Windows tasks run, up to one Windows task length (12 s against a 39 s ideal).
-  2. No queue for the scheduler: the harness keeps as many submits in flight as there are slots (30), so the
-     master never holds a waiting task and the speed-aware placement of design 0060 never has a choice.
-  3. Per-task overhead: one CLI process per task (BENCH-1 (a): 26 to 69 ms on loopback), the LAN round trip,
-     the sandbox and the Python start; BENCH-5 measures it.
-- **Do:** With the same two workers and units, under a plan committed first: (a) 480 tasks instead of 120;
-  (b) 120 tasks with `--client-concurrency 120`; (c) each worker alone through the grid (BENCH-3's controls).
-  Compare each with the record above; if (b) helps, look at the placement of the last tasks in the master
-  log.
-- **Done when:** The records are committed and this section names the cause or causes with their share of
-  the gap, or the change that closes it.
-- **Implemented (2026-11-18, pull request 355):** Plan
-  `benchmarks/sweep/plans/2026-11-18-bench-8-w1-efficiency-gap.json`, committed before the first run, with
-  two amendments committed before the steps they add. Same units, release 0.4.3, master for the run on the
-  Mac; nine records in `benchmarks/sweep/results/` (`2026-11-18-w1-*`), every checksum equal.
-
-  | Step | Record | Tasks/s | Efficiency |
-  |---|---|---|---|
-  | BENCH-3: both, 120 tasks, 30 in flight | `w1-two-machines-lan` | 2.233 | 0.734 |
-  | (b) both, 120 tasks, 120 in flight | `w1-two-machines-lan-cc120` | 2.349 | 0.772 |
-  | (a) both, 480 tasks, 30 in flight | `w1-two-machines-lan-480` | 2.301 | 0.756 |
-  | (c) Mac worker alone, master on the same Mac | `w1-mac-worker-only-lan` | 1.108 | 0.785 |
-  | 4b: the same, `--task-priority normal` | `w1-mac-worker-only-normal-priority-lan` | 1.180 | 0.836 |
-  | (c) Windows worker alone, master on the Mac over the LAN | `w1-win-worker-only-lan` | 1.269 | 0.778 |
-  | 1c: Windows alone, master on the same machine | `w1-win-loopback-default-priority` | 1.535 | 0.941 |
-  | 1d: the same, `--task-priority normal` | `w1-win-loopback-normal-priority` | 1.539 | 0.944 |
-
-  Efficiency of a one-worker step is against that machine alone. Findings:
-  1. Combining the machines costs little: both through the grid against the sum of each worker alone
-     through the grid (1.108 + 1.269 = 2.377 tasks/s) is 0.94 for BENCH-3, 0.99 for (b) and 0.97 for (a).
-  2. Causes 1 and 2 are below the plan's 0.05 threshold: (a) adds 0.022 and (b) adds 0.038 to BENCH-3's
-     0.734. The Windows worker took 60 to 70 of 120 tasks in (b) and 300 to 320 of 480 in (a).
-  3. Cause 3 is the gap: each worker alone through the grid reaches about 0.78 of its machine alone.
-     - Windows: with the master on the same machine it reaches 0.94 with either priority, so the default
-       below-normal priority costs nothing there, and the master on another machine over the home LAN costs
-       0.16 (median submit-to-result 15.3 to 17.7 s against 12.0 to 13.8 s, about 3 s more per task).
-     - Mac: the master is on the same Mac, so the LAN is not involved. `--task-priority normal` adds 0.051,
-       at the threshold; the other 0.16 is open. In both Mac steps the warm-up run was faster than the
-       measured runs (1.19 then 1.11, and 1.42 then 1.18 tasks/s), which the heat of a fanless machine under
-       seven minutes of full load could explain; not tested. BENCH-9 splits the cost with per-task times;
-       Q93 asks whether the default priority should change.
-  Deviations: step 1b (the Windows worker with `--task-priority normal` over the LAN) was run once and is
-  void, because the worker restarted during its runs; a second attempt was refused because a cargo test of
-  another project had started on the Mac. Amendment 2 replaced it with 1c and 1d on the Windows machine
-  alone. Steps 2 and 3 ended their grid runs before that cargo test started. A second attempt of 4b was
-  needed for the same reason; the void records are not committed.
 
 ### BENCH-9: Split the per-machine cost of running W1 through the grid into task process time and slot idle time
 
@@ -2376,13 +2237,21 @@ Add one dated line per finished item, newest last.
   tail and the missing queue are below 0.05; the gap is the cost of running through the grid on each machine
   (about 0.78 of each machine alone): on Windows the master on another machine over the LAN (0.16), on the Mac
   the default task priority (0.05) and 0.16 still open. BENCH-9 added (Planned, Out); Q93 open.
-- 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341, open): the USB kit's folder
+- 2026-11-18: BUG-29, BUG-30 and BUG-31 added and Implemented (pull request 341): the USB kit's folder
   menu, the removal of installs from older kits, and failed-start reporting with a kept log, found on a Windows 11
   laptop with kit 0.4.3; the Windows sandbox base decision is in the design 0053 status log. Texts in the archive.
-- 2026-11-19: BUG-32 added and Implemented (pull request 352, open): `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces` and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts regular non-reparse `.oxideswarm-usb-workspaces` files ([design 0033](design/0033-os-level-task-isolation.md)), and `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces targets any other path under `%USERPROFILE%`.
-- 2026-11-18: ADOPT-2 Implemented (pull request 350, open): D5 run summary in `submit --wait`, `--json`, and MCP `submit` / `task_result`, with `waited_ms: null` when the MCP submission timestamp is unknown.
+- 2026-11-19: BUG-32 added and Implemented (pull request 352): `windows::validate_workspace_root_safe` statically allowlists `<user_home>\AppData\Local\OxideSwarm-USB\workspaces` and `<user_home>\AppData\Local\OxideSwarm\usb-kit\workspaces` and accepts regular non-reparse `.oxideswarm-usb-workspaces` files ([design 0033](design/0033-os-level-task-isolation.md)), and `packaging/usb/install.ps1` stops before creating `$InstallRoot` when `-Isolation fs` with workspaces targets any other path under `%USERPROFILE%`.
+- 2026-11-18: ADOPT-2 Implemented (pull request 350): D5 run summary in `submit --wait`, `--json`, and MCP `submit` / `task_result`, with `waited_ms: null` when the MCP submission timestamp is unknown.
 - 2026-11-18: LV-15 Partial (pull request 351): guide and accounts skeleton; step 2 holders, steps 3 and 4 stay with the owner.
-- 2026-11-19: TEST-55 added and Implemented (pull request 356, open): `s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
+- 2026-11-19: TEST-55 added and Implemented (pull request 356): `s1_write_grants_are_refused_and_read_only_grants_warn_once_with_working_remedy`
   in `crates/worker/src/sandbox.rs` uses `BUILTIN\Guests` (`S-1-5-32-546`) instead of
   `BUILTIN\Remote Desktop Users` (`S-1-5-32-555`, absent on Windows Home), so `cargo test -p rusty_grid_worker --lib`
   passes in full on Windows 11 Home; text in the archive.
+- 2026-11-19: Rows brought up to date after pull requests 340 to 359 (354 still open): "(open)" dropped for
+  LV-4, LV-5, BUG-29 to BUG-32, BENCH-3, LV-15, BENCH-8, ADOPT-2, TEST-23, TEST-41 and TEST-55, and ADOPT-2's Line
+  cleared. MAINT-2 Implemented (pull requests 323, 325 and 331; the allowlist has no entry). TEST-29 Implemented:
+  no `workspace tests (windows-latest)` job of 2026-11-18 lost its runner (82 passed); the speed work is TEST-56.
+  The texts of TEST-29, BUG-32, MAINT-2, ADOPT-2 and BENCH-8 moved to the archive. SEC-17 added from the review of
+  352. SEC-16 Partial: its cause is on record on both Windows machines, and none of the foreign grants is
+  OxideSwarm's. Counted from the rows: 215 items, 143 Implemented, 18 Partial and 54 Planned; 26 open items In,
+  46 Out.
