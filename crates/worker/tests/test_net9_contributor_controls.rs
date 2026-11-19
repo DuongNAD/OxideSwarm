@@ -11,12 +11,16 @@ use std::time::{Duration, Instant};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WorkerMessage};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
-use rusty_grid_core::CONTRIBUTOR_CONTROL_REFUSAL_PREFIX;
-use rusty_grid_master::{MasterHandle, MasterServer, ServerConfig, TaskState, WorkerStatus};
+use rusty_grid_core::{CONTRIBUTOR_CONTROL_REFUSAL_PREFIX, CONTRIBUTOR_HOLD_CPU_PCT};
+use rusty_grid_master::{
+    MasterHandle, MasterServer, ReaperConfig, SchedulerConfig, ServerConfig, TaskState,
+    WorkerStatus,
+};
 use rusty_grid_worker::{
-    write_pause_file, AllowHoursSchedule, BackoffConfig, Clock, ContributorControlsConfig,
-    FakeRunnerConfig, HostCpuProbe, NetworkCost, NetworkCostProbe, PowerProbe, PowerSource,
-    WorkerClient, WorkerConfig, WorkerControls, WorkerControlsHandle, EXIT_CODE_SUCCESS,
+    check_watcher_status, is_process_alive, write_pause_file, AllowHoursSchedule, BackoffConfig,
+    Clock, ContributorControlsConfig, FakeRunnerConfig, HostCpuProbe, NetworkCost,
+    NetworkCostProbe, PowerProbe, PowerSource, WatcherStatus, WorkerClient, WorkerConfig,
+    WorkerControls, WorkerControlsHandle, EXIT_CODE_SUCCESS,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -222,6 +226,10 @@ fn simulated_worker(
     client
 }
 
+fn is_held_pct(cpu_usage_pct: f32) -> bool {
+    cpu_usage_pct > 100.0 && (cpu_usage_pct - CONTRIBUTOR_HOLD_CPU_PCT).abs() < 0.01
+}
+
 fn pin_worker_task(worker_id: Uuid) -> Task {
     Task::new(
         TaskSpec::BuiltinTest {
@@ -315,7 +323,7 @@ async fn test_net9_injected_probes_gate_cpu_schedule_daily_cap_battery_and_meter
             .registry()
             .get_worker(w1_id)
             .await
-            .is_some_and(|w| w.cpu_usage_pct > 90.0)
+            .is_some_and(|w| is_held_pct(w.cpu_usage_pct))
     })
     .await;
     let res = submit_and_wait(master_addr, unpinned_task()).await;
@@ -344,7 +352,7 @@ async fn test_net9_injected_probes_gate_cpu_schedule_daily_cap_battery_and_meter
                 .registry()
                 .get_worker(w1_id)
                 .await
-                .is_some_and(|w| w.cpu_usage_pct > 90.0)
+                .is_some_and(|w| is_held_pct(w.cpu_usage_pct))
         },
     )
     .await;
@@ -370,7 +378,7 @@ async fn test_net9_injected_probes_gate_cpu_schedule_daily_cap_battery_and_meter
             .registry()
             .get_worker(w1_id)
             .await
-            .is_some_and(|w| w.cpu_usage_pct > 90.0)
+            .is_some_and(|w| is_held_pct(w.cpu_usage_pct))
     })
     .await;
     let res_bat = submit_and_wait(master_addr, unpinned_task()).await;
@@ -401,7 +409,7 @@ async fn test_net9_injected_probes_gate_cpu_schedule_daily_cap_battery_and_meter
                 .registry()
                 .get_worker(w1_id)
                 .await
-                .is_some_and(|w| w.cpu_usage_pct > 90.0)
+                .is_some_and(|w| is_held_pct(w.cpu_usage_pct))
         },
     )
     .await;
@@ -431,7 +439,7 @@ async fn test_net9_injected_probes_gate_cpu_schedule_daily_cap_battery_and_meter
             .registry()
             .get_worker(w1_id)
             .await
-            .is_some_and(|w| w.cpu_usage_pct > 90.0)
+            .is_some_and(|w| is_held_pct(w.cpu_usage_pct))
     })
     .await;
     let res_capped = submit_and_wait(master_addr, unpinned_task()).await;
@@ -549,21 +557,30 @@ async fn test_net9_worker_pause_stops_running_task_within_5s_and_hands_back_unch
                 .get_worker(w1_id)
                 .await
                 .is_some_and(|w| w.status == WorkerStatus::Connected && w.cpu_usage_pct < 85.0);
-            let w2_paused = master
-                .registry()
-                .get_worker(w2_id)
-                .await
-                .is_some_and(|w| w.status == WorkerStatus::Connected && w.cpu_usage_pct > 90.0);
+            let w2_paused = master.registry().get_worker(w2_id).await.is_some_and(|w| {
+                w.status == WorkerStatus::Connected && is_held_pct(w.cpu_usage_pct)
+            });
             w1_ok && w2_paused
         },
     )
     .await;
 
-    // On run 1 (w1): creates started_marker and sleeps until killed.
+    wait_until(10, "w1 creates .watch PID file", || {
+        let p = ctrl_file.clone();
+        async move {
+            matches!(
+                check_watcher_status(&p),
+                Ok(WatcherStatus::Watching { pid }) if pid == std::process::id()
+            )
+        }
+    })
+    .await;
+
+    // On run 1 (w1): atomically writes its PID into started_marker and sleeps until killed.
     // On run 2 (w2 after handback): sees started_marker already exists and exits 0 immediately.
     #[cfg(unix)]
     let script = format!(
-        "if [ ! -f '{0}' ]; then echo started > '{0}'; while :; do sleep 0.2; done; else echo resumed_done; fi",
+        "if [ ! -f '{0}' ]; then echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'; while :; do sleep 0.2; done; else echo resumed_done; fi",
         started_marker.display()
     );
     #[cfg(windows)]
@@ -599,11 +616,10 @@ async fn test_net9_worker_pause_stops_running_task_within_5s_and_hands_back_unch
         15,
         "w1 stops active task and becomes idle+paused on master",
         || async {
-            let worker_idle_and_busy_gated = master
-                .registry()
-                .get_worker(w1_id)
-                .await
-                .is_some_and(|w| w.status == WorkerStatus::Connected && w.cpu_usage_pct > 90.0);
+            let worker_idle_and_busy_gated =
+                master.registry().get_worker(w1_id).await.is_some_and(|w| {
+                    w.status == WorkerStatus::Connected && is_held_pct(w.cpu_usage_pct)
+                });
             let handback_seen = master
                 .queue()
                 .get_task(&task_id)
@@ -613,6 +629,47 @@ async fn test_net9_worker_pause_stops_running_task_within_5s_and_hands_back_unch
         },
     )
     .await;
+
+    #[cfg(unix)]
+    {
+        let pid_text = std::fs::read_to_string(&started_marker).expect("read run 1 PID");
+        let run1_pid: u32 = pid_text
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid PID in started_marker {pid_text:?}: {e}"));
+        wait_until(10, "first run process tree is dead", || async move {
+            !is_process_alive(run1_pid)
+        })
+        .await;
+    }
+
+    // Master ListWorkers reports `state:held` for the paused worker while it stays connected.
+    {
+        let mut client_tr = MessageTransport::new(TcpStream::connect(master_addr).await.unwrap());
+        client_tr
+            .send_msg(&ClientMessage::ListWorkers)
+            .await
+            .unwrap();
+        let resp = client_tr
+            .recv_msg::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientResponse::WorkerList { workers } = resp else {
+            panic!("expected WorkerList, got {resp:?}");
+        };
+        let w1_listed = workers
+            .iter()
+            .find(|w| rusty_grid_core::placement::listed_worker_id(w) == Some(w1_id))
+            .expect("w1 listed");
+        assert_eq!(
+            rusty_grid_core::placement::tag_value(
+                &w1_listed.tags,
+                rusty_grid_core::placement::STATE_TAG_PREFIX
+            ),
+            Some("held")
+        );
+    }
 
     assert!(
         w1_controls.is_paused(),
@@ -658,11 +715,10 @@ async fn test_net9_worker_pause_stops_running_task_within_5s_and_hands_back_unch
             .get_worker(w1_id)
             .await
             .is_some_and(|w| w.status == WorkerStatus::Connected && w.cpu_usage_pct < 85.0);
-        let w2_paused = master
-            .registry()
-            .get_worker(w2_id)
-            .await
-            .is_some_and(|w| w.status == WorkerStatus::Connected && w.cpu_usage_pct > 90.0);
+        let w2_paused =
+            master.registry().get_worker(w2_id).await.is_some_and(|w| {
+                w.status == WorkerStatus::Connected && is_held_pct(w.cpu_usage_pct)
+            });
         w1_ready && w2_paused
     })
     .await;
@@ -674,4 +730,267 @@ async fn test_net9_worker_pause_stops_running_task_within_5s_and_hands_back_unch
     let _ = h1.await;
     let _ = h2.await;
     let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_net9_soft_control_lets_running_task_finish_and_holds_new_tasks_against_max_cpu_100() {
+    let dir = tempfile::tempdir().unwrap();
+    let started_marker = dir.path().join("soft_started.marker");
+    let release_marker = dir.path().join("soft_release.marker");
+    let sb1 = dir.path().join("sb1");
+    let sb2 = dir.path().join("sb2");
+    std::fs::create_dir_all(&sb1).unwrap();
+    std::fs::create_dir_all(&sb2).unwrap();
+
+    // Configure master with `--max-host-cpu-pct 100`: contributor hold at 101.0 must still gate it.
+    let srv_cfg = ServerConfig::from_addr("127.0.0.1:0")
+        .expect("loopback")
+        .with_web_ui(false)
+        .with_implicit_local_dashboard(false)
+        .with_discovery(false)
+        .with_heartbeat_interval(1)
+        .with_session_resume_hold(Duration::ZERO);
+    let sched_cfg = SchedulerConfig {
+        max_host_cpu_pct: 100.0,
+        ..Default::default()
+    };
+    let master = MasterServer::spawn_with_config(srv_cfg, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("spawn master");
+    let master_addr = master.server_addr();
+    let master_str = master_addr.to_string();
+
+    let clock = InjectedClock::from_local(2026, 11, 19, 10, 0);
+    let cpu1 = InjectedCpuProbe::new(10.0);
+    let power1 = InjectedPowerProbe::new(PowerSource::Ac);
+    let net1 = InjectedNetworkProbe::new(NetworkCost::Unmetered);
+    let w1_controls = WorkerControls::with_probes(
+        ContributorControlsConfig {
+            max_host_cpu_pct: Some(50.0),
+            pause_on_battery: true,
+            ..Default::default()
+        },
+        clock,
+        Arc::clone(&cpu1) as Arc<dyn HostCpuProbe>,
+        Arc::clone(&power1) as Arc<dyn PowerProbe>,
+        net1,
+    );
+
+    let mut w1 = WorkerClient::new(
+        real_test_worker_config(master_str.clone(), "w1-soft", &sb1)
+            .with_controls_handle(Arc::clone(&w1_controls)),
+    );
+    let mut w2 = WorkerClient::new(
+        real_test_worker_config(master_str, "w2-open", &sb2)
+            .with_controls_handle(default_injected_controls(None)),
+    );
+    let w1_id = w1.worker_id();
+    let w2_id = w2.worker_id();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let h1 = tokio::spawn({
+        let rx = shutdown_rx.clone();
+        async move { w1.run(rx).await }
+    });
+    let h2 = tokio::spawn({
+        let rx = shutdown_rx.clone();
+        async move { w2.run(rx).await }
+    });
+
+    wait_until(15, "both workers connected", || async {
+        let ws = master.registry().list_workers().await;
+        ws.iter()
+            .filter(|w| w.status == WorkerStatus::Connected)
+            .count()
+            == 2
+    })
+    .await;
+
+    #[cfg(unix)]
+    let script = format!(
+        "echo running > '{0}'; while [ ! -f '{1}' ]; do sleep 0.05; done; echo finished_cleanly",
+        started_marker.display(),
+        release_marker.display()
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "echo running > \"{0}\" & :waitloop & if not exist \"{1}\" (ping -n 1 127.0.0.1 >NUL & goto waitloop) & echo finished_cleanly",
+        started_marker.display(),
+        release_marker.display()
+    );
+
+    let running_task = Task::new(
+        TaskSpec::shell_script(script),
+        TaskRequirements::generic(1, 60),
+    )
+    .with_tags(vec![format!("require:worker={w1_id}")]);
+    let running_id = running_task.id;
+    let running_fut = tokio::spawn(submit_and_wait(master_addr, running_task));
+
+    wait_until(20, "task 1 started on w1", || {
+        let p = started_marker.clone();
+        async move { p.exists() }
+    })
+    .await;
+    wait_until(10, "master sees task 1 Running on w1", || async {
+        master
+            .queue()
+            .get_task(&running_id)
+            .await
+            .is_some_and(|t| t.state == TaskState::Running && t.assigned_worker_id == Some(w1_id))
+    })
+    .await;
+
+    // Trigger soft contributor controls while Task 1 is running: new work is held, Task 1 stays alive.
+    cpu1.set(85.0);
+    power1.set(PowerSource::Battery);
+    w1_controls.state_notify().notify_waiters();
+    wait_until(
+        10,
+        "master observes w1 at 101.0 hold despite max_host_cpu_pct 100",
+        || async {
+            master.registry().get_worker(w1_id).await.is_some_and(|w| {
+                w.status != WorkerStatus::Disconnected && is_held_pct(w.cpu_usage_pct)
+            })
+        },
+    )
+    .await;
+
+    // A new unpinned task must bypass w1 and run cleanly on w2.
+    let second_res = submit_and_wait(master_addr, unpinned_task()).await;
+    assert_eq!(second_res.exit_code, EXIT_CODE_SUCCESS);
+    assert_eq!(
+        second_res.worker_id, w2_id,
+        "held worker must not receive new assignments even when master max_host_cpu_pct is 100"
+    );
+
+    // Let Task 1 finish: soft controls never kill an already-running task.
+    std::fs::write(&release_marker, b"go\n").unwrap();
+    let res1 = tokio::time::timeout(Duration::from_secs(20), running_fut)
+        .await
+        .expect("task 1 finish timeout")
+        .expect("submit 1 join");
+    assert_eq!(res1.exit_code, EXIT_CODE_SUCCESS);
+    assert_eq!(res1.worker_id, w1_id);
+    assert!(
+        res1.stdout_str().contains("finished_cleanly"),
+        "expected task 1 stdout to contain finished_cleanly, got {:?}",
+        res1.stdout_str()
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = h1.await;
+    let _ = h2.await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_net9_pause_file_stops_running_task_while_disconnected_during_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctrl_file = dir.path().join("worker_pause.reconnect");
+    let pid_marker = dir.path().join("reconnect_task.pid");
+    let sb = dir.path().join("sb");
+    std::fs::create_dir_all(&sb).unwrap();
+
+    // Long session-resume hold so disconnecting keeps the active task running across reconnects.
+    let srv_cfg = ServerConfig::from_addr("127.0.0.1:0")
+        .expect("loopback")
+        .with_web_ui(false)
+        .with_implicit_local_dashboard(false)
+        .with_discovery(false)
+        .with_heartbeat_interval(1)
+        .with_session_resume_hold(Duration::from_secs(30));
+    let master = MasterServer::spawn(srv_cfg).await.expect("spawn master");
+    let master_addr = master.server_addr();
+
+    let w1_controls = default_injected_controls(Some(ctrl_file.clone()));
+    let mut w1 = WorkerClient::new(
+        real_test_worker_config(master_addr.to_string(), "w1-disc", &sb)
+            .with_controls_handle(Arc::clone(&w1_controls)),
+    );
+    w1.set_backoff_config(
+        BackoffConfig::default()
+            .with_initial(Duration::from_millis(50))
+            .with_max(Duration::from_millis(100)),
+    );
+    let w1_id = w1.worker_id();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let h1 = tokio::spawn(async move { w1.run(shutdown_rx).await });
+
+    wait_until(15, "w1 connected", || async {
+        master
+            .registry()
+            .get_worker(w1_id)
+            .await
+            .is_some_and(|w| w.status == WorkerStatus::Connected)
+    })
+    .await;
+
+    #[cfg(unix)]
+    let script = format!(
+        "echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'; while :; do sleep 0.2; done",
+        pid_marker.display()
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "echo started > \"{0}\" & ping -n 61 127.0.0.1 >NUL",
+        pid_marker.display()
+    );
+
+    let task = Task::new(
+        TaskSpec::shell_script(script),
+        TaskRequirements::generic(1, 60),
+    );
+    let task_id = task.id;
+    let mut submit_tr = MessageTransport::new(TcpStream::connect(master_addr).await.unwrap());
+    submit_tr
+        .send_msg(&ClientMessage::SubmitTask { task, wait: false })
+        .await
+        .unwrap();
+    let _ = submit_tr.recv_msg::<ClientResponse>().await.unwrap();
+
+    wait_until(20, "pid_marker written", || {
+        let p = pid_marker.clone();
+        async move { p.exists() }
+    })
+    .await;
+    wait_until(10, "master records task Running on w1", || async {
+        master
+            .queue()
+            .get_task(&task_id)
+            .await
+            .is_some_and(|t| t.state == TaskState::Running && t.assigned_worker_id == Some(w1_id))
+    })
+    .await;
+
+    #[cfg(unix)]
+    let running_pid: u32 = std::fs::read_to_string(&pid_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Drop the master while the 30 s resume grace window would otherwise keep the task running.
+    let _ = master.shutdown();
+
+    // Pause via the control file while disconnected/reconnecting: worker-lifetime watcher must stop it.
+    write_pause_file(&ctrl_file).expect("write pause file while disconnected");
+    wait_until(
+        10,
+        "worker-lifetime watcher pauses w1 while disconnected",
+        || async { w1_controls.is_paused() },
+    )
+    .await;
+
+    #[cfg(unix)]
+    wait_until(
+        10,
+        "paused task process killed while disconnected",
+        || async move { !is_process_alive(running_pid) },
+    )
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = h1.await;
 }

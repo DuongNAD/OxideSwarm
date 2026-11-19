@@ -30,6 +30,22 @@ async fn receive_cancel_signal(slot: &mut Option<oneshot::Receiver<CancelSignal>
     }
 }
 
+fn resolve_current_tx(
+    session_data_tx: &std::sync::RwLock<Option<mpsc::Sender<WorkerMessage>>>,
+    fallback_tx: Option<&mpsc::Sender<WorkerMessage>>,
+) -> Option<mpsc::Sender<WorkerMessage>> {
+    if let Some(tx) = session_data_tx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        if !tx.is_closed() {
+            return Some(tx);
+        }
+    }
+    fallback_tx.filter(|tx| !tx.is_closed()).cloned()
+}
+
 fn cancelled_task_result(
     worker_id: uuid::Uuid,
     task_id: TaskId,
@@ -612,6 +628,8 @@ impl WorkerClient {
         let (cancel_tx, cancel_rx) = oneshot::channel::<CancelSignal>();
         let child_pid = Arc::new(AtomicU32::new(0));
         let suppress_result = Arc::new(AtomicBool::new(false));
+        let result_sent = Arc::new(AtomicBool::new(false));
+        let outbound_tx_for_handle = outbound_tx.clone();
 
         let tracker = Arc::clone(&self.heartbeat_tracker);
         let table = Arc::clone(&self.active_task_table);
@@ -619,6 +637,7 @@ impl WorkerClient {
         let runner = Arc::clone(&self.runner);
         let child_pid_clone = Arc::clone(&child_pid);
         let suppress = Arc::clone(&suppress_result);
+        let sent_flag = Arc::clone(&result_sent);
         let blob_client_slot = Arc::clone(&self.blob_client);
         let session_data_tx = Arc::clone(&self.session_data_tx);
         let current_session_hold_secs = Arc::clone(&self.current_session_hold_secs);
@@ -631,23 +650,17 @@ impl WorkerClient {
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
         // entry behind.
         let mut lock = self.active_task_table.write().await;
+        if self.controls.is_paused() {
+            drop(lock);
+            let refusal = cancelled_task_result(
+                worker_id,
+                task_id,
+                CancelSignal::ContributorPause("paused by contributor".to_string()),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(refusal)).await;
+            return;
+        }
         let runner_handle = tokio::spawn(async move {
-            let current_tx =
-                |session_data_tx: &std::sync::RwLock<Option<mpsc::Sender<WorkerMessage>>>,
-                 fallback_tx: &mpsc::Sender<WorkerMessage>|
-                 -> Option<mpsc::Sender<WorkerMessage>> {
-                    if let Some(tx) = session_data_tx
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                    {
-                        if !tx.is_closed() {
-                            return Some(tx);
-                        }
-                    }
-                    (!fallback_tx.is_closed()).then(|| fallback_tx.clone())
-                };
-
             let mut cancel_rx = cancel_rx;
             let permit = tokio::select! {
                 res = semaphore.acquire_owned() => match res {
@@ -658,8 +671,8 @@ impl WorkerClient {
                     let sig = cancel_msg.unwrap_or_else(|_| CancelSignal::MasterCancel("Cancelled while queued".into()));
                     let res = cancelled_task_result(worker_id, task_id, sig);
                     remove_active(&table, task_id, attempt).await;
-                    if !suppress.load(Ordering::Acquire) {
-                        if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
+                    if !suppress.load(Ordering::Acquire) && !sent_flag.swap(true, Ordering::AcqRel) {
+                        if let Some(tx) = resolve_current_tx(&session_data_tx, Some(&outbound_tx)) {
                             let _ = tx.send(WorkerMessage::from(res)).await;
                         }
                     }
@@ -683,7 +696,7 @@ impl WorkerClient {
                 task_id,
                 status: TaskStatus::Running,
             };
-            if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
+            if let Some(tx) = resolve_current_tx(&session_data_tx, Some(&outbound_tx)) {
                 if tx.send(progress).await.is_err() && !resume_window_active.load(Ordering::Acquire)
                 {
                     return;
@@ -732,8 +745,12 @@ impl WorkerClient {
                 match failure {
                     Ok(pin) => Some(pin),
                     Err(result) => {
-                        if !suppress.load(Ordering::Acquire) {
-                            if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
+                        if !suppress.load(Ordering::Acquire)
+                            && !sent_flag.swap(true, Ordering::AcqRel)
+                        {
+                            if let Some(tx) =
+                                resolve_current_tx(&session_data_tx, Some(&outbound_tx))
+                            {
                                 let _ = tx.send(WorkerMessage::from(result)).await;
                             }
                         }
@@ -749,7 +766,7 @@ impl WorkerClient {
                 .then_some(cp_tx);
             let forward_checkpoint = |cp_msg: WorkerMessage| {
                 let mut sent = false;
-                if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
+                if let Some(tx) = resolve_current_tx(&session_data_tx, Some(&outbound_tx)) {
                     if tx.try_send(cp_msg.clone()).is_ok() {
                         sent = true;
                     }
@@ -823,7 +840,7 @@ impl WorkerClient {
                     let mut outbox = pending_resume_outbox
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let tx = current_tx(&session_data_tx, &outbound_tx);
+                    let tx = resolve_current_tx(&session_data_tx, Some(&outbound_tx));
                     let evicted = match buffered_token {
                         Some(ack_token) => outbox.push_result(BufferedTaskResult::new(
                             task.clone(),
@@ -894,7 +911,8 @@ impl WorkerClient {
                 if cancelled_signal.is_none()
                     && !suppress.load(Ordering::Acquire)
                     && resume_enabled
-                    && (blob_client_closed || current_tx(&session_data_tx, &outbound_tx).is_none())
+                    && (blob_client_closed
+                        || resolve_current_tx(&session_data_tx, Some(&outbound_tx)).is_none())
                 {
                     drop(output_pin);
                     drop(_inputs);
@@ -945,8 +963,8 @@ impl WorkerClient {
                 }
             }
 
-            if !suppress.load(Ordering::Acquire) {
-                if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
+            if !suppress.load(Ordering::Acquire) && !sent_flag.swap(true, Ordering::AcqRel) {
+                if let Some(tx) = resolve_current_tx(&session_data_tx, Some(&outbound_tx)) {
                     let _ = tx.send(WorkerMessage::from(result)).await;
                 }
             }
@@ -963,6 +981,8 @@ impl WorkerClient {
                 started_at_epoch_sec: current_epoch_secs(),
                 attempt,
                 suppress_result,
+                result_sent,
+                outbound_tx: Some(outbound_tx_for_handle),
                 join: Some(runner_handle),
             },
         );
@@ -1041,7 +1061,125 @@ impl WorkerClient {
             }
         }
     }
+}
 
+pub(super) async fn pause_active_tasks_inner(
+    worker_id: uuid::Uuid,
+    active_task_table: &ActiveTaskTable,
+    session_data_tx: &std::sync::RwLock<Option<mpsc::Sender<WorkerMessage>>>,
+    pause_stop_timeout: Duration,
+    reason: &str,
+) -> usize {
+    let handles: Vec<TaskExecutionHandle> = {
+        let mut lock = active_task_table.write().await;
+        lock.drain().map(|(_, handle)| handle).collect()
+    };
+    if handles.is_empty() {
+        return 0;
+    }
+    let count = handles.len();
+    info!(
+        worker_id = %worker_id,
+        tasks = count,
+        reason = %reason,
+        "Pausing active tasks under contributor control; stopping process trees and handing tasks back"
+    );
+    let mut pending = Vec::with_capacity(count);
+    for mut handle in handles {
+        let sent = handle.cancel_tx.take().is_some_and(|tx| {
+            tx.send(CancelSignal::ContributorPause(reason.to_string()))
+                .is_ok()
+        });
+        if !sent {
+            handle.abort_handle.abort();
+        }
+        pending.push((
+            handle.task_id,
+            handle.suppress_result,
+            handle.result_sent,
+            handle.outbound_tx,
+            handle.join.take(),
+            sent,
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + pause_stop_timeout;
+    for (task_id, suppress_result, result_sent, fallback_tx, join_opt, sent) in pending {
+        let mut aborted = !sent;
+        if let Some(mut join) = join_opt {
+            if sent {
+                match tokio::time::timeout_at(deadline, &mut join).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        aborted = true;
+                    }
+                    Err(_) => {
+                        warn!(
+                            task_id = %task_id,
+                            timeout_secs = pause_stop_timeout.as_secs_f32(),
+                            "A paused task did not stop within PAUSE_STOP_TIMEOUT; aborting it"
+                        );
+                        join.abort();
+                        let _ = join.await;
+                        aborted = true;
+                    }
+                }
+            } else {
+                let _ = join.await;
+                aborted = true;
+            }
+        }
+        if aborted
+            && !suppress_result.load(Ordering::Acquire)
+            && !result_sent.swap(true, Ordering::AcqRel)
+        {
+            let refusal = cancelled_task_result(
+                worker_id,
+                task_id,
+                CancelSignal::ContributorPause(reason.to_string()),
+            );
+            if let Some(tx) = resolve_current_tx(session_data_tx, fallback_tx.as_ref()) {
+                let _ = tx.send(WorkerMessage::from(refusal)).await;
+            }
+        }
+    }
+    count
+}
+
+pub(super) async fn handle_pause_transition(
+    worker_id: uuid::Uuid,
+    active_task_table: &ActiveTaskTable,
+    session_data_tx: &std::sync::RwLock<Option<mpsc::Sender<WorkerMessage>>>,
+    pause_stop_timeout: Duration,
+    transition: crate::controls::PauseTransition,
+) {
+    match transition {
+        crate::controls::PauseTransition::BecamePaused => {
+            info!(
+                worker_id = %worker_id,
+                control = "local_pause",
+                "Contributor pause activated; holding new tasks and stopping active tasks"
+            );
+            pause_active_tasks_inner(
+                worker_id,
+                active_task_table,
+                session_data_tx,
+                pause_stop_timeout,
+                "paused by contributor",
+            )
+            .await;
+        }
+        crate::controls::PauseTransition::BecameResumed => {
+            info!(
+                worker_id = %worker_id,
+                control = "local_pause",
+                "Contributor pause cleared; resuming task acceptance"
+            );
+        }
+        crate::controls::PauseTransition::Unchanged => {}
+    }
+}
+
+impl WorkerClient {
     /// Stops a run the worker itself decided to end: its result will not be sent.
     /// Returns the run's join handle so the caller can wait for the cleanup.
     pub(super) fn begin_stop(
@@ -1060,45 +1198,18 @@ impl WorkerClient {
     }
 
     /// Interrupts every active task under a contributor local pause (`worker pause`, `NET-9`),
-    /// waiting up to [`crate::controls::PAUSE_STOP_TIMEOUT`] (`5 s`) for their process trees to
-    /// exit while keeping `suppress_result == false` so each interrupted task reports a design 0090
+    /// waiting up to `pause_stop_timeout` (`5 s`) for their process trees to exit while keeping
+    /// `suppress_result == false` so each interrupted or force-aborted task reports a design 0090
     /// worker refusal and is requeued without charging execution retries.
     pub async fn pause_active_tasks(&self, reason: &str) -> usize {
-        let handles: Vec<TaskExecutionHandle> = {
-            let mut lock = self.active_task_table.write().await;
-            lock.drain().map(|(_, handle)| handle).collect()
-        };
-        if handles.is_empty() {
-            return 0;
-        }
-        let count = handles.len();
-        info!(
-            worker_id = %self.worker_id,
-            tasks = count,
-            reason = %reason,
-            "Pausing active tasks under contributor control; stopping process trees and handing tasks back"
-        );
-        let mut joins: Vec<JoinHandle<()>> = Vec::with_capacity(count);
-        for mut handle in handles {
-            let sent = handle.cancel_tx.take().is_some_and(|tx| {
-                tx.send(CancelSignal::ContributorPause(reason.to_string()))
-                    .is_ok()
-            });
-            if !sent {
-                handle.abort_handle.abort();
-            }
-            if let Some(join) = handle.join.take() {
-                joins.push(join);
-            }
-        }
-        let deadline = tokio::time::Instant::now() + crate::controls::PAUSE_STOP_TIMEOUT;
-        for mut join in joins {
-            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
-                warn!("A paused task did not stop within PAUSE_STOP_TIMEOUT (5 s); aborting it");
-                join.abort();
-            }
-        }
-        count
+        pause_active_tasks_inner(
+            self.worker_id,
+            &self.active_task_table,
+            &self.session_data_tx,
+            self.config.pause_stop_timeout,
+            reason,
+        )
+        .await
     }
 
     /// Cancels the previous run of `task_id`, if any, and waits until it is gone.

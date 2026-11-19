@@ -5,16 +5,19 @@
 //! pause switch (`oxideswarm worker pause|resume|status`) that ends running tasks within `5 s`
 //! without charging a task retry or dropping the master session.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{Datelike, Local, NaiveDate, Timelike, Weekday};
+use chrono::{
+    Datelike, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Weekday,
+};
 use tokio::sync::Notify;
 
 use rusty_grid_core::capabilities::detect_live_mobile_status;
@@ -154,6 +157,34 @@ impl CachedSystemPowerProbe {
             no_battery,
         }
     }
+    pub(crate) fn apply_probe_reading(&self, reading: Option<PowerSource>) {
+        let prev = PowerSource::from_u8(self.cached.load(Ordering::Acquire));
+        match reading {
+            Some(next) => {
+                self.cached.store(next as u8, Ordering::Release);
+                if next != prev {
+                    if next == PowerSource::Unknown {
+                        tracing::warn!(
+                            previous = ?prev,
+                            "Battery probe transitioned to Unknown (no readable battery sensor; pause-on-battery stays inactive while unknown)"
+                        );
+                    } else {
+                        tracing::info!(
+                            previous = ?prev,
+                            current = ?next,
+                            "Battery power source updated"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    last_known = ?prev,
+                    "Battery probe failed or timed out; keeping last known state"
+                );
+            }
+        }
+    }
 }
 
 impl PowerProbe for CachedSystemPowerProbe {
@@ -181,13 +212,13 @@ impl PowerProbe for CachedSystemPowerProbe {
             if mob.is_externally_fed() {
                 if let Some(status) = mob.live_status() {
                     let src = power_from_is_charging(status.is_charging);
-                    self.cached.store(src as u8, Ordering::Release);
+                    self.apply_probe_reading(Some(src));
                     return;
                 }
             }
         }
         let detected = detect_system_power_source_blocking();
-        self.cached.store(detected as u8, Ordering::Release);
+        self.apply_probe_reading(detected);
     }
 }
 
@@ -222,6 +253,35 @@ impl CachedSystemNetworkCostProbe {
             cached: AtomicU8::new(NetworkCost::Unsupported as u8),
         }
     }
+
+    pub(crate) fn apply_probe_reading(&self, reading: Option<NetworkCost>) {
+        let prev = NetworkCost::from_u8(self.cached.load(Ordering::Acquire));
+        match reading {
+            Some(next) => {
+                self.cached.store(next as u8, Ordering::Release);
+                if next != prev {
+                    if next == NetworkCost::Unsupported {
+                        tracing::warn!(
+                            previous = ?prev,
+                            "Metered-network probe transitioned to Unsupported (pause-on-metered stays inactive while unsupported)"
+                        );
+                    } else {
+                        tracing::info!(
+                            previous = ?prev,
+                            current = ?next,
+                            "Metered-network status updated"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    last_known = ?prev,
+                    "Metered-network probe failed or timed out; keeping last known state"
+                );
+            }
+        }
+    }
 }
 
 impl NetworkCostProbe for CachedSystemNetworkCostProbe {
@@ -231,7 +291,7 @@ impl NetworkCostProbe for CachedSystemNetworkCostProbe {
 
     fn refresh_blocking(&self) {
         let detected = detect_network_cost_blocking();
-        self.cached.store(detected as u8, Ordering::Release);
+        self.apply_probe_reading(detected);
     }
 }
 
@@ -276,13 +336,57 @@ impl AllowHoursSchedule {
         })
     }
 
+    fn contains_weekday_minute(&self, weekday: Weekday, minute: u16) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.weekday == weekday && minute >= w.start_minute && minute < w.end_minute)
+    }
+
     /// True if `dt` (in local wall-clock time) falls inside any allowed window.
     pub fn contains(&self, dt: chrono::DateTime<Local>) -> bool {
         let weekday = dt.weekday();
         let minute = (dt.hour() * 60 + dt.minute()) as u16;
-        self.windows
-            .iter()
-            .any(|w| w.weekday == weekday && minute >= w.start_minute && minute < w.end_minute)
+        self.contains_weekday_minute(weekday, minute)
+    }
+
+    /// Duration from `now` until the next minute boundary where `self.contains(...)` flips state,
+    /// or `None` when every minute of the week has the same admission state.
+    pub fn next_transition_after(&self, now: chrono::DateTime<Local>) -> Option<Duration> {
+        let start_wd = now.weekday();
+        let start_min = (now.hour() * 60 + now.minute()) as u16;
+        let current = self.contains_weekday_minute(start_wd, start_min);
+
+        let mut wd = start_wd;
+        let mut min = start_min;
+        for delta_mins in 1u32..=10_080 {
+            min += 1;
+            if min == 1440 {
+                min = 0;
+                wd = wd.succ();
+            }
+            if self.contains_weekday_minute(wd, min) != current {
+                let day_offset = (start_min as u32 + delta_mins) / 1440;
+                let exact_wall = now
+                    .date_naive()
+                    .checked_add_days(Days::new(u64::from(day_offset)))
+                    .and_then(|date| {
+                        let time =
+                            NaiveTime::from_hms_opt(u32::from(min / 60), u32::from(min % 60), 0)?;
+                        Local
+                            .from_local_datetime(&NaiveDateTime::new(date, time))
+                            .earliest()
+                    })
+                    .and_then(|dt| dt.signed_duration_since(now).to_std().ok());
+                let dur = exact_wall.unwrap_or_else(|| {
+                    Duration::from_secs(u64::from(delta_mins) * 60).saturating_sub(Duration::new(
+                        u64::from(now.second().min(59)),
+                        now.nanosecond().min(999_999_999),
+                    ))
+                });
+                return Some(dur.max(Duration::from_millis(1)));
+            }
+        }
+        None
     }
 
     pub fn raw(&self) -> &str {
@@ -696,7 +800,7 @@ impl WorkerControls {
         if !self.paused.swap(true, Ordering::AcqRel) {
             self.pending_transition.store(1, Ordering::Release);
             self.state_notify.notify_waiters();
-            self.pause_notify.notify_waiters();
+            self.pause_notify.notify_one();
         }
     }
 
@@ -705,7 +809,7 @@ impl WorkerControls {
         if self.paused.swap(false, Ordering::AcqRel) {
             self.pending_transition.store(2, Ordering::Release);
             self.state_notify.notify_waiters();
-            self.pause_notify.notify_waiters();
+            self.pause_notify.notify_one();
         }
     }
 
@@ -746,6 +850,14 @@ impl WorkerControls {
     /// Current host CPU percentage reported by the configured [`HostCpuProbe`].
     pub fn host_cpu_pct(&self) -> f32 {
         self.cpu_probe.cpu_usage_pct()
+    }
+
+    /// Time remaining until the next `--allow-hours` window entry or exit boundary, if any.
+    pub fn next_allow_hours_transition(&self) -> Option<Duration> {
+        self.config
+            .allow_hours
+            .as_ref()
+            .and_then(|sched| sched.next_transition_after(self.clock.local_now()))
     }
 
     /// Refreshes blocking OS probes (`battery`, `metered network`) for enabled controls.
@@ -888,67 +1000,390 @@ pub fn default_control_file_path(worker_name: Option<&str>) -> Option<PathBuf> {
     Some(dir.join(file))
 }
 
-fn reject_symlink(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("refusing symbolic link at control file {}", path.display()),
-                ))
-            } else {
-                Ok(())
-            }
+/// Companion PID file written alongside a worker's pause control file (`<control_file>.watch`)
+/// so `oxideswarm worker pause` / `status` can warn when no live worker watches that path.
+pub fn watch_file_path(control_file: &Path) -> PathBuf {
+    let mut os: OsString = control_file.as_os_str().to_os_string();
+    os.push(".watch");
+    PathBuf::from(os)
+}
+
+/// Live-watcher state read from `<control_file>.watch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherStatus {
+    Watching { pid: u32 },
+    Stale { pid: u32 },
+    NotWatching,
+}
+
+fn control_parent(path: &Path) -> io::Result<&Path> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid control file path {}", path.display()),
+        ));
+    }
+    Ok(path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".")))
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid()` is thread-safe and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+fn validate_control_parent_dir(parent: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(parent)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing symbolic link at control file directory {}",
+                parent.display()
+            ),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "control file parent {} is not a directory",
+                parent.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = current_euid();
+        if meta.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file directory {} belongs to uid {}, expected {euid}",
+                    parent.display(),
+                    meta.uid()
+                ),
+            ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing unsafe shared control file directory {} (mode {:o} is group/world-writable)",
+                    parent.display(),
+                    mode
+                ),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use rusty_grid_core::private_file::{
+            current_user_sid, dir_write_grants, inspect_dir_security_no_follow,
+            is_trusted_owner_sid,
+        };
+        let snap = inspect_dir_security_no_follow(parent)?;
+        if snap.is_reparse_point {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing link/reparse point at control file directory {}",
+                    parent.display()
+                ),
+            ));
+        }
+        if !snap.is_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "control file parent {} is not a directory",
+                    parent.display()
+                ),
+            ));
+        }
+        let user_sid = current_user_sid()?;
+        let owner = snap.owner_sid.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot verify owner of {}: {e}", parent.display()),
+            )
+        })?;
+        if !is_trusted_owner_sid(&owner, &user_sid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file directory {} belongs to {owner}, not current user",
+                    parent.display()
+                ),
+            ));
+        }
+        let (aces, _) = snap.dacl.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot verify DACL of {}: {e}", parent.display()),
+            )
+        })?;
+        let offenders = dir_write_grants(&aces, &user_sid);
+        if !offenders.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing unsafe control file directory {}: grants write access to {:?}",
+                    parent.display(),
+                    offenders
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_safe_control_parent(parent: &Path, create_missing: bool) -> io::Result<bool> {
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {
+            validate_control_parent_dir(parent)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if !create_missing {
+                return Ok(false);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+                let mut missing_dirs = Vec::new();
+                let mut cur = parent.to_path_buf();
+                loop {
+                    match fs::symlink_metadata(&cur) {
+                        Ok(_) => break,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            let Some(name) = cur.file_name().map(OsString::from) else {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    format!(
+                                        "control file parent {} has no existing ancestor",
+                                        parent.display()
+                                    ),
+                                ));
+                            };
+                            missing_dirs.push(name);
+                            match cur.parent() {
+                                Some(p) if !p.as_os_str().is_empty() => cur = p.to_path_buf(),
+                                _ => {
+                                    cur = PathBuf::from(".");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                let anc_meta = fs::metadata(&cur)?;
+                if !anc_meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("control file ancestor {} is not a directory", cur.display()),
+                    ));
+                }
+                let euid = current_euid();
+                if anc_meta.uid() != 0 && anc_meta.uid() != euid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "control file ancestor {} belongs to uid {}",
+                            cur.display(),
+                            anc_meta.uid()
+                        ),
+                    ));
+                }
+                let anc_mode = anc_meta.permissions().mode() & 0o7777;
+                if anc_mode & 0o022 != 0 && anc_mode & 0o1000 == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to create control file directory under unsafe shared ancestor {} (mode {:o} without sticky bit)",
+                            cur.display(),
+                            anc_mode
+                        ),
+                    ));
+                }
+                for component in missing_dirs.into_iter().rev() {
+                    cur.push(component);
+                    match fs::DirBuilder::new().mode(0o700).create(&cur) {
+                        Ok(()) => {
+                            let _ = fs::set_permissions(&cur, fs::Permissions::from_mode(0o700));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                rusty_grid_core::private_file::create_or_open_private_dir_all(parent)?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                fs::create_dir_all(parent)?;
+            }
+            validate_control_parent_dir(parent)?;
+            Ok(true)
+        }
         Err(e) => Err(e),
     }
 }
 
-/// Writes the local pause control file with owner-only permissions (`0700` dir, `0600` file on Unix)
-/// and refuses symbolic links.
-pub fn write_pause_file(path: &Path) -> io::Result<()> {
-    reject_symlink(path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-        reject_symlink(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+fn validate_control_file_meta(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symbolic link at control file {}", path.display()),
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing non-regular control file {}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = current_euid();
+        if meta.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file {} belongs to uid {}, expected {euid}",
+                    path.display(),
+                    meta.uid()
+                ),
+            ));
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing unsafe control file {} (mode {:o} is group/world-writable)",
+                    path.display(),
+                    mode
+                ),
+            ));
         }
     }
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use rusty_grid_core::private_file::{
+            current_user_sid, dir_write_grants, inspect_dir_security_no_follow,
+            is_trusted_owner_sid,
+        };
+        let snap = inspect_dir_security_no_follow(path)?;
+        if snap.is_reparse_point || snap.is_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing unsafe control file {}", path.display()),
+            ));
+        }
+        let user_sid = current_user_sid()?;
+        let owner = snap.owner_sid.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot verify owner of {}: {e}", path.display()),
+            )
+        })?;
+        if !is_trusted_owner_sid(&owner, &user_sid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file {} belongs to {owner}, not current user",
+                    path.display()
+                ),
+            ));
+        }
+        let (aces, _) = snap.dacl.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot verify DACL of {}: {e}", path.display()),
+            )
+        })?;
+        let offenders = dir_write_grants(&aces, &user_sid);
+        if !offenders.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing unsafe control file {}: grants write access to {:?}",
+                    path.display(),
+                    offenders
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_private_control_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = control_parent(path)?;
+    ensure_safe_control_parent(parent, true)?;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        validate_control_file_meta(path, &meta)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
         let mut file = opts.open(path)?;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        file.write_all(b"paused\n")?;
+        let fd_meta = file.metadata()?;
+        validate_control_file_meta(path, &fd_meta)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.set_len(0)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let mut file = opts.open(path)?;
-        file.write_all(b"paused\n")?;
+        rusty_grid_core::private_file::write_private_replace(path, bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
     }
 }
 
-/// Removes the local pause control file if present (`Ok(false)` if absent), refusing symlinks.
+/// Writes the local pause control file with owner-only permissions (`0700` on newly created dirs,
+/// `0600` on the file on Unix) without changing existing parent permissions, refusing symlinks and
+/// unsafe shared parent directories or files.
+pub fn write_pause_file(path: &Path) -> io::Result<()> {
+    write_private_control_file(path, b"paused\n")
+}
+
+/// Removes the local pause control file if present (`Ok(false)` if absent), refusing symlinks and
+/// unsafe parent directories or files.
 pub fn remove_pause_file(path: &Path) -> io::Result<bool> {
+    let parent = control_parent(path)?;
+    if !ensure_safe_control_parent(parent, false)? {
+        return Ok(false);
+    }
     match fs::symlink_metadata(path) {
         Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("refusing symbolic link at control file {}", path.display()),
-                ));
-            }
+            validate_control_file_meta(path, &meta)?;
             fs::remove_file(path)?;
             Ok(true)
         }
@@ -957,22 +1392,163 @@ pub fn remove_pause_file(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Returns `true` if a regular pause control file exists at `path`, `false` if absent, and errors
-/// on symbolic links.
+/// Returns `true` if a valid owner-private regular pause control file exists at `path`, `false` if
+/// absent, and errors on symbolic links or unsafe shared parent directories/files.
 pub fn is_pause_file_present(path: &Path) -> io::Result<bool> {
+    let parent = control_parent(path)?;
+    if !ensure_safe_control_parent(parent, false)? {
+        return Ok(false);
+    }
     match fs::symlink_metadata(path) {
         Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("refusing symbolic link at control file {}", path.display()),
-                ))
-            } else {
-                Ok(meta.is_file())
-            }
+            validate_control_file_meta(path, &meta)?;
+            Ok(true)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Records the current worker's PID in `<control_file>.watch` using the same safety rules as
+/// [`write_pause_file`].
+pub fn write_watch_file(control_file: &Path) -> io::Result<PathBuf> {
+    let path = watch_file_path(control_file);
+    let body = format!("{}\n", std::process::id());
+    write_private_control_file(&path, body.as_bytes())?;
+    Ok(path)
+}
+
+fn read_validated_watch_pid(watch_path: &Path) -> io::Result<Option<u32>> {
+    let parent = control_parent(watch_path)?;
+    if !ensure_safe_control_parent(parent, false)? {
+        return Ok(None);
+    }
+    let meta = match fs::symlink_metadata(watch_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    validate_control_file_meta(watch_path, &meta)?;
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(watch_path)?
+        }
+        #[cfg(not(unix))]
+        {
+            fs::File::open(watch_path)?
+        }
+    };
+    let mut buf = [0u8; 64];
+    let n = file.read(&mut buf)?;
+    let text = std::str::from_utf8(&buf[..n]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-UTF-8 watcher PID in {}", watch_path.display()),
+        )
+    })?;
+    let pid: u32 = text.trim().parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid watcher PID {:?} in {}",
+                text.trim(),
+                watch_path.display()
+            ),
+        )
+    })?;
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("zero PID in {}", watch_path.display()),
+        ));
+    }
+    Ok(Some(pid))
+}
+
+/// Removes `<control_file>.watch` only if it exists, passes safety checks, and records this
+/// process's own PID.
+pub fn remove_watch_file_if_owned(control_file: &Path) -> io::Result<bool> {
+    let watch_path = watch_file_path(control_file);
+    let Some(pid) = read_validated_watch_pid(&watch_path)? else {
+        return Ok(false);
+    };
+    if pid != std::process::id() {
+        return Ok(false);
+    }
+    match fs::remove_file(&watch_path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(
+        dw_desired_access: u32,
+        b_inherit_handle: i32,
+        dw_process_id: u32,
+    ) -> *mut core::ffi::c_void;
+    fn GetExitCodeProcess(h_process: *mut core::ffi::c_void, lp_exit_code: *mut u32) -> i32;
+    fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+}
+
+/// Returns `true` when OS process `pid` is currently alive.
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: `kill(pid, 0)` only queries process existence and sends no signal.
+        let rc = unsafe { libc::kill(raw_pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: `OpenProcess` takes only value arguments and returns a handle or null.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+        }
+        let mut exit_code: u32 = 0;
+        // SAFETY: `handle` is non-null from `OpenProcess` and `exit_code` points to a local `u32`.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code as *mut u32) };
+        // SAFETY: `handle` was opened by `OpenProcess` above and is closed once here.
+        unsafe { CloseHandle(handle) };
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+/// Checks `<control_file>.watch` and verifies whether the recorded worker PID is currently alive.
+pub fn check_watcher_status(control_file: &Path) -> io::Result<WatcherStatus> {
+    let watch_path = watch_file_path(control_file);
+    let Some(pid) = read_validated_watch_pid(&watch_path)? else {
+        return Ok(WatcherStatus::NotWatching);
+    };
+    if is_process_alive(pid) {
+        Ok(WatcherStatus::Watching { pid })
+    } else {
+        Ok(WatcherStatus::Stale { pid })
     }
 }
 
@@ -1008,7 +1584,7 @@ pub fn parse_windows_power_status(ac_line_status: u8, battery_flag: u8) -> Power
     }
 }
 
-fn detect_system_power_source_blocking() -> PowerSource {
+fn detect_system_power_source_blocking() -> Option<PowerSource> {
     #[cfg(windows)]
     {
         let mut status = Win32SystemPowerStatus {
@@ -1024,14 +1600,15 @@ fn detect_system_power_source_blocking() -> PowerSource {
         if ok != 0 {
             let win_src = parse_windows_power_status(status.ac_line_status, status.battery_flag);
             if win_src != PowerSource::Unknown {
-                return win_src;
+                return Some(win_src);
             }
+            if let Some(status) = detect_live_mobile_status() {
+                return Some(power_from_is_charging(status.is_charging));
+            }
+            return Some(PowerSource::Unknown);
         }
     }
-    if let Some(status) = detect_live_mobile_status() {
-        return power_from_is_charging(status.is_charging);
-    }
-    PowerSource::Unknown
+    detect_live_mobile_status().map(|status| power_from_is_charging(status.is_charging))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -1055,7 +1632,6 @@ fn run_command_bounded(program: &str, args: &[&str], timeout: Duration) -> Optio
                 if !status.success() {
                     return None;
                 }
-                use std::io::Read;
                 let mut out = String::new();
                 if let Some(mut stdout) = child.stdout.take() {
                     let _ = stdout.read_to_string(&mut out);
@@ -1173,17 +1749,25 @@ pub fn parse_windows_connection_cost(output: &str) -> NetworkCost {
     NetworkCost::Unsupported
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_windows_powershell_path(system_root: Option<&str>) -> String {
+    let base = system_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\Windows")
+        .trim_end_matches(['\\', '/']);
+    format!(r"{base}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 #[cfg(target_os = "macos")]
-fn detect_network_cost_blocking() -> NetworkCost {
-    let Some(nwi) = run_command_bounded("scutil", &["--nwi"], Duration::from_secs(2)) else {
-        return NetworkCost::Unsupported;
-    };
+fn detect_network_cost_blocking() -> Option<NetworkCost> {
+    let nwi = run_command_bounded("scutil", &["--nwi"], Duration::from_secs(2))?;
     let (is_wwan, ifaces) = parse_macos_scutil_nwi(&nwi);
     if is_wwan {
-        return NetworkCost::Metered;
+        return Some(NetworkCost::Metered);
     }
     if ifaces.is_empty() {
-        return NetworkCost::Unsupported;
+        return Some(NetworkCost::Unsupported);
     }
     let mut saw_any = false;
     for iface in ifaces {
@@ -1192,27 +1776,29 @@ fn detect_network_cost_blocking() -> NetworkCost {
         {
             saw_any = true;
             if parse_macos_ifconfig_v(&ifcfg) {
-                return NetworkCost::Metered;
+                return Some(NetworkCost::Metered);
             }
         }
     }
     if saw_any {
-        NetworkCost::Unmetered
+        Some(NetworkCost::Unmetered)
     } else {
-        NetworkCost::Unsupported
+        None
     }
 }
 
 #[cfg(target_os = "linux")]
-fn detect_network_cost_blocking() -> NetworkCost {
+fn detect_network_cost_blocking() -> Option<NetworkCost> {
+    let mut saw_probe = false;
     if let Some(out) = run_command_bounded(
         "nmcli",
         &["-t", "-f", "METERED", "general"],
         Duration::from_secs(2),
     ) {
+        saw_probe = true;
         let parsed = parse_linux_nmcli_metered(&out);
         if parsed != NetworkCost::Unsupported {
-            return parsed;
+            return Some(parsed);
         }
     }
     if let Some(out) = run_command_bounded(
@@ -1226,13 +1812,13 @@ fn detect_network_cost_blocking() -> NetworkCost {
         ],
         Duration::from_secs(2),
     ) {
-        return parse_linux_busctl_metered(&out);
+        return Some(parse_linux_busctl_metered(&out));
     }
-    NetworkCost::Unsupported
+    saw_probe.then_some(NetworkCost::Unsupported)
 }
 
 #[cfg(windows)]
-fn detect_network_cost_blocking() -> NetworkCost {
+fn detect_network_cost_blocking() -> Option<NetworkCost> {
     const SCRIPT: &str = "\
 Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null; \
 $p = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile(); \
@@ -1243,17 +1829,16 @@ if ($null -eq $p) { 'Unsupported' } else { \
   elseif ($c.NetworkCostType -eq 'Unrestricted') { 'Unmetered' } \
   else { 'Unsupported' } \
 }";
-    if let Some(out) = run_command_bounded(
-        "powershell.exe",
+    let powershell = resolve_windows_powershell_path(std::env::var("SystemRoot").ok().as_deref());
+    run_command_bounded(
+        &powershell,
         &["-NoProfile", "-NonInteractive", "-Command", SCRIPT],
         Duration::from_secs(3),
-    ) {
-        return parse_windows_connection_cost(&out);
-    }
-    NetworkCost::Unsupported
+    )
+    .map(|out| parse_windows_connection_cost(&out))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn detect_network_cost_blocking() -> NetworkCost {
-    NetworkCost::Unsupported
+fn detect_network_cost_blocking() -> Option<NetworkCost> {
+    Some(NetworkCost::Unsupported)
 }

@@ -23,8 +23,9 @@ mod wire_layout_tests;
 
 pub use arbitrage::{LeaseValidationError, MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
 pub use capabilities::{
-    calculate_effective_concurrency, calculate_keepalive_interval, is_task_eligible, BatteryTier,
-    MobileCapabilities, MobileLiveStatus, ThermalTier, WorkerCapabilities,
+    calculate_effective_concurrency, calculate_keepalive_interval, is_contributor_hold_cpu_pct,
+    is_task_eligible, BatteryTier, MobileCapabilities, MobileLiveStatus, ThermalTier,
+    WorkerCapabilities, CONTRIBUTOR_HOLD_CPU_PCT,
 };
 pub use cluster_auth::{client_handshake, server_handshake, ClusterSecret};
 pub use discovery::{

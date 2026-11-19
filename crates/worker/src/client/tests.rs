@@ -1187,6 +1187,8 @@ async fn test_cleanup_of_an_old_run_never_removes_the_entry_of_a_newer_one() {
             started_at_epoch_sec: 0,
             attempt: 2,
             suppress_result: Arc::new(AtomicBool::new(false)),
+            result_sent: Arc::new(AtomicBool::new(false)),
+            outbound_tx: None,
             join: None,
         },
     );
@@ -4265,4 +4267,114 @@ async fn test_worker_reports_a_previous_version_master_refusing_its_register() {
         matches!(&err, GridError::RegistrationRejected(m) if m.contains("Incompatible protocol version")),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn test_pause_active_tasks_timeout_abort_still_sends_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = WorkerConfig::new("127.0.0.1:1")
+        .with_no_battery(true)
+        .with_sandbox_base_dir(dir.path())
+        .with_pause_stop_timeout(Duration::from_millis(40));
+    let client = WorkerClient::new(cfg);
+    let (tx, mut rx) = mpsc::channel(8);
+    *client.session_data_tx.write().unwrap() = Some(tx.clone());
+
+    let task_id = TaskId::new();
+    let (cancel_tx, _cancel_rx_never_polled) = tokio::sync::oneshot::channel::<CancelSignal>();
+    let join = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    client.active_task_table().write().await.insert(
+        task_id,
+        TaskExecutionHandle {
+            task_id,
+            cancel_tx: Some(cancel_tx),
+            abort_handle: join.abort_handle(),
+            child_pid: Arc::new(AtomicU32::new(0)),
+            started_at_epoch_sec: 0,
+            attempt: 1,
+            suppress_result: Arc::new(AtomicBool::new(false)),
+            result_sent: Arc::new(AtomicBool::new(false)),
+            outbound_tx: Some(tx),
+            join: Some(join),
+        },
+    );
+
+    let paused = client.pause_active_tasks("paused by contributor").await;
+    assert_eq!(paused, 1);
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("abort refusal timeout")
+        .expect("TaskResult");
+    match msg {
+        WorkerMessage::TaskResult {
+            task_id: got_id,
+            exit_code,
+            execution_time_ms,
+            stdout,
+            error,
+            ..
+        } => {
+            assert_eq!(got_id, task_id);
+            assert_eq!(exit_code, 1);
+            assert_eq!(execution_time_ms, 0);
+            assert!(stdout.is_empty());
+            assert!(
+                error.as_deref().is_some_and(
+                    |e| e.starts_with(rusty_grid_core::CONTRIBUTOR_CONTROL_REFUSAL_PREFIX)
+                ),
+                "unexpected error: {error:?}"
+            );
+        }
+        other => panic!("expected TaskResult refusal after abort, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_pause_active_tasks_without_cancel_tx_still_sends_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = WorkerConfig::new("127.0.0.1:1")
+        .with_no_battery(true)
+        .with_sandbox_base_dir(dir.path());
+    let client = WorkerClient::new(cfg);
+    let (tx, mut rx) = mpsc::channel(8);
+
+    let task_id = TaskId::new();
+    let join = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    client.active_task_table().write().await.insert(
+        task_id,
+        TaskExecutionHandle {
+            task_id,
+            cancel_tx: None,
+            abort_handle: join.abort_handle(),
+            child_pid: Arc::new(AtomicU32::new(0)),
+            started_at_epoch_sec: 0,
+            attempt: 1,
+            suppress_result: Arc::new(AtomicBool::new(false)),
+            result_sent: Arc::new(AtomicBool::new(false)),
+            outbound_tx: Some(tx),
+            join: Some(join),
+        },
+    );
+
+    let paused = client.pause_active_tasks("paused by contributor").await;
+    assert_eq!(paused, 1);
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("abort refusal timeout")
+        .expect("TaskResult");
+    assert!(matches!(
+        msg,
+        WorkerMessage::TaskResult {
+            task_id: got_id,
+            exit_code: 1,
+            execution_time_ms: 0,
+            ..
+        } if got_id == task_id
+    ));
 }

@@ -2002,7 +2002,7 @@
                             <rect x="110" y="7" width="36" height="13" rx="2.5" fill="${rc.bg}"/>
                             <text x="128" y="16.5" fill="${rc.fg}" font-size="7" font-weight="700" text-anchor="middle">${shortText(role, 6)}</text>
                             <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${num(w.cpu_cores)} Cores • ${fmtGb(w.ram_mb)} GB RAM</text>
-                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${t.label} • CPU ${num(w.cpu_usage_pct).toFixed(1)}%</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${t.label} • ${online && num(w.cpu_usage_pct) > 100 ? 'Paused' : `CPU ${num(w.cpu_usage_pct).toFixed(1)}%`}</text>
                         </g>`;
         }
 
@@ -2211,13 +2211,15 @@
                 const role = w.role || 'WORKER';
                 const tagClass = role === 'ORCH' ? 'tag-orch' : (role === 'GPU' ? 'tag-gpu' : 'tag-worker');
                 const isOnline = isOnlineStatus(w.status);
+                const isHeld = isOnline && num(w.cpu_usage_pct) > 100;
                 const isBusy = w.status === 'Busy';
                 const dotClass = isOnline ? (isBusy ? 'dot-busy' : 'dot-online') : 'dot-offline';
 
                 // Telemetry: CPU
-                const cpuPct = Math.min(100, Math.max(0, Math.round(num(w.cpu_usage_pct))));
+                const cpuPct = isHeld ? 0 : Math.min(100, Math.max(0, Math.round(num(w.cpu_usage_pct))));
                 const cpuBlocks = renderBlocks(cpuPct);
                 const cpuCls = getFillClass(cpuPct);
+                const cpuText = isHeld ? 'Paused' : `${cpuPct}%`;
 
                 // Telemetry: RAM
                 const ramMb = num(w.ram_mb);
@@ -2268,7 +2270,7 @@
                         <div class="device-card" data-wid="${w.id}">
                             <div class="card-row-1">
                                 <div class="card-id-group">
-                                    <span class="status-dot ${dotClass}" title="Status: ${w.status}"></span>
+                                    <span class="status-dot ${dotClass}" title="${isHeld ? 'Status: Paused (contributor hold)' : `Status: ${w.status}`}"></span>
                                     <span class="role-badge ${tagClass}">${role}</span>
                                     <span class="node-name" title="${w.name}">${w.name}</span>
                                 </div>
@@ -2283,7 +2285,7 @@
                                     <span class="m-label">CPU:</span>
                                     <span class="meter-blocks">[${cpuBlocks}]</span>
                                     <span class="meter-track"><span class="meter-fill ${cpuCls}" style="width: ${cpuPct}%"></span></span>
-                                    <span>${cpuPct}%</span>
+                                    <span>${cpuText}</span>
                                 </div>
                                 <div class="metric-pill">
                                     <span class="m-label">RAM:</span>
@@ -2418,7 +2420,7 @@
             if (coresEl) coresEl.textContent = `${num(w.cpu_cores)} Cores (Phần cứng thật)`;
 
             const cpuEl = document.getElementById('mCpu');
-            if (cpuEl) cpuEl.textContent = `${Math.round(num(w.cpu_usage_pct))}%`;
+            if (cpuEl) cpuEl.textContent = (isOnline && num(w.cpu_usage_pct) > 100) ? 'Paused' : `${Math.round(num(w.cpu_usage_pct))}%`;
 
             const ramMb = num(w.ram_mb);
             const ramTotalEl = document.getElementById('mRamTotal');

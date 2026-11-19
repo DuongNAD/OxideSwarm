@@ -799,8 +799,8 @@ pub(super) struct ContributorControlInputs<'a> {
     pub(super) max_host_cpu_pct: Option<f32>,
     pub(super) allow_hours: Option<&'a str>,
     pub(super) daily_task_hours: Option<f64>,
-    pub(super) pause_on_battery: bool,
-    pub(super) pause_on_metered: bool,
+    pub(super) pause_on_battery: Option<bool>,
+    pub(super) pause_on_metered: Option<bool>,
     pub(super) control_file: Option<&'a std::path::Path>,
 }
 
@@ -868,8 +868,8 @@ pub(super) fn resolve_contributor_controls_from(
         None
     };
 
-    let pause_on_battery = if cli.pause_on_battery {
-        true
+    let pause_on_battery = if let Some(v) = cli.pause_on_battery {
+        v
     } else if let Some(raw) =
         get_env("RUSTY_GRID_PAUSE_ON_BATTERY").filter(|s| !s.trim().is_empty())
     {
@@ -878,8 +878,8 @@ pub(super) fn resolve_contributor_controls_from(
         worker_cfg.and_then(|w| w.pause_on_battery).unwrap_or(false)
     };
 
-    let pause_on_metered = if cli.pause_on_metered {
-        true
+    let pause_on_metered = if let Some(v) = cli.pause_on_metered {
+        v
     } else if let Some(raw) =
         get_env("RUSTY_GRID_PAUSE_ON_METERED").filter(|s| !s.trim().is_empty())
     {
@@ -933,6 +933,33 @@ fn format_controls_summary(cfg: &ContributorControlsConfig) -> Option<String> {
     Some(format!("Contributor controls: {}", parts.join(", ")))
 }
 
+fn warn_if_no_watcher(path: &std::path::Path) -> Option<u32> {
+    match rusty_grid_worker::check_watcher_status(path) {
+        Ok(rusty_grid_worker::WatcherStatus::Watching { pid }) => Some(pid),
+        Ok(rusty_grid_worker::WatcherStatus::Stale { pid }) => {
+            eprintln!(
+                "Warning: no live worker is watching {} (stale watcher PID {pid}). If the worker runs with --name or as a service/daemon under another account, pass --name or --control-file pointing to its control file.",
+                path.display()
+            );
+            None
+        }
+        Ok(rusty_grid_worker::WatcherStatus::NotWatching) => {
+            eprintln!(
+                "Warning: no running worker is watching {}. If the worker runs with --name or as a service/daemon under another account, pass --name or --control-file pointing to its control file.",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not inspect watcher file for {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn run_worker_control_action(
     action: WorkerAction,
     top_name: Option<String>,
@@ -965,6 +992,7 @@ fn run_worker_control_action(
         "pause" => match write_pause_file(&path) {
             Ok(()) => {
                 println!("Worker paused (control file: {}).", path.display());
+                warn_if_no_watcher(&path);
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -997,11 +1025,25 @@ fn run_worker_control_action(
         },
         _ => match is_pause_file_present(&path) {
             Ok(true) => {
-                println!("Worker status: paused (control file: {})", path.display());
+                if let Some(pid) = warn_if_no_watcher(&path) {
+                    println!(
+                        "Worker status: paused (control file: {}, watched by worker PID {pid})",
+                        path.display()
+                    );
+                } else {
+                    println!("Worker status: paused (control file: {})", path.display());
+                }
                 ExitCode::SUCCESS
             }
             Ok(false) => {
-                println!("Worker status: active (control file: {})", path.display());
+                if let Some(pid) = warn_if_no_watcher(&path) {
+                    println!(
+                        "Worker status: active (control file: {}, watched by worker PID {pid})",
+                        path.display()
+                    );
+                } else {
+                    println!("Worker status: active (control file: {})", path.display());
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -1152,8 +1194,8 @@ mod tests {
                 max_host_cpu_pct: Some(80.0),
                 allow_hours: Some("Sat-Sun 10:00-18:00"),
                 daily_task_hours: Some(1.5),
-                pause_on_battery: true,
-                pause_on_metered: true,
+                pause_on_battery: Some(true),
+                pause_on_metered: Some(true),
                 control_file: Some(&cli_ctrl_path),
             },
             Some(&cfg),
@@ -1170,6 +1212,47 @@ mod tests {
         assert!(resolved_cli.pause_on_battery);
         assert!(resolved_cli.pause_on_metered);
         assert_eq!(resolved_cli.control_file, Some(cli_ctrl_path));
+
+        // Explicit `--pause-on-battery=false` / `--pause-on-metered=false` override env & config `true`.
+        let parsed_false = Cli::try_parse_from([
+            "oxideswarm",
+            "worker",
+            "--pause-on-battery=false",
+            "--pause-on-metered=false",
+        ])
+        .unwrap();
+        let Commands::Worker(false_args) = parsed_false.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(false_args.pause_on_battery, Some(false));
+        assert_eq!(false_args.pause_on_metered, Some(false));
+        let overridden_false = resolve_contributor_controls_from(
+            ContributorControlInputs {
+                pause_on_battery: false_args.pause_on_battery,
+                pause_on_metered: false_args.pause_on_metered,
+                ..Default::default()
+            },
+            Some(&cfg),
+            Some("w1"),
+            |k| match k {
+                "RUSTY_GRID_PAUSE_ON_BATTERY" | "RUSTY_GRID_PAUSE_ON_METERED" => {
+                    Some("true".to_string())
+                }
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(!overridden_false.pause_on_battery);
+        assert!(!overridden_false.pause_on_metered);
+
+        // Bare `--pause-on-battery` still sets `Some(true)` and leaves subcommand positional args intact.
+        let parsed_true =
+            Cli::try_parse_from(["oxideswarm", "worker", "--pause-on-battery"]).unwrap();
+        let Commands::Worker(true_args) = parsed_true.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(true_args.pause_on_battery, Some(true));
+        assert_eq!(true_args.pause_on_metered, None);
 
         // Invalid values fail loudly.
         assert!(resolve_contributor_controls_from(
@@ -1246,5 +1329,10 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(ctrl_path.exists());
+        assert_eq!(warn_if_no_watcher(&ctrl_path), None);
+
+        rusty_grid_worker::write_watch_file(&ctrl_path).unwrap();
+        assert_eq!(warn_if_no_watcher(&ctrl_path), Some(std::process::id()));
+        assert!(rusty_grid_worker::remove_watch_file_if_owned(&ctrl_path).unwrap());
     }
 }

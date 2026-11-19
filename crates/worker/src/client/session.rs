@@ -24,7 +24,7 @@ use rusty_grid_core::task::{TaskId, TaskResult};
 
 use crate::backoff::ExponentialBackoff;
 use crate::blob_client::{upload_task_outputs, BlobClient};
-use crate::controls::{PauseTransition, CONTROL_FILE_POLL_INTERVAL, RESOURCE_PROBE_POLL_INTERVAL};
+use crate::controls::RESOURCE_PROBE_POLL_INTERVAL;
 use crate::heartbeat::{
     current_epoch_secs, spawn_adaptive_heartbeat_task_with_controls, IoClock, StampedStream,
 };
@@ -961,10 +961,6 @@ impl WorkerClient {
                     }
                 }))
             });
-        let has_control_file = self.controls.config().control_file.is_some();
-        let mut control_file_ticker = tokio::time::interval(CONTROL_FILE_POLL_INTERVAL);
-        control_file_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let ctrl_pause_notify = self.controls.pause_notify();
 
         let mut dead_after =
             self.dead_peer_timeout(self.current_keepalive_interval(heartbeat_interval));
@@ -1203,16 +1199,6 @@ impl WorkerClient {
                         break Ok(());
                     }
                 }
-
-                // Contributor local pause/resume file poll & in-process notify (`NET-9`)
-                _ = control_file_ticker.tick(), if has_control_file => {
-                    let transition = self.controls.sync_pause_file();
-                    self.apply_pause_transition(transition).await;
-                }
-                _ = ctrl_pause_notify.notified() => {
-                    let transition = self.controls.sync_pause_file();
-                    self.apply_pause_transition(transition).await;
-                }
             }
         };
 
@@ -1251,27 +1237,6 @@ impl WorkerClient {
         }
 
         outcome
-    }
-
-    async fn apply_pause_transition(&self, transition: PauseTransition) {
-        match transition {
-            PauseTransition::BecamePaused => {
-                info!(
-                    worker_id = %self.worker_id,
-                    control = "local_pause",
-                    "Contributor pause activated; holding new tasks and stopping active tasks"
-                );
-                self.pause_active_tasks("paused by contributor").await;
-            }
-            PauseTransition::BecameResumed => {
-                info!(
-                    worker_id = %self.worker_id,
-                    control = "local_pause",
-                    "Contributor pause cleared; resuming task acceptance"
-                );
-            }
-            PauseTransition::Unchanged => {}
-        }
     }
 
     /// Executes the cluster authentication (when a secret is configured) and the atomic

@@ -32,11 +32,12 @@ pub use client::{
     compute_effective_resume_grace, WorkerClient, WorkerConfig, RESUME_SAFETY_MARGIN,
 };
 pub use controls::{
-    default_control_file_path, is_pause_file_present, remove_pause_file, validate_daily_task_hours,
-    validate_max_host_cpu_pct, write_pause_file, AllowHoursSchedule, AtomicHostCpuProbe,
-    BlockReason, Clock, ContributorControlsConfig, HostCpuProbe, NetworkCost, NetworkCostProbe,
-    PauseTransition, PowerProbe, PowerSource, SystemClock, WorkerControls, WorkerControlsHandle,
-    PAUSE_STOP_TIMEOUT,
+    check_watcher_status, default_control_file_path, is_pause_file_present, is_process_alive,
+    remove_pause_file, remove_watch_file_if_owned, validate_daily_task_hours,
+    validate_max_host_cpu_pct, watch_file_path, write_pause_file, write_watch_file,
+    AllowHoursSchedule, AtomicHostCpuProbe, BlockReason, Clock, ContributorControlsConfig,
+    HostCpuProbe, NetworkCost, NetworkCostProbe, PauseTransition, PowerProbe, PowerSource,
+    SystemClock, WatcherStatus, WorkerControls, WorkerControlsHandle, PAUSE_STOP_TIMEOUT,
 };
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
@@ -50,6 +51,7 @@ pub use runner::{
     EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_INTERRUPTED, EXIT_CODE_SUCCESS,
     EXIT_CODE_TIMEOUT,
 };
+pub use rusty_grid_core::{is_contributor_hold_cpu_pct, CONTRIBUTOR_HOLD_CPU_PCT};
 pub use sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 pub use sim::{
     FakeRunnerConfig, LinkLossAction, SimulatedLinkConfig, SimulatedLinkStream,

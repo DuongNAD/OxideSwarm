@@ -97,10 +97,17 @@ async fn listed_worker(
         rusty_grid_core::placement::ID_TAG_PREFIX,
         w.worker_id
     ));
+    let state_str = if w.status == crate::registry::WorkerStatus::Connected
+        && rusty_grid_core::is_contributor_hold_cpu_pct(w.cpu_usage_pct)
+    {
+        "held"
+    } else {
+        w.status.as_str()
+    };
     caps.tags.push(format!(
         "{}{}",
         rusty_grid_core::placement::STATE_TAG_PREFIX,
-        w.status.as_str()
+        state_str
     ));
     if w.features
         .contains(rusty_grid_core::protocol::ProtocolCapabilities::WORKSPACES)

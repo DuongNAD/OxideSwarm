@@ -5,6 +5,17 @@ use std::time::Duration;
 
 use crate::task::TaskRequirements;
 
+/// Synthetic `cpu_usage_pct` sent in `WorkerMessage::Heartbeat` while a local contributor
+/// control (`NET-9`, design 0095) is holding back new assignments. Exceeds `100.0` so no real
+/// CPU reading can collide with it and so a master with `--max-host-cpu-pct 100` still gates
+/// dispatch (`seat.worker.cpu_usage_pct > config.max_host_cpu_pct`).
+pub const CONTRIBUTOR_HOLD_CPU_PCT: f32 = 101.0;
+
+/// True when a heartbeat `cpu_usage_pct` carries the contributor-hold sentinel (`> 100.0`).
+pub fn is_contributor_hold_cpu_pct(cpu_usage_pct: f32) -> bool {
+    cpu_usage_pct > 100.0
+}
+
 /// Battery status tier for mobile load-shedding and concurrency limiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BatteryTier {

@@ -657,15 +657,21 @@ pub struct WorkerArgs {
 
     #[arg(
         long,
-        help = "Pause new task admission while the host runs on battery (env RUSTY_GRID_PAUSE_ON_BATTERY, config [worker].pause_on_battery)"
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Pause new task admission while the host runs on battery; pass --pause-on-battery=false to override env/config (env RUSTY_GRID_PAUSE_ON_BATTERY, config [worker].pause_on_battery)"
     )]
-    pub pause_on_battery: bool,
+    pub pause_on_battery: Option<bool>,
 
     #[arg(
         long,
-        help = "Pause new task admission while the OS reports a metered network (env RUSTY_GRID_PAUSE_ON_METERED, config [worker].pause_on_metered)"
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Pause new task admission while the OS reports a metered network; pass --pause-on-metered=false to override env/config (env RUSTY_GRID_PAUSE_ON_METERED, config [worker].pause_on_metered)"
     )]
-    pub pause_on_metered: bool,
+    pub pause_on_metered: Option<bool>,
 
     #[arg(
         long,

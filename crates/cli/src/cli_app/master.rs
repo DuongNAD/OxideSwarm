@@ -290,6 +290,13 @@ async fn run_master_inner(
         master_cfg.as_ref().and_then(|m| m.max_host_cpu_pct),
         85.0,
     );
+    let max_host_cpu = match validate_master_max_host_cpu_pct(max_host_cpu) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let preserve_gpu = resolve_bool(
         args.preserve_gpu,
@@ -891,6 +898,18 @@ fn apply_discovery_port(config: ServerConfig, port: Option<u16>) -> ServerConfig
     }
 }
 
+/// Validates master `--max-host-cpu-pct` (`1.0..=100.0`, finite). Keeping the ceiling at
+/// `100.0` lets `100` disable real-CPU throttling while ensuring contributor hold heartbeats
+/// (`CONTRIBUTOR_HOLD_CPU_PCT = 101.0`) always trigger `host_busy`.
+pub(super) fn validate_master_max_host_cpu_pct(pct: f32) -> Result<f32, String> {
+    if !pct.is_finite() || !(1.0..=100.0).contains(&pct) {
+        return Err(format!(
+            "--max-host-cpu-pct must be between 1.0 and 100.0 (got {pct})"
+        ));
+    }
+    Ok(pct)
+}
+
 #[cfg(test)]
 mod discovery_port_tests {
     use super::*;
@@ -923,5 +942,18 @@ mod discovery_port_tests {
     fn a_port_does_not_turn_a_disabled_beacon_back_on() {
         let c = apply_discovery_port(base().with_discovery(false), Some(18089));
         assert!(!c.enable_discovery);
+    }
+
+    #[test]
+    fn master_max_host_cpu_pct_validation_accepts_1_to_100_and_rejects_out_of_range() {
+        for valid in [1.0, 85.0, 100.0] {
+            assert_eq!(validate_master_max_host_cpu_pct(valid), Ok(valid));
+        }
+        for invalid in [0.0, 0.5, -5.0, 100.1, 101.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                validate_master_max_host_cpu_pct(invalid).is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
     }
 }
