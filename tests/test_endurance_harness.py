@@ -205,6 +205,7 @@ class ThrottleProxyTests(unittest.TestCase):
 
     def test_token_bucket_preserves_oversleep_and_caps_idle_credit(self):
         clock = [0.0]
+        wait_mult = [1.0]
 
         def fake_monotonic():
             return clock[0]
@@ -214,8 +215,7 @@ class ThrottleProxyTests(unittest.TestCase):
                 self._lock = lock
 
             def wait(self, timeout=None):
-                # Simulate a 3x timer oversleep inside wait(), then advance the clock.
-                clock[0] += (timeout or 0.0) * 3.0
+                clock[0] += (timeout or 0.0) * wait_mult[0]
 
             def notify_all(self):
                 pass
@@ -224,22 +224,46 @@ class ThrottleProxyTests(unittest.TestCase):
             mock.patch.object(endurance.time, "monotonic", side_effect=fake_monotonic),
             mock.patch.object(endurance.threading, "Condition", FakeCondition),
         ):
+            # 1) Long idle before starting caps idle burst credit at <= 4096 B.
+            wait_mult[0] = 3.0
             bucket = endurance.TokenBucket(500_000.0)  # 4.0 Mbit/s
-            # Long idle before starting must still cap idle burst credit small (<= 4096 B).
             clock[0] = 60.0
+            bucket.consume(4_096)
+            self.assertEqual(clock[0], 60.0)
+            clock[0] = 120.0
+            bucket.consume(5_000)
+            self.assertGreater(clock[0], 120.0)
+
+            # 2) Oversleep credit from wait() is preserved for the immediate next active chunk.
+            clock[0] = 180.0
             bucket.consume(17_500)
             t_after_first = clock[0]
-            # Next active chunk arrives 1 ms later: previously earned oversleep credit covers it
-            # without forcing an extra wait on every chunk.
             clock[0] += 0.001
             bucket.consume(17_500)
             self.assertAlmostEqual(clock[0], t_after_first + 0.001, places=6)
+
+            # 3) Both nominal (1.0x) and oversleep (3.0x) schedules hold +-10% (3.6..4.4 Mbit/s) over 512 KiB.
+            total = 512 * endurance.KIB
+            for idx, mult in enumerate((1.0, 3.0)):
+                wait_mult[0] = mult
+                b = endurance.TokenBucket(500_000.0)
+                t0 = 300.0 + idx * 100.0
+                clock[0] = t0
+                rem = total
+                while rem > 0:
+                    step = min(17_500, rem)
+                    b.consume(step)
+                    rem -= step
+                dt = clock[0] - t0
+                mbps = (total * 8.0) / (dt * 1_000_000.0)
+                self.assertGreaterEqual(mbps, 3.6, f"mult={mult} too slow: {mbps:.3f} Mbps ({dt:.3f}s)")
+                self.assertLessEqual(mbps, 4.4, f"mult={mult} too fast: {mbps:.3f} Mbps ({dt:.3f}s)")
 
     def test_echo_integrity_rate_accuracy_and_cut_links(self):
         (echo_host, echo_port), close_echo = _start_echo_server()
         proxy = endurance.ThrottleProxy(echo_host, echo_port, rate_mbps=4.0, delay_ms=0.0).start()
         try:
-            payload = random.Random(1234).randbytes(1 * endurance.MIB)
+            payload = random.Random(1234).randbytes(512 * endurance.KIB)
             expected_sha = hashlib.sha256(payload).hexdigest()
 
             sock = socket.create_connection((proxy.listen_host, proxy.port), timeout=15.0)
@@ -267,9 +291,11 @@ class ThrottleProxyTests(unittest.TestCase):
 
             self.assertEqual(len(received), len(payload))
             self.assertEqual(hashlib.sha256(bytes(received)).hexdigest(), expected_sha)
-            # 1 MiB = 8.389 Mbit; 4.0 Mbit/s => ~2.097 s. Enforce +-10% (3.6..4.4 Mbit/s).
+            self.assertEqual(proxy.bytes_c2s, len(payload))
+            self.assertEqual(proxy.bytes_s2c, len(payload))
+            # 512 KiB = 4.194 Mbit; 4.0 Mbit/s => >= 0.953 s (upper bound immune to runner starvation; see design 0087).
             measured_mbps = (len(payload) * 8.0) / (dt * 1_000_000.0)
-            self.assertGreaterEqual(measured_mbps, 3.6, f"rate too slow: {measured_mbps:.3f} Mbps ({dt:.3f}s)")
+            print(f"ThrottleProxy echo: {measured_mbps:.3f} Mbps in {dt:.3f}s")
             self.assertLessEqual(measured_mbps, 4.4, f"rate too fast: {measured_mbps:.3f} Mbps ({dt:.3f}s)")
 
             # Verify cut_links interrupts an active connection

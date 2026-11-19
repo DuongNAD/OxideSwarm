@@ -863,7 +863,7 @@ class TokenBucket:
                 self._tokens = max(self._tokens, min(max_credit, self._tokens + elapsed * self._rate_bps))
             self._last = now
             self._tokens -= float(nbytes)
-            while self._tokens < 0.0 and not self._closed and self._rate_bps is not None:
+            while self._tokens < -1e-6 and not self._closed and self._rate_bps is not None:
                 wait = (-self._tokens) / self._rate_bps
                 self._cond.wait(timeout=wait)
                 if self._closed or self._rate_bps is None:
