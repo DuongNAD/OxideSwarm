@@ -6,28 +6,31 @@ Created: 2026-11-19    Updated: 2026-11-19
 ## Summary
 
 Adds a bounded, append-only contribution ledger on the master (`crates/master/src/credits.rs`) so
-each participant in a circle sees the tasks, core-seconds, and GPU-seconds their machines ran for
-others and their tasks used over the last day, the last week, and all time (`NET-10`, Stage 1 of
-[design 0094](0094-road-to-a-shared-research-grid.md)). Every entry credits the runner and debits the
-submitter by the same amount, is strictly display-only (Q96), and shares one record format with
-model-tunnel usage records (`LLM-10`, `LLM-11` of [design 0061](0061-first-application-model-tunnel.md)).
+each participant in a circle sees the tasks, core-seconds, and GPU-seconds their machines **ran
+for others**, their tasks **used from others**, and their **self-run** work over the last day,
+the last week, and all time (`NET-10`, Stage 1 of [design 0094](0094-road-to-a-shared-research-grid.md)).
+Double-entry conservation stays internal (`sum(ran_for_others) == sum(used_from_others)` across all
+participants, with self-run isolated separately and not counted as "for others"); no signed net
+column or `"balance"`/`"debited"` terminology is shown (Q96). The ledger keys persisted records on
+immutable member identities (`member_id` hex, or `"organiser"` for v2/local peers) and resolves
+participant labels at display time so `NET-10` does not wait for `ECO-9` and [design 0094](0094-road-to-a-shared-research-grid.md)
+needs no amendment.
 
 Per coordinator decision (2026-11-19, **Option B**), the master ledger, `GET /api/credits`
-(`AuthScope::Observer`), `--max-credit-records` / `--max-credit-bytes`, and the dashboard
-"Contribution Credits (Display Only)" panel ship with zero wire or store-format change on draft pull
-request 379 (holding as a draft for post-stability merge). Wire change: deferred to the protocol 11
-train with BUG-22 and ECO-9.
+(`AuthScope::Observer` showing labels only; `AuthScope::Admin` seeing `member_ids`),
+`--max-credit-records` / `--max-credit-bytes`, and the dashboard Q96 panel ship with zero wire or
+store-format change on draft pull request 379 (holding as a draft for post-stability merge). Wire
+change: deferred to the protocol 11 train with BUG-22 and ECO-9.
 
 ## Context
 
 Read against `master` (`f6554a72`) on 2026-11-19:
 
 - **Task execution facts:** When a task finishes on a worker, the worker returns `TaskResult`
-  (`crates/core/src/task.rs`: `worker_id`, `task_id`, `exit_code`, `execution_time_ms`,
-  `is_gpu_executed`), while the task carries `TaskRequirements` (`cpu_cores`, `gpu_required`,
-  `vram_mb`). The master commits terminal state once in `handle_task_result` when
-  `queue.record_result_from_enqueued` returns `ResultDisposition::Terminal`
-  (`crates/master/src/server/tasks_and_blobs.rs`).
+  (`crates/core/src/task.rs`: `worker_id`, `task_id`, `exit_code`, `execution_time_ms`), while the
+  task carries `TaskRequirements` (`cpu_cores`, `gpu_required`, `vram_mb`). The master commits
+  terminal state once in `handle_task_result` when `queue.record_result_from_enqueued` returns
+  `ResultDisposition::Terminal` (`crates/master/src/server/tasks_and_blobs.rs`).
 - **Terminal eviction:** `TaskQueue` (`crates/master/src/queue.rs`) evicts finished tasks beyond
   `--max-retained-tasks` and `--max-retained-mb`, so the task table cannot serve as the account.
 - **Worker ownership:** `MembersFile::worker_owners` (`crates/master/src/members.rs`) and
@@ -35,9 +38,9 @@ Read against `master` (`f6554a72`) on 2026-11-19:
   to its owning `member_id`.
 - **Submitter identity:** `handle_client_connection` (`crates/master/src/server/client_and_members.rs`)
   creates a per-connection `SubmitterId::Client(Uuid::new_v4())` for fair share and holds
-  `Option<AuthenticatedV3Peer>` (which carries `member_id`), but `TaskQueue` and `TaskStore`
-  (`STORE_FORMAT_VERSION = 4`, `crates/master/src/store.rs`) do not yet record or persist the
-  submitting member or participant label (planned in `ECO-9` step 2 together with `ENROLL-1c` step 2).
+  `Option<AuthenticatedV3Peer>` (which carries `member_id`). `TaskEntry.submitted_by_member` keeps
+  that identity in memory; persisting it in `TaskStore` (`STORE_FORMAT_VERSION` `4 -> 5`) stays in
+  `ECO-9` / `ENROLL-1c` step 2.
 - **Wire surface today:**
   - `oxideswarm members list` (`crates/cli/src/members_cmd.rs`) sends `ClientMessage::ListMembers`
     and receives `ClientResponse::MembersList { members: Vec<MemberEntry> }`
@@ -60,46 +63,46 @@ Read against `master` (`f6554a72`) on 2026-11-19:
 
 - **G1:** Keep an accurate, bounded, append-only ledger on the master (in `--state-dir` when
   configured, and in memory otherwise) that survives master restarts without losing totals when old
-  raw entries age out.
-- **G2:** Preserve exact double-entry conservation (`contributed - used` sums to zero across all
-  participants for tasks, core-seconds, and GPU-seconds) over `1d`, `7d`, and `all_time`.
+  raw entries age out, and never stops or blocks the master on disk or compaction errors.
+- **G2:** Preserve exact double-entry conservation (`sum(ran_for_others) == sum(used_from_others)`
+  for tasks, core-milliseconds/seconds, and GPU-milliseconds/seconds, with self-run isolated) over
+  `24h`, `7d`, and `all_time`.
 - **G3:** Share one ledger record schema with model-tunnel usage records (`LLM-10`, `LLM-11` of
   [design 0061](0061-first-application-model-tunnel.md)).
-- **G4:** Enforce the display-only rule of Q96 and Q39: credits never affect placement, admission,
-  fair share, or worker limits, cannot be moved or spent, and never leave the master automatically.
-- **G5:** Surface participant credits in the web dashboard, `oxideswarm members list`, and
+- **G4:** Enforce the display-only rule of Q96 and Q39: contribution records never affect placement,
+  admission, fair share, or worker limits, cannot be moved or spent, show no signed net column or
+  monetary/balance wording, and never leave the master automatically.
+- **G5:** Surface participant contributions in the web dashboard, `oxideswarm members list`, and
   `oxideswarm status` cleanly without violating [design 0076](0076-protocol-compatibility-and-release-train.md)
   or [design 0083](0083-one-version-window.md).
 
 ## Non-goals
 
-- Transferring, spending, selling, buying, or valuing credits in currency (Q96).
-- Enforcing quotas, throttling, or rejecting submissions based on credit balance (those belong to
-  `ECO-9` quotas, never the credit balance).
+- Transferring, spending, selling, buying, or valuing credits in currency or showing signed "Net"
+  or "balance" indicators (Q96).
+- Enforcing quotas, throttling, or rejecting submissions based on contribution history (those belong
+  to `ECO-9` quotas).
 - Inter-cluster signed receipts (`NET-2` of [design 0054](0054-open-compute-network.md)).
-- Replacing `ECO-9`'s participant label or `ENROLL-1c`'s journal submitter field; this design uses
-  them when present and states how pre-`ECO-9` masters attribute work.
+- Replacing `ECO-9`'s participant label or `ENROLL-1c`'s journal submitter field; this design keys
+  records by `member_id` so participant labels can be applied at display time without migration.
 
 ## Design
 
 ### D1 Shared ledger format (`NET-10` and `LLM-10`)
 
 A single master-owned module `crates/master/src/credits.rs` maintains the usage ledger and exposes
-read-only window aggregations (`LedgerSnapshot`).
+read-only window aggregations (`CreditsSnapshot`).
 
-Each appended entry is a self-contained JSON line (or length+BLAKE3-framed record matching the framing
-discipline of [design 0046](0046-master-durability.md), avoiding bincode layout coupling across minor
-releases) with one shared outer envelope covering both compute tasks (`NET-10`) and model tunnels
-(`LLM-10`):
+Each appended entry is a self-contained compact JSON line (avoiding pretty-printing and avoiding
+`serde_json::Value` DOM trees) with one shared outer envelope covering both compute tasks (`NET-10`)
+and model tunnels (`LLM-10`):
 
 ```rust
 pub struct UsageRecord {
-    pub record_id: u64,               // Monotonic master-assigned sequence
-    pub recorded_at_utc: u64,         // Unix epoch seconds when committed
-    pub credited_participant: String, // Runner's participant label or fallback id
-    pub debited_participant: String,  // Submitter's participant label or fallback id
-    pub credited_member_id: Option<String>, // None for v2 / local-host worker
-    pub debited_member_id: Option<String>,  // None for v2 / dashboard / local submitter
+    pub record_id: u64,               // Monotonic master-assigned sequence starting at 1
+    pub recorded_at_utc: u64,         // Unix epoch seconds when recorded on the master
+    pub runner_member_key: String,    // Runner owner's member_id hex, or "organiser"
+    pub submitter_member_key: String, // Submitter's member_id hex, or "organiser"
     pub kind: UsageKind,
 }
 
@@ -108,10 +111,9 @@ pub enum UsageKind {
     Task {
         task_id: TaskId,
         worker_id: Uuid,
-        duration_ms: u64,
-        cpu_cores: usize,
-        gpu_reserved: bool,
-        is_gpu_executed: bool,
+        duration_ms: u64,   // Master-clamped <= min(reported, elapsed, timeout, 7d)
+        cpu_cores: usize,   // Reserved cores (clamped 1..=4096)
+        gpu_reserved: bool, // GPU-seconds count only when reserved
         exit_code: i32,
         verified: Option<bool>, // None in Stage 1; Some(true/false) from Stage 2
     },
@@ -127,174 +129,170 @@ pub enum UsageKind {
 }
 ```
 
-- **Commit point (exactly once per terminal task):** Recorded in `handle_task_result` only when
-  `queue.record_result_from_enqueued` returns `ResultDisposition::Terminal`. Stale results, late
-  duplicates, worker rejections, evacuations, and transient retries are never booked.
-- **Conservation law (design 0054 D6):** A `UsageKind::Task` entry credits `credited_participant` and
-  debits `debited_participant` by the identical vector:
-  - `tasks = 1`
-  - `core_ms = duration_ms.saturating_mul(cpu_cores as u64)` (reported as both exact `core_ms` in
-    JSON and `core_secs = core_ms as f64 / 1000.0`)
-  - `gpu_ms = if gpu_reserved || is_gpu_executed { duration_ms } else { 0 }`
-  When `credited_participant == debited_participant` (self-run work), both contributed and used sides
-  increase by the same amount, so net (`contributed - used`) is `0`, and across the whole ledger
-  $\sum_p (\text{contributed}_p - \text{used}_p) = 0$ always holds identically.
+- **Commit point and ordering (exactly once, non-blocking after ACK and notify):**
+  `apply_task_result` calls `prepare_terminal_credit` only when `queue.record_result_from_enqueued`
+  returns `ResultDisposition::Terminal` and `!outcome.rejected`. Stale results, late duplicates,
+  worker rejections, evacuations, cancellations, and intermediate failovers are never booked. The
+  entry is passed to `CreditsLedger::enqueue_task` strictly **after** durable store `ack.await`,
+  `send_result_ack`, and `notify_result_waiters`, handing off to a single batching OS writer thread
+  (5 ms / 256-record group commit) so disk sync and compaction never delay worker ACKs or client
+  notifications and no `std::sync::Mutex` is ever held across `.await` or disk I/O.
+- **Clamping & GPU-reserved-only rule:** Master clamps worker-reported `execution_time_ms` against
+  master observed elapsed time since submit (`max(monotonic_elapsed, utc_elapsed + 1s)`), declared
+  `timeout_secs`, and `MAX_CREDIT_DURATION_MS` (7 days). GPU-seconds count **only** when
+  `gpu_reserved` is true (`design 0094 D8`), ignoring unverified worker `is_gpu_executed` claims.
+  Counters accumulate in `u128` so extreme values cannot saturate one side and break conservation.
+- **Cross-participant conservation & self-run isolation (Q96 / design 0054 D6):**
+  After resolving `runner_member_key` and `submitter_member_key` at display time to participant groups:
+  - When `runner_group == submitter_group`: the work goes exclusively into `self_run` (not
+    `ran_for_others`, not `used_from_others`).
+  - When `runner_group != submitter_group`: `runner_group.ran_for_others` and
+    `submitter_group.used_from_others` increment by the identical `SideCounters` vector
+    (`tasks = 1`, `core_ms = clamped_ms * cores`, `gpu_ms = if gpu_reserved { clamped_ms } else { 0 }`),
+    guaranteeing $\sum_p \text{ran\_for\_others}_p == \sum_p \text{used\_from\_others}_p$ identically
+    over `last_24h`, `last_7d`, and `all_time`.
 - **Stage 1 vs Stage 2 counting:** In Stage 1 (`verified: None`), every terminal task counts per
-  [design 0094](0094-road-to-a-shared-research-grid.md) D8 (`verified` can be omitted on Stage 1 task
-  records; dashboard/CLI still display `exit_code == 0` vs non-zero counts if helpful, without
-  breaking zero-sum). From Stage 2 (`NET-3`), entries with `verified == Some(false)` are excluded
-  from verified totals.
+  [design 0094](0094-road-to-a-shared-research-grid.md) D8. From Stage 2 (`NET-3`), entries with
+  `verified == Some(false)` are excluded from counters.
 - **Privacy (`Q39`, `LLM-10`):** No command arguments, environment variables, file paths, stdout,
   stderr, or prompt/response bytes are ever stored in `UsageRecord`.
 
-### D2 Grouping by participant label and member attribution
+### D2 Member-id keying and display-time label resolution
 
-- **Grouping rule:**
-  1. When `ECO-9` adds `participant: Option<String>` to `MemberEntry`, every member maps to its
-     non-empty trimmed `participant` label; unlabeled members fall back to `member:<member_id>` (or
-     `"organiser"` for v2 peers and the local master host, matching `ECO-9` step 1).
-  2. Before `ECO-9` merges: v3 peers group by their enrolled `member_id` (display helper can resolve
-     the current `MemberEntry.name` alongside `member_id` when local to the master), and v2
-     shared-secret / unauthenticated loopback peers group under the reserved key `"organiser"`.
-- **Submitter attribution (`debited_participant`):**
-  - `handle_client_connection` knows `v3_peer.as_ref().map(|p| p.member_id.clone())`. That value is
-    stored alongside the queued task (`submitted_by_member: Option<String>` in `TaskQueue`, and
-    persisted across restarts once `ECO-9` step 2 / `ENROLL-1c` step 2 updates
-    `STORE_FORMAT_VERSION`). Web UI `POST /api/tasks` submissions carry `"organiser"` (or the RBAC
-    identity if applicable).
-  - If `NET-10` runs before `ECO-9` persists submitters in `journal.bin`/`snapshot.bin`, an in-memory
-    map tracks submitters cleanly during runtime, while in-flight tasks replayed after a crash fallback
-    to `"organiser"` until `TaskStore` format `5` lands; this tradeoff should be weighed when
-    ordering `ECO-9` and `NET-10`.
+- Persisted `UsageRecord` and archived totals key strictly on `member_id` (or `"organiser"` for v2
+  shared-secret / local / dashboard submissions).
+- `CreditsSnapshotFile` stores pairwise archived totals `archived_pairs: BTreeMap<String, BTreeMap<String, SideCounters>>`
+  (`[runner_member_key][submitter_member_key]`) rather than pre-flattened label totals. When
+  `ECO-9` adds participant labels or an admin assigns/renames a label covering one or more machine
+  keys, `snapshot_for_display` regroups both `archived_pairs` and `retained` at display time:
+  history never splits across label edits, and cross-machine tasks between keys under one label
+  reclassify automatically into `self_run` while keeping global conservation exact.
+- **RBAC display filtering (D9(c)):**
+  - `AuthScope::Admin` callers on `GET /api/credits` receive resolved participant labels (or
+    `MemberEntry.name` / `member_id` for unlabeled members) plus `member_ids: Vec<String>`.
+  - `AuthScope::Observer` callers receive labels only (`member_ids` omitted): `"organiser"`,
+    explicit participant labels, or neutral deterministic `"participant-N"` placeholders for unlabeled
+    members, never revealing raw `member_id` hex or `MemberEntry.name` machine names.
 
-### D3 Bounded storage, restart survival, and rollover conservation
+### D3 Bounded storage, low-water compaction, and fail-open recovery
 
-Inside `--state-dir`, `LedgerStore` writes:
-- `credits.snapshot.json`: `{ version: 1, next_record_id, archived_totals: BTreeMap<String, WindowCounters>, retained: Vec<UsageRecord> }`, compacted atomically (`write tmp -> sync_all -> rename`, plus BLAKE3 integrity tag header or envelope, `0600` mode on Unix / owner-only DACL on Windows per [design 0047](0047-windows-private-files.md)).
-- `credits.journal.jsonl`: append-only NDJSON (each line carrying a sequence id and per-line BLAKE3 tag over the JSON payload; torn trailing lines are truncated on recovery like `store.rs`).
+Inside `--state-dir`, `CreditsLedger` writes:
+- `credits.snapshot.json`: compact JSON envelope `{ "version": 1, "blake3": ..., "payload": ... }`
+  written atomically via temp file + `sync_all` + `rename` + `store::sync_dir` before resetting the
+  journal (`0600` Unix mode / owner-only Windows DACL per [design 0047](0047-windows-private-files.md)).
+- `credits.journal.jsonl`: append-only compact NDJSON opened read+write (without `.append(true)` so
+  `set_len` works on Windows during both compaction and torn-tail recovery).
 
-Bounding rules (configurable with sane defaults):
-- Defaults: `--max-credit-records 100000`, `--max-credit-bytes 33554432` (32 MiB).
-- When `retained.len()` exceeds `max_credit_records` or journal+snapshot exceeds `max_credit_bytes`,
-  the oldest records are folded into `archived_totals` (`contributed` for `credited_participant`,
-  `used` for `debited_participant`) and compacted out of the journal.
-- Folding evicted records into `archived_totals` guarantees:
-  1. Disk and memory stay strictly bounded regardless of cluster lifetime.
-  2. `all_time` totals and $\sum (\text{contributed} - \text{used}) = 0$ stay exact forever.
-  3. `last_24h` (`now - 86_400`) and `last_7d` (`now - 604_800`) compute over `retained` records; if
-     retained capacity was exhausted inside the last 7 days, the response marks
-     `window_truncated: true` honestly instead of claiming completeness.
+Checksum scope: the per-line BLAKE3 digest in `credits.journal.jsonl` (and `credits.snapshot.json`)
+is a local integrity checksum, not a hash chain: it detects torn or accidental writes, not tampering
+by anyone who already has write access to `--state-dir`.
+
+Bounding & fail-open rules:
+- Defaults: `--max-credit-records 100000`, `--max-credit-bytes 33554432` (32 MiB). Values of `0` on
+  either flag/config field are refused at CLI validation.
+- **Low-water compaction (~50%):** When `retained.len() > max_credit_records` or
+  `snapshot_bytes + journal_bytes > max_credit_bytes`, the writer thread folds oldest records into
+  `archived_pairs` down to `max_records / 2` (and half of `max_bytes`), writes the compact snapshot
+  with `store::sync_dir`, then truncates `credits.journal.jsonl` to `0` (`set_len(0)` + `sync_all`)
+  and updates the in-memory cutoff without blocking readers.
+- **Fail-open guarantee:** A display-only ledger never stops the master:
+  - On journal write/sync failure (e.g. full disk), the writer truncates `credits.journal.jsonl` back
+    to the last clean byte offset (`set_len(saved_len)`), seeks cleanly, enforces RAM bounds, logs a
+    warning, and keeps running.
+  - On compaction error after journal commit, the writer logs a warning and returns `Ok` to any
+    record waiter so callers never fail after a record was journaled.
+  - On startup `open()`, torn trailing lines truncate cleanly; corrupt snapshot or mid-file corrupt
+    journal files are quarantined (`*.corrupt.<epoch>`) with a warning and replaced by a fresh empty
+    ledger (while symlinks on credit files remain refused by `open()`; if `MasterServer` startup
+    still gets an error opening the ledger, it warns and falls back to an in-memory ledger).
 
 ### D4 Display-only enforcement (Q96, Q39)
 
 - `WorkloadScheduler` (`crates/master/src/scheduler.rs`), `TaskQueue` admission/fair-share, and
   `WorkerClient` never query `credits.rs`.
-- No RPC, CLI verb, or HTTP endpoint mutates balances (no `transfer`, `grant`, `spend`, or `reset`).
-- No telemetry exporter (`otel.rs` / `discovery.rs`) sends credit balances off the master.
+- No RPC, CLI verb, or HTTP endpoint mutates counters (no `transfer`, `grant`, `spend`, or `reset`;
+  no signed `Net` column, no balance icon, no `"debited"` or `"balance"` names).
+- No telemetry exporter (`otel.rs` / `discovery.rs`) leaves the master with credit data.
 
 ### D5 Display surfaces and why `ClientResponse` needs a wire change
 
 1. **Web dashboard (`crates/master/src/web_ui.rs`, `dashboard.html`) — no wire change:**
-   - Adds `GET /api/credits` (protected by `AuthScope::Observer`) and an optional `credits`
-     summary in `/api/status` or `ClusterSnapshotDto`.
-   - `dashboard.html` renders a "Contribution Credits (Display Only)" table showing per-participant
-     `Last 24h`, `Last 7d`, and `All Time` (`Tasks`, `Core-s`, `GPU-s` contributed / used / net),
-     with a footer note confirming Q96 (`display only; net sum = 0`).
+   - Adds `GET /api/credits` (protected by `AuthScope::Observer`, redacting member ids/names from
+     non-Admin observers).
+   - `dashboard.html` renders "Contribution Credits (Display Only)" with columns `Participant`,
+     `Ran for others`, `Used from others`, and `Self-run` across `24h`, `7d`, and `All Time` tabs.
 2. **`oxideswarm members list` and `oxideswarm status` — requires a `ClientResponse` wire change:**
-   - `oxideswarm members list` sends `ClientMessage::ListMembers` and decodes ONLY
-     `ClientResponse::MembersList { members: Vec<MemberEntry> }`. Neither `MemberEntry` nor
-     `ClientResponse::MembersList` contains credit counters, and positional bincode rejects any added
-     field at deserialization unless guarded by a protocol bump.
-   - `oxideswarm status` sends `ClientMessage::ClusterStatus` and decodes ONLY
-     `ClientResponse::ClusterStatus`, which likewise carries fixed task bucket counts and
-     `Vec<WorkerCapabilities>` with no per-member/participant credit slice (adding a single field
-     here is the exact reason `BUG-22` is held for the next wire change).
-   - **Role access consideration:** `ClientMessage::ListMembers` is currently `admin`-only
-     (`crates/master/src/server/handshakes.rs:163`). A contributor holding only `worker` or `client`
-     roles should still be able to view cluster contribution credits via `oxideswarm status` or a
-     dedicated read-only query (`ListCredits` under `member.has_any_role()`), just like
-     `ClusterStatus`.
+   - Both use positional bincode (`crates/core/src/protocol/client_resp_mirrors.rs`) frozen at
+     `PROTOCOL_VERSION_CURRENT = 10` (`BUG-22` is already waiting here). Adding fields or a
+     `ListCredits` variant stops at this design until the protocol 11 train.
 
-### D6 Wire-change options for coordinator decision (stop point)
+### D6 Wire-change decision (Option B shipped, protocol 11 deferred)
 
-Because exposing credits in `oxideswarm members list` and `oxideswarm status` modifies the
-client-master wire protocol, implementation pauses here for a coordinator choice among three options
-under [design 0076](0076-protocol-compatibility-and-release-train.md) and
-[design 0083](0083-one-version-window.md):
-
-| Option | Wire shape (Protocol `11`) | Compatibility window | Timing vs `BUG-22` & `ECO-9` |
-|---|---|---|---|
-| **A (Recommended): Bundle CLI credits into the next protocol `11` train alongside `BUG-22` (and `ECO-9` if ready)** | Append `ClientMessage::ListCredits` + `ClientResponse::CreditsList { summary }` (available to `has_any_role()`), add optional `participant: Option<String>` / credit summary support in `MembersList`, and add `cancelled_tasks` (`BUG-22`) + optional credits summary in `ClusterStatus`. | `serialize_message_for_peer` encodes v10 `ClusterStatus` / `MembersList` cleanly for v10 peers, keeping the one-version window (`10..=11`) open per [design 0083](0083-one-version-window.md), OR closes window at `11` if bundled with `ECO-9`. `members list` / `status` query `ListCredits` when master protocol >= `11`. | One protocol bump serves `BUG-22`, `NET-10`, and `ECO-9` together (satisfies design 0076 D1). |
-| **B: Ship master ledger + dashboard `/api/credits` now (zero wire change), defer CLI `ClientResponse` fields** | No protocol change now (`10` stays untouched); `credits.rs` + `GET /api/credits` + `dashboard.html` land after the stability release. | Protocol stays `10` with zero skew. | `oxideswarm status` and `oxideswarm members list` still lack credits until Option A's wire bump lands. |
-| **C: Hold all `NET-10` code until `ECO-9` + `BUG-22` wire & store format `5` train** | Same wire & store train as Option A, plus `TaskStore` format `5` for persisted task submitter (`ECO-9` step 2 / `ENROLL-1c` step 2). | Single protocol `11` + store `5` release after the `0.4.x` stability release. | Avoids temporary in-flight submitter fallback on master restart prior to `ECO-9`. |
+Protocol `10` stays untouched now: `credits.rs`, `--max-credit-records`, `--max-credit-bytes`,
+`GET /api/credits`, and `dashboard.html` ship on draft pull request 379 (holding for post-stability
+merge). CLI `ClientResponse` fields (`ListCredits` / `ClusterStatus` / `MembersList`) defer to the
+protocol 11 train alongside `BUG-22` and `ECO-9` (`design 0076 D1`, `design 0083`).
 
 ## Compatibility
 
 - **Option B on draft pull request 379:** Keeps protocol version (`10`), `TaskStore` format (`4`),
-  and `Cargo.lock` completely unchanged (`--max-credit-records` / `--max-credit-bytes`,
-  `crates/master/src/credits.rs`, `GET /api/credits`, and `dashboard.html` only).
-- **Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9:**
-  - Bumps `PROTOCOL_VERSION_CURRENT` to `11`, updates both `HumanClient*` and `BinaryClient*`
-    mirrors + all four `From` impls, refreshes `crates/core/tests/data/wire_layout.txt` (and moves
-    v10 layout to `wire_layout_previous.txt` if keeping the `10..=11` window), and updates
-    `tests/test_release_skew.py`.
-  - If `ListCredits` / `CreditsList` is appended as new enum variants while `ClusterStatus` /
-    `MembersList` add v11-only trailing fields formatted conditionally via `serialize_message_for_peer`
-    by peer version (`last_peer_version`), v10 CLI clients continue working seamlessly against a v11
-    master without seeing credit fields.
-  - Note: a v11 CLI `members list` / `status` calling `ListCredits` after `ClusterStatus`/`MembersList`
-    must check `Hello`'s version or peer server version (`>= 11`, cached on `connect_master`) so it
-    never sends an unknown `ListCredits` variant to a v10 master.
+  and `Cargo.lock` completely unchanged.
+- **Wire change deferred to protocol 11:** Bumps `PROTOCOL_VERSION_CURRENT` to `11`, updates wire
+  mirrors and `tests/test_release_skew.py`, and serves `ClientMessage::ListCredits` / trailing
+  fields via `serialize_message_for_peer`.
 
 ## Security
 
-- **Local files:** `credits.snapshot.json` and `credits.journal.jsonl` under `--state-dir` are created
-  with `0600` Unix permissions / owner-only Windows DACL (`std::fs::OpenOptions`), refusing symlinks on
-  open/recovery.
-- **No external leakage (Q39):** Ledger endpoints require RBAC `AuthScope::Observer` (with existing
-  loopback `--dev` bypass rules, never off loopback); worker nodes and external clusters never pull or
-  receive the ledger.
-- **Saturating integer math:** `core_ms` and `gpu_ms` use saturating arithmetic (`u128` or
-  `u64::saturating_*`) to prevent overflow even on crafted/corrupted task durations, plus per-record
-  BLAKE3 verification on journal replay so corrupted trailing bytes are safely truncated without
-  corrupting balances.
-- **Bounded memory & disk:** `--max-credit-records` and `--max-credit-bytes` cap ledger growth so
-  long-lived masters cannot exhaust disk or RAM.
+- **Local files:** `credits.snapshot.json` and `credits.journal.jsonl` under `--state-dir` use `0600`
+  Unix mode / owner-only Windows DACL (`design 0047`), refusing symlinks on open/compaction.
+- **Observer redaction (D9(c)):** `GET /api/credits` never exposes raw `member_id` hex or machine
+  names to non-Admin `AuthScope::Observer` tokens.
+- **Clamping & overflow immunity:** Master clamps task duration (`min(reported, elapsed, timeout, 7d)`)
+  and `cpu_cores` (`1..=4096`), ignores worker `is_gpu_executed` when `!gpu_reserved`, and sums in
+  `u128` so extreme inputs never break zero-sum conservation.
+- **Bounded memory & disk:** `--max-credit-records` and `--max-credit-bytes` cap both RAM and disk.
 
 ## Test plan
 
-Once approved for implementation:
-- **Unit (`crates/master/src/credits.rs`):**
-  - Terminal-only booking (stale, late, rejection, evacuation, failover attempts ignored; single
-    terminal completion booked once).
-  - Double-entry conservation check across mixed self-run and cross-participant tasks (`sum(contributed - used) == 0` for tasks, core-ms, and gpu-ms).
-  - Time window filtering (`24h`, `7d`, `all_time`) with injected clock.
-  - Rollover compaction past `--max-credit-records` preserving exact `all_time` totals and zero-sum
-    invariant while bounding retained records and journal size; torn trailing journal line recovery.
-- **Wire & protocol (`crates/core`):** `wire_layout_tests` + `window_tests` covering v10 <-> v11
-  compatibility when `ClientResponse` changes are included.
-- **Integration (loopback cluster, private `HOME`):**
-  - Two enrolled v3 participants (and organiser/worker mix): run tasks across both workers, verify
-    contributed vs used core-seconds match task `execution_time_ms * cpu_cores`, sum to `0` across
-    all participants, persist across master restart with `--state-dir`, and appear identically in
-    `oxideswarm members list --json`, `oxideswarm status --json`, and `GET /api/credits`.
+- **Unit (`crates/master/src/credits/tests.rs` & `web_ui.rs` & `crates/cli`):**
+  - Q96 conservation & self-run isolation (`sum(ran_for_others) == sum(used_from_others)`).
+  - Member-id keying, display-time label grouping/renaming, and Observer redaction vs Admin `member_ids`.
+  - Duration clamping, `gpu_reserved`-only billing, and `u128` extreme-value conservation.
+  - Time window filtering (`24h`, `7d`, `all_time`) with injected clock and shared `ModelTunnel` envelope.
+  - Low-water (~50%) compaction count at cap, compact JSON format, `mode 0600` permissions, torn-tail
+    truncation (`set_len(valid_len)`), compaction (`set_len(0)`), failed-append rollback truncation,
+    corrupt snapshot/journal quarantine (`*.corrupt.*`), symlink refusal, and CLI `0` flag rejection.
+- **Integration (`crates/master/tests/test_net10_contribution_credits.rs`):**
+  - Two enrolled v3 participants on loopback: cross-participant + self-run conservation, Observer vs
+    Admin redaction on `GET /api/credits`, restart survival in `--state-dir`, low-water rollover
+    compaction, worker rejection, failover, late/stale duplicate results, queued & running
+    cancellations, inflated duration/GPU clamping, and master startup resilience with corrupt credit
+    files.
 
 ## Work items
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| NET-10 | Contribution credits per participant, display only (Stage 1 of design 0094, Option B) | `crates/master/src/credits.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/dashboard.html`, `crates/cli/src/cli_app.rs`, `docs/reference.md` | Master ledger, `--state-dir` persistence + compaction, `GET /api/credits`, dashboard table, and 2-participant loopback conservation/restart tests pass (CLI `ClientResponse` fields deferred to protocol 11 with `BUG-22` and `ECO-9`) | Partial |
+| NET-10 | Contribution credits per participant, display only (Stage 1 of design 0094, Option B) | `crates/master/src/credits.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/dashboard.html`, `crates/cli/src/cli_app.rs`, `docs/reference.md` | Master ledger, `--state-dir` persistence + low-water compaction, fail-open quarantine, `GET /api/credits`, dashboard Q96 table, and loopback/unit tests pass (CLI `ClientResponse` fields deferred to protocol 11 with `BUG-22` and `ECO-9`) | Partial |
 
 ## Decisions (resolved 2026-11-19)
 
-- **Wire-change bundling:** Decided **Option B** — ship the master ledger, `GET /api/credits`, and the
-  dashboard card first with zero wire or store-format change on draft pull request 379 (held as draft
-  until post-stability merge). Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9.
-- **Dashboard RBAC:** `/api/credits` requires `AuthScope::Observer` (matching `/api/status`), and
-  all mutating methods on `/api/credits` remain rejected (`405 Method Not Allowed` for Admins, `403`
-  for Observers).
+- **Wire-change bundling:** Decided **Option B** — ship master ledger, `GET /api/credits`, and
+  dashboard card first with zero wire or store-format change on draft pull request 379; wire change
+  deferred to the protocol 11 train with `BUG-22` and `ECO-9`.
+- **Member-id keying (coordinator decision):** Key ledger by `member_id` and resolve participant
+  labels at display time so history never splits when labels change and `NET-10` does not wait for
+  `ECO-9` or amend `design 0094`.
+- **Q96 wording (coordinator decision):** Keep double-entry internal; display `"Ran for others"`,
+  `"Used from others"`, and `"Self-run"` with no signed `Net`, no balance icon, and no
+  `"debited"`/`"balance"` names.
+- **Integrity scope (coordinator decision):** Per-line BLAKE3 in the journal is a checksum catching
+  torn or accidental writes, not a tamper-proof chain.
+- **Dashboard RBAC:** `/api/credits` requires `AuthScope::Observer` (labels only for Observer;
+  `member_ids` and member names for Admin), rejecting mutating methods (`405`/`403`).
 
 ## Status log
 
-- 2026-11-19: Claimed `design 0096` on the hub and wrote initial `Draft` design for `NET-10` on branch `mac/net-10-contribution-credits` (draft pull request 379). Verified that showing credits in `oxideswarm members list` and `oxideswarm status` requires a `ClientResponse` wire change (`PROTOCOL_VERSION_CURRENT` currently `10`), and stopped before Rust/wire implementation awaiting coordinator decision.
-- 2026-11-19: Implemented Option B on draft pull request 379 (`crates/master/src/credits.rs`, `--max-credit-records` / `--max-credit-bytes`, `GET /api/credits` behind `AuthScope::Observer`, and `dashboard.html` panel, zero wire change); Wire change: deferred to the protocol 11 train with BUG-22 and ECO-9.
+- 2026-11-19: Claimed `design 0096` on the hub and wrote initial `Draft` design for `NET-10` on branch `mac/net-10-contribution-credits` (draft pull request 379).
+- 2026-11-19: Implemented Option B on draft pull request 379 (`crates/master/src/credits.rs`, `--max-credit-records` / `--max-credit-bytes`, `GET /api/credits`, and `dashboard.html` panel, zero wire change); wire change deferred to the protocol 11 train with `BUG-22` and `ECO-9`.
+- 2026-11-19: Applied all coordinator review fixes on draft pull request 379 (Windows read+write journal open, partial-append rollback + corrupt-file quarantine + fail-open startup, low-water compact-JSON compaction + single batching writer after ACK/notify + `store::sync_dir`, master duration clamping + `gpu_reserved`-only billing, member-id keying + display-time label resolution, Q96 UI/API wording, Observer redaction, `--max-credit-records 0` validation, and added tests).

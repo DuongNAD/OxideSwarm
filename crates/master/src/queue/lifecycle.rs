@@ -293,6 +293,7 @@ impl TaskQueue {
             cpu_cores,
             gpu_reserved,
             submitted_by_member,
+            elapsed_since_submit_ms,
         ) = {
             let entry = inner
                 .tasks
@@ -304,6 +305,12 @@ impl TaskQueue {
                 && entry
                     .adoptable_by
                     .is_some_and(|(w, until)| w == worker_id && now_instant < until);
+            let mono_ms =
+                u64::try_from(entry.submitted_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let utc_ms = now_epoch
+                .saturating_sub(entry.submitted_at_utc)
+                .saturating_add(1)
+                .saturating_mul(1000);
             (
                 entry.state,
                 owner,
@@ -316,6 +323,7 @@ impl TaskQueue {
                 entry.task.requirements.cpu_cores.max(1),
                 entry.task.requirements.requires_gpu_or_vram() || entry.task.spec.requires_gpu(),
                 entry.submitted_by_member.clone(),
+                mono_ms.max(utc_ms),
             )
         };
 
@@ -339,6 +347,7 @@ impl TaskQueue {
                     cpu_cores,
                     gpu_reserved,
                     submitted_by_member,
+                    elapsed_since_submit_ms,
                 },
                 None,
             ));
@@ -389,6 +398,7 @@ impl TaskQueue {
                     cpu_cores,
                     gpu_reserved,
                     submitted_by_member,
+                    elapsed_since_submit_ms,
                 },
                 None,
             ));
@@ -617,6 +627,7 @@ impl TaskQueue {
                 cpu_cores,
                 gpu_reserved,
                 submitted_by_member,
+                elapsed_since_submit_ms,
             },
             ack,
         ))

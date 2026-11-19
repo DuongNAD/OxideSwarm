@@ -1,8 +1,11 @@
-//! NET-10 Option B integration tests: two enrolled v3 participants on loopback, exact
-//! double-entry core-ms conservation, restart persistence in `--state-dir`, bounded rollover
-//! compaction, `GET /api/credits` RBAC (`Observer`), and worker rejections never booking credit.
+//! NET-10 Option B integration tests: two enrolled v3 participants on loopback, exact Q96
+//! `ran_for_others` == `used_from_others` conservation (with `self_run` separated), Observer vs
+//! Admin redaction on `GET /api/credits`, restart persistence and fail-open corruption quarantine
+//! in `--state-dir`, low-water rollover compaction, and late/stale/failover/cancel/rejection/
+//! duration-clamping edge cases.
 
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,7 +24,7 @@ use rusty_grid_core::protocol::{
 use rusty_grid_core::task::{Task, TaskRequirements, TaskResult, TaskSpec};
 use rusty_grid_core::{MasterMessage, MessageTransport, WorkerCapabilities, WorkerMessage};
 use rusty_grid_master::auth::{AuthConfig, AuthScope};
-use rusty_grid_master::credits::CreditsSnapshot;
+use rusty_grid_master::credits::{CreditsSnapshot, CREDITS_JOURNAL_FILE, CREDITS_SNAPSHOT_FILE};
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::server::{AuthMode, MasterHandle, MasterServer, MemberStore, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
@@ -92,6 +95,22 @@ async fn wait_for_two_workers(master: &MasterHandle) {
     }
 }
 
+async fn wait_for_credits_total(master: &MasterHandle, expected: u64) -> CreditsSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = master.credits().snapshot();
+        if snap.total_records >= expected {
+            return snap;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for credits total_records >= {expected}, got {}",
+            snap.total_records
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
 async fn submit_v3_and_wait(
     addr: SocketAddr,
     client_kp: &NodeKeypair,
@@ -135,6 +154,62 @@ async fn submit_v3_and_wait(
     }
 }
 
+async fn submit_v3_async(
+    addr: SocketAddr,
+    client_kp: &NodeKeypair,
+    master_pub: &PublicKey,
+    task: Task,
+) -> rusty_grid_core::task::TaskId {
+    let stream = TcpStream::connect(addr).await.expect("connect v3 client");
+    let mut t = MessageTransport::new(stream);
+    let sk = v3_client_handshake(&mut t, client_kp, master_pub, HandshakePurpose::Member)
+        .await
+        .expect("v3 client handshake");
+    t.enable_encryption(&sk, EndpointRole::Client);
+
+    t.send_msg(&ClientMessage::SubmitTask { task, wait: false })
+        .await
+        .expect("send SubmitTask");
+    match t
+        .recv_msg::<ClientResponse>()
+        .await
+        .expect("recv ClientResponse")
+    {
+        Some(ClientResponse::TaskSubmitted { task_id }) => task_id,
+        other => panic!("expected TaskSubmitted, got {other:?}"),
+    }
+}
+
+async fn register_v3_mock_worker(
+    addr: SocketAddr,
+    worker_kp: &NodeKeypair,
+    master_pub: &PublicKey,
+    worker_id: Uuid,
+    name: &str,
+    features: ProtocolCapabilities,
+) -> MessageTransport<TcpStream> {
+    let stream = TcpStream::connect(addr).await.expect("connect mock worker");
+    let mut wt = MessageTransport::new(stream);
+    let wsk = v3_client_handshake(&mut wt, worker_kp, master_pub, HandshakePurpose::Member)
+        .await
+        .expect("worker handshake");
+    wt.enable_encryption(&wsk, EndpointRole::Client);
+
+    wt.send_msg(&WorkerMessage::Register {
+        worker_id,
+        capabilities: WorkerCapabilities::new(name, 4, 2048, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features,
+    })
+    .await
+    .expect("register mock worker");
+    match wt.recv_msg::<MasterMessage>().await.expect("reg ack") {
+        Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+        other => panic!("expected RegisterAck, got {other:?}"),
+    }
+    wt
+}
+
 async fn spawn_master_with_retry(config: ServerConfig) -> MasterHandle {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -153,17 +228,6 @@ async fn spawn_master_with_retry(config: ServerConfig) -> MasterHandle {
             }
             Err(e) => panic!("MasterServer::spawn failed past deadline: {e}"),
         }
-    }
-}
-
-fn assert_zero_sum_all_windows(snap: &CreditsSnapshot) {
-    for sum in [&snap.net_sum_24h, &snap.net_sum_7d, &snap.net_sum_all_time] {
-        assert_eq!(sum.tasks, 0);
-        assert_eq!(sum.core_ms, 0);
-        assert_eq!(sum.gpu_ms, 0);
-        assert_eq!(sum.tunnel_sessions, 0);
-        assert_eq!(sum.tunnel_duration_ms, 0);
-        assert_eq!(sum.tunnel_bytes, 0);
     }
 }
 
@@ -187,11 +251,11 @@ async fn test_net10_two_v3_participants_conservation_restart_and_rbac() {
         .with_master_noise_key(master_kp.clone())
         .with_members(make_members(alice_kp.public_key(), bob_kp.public_key()))
         .with_dashboard_port(0)
-        .with_auth_config(AuthConfig::new().with_token(
-            "observer-token",
-            "observer",
-            &[AuthScope::Observer],
-        ));
+        .with_auth_config(
+            AuthConfig::new()
+                .with_token("observer-token", "observer", &[AuthScope::Observer])
+                .with_token("admin-token", "admin", &[AuthScope::Admin]),
+        );
 
     let master = MasterServer::spawn(cfg.clone())
         .await
@@ -247,6 +311,8 @@ async fn test_net10_two_v3_participants_conservation_restart_and_rbac() {
     )
     .await;
 
+    let _ = wait_for_credits_total(&master, 3).await;
+
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::new();
     let unauth = http
@@ -256,53 +322,84 @@ async fn test_net10_two_v3_participants_conservation_restart_and_rbac() {
         .expect("unauth request");
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
-    let authed = http
+    // Observer view must NOT expose raw member_ids or machine names (design 0094 D9(c)).
+    let obs_res = http
         .get(format!("http://{dash_addr}/api/credits"))
         .bearer_auth("observer-token")
         .send()
         .await
-        .expect("authed request");
-    assert_eq!(authed.status(), StatusCode::OK);
-    let snap: CreditsSnapshot = authed.json().await.expect("parse CreditsSnapshot");
+        .expect("observer request");
+    assert_eq!(obs_res.status(), StatusCode::OK);
+    let obs_text = obs_res.text().await.expect("observer body");
+    assert!(!obs_text.contains(&alice_id), "observer leaked alice_id");
+    assert!(!obs_text.contains(&bob_id), "observer leaked bob_id");
+    assert!(
+        !obs_text.contains("\"alice\"") && !obs_text.contains("\"bob\""),
+        "observer leaked member names: {obs_text}"
+    );
+    let obs_snap: CreditsSnapshot = serde_json::from_str(&obs_text).expect("parse observer");
+    assert!(obs_snap.display_only);
+    assert!(obs_snap.conservation_holds());
+    assert_eq!(obs_snap.total_records, 3);
+    assert!(obs_snap
+        .participants
+        .iter()
+        .all(|p| p.member_ids.is_empty()));
 
+    // Admin view receives member names and `member_ids`.
+    let adm_res = http
+        .get(format!("http://{dash_addr}/api/credits"))
+        .bearer_auth("admin-token")
+        .send()
+        .await
+        .expect("admin request");
+    assert_eq!(adm_res.status(), StatusCode::OK);
+    let snap: CreditsSnapshot = adm_res.json().await.expect("parse CreditsSnapshot");
     assert!(snap.display_only);
     assert!(!snap.window_truncated);
     assert_eq!(snap.total_records, 3);
     assert_eq!(snap.retained_records, 3);
     assert_eq!(snap.archived_records, 0);
-    assert_zero_sum_all_windows(&snap);
+    assert!(snap.conservation_holds());
 
-    let by_id: HashMap<&str, _> = snap
+    let by_label: HashMap<&str, _> = snap
         .participants
         .iter()
-        .map(|p| (p.participant.as_str(), p))
+        .map(|p| (p.label.as_str(), p))
         .collect();
-    let alice = by_id[alice_id.as_str()];
-    let bob = by_id[bob_id.as_str()];
+    let alice = by_label["alice"];
+    let bob = by_label["bob"];
+    assert_eq!(alice.member_ids, vec![alice_id.clone()]);
+    assert_eq!(bob.member_ids, vec![bob_id.clone()]);
 
-    assert_eq!(alice.display_name.as_deref(), Some("alice"));
-    assert_eq!(bob.display_name.as_deref(), Some("bob"));
-
-    assert_eq!(alice.all_time.contributed.tasks, 2);
+    assert_eq!(alice.all_time.ran_for_others.tasks, 1);
     assert_eq!(
-        alice.all_time.contributed.core_ms,
-        r2.execution_time_ms.saturating_mul(2) + r3.execution_time_ms
+        alice.all_time.ran_for_others.core_ms,
+        u128::from(r2.execution_time_ms) * 2
     );
-    assert_eq!(alice.all_time.used.tasks, 2);
+    assert_eq!(alice.all_time.used_from_others.tasks, 1);
     assert_eq!(
-        alice.all_time.used.core_ms,
-        r1.execution_time_ms + r3.execution_time_ms
+        alice.all_time.used_from_others.core_ms,
+        u128::from(r1.execution_time_ms)
     );
-
-    assert_eq!(bob.all_time.contributed.tasks, 1);
-    assert_eq!(bob.all_time.contributed.core_ms, r1.execution_time_ms);
-    assert_eq!(bob.all_time.used.tasks, 1);
+    assert_eq!(alice.all_time.self_run.tasks, 1);
     assert_eq!(
-        bob.all_time.used.core_ms,
-        r2.execution_time_ms.saturating_mul(2)
+        alice.all_time.self_run.core_ms,
+        u128::from(r3.execution_time_ms)
     );
 
-    // Stop workers & master cleanly, then restart master on the same `--state-dir`.
+    assert_eq!(bob.all_time.ran_for_others.tasks, 1);
+    assert_eq!(
+        bob.all_time.ran_for_others.core_ms,
+        u128::from(r1.execution_time_ms)
+    );
+    assert_eq!(bob.all_time.used_from_others.tasks, 1);
+    assert_eq!(
+        bob.all_time.used_from_others.core_ms,
+        u128::from(r2.execution_time_ms) * 2
+    );
+    assert_eq!(bob.all_time.self_run.tasks, 0);
+
     w_alice.stop().await;
     w_bob.stop().await;
     let _ = master.shutdown();
@@ -312,7 +409,7 @@ async fn test_net10_two_v3_participants_conservation_restart_and_rbac() {
     let dash_addr_2 = restarted.dashboard_addr().expect("restarted dash addr");
     let snap_after: CreditsSnapshot = http
         .get(format!("http://{dash_addr_2}/api/credits"))
-        .bearer_auth("observer-token")
+        .bearer_auth("admin-token")
         .send()
         .await
         .expect("credits after restart")
@@ -322,20 +419,18 @@ async fn test_net10_two_v3_participants_conservation_restart_and_rbac() {
 
     assert_eq!(snap_after.total_records, 3);
     assert_eq!(snap_after.participants.len(), 2);
-    assert_zero_sum_all_windows(&snap_after);
-    let by_id_after: HashMap<&str, _> = snap_after
+    assert!(snap_after.conservation_holds());
+    let by_label_after: HashMap<&str, _> = snap_after
         .participants
         .iter()
-        .map(|p| (p.participant.as_str(), p))
+        .map(|p| (p.label.as_str(), p))
         .collect();
     assert_eq!(
-        by_id_after[alice_id.as_str()].all_time,
-        alice.all_time,
+        by_label_after["alice"].all_time, alice.all_time,
         "alice all_time totals must survive restart"
     );
     assert_eq!(
-        by_id_after[bob_id.as_str()].all_time,
-        bob.all_time,
+        by_label_after["bob"].all_time, bob.all_time,
         "bob all_time totals must survive restart"
     );
 
@@ -361,7 +456,7 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
         .with_auth_mode(AuthMode::Members)
         .with_master_noise_key(master_kp.clone())
         .with_members(make_members(alice_kp.public_key(), bob_kp.public_key()))
-        .with_max_credit_records(3);
+        .with_max_credit_records(4);
 
     let master = MasterServer::spawn(cfg.clone())
         .await
@@ -384,9 +479,9 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
     );
     wait_for_two_workers(&master).await;
 
-    let mut total_core_ms_bob_contrib = 0u64;
-    let mut total_core_ms_alice_contrib = 0u64;
-    for i in 0..5 {
+    let mut total_core_ms_bob_contrib = 0u128;
+    let mut total_core_ms_alice_contrib = 0u128;
+    for i in 0..8 {
         if i % 2 == 0 {
             let r = submit_v3_and_wait(
                 master.server_addr(),
@@ -397,7 +492,7 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
                 &format!("roll-{i}"),
             )
             .await;
-            total_core_ms_bob_contrib += r.execution_time_ms;
+            total_core_ms_bob_contrib += u128::from(r.execution_time_ms);
         } else {
             let r = submit_v3_and_wait(
                 master.server_addr(),
@@ -408,24 +503,26 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
                 &format!("roll-{i}"),
             )
             .await;
-            total_core_ms_alice_contrib += r.execution_time_ms;
+            total_core_ms_alice_contrib += u128::from(r.execution_time_ms);
         }
     }
 
+    let _ = wait_for_credits_total(&master, 8).await;
+    master
+        .credits()
+        .flush_async()
+        .await
+        .expect("flush credits writer before inspecting compaction bounds");
     let snap = master.credits().snapshot();
-    assert!(
-        snap.retained_records <= 3,
-        "retained records {} exceeded bound 3",
-        snap.retained_records
-    );
-    assert!(
-        snap.archived_records >= 2,
-        "expected archived_records >= 2, got {}",
-        snap.archived_records
-    );
-    assert_eq!(snap.total_records, 5);
+    assert!(snap.retained_records <= 4);
+    assert!(snap.archived_records >= 4);
     assert!(snap.window_truncated);
-    assert_zero_sum_all_windows(&snap);
+    assert!(snap.conservation_holds());
+    assert!(
+        master.credits().compaction_count() <= 4,
+        "low-water compaction should trigger sparingly, got {}",
+        master.credits().compaction_count()
+    );
 
     w_alice.stop().await;
     w_bob.stop().await;
@@ -434,25 +531,24 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
 
     let restarted = spawn_master_with_retry(cfg).await;
     let snap2 = restarted.credits().snapshot();
-    assert_eq!(snap2.total_records, 5);
-    assert_zero_sum_all_windows(&snap2);
-    let by_id: HashMap<&str, _> = snap2
+    assert_eq!(snap2.total_records, 8);
+    assert!(snap2.conservation_holds());
+    let by_label: HashMap<&str, _> = snap2
         .participants
         .iter()
-        .map(|p| (p.participant.as_str(), p))
+        .map(|p| (p.label.as_str(), p))
         .collect();
     assert_eq!(
-        by_id[bob_id.as_str()].all_time.contributed.core_ms,
+        by_label[bob_id.as_str()].all_time.ran_for_others.core_ms,
         total_core_ms_bob_contrib
     );
     assert_eq!(
-        by_id[alice_id.as_str()].all_time.contributed.core_ms,
+        by_label[alice_id.as_str()].all_time.ran_for_others.core_ms,
         total_core_ms_alice_contrib
     );
     let _ = restarted.shutdown();
 
-    // Verify a worker rejection that ends the task terminally (`max_retries = 0`) never credits the
-    // refusing worker.
+    // Verify a worker rejection that ends the task terminally (`max_retries = 0`) never credits.
     let rej_kp = NodeKeypair::generate().expect("rej kp");
     let rej_master_kp = NodeKeypair::generate().expect("rej master kp");
     let rej_master_pub = *rej_master_kp.public_key();
@@ -469,28 +565,16 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
     .await
     .expect("spawn rejection master");
 
-    let stream = TcpStream::connect(rej_master.server_addr())
-        .await
-        .expect("connect mock worker");
-    let mut wt = MessageTransport::new(stream);
-    let wsk = v3_client_handshake(&mut wt, &rej_kp, &rej_master_pub, HandshakePurpose::Member)
-        .await
-        .expect("worker handshake");
-    wt.enable_encryption(&wsk, EndpointRole::Client);
-
     let worker_id = Uuid::new_v4();
-    wt.send_msg(&WorkerMessage::Register {
+    let mut wt = register_v3_mock_worker(
+        rej_master.server_addr(),
+        &rej_kp,
+        &rej_master_pub,
         worker_id,
-        capabilities: WorkerCapabilities::new("mock-refuser", 1, 1024, false, false, None),
-        protocol_version: PROTOCOL_VERSION_CURRENT,
-        features: ProtocolCapabilities::all_supported(),
-    })
-    .await
-    .expect("register mock worker");
-    match wt.recv_msg::<MasterMessage>().await.expect("reg ack") {
-        Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
-        other => panic!("expected RegisterAck, got {other:?}"),
-    }
+        "mock-refuser",
+        ProtocolCapabilities::all_supported(),
+    )
+    .await;
 
     let task = Task::new(
         TaskSpec::command("echo", vec!["never-runs".into()]),
@@ -526,11 +610,288 @@ async fn test_net10_rollover_compaction_and_rejection_not_booked() {
     assert_eq!(final_res.exit_code, 1);
     let info = rej_master.get_task_info(task_id).await.expect("task info");
     assert_eq!(info.state, TaskState::Failed);
-    assert_eq!(
-        rej_master.credits().snapshot().total_records,
-        0,
-        "worker rejection must never book contribution credit"
-    );
+    let _ = rej_master.credits().flush_async().await;
+    assert_eq!(rej_master.credits().snapshot().total_records, 0);
 
     let _ = rej_master.shutdown();
+}
+
+#[tokio::test]
+async fn test_net10_late_stale_failover_cancel_and_clamping() {
+    let master_kp = NodeKeypair::generate().expect("master kp");
+    let master_pub = *master_kp.public_key();
+    let alice_kp = NodeKeypair::generate().expect("alice kp");
+    let bob_kp = NodeKeypair::generate().expect("bob kp");
+    let alice_id = alice_kp.public_key().member_id();
+    let bob_id = bob_kp.public_key().member_id();
+
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_auth_mode(AuthMode::Members)
+            .with_master_noise_key(master_kp)
+            .with_members(make_members(alice_kp.public_key(), bob_kp.public_key())),
+    )
+    .await
+    .expect("spawn master");
+
+    // 1) Failover: Worker 1 (bob) receives task 1 submitted by alice, disconnects without result.
+    let w1_id = Uuid::new_v4();
+    let mut wt1 = register_v3_mock_worker(
+        master.server_addr(),
+        &bob_kp,
+        &master_pub,
+        w1_id,
+        "w1-bob",
+        ProtocolCapabilities::empty(),
+    )
+    .await;
+
+    let t1 = Task::new(
+        TaskSpec::command("echo", vec!["failover".into()]),
+        TaskRequirements::generic(2, 30),
+    );
+    let t1_id = submit_v3_async(master.server_addr(), &alice_kp, &master_pub, t1).await;
+    match wt1.recv_msg::<MasterMessage>().await.expect("assign t1") {
+        Some(MasterMessage::AssignTask { task }) => assert_eq!(task.id, t1_id),
+        other => panic!("expected AssignTask t1, got {other:?}"),
+    }
+    drop(wt1);
+
+    // Worker 2 (alice) connects and completes failed-over t1 cleanly.
+    let w2_id = Uuid::new_v4();
+    let mut wt2 = register_v3_mock_worker(
+        master.server_addr(),
+        &alice_kp,
+        &master_pub,
+        w2_id,
+        "w2-alice",
+        ProtocolCapabilities::empty(),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            wt2.recv_msg::<MasterMessage>(),
+        )
+        .await
+        {
+            Ok(Ok(Some(MasterMessage::AssignTask { task }))) => {
+                assert_eq!(task.id, t1_id);
+                break;
+            }
+            Ok(Ok(Some(_))) => continue,
+            other => panic!("timed out/failed waiting for failover AssignTask: {other:?}"),
+        }
+    }
+    wt2.send_msg(&WorkerMessage::TaskResult {
+        worker_id: w2_id,
+        task_id: t1_id,
+        exit_code: 0,
+        stdout: Vec::new().into(),
+        stderr: Vec::new().into(),
+        execution_time_ms: 250,
+        is_gpu_executed: false,
+        device_name: None,
+        error: None,
+        asset_bytes: None,
+        artifacts: Vec::new(),
+        outputs: Vec::new(),
+    })
+    .await
+    .expect("send failover result");
+    let _ = master
+        .wait_task(t1_id, Some(Duration::from_secs(5)))
+        .await
+        .expect("t1 complete");
+
+    let snap_after_failover = wait_for_credits_total(&master, 1).await;
+    assert_eq!(snap_after_failover.total_records, 1);
+    assert!(snap_after_failover.conservation_holds());
+    let by_label: HashMap<&str, _> = snap_after_failover
+        .participants
+        .iter()
+        .map(|p| (p.label.as_str(), p))
+        .collect();
+    // Both runner (w2-alice) and submitter (alice) are alice -> self_run only; w1 (bob) got 0!
+    assert_eq!(by_label[alice_id.as_str()].all_time.self_run.core_ms, 500);
+    assert!(!by_label.contains_key(bob_id.as_str()));
+
+    // 2) Stale/late duplicate results must never add extra credit records.
+    wt2.send_msg(&WorkerMessage::TaskResult {
+        worker_id: w2_id,
+        task_id: t1_id,
+        exit_code: 0,
+        stdout: Vec::new().into(),
+        stderr: Vec::new().into(),
+        execution_time_ms: 999,
+        is_gpu_executed: false,
+        device_name: None,
+        error: None,
+        asset_bytes: None,
+        artifacts: Vec::new(),
+        outputs: Vec::new(),
+    })
+    .await
+    .expect("send late duplicate result");
+    wt2.send_msg(&WorkerMessage::TaskResult {
+        worker_id: w1_id,
+        task_id: t1_id,
+        exit_code: 0,
+        stdout: Vec::new().into(),
+        stderr: Vec::new().into(),
+        execution_time_ms: 999,
+        is_gpu_executed: false,
+        device_name: None,
+        error: None,
+        asset_bytes: None,
+        artifacts: Vec::new(),
+        outputs: Vec::new(),
+    })
+    .await
+    .expect("send stale worker result");
+
+    // 3) Cancelled queued task and cancelled running task (even if worker sends late result)
+    // must never book credit.
+    let t_queued = Task::new(
+        TaskSpec::command("echo", vec!["cancel-q".into()]),
+        TaskRequirements::generic(1, 30),
+    )
+    .with_tags(vec!["require:worker=missing-worker".into()]);
+    let t_queued_id = submit_v3_async(master.server_addr(), &bob_kp, &master_pub, t_queued).await;
+    master
+        .cancel_task(t_queued_id)
+        .await
+        .expect("cancel queued");
+
+    let t_running = Task::new(
+        TaskSpec::command("echo", vec!["cancel-run".into()]),
+        TaskRequirements::generic(1, 30),
+    );
+    let t_running_id = submit_v3_async(master.server_addr(), &bob_kp, &master_pub, t_running).await;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), wt2.recv_msg::<MasterMessage>()).await {
+            Ok(Ok(Some(MasterMessage::AssignTask { task }))) => {
+                assert_eq!(task.id, t_running_id);
+                break;
+            }
+            Ok(Ok(Some(_))) => continue,
+            other => panic!("failed receiving AssignTask for t_running: {other:?}"),
+        }
+    }
+    master
+        .cancel_task(t_running_id)
+        .await
+        .expect("cancel running");
+    wt2.send_msg(&WorkerMessage::TaskResult {
+        worker_id: w2_id,
+        task_id: t_running_id,
+        exit_code: 0,
+        stdout: Vec::new().into(),
+        stderr: Vec::new().into(),
+        execution_time_ms: 400,
+        is_gpu_executed: false,
+        device_name: None,
+        error: None,
+        asset_bytes: None,
+        artifacts: Vec::new(),
+        outputs: Vec::new(),
+    })
+    .await
+    .expect("send late result after cancel");
+
+    // 4) Non-GPU task with inflated worker execution_time_ms + is_gpu_executed=true gets clamped
+    // and receives 0 GPU-ms.
+    let t_clamp = Task::new(
+        TaskSpec::command("echo", vec!["clamp".into()]),
+        TaskRequirements::generic(2, 5),
+    );
+    let t_clamp_id = submit_v3_async(master.server_addr(), &bob_kp, &master_pub, t_clamp).await;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), wt2.recv_msg::<MasterMessage>()).await {
+            Ok(Ok(Some(MasterMessage::AssignTask { task }))) => {
+                assert_eq!(task.id, t_clamp_id);
+                break;
+            }
+            Ok(Ok(Some(_))) => continue,
+            other => panic!("failed receiving AssignTask for t_clamp: {other:?}"),
+        }
+    }
+    wt2.send_msg(&WorkerMessage::TaskResult {
+        worker_id: w2_id,
+        task_id: t_clamp_id,
+        exit_code: 0,
+        stdout: Vec::new().into(),
+        stderr: Vec::new().into(),
+        execution_time_ms: 10_000_000_000,
+        is_gpu_executed: true,
+        device_name: Some("fake-gpu".into()),
+        error: None,
+        asset_bytes: None,
+        artifacts: Vec::new(),
+        outputs: Vec::new(),
+    })
+    .await
+    .expect("send inflated result");
+    let _ = master
+        .wait_task(t_clamp_id, Some(Duration::from_secs(5)))
+        .await
+        .expect("t_clamp complete");
+
+    let final_snap = wait_for_credits_total(&master, 2).await;
+    assert_eq!(final_snap.total_records, 2);
+    assert!(final_snap.conservation_holds());
+    let final_by_label: HashMap<&str, _> = final_snap
+        .participants
+        .iter()
+        .map(|p| (p.label.as_str(), p))
+        .collect();
+    let alice_row = final_by_label[alice_id.as_str()];
+    assert_eq!(alice_row.all_time.ran_for_others.tasks, 1);
+    assert_eq!(alice_row.all_time.ran_for_others.gpu_ms, 0);
+    assert!(
+        alice_row.all_time.ran_for_others.core_ms <= 10_000,
+        "clamped core_ms ({}) must not exceed timeout*cores (10000)",
+        alice_row.all_time.ran_for_others.core_ms
+    );
+    let bob_row = final_by_label[bob_id.as_str()];
+    assert_eq!(bob_row.all_time.used_from_others.tasks, 1);
+    assert_eq!(
+        bob_row.all_time.used_from_others.core_ms,
+        alice_row.all_time.ran_for_others.core_ms
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_net10_corrupt_credits_files_do_not_stop_master_startup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).expect("mkdir state");
+    fs::write(state_dir.join(CREDITS_SNAPSHOT_FILE), b"{corrupt-snapshot").expect("corrupt snap");
+    fs::write(
+        state_dir.join(CREDITS_JOURNAL_FILE),
+        b"{\"seq\":1,\"blake3\":\"deadbeef\",\"payload\":{\"corrupt\":1}}\n{\"seq\":2,\"blake3\":\"deadbeef\",\"payload\":{\"ok\":2}}\n",
+    )
+    .expect("corrupt jrn");
+
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_state_dir(&state_dir),
+    )
+    .await
+    .expect("master must still start cleanly with corrupt credits files");
+    assert_eq!(master.credits().snapshot().total_records, 0);
+    let _ = master.shutdown();
+
+    let quarantined: Vec<String> = fs::read_dir(&state_dir)
+        .expect("readdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".corrupt."))
+        .collect();
+    assert!(
+        !quarantined.is_empty(),
+        "corrupt credit files should be moved aside"
+    );
 }

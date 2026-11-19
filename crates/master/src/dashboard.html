@@ -1190,7 +1190,7 @@
                 <!-- CONTRIBUTION CREDITS CARD (Display Only, Q96) -->
                 <div class="credits-card" id="creditsCard">
                     <div class="credits-header">
-                        <span class="credits-title">⚖️ Contribution Credits (Display Only)</span>
+                        <span class="credits-title">Contribution Credits (Display Only)</span>
                         <div class="credits-tabs" id="creditsWindowTabs">
                             <button class="credits-tab active" data-win="last_24h" onclick="setCreditWindow('last_24h')">24h</button>
                             <button class="credits-tab" data-win="last_7d" onclick="setCreditWindow('last_7d')">7d</button>
@@ -1198,7 +1198,7 @@
                         </div>
                     </div>
                     <div id="creditsBody" style="font-size:11.5px;color:var(--text-dim);">No completed tasks recorded yet.</div>
-                    <div class="credits-foot" id="creditsFooter">Display only (Q96) — net sum = 0; credits never affect scheduling or quotas.</div>
+                    <div class="credits-foot" id="creditsFooter">Display only (Q96) — contribution records never affect scheduling, admission, or quotas.</div>
                 </div>
             </div>
         </div>
@@ -2384,20 +2384,16 @@
                 const winKey = activeCreditWindow;
                 const rows = list.map(p => {
                     const w = (p && p[winKey]) || {};
-                    const net = w.net || {};
-                    const label = p.display_name ? `${p.display_name} (${shortText(p.participant, 10)})` : p.participant;
-                    const netCore = num(net.core_secs);
-                    const netSign = netCore > 0 ? '+' : '';
-                    const netGpu = num(net.gpu_ms) !== 0 ? ` / ${num(net.gpu_secs) > 0 ? '+' : ''}${num(net.gpu_secs).toFixed(1)}g` : '';
-                    return html`<tr><td>${label}</td><td>${fmtCreditSide(w.contributed)}</td><td>${fmtCreditSide(w.used)}</td><td>${netSign}${netCore.toFixed(1)}c${netGpu}</td></tr>`;
+                    const ids = Array.isArray(p.member_ids) && p.member_ids.length > 0
+                        ? ` (${p.member_ids.map(id => shortText(id, 8)).join(', ')})`
+                        : '';
+                    return html`<tr><td>${p.label || ''}${ids}</td><td>${fmtCreditSide(w.ran_for_others)}</td><td>${fmtCreditSide(w.used_from_others)}</td><td>${fmtCreditSide(w.self_run)}</td></tr>`;
                 });
-                setHtml(body, html`<table class="credits-table"><thead><tr><th>Participant</th><th>Contributed</th><th>Used</th><th>Net</th></tr></thead><tbody>${rows}</tbody></table>`);
+                setHtml(body, html`<table class="credits-table"><thead><tr><th>Participant</th><th>Ran for others</th><th>Used from others</th><th>Self-run</th></tr></thead><tbody>${rows}</tbody></table>`);
             }
             if (foot) {
-                const sumObj = activeCreditWindow === 'last_24h' ? snap.net_sum_24h : (activeCreditWindow === 'last_7d' ? snap.net_sum_7d : snap.net_sum_all_time);
-                const netSum = sumObj ? num(sumObj.core_ms) : 0;
                 const trunc = snap.window_truncated ? ' • oldest 7d records archived (all-time exact)' : '';
-                foot.textContent = `Display only (Q96) — net sum = ${netSum} core-ms • ${num(snap.total_records)} records${trunc}`;
+                foot.textContent = `Display only (Q96) — contribution records never affect scheduling, admission, or quotas • ${num(snap.total_records)} records${trunc}`;
             }
         }
 

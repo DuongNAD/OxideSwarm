@@ -654,6 +654,8 @@ pub struct ResultOutcome {
     pub gpu_reserved: bool,
     /// Authenticated v3 submitting member id captured at submission, if any.
     pub submitted_by_member: Option<String>,
+    /// Upper bound on how long ago this task was submitted (`max(mono_elapsed, utc_elapsed + 1s)`).
+    pub elapsed_since_submit_ms: u64,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.

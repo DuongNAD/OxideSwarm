@@ -780,12 +780,27 @@ impl MasterServer {
         };
         let credits = if let Some(ref state_dir) = config.state_dir {
             let state_dir_clone = state_dir.clone();
-            let opened = tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 crate::credits::CreditsLedger::open(&state_dir_clone, credits_config)
             })
             .await
-            .map_err(|e| GridError::Config(format!("Credits ledger start-up failed: {e}")))??;
-            Arc::new(opened)
+            {
+                Ok(Ok(opened)) => Arc::new(opened),
+                Ok(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        "Failed to open persistent credits ledger; continuing with in-memory display-only ledger"
+                    );
+                    Arc::new(crate::credits::CreditsLedger::in_memory(credits_config))
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Credits ledger start-up task failed; continuing with in-memory display-only ledger"
+                    );
+                    Arc::new(crate::credits::CreditsLedger::in_memory(credits_config))
+                }
+            }
         } else {
             Arc::new(crate::credits::CreditsLedger::in_memory(credits_config))
         };
@@ -2447,6 +2462,12 @@ impl MasterHandle {
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
         self.queue.close_and_compact_store_sync();
+        if let Err(e) = self.credits.flush() {
+            warn!(
+                error = %e,
+                "Failed to flush display-only credits ledger on shutdown"
+            );
+        }
         if self.auth_mode.allows_members() && self.members.is_dirty() {
             if let Err(e) = self.members.flush_dirty() {
                 warn!(

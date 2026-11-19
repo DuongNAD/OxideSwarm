@@ -57,6 +57,37 @@ pub(super) fn apply_max_queue_size(
     Ok(config.with_max_queue_size(max_queue_size))
 }
 
+/// Resolve `--max-credit-records` and `--max-credit-bytes`, refusing `0` on either bound.
+pub(super) fn apply_max_credit_limits(
+    config: ServerConfig,
+    flag_records: Option<usize>,
+    cfg_records: Option<usize>,
+    flag_bytes: Option<u64>,
+    cfg_bytes: Option<u64>,
+) -> Result<ServerConfig, String> {
+    let max_credit_records = resolve_usize(
+        flag_records,
+        &["RUSTY_GRID_MAX_CREDIT_RECORDS"],
+        cfg_records,
+        rusty_grid_master::DEFAULT_MAX_CREDIT_RECORDS,
+    );
+    if max_credit_records == 0 {
+        return Err("--max-credit-records / max_credit_records must be greater than 0".to_string());
+    }
+    let max_credit_bytes = resolve_u64(
+        flag_bytes,
+        &["RUSTY_GRID_MAX_CREDIT_BYTES"],
+        cfg_bytes,
+        rusty_grid_master::DEFAULT_MAX_CREDIT_BYTES,
+    );
+    if max_credit_bytes == 0 {
+        return Err("--max-credit-bytes / max_credit_bytes must be greater than 0".to_string());
+    }
+    Ok(config
+        .with_max_credit_records(max_credit_records)
+        .with_max_credit_bytes(max_credit_bytes))
+}
+
 /// Resolve `--scheduler-policy` / `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy`,
 /// returning an error prefixed with the source name on unknown policy names.
 pub(super) fn resolve_scheduler_policy(
@@ -407,22 +438,19 @@ async fn run_master_inner(
         master_cfg.as_ref().and_then(|m| m.max_retained_mb),
         (rusty_grid_master::queue::DEFAULT_MAX_TERMINAL_BYTES / (1024 * 1024)) as u64,
     );
-    let max_credit_records = resolve_usize(
+    server_config = match apply_max_credit_limits(
+        server_config,
         args.max_credit_records,
-        &["RUSTY_GRID_MAX_CREDIT_RECORDS"],
         master_cfg.as_ref().and_then(|m| m.max_credit_records),
-        rusty_grid_master::DEFAULT_MAX_CREDIT_RECORDS,
-    );
-    let max_credit_bytes = resolve_u64(
         args.max_credit_bytes,
-        &["RUSTY_GRID_MAX_CREDIT_BYTES"],
         master_cfg.as_ref().and_then(|m| m.max_credit_bytes),
-        rusty_grid_master::DEFAULT_MAX_CREDIT_BYTES,
-    );
-    if max_credit_bytes == 0 {
-        eprintln!("--max-credit-bytes must be greater than 0");
-        return ExitCode::FAILURE;
-    }
+    ) {
+        Ok(cfg) => cfg,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mapreduce_parallelism = resolve_usize(
         args.mapreduce_parallelism,
         &["RUSTY_GRID_MAPREDUCE_PARALLELISM"],
@@ -496,8 +524,6 @@ async fn run_master_inner(
         .with_max_terminal_bytes(
             usize::try_from(max_retained_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
         )
-        .with_max_credit_records(max_credit_records)
-        .with_max_credit_bytes(max_credit_bytes)
         .with_mapreduce_parallelism(mapreduce_parallelism)
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);

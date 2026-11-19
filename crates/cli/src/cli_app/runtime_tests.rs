@@ -13,9 +13,9 @@ use crate::connect::connect_master;
 
 use super::mapreduce::run_mapreduce;
 use super::master::{
-    apply_max_queue_size, build_master_scheduler_config, resolve_fail_unfulfillable_tasks,
-    resolve_max_batch_size_with_env, resolve_scheduler_policy, resolve_speed_hold_factor,
-    run_master,
+    apply_max_credit_limits, apply_max_queue_size, build_master_scheduler_config,
+    resolve_fail_unfulfillable_tasks, resolve_max_batch_size_with_env, resolve_scheduler_policy,
+    resolve_speed_hold_factor, run_master,
 };
 use super::submit::{
     any_connected_worker_satisfies_vram, build_task_spec, run_submit, run_submit_with_secret,
@@ -78,7 +78,12 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
             .max_queue_size,
         Some(2)
     );
-    assert!(apply_max_queue_size(base, Some(0), None).is_err());
+    assert!(apply_max_queue_size(base.clone(), Some(0), None).is_err());
+    assert!(apply_max_credit_limits(base.clone(), Some(0), None, None, None).is_err());
+    assert!(apply_max_credit_limits(base.clone(), None, None, Some(0), None).is_err());
+    let applied_credits = apply_max_credit_limits(base, Some(50), None, Some(4096), None).unwrap();
+    assert_eq!(applied_credits.max_credit_records, 50);
+    assert_eq!(applied_credits.max_credit_bytes, 4096);
 
     //    - `resolve_scheduler_policy` and `build_master_scheduler_config` parse known policies,
     //      carry `policy` into `SchedulerConfig`, and reject unknown ones.

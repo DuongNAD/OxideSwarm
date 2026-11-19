@@ -14,7 +14,7 @@ use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus
 use rusty_grid_core::{GridResult, MasterMessage, MessageTransport, WorkerMessage};
 
 use crate::blob_store::BlobStore;
-use crate::credits::{CreditsLedger, TaskUsageInput};
+use crate::credits::{CreditsLedger, TaskUsageInput, MAX_CREDIT_DURATION_MS};
 use crate::queue::{ResultDisposition, ResultOutcome, TaskQueue, TaskState};
 use crate::registry::WorkerRegistry;
 
@@ -537,41 +537,39 @@ async fn prepare_terminal_credit(
         return None;
     }
     let ledger = credits?;
-    let credited_member_id = match registry.worker_owner(&worker_id).await {
+    let runner_member_id = match registry.worker_owner(&worker_id).await {
         Some(mid) => Some(mid),
         None => members.and_then(|m| m.worker_owner(&worker_id)),
     };
+    let timeout_cap_ms = if outcome.timeout_secs > 0 {
+        outcome.timeout_secs.saturating_mul(1000)
+    } else {
+        MAX_CREDIT_DURATION_MS
+    };
+    let duration_ms = result
+        .execution_time_ms
+        .min(outcome.elapsed_since_submit_ms)
+        .min(timeout_cap_ms)
+        .min(MAX_CREDIT_DURATION_MS);
     Some((
         Arc::clone(ledger),
         TaskUsageInput {
             task_id,
             worker_id,
-            duration_ms: result.execution_time_ms,
+            duration_ms,
             cpu_cores: outcome.cpu_cores,
             gpu_reserved: outcome.gpu_reserved,
-            is_gpu_executed: result.is_gpu_executed,
             exit_code: result.exit_code,
             verified: None,
-            credited_member_id,
-            debited_member_id: outcome.submitted_by_member.clone(),
-            credited_label: None,
-            debited_label: None,
+            runner_member_id,
+            submitter_member_id: outcome.submitted_by_member.clone(),
         },
     ))
 }
 
-async fn commit_terminal_credit(
-    credit_entry: Option<(Arc<CreditsLedger>, TaskUsageInput)>,
-    task_id: TaskId,
-) {
+fn enqueue_terminal_credit(credit_entry: Option<(Arc<CreditsLedger>, TaskUsageInput)>) {
     if let Some((ledger, input)) = credit_entry {
-        if let Err(err) = ledger.record_task_async(input).await {
-            warn!(
-                task_id = %task_id.0,
-                error = %err,
-                "Failed to record contribution credit for terminal task"
-            );
-        }
+        ledger.enqueue_task(input);
     }
 }
 
@@ -717,23 +715,23 @@ async fn apply_task_result_inner(
                             "Failed to sync TaskTerminal journal record for task result"
                         );
                     }
-                    commit_terminal_credit(credit_entry, task_id).await;
                     if let Some(ack_token) = ack_token {
                         ack_registry
                             .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
                     }
                     notify_result_waiters(&waiters, task_id, result).await;
+                    enqueue_terminal_credit(credit_entry);
                     cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
-                commit_terminal_credit(credit_entry, task_id).await;
                 if let Some(ack_token) = ack_token {
                     registry
                         .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
                 }
                 notify_result_waiters(waiters, task_id, result).await;
+                enqueue_terminal_credit(credit_entry);
                 queue.spawn_cold_maintenance().await;
             }
         } else {
@@ -746,13 +744,13 @@ async fn apply_task_result_inner(
                     );
                 }
             }
-            commit_terminal_credit(credit_entry, task_id).await;
             if let Some(ack_token) = ack_token {
                 registry
                     .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
             }
             notify_result_waiters(waiters, task_id, result).await;
+            enqueue_terminal_credit(credit_entry);
             queue.spawn_cold_maintenance().await;
         }
     } else if let Some(ack_token) = ack_token {
