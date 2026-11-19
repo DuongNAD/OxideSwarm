@@ -25,6 +25,10 @@
   open. Traffic beyond loopback is authenticated and encrypted.
 - **Isolates tasks.** With `worker --isolation fs`, a task can write only its own sandbox and cannot
   read the cluster secret, on macOS, Linux and Windows.
+- **Keeps contributor limits.** Each worker enforces its own CPU limit (`--max-host-cpu-pct`), weekly
+  local-time schedule (`--allow-hours`), daily task-hours cap (`--daily-task-hours`), battery pause
+  (`--pause-on-battery`), metered-network pause (`--pause-on-metered`), and local stop switch
+  (`oxideswarm worker pause`, `resume`, `status`) ([docs/reference.md](docs/reference.md#oxideswarm-worker-flags)).
 
 **Measured (2026-11-18):** a Mac and a Windows PC together ran the CPU workload W1 1.37 times as fast
 as the faster machine alone (0.73 of their combined local throughput), and all 360 results matched the

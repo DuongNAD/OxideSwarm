@@ -197,6 +197,18 @@ pub struct WorkerFileConfig {
     pub master_key: Option<String>,
     /// Allow connecting to a remote / `auto` / P2P master without a cluster secret.
     pub insecure: Option<bool>,
+    /// Stop starting new tasks when host CPU usage exceeds this percentage (`worker --max-host-cpu-pct`).
+    pub max_host_cpu_pct: Option<f32>,
+    /// Allowed weekly local-time windows (`worker --allow-hours`).
+    pub allow_hours: Option<String>,
+    /// Cumulative daily task-hours limit per local calendar day (`worker --daily-task-hours`).
+    pub daily_task_hours: Option<f64>,
+    /// Pause new task admission while the host runs on battery (`worker --pause-on-battery`).
+    pub pause_on_battery: Option<bool>,
+    /// Pause new task admission while the OS reports a metered network (`worker --pause-on-metered`).
+    pub pause_on_metered: Option<bool>,
+    /// Local pause control file path (`worker --control-file`).
+    pub control_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

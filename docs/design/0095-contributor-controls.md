@@ -175,7 +175,7 @@ Protocol version stays `10`.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| NET-9 | Contributor controls on each machine (Stage 1 of design 0094) | `crates/core/src/error.rs`, `crates/master/src/queue.rs`, `crates/worker/src/controls.rs`, `crates/worker/src/client*.rs`, `crates/worker/src/heartbeat.rs`, `crates/cli/src/...`, `docs/reference.md`, `tests/test_net9_contributor_controls.rs` | Injected-probe worker and integration tests pass; `pause` stops running tasks within 5 s and hands them back without charging execution retries | Partial (design and draft PR open; merges after stability release) |
+| NET-9 | Contributor controls on each machine (Stage 1 of design 0094) | `crates/core/src/error.rs`, `crates/master/src/queue.rs`, `crates/worker/src/controls.rs`, `crates/worker/src/controls/tests.rs`, `crates/worker/src/client*.rs`, `crates/worker/src/heartbeat.rs`, `crates/cli/src/...`, `README.md`, `docs/reference.md`, `crates/worker/tests/test_net9_contributor_controls.rs` | Injected-probe worker and integration tests pass; `pause` stops running tasks within 5 s and hands them back without charging execution retries | Partial (design and draft PR open; merges after stability release) |
 
 ## Status log
 

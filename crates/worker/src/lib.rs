@@ -9,6 +9,7 @@ pub mod backoff;
 pub mod blob_cache;
 pub mod blob_client;
 pub mod client;
+pub mod controls;
 pub mod cpu_simd;
 #[cfg(feature = "3d")]
 pub mod gen3d;
@@ -29,6 +30,13 @@ pub use backoff::{BackoffConfig, ExponentialBackoff};
 pub use blob_cache::{BlobCache, CachePin, DEFAULT_BLOB_CACHE_MAX_BYTES};
 pub use client::{
     compute_effective_resume_grace, WorkerClient, WorkerConfig, RESUME_SAFETY_MARGIN,
+};
+pub use controls::{
+    default_control_file_path, is_pause_file_present, remove_pause_file, validate_daily_task_hours,
+    validate_max_host_cpu_pct, write_pause_file, AllowHoursSchedule, AtomicHostCpuProbe,
+    BlockReason, Clock, ContributorControlsConfig, HostCpuProbe, NetworkCost, NetworkCostProbe,
+    PauseTransition, PowerProbe, PowerSource, SystemClock, WorkerControls, WorkerControlsHandle,
+    PAUSE_STOP_TIMEOUT,
 };
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};

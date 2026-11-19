@@ -31,7 +31,10 @@ pub use discovery::{
     discover_master, discover_master_with_secret, MasterBeacon, DEFAULT_DISCOVERY_PORT,
     DISCOVERY_MAGIC_REQUEST,
 };
-pub use error::{sandbox_base_refusal, GridError, GridResult, SANDBOX_BASE_REFUSAL_PREFIX};
+pub use error::{
+    contributor_control_refusal, sandbox_base_refusal, GridError, GridResult,
+    CONTRIBUTOR_CONTROL_REFUSAL_PREFIX, SANDBOX_BASE_REFUSAL_PREFIX,
+};
 pub use mode::{ModeExecutionResult, WorkflowMode};
 pub use placement::Placement;
 pub use protocol::{

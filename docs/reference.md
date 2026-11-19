@@ -199,7 +199,11 @@ flowchart LR
   keys, MAC-protected `p2p_ticket` P2P fallback, and upfront rejection of unsupported `https://`
   rendezvous URLs (terminate TLS in a local reverse proxy).
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker
-  (`--max-host-cpu-pct`). Tasks run at below-normal priority.
+  (`--max-host-cpu-pct`). Each contributor can also enforce stricter local worker limits: a
+  worker-side CPU ceiling (`--max-host-cpu-pct`), a weekly local-time schedule (`--allow-hours`),
+  a daily task-hours cap (`--daily-task-hours`), `--pause-on-battery`, `--pause-on-metered`, and
+  the local stop switch (`oxideswarm worker pause`, `resume`, `status`,
+  [design 0095](design/0095-contributor-controls.md)). Tasks run at below-normal priority.
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
   log still ends with its summary ([design 0022](design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` detects GPU compute hardware (`--gpu`,
@@ -688,6 +692,25 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
+| `--max-host-cpu-pct <PCT>` | off (`RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT`, `[worker].max_host_cpu_pct`) | Contributor CPU cap (`1.0..=100.0`): hold back new tasks locally when host CPU meets or exceeds this percentage |
+| `--allow-hours <SPEC>` | off (`RUSTY_GRID_ALLOW_HOURS`, `[worker].allow_hours`) | Contributor weekly local-time schedule (`Mon-Fri 22:00-07:00, Sat-Sun 00:00-24:00`); hold back new tasks outside the allowed windows |
+| `--daily-task-hours <HOURS>` | off (`RUSTY_GRID_DAILY_TASK_HOURS`, `[worker].daily_task_hours`) | Daily cumulative task execution cap in hours (finite `> 0.0`, resets at local midnight) |
+| `--pause-on-battery` | `false` (`RUSTY_GRID_PAUSE_ON_BATTERY`, `[worker].pause_on_battery`) | Hold back new tasks while the host is running on battery power (`PowerSource::Battery`) |
+| `--pause-on-metered` | `false` (`RUSTY_GRID_PAUSE_ON_METERED`, `[worker].pause_on_metered`) | Hold back new tasks while the OS reports a metered connection; logs a start-up warning when OS metered detection is unavailable |
+| `--control-file <PATH>` | `<OXIDESWARM_HOME>/worker_pause[.<NAME>]` (`RUSTY_GRID_CONTROL_FILE`, `[worker].control_file`) | Path of the owner-only pause marker file read and toggled by `oxideswarm worker pause \| resume \| status` |
+
+`oxideswarm worker pause`, `oxideswarm worker resume`, and `oxideswarm worker status` (all accept
+`--name <NAME>` and `--control-file <PATH>`) toggle the worker's local stop switch while the
+worker stays connected: `pause` blocks new assignments, terminates active task process trees within
+`5 s`, and returns running or arriving tasks via the worker-refusal path
+([design 0090](design/0090-sandbox-base-refusal-hand-back.md)) so they run on another worker
+without charging execution retries. Metered detection uses `scutil --nwi` + `/sbin/ifconfig -v`
+(`EXPENSIVE`/`CONSTRAINED`) on macOS, NetworkManager (`nmcli`/`busctl`) on Linux, and WinRT
+`NetworkInformation` (`Fixed`/`Variable`/`OverDataLimit`/`Roaming`) on Windows; Linux hosts
+without NetworkManager, Termux/Android, and upstream hotspots over unmetered Wi-Fi or Ethernet
+report unknown/unsupported and log that state at worker start-up. Battery detection uses `pmset` on
+macOS, `/sys/class/power_supply` on Linux, and `GetSystemPowerStatus` on Windows; desktops without
+a battery sensor report unknown power source.
 
 #### `oxideswarm submit` Flags
 | Flag / Alias | Default / Env / Config | Description |
@@ -751,6 +774,9 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm workspaces` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
+| `oxideswarm worker pause` | `--name <NAME>`, `--control-file <PATH>` | Write the contributor pause marker file (`0700` dir / `0600` file on Unix) so the running worker holds back new tasks, ends running tasks within `5 s`, and hands them back via worker refusal without charging execution retries ([design 0095](design/0095-contributor-controls.md)) |
+| `oxideswarm worker resume` | `--name <NAME>`, `--control-file <PATH>` | Remove the contributor pause marker file so the worker resumes accepting tasks |
+| `oxideswarm worker status` | `--name <NAME>`, `--control-file <PATH>` | Print whether the local stop switch is `paused` or `active` along with the resolved control file path |
 | `oxideswarm mapreduce` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
 | `oxideswarm doctor` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
 | `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
@@ -921,6 +947,12 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_MAX_WORKSPACES` | Worker | Maximum persistent workspaces retained on disk before idle LRU eviction (`--max-workspaces`, `[worker].max_workspaces`; default `8`) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `:8080` (`--no-portal`), e.g. for a second worker on one machine |
 | `RUSTY_GRID_NO_BATTERY` | Worker | Disables host battery and thermal probing in `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0028](design/0028-host-battery-probe-override.md)) |
+| `RUSTY_GRID_WORKER_MAX_HOST_CPU_PCT` | Worker | Contributor host CPU percentage ceiling (`--max-host-cpu-pct`, `[worker].max_host_cpu_pct`; `1.0..=100.0`) |
+| `RUSTY_GRID_ALLOW_HOURS` | Worker | Contributor weekly local-time schedule (`--allow-hours`, `[worker].allow_hours`, e.g. `Mon-Fri 22:00-07:00`) |
+| `RUSTY_GRID_DAILY_TASK_HOURS` | Worker | Contributor daily cumulative task execution limit in hours (`--daily-task-hours`, `[worker].daily_task_hours`, `> 0.0`) |
+| `RUSTY_GRID_PAUSE_ON_BATTERY` | Worker | Contributor pause on battery (`--pause-on-battery`, `[worker].pause_on_battery`) |
+| `RUSTY_GRID_PAUSE_ON_METERED` | Worker | Contributor pause on metered network (`--pause-on-metered`, `[worker].pause_on_metered`) |
+| `RUSTY_GRID_CONTROL_FILE` | Worker | Override path for the `worker pause` / `resume` / `status` marker file (`--control-file`, `[worker].control_file`) |
 | `RUSTY_GRID_SESSION_RESUME_GRACE_SECS` | Worker | Optional upper bound in seconds on how long the worker keeps running tasks alive across a disconnect (`--session-resume-grace-secs`, `[worker].session_resume_grace_secs`; clamped to `hold - dead_peer_timeout - 3 s`, `0` disables worker session resume, [design 0046](design/0046-master-durability.md)) |
 
 #### Tier D: Task Child Process Injection Environment

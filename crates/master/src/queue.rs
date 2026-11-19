@@ -669,6 +669,9 @@ const WORKER_REJECTION_MARKERS: &[&str] = &[
     // `rusty_grid_core::SANDBOX_BASE_REFUSAL_PREFIX`, lower case (design 0090); it also holds
     // "rejected by worker", which is what an older master matches.
     "rejected by worker: sandbox base unusable",
+    // `rusty_grid_core::CONTRIBUTOR_CONTROL_REFUSAL_PREFIX`, lower case (NET-9, design 0095); it
+    // also holds "rejected by worker", which is what an older master matches.
+    "rejected by worker: contributor control",
 ];
 
 /// True when `result` is a worker refusing to run a task at all (critically low battery,
