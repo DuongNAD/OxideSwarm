@@ -2798,6 +2798,32 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-74: m5_challenger_2_stress: wait 60 s for reduce Running on w1 and use TEST-54 MapReduce timeouts
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate_retained` failed at
+  `tests/m5_challenger_2_stress.rs:623`: `mapreduce execution after reduce worker crash: Timeout { operation: "MapReduce task ...", duration_secs: 60 }`.
+  Reproduced locally on Apple M5 (`98570ab9`, 6 CPU busy loops) in `2/20` runs (runs 11 and 12 of
+  20, both at `:623:10` after `67.40 s` / `67.42 s`, with the other 18 runs splitting into `~5.1 s` vs
+  `~7.6 s`).
+- **Problem:** In `test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate_retained`,
+  `tasks.iter().find(|t| t.assigned_worker_id == Some(w1.worker_id))` returned `w1`'s already
+  `Completed` map task instead of checking for a `Running` reduce task, so whenever `w1` had run a
+  map partition the loop spun for its full `6 s` deadline before falling back to `w1.abort()`.
+  Sibling `test_m5_mapreduce_worker_crash_during_map_phase_rescheduled` also used a `4 s` fallback
+  loop, `wait_for_workers` used `5 s`, `MapReduceJobSpec` used `30–60 s` without an outer `WAIT`,
+  and `spawn_test_worker` omitted `.with_ram_mb(4096)` / `.with_no_gpu` / `.with_no_blender(true)` /
+  `.with_no_cuda(true)` / `.with_redirection_portal(false)` (`TEST-20`).
+- **Do:** Poll up to `TEST_WAIT_TIMEOUT = 60 s` using `.any(|t| t.assigned_worker_id == Some(w1.worker_id) && t.state == TaskState::Running)` (plus `completed_count >= 2` in the reduce-crash test) and panic with `task_summary` diagnostics instead of falling back after `4–6 s`; adopt the `TEST-54` MapReduce timeout pairing (`MR_WAIT = 180 s` outer `tokio::time::timeout` dumping `queue_stats` + `task_summary`, and `MR_TASK_TIMEOUT_SECS = 540` strictly above `MR_WAIT` across all specs); widen all `wait_for_workers` calls (`5 s` -> `60 s`); and apply the `TEST-20` worker config flags in `spawn_test_worker`.
+- **Done when:** All 11 tests keep every MapReduce, intermediate shuffle retention, and `retry_count == 0` map-phase invariant, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request TBD):** Updated `tests/m5_challenger_2_stress.rs` and
+  verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `98570ab9`): `18/20` passed, **`2/20` failed** at `:623:10`
+    (`252.31 s` total, `4.97–67.79 s` per run).
+  - After fix: `11/11` passed in `3.56 s`, and the 20-run loaded loop passed `20/20` (`75.09 s` total,
+    `3.65–3.90 s` per run, `0` failures).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
