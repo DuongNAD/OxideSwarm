@@ -51,6 +51,7 @@ pub(super) async fn tool_status(state: &McpState, args: &Value) -> ToolCallResul
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                cancelled_tasks,
                 workers,
                 active_bytes,
                 max_active_bytes,
@@ -84,6 +85,7 @@ pub(super) async fn tool_status(state: &McpState, args: &Value) -> ToolCallResul
                     "running_tasks": running_tasks,
                     "completed_tasks": completed_tasks,
                     "failed_tasks": failed_tasks,
+                    "cancelled_tasks": cancelled_tasks,
                     "active_bytes": active_bytes,
                     "max_active_bytes": max_active_bytes,
                 });

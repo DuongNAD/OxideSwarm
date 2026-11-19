@@ -969,15 +969,17 @@ async fn test_cluster_status_counts_scheduled_cancelled_and_every_other_state() 
             running_tasks,
             completed_tasks,
             failed_tasks,
+            cancelled_tasks,
             ..
         } => {
             assert_eq!(total_tasks, 6);
             assert_eq!(pending_tasks, 1, "the unrunnable GPU task");
             assert_eq!(running_tasks, 2, "one running + one merely scheduled");
             assert_eq!(completed_tasks, 1);
-            assert_eq!(failed_tasks, 2, "one failed + one cancelled");
+            assert_eq!(failed_tasks, 1);
+            assert_eq!(cancelled_tasks, 1);
             assert_eq!(
-                pending_tasks + running_tasks + completed_tasks + failed_tasks,
+                pending_tasks + running_tasks + completed_tasks + failed_tasks + cancelled_tasks,
                 total_tasks,
                 "every task is in exactly one bucket"
             );
@@ -1023,12 +1025,19 @@ async fn test_cluster_status_counts_a_task_that_is_waiting_out_a_failover_backof
             running_tasks,
             completed_tasks,
             failed_tasks,
+            cancelled_tasks,
             ..
         } => {
             assert_eq!(total_tasks, 1);
             assert_eq!(
-                (pending_tasks, running_tasks, completed_tasks, failed_tasks),
-                (1, 0, 0, 0),
+                (
+                    pending_tasks,
+                    running_tasks,
+                    completed_tasks,
+                    failed_tasks,
+                    cancelled_tasks,
+                ),
+                (1, 0, 0, 0, 0),
                 "a task waiting out its failover backoff is pending work, not missing"
             );
         }

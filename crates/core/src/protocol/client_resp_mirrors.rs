@@ -48,6 +48,8 @@ pub(super) enum HumanClientResponse {
         max_active_bytes: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_error: Option<String>,
+        #[serde(default)]
+        cancelled_tasks: usize,
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
@@ -206,6 +208,7 @@ pub(super) enum BinaryClientResponse {
         active_bytes: usize,
         max_active_bytes: usize,
         store_error: Option<String>,
+        cancelled_tasks: usize,
         protocol_version: u32,
     },
     WorkerList {
@@ -399,6 +402,171 @@ pub(super) enum LegacyV3V4BinaryClientResponse {
     },
 }
 
+/// Protocol v10 positional bincode layout of [`ClientResponse::ClusterStatus`], which ended at
+/// `store_error` before `cancelled_tasks` was appended in v11 (design 0098).
+///
+/// Variants 0..=3 keep `ClusterStatus` at bincode variant index `4`. Used both so a v11 Master
+/// serializes v10-shaped `ClusterStatus` replies to v10 bincode clients and so a v11 client
+/// recognizes a v10 Master's `ClusterStatus` frame (reporting `IncompatibleVersion`) instead of an
+/// opaque bincode decode error.
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+pub(super) enum LegacyV10BinaryClientResponse {
+    TaskSubmitted {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        result: TaskResult,
+        protocol_version: u32,
+    },
+    TaskStatusInfo {
+        task_id: TaskId,
+        status: TaskStatus,
+        state_name: String,
+        assigned_worker: Option<Uuid>,
+        error: Option<String>,
+        protocol_version: u32,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        success: bool,
+        protocol_version: u32,
+    },
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+        active_bytes: usize,
+        max_active_bytes: usize,
+        store_error: Option<String>,
+        protocol_version: u32,
+    },
+}
+
+/// Protocol v10 JSON layout of [`ClientResponse::ClusterStatus`], which had no `cancelled_tasks`
+/// field (design 0098). Used so a v11 Master serves a v10 JSON client without emitting
+/// `cancelled_tasks` (folding it into `failed_tasks`), and frozen v10 test readers can decode
+/// v10 JSON `ClusterStatus` payloads. Name starts with `Human` per `crates/core/src/lib.rs`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub(super) enum HumanLegacyV10ClientResponse {
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+        #[serde(default)]
+        active_bytes: usize,
+        #[serde(default)]
+        max_active_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        store_error: Option<String>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+}
+
+#[cfg(any(test, feature = "test-extensions"))]
+impl HumanLegacyV10ClientResponse {
+    pub(super) const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::ClusterStatus {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-extensions"))]
+impl From<HumanLegacyV10ClientResponse> for ClientResponse {
+    fn from(msg: HumanLegacyV10ClientResponse) -> Self {
+        match msg {
+            HumanLegacyV10ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                store_error,
+                ..
+            } => ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                store_error,
+                cancelled_tasks: 0,
+            },
+        }
+    }
+}
+
+impl LegacyV10BinaryClientResponse {
+    pub(super) const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::TaskSubmitted {
+                protocol_version, ..
+            }
+            | Self::TaskCompleted {
+                protocol_version, ..
+            }
+            | Self::TaskStatusInfo {
+                protocol_version, ..
+            }
+            | Self::TaskCancelled {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-extensions"))]
+    pub(super) fn into_cluster_status(self) -> Option<ClientResponse> {
+        match self {
+            Self::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                store_error,
+                ..
+            } => Some(ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                store_error,
+                cancelled_tasks: 0,
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl HumanClientResponse {
     fn from_client_response(msg: ClientResponse, protocol_version: u32) -> Self {
         match msg {
@@ -444,6 +612,7 @@ impl HumanClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
             } => HumanClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -454,6 +623,7 @@ impl HumanClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
                 protocol_version,
             },
             ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList {
@@ -717,6 +887,7 @@ impl BinaryClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
             } => BinaryClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -727,6 +898,7 @@ impl BinaryClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
                 protocol_version,
             },
             ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList {
@@ -987,6 +1159,7 @@ impl From<HumanClientResponse> for ClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
                 ..
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -998,6 +1171,7 @@ impl From<HumanClientResponse> for ClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
             },
             HumanClientResponse::WorkerList { workers, .. } => {
                 ClientResponse::WorkerList { workers }
@@ -1136,6 +1310,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
                 ..
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -1147,6 +1322,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 active_bytes,
                 max_active_bytes,
                 store_error,
+                cancelled_tasks,
             },
             BinaryClientResponse::WorkerList { workers, .. } => {
                 ClientResponse::WorkerList { workers }
@@ -1280,5 +1456,68 @@ pub(crate) fn serialize_client_response_with_version(
             let wire = HumanClientResponse::from_client_response(msg.clone(), protocol_version);
             super::codec::serialize_message(&wire, super::WireCodec::Json)
         }
+    }
+}
+
+/// Serializes a [`ClientResponse`] for a peer speaking `peer_version` (design 0083 D3, design 0098).
+///
+/// For `peer_version >= 11`, encodes the current layout stamped with `peer_version`. For
+/// `peer_version < 11` (protocol 10), `ClusterStatus` folds `cancelled_tasks` back into
+/// `failed_tasks` via [`ClientResponse::for_peer`] and omits `cancelled_tasks` from both wire
+/// formats (`LegacyV10BinaryClientResponse` / `HumanLegacyV10ClientResponse`).
+pub(super) fn serialize_client_response_for_peer(
+    msg: &ClientResponse,
+    peer_version: u32,
+    codec: super::WireCodec,
+) -> Result<bytes::Bytes, super::ProtocolError> {
+    if peer_version >= 11 {
+        return serialize_client_response_with_version(msg, peer_version, codec);
+    }
+    let adapted = msg.for_peer(peer_version);
+    match adapted {
+        ClientResponse::ClusterStatus {
+            total_tasks,
+            pending_tasks,
+            running_tasks,
+            completed_tasks,
+            failed_tasks,
+            workers,
+            active_bytes,
+            max_active_bytes,
+            store_error,
+            cancelled_tasks: _,
+        } => match codec {
+            super::WireCodec::Bincode => {
+                let wire = LegacyV10BinaryClientResponse::ClusterStatus {
+                    total_tasks,
+                    pending_tasks,
+                    running_tasks,
+                    completed_tasks,
+                    failed_tasks,
+                    workers,
+                    active_bytes,
+                    max_active_bytes,
+                    store_error,
+                    protocol_version: peer_version,
+                };
+                super::codec::serialize_message(&wire, super::WireCodec::Bincode)
+            }
+            super::WireCodec::Json => {
+                let wire = HumanLegacyV10ClientResponse::ClusterStatus {
+                    total_tasks,
+                    pending_tasks,
+                    running_tasks,
+                    completed_tasks,
+                    failed_tasks,
+                    workers,
+                    active_bytes,
+                    max_active_bytes,
+                    store_error,
+                    protocol_version: peer_version,
+                };
+                super::codec::serialize_message(&wire, super::WireCodec::Json)
+            }
+        },
+        other => serialize_client_response_with_version(&other, peer_version, codec),
     }
 }

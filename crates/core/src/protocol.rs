@@ -28,7 +28,7 @@ pub use codec::{
     MessageReader, MessageTransport, MessageWriter, AEAD_RECORD_OVERHEAD,
 };
 #[cfg(any(test, feature = "test-extensions"))]
-pub use codec::{deserialize_message_as_v9, serialize_v9_client_message};
+pub use codec::{deserialize_message_as_v10, serialize_v10_client_message};
 
 /// Maximum allowable frame size in bytes (64 MB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -46,10 +46,10 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 10;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 11;
 /// Minimum wire protocol version compatible with this build. One version back while the window
 /// of design 0083 is open (`CURRENT - 1`); equal to `CURRENT` when a wire change closes it.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 9;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 10;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -772,6 +772,7 @@ pub enum ClientResponse {
         active_bytes: usize,
         max_active_bytes: usize,
         store_error: Option<String>,
+        cancelled_tasks: usize,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
@@ -868,6 +869,46 @@ pub enum ClientResponse {
     WorkerIdReleased {
         worker_id: Uuid,
     },
+}
+
+impl ClientResponse {
+    /// Returns the response payload adapted for a peer speaking protocol `version`.
+    ///
+    /// Protocol 10 had no `cancelled_tasks` field on `ClusterStatus` and reported cancelled tasks
+    /// inside `failed_tasks` (`QueueStats::cluster_buckets` before protocol 11). For `version < 11`,
+    /// `cancelled_tasks` is folded back into `failed_tasks` with saturating addition so v10
+    /// peers observe the same combined count.
+    pub fn for_peer(&self, version: u32) -> Self {
+        if version >= 11 {
+            return self.clone();
+        }
+        match self {
+            Self::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                store_error,
+                cancelled_tasks,
+            } => Self::ClusterStatus {
+                total_tasks: *total_tasks,
+                pending_tasks: *pending_tasks,
+                running_tasks: *running_tasks,
+                completed_tasks: *completed_tasks,
+                failed_tasks: failed_tasks.saturating_add(*cancelled_tasks),
+                workers: workers.clone(),
+                active_bytes: *active_bytes,
+                max_active_bytes: *max_active_bytes,
+                store_error: store_error.clone(),
+                cancelled_tasks: 0,
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// Unified message discriminator for multiplexed connections on the Master.

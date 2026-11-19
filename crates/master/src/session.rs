@@ -2065,13 +2065,14 @@ mod tests {
         session_task.abort();
     }
 
-    /// Design 0083 D2/D3: a worker that registers with protocol 9 on a two-lane (QUIC-shaped)
-    /// session gets the same peer version on both lanes: the accepted `RegisterAck` on the control
-    /// lane echoes 9, and an `AssignTask` on the data lane takes the v9 task layout without the
-    /// extension lists (the stored task keeps them).
+    /// Design 0083 D2/D3, design 0098: a worker that registers with protocol 10 on a two-lane
+    /// (QUIC-shaped) session gets the same peer version on both lanes: the accepted `RegisterAck`
+    /// on the control lane echoes 10, and an `AssignTask` on the data lane goes through
+    /// `for_peer(10)` (removing `Master`-scope extensions while keeping non-critical ones and the
+    /// stored task whole).
     #[tokio::test]
-    async fn test_multiplexed_v9_worker_gets_v9_on_both_lanes() {
-        use rusty_grid_core::protocol::deserialize_message_as_v9;
+    async fn test_multiplexed_v10_worker_gets_v10_on_both_lanes() {
+        use rusty_grid_core::protocol::deserialize_message_as_v10;
         use rusty_grid_core::task::Extension;
 
         let registry = WorkerRegistry::new();
@@ -2099,8 +2100,15 @@ mod tests {
         mux_ctrl
             .send_msg(&WorkerMessage::Register {
                 worker_id,
-                capabilities: WorkerCapabilities::new("mux-v9-worker", 2, 4096, false, false, None),
-                protocol_version: 9,
+                capabilities: WorkerCapabilities::new(
+                    "mux-v10-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: 10,
                 features: ProtocolCapabilities::all_supported(),
             })
             .await
@@ -2110,17 +2118,27 @@ mod tests {
             .await
             .unwrap()
             .expect("RegisterAck");
-        match deserialize_message_as_v9::<MasterMessage>(&ack).unwrap().0 {
+        match deserialize_message_as_v10::<MasterMessage>(&ack).unwrap().0 {
             MasterMessage::RegisterAck {
                 accepted: true,
-                protocol_version: 9,
+                protocol_version: 10,
                 ..
             } => {}
-            other => panic!("expected a RegisterAck stamped 9, got {other:?}"),
+            other => panic!("expected a RegisterAck stamped 10, got {other:?}"),
         }
+        // Only the peer's own version (10) was echoed, not PROTOCOL_VERSION_CURRENT (11).
+        let (raw_ack, _) =
+            rusty_grid_core::protocol::deserialize_message::<MasterMessage>(&ack).unwrap();
+        assert!(matches!(
+            raw_ack,
+            MasterMessage::RegisterAck {
+                protocol_version: 10,
+                ..
+            }
+        ));
         let info = registry.get_worker(worker_id).await.unwrap();
         assert!(
-            info.capabilities.tags.contains(&"proto:9".to_string()),
+            info.capabilities.tags.contains(&"proto:10".to_string()),
             "{:?}",
             info.capabilities.tags
         );
@@ -2133,18 +2151,25 @@ mod tests {
         let mut task = Task::new(
             TaskSpec::Command {
                 program: "echo".into(),
-                args: vec!["v9".into()],
+                args: vec!["v10".into()],
                 env: HashMap::new(),
                 working_dir: None,
                 stdin: None,
             },
             TaskRequirements::generic(1, 64),
         );
-        task.extensions = vec![Extension {
-            id: 0x8001,
-            critical: false,
-            bytes: vec![1],
-        }];
+        task.extensions = vec![
+            Extension {
+                id: 0x8001,
+                critical: false,
+                bytes: vec![1],
+            },
+            Extension {
+                id: 0x8003,
+                critical: true,
+                bytes: vec![2],
+            },
+        ];
         outbound_tx
             .send(MasterMessage::AssignTask { task: task.clone() })
             .await
@@ -2155,20 +2180,17 @@ mod tests {
             .expect("AssignTask must arrive on the data lane")
             .unwrap()
             .expect("a frame");
-        match deserialize_message_as_v9::<MasterMessage>(&frame)
+        match deserialize_message_as_v10::<MasterMessage>(&frame)
             .unwrap()
             .0
         {
             MasterMessage::AssignTask { task: received } => {
                 assert_eq!(received.id, task.id);
-                assert!(received.extensions.is_empty());
+                assert_eq!(received.extensions.len(), 1);
+                assert_eq!(received.extensions[0].id, 0x8001);
             }
             other => panic!("expected AssignTask, got {other:?}"),
         }
-        assert!(
-            rusty_grid_core::protocol::deserialize_message::<MasterMessage>(&frame).is_err(),
-            "the data lane carries the v9 task layout"
-        );
 
         let _ = stop_tx.send(true);
         session_task.abort();

@@ -11,12 +11,12 @@ use super::client_msg_mirrors::{
     LegacyV5BinaryClientMessage, LegacyV6ToV8BinaryClientMessage, LegacyV9BinaryClientMessage,
 };
 use super::client_resp_mirrors::{
-    serialize_client_response_with_version, BinaryClientResponse, HumanClientResponse,
-    LegacyV2BinaryClientResponse, LegacyV3V4BinaryClientResponse,
+    serialize_client_response_for_peer, BinaryClientResponse, HumanClientResponse,
+    LegacyV10BinaryClientResponse, LegacyV2BinaryClientResponse, LegacyV3V4BinaryClientResponse,
 };
 use super::worker_master_mirrors::{
-    master_message_for_peer, serialize_master_message_v9_bincode, BinaryInboundMessage,
-    LegacyBinaryMasterMessage, LegacyBinaryWorkerMessage,
+    master_message_for_peer, BinaryInboundMessage, LegacyBinaryMasterMessage,
+    LegacyBinaryWorkerMessage,
 };
 use super::{
     is_master_echo_acceptable, is_protocol_version_compatible, ClientMessage, ClientResponse,
@@ -279,14 +279,15 @@ pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Byte
     }
 }
 
-/// Serializes a message for a peer speaking `peer_version` (design 0083 D3).
+/// Serializes a message for a peer speaking `peer_version` (design 0083 D3, design 0098).
 ///
-/// For the current version this is [`serialize_message`]. For an older one the messages whose
-/// layout or stamp differ are re-encoded: `MasterMessage` (the accepted `RegisterAck` echoes the
-/// peer's version, tasks go through `Task::for_peer` and, in bincode, take the v9 task layout)
-/// and `ClientResponse` (same layout, stamp = the peer's version, except `Error`, which keeps
-/// stamping the current version that a peer reads without a check). Every other message has the
-/// same bytes in both versions.
+/// For the current version (`>= PROTOCOL_VERSION_CURRENT`) this is [`serialize_message`]. For an
+/// older compatible version (`10`), the messages whose layout or stamp differ are re-encoded:
+/// `MasterMessage` (accepted `RegisterAck` echoes the peer's version, `Master`-scope extensions
+/// are stripped, and both bincode and JSON share the v10 layout) and `ClientResponse` (`ClusterStatus`
+/// folds `cancelled_tasks` into `failed_tasks` and omits `cancelled_tasks`; every response echoes
+/// the peer's stamp except `Error`, which keeps stamping the current version that any peer reads
+/// without a check). Every other message has the same bytes in both versions.
 pub fn serialize_message_for_peer<M: Serialize + 'static>(
     msg: &M,
     codec: WireCodec,
@@ -298,104 +299,63 @@ pub fn serialize_message_for_peer<M: Serialize + 'static>(
     let any: &dyn std::any::Any = msg;
     if let Some(master) = any.downcast_ref::<MasterMessage>() {
         let adapted = master_message_for_peer(master, peer_version);
-        return match codec {
-            WireCodec::Json => serialize_message(&adapted, WireCodec::Json),
-            WireCodec::Bincode => {
-                let payload = serialize_master_message_v9_bincode(adapted)?;
-                let size = 1usize.saturating_add(payload.len());
-                if size > MAX_FRAME_SIZE {
-                    return Err(ProtocolError::FrameTooLarge {
-                        size,
-                        max: MAX_FRAME_SIZE,
-                    });
-                }
-                let mut buf = Vec::with_capacity(size);
-                buf.push(WIRE_FORMAT_BINCODE);
-                buf.extend_from_slice(&payload);
-                Ok(Bytes::from(buf))
-            }
-        };
+        return serialize_message(&adapted, codec);
     }
     if let Some(resp) = any.downcast_ref::<ClientResponse>() {
         if matches!(resp, ClientResponse::Error { .. }) {
             return serialize_message(resp, codec);
         }
-        return serialize_client_response_with_version(resp, peer_version, codec);
+        return serialize_client_response_for_peer(resp, peer_version, codec);
     }
     serialize_message(msg, codec)
 }
 
-/// Serializes a [`ClientMessage`] as a v9 client sends it (design 0083, for tests): stamped 9, and
-/// a `SubmitTask` in the v9 task layout without extensions. Every other message has the same
-/// layout in both versions. The layout is the one `wire_layout_previous.txt` (v0.3.0) pins.
+/// Serializes a [`ClientMessage`] as a v10 client sends it (design 0098, for tests): stamped 10.
+/// All `ClientMessage` layouts match between protocol 10 and 11, which `wire_layout_previous.txt`
+/// (`v0.4.4`) pins.
 #[cfg(any(test, feature = "test-extensions"))]
-pub fn serialize_v9_client_message(
+pub fn serialize_v10_client_message(
     msg: &ClientMessage,
     codec: WireCodec,
 ) -> Result<Bytes, ProtocolError> {
-    use super::client_msg_mirrors::LegacyV9Task;
-    const V9: u32 = 9;
-    if let (ClientMessage::SubmitTask { task, wait }, WireCodec::Bincode) = (msg, codec) {
-        return serialize_message(
-            &LegacyV9BinaryClientMessage::SubmitTask {
-                task: LegacyV9Task::from(task.for_peer(V9)),
-                wait: *wait,
-                protocol_version: V9,
-            },
-            WireCodec::Bincode,
-        );
-    }
-    let msg = match msg {
-        ClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask {
-            task: task.for_peer(V9),
-            wait: *wait,
-        },
-        other => other.clone(),
-    };
+    const V10: u32 = 10;
     match codec {
         WireCodec::Bincode => serialize_message(
-            &BinaryClientMessage::from_client_message(msg, V9),
+            &BinaryClientMessage::from_client_message(msg.clone(), V10),
             WireCodec::Bincode,
         ),
         WireCodec::Json => serialize_message(
-            &HumanClientMessage::from_client_message(msg, V9),
+            &HumanClientMessage::from_client_message(msg.clone(), V10),
             WireCodec::Json,
         ),
     }
 }
 
-/// Reads a frame the way a v9 peer does (a frozen reader for tests, design 0083): a
-/// `MasterMessage` in the v9 task layout whose accepted `RegisterAck` must carry version 9, a
-/// `ClientResponse` whose stamp must be 9 unless it is an `Error`. Any other type has the same
-/// layout in both versions and goes through [`deserialize_message`].
+/// Reads a frame the way a v10 peer does (a frozen reader for tests, design 0098): a
+/// `MasterMessage` whose accepted `RegisterAck` must carry version 10, and a `ClientResponse`
+/// whose stamp must be 10 unless it is an `Error` (`ClusterStatus` decoded in its v10 layout
+/// without `cancelled_tasks`). Any other type has the same layout in both versions and goes
+/// through [`deserialize_message`].
 #[cfg(any(test, feature = "test-extensions"))]
-pub fn deserialize_message_as_v9<M: DeserializeOwned + 'static>(
+pub fn deserialize_message_as_v10<M: DeserializeOwned + 'static>(
     bytes: &[u8],
 ) -> Result<(M, WireCodec), ProtocolError> {
-    const V9: u32 = 9;
+    use super::client_resp_mirrors::HumanLegacyV10ClientResponse;
+    const V10: u32 = 10;
     let tid = std::any::TypeId::of::<M>();
     if tid == std::any::TypeId::of::<MasterMessage>() {
-        let (msg, codec) = match bytes.first().copied() {
-            Some(WIRE_FORMAT_BINCODE) => (
-                super::worker_master_mirrors::deserialize_master_message_v9_bincode(&bytes[1..])?,
-                WireCodec::Bincode,
-            ),
-            _ => {
-                let (m, c) = deserialize_message::<MasterMessage>(bytes)?;
-                (m, c)
-            }
-        };
+        let (msg, codec) = deserialize_message::<MasterMessage>(bytes)?;
         if let MasterMessage::RegisterAck {
             accepted: true,
             protocol_version,
             ..
         } = &msg
         {
-            if *protocol_version != V9 {
+            if *protocol_version != V10 {
                 return Err(ProtocolError::IncompatibleVersion {
                     peer_version: *protocol_version,
-                    current_version: V9,
-                    min_compatible_version: V9,
+                    current_version: V10,
+                    min_compatible_version: V10,
                 });
             }
         }
@@ -404,32 +364,63 @@ pub fn deserialize_message_as_v9<M: DeserializeOwned + 'static>(
     if tid == std::any::TypeId::of::<ClientResponse>() {
         let (stamp, is_error, msg, codec) = match bytes.first().copied() {
             Some(WIRE_FORMAT_BINCODE) => {
-                let bin: BinaryClientResponse =
-                    bincode_exact_deserialize(&bytes[1..]).map_err(ProtocolError::Bincode)?;
-                (
-                    bin.protocol_version(),
-                    bin.is_error(),
-                    ClientResponse::from(bin),
-                    WireCodec::Bincode,
-                )
+                let slice = &bytes[1..];
+                if slice.len() >= 4 && slice[..4] == 4u32.to_le_bytes() {
+                    let legacy: LegacyV10BinaryClientResponse =
+                        bincode_exact_deserialize(slice).map_err(ProtocolError::Bincode)?;
+                    let stamp = legacy.protocol_version();
+                    let msg = legacy
+                        .into_cluster_status()
+                        .expect("variant tag 4 is ClusterStatus");
+                    (stamp, false, msg, WireCodec::Bincode)
+                } else {
+                    let bin: BinaryClientResponse =
+                        bincode_exact_deserialize(slice).map_err(ProtocolError::Bincode)?;
+                    (
+                        bin.protocol_version(),
+                        bin.is_error(),
+                        ClientResponse::from(bin),
+                        WireCodec::Bincode,
+                    )
+                }
             }
             Some(WIRE_FORMAT_JSON) => {
-                let human: HumanClientResponse = serde_json::from_slice(&bytes[1..])?;
-                (
-                    human.protocol_version(),
-                    human.is_error(),
-                    ClientResponse::from(human),
-                    WireCodec::Json,
-                )
+                let val: serde_json::Value = serde_json::from_slice(&bytes[1..])?;
+                if val.get("type").and_then(|v| v.as_str()) == Some("ClusterStatus") {
+                    if val
+                        .as_object()
+                        .is_some_and(|obj| obj.contains_key("cancelled_tasks"))
+                    {
+                        return Err(ProtocolError::Violation(
+                            "v10 ClientResponse::ClusterStatus must not contain cancelled_tasks"
+                                .into(),
+                        ));
+                    }
+                    let human: HumanLegacyV10ClientResponse = serde_json::from_value(val)?;
+                    (
+                        human.protocol_version(),
+                        false,
+                        ClientResponse::from(human),
+                        WireCodec::Json,
+                    )
+                } else {
+                    let human: HumanClientResponse = serde_json::from_value(val)?;
+                    (
+                        human.protocol_version(),
+                        human.is_error(),
+                        ClientResponse::from(human),
+                        WireCodec::Json,
+                    )
+                }
             }
             Some(tag) => return Err(ProtocolError::InvalidFormatTag(tag)),
             None => return Err(ProtocolError::UnexpectedEof),
         };
-        if !is_error && stamp != V9 {
+        if !is_error && stamp != V10 {
             return Err(ProtocolError::IncompatibleVersion {
                 peer_version: stamp,
-                current_version: V9,
-                min_compatible_version: V9,
+                current_version: V10,
+                min_compatible_version: V10,
             });
         }
         return Ok((downcast_msg(msg), codec));
@@ -463,33 +454,6 @@ fn incompatible_version_error(peer_version: u32) -> ProtocolError {
     }
 }
 
-/// The protocol version whose `Task` layout (no `extensions`) a v10 Master still reads in a
-/// `SubmitTask` (design 0083 D4).
-const WINDOW_LEGACY_TASK_VERSION: u32 = 9;
-
-/// Decodes `slice` as the v9 `SubmitTask` its stamp `stamp` claims, and as nothing else: a frame
-/// is never accepted under a layout its stamp contradicts (design 0083 D2).
-fn decode_legacy_v9_submit(slice: &[u8], stamp: u32) -> Result<ClientMessage, ProtocolError> {
-    match bincode_exact_deserialize::<LegacyV9BinaryClientMessage>(slice) {
-        Ok(LegacyV9BinaryClientMessage::SubmitTask {
-            task,
-            wait,
-            protocol_version,
-        }) if protocol_version == stamp && stamp == WINDOW_LEGACY_TASK_VERSION => {
-            Ok(ClientMessage::SubmitTask {
-                task: task.into(),
-                wait,
-            })
-        }
-        Ok(_) => Err(ProtocolError::Bincode(Box::new(
-            bincode::ErrorKind::Custom(format!(
-                "SubmitTask stamped {stamp} does not match the layout of that version"
-            )),
-        ))),
-        Err(e) => Err(ProtocolError::Bincode(e)),
-    }
-}
-
 /// Decodes a bincode [`ClientMessage`] and returns it with its protocol version stamp.
 fn decode_bincode_client_message(slice: &[u8]) -> Result<(ClientMessage, u32), ProtocolError> {
     match bincode_exact_deserialize::<BinaryClientMessage>(slice) {
@@ -497,14 +461,6 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<(ClientMessage, u32), P
             let ver = bin_msg.protocol_version();
             if !is_protocol_version_compatible(ver) {
                 return Err(incompatible_version_error(ver));
-            }
-            // A v9 `SubmitTask` can parse as a v10 one by accident (design 0083 D2: a
-            // `created_at_utc` of 0 reads as an empty extension list). When the stamp is below the
-            // current version, the layout of that stamp decides.
-            if ver < PROTOCOL_VERSION_CURRENT
-                && matches!(bin_msg, BinaryClientMessage::SubmitTask { .. })
-            {
-                return decode_legacy_v9_submit(slice, ver).map(|m| (m, ver));
             }
             Ok((bin_msg.into(), ver))
         }
@@ -535,10 +491,6 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<(ClientMessage, u32), P
                 if !is_protocol_version_compatible(protocol_version) {
                     return Err(incompatible_version_error(protocol_version));
                 }
-                if protocol_version == WINDOW_LEGACY_TASK_VERSION {
-                    return decode_legacy_v9_submit(slice, protocol_version)
-                        .map(|m| (m, protocol_version));
-                }
             }
             Err(ProtocolError::Bincode(err))
         }
@@ -555,6 +507,14 @@ fn decode_bincode_client_response(slice: &[u8]) -> Result<ClientResponse, Protoc
             Ok(bin_resp.into())
         }
         Err(err) => {
+            if let Ok(legacy_v10) =
+                bincode_exact_deserialize::<LegacyV10BinaryClientResponse>(slice)
+            {
+                let ver = legacy_v10.protocol_version();
+                if !is_master_echo_acceptable(ver) {
+                    return Err(incompatible_version_error(ver));
+                }
+            }
             if let Ok(LegacyV3V4BinaryClientResponse::ClusterStatus {
                 protocol_version, ..
             }) = bincode_exact_deserialize::<LegacyV3V4BinaryClientResponse>(slice)

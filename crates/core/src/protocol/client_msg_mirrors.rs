@@ -290,8 +290,10 @@ pub(super) struct LegacyV6ToV8Task {
 }
 
 /// Protocol v9 positional bincode layout of [`TaskRequirements`], which ended at `vram_mb`
-/// before `extensions` was appended in v10.
-#[derive(Serialize, Deserialize)]
+/// before `extensions` was appended in v10. Used only so a v10+ Master can refuse a v9
+/// `SubmitTask` frame with [`ProtocolError::IncompatibleVersion`].
+#[derive(Deserialize)]
+#[allow(dead_code)]
 pub(super) struct LegacyV9TaskRequirements {
     cpu_cores: usize,
     ram_mb: u64,
@@ -302,9 +304,10 @@ pub(super) struct LegacyV9TaskRequirements {
 }
 
 /// Protocol v9 positional bincode layout of [`Task`], which ended at `workspace` before
-/// `extensions` was appended in v10 (design 0083). A v10 Master reads a v9 `SubmitTask` through it
-/// and writes `AssignTask` to a v9 worker with it; the frozen v0.3.0 layout file is its oracle.
-#[derive(Serialize, Deserialize)]
+/// `extensions` was appended in v10. Used only so a v10+ Master can refuse a v9 `SubmitTask`
+/// frame with [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode error.
+#[derive(Deserialize)]
+#[allow(dead_code)]
 pub(super) struct LegacyV9Task {
     id: crate::task::TaskId,
     spec: crate::task::TaskSpec,
@@ -317,61 +320,6 @@ pub(super) struct LegacyV9Task {
     inputs: Vec<crate::blob::TaskInput>,
     output_globs: Vec<String>,
     workspace: Option<crate::task::WorkspaceRef>,
-}
-
-impl From<LegacyV9Task> for Task {
-    /// Total: every field of the v9 layout exists in v10, and a v9 peer cannot send an extension,
-    /// so both extension lists are empty.
-    fn from(t: LegacyV9Task) -> Self {
-        Task {
-            id: t.id,
-            spec: t.spec,
-            requirements: crate::task::TaskRequirements {
-                cpu_cores: t.requirements.cpu_cores,
-                ram_mb: t.requirements.ram_mb,
-                gpu_required: t.requirements.gpu_required,
-                timeout_secs: t.requirements.timeout_secs,
-                max_retries: t.requirements.max_retries,
-                vram_mb: t.requirements.vram_mb,
-                extensions: Vec::new(),
-            },
-            created_at_utc: t.created_at_utc,
-            tags: t.tags,
-            latest_checkpoint: t.latest_checkpoint,
-            staged_files: t.staged_files,
-            expected_outputs: t.expected_outputs,
-            inputs: t.inputs,
-            output_globs: t.output_globs,
-            workspace: t.workspace,
-            extensions: Vec::new(),
-        }
-    }
-}
-
-impl From<Task> for LegacyV9Task {
-    /// Drops both extension lists; callers pass the task through `Task::for_peer(9)` first.
-    fn from(t: Task) -> Self {
-        LegacyV9Task {
-            id: t.id,
-            spec: t.spec,
-            requirements: LegacyV9TaskRequirements {
-                cpu_cores: t.requirements.cpu_cores,
-                ram_mb: t.requirements.ram_mb,
-                gpu_required: t.requirements.gpu_required,
-                timeout_secs: t.requirements.timeout_secs,
-                max_retries: t.requirements.max_retries,
-                vram_mb: t.requirements.vram_mb,
-            },
-            created_at_utc: t.created_at_utc,
-            tags: t.tags,
-            latest_checkpoint: t.latest_checkpoint,
-            staged_files: t.staged_files,
-            expected_outputs: t.expected_outputs,
-            inputs: t.inputs,
-            output_globs: t.output_globs,
-            workspace: t.workspace,
-        }
-    }
 }
 
 /// Protocol v3 to v5 positional bincode layout of [`ClientMessage`]: the same variants as v6
@@ -403,10 +351,10 @@ pub(super) enum LegacyV6ToV8BinaryClientMessage {
 }
 
 /// Protocol v9 positional bincode layout of [`ClientMessage::SubmitTask`] carrying
-/// [`LegacyV9Task`]. A v10 Master decodes a v9 `SubmitTask` with it (design 0083 D4); it is
-/// `Serialize` too so tests can speak as a v9 client.
-#[derive(Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
+/// [`LegacyV9Task`]. Used only so a v11+ Master refuses a v9 `SubmitTask` with
+/// [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode error.
+#[derive(Deserialize)]
+#[allow(clippy::large_enum_variant, dead_code)]
 pub(super) enum LegacyV9BinaryClientMessage {
     SubmitTask {
         task: LegacyV9Task,

@@ -371,13 +371,14 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     );
                 }
                 let stats = queue.stats().await;
-                let (pending, running, completed, failed) = stats.cluster_buckets();
+                let (pending, running, completed, failed, cancelled) = stats.cluster_buckets();
                 let resp = ClientResponse::ClusterStatus {
                     total_tasks: stats.total,
                     pending_tasks: pending,
                     running_tasks: running,
                     completed_tasks: completed,
                     failed_tasks: failed,
+                    cancelled_tasks: cancelled,
                     active_bytes: stats.active_bytes,
                     max_active_bytes: stats.max_active_bytes,
                     store_error: stats.store_error,
