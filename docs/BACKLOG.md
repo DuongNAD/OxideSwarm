@@ -410,6 +410,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | R18 | Spike: the cost of a boundary in a split whose head has a GPU | P3 | S |  | Yes | Planned | Out | (design 0062) |
 | FEAT-9b | Report usable GPU memory live, not the configured total | P2 | M | FEAT-9 | Q62 | Planned | Out | (design 0067) |
 | LLM-1 | Expert routing through local model servers: a guide and a script | P2 | S | R21 | Q54 | Planned | Out | (design 0038) |
+| LLM-15 | Spike: Laya as a fast router in front of the model services, then a decision | P3 | S | R21 |  | Planned | Out | 368 (open) |
 | LLM-9 | Named model services (`worker --serve`) and a client tunnel (`llm connect`) | P1 | L | APP-1 | Q41, Q42 | Planned | Out | (design 0061) |
 | LLM-14 | Knee-point admission and interactive versus batch bands for model requests | P2 | M | R22, LLM-9 | Q61 | Planned | Out | (design 0067) |
 | LLM-6 | OpenAI-compatible gateway (`llm serve`) | P2 | M | LLM-1, LLM-9 | Q41, Q54 | Planned | Out | (design 0056) |
@@ -1827,7 +1828,8 @@ beside the stability release. The items come from
 [design 0061](design/0061-first-application-model-tunnel.md) (APP-1, LLM-9 to LLM-11),
 [design 0062](design/0062-model-weights-into-remote-memory.md) (R15 to R18, LLM-12, LLM-13),
 [design 0064](design/0064-research-of-2026-11-13-and-route.md) (R21) and
-[design 0067](design/0067-multi-node-llm-serving-and-admission.md) (R22, LLM-14, FEAT-9b). Each item
+[design 0067](design/0067-multi-node-llm-serving-and-admission.md) (R22, LLM-14, FEAT-9b). LLM-15 comes from the owner's question of 2026-11-20 and the
+first session of [benchmarks/model-bringup](../benchmarks/model-bringup/README.md). Each item
 keeps the id and the meaning its design gives it. Every item is outside the stop line of
 [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) (D1), so its Line is Out.
 
@@ -1845,7 +1847,8 @@ The gate:
 The order:
 
 1. The owner answers Q41, Q54 and Q60 to Q63, and Q45 to Q47 before LLM-12, LLM-13 and LLM-5.
-2. R21. R15, R16 and R17 in any order, and R18 with them or after them.
+2. R21. R15, R16 and R17 in any order, and R18 with them or after them. The spike part of LLM-15 at
+   any time after R21; it builds nothing.
 3. APP-1 part A, in the same sitting as R14 and the two-machine run of R22.
 4. After the stability release: FEAT-9b and LLM-1; LLM-9 if Q41 is yes; LLM-14 if Q61 is yes; LLM-6;
    LLM-3.
@@ -2027,6 +2030,44 @@ this phase.
   item if R21 shows that Mesh-LLM does this (Q54).
 - **Done when:** The guide and the script send a prompt to the tagged worker and print the reply, and
   the integration test of design 0038 D1 (a stub HTTP model server behind a tagged worker) passes.
+
+### LLM-15: Spike: Laya as a fast router in front of the model services, then a decision
+
+- **Evidence:** Laya ([model card](https://huggingface.co/convaiinnovations/laya), Apache-2.0) scores
+  a fixed list of labels in one forward pass and generates no text, so it cannot answer with a label
+  outside the list. Its checkpoints: the root (ModernBERT-large, about 421M parameters, English),
+  `multilingual` (mmBERT-base, about 322M parameters, 1,024 tokens) and `typed-decisions`, for which
+  its authors report 0.766 accuracy on their own 2,000-decision benchmark. Session 1 of
+  [benchmarks/model-bringup](../benchmarks/model-bringup/README.md) (2026-11-11, Apple M5, checkpoint
+  `multilingual`): one decision median 17.7 ms (n=100), warm load 2.09 s, 18 of 20 Vietnamese
+  sentences sorted correctly into "command" and "question", the same labels over six passes, and
+  probabilities that do not separate right answers from wrong ones.
+- **Problem:** In this phase the user picks the model service for every request (a tag in LLM-1, a
+  name in LLM-9, a model in LLM-6). A request that a small model on the caller's machine could answer
+  still waits for a large model split across machines, and no item decides per request. A generative
+  model used as a router would add its own latency and could answer outside the list of routes.
+- **Do:** A spike on the owner's machines, then a decision. It builds nothing in the product.
+  1. A labelled set of 200 requests in English and Vietnamese for three or four routes (for example:
+     a small local model, the large model, a request that needs a tool, a request to refuse),
+     labelled by the owner, with no private data.
+  2. Accuracy of `multilingual` and `typed-decisions` with no fine-tuning, then after fine-tuning on
+     half of the set, measured on the other half; temperature calibration, and the probability
+     under which a request goes to the large model.
+  3. Time per decision on the processor of each machine (median of at least 100, the model loaded
+     once) and the memory the process holds; the Dell under its memory rules.
+  4. One record per machine under `benchmarks/model-bringup/results/`, with the record rules of
+     session 1 (no host name, user name or path).
+  Decision: build the router (as part of LLM-6 or LLM-9, with its own design record) only if the
+  fine-tuned accuracy on the held-out half is at least 0.95 with the rule "unsure goes to the large
+  model", and the median time per decision is under 50 ms on the slowest machine; otherwise close
+  the item with the record. A built router runs first as a Python task or service of a worker, with
+  no new Rust dependency; an ONNX path in Rust only if that later pays. Laya never decides a merge,
+  a placement, an admission or anything about security: even a good router is wrong about one
+  request in twenty. A batch classification run with Laya is also a candidate workload for the
+  campaigns of design 0094 (the road to a shared research grid); that is not part of
+  this item.
+- **Done when:** The records exist, and LLM-15 is either closed with them or replaced by a build item
+  that has a design record.
 
 ### LLM-9: Named model services and a client tunnel
 
@@ -2708,3 +2749,5 @@ Add one dated line per finished item, newest last.
   254), R14 to R18, FEAT-9b and LLM-1 to LLM-14, all Planned except R22 and all Out. No item is built
   before the stability release (Q80), and no model item before R21 has a record (Q54, open). The count
   sentences of the Index are not changed here; the coordinator recounts.
+- 2026-11-20: LLM-15 added to the Phase 18 draft (pull request 368): a spike of Laya as a fast router in
+  front of the model services, from the owner's question and session 1 of benchmarks/model-bringup.
