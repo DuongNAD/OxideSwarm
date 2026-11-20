@@ -36,11 +36,24 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
+use rusty_grid_core::mapreduce::{
+    MapFunctionSpec, MapReduceJobSpec, MapReduceResult, ReduceFunctionSpec,
+};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+use rusty_grid_core::GridResult;
+use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+// Match TEST-54: outer wait turns a hang into a diagnostic failure, while the MapReduce
+// per-task timeout sits strictly above it (3x) so starved CI runners never fail silently
+// inside the engine's internal timeout.
+const MR_WAIT: Duration = Duration::from_secs(180);
+const MR_TASK_TIMEOUT_SECS: u64 = 540;
+
+type TaskSummaryRow = (rusty_grid_core::TaskId, TaskState, Option<Uuid>, u32, u32);
 
 /// Helper representing a spawned test worker with an isolated sandbox directory.
 struct SpawnedWorker {
@@ -67,6 +80,11 @@ fn spawn_test_worker(
     let temp_dir = tempfile::tempdir().expect("failed to create worker tempdir");
     let cfg = WorkerConfig::new(master_addr)
         .with_no_battery(true)
+        .with_ram_mb(4096)
+        .with_no_gpu(!simulate_gpu)
+        .with_no_blender(true)
+        .with_no_cuda(true)
+        .with_redirection_portal(false)
         .with_name(name)
         .with_cores(cores)
         .with_simulate_gpu(simulate_gpu)
@@ -88,22 +106,95 @@ fn spawn_test_worker(
     }
 }
 
-/// Awaits until at least `expected_count` workers are in `Connected` status.
-async fn wait_for_workers(master: &MasterHandle, expected_count: usize, timeout: Duration) -> bool {
+/// Awaits up to `TEST_WAIT_TIMEOUT` until at least `expected_count` workers are `Connected`.
+async fn wait_for_workers(master: &MasterHandle, expected_count: usize) {
     let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(workers) = master.list_workers().await {
-            let active = workers
-                .iter()
-                .filter(|w| w.status == WorkerStatus::Connected)
-                .count();
-            if active >= expected_count {
-                return true;
-            }
+    loop {
+        let workers = master.list_workers().await.unwrap_or_default();
+        let active = workers
+            .iter()
+            .filter(|w| w.status == WorkerStatus::Connected)
+            .count();
+        if active >= expected_count {
+            return;
+        }
+        if start.elapsed() >= TEST_WAIT_TIMEOUT {
+            let observed: Vec<_> = workers
+                .into_iter()
+                .map(|w| (w.worker_id, w.status))
+                .collect();
+            panic!(
+                "expected at least {expected_count} Connected workers within {}s; observed: {observed:?}",
+                TEST_WAIT_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+}
+
+async fn task_summary(master: &MasterHandle) -> Vec<TaskSummaryRow> {
+    master
+        .list_tasks()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| {
+            (
+                t.task_id,
+                t.state,
+                t.assigned_worker_id,
+                t.retry_count,
+                t.failover_count,
+            )
+        })
+        .collect()
+}
+
+async fn unwrap_mapreduce_outcome(
+    master: &MasterHandle,
+    outcome: Result<GridResult<MapReduceResult>, &'static str>,
+    label: &str,
+) -> MapReduceResult {
+    match outcome {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
+            let stats = master.queue_stats().await;
+            let summary = task_summary(master).await;
+            panic!("{label}: execute_mapreduce failed: {e}; stats={stats:?}; tasks={summary:?}");
+        }
+        Err(reason) => {
+            let stats = master.queue_stats().await;
+            let summary = task_summary(master).await;
+            panic!(
+                "{label}: {reason} within {}s; stats={stats:?}; tasks={summary:?}",
+                MR_WAIT.as_secs()
+            );
+        }
+    }
+}
+
+async fn execute_mapreduce_within(
+    master: &MasterHandle,
+    spec: MapReduceJobSpec,
+    label: &str,
+) -> MapReduceResult {
+    let outcome = tokio::time::timeout(MR_WAIT, master.execute_mapreduce(spec))
+        .await
+        .map_err(|_| "execute_mapreduce timed out");
+    unwrap_mapreduce_outcome(master, outcome, label).await
+}
+
+async fn await_mapreduce_handle(
+    master: &MasterHandle,
+    handle: tokio::task::JoinHandle<GridResult<MapReduceResult>>,
+    label: &str,
+) -> MapReduceResult {
+    let outcome = match tokio::time::timeout(MR_WAIT, handle).await {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(join_err)) => panic!("{label}: job task panicked: {join_err}"),
+        Err(_) => Err("MapReduce job handle timed out"),
+    };
+    unwrap_mapreduce_outcome(master, outcome, label).await
 }
 
 // =========================================================================
@@ -121,10 +212,7 @@ async fn test_m5_mapreduce_word_count_multi_partition_multi_worker() {
     let _w2 = spawn_test_worker(master_addr.clone(), "worker-m5-2", 2, false);
     let _w3 = spawn_test_worker(master_addr.clone(), "worker-m5-3", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 3, Duration::from_secs(5)).await,
-        "Failed to connect 3 workers"
-    );
+    wait_for_workers(&master, 3).await;
 
     let input_data = vec![
         "apple banana cherry date apple".to_string(),
@@ -144,13 +232,10 @@ async fn test_m5_mapreduce_word_count_multi_partition_multi_worker() {
         },
         4,
         2,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("execute_mapreduce failed");
+    let res = execute_mapreduce_within(&master, spec, "fruit_word_count").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 4);
@@ -191,10 +276,7 @@ async fn test_m5_mapreduce_word_count_shell_pipeline_multi_worker() {
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-sh-1", 2, false);
     let _w2 = spawn_test_worker(master_addr.clone(), "worker-sh-2", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 2, Duration::from_secs(5)).await,
-        "Failed to connect workers"
-    );
+    wait_for_workers(&master, 2).await;
 
     let mapper_script = r#"while IFS= read -r line || [ -n "$line" ]; do
   for w in $line; do
@@ -218,13 +300,10 @@ done"#;
         },
         2,
         2,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("execute_mapreduce shell pipeline");
+    let res = execute_mapreduce_within(&master, spec, "shell_wc").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 2);
@@ -268,13 +347,10 @@ async fn test_m5_mapreduce_empty_input() {
         },
         4,
         2,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("empty mapreduce should succeed immediately");
+    let res = execute_mapreduce_within(&master, spec, "empty_job").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 0);
@@ -296,10 +372,7 @@ async fn test_m5_mapreduce_single_partition_input() {
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-single", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 1, Duration::from_secs(5)).await,
-        "Worker failed to connect"
-    );
+    wait_for_workers(&master, 1).await;
 
     let spec = MapReduceJobSpec::new(
         "single_part_job",
@@ -312,13 +385,10 @@ async fn test_m5_mapreduce_single_partition_input() {
         },
         1,
         1,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("single partition mapreduce failed");
+    let res = execute_mapreduce_within(&master, spec, "single_part_job").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 1);
@@ -349,10 +419,7 @@ async fn test_m5_mapreduce_large_multiline_input_stress() {
     let _w2 = spawn_test_worker(master_addr.clone(), "worker-large-2", 2, false);
     let _w3 = spawn_test_worker(master_addr.clone(), "worker-large-3", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 3, Duration::from_secs(5)).await,
-        "Workers failed to connect"
-    );
+    wait_for_workers(&master, 3).await;
 
     // Dictionary of 30 deterministic words
     let vocabulary = [
@@ -414,13 +481,10 @@ async fn test_m5_mapreduce_large_multiline_input_stress() {
         },
         6,
         3,
-        60,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("large multi-line mapreduce failed");
+    let res = execute_mapreduce_within(&master, spec, "large_stress_job").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 6);
@@ -454,12 +518,9 @@ async fn test_m5_mapreduce_worker_crash_during_map_phase_rescheduled() {
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-1", 2, false);
-    let _w2 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-2", 2, false);
+    let w2 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-2", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 2, Duration::from_secs(5)).await,
-        "Workers failed to connect"
-    );
+    wait_for_workers(&master, 2).await;
 
     // Mapper script sleeps for 1 second on attempt to allow crash injection
     let slow_mapper = r#"sleep 1
@@ -483,40 +544,45 @@ done"#;
         },
         2,
         1,
-        60,
+        MR_TASK_TIMEOUT_SECS,
     );
 
     let master_clone = master.clone();
     let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
-    // Wait until a task is actively running on W1, then terminate W1
-    let mut aborted = false;
+    // Wait up to TEST_WAIT_TIMEOUT until a map task is actively running on either worker, then terminate that worker
+    let mut aborted_worker = None;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(4) {
+    while start.elapsed() < TEST_WAIT_TIMEOUT {
+        if job_fut.is_finished() {
+            break;
+        }
         let tasks = master.list_tasks().await.unwrap_or_default();
-        if let Some(t) = tasks
-            .iter()
-            .find(|t| t.assigned_worker_id == Some(w1.worker_id))
-        {
-            if t.state == rusty_grid_master::queue::TaskState::Running {
-                w1.abort();
-                aborted = true;
-                break;
-            }
+        if let Some(victim) = [&w1, &w2].into_iter().find(|worker| {
+            tasks.iter().any(|t| {
+                t.assigned_worker_id == Some(worker.worker_id) && t.state == TaskState::Running
+            })
+        }) {
+            victim.abort();
+            aborted_worker = Some(victim.worker_id);
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    if !aborted {
-        // Fallback: abort w1 anyway if it was scheduled
-        w1.abort();
+    if aborted_worker.is_none() {
+        let summary = task_summary(&master).await;
+        panic!(
+            "did not observe a Running map task on either worker ({}, {}) within {}s (job_finished={}); tasks={summary:?}",
+            w1.worker_id,
+            w2.worker_id,
+            TEST_WAIT_TIMEOUT.as_secs(),
+            job_fut.is_finished()
+        );
     }
 
-    // Await job completion — worker 2 should take over and complete the job
-    let res = job_fut
-        .await
-        .expect("job task panicked")
-        .expect("mapreduce execution after worker crash");
+    // Await job completion — the surviving worker should take over and complete the job
+    let res = await_mapreduce_handle(&master, job_fut, "map_fault_tolerance_job").await;
 
     assert_eq!(res.status, "Completed");
     assert_eq!(res.map_tasks_total, 2);
@@ -549,12 +615,9 @@ async fn test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-redcrash-1", 2, false);
-    let _w2 = spawn_test_worker(master_addr.clone(), "worker-redcrash-2", 2, false);
+    let w2 = spawn_test_worker(master_addr.clone(), "worker-redcrash-2", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 2, Duration::from_secs(5)).await,
-        "Workers failed to connect"
-    );
+    wait_for_workers(&master, 2).await;
 
     // Fast mapper
     let fast_mapper = r#"while IFS= read -r line || [ -n "$line" ]; do
@@ -581,46 +644,53 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
         },
         2,
         2,
-        60,
+        MR_TASK_TIMEOUT_SECS,
     );
 
     let master_clone = master.clone();
     let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
-    // Wait until map tasks are completed and a reduce task is running on W1
-    let mut aborted = false;
+    // Wait up to TEST_WAIT_TIMEOUT until map tasks have completed and a reduce task is Running on either worker
+    let mut crash_pair = None;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(6) {
+    while start.elapsed() < TEST_WAIT_TIMEOUT {
+        if job_fut.is_finished() {
+            break;
+        }
         let tasks = master.list_tasks().await.unwrap_or_default();
-        // Check if there are tasks with retry count or running on W1 after map phase
-        if let Some(t) = tasks
+        let completed_count = tasks
             .iter()
-            .find(|t| t.assigned_worker_id == Some(w1.worker_id))
-        {
-            if t.state == rusty_grid_master::queue::TaskState::Running {
-                // If there are at least 2 completed tasks, map phase has finished and reduce has started
-                let completed_count = tasks
-                    .iter()
-                    .filter(|tk| tk.state == rusty_grid_master::queue::TaskState::Completed)
-                    .count();
-                if completed_count >= 2 {
-                    w1.abort();
-                    aborted = true;
-                    break;
-                }
+            .filter(|tk| tk.state == TaskState::Completed)
+            .count();
+        if completed_count >= 2 {
+            if let Some((victim, survivor)) = [(&w1, &w2), (&w2, &w1)].into_iter().find(|(v, _)| {
+                tasks.iter().any(|t| {
+                    t.assigned_worker_id == Some(v.worker_id) && t.state == TaskState::Running
+                })
+            }) {
+                victim.abort();
+                crash_pair = Some((victim.worker_id, survivor.worker_id));
+                break;
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if !aborted {
-        w1.abort();
-    }
+    let (aborted_worker_id, survivor_worker_id) = match crash_pair {
+        Some(pair) => pair,
+        None => {
+            let summary = task_summary(&master).await;
+            panic!(
+                "did not observe >= 2 completed map tasks and a Running reduce task on either worker ({}, {}) within {}s (job_finished={}); tasks={summary:?}",
+                w1.worker_id,
+                w2.worker_id,
+                TEST_WAIT_TIMEOUT.as_secs(),
+                job_fut.is_finished()
+            );
+        }
+    };
 
-    let res = job_fut
-        .await
-        .expect("job task panicked")
-        .expect("mapreduce execution after reduce worker crash");
+    let res = await_mapreduce_handle(&master, job_fut, "reduce_fault_tolerance_job").await;
 
     assert_eq!(res.status, "Completed");
 
@@ -637,16 +707,57 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
     assert_eq!(get_count("retained"), 1);
     assert_eq!(get_count("verification"), 1);
 
-    // Verify empirical contract: Map phase was NOT re-run!
-    // Exactly 2 map tasks were ever created and completed without being re-executed.
+    // Verify empirical contract: Map phase was NOT re-run (intermediate outputs retained), and
+    // the interrupted reduce task was retried and completed on the surviving worker.
+    // A master retry reuses the task id, so 7 total tasks (2 map + 5 reduce) proves no map recomputation.
     let tasks = master.list_tasks().await.unwrap_or_default();
-    let map_tasks: Vec<_> = tasks
+    let summary: Vec<TaskSummaryRow> = tasks
         .iter()
-        .filter(|t| t.exit_code == Some(0) && t.retry_count == 0)
+        .map(|t| {
+            (
+                t.task_id,
+                t.state,
+                t.assigned_worker_id,
+                t.retry_count,
+                t.failover_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        tasks.len(),
+        7,
+        "Expected 7 total tasks (2 map + 5 reduce; map phase must not re-run); tasks={summary:?}"
+    );
+    let retried_reduces: Vec<TaskSummaryRow> = tasks
+        .iter()
+        .filter(|t| t.failover_count >= 1 && t.state == TaskState::Completed)
+        .map(|t| {
+            (
+                t.task_id,
+                t.state,
+                t.assigned_worker_id,
+                t.retry_count,
+                t.failover_count,
+            )
+        })
         .collect();
     assert!(
-        map_tasks.len() >= 2,
-        "Expected at least 2 map tasks completed with retry_count == 0"
+        !retried_reduces.is_empty(),
+        "Expected at least one Completed reduce task with failover_count >= 1; tasks={summary:?}"
+    );
+    assert!(
+        retried_reduces.iter().all(|(_, _, assigned, _, _)| {
+            *assigned != Some(aborted_worker_id) && *assigned == Some(survivor_worker_id)
+        }),
+        "Expected retried reduce tasks to complete on surviving worker {survivor_worker_id} (not aborted {aborted_worker_id}); retried={retried_reduces:?}"
+    );
+    let unretried_completed_count = tasks
+        .iter()
+        .filter(|t| t.exit_code == Some(0) && t.retry_count == 0)
+        .count();
+    assert!(
+        unretried_completed_count >= 2,
+        "Expected at least 2 tasks completed with retry_count == 0; tasks={summary:?}"
     );
 
     let _ = master.shutdown();
@@ -665,10 +776,7 @@ async fn test_m5_mapreduce_map_task_nonzero_exit_fails_with_error() {
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-fail-1", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 1, Duration::from_secs(5)).await,
-        "Worker failed to connect"
-    );
+    wait_for_workers(&master, 1).await;
 
     let failing_mapper = "echo 'SYNTAX_ERROR_ABORTING' >&2; exit 42";
 
@@ -683,13 +791,10 @@ async fn test_m5_mapreduce_map_task_nonzero_exit_fails_with_error() {
         },
         1,
         1,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("execute_mapreduce returns Ok(MapReduceResult)");
+    let res = execute_mapreduce_within(&master, spec, "failing_map_job").await;
 
     assert_eq!(res.status, "Failed");
     assert!(res.output.is_empty());
@@ -717,10 +822,7 @@ async fn test_m5_mapreduce_reduce_task_nonzero_exit_fails_with_error() {
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-fail-2", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 1, Duration::from_secs(5)).await,
-        "Worker failed to connect"
-    );
+    wait_for_workers(&master, 1).await;
 
     let failing_reducer = "echo 'REDUCER_CORRUPTED_STREAM' >&2; exit 19";
 
@@ -735,13 +837,10 @@ async fn test_m5_mapreduce_reduce_task_nonzero_exit_fails_with_error() {
         },
         1,
         1,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
-    let res = master
-        .execute_mapreduce(spec)
-        .await
-        .expect("execute_mapreduce returns Ok(MapReduceResult)");
+    let res = execute_mapreduce_within(&master, spec, "failing_reduce_job").await;
 
     assert_eq!(res.status, "Failed");
     assert!(res.output.is_empty());
@@ -771,10 +870,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
     let _w2 = spawn_test_worker(master_addr.clone(), "worker-conc-2", 4, false);
     let _w3 = spawn_test_worker(master_addr.clone(), "worker-conc-3", 4, false);
 
-    assert!(
-        wait_for_workers(&master, 3, Duration::from_secs(5)).await,
-        "Workers failed to connect"
-    );
+    wait_for_workers(&master, 3).await;
 
     // 5 distinct MapReduce jobs with distinct domain vocabulary
     let job_specs = vec![
@@ -790,7 +886,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
                 },
                 2,
                 2,
-                30,
+                MR_TASK_TIMEOUT_SECS,
             ),
             vec![("apple", 3), ("orange", 2), ("banana", 1)],
         ),
@@ -806,7 +902,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
                 },
                 2,
                 2,
-                30,
+                MR_TASK_TIMEOUT_SECS,
             ),
             vec![
                 ("rust", 3),
@@ -829,7 +925,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
                 },
                 2,
                 2,
-                30,
+                MR_TASK_TIMEOUT_SECS,
             ),
             vec![("red", 3), ("blue", 2), ("green", 2), ("yellow", 1)],
         ),
@@ -845,7 +941,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
                 },
                 2,
                 2,
-                30,
+                MR_TASK_TIMEOUT_SECS,
             ),
             vec![
                 ("cat", 3),
@@ -867,7 +963,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
                 },
                 1,
                 1,
-                30,
+                MR_TASK_TIMEOUT_SECS,
             ),
             vec![("unique_token", 2)],
         ),
@@ -883,7 +979,14 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
         }));
     }
 
-    let results = join_all(futures).await;
+    let results = tokio::time::timeout(MR_WAIT, join_all(futures))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "concurrent_jobs_stress did not finish within {}s",
+                MR_WAIT.as_secs()
+            )
+        });
 
     for task_res in results {
         let (job_res, expected) = task_res.expect("spawned job panicked");
@@ -921,10 +1024,7 @@ async fn test_m5_mapreduce_via_client_network_transport() {
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-net-1", 2, false);
 
-    assert!(
-        wait_for_workers(&master, 1, Duration::from_secs(5)).await,
-        "Worker failed to connect"
-    );
+    wait_for_workers(&master, 1).await;
 
     let stream = TcpStream::connect(&master_addr)
         .await
@@ -945,7 +1045,7 @@ async fn test_m5_mapreduce_via_client_network_transport() {
         },
         2,
         2,
-        30,
+        MR_TASK_TIMEOUT_SECS,
     );
 
     let client_msg = ClientMessage::SubmitMapReduce { job: spec };
@@ -954,9 +1054,14 @@ async fn test_m5_mapreduce_via_client_network_transport() {
         .await
         .expect("send_msg ClientMessage::SubmitMapReduce");
 
-    let response = transport
-        .recv_msg::<ClientResponse>()
+    let response = tokio::time::timeout(MR_WAIT, transport.recv_msg::<ClientResponse>())
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "net_wire_job did not receive ClientResponse within {}s",
+                MR_WAIT.as_secs()
+            )
+        })
         .expect("recv_msg ClientResponse")
         .expect("Stream closed prematurely");
 
