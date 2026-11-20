@@ -3397,6 +3397,118 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `master::zero_copy_quic_test`: single `8/8` (`0.33 s`), after `20/20` (`total=20.48s`, `min=0.89s`, `max=2.94s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
+### TEST-84: Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards
+
+- **Evidence:** Read-only wall-clock audit on `origin/master` (`2026-11-20`) found `19` Category 1
+  wall-clock upper-bound assertions across `12` files / `12` test binaries in `agent_mesh`,
+  `rusty_grid_android_bridge`, `rusty_grid_cli`, and Python tests (`tests/test_agent_bridge.py`,
+  `tests/test_sec6_mesh_sandbox.py`). Zero `!cfg!(debug_assertions)` release-only SLAs exist in those
+  crates or scripts.
+- **Problem:** Under loaded CI runners or concurrent suites, short proof-proxy ceilings (`< 15 ms`,
+  `< 100 ms`, `< 500 ms`, `< 1.4–5 s`, `< 10 s`) and tight readiness/timeout sleeps (`2–30 s`) flake on CPU
+  scheduling jitter even when the underlying non-blocking drain, evacuation, hook locking, or cancellation
+  logic is working properly.
+- **Do:** Replace proof proxies with structural checks and print elapsed times, replace dead readiness markers,
+  preserve `>= 900 ms` / `>= 950 ms` lower bounds where `1 s` timeouts are verified, widen hang guards to
+  `60 s` (and inner sleep targets to `120 s`), and verify every touched binary `20/20` under 6 CPU busy
+  loops.
+- **Done when:** Every audited Category 1 bound across `android_bridge`, `cli`, `agent_mesh`, and Python
+  tests is structural or guarded at `60 s`, `cargo fmt`, workspace `clippy`, and doc hygiene pass, and
+  all `12` binaries pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-20, pull request 407, open):** Updated all `19` audited Category 1 hits (plus
+  coupled waits/sleep targets in the same tests) across `12` files / `12` binaries:
+  - `crates/agent_mesh/src/executor.rs` (`agent_mesh --lib`, `1` hit, `:775`): in
+    `test_command_timeout_kills_hung_process`, raised inner sleep `10 -> 120` (Windows and Unix), widened
+    `< 4000 ms` to `< 60 s` while keeping `>= 950 ms` lower bound, and logged elapsed.
+  - `crates/agent_mesh/tests/adversarial_challenge.rs` (`agent_mesh::adversarial_challenge`, `1` hit,
+    `:180`): in `test_rust_executor_direct_hung_command_kill`, raised inner sleep `10 -> 120` (Windows and
+    Unix), widened `< 4000 ms` to `< 60 s`, and logged elapsed.
+  - `crates/android_bridge/src/lib.rs` (`rusty_grid_android_bridge --lib`, `4` hits,
+    `:1353`, `:1379`, `:1510`, `:1605` + coupled `:1008`): widened `wait_until_not_stopping()` (`200 x 10 ms`
+    -> `60 s` deadline); in `test_stop_worker_returns_in_under_100ms_while_worker_drains`, replaced the
+    `5 s` drain sleep with a gated `drain_release_rx` (`120 s`) + `drain_finished: Arc<AtomicBool>`,
+    asserting `!drain_finished` after `stop_worker_impl()` (`< 500 ms -> < 60 s`) and `start_worker_impl()`
+    refusal (`< 500 ms -> < 60 s`) before releasing drain and asserting `drain_finished`; widened
+    `test_stop_then_start_again_works` (`< 100 ms -> < 60 s`) and
+    `test_interleaved_stop_start_at_most_one_worker_thread` (`< 10 s -> < 60 s`) while logging elapsed.
+  - `crates/cli/tests/test_cli_cancel_and_result.rs` (`cli::test_cli_cancel_and_result`, `1` hit, `:174` +
+    coupled `:111`): in `test_cli_cancel_stops_running_sleep_task`, raised `time.sleep(30 -> 120)`, widened
+    running poll (`5 s -> 60 s`) and `< 10 s -> < 60 s`, asserted `Cancelled` state in `master.queue()`, and
+    logged elapsed. (Note: under heavy load an unrelated pre-existing macOS `Command::spawn` pipe FD leak
+    [`BUG-35`] stalled untouched `test_cli_result_reads_finished_task_and_downloads_outputs:410` once across
+    runs.)
+  - `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs` (`cli::test_mcp_concurrent_and_deadlines`, `3`
+    hits, `:470`, `:1146`, `:1407` + coupled `:466`, `:1114`, `:1153`, `:1397`): widened `recv_timeout`
+    (`4 s -> 60 s` on cancel/EOF/discovery, `30 s` on `task_result`), `exit_deadline` (`2 s -> 60 s`),
+    and the upper guards (`< 30 s` on `task_result` to stay unambiguously below the `60 s` default,
+    `< 60 s` on the silent-master and cached-discovery checks) across
+    `test_mcp1_cancel_tool_cancelled_notification_and_progress_tokens`,
+    `test_mcp1_silent_master_bounded_by_wait_secs_and_exits_on_eof`, and
+    `test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_secs`, added `>= 900 ms` lower
+    bounds around both `wait_secs: 1` waits, preserved `rv_hits == 1`, and logged elapsed.
+  - `crates/cli/tests/test_p2p_key_persistence.rs` (`cli::test_p2p_key_persistence`, `1` hit, `:608` +
+    coupled `:603`, `:692`): in `test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s`, widened
+    `wait_for_non_empty_file`, ticket upper bound, and `w_deadline` from `3 s -> 60 s`, logged ticket
+    elapsed, replaced the dead `"RustyGrid Worker started"` stdout wait with `saw_warn` (stderr
+    `"P2P minimal preset is enabled (p2p_minimal_preset=true)"`) + `saw_dialing` (stdout
+    `"iroh::_events::conn::connecting"`), held the worker alive `2 s` after dialing starts before teardown
+    so any stray relay/lookup traffic remains observable, and asserted `saw_dialing`.
+  - `tests/m5a_challenger_2_stress.rs` (`android_bridge::m5a_challenger_2_stress`, `2` hits,
+    `:422`, `:507` + coupled `:300`, `:335`, `:366`, `:428`): in
+    `test_pre_sleep_fast_evacuation_under_multi_task_load`, replaced the `1.8 s` `BuiltinTest` batch with
+    `release.gate` (`ReleaseOnDrop` + cross-platform shell/`python3` waiter) tasks written only after
+    `w1`'s tasks evacuate, configured `ReaperConfig(1 s, 120 s)` and `TaskRequirements::generic(1, 120)`,
+    widened polling/completion waits and `EVACUATION_GUARD` (`1–8 s -> 60 s`), asserted
+    `final_info.evacuation_count == 1` alongside `retry_count == 0` / `failover_count == 0` proving
+    uncharged evacuation, widened `cancel_all_active_tasks` (`< 15 ms -> < 60 s`), and logged elapsed.
+  - `tests/mcp_server_e2e.rs` (`cli::mcp_server_e2e`, `1` hit, `:1886`): in
+    `test_mcp_and_cli_workspace_sync_dir_refusals_and_wait_warning`, widened `< 10 s -> < 60 s` and logged
+    elapsed while keeping `Timed out after 1s waiting for task`.
+  - `tests/mobile_coordination_test.rs` (`android_bridge::mobile_coordination_test`, `2` hits,
+    `:701`, `:789` + coupled `:620`, `:650`, `:676`, `:711`, `:742`, `:764`, `:794`): renamed
+    `test_fast_evacuation_under_50ms_without_task_loss` to `test_fast_evacuation_without_task_loss`
+    (updated `design/0036-bounded-uncharged-worker-evacuations.md`), replaced the `2.5 s` `BuiltinTest`
+    with a `release.gate` (`ReleaseOnDrop`) task written only after both evacuations complete (`w3`
+    assigned in `Scheduled | Running` and `evacuation_count == 2`), configured `ReaperConfig(1 s, 120 s)`
+    and `TaskRequirements::generic(1, 120)`, widened waits and both `< 100 ms` evacuation guards
+    (`100 ms / 5–6 s -> 60 s`), asserted `after_first.evacuation_count == 1` and
+    `after_second.evacuation_count == 2` with `retry_count == 0` / `failover_count == 0`, and logged
+    elapsed.
+  - `tests/test_agent_bridge.py` (`python::test_agent_bridge`, `1` hit, `:301`): in
+    `ClaudeCodeHook.test_second_hook_exits_while_first_waits`, used `--max-wait 120` for `first` / second
+    hook (`--max-wait 30` for `other`), replaced fixed `time.sleep(2.5)` / `time.sleep(2)` sleeps with
+    `60 s` `watch_*.lock` condition waits, asserted `first.poll() is None` after the second hook exits `0`
+    (`timeout=60`), widened `< 5 s -> < 60 s`, and printed `elapsed`.
+  - `tests/test_m2_identity_scripts.rs` (`cli::test_m2_identity_scripts`, `1` hit, `:291` + coupled
+    `:210`, `:236`, `:269`): renamed `test_worker_auto_reconnect_under_3_seconds` to
+    `test_worker_auto_reconnect_preserves_identity` (updated
+    `design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md`), widened `init_deadline`,
+    `close_deadline`, `max_allowed`, and `< 3 s -> < 60 s`, logged elapsed, and preserved `worker_id`
+    reconnect verification.
+  - `tests/test_sec6_mesh_sandbox.py` (`python::test_sec6_mesh_sandbox`, `1` hit, `:401`): in `run_sec6_tests`
+    Test 10, raised `timeout_ms=60000` / `timeout=65.0`, widened `duration < 3.0 -> < 60.0` (preserving
+    `status == "success"`, `exit_code == 0`, `"STDIN_DEVNULL_DONE"`), and logged `duration`.
+  - **Cheap targeted 20-run loaded before-loops (`origin/master` `e31b69e3`, Apple M5, 6 busy loops, private `HOME`; expensive full-binary before-loops skipped):**
+    - `agent_mesh_lib` (`test_command_timeout_kills_hung_process`): `20/20` (`total=29.04s`, `min=1.25s`, `max=4.78s`)
+    - `agent_mesh_adv` (`test_rust_executor_direct_hung_command_kill`): `20/20` (`total=30.88s`, `min=1.27s`, `max=6.39s`)
+    - `android_bridge_lib` (3 stop/start tests): `20/20` (`total=24.13s`, `min=1.00s`, `max=4.70s`)
+    - `m5a_challenger_2_stress` (`test_pre_sleep_fast_evacuation_under_multi_task_load`): `20/20` (`total=84.32s`, `min=3.96s`, `max=7.94s`)
+    - `sec6_mesh_sandbox`: `20/20` (`total=193.01s`, `min=9.63s`, `max=9.70s`)
+  - **Single-run counts and full-binary 20-run loaded after-loops (Apple M5, 6 busy loops, private `HOME`, `--locked`; all `12/12` binaries passed `20/20`):**
+    - `agent_mesh --lib`: single `45/45` (`3.67 s`), after `20/20` (`total=53.26s`, `min=1.96s`, `max=4.70s`)
+    - `agent_mesh::adversarial_challenge`: single `4/4` (`1.55 s`), after `20/20` (`total=38.18s`, `min=1.79s`, `max=3.60s`)
+    - `rusty_grid_android_bridge --lib`: single `17/17` (`3.40 s`), after `20/20` (`total=91.60s`, `min=4.08s`, `max=8.41s`)
+    - `android_bridge::m5a_challenger_2_stress`: single `2/2` (`3.24 s`), post-review after `20/20` (`total=62.05s`, `min=2.50s`, `max=6.07s`; initial `86.35 s`)
+    - `android_bridge::mobile_coordination_test`: single `9/9` (`50.47 s`), post-review after `20/20` (`total=1045.91s`, `min=51.26s`, `max=57.83s`; initial `1046.20 s`)
+    - `cli::mcp_server_e2e`: single `9/9` (`3.24 s`), after `20/20` (`total=75.44s`, `min=3.52s`, `max=7.37s`)
+    - `cli::test_cli_cancel_and_result`: single `2/2` (`1.91 s`), after `20/20` (`total=59.86s`, `min=2.47s`, `max=9.73s`)
+    - `cli::test_m2_identity_scripts`: single `5/5` (`0.60 s`), post-review after `20/20` (`total=32.13s`, `min=1.17s`, `max=7.38s`; initial `27.88 s`)
+    - `cli::test_mcp_concurrent_and_deadlines`: single `9/9` (`7.00 s`), post-review after `20/20` (`total=160.00s`, `min=7.70s`, `max=11.77s`; initial `160.24 s`)
+    - `cli::test_p2p_key_persistence`: single `6/6` (1 ignored, `1.30 s`), post-review after `20/20` (`total=84.91s`, `min=3.91s`, `max=8.48s`; initial `43.21 s`)
+    - `python::test_agent_bridge`: single `72/72` (`48.84 s`, second hook `0.049 s`), after `20/20` (`total=1121.88s`, `min=54.43s`, `max=56.86s`)
+    - `python::test_sec6_mesh_sandbox`: single passed, after `20/20` (`total=192.31s`, `min=9.51s`, `max=9.67s`)
+  - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with

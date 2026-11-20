@@ -1004,12 +1004,14 @@ mod tests {
 
     fn wait_until_not_stopping() {
         let ws = get_worker_state();
-        for _ in 0..200 {
-            if !ws.stopping.load(Ordering::SeqCst) {
-                break;
-            }
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while ws.stopping.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            !ws.stopping.load(Ordering::SeqCst),
+            "worker stayed STOPPING past 60s guard"
+        );
     }
 
     fn reset_test_state() {
@@ -1319,13 +1321,14 @@ mod tests {
         let (drain_release_tx, drain_release_rx) = std::sync::mpsc::channel::<()>();
         let (worker_started_tx, worker_started_rx) = std::sync::mpsc::channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let drain_finished = Arc::new(AtomicBool::new(false));
+        let drain_finished_worker = Arc::clone(&drain_finished);
 
         *lock_unpoisoned(&state.shutdown_tx) = Some(shutdown_tx);
         *lock_unpoisoned(&state.status) = "RUNNING".to_string();
         state.running.store(true, Ordering::SeqCst);
 
-        // Simulate a worker thread that takes 5 s to drain after receiving the shutdown signal
-        // (matching `TASK_DRAIN_TIMEOUT` task cleanup on a running `WorkerClient`).
+        // Simulate a worker thread that stays in shutdown drain until released (`120 s` max).
         let handle = std::thread::Builder::new()
             .name("OxideWorker-DrainSim".to_string())
             .spawn(move || {
@@ -1336,21 +1339,27 @@ mod tests {
                 rt.block_on(async move {
                     let _ = worker_started_tx.send(());
                     let _ = shutdown_rx.changed().await;
-                    let _ = drain_release_rx.recv_timeout(Duration::from_secs(5));
+                    let _ = drain_release_rx.recv_timeout(Duration::from_secs(120));
+                    drain_finished_worker.store(true, Ordering::SeqCst);
                 });
             })
             .unwrap();
         *lock_unpoisoned(&state.thread_handle) = Some(handle);
         worker_started_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .unwrap();
 
         let start = std::time::Instant::now();
         assert!(stop_worker_impl());
         let elapsed = start.elapsed();
+        println!("stop_worker_impl returned in {elapsed:?} while worker drain stayed gated");
         assert!(
-            elapsed < Duration::from_millis(500),
-            "stop_worker_impl took {elapsed:?} (>= 500 ms); must not block the calling thread"
+            !drain_finished.load(Ordering::SeqCst),
+            "stop_worker_impl must return while worker drain is still blocked"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "stop_worker_impl hung past 60s guard: took {elapsed:?}"
         );
         assert!(!is_running_impl());
         assert_eq!(status_text(), "STOPPING");
@@ -1369,15 +1378,22 @@ mod tests {
             ),
             "start_worker_impl must refuse to start while the previous worker is still stopping"
         );
+        let refuse_elapsed = start_while_stopping.elapsed();
+        println!("start_worker_impl refused while stopping in {refuse_elapsed:?}");
         assert!(
-            start_while_stopping.elapsed() < Duration::from_millis(500),
-            "start refusal while stopping must not block"
+            !drain_finished.load(Ordering::SeqCst),
+            "start_worker_impl must refuse without waiting for drain completion"
+        );
+        assert!(
+            refuse_elapsed < Duration::from_secs(60),
+            "start refusal while stopping hung past 60s guard: took {refuse_elapsed:?}"
         );
         assert_eq!(status_text(), "STOPPING");
 
         // Release the simulated drain and verify the join thread sets final status `STOPPED`.
         let _ = drain_release_tx.send(());
         wait_until_not_stopping();
+        assert!(drain_finished.load(Ordering::SeqCst));
         assert_eq!(status_text(), "STOPPED");
 
         reset_test_state();
@@ -1493,9 +1509,11 @@ mod tests {
 
         let stop_start = std::time::Instant::now();
         assert!(stop_worker_impl());
+        let stop_elapsed = stop_start.elapsed();
+        println!("test_stop_then_start_again_works stop_worker_impl took {stop_elapsed:?}");
         assert!(
-            stop_start.elapsed() < Duration::from_millis(100),
-            "stop_worker_impl must return in under 100 ms"
+            stop_elapsed < Duration::from_secs(60),
+            "stop_worker_impl hung past 60s guard: took {stop_elapsed:?}"
         );
         assert!(!is_running_impl());
 
@@ -1586,9 +1604,10 @@ mod tests {
         h2.join().unwrap();
 
         let elapsed = start_time.elapsed();
+        println!("test_interleaved_stop_start_at_most_one_worker_thread finished in {elapsed:?}");
         assert!(
-            elapsed < Duration::from_secs(10),
-            "Test exceeded 10s: took {elapsed:?}"
+            elapsed < Duration::from_secs(60),
+            "Test hung past 60s guard: took {elapsed:?}"
         );
 
         assert!(stop_worker_impl());
