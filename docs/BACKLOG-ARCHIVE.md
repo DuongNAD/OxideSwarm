@@ -2690,6 +2690,32 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-66: worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `test_unanswered_handshake_times_out_with_a_secret`
+  (`tests/worker_cluster_auth.rs:382:5`) failed `1/5` runs at `assertion failed: started.elapsed() < Duration::from_secs(3)`.
+- **Problem:** `tests/worker_cluster_auth.rs` checked wall-clock upper bounds (`< 3 s` around a `300 ms`
+  handshake timeout in `test_unanswered_handshake_times_out_with_a_secret`, `< 2 s` in
+  `test_shutdown_interrupts_a_handshake_with_a_silent_master` after a fixed `400 ms` sleep, and `< 2 s` /
+  `5 s` in `test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interrupts_it` alongside a
+  `10 s` `RunningWorker::stop` bound), which trip on a CPU-starved host.
+- **Do:** Raise `RunningWorker::stop` to `TEST_WAIT_TIMEOUT` (`60 s`), wait by condition for the initial
+  auth attempt / silent-master TCP accept (`tokio::sync::Notify`) up to `60 s`, bound the `300 ms`
+  unanswered-handshake test by `tokio::time::timeout(TEST_WAIT_TIMEOUT, ...)` without `< 3 s` or `< 2 s`
+  wall-clock assertions, and assert `shutdown` ends the `30 s`-floored auth backoff within `25 s` with
+  `attempts == 1`.
+- **Done when:** All outcome assertions stay intact and `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 387, open):** Updated `tests/worker_cluster_auth.rs` as planned. On
+  a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`:
+  - Before fix (on `origin/master` `fc694126`): `20/20` passed (`188.76 s` total, `8.11–10.36 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`198.06 s` total, `8.54–11.57 s` per run).
+  Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `worker_cluster_auth`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
 ### TEST-62: blob_transfer_e2e: print CLI submit output on failure and harden loaded timeouts
 
 - **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
