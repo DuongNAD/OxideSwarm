@@ -510,8 +510,9 @@ async fn test_max_retries_exhaustion() {
 /// TaskResult::failure instead of hanging indefinitely.
 #[tokio::test]
 async fn test_reaper_waiters_resolution() {
-    // Fast reaper: scans every 20ms, timeout 60ms
-    let reaper_config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(60));
+    // Wait-by-condition margin: 50ms scan, 1s timeout avoids 60-80ms CI starvation flakes
+    // (TEST-45) while remaining far below the 60s wait guard and 120s task duration.
+    let reaper_config = ReaperConfig::new(Duration::from_millis(50), Duration::from_secs(1));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0);
     let master =
         MasterServer::spawn_with_config(server_config, test_scheduler_config(), reaper_config)
@@ -519,7 +520,7 @@ async fn test_reaper_waiters_resolution() {
             .expect("master spawn");
     let master_addr = master.server_addr();
 
-    // Connect raw TCP worker that performs handshake then halts sending heartbeats
+    // Connect raw TCP worker that heartbeats until AssignTask arrives, then halts heartbeats
     let stream = tokio::net::TcpStream::connect(master_addr)
         .await
         .expect("tcp connect");
@@ -557,13 +558,40 @@ async fn test_reaper_waiters_resolution() {
     );
     let task_id = master.submit_task(task).await.expect("submit task");
 
-    // Receive AssignTask on worker
-    let assign_msg: Option<rusty_grid_core::protocol::MasterMessage> =
-        transport.recv_msg().await.expect("recv assign");
-    assert!(matches!(
-        assign_msg,
-        Some(rusty_grid_core::protocol::MasterMessage::AssignTask { .. })
-    ));
+    // Keep the raw worker alive with heartbeats while waiting for AssignTask (60s guard)
+    let (mut writer, mut reader) = transport.split();
+    let assign_timeout = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(assign_timeout);
+    let mut hb_interval = tokio::time::interval(Duration::from_millis(50));
+    hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = reader.recv_msg::<rusty_grid_core::protocol::MasterMessage>() => {
+                match msg {
+                    Ok(Some(rusty_grid_core::protocol::MasterMessage::AssignTask { task })) => {
+                        assert_eq!(task.id, task_id);
+                        break;
+                    }
+                    Ok(Some(rusty_grid_core::protocol::MasterMessage::HeartbeatAck { .. })) => continue,
+                    Ok(other) => panic!("unexpected master message before AssignTask: {other:?}"),
+                    Err(e) => panic!("recv_msg failed while waiting for AssignTask: {e:?}"),
+                }
+            }
+            _ = hb_interval.tick() => {
+                let hb = rusty_grid_core::protocol::WorkerMessage::Heartbeat {
+                    worker_id,
+                    timestamp: 0,
+                    active_tasks: 0,
+                    cpu_usage_pct: 0.0,
+                    ram_available_mb: 4096,
+                };
+                writer.send_msg(&hb).await.expect("send heartbeat");
+            }
+            _ = &mut assign_timeout => {
+                panic!("timed out waiting for AssignTask after 60s");
+            }
+        }
+    }
 
     // Spawn client task waiting on wait_task
     let master_clone = master.clone();
@@ -573,8 +601,8 @@ async fn test_reaper_waiters_resolution() {
             .await
     });
 
-    // Do NOT send any heartbeats! The worker holds TCP open but is silent (simulating partition/freeze).
-    // The reaper detects inactivity >60ms and marks worker Disconnected.
+    // Do NOT send any more heartbeats! Keep TCP open and silent (simulating partition/freeze).
+    // The reaper detects inactivity >1s and marks worker Disconnected.
     // Because max_retries == 0, task transitions to Failed and immediately resolves waiter!
     let start_wait = Instant::now();
     let result = wait_handle
@@ -595,5 +623,7 @@ async fn test_reaper_waiters_resolution() {
         "Must mention retry limit or heartbeat timeout: {err}"
     );
 
+    // Explicitly keep TCP open until wait_task resolves so NLL cannot close it early via EOF.
+    drop((writer, reader));
     let _ = master.shutdown();
 }

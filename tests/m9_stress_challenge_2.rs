@@ -875,8 +875,9 @@ async fn test_client_wait_task_unblocks_promptly_on_crash() {
 
 #[tokio::test]
 async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
-    // Fast reaper: 20ms scan interval, 60ms timeout threshold
-    let reaper_config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(60));
+    // 50ms scan interval, 1s timeout threshold: avoids 60-80ms CI starvation flakes
+    // (TEST-45) while remaining far below the 60s wait guard and 120s task duration.
+    let reaper_config = ReaperConfig::new(Duration::from_millis(50), Duration::from_secs(1));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0);
     let master =
         MasterServer::spawn_with_config(server_config, test_scheduler_config(), reaper_config)
@@ -884,7 +885,7 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
             .expect("master spawn");
     let master_addr = master.server_addr();
 
-    // Raw TCP connection simulating a silent/frozen worker (no heartbeats sent)
+    // Raw TCP connection that heartbeats until AssignTask arrives, then goes silent
     let stream = TcpStream::connect(master_addr).await.expect("connect");
     let mut transport = MessageTransport::new(stream);
 
@@ -915,9 +916,40 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     );
     let task_id = master.submit_task(task).await.expect("submit");
 
-    // Receive AssignTask frame on worker socket
-    let assign: Option<MasterMessage> = transport.recv_msg().await.expect("recv assign");
-    assert!(matches!(assign, Some(MasterMessage::AssignTask { .. })));
+    // Keep the raw worker alive with heartbeats while waiting for AssignTask (60s guard)
+    let (mut writer, mut reader) = transport.split();
+    let assign_timeout = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(assign_timeout);
+    let mut hb_interval = tokio::time::interval(Duration::from_millis(50));
+    hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = reader.recv_msg::<MasterMessage>() => {
+                match msg {
+                    Ok(Some(MasterMessage::AssignTask { task })) => {
+                        assert_eq!(task.id, task_id);
+                        break;
+                    }
+                    Ok(Some(MasterMessage::HeartbeatAck { .. })) => continue,
+                    Ok(other) => panic!("unexpected master message before AssignTask: {other:?}"),
+                    Err(e) => panic!("recv_msg failed while waiting for AssignTask: {e:?}"),
+                }
+            }
+            _ = hb_interval.tick() => {
+                let hb = WorkerMessage::Heartbeat {
+                    worker_id,
+                    timestamp: 0,
+                    active_tasks: 0,
+                    cpu_usage_pct: 0.0,
+                    ram_available_mb: 4096,
+                };
+                writer.send_msg(&hb).await.expect("send heartbeat");
+            }
+            _ = &mut assign_timeout => {
+                panic!("timed out waiting for AssignTask after 60s");
+            }
+        }
+    }
 
     // Spawn client calling wait_task
     let master_clone = master.clone();
@@ -927,10 +959,10 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
             .await
     });
 
-    // Mark start of freeze. The worker sends NO heartbeats.
+    // Mark start of freeze. The worker holds TCP open and sends NO more heartbeats.
     let freeze_start = Instant::now();
 
-    // Waiter MUST unblock once reaper detects inactivity > 60ms (far below 120s task timeout)
+    // Waiter MUST unblock once reaper detects inactivity > 1s (far below 120s task timeout)
     let result = wait_handle
         .await
         .expect("join wait handle")
@@ -949,6 +981,8 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
         "Error message must indicate failure reason: {err}"
     );
 
+    // Explicitly keep TCP open until wait_task resolves so NLL cannot close it early via EOF.
+    drop((writer, reader));
     let _ = master.shutdown();
 }
 

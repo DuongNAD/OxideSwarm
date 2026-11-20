@@ -3335,12 +3335,16 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - `tests/m4_challenger_2_stress.rs` (`1` hit, `:808`): in
     `test_adversarial_cancel_mid_execution_and_permit_reuse`, raised task `sleep 10 -> 120` / timeout
     `20 -> 120`, widened `wait_for`/`wait_task`/elapsed guard (`< 1500 ms -> < 60 s`), and logged elapsed.
-  - `tests/m9_stress_challenge_2.rs` (`3` hits, `:850`, `:930`, `:1136`): in
+  - `tests/m9_stress_challenge_2.rs` (`3` hits, `:850`, `:930`, `:1136` + raw-worker reaper race at `:879`): in
     `test_client_wait_task_unblocks_promptly_on_crash`,
     `test_client_wait_task_unblocks_on_reaper_eviction_latency`, and
     `test_multiple_concurrent_client_waiters_fanout`, raised `BuiltinTest` `duration_ms` (`3000`/`5000` ->
     `120_000`) and task timeouts (`30 -> 120`), widened `wait_for`/`wait_task`/elapsed guards (`500–600 ms`
-    -> `60 s`), and logged elapsed.
+    -> `60 s`), and logged elapsed; in `test_client_wait_task_unblocks_on_reaper_eviction_latency`, also
+    fixed the Windows CI race (`ReaperConfig::new(50 ms, 1 s)` to avoid `60–80 ms` starvation flakes per
+    `TEST-45`, splitting `transport.split()` and sending `50 ms` `WorkerMessage::Heartbeat` frames while
+    skipping `HeartbeatAck` inside a `60 s` `tokio::select!` until `AssignTask` arrives, then halting
+    heartbeats and calling `drop((writer, reader))` after `wait_task` resolves).
   - `tests/master_limits_and_scheduling.rs` (`1` hit, `:136`): in
     `test_surplus_peers_are_closed_and_closing_one_frees_its_slot`, widened slot-release loop guard
     `< 5 s -> < 60 s` and logged release elapsed.
@@ -3353,13 +3357,17 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - `tests/test_challenger_m4_scheduler_runner.rs` (`1` hit, `:553`): in
     `test_stress_high_throughput_matchmaking_burst_100_tasks`, widened `< 50 ms` to `< 60 s` while keeping
     latency printing, determinism, and constraint invariants.
-  - `tests/worker_crash_rescheduling_test.rs` (`2` audited + `1` coupled `wait_for` at `:272`): in
-    `test_immediate_graceful_disconnect` (`:272`, `:274`), raised reaper timeout `10 -> 120 s`, widened
-    `wait_for`/elapsed guard `< 300 ms -> < 60 s`, accepted `Scheduled | Running | Completed` on survivor, and
-    asserted `evacuation_count == 1`, `retry_count == 0`, and `failover_count == 0` after reassignment to
-    prove the uncharged `0 ms`-backoff graceful evacuation path;
-    in `test_reaper_waiters_resolution` (`:549`), raised `duration_ms` `5000 -> 120_000` / timeout
-    `30 -> 120`, widened `wait_task`/elapsed guard (`< 2 s -> < 60 s`), and logged elapsed.
+  - `tests/worker_crash_rescheduling_test.rs` (`2` audited + `1` coupled `wait_for` at `:272` + raw-worker
+    reaper race at `:514`): in `test_immediate_graceful_disconnect` (`:272`, `:274`), raised reaper timeout
+    `10 -> 120 s`, widened `wait_for`/elapsed guard `< 300 ms -> < 60 s`, accepted
+    `Scheduled | Running | Completed` on survivor, and asserted `evacuation_count == 1`,
+    `retry_count == 0`, and `failover_count == 0` after reassignment to prove the uncharged `0 ms`-backoff
+    graceful evacuation path; in `test_reaper_waiters_resolution` (`:549`), raised `duration_ms`
+    `5000 -> 120_000` / timeout `30 -> 120`, widened `wait_task`/elapsed guard (`< 2 s -> < 60 s`),
+    logged elapsed, and fixed the Windows CI run `44723960201` raw-worker reaper race (`ReaperConfig::new(50
+    ms, 1 s)`, splitting `transport.split()` to send `50 ms` `WorkerMessage::Heartbeat` frames and skip
+    `HeartbeatAck` inside a `60 s` `tokio::select!` until `AssignTask` arrives, then halting heartbeats
+    with `drop((writer, reader))` after `wait_task` resolves).
   - `tests/zero_copy_quic_test.rs` (`1` hit, `:406`): in
     `test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`, replaced `avg_latency < 50 ms` with the
     same structural QUIC stream flow-control pause check (`stream_receive_window(64 KiB)`, `receive_window(4
@@ -3381,11 +3389,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `master::m2_challenger_2_stress`: single `12/12` (`0.63 s`), after `20/20` (`total=22.97s`, `min=0.92s`, `max=4.84s`)
     - `master::m2_stress_challenge`: single `6/6` (`10.06 s`), after `20/20` (`total=211.20s`, `min=10.38s`, `max=12.27s`)
     - `master::m4_challenger_2_stress`: single `11/11` (`4.51 s`), after `20/20` (`total=103.60s`, `min=4.81s`, `max=11.41s`)
-    - `master::m9_stress_challenge_2`: single `10/10` (`1.90 s`), after `20/20` (`total=47.88s`, `min=2.18s`, `max=5.75s`)
+    - `master::m9_stress_challenge_2`: single `10/10` (`1.86 s`, reaper eviction unblocked in `1.05 s`), post-reaper-fix after `20/20` (`total=48.16s`, `min=2.18s`, `max=6.30s`; initial `47.88 s`, `2.18–5.75 s`)
     - `master::master_limits_and_scheduling`: single `5/5` (`3.48 s`), after `20/20` (`total=87.71s`, `min=4.06s`, `max=6.37s`)
     - `master::master_quic_limits`: single `3/3` (`1.56 s`), post-review after `20/20` (`total=73.76s`, `min=1.99s`, `max=31.99s`; initial `45.28 s`, `2.07–4.54 s`)
     - `master::test_challenger_m4_scheduler_runner`: single `3/3` (`0.00 s`), after `20/20` (`total=10.05s`, `min=0.29s`, `max=4.26s`)
-    - `master::worker_crash_rescheduling_test`: single `4/4` (`2.22 s`), post-review after `20/20` (`total=53.08s`, `min=2.47s`, `max=5.18s`; initial `54.84 s`, `2.50–6.72 s`)
+    - `master::worker_crash_rescheduling_test`: single `4/4` (`2.20 s`, reaper eviction unblocked in `1.00 s`), post-reaper-fix after `20/20` (`total=50.04s`, `min=2.41s`, `max=2.55s`; review `53.08 s`, `2.47–5.18 s`; initial `54.84 s`, `2.50–6.72 s`)
     - `master::zero_copy_quic_test`: single `8/8` (`0.33 s`), after `20/20` (`total=20.48s`, `min=0.89s`, `max=2.94s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
