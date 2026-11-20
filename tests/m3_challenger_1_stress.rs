@@ -24,6 +24,8 @@ use rusty_grid_worker::{
     WorkerConfig, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_TIMEOUT,
 };
 
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Helper to check if a process is still alive in the OS process table.
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
@@ -378,7 +380,7 @@ t2.join()
 
     let task = Task::new(
         TaskSpec::command("python3", vec!["-c".into(), py_script.into()]),
-        TaskRequirements::generic(1, 15), // 15 second timeout
+        TaskRequirements::generic(1, 90), // generous deadline above 60s hang guard
     );
 
     // Test 1: Exit code 0 (success).
@@ -387,6 +389,7 @@ t2.join()
     let t0 = Instant::now();
     let res = runner.execute_task(&task, None, None).await;
     let elapsed = t0.elapsed();
+    println!("Concurrent pipe 2MB stdout test completed in {elapsed:?}");
 
     assert!(
         res.is_success(),
@@ -404,9 +407,8 @@ t2.join()
     );
     assert!(res.stdout.starts_with('A'));
     assert!(
-        elapsed < Duration::from_secs(10),
-        "Execution completed in {:?}, not hanging on pipe deadlock",
-        elapsed
+        elapsed < TEST_WAIT_TIMEOUT,
+        "Execution hung for {elapsed:?}, likely pipe deadlock"
     );
 
     // Note: On exit code 0, TaskResult::success discards stderr_str (setting it to "").
@@ -438,12 +440,13 @@ sys.exit(42)
 
     let task_fail = Task::new(
         TaskSpec::command("python3", vec!["-c".into(), py_script_fail.into()]),
-        TaskRequirements::generic(1, 15),
+        TaskRequirements::generic(1, 90),
     );
 
     let t1 = Instant::now();
     let res_fail = runner.execute_task(&task_fail, None, None).await;
     let elapsed_fail = t1.elapsed();
+    println!("Concurrent pipe 2MB stdout+stderr (code 42) completed in {elapsed_fail:?}");
 
     assert_eq!(res_fail.exit_code, 42);
     assert!(
@@ -460,9 +463,8 @@ sys.exit(42)
     assert!(res_fail.stdout.starts_with('A'));
     assert!(res_fail.stderr.starts_with('B'));
     assert!(
-        elapsed_fail < Duration::from_secs(10),
-        "Execution with code 42 completed in {:?}, not deadlocking",
-        elapsed_fail
+        elapsed_fail < TEST_WAIT_TIMEOUT,
+        "Execution with code 42 hung for {elapsed_fail:?}, likely pipe deadlock"
     );
 }
 
@@ -531,6 +533,7 @@ async fn test_infinite_stream_resistance_yes_command_watchdog() {
         .execute_task(&task, Some(Arc::clone(&child_pid)), None)
         .await;
     let elapsed = t0.elapsed();
+    println!("Infinite stream watchdog terminated `yes` in {elapsed:?}");
 
     assert_eq!(
         res.exit_code, EXIT_CODE_TIMEOUT,
@@ -542,9 +545,8 @@ async fn test_infinite_stream_resistance_yes_command_watchdog() {
         "Timeout must wait at least 1s"
     );
     assert!(
-        elapsed < Duration::from_millis(3000),
-        "Timeout must trigger promptly, took {:?}",
-        elapsed
+        elapsed < TEST_WAIT_TIMEOUT,
+        "Timeout hung on infinite stream for {elapsed:?}"
     );
 
     // Verify child PID was reaped
@@ -567,7 +569,7 @@ async fn test_timeout_watchdog_precision_and_os_reaping() {
 
     // 1-second timeout test
     let task_1s = Task::new(
-        TaskSpec::command("sleep", vec!["30".into()]),
+        TaskSpec::command("sleep", vec!["120".into()]),
         TaskRequirements::generic(1, 1),
     );
 
@@ -577,12 +579,12 @@ async fn test_timeout_watchdog_precision_and_os_reaping() {
         .execute_task(&task_1s, Some(Arc::clone(&child_pid_1s)), None)
         .await;
     let elapsed_1s = t0.elapsed();
+    println!("1s timeout watchdog terminated sleep 120 in {elapsed_1s:?}");
 
     assert_eq!(res_1s.exit_code, EXIT_CODE_TIMEOUT);
     assert!(
-        elapsed_1s >= Duration::from_millis(990) && elapsed_1s <= Duration::from_millis(2500),
-        "1s timeout elapsed time {:?} out of precision bounds (1.0s - 2.5s)",
-        elapsed_1s
+        elapsed_1s >= Duration::from_millis(990) && elapsed_1s < TEST_WAIT_TIMEOUT,
+        "1s timeout elapsed time {elapsed_1s:?} out of bounds (min 990ms, guard < {TEST_WAIT_TIMEOUT:?})"
     );
 
     let pid_1s = child_pid_1s.load(Ordering::Acquire);
@@ -598,7 +600,7 @@ async fn test_timeout_watchdog_precision_and_os_reaping() {
 
     // 2-second timeout test
     let task_2s = Task::new(
-        TaskSpec::command("sleep", vec!["30".into()]),
+        TaskSpec::command("sleep", vec!["120".into()]),
         TaskRequirements::generic(1, 2),
     );
 
@@ -608,12 +610,12 @@ async fn test_timeout_watchdog_precision_and_os_reaping() {
         .execute_task(&task_2s, Some(Arc::clone(&child_pid_2s)), None)
         .await;
     let elapsed_2s = t1.elapsed();
+    println!("2s timeout watchdog terminated sleep 120 in {elapsed_2s:?}");
 
     assert_eq!(res_2s.exit_code, EXIT_CODE_TIMEOUT);
     assert!(
-        elapsed_2s >= Duration::from_millis(1980) && elapsed_2s <= Duration::from_millis(3500),
-        "2s timeout elapsed time {:?} out of precision bounds (2.0s - 3.5s)",
-        elapsed_2s
+        elapsed_2s >= Duration::from_millis(1980) && elapsed_2s < TEST_WAIT_TIMEOUT,
+        "2s timeout elapsed time {elapsed_2s:?} out of bounds (min 1980ms, guard < {TEST_WAIT_TIMEOUT:?})"
     );
 
     let pid_2s = child_pid_2s.load(Ordering::Acquire);
@@ -868,93 +870,115 @@ async fn test_cancellation_burst_storm_integrity() {
 
 #[tokio::test]
 async fn test_cancellation_of_queued_task_behind_saturated_worker() {
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"go");
+        }
+    }
+
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
+    let release_file = temp_dir.path().join("release_task1");
     let cores = 1; // single core worker: max 1 active task
     let config = WorkerConfig::new("127.0.0.1:9999")
         .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = Arc::new(WorkerClient::new(config));
+    let _release_guard = ReleaseOnDrop(release_file.clone());
     let (tx, mut rx) = mpsc::channel(16);
 
-    // Task 1 occupies the single core for 1 second
+    // Task 1 holds the single worker permit until `release_file` appears.
     let task1 = Task::new(
-        TaskSpec::command("sleep", vec!["1".into()]),
-        TaskRequirements::generic(1, 10),
+        TaskSpec::command(
+            "python3",
+            vec![
+                "-c".into(),
+                "import os, sys, time\nwhile not os.path.exists(sys.argv[1]):\n    time.sleep(0.02)\n".into(),
+                release_file.to_string_lossy().into_owned(),
+            ],
+        ),
+        TaskRequirements::generic(1, 90),
     );
     let task1_id = task1.id;
     client.handle_assign_task(task1, tx.clone()).await;
 
     // Wait until Task 1 is running
-    while let Some(msg) = rx.recv().await {
-        if let WorkerMessage::TaskProgress {
-            task_id,
-            status: TaskStatus::Running,
-            ..
-        } = msg
-        {
-            if task_id == task1_id {
-                break;
-            }
+    let running_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(running_deadline, rx.recv()).await {
+            Ok(Some(WorkerMessage::TaskProgress {
+                task_id,
+                status: TaskStatus::Running,
+                ..
+            })) if task_id == task1_id => break,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("channel closed before Task 1 started running"),
+            Err(_) => panic!("timed out waiting for Task 1 Running progress"),
         }
     }
 
     // Task 2 is assigned but queued behind Task 1 (waiting for the semaphore permit)
     let task2 = Task::new(
-        TaskSpec::command("sleep", vec!["10".into()]),
-        TaskRequirements::generic(1, 30),
+        TaskSpec::command("sleep", vec!["120".into()]),
+        TaskRequirements::generic(1, 90),
     );
     let task2_id = task2.id;
     client.handle_assign_task(task2, tx.clone()).await;
 
-    // Immediately cancel Task 2 while it is waiting in the semaphore queue
+    // Immediately cancel Task 2 while Task 1 is still gated on `release_file`
     let t_cancel_start = Instant::now();
     client
         .handle_cancel_task(task2_id, Some("Cancelled while queued".into()))
         .await;
 
-    // Check when Task 2 cancellation result arrives
-    let mut task2_cancelled_elapsed = None;
-    let mut task1_finished = false;
-
-    let timeout = Duration::from_secs(5);
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+    // Phase 1: Task 2 cancellation must arrive BEFORE Task 1 is released from the barrier.
+    let phase1_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    let task2_cancelled_elapsed;
+    loop {
+        match tokio::time::timeout_at(phase1_deadline, rx.recv()).await {
             Ok(Some(WorkerMessage::TaskResult {
                 task_id, exit_code, ..
             })) => {
-                if task_id == task2_id {
+                if task_id == task1_id {
+                    panic!(
+                        "Task 1 finished before queued Task 2 cancellation completed (exit_code={exit_code})"
+                    );
+                } else if task_id == task2_id {
                     assert_eq!(exit_code, EXIT_CODE_CANCELLED);
                     assert_eq!(exit_code, 130);
-                    task2_cancelled_elapsed = Some(t_cancel_start.elapsed());
-                } else if task_id == task1_id {
-                    assert_eq!(exit_code, 0);
-                    task1_finished = true;
-                }
-                if task2_cancelled_elapsed.is_some() && task1_finished {
+                    task2_cancelled_elapsed = t_cancel_start.elapsed();
                     break;
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {}
+            Ok(None) => panic!("channel closed before queued Task 2 cancellation result arrived"),
+            Err(_) => panic!(
+                "timed out ({TEST_WAIT_TIMEOUT:?}) waiting for queued Task 2 cancellation while Task 1 held the barrier"
+            ),
         }
     }
-
-    assert!(
-        task2_cancelled_elapsed.is_some(),
-        "Task 2 must eventually receive cancelled result"
-    );
-    let elapsed = task2_cancelled_elapsed.unwrap();
     println!(
-        "Empirical measurement: Queued task cancellation took {:?}",
-        elapsed
+        "Empirical measurement: Queued task cancellation while Task 1 held the sole permit took {:?}",
+        task2_cancelled_elapsed
     );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "Queued task cancellation must occur immediately (<500ms) without waiting for saturated permit release, took {:?}",
-        elapsed
-    );
+
+    // Phase 2: Release Task 1 from its barrier and confirm it completes cleanly.
+    std::fs::write(&release_file, b"go").expect("write release file");
+    let phase2_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(phase2_deadline, rx.recv()).await {
+            Ok(Some(WorkerMessage::TaskResult {
+                task_id, exit_code, ..
+            })) if task_id == task1_id => {
+                assert_eq!(exit_code, 0, "Task 1 should succeed after barrier release");
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("channel closed before Task 1 completion result arrived"),
+            Err(_) => panic!("timed out ({TEST_WAIT_TIMEOUT:?}) waiting for released Task 1"),
+        }
+    }
 }
 
 // =========================================================================

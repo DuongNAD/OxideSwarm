@@ -617,3 +617,51 @@ async fn test_runner_autorig_checkpoints() {
     assert!(asset.len() >= 20);
     assert_eq!(&asset.as_slice()[0..4], b"glTF");
 }
+
+#[tokio::test]
+async fn test_spawn_simulated_gpu_job_stops_when_stop_flag_raised() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let guard = super::StopOnDrop(std::sync::Arc::clone(&stop));
+    drop(guard);
+    assert!(
+        stop.load(Ordering::Relaxed),
+        "StopOnDrop must raise the stop flag on drop"
+    );
+
+    let interrupted = super::spawn_simulated_gpu_job(
+        "stop_flag_test".into(),
+        Vec::new(),
+        Uuid::new_v4(),
+        64,
+        16,
+        stop,
+    )
+    .await
+    .expect("blocking task must join");
+    match interrupted {
+        Err(crate::gpu::GpuError::Interrupted(_)) => {}
+        Err(other) => {
+            panic!("expected GpuError::Interrupted when stop flag is raised, got Err({other:?})")
+        }
+        Ok(done) => panic!(
+            "expected GpuError::Interrupted when stop flag is raised, got Ok(elapsed_ms={})",
+            done.elapsed_ms
+        ),
+    }
+
+    let unstopped = super::spawn_simulated_gpu_job(
+        "stop_flag_control".into(),
+        Vec::new(),
+        Uuid::new_v4(),
+        64,
+        16,
+        std::sync::Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("control blocking task must join");
+    if let Err(err) = unstopped {
+        panic!("expected Ok when stop flag stays false, got Err({err:?})");
+    }
+}

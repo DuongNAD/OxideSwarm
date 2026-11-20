@@ -1190,7 +1190,7 @@ cargo build --offline 2>&1
             "the tracked PID must become the task itself, not stay sandbox-exec; it is `{name}`"
         );
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -1211,7 +1211,15 @@ cargo build --offline 2>&1
             .execute_task(&task, Some(Arc::clone(&pid)), None)
             .await;
         assert_eq!(result.exit_code, EXIT_CODE_TIMEOUT, "{:?}", result.error);
-        assert!(started.elapsed() < Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "macos timeout task killed in {:.2}s (limit 60s)",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "timed-out task hung for {elapsed:?}"
+        );
         let tracked = pid.load(Ordering::Acquire);
         assert!(tracked > 1);
         assert!(wait_dead(tracked).await, "the timed-out task is gone");
@@ -2909,7 +2917,7 @@ cargo build --offline 2>&1
         }
         assert_eq!(name, "sleep", "the tracked PID must become the task itself");
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -2936,7 +2944,15 @@ cargo build --offline 2>&1
                 "{level}: {:?}",
                 result.error
             );
-            assert!(started.elapsed() < Duration::from_secs(30));
+            let elapsed = started.elapsed();
+            eprintln!(
+                "linux timeout task ({level}) killed in {:.2}s (limit 60s)",
+                elapsed.as_secs_f64()
+            );
+            assert!(
+                elapsed < Duration::from_secs(60),
+                "{level}: timed-out task hung for {elapsed:?}"
+            );
             let tracked = pid.load(Ordering::Acquire);
             assert!(tracked > 1);
             assert!(

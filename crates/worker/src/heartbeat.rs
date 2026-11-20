@@ -226,6 +226,8 @@ pub struct IoClock {
     epoch: Instant,
     last_rx_nanos: AtomicU64,
     last_bulk_tx_nanos: AtomicU64,
+    #[cfg(test)]
+    fake_now_nanos: Option<Arc<AtomicU64>>,
 }
 
 impl IoClock {
@@ -235,10 +237,26 @@ impl IoClock {
             epoch: Instant::now(),
             last_rx_nanos: AtomicU64::new(0),
             last_bulk_tx_nanos: AtomicU64::new(0),
+            #[cfg(test)]
+            fake_now_nanos: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_fake_clock(now_nanos: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            epoch: Instant::now(),
+            last_rx_nanos: AtomicU64::new(0),
+            last_bulk_tx_nanos: AtomicU64::new(0),
+            fake_now_nanos: Some(now_nanos),
         })
     }
 
     fn now_nanos(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ref fake) = self.fake_now_nanos {
+            return fake.load(Ordering::Relaxed);
+        }
         self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
 
@@ -747,50 +765,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_io_clock_counts_received_bytes_and_bulk_write_progress_only() {
-        let clock = IoClock::new();
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = IoClock::with_fake_clock(Arc::clone(&now));
+        now.store(60_000_000, Ordering::Relaxed);
         let idle = clock.silence();
-        assert!(
-            idle >= Duration::from_millis(50),
+        assert_eq!(
+            idle,
+            Duration::from_millis(60),
             "idle connection ages: {idle:?}"
         );
 
         // Received bytes are life.
         clock.touch_rx();
-        assert!(clock.silence() < Duration::from_millis(40));
+        assert_eq!(clock.silence(), Duration::ZERO);
 
         // Bulk upload progress is life too, until it stalls.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(clock.silence() >= Duration::from_millis(50));
+        now.store(120_000_000, Ordering::Relaxed);
+        assert_eq!(clock.silence(), Duration::from_millis(60));
         clock.touch_bulk_tx();
-        assert!(clock.silence() < Duration::from_millis(40));
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(
-            clock.silence() >= Duration::from_millis(50),
+        assert_eq!(clock.silence(), Duration::ZERO);
+        now.store(180_000_000, Ordering::Relaxed);
+        assert_eq!(
+            clock.silence(),
+            Duration::from_millis(60),
             "a stalled upload stops counting"
         );
+
+        // Cover production Instant-based clock aging with a lower-bound check only.
+        let real_clock = IoClock::new();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(real_clock.silence() >= Duration::from_millis(10));
     }
 
     #[tokio::test]
     async fn test_stamped_stream_stamps_reads_and_only_bulk_writes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (a, mut b) = tokio::io::duplex(256 * 1024);
-        let clock = IoClock::new();
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = IoClock::with_fake_clock(Arc::clone(&now));
         let mut stamped = StampedStream::new(a, Arc::clone(&clock));
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(clock.silence() >= Duration::from_millis(50));
+        now.store(60_000_000, Ordering::Relaxed);
+        assert_eq!(clock.silence(), Duration::from_millis(60));
 
         // Reading data from the peer is a sign of life.
         b.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         stamped.read_exact(&mut buf).await.unwrap();
-        assert!(clock.silence() < Duration::from_millis(40));
+        assert_eq!(clock.silence(), Duration::ZERO);
 
         // A heartbeat-sized write succeeds into a dead peer's buffer too, so it proves nothing...
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        now.store(120_000_000, Ordering::Relaxed);
         stamped.write_all(b"pong").await.unwrap();
-        assert!(
-            clock.silence() >= Duration::from_millis(50),
+        assert_eq!(
+            clock.silence(),
+            Duration::from_millis(60),
             "small writes are not life"
         );
 
@@ -799,8 +827,9 @@ mod tests {
             .write_all(&vec![7u8; BULK_WRITE_BYTES * 2])
             .await
             .unwrap();
-        assert!(
-            clock.silence() < Duration::from_millis(40),
+        assert_eq!(
+            clock.silence(),
+            Duration::ZERO,
             "bulk write progress is life"
         );
     }

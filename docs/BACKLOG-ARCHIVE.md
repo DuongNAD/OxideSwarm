@@ -3158,6 +3158,100 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     --locked -- -D warnings`, and `cargo test --workspace --locked` (`137` binaries, `2,228 passed;
     0 failed; 5 ignored`).
 
+### TEST-82: `rusty_grid_worker`: replace wall-clock upper bounds and bound `scale1` status queries
+
+- **Evidence:** Read-only audit `OxideSwarm_Agent_Hub` `test_runs/mac_wallclock_audit_2026-11-20.md`
+  (coordinator follow-up `TEST-82`) identified `31` Category 1 wall-clock upper bounds in
+  `rusty_grid_worker` and `3` Category 3 unbounded `recv_msg` awaits inside `TEST_WAIT_TIMEOUT`
+  deadline loops in `crates/worker/tests/scale1_simulated_worker.rs`.
+- **Problem:** Under overloaded CI or local stress loops, wall-clock upper bounds (`< 40 ms`, `< 400 ms`,
+  `< 500 ms`, `< 1–30 s`) fail when an OS scheduler slice delays a task or `IoClock` read, while unbounded
+  `query.recv_msg::<ClientResponse>().await` calls in `scale1_simulated_worker.rs` can hang past
+  `TEST_WAIT_TIMEOUT` if the master stalls a status reply.
+- **Do:** Replace proof proxies with deterministic structural or ordering checks and print elapsed times,
+  widen hang guards to `60 s` (raising inner task/lock timeouts above `60 s`), leave release-only
+  `!cfg!(debug_assertions)` SLAs untouched, skip `tests/worker_connection_lifecycle.rs` (`TEST-76`) and
+  `crates/worker/tests/test_feat3_os_isolation.rs` `mod windows` (`TEST-69`), and bound every status
+  query in `scale1_simulated_worker.rs` by the remaining deadline budget:
+  1. `tests/gpu_wgpu_compute_test.rs:1000` (with `:981`, `gpu_class_compute_does_not_block_the_async_runtime`):
+     replaced the 600-tick loop and `worst_gap < 400 ms` assertion with a `compute_done` `AtomicBool` and a
+     `current_thread` ticker counter (`yield_now`/`sleep`) asserting `ticks_during_compute >= 1` inside
+     `TEST_WAIT_TIMEOUT` (`60 s`), logging compute wall time, ticks, and worst gap.
+  2. `tests/gpu_wgpu_compute_test.rs:1021, :1029` (`gpu_class_timeout_fires_and_stops_the_multiplication`):
+     added a deterministic `cpu_simd::matmul_simd_cancellable` row-stop proof (`!completed`, `polls == 3 < 64`),
+     added `runner::tests::test_spawn_simulated_gpu_job_stops_when_stop_flag_raised` in `crates/worker/src/runner/tests.rs`
+     (verifying `StopOnDrop` -> `spawn_simulated_gpu_job` returns `Err(GpuError::Interrupted(_))` while an unstopped control returns `Ok`),
+     widened `execute_task` (`< 10 s`) and `drop(runtime)` (`< 2500 ms`) guards to `TEST_WAIT_TIMEOUT`
+     (`60 s`), and logged elapsed times.
+  3. `tests/gpu_wgpu_compute_test.rs:1049` (`gpu_class_cancel_is_honoured_promptly`):
+     added the `"user requested cancel"` error assertion, logged elapsed time, and widened `< 10 s` to `TEST_WAIT_TIMEOUT` (`60 s`).
+  4. `crates/worker/src/heartbeat.rs:760, :766, :787, :803` (`tests::test_io_clock_counts_received_bytes_and_bulk_write_progress_only`,
+     `tests::test_stamped_stream_stamps_reads_and_only_bulk_writes`):
+     added test-only `IoClock::with_fake_clock(Arc<AtomicU64>)` and asserted exact `Duration::ZERO` /
+     `60 ms` silence transitions (keeping a lower-bound `IoClock::new()` check) instead of `< 40 ms` real-clock windows.
+  5. `crates/worker/src/runner/process_tree_tests.rs:189, :274` (`test_a_background_process_holding_the_pipes_does_not_turn_exit_7_into_a_timeout`,
+     `test_a_helper_that_escaped_the_process_group_cannot_hold_the_run_hostage`):
+     raised task timeouts `20` -> `90`, logged elapsed times, and widened `< 10 s` hang guards to `< 60 s`.
+  6. `crates/worker/src/runner/workspace_runner_tests.rs:293` (`test_workspace_task_error_cases_and_over_limit_warning`):
+     set `.with_workspace_lock_wait(Duration::from_secs(90))` and task timeout `90 s`, asserted
+     `error == Some("Cancelled: cancelled during lock wait")` and `!stdout.contains("should-not-run")`,
+     logged `wait_elapsed`, and widened `< 1 s` to `< 60 s`.
+  7. `crates/worker/src/wgpu_engine.rs:1055, :1073` (`tests::waiting_for_the_gpu_stops_on_cancel_and_on_deadline`):
+     widened both `< 5 s` hang guards (`never_sent` still alive) to `< 60 s`, logging elapsed times.
+  8. `tests/m3_challenger_1_stress.rs:407, :463` (`test_pipe_buffer_deadlock_resistance_simultaneous_large_output`):
+     added `TEST_WAIT_TIMEOUT = 60 s`, raised task timeouts `15` -> `90`, logged elapsed times, and
+     widened `< 10 s` guards to `< TEST_WAIT_TIMEOUT`.
+  9. `tests/m3_challenger_1_stress.rs:545` (`test_infinite_stream_resistance_yes_command_watchdog`):
+     logged elapsed time, kept `>= 990 ms` and PID reap checks, and widened `< 3000 ms` to `< TEST_WAIT_TIMEOUT`.
+  10. `tests/m3_challenger_1_stress.rs:583, :614` (`test_timeout_watchdog_precision_and_os_reaping`):
+      changed `sleep 30` -> `sleep 120`, logged elapsed times, kept `>= 990 ms` / `>= 1980 ms` and PID reap
+      checks, and widened `<= 2500 ms` / `<= 3500 ms` guards to `< TEST_WAIT_TIMEOUT`.
+  11. `tests/m3_challenger_1_stress.rs:954` (with `:920`, `test_cancellation_of_queued_task_behind_saturated_worker`):
+      replaced `< 500 ms` (and inner `5 s` loop) with a `release_task1` file barrier (`ReleaseOnDrop` guard)
+      proving `task2` receives `EXIT_CODE_CANCELLED` (`130`) *before* `task1` is released to exit (`0`),
+      using `TEST_WAIT_TIMEOUT` (`60 s`) `timeout_at` deadlines and printing cancellation time.
+  12. `tests/m3_execution.rs:279` (`tests::test_timeout_watchdog_terminates_runaway`):
+      changed `sleep 60` -> `sleep 120`, logged elapsed time, kept `>= 1 s` and timeout-message checks, and
+      widened `< 5 s` to `< 60 s`.
+  13. `crates/worker/tests/test_feat3_os_isolation.rs:1214, :2939` (`macos` and `linux` `test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it`):
+      widened `< 30 s` timeout checks and `20 s` cancel guards to `60 s` and logged elapsed times (Linux branch verified by CI `ubuntu-latest`; `mod windows` skipped per `TEST-69`).
+  14. `crates/worker/tests/test_sec5_hardened_runner.rs:292, :1239` (`test_sec5_blender_large_stderr_does_not_block`,
+      `test_sec5_fifo_or_non_regular_output_fails_for_both_engines`):
+      raised Blender rig timeout `10` -> `60` and removed `< 8 s`; raised 3D FIFO task timeout `5` -> `60`,
+      wrapped `execute_task` in a `90 s` `tokio::time::timeout` hang guard, and removed `< 4 s` while keeping
+      `"Failed to read generated .glb asset"` and `asset_bytes.is_none()` and logging elapsed times.
+  15. `crates/worker/tests/scale1_simulated_worker.rs:268, :313, :343` (`hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_recover`):
+      wrapped all three `ClusterStatus` `send_msg`/`recv_msg` awaits (registration, submitter-failure diagnostic,
+      and reconnect convergence) in `tokio::time::timeout(remaining, ...)` against their deadlines.
+  16. **Untouched release-only `!cfg!(debug_assertions)` SLAs (never run in CI):**
+      `crates/worker/tests/test_autorig_adversarial_stress.rs:1157` (`elapsed_ms < 100.0`),
+      `crates/worker/tests/test_gen3d_adversarial_stress.rs:173, :203` (`avg_mc_ms < 50.0`, `avg_geom_ms < 50.0`),
+      `crates/worker/tests/test_gen3d_pipeline.rs:100` (`elapsed < Duration::from_millis(50)`).
+  17. **Skipped per coordinator split:** `tests/worker_connection_lifecycle.rs:351, :515, :780` (`TEST-76`).
+- **Done when:** All `24` fixed Cat 1 bounds and `3` bounded Cat 3 awaits keep structural/outcome assertions,
+  `cargo fmt --all -- --check` and clippy pass with `-D warnings`, and every touched `rusty_grid_worker`
+  binary passes `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-20, pull request 405, open):** Applied all `TEST-82` changes across the 10 worker files and
+  verified on Apple M5 (`10` cores, private `HOME`, `--locked`, 6 Python CPU busy loops):
+  - Cheap before-loops (`origin/master` `f485533e`; skipped `scale1_simulated_worker` [looped in `TEST-79`] and `test_feat3_os_isolation`):
+    - `gpu_wgpu_compute_test` (`gpu_class_` 3 tests): `20/20` (`96.21 s` total, `4.60–7.97 s`)
+    - `rusty_grid_worker --lib` (5 targeted tests): `20/20` (`29.43 s` total, `1.09–5.53 s`)
+    - `m3_execution` (`test_timeout_watchdog_terminates_runaway`): `20/20` (`34.03 s` total, `1.28–6.06 s`)
+    - `m3_challenger_1_stress` (`test_cancellation_of_queued_task_behind_saturated_worker`): `20/20` (`45.64 s` total, `1.84–6.21 s`)
+    - `test_sec5_hardened_runner --features 3d` (2 targeted tests): `20/20` (`20.55 s` total, `0.68–4.05 s`)
+  - Gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+    `cargo clippy -p rusty_grid_worker --all-targets --features 3d,gpu-wgpu --locked -- -D warnings`, and
+    `python3 tests/test_m1_challenger_hygiene.py`.
+  - After-loops (full touched binaries, `20/20` each under 6 busy loops; review follow-up re-run `313 passed` single `--lib` plus `20/20` each on `test_spawn_simulated_gpu_job_stops_when_stop_flag_raised` [`5.07 s`], `macos::test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it` [`50.05 s`], and `test_sec5_fifo_or_non_regular_output_fails_for_both_engines` [`10.62 s`]):
+    - `rusty_grid_worker --lib --locked` (`312 passed` pre-review; `313 passed` post-review): `20/20` (`208.35 s` total, `9.63–10.80 s`)
+    - `rusty_grid_worker --lib --features gpu-wgpu --locked -- wgpu_engine::tests::waiting_for_the_gpu_stops_on_cancel_and_on_deadline` (`1 passed`): `20/20` (`132.23 s` total, `5.89–11.71 s`)
+    - `gpu_wgpu_compute_test --locked` (`14 passed`; single `--features gpu-wgpu` run `19 passed` in `6.90 s`): `20/20` (`73.06 s` total, `3.17–9.46 s`)
+    - `m3_challenger_1_stress --locked` (`16 passed`): `20/20` (`81.48 s` total, `3.64–10.37 s`)
+    - `m3_execution --locked` (`7 passed`): `20/20` (`37.41 s` total, `1.50–7.66 s`)
+    - `test_sec5_hardened_runner --features 3d --locked` (`28 passed`): `20/20` (`83.75 s` total, `3.67–11.26 s`)
+    - `scale1_simulated_worker --locked` (`3 passed`): `20/20` (`43.57 s` total, `1.89–6.49 s`)
+    - `test_feat3_os_isolation --locked` (`28 passed; 1 ignored`): `20/20` (`585.75 s` total, `27.90–33.59 s`)
+
 ### TEST-83: Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards
 
 - **Evidence:** Read-only wall-clock audit on `origin/master` (`2026-11-20`) found `36` Category 1

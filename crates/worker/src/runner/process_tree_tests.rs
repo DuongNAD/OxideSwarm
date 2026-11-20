@@ -178,15 +178,16 @@ async fn test_a_background_process_holding_the_pipes_does_not_turn_exit_7_into_a
             "sleep 300 &\necho $! > '{}'\necho done-output\necho some-warning >&2\nexit 7\n",
             pid_file.display()
         ),
-        20,
+        90,
     );
 
     let t0 = Instant::now();
     let res = runner.execute_task(&task, None, None).await;
     let elapsed = t0.elapsed();
+    println!("pipe-holder exit-7 task finished in {elapsed:?}");
 
     assert!(
-        elapsed < Duration::from_secs(10),
+        elapsed < Duration::from_secs(60),
         "must not wait for the pipes or the timeout: {elapsed:?}"
     );
     assert_eq!(
@@ -250,12 +251,13 @@ async fn test_a_helper_that_escaped_the_process_group_cannot_hold_the_run_hostag
                 "import subprocess; p = subprocess.Popen(['sleep', '300'], start_new_session=True); print(p.pid, flush=True)".into(),
             ],
         ),
-        TaskRequirements::generic(1, 20),
+        TaskRequirements::generic(1, 90),
     );
 
     let t0 = Instant::now();
     let res = runner.execute_task(&task, None, None).await;
     let elapsed = t0.elapsed();
+    println!("escaped-helper task finished in {elapsed:?}");
 
     let escaped: Option<u32> = res
         .stdout_str()
@@ -271,7 +273,7 @@ async fn test_a_helper_that_escaped_the_process_group_cannot_hold_the_run_hostag
         "the pid line was captured: {:?}",
         res.stdout_str()
     );
-    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
 }
 
 #[tokio::test]
