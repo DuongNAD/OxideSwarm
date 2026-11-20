@@ -3285,7 +3285,7 @@ function Compile-CSharp([string]$code) {
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\secret.txt", 'secret-from-t1')
 $goDeadline = [DateTime]::UtcNow.AddSeconds(60)
 while ([DateTime]::UtcNow -lt $goDeadline) {
-    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { break }
+    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { [Console]::Out.WriteLine('GO_SEEN'); break }
     [System.Threading.Thread]::Sleep(25)
 }
 try { $null = [System.IO.File]::ReadAllText("$env:T_SIB_SANDBOX\secret.txt"); [Console]::Out.WriteLine('LEAK_SIBLING_READ') } catch { [Console]::Out.WriteLine('DENY_SIBLING_READ') }
@@ -3400,6 +3400,7 @@ while ([DateTime]::UtcNow -lt $exitDeadline) {
             let got = lines(res);
             for expected in [
                 "TASK_STARTED",
+                "GO_SEEN",
                 "DENY_SIBLING_READ",
                 "DENY_SIBLING_LIST",
                 "DENY_SIBLING_WRITE",
