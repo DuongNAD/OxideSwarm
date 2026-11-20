@@ -2879,6 +2879,33 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-77: e2e_cluster: widen 3-5 s worker and wait_task deadlines to 60 s
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_tier2_bva_max_concurrency_limit_throttles_worker` failed at `tests/e2e_cluster.rs:1142`:
+  `called Result::unwrap() on an Err value: Timeout { operation: "wait_task(...)", duration_secs: 5 }`.
+- **Problem:** Across `tests/e2e_cluster.rs`, `wait_for_workers`, `poll_until`, `submit_and_wait`,
+  and dozens of direct `wait_task`, `Instant::now() + 2–3 s`, and `tokio::time::timeout(3 s)` calls
+  used `2–15 s` deadlines (paired with `5–15 s` task timeouts), and `TestCluster::spawn_worker` plus
+  `test_tier2_bva_max_concurrency_limit_throttles_worker` omitted `TEST-20` no-Blender/no-CUDA/no-portal
+  flags.
+- **Do:** Add `TEST_WAIT_TIMEOUT = 60 s`, floor `wait_for_workers`, `submit_and_wait`, and
+  `poll_until` at `TEST_WAIT_TIMEOUT`, raise all direct `wait_task` (`5–15 s` -> `60 s`),
+  registration (`3–30 s` -> `60 s`), cancellation/routing deadlines (`2–3 s` -> `60 s`), `sleep 2`/`10`
+  cancellation targets (`sleep 120`, `timeout_secs = 180`), MapReduce specs (`20–30 s` -> `180 s`), and
+  non-timeout `TaskRequirements` (`10–30 s` -> `60 s`), and apply `TEST-20` worker config flags in
+  `spawn_worker` and `test_tier2_bva_max_concurrency_limit_throttles_worker` (keeping every routing,
+  serial `>= 250 ms`, negative `Queued`, and `1 s` timeout test assertion intact).
+- **Done when:** All 65 tests keep full assertions (including `elapsed >= 250 ms` serialization and the
+  `1 s` timeout test) and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 399, open):** Updated `tests/e2e_cluster.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures before the fix is
+  expected since the `5 s` timeout occurred on a 12-thread Windows laptop):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`162.16 s` total, `7.52–9.50 s` per run).
+  - After fix: `65/65` passed in `2.50 s`, and the 20-run loaded loop passed `20/20` (`63.93 s` total,
+    `2.99–3.38 s` per run, `0` failures).
+
 ### TEST-73: m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows
 
 - **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
