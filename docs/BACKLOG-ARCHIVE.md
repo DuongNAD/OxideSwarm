@@ -3120,7 +3120,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** Non-backpressure test masters opt out of `85 %` CPU backpressure, host-CPU
   backpressure and config tests remain at `85.0 %` and pass, `blob_transfer_e2e` passes `20/20` under
   6 busy loops, and `cargo test --workspace --locked` passes cleanly.
-- **Implemented (2026-11-20, pull request TBD, open):** Added `SchedulerConfig::with_max_host_cpu_pct`,
+- **Implemented (2026-11-20, pull request 404, open):** Added `SchedulerConfig::with_max_host_cpu_pct`,
   gated `DEBUG` logging (`ScheduleSkipReason` with saturated workers), and unit test
   `test_with_max_host_cpu_pct_100_allows_saturated_test_host` in `crates/master/src/scheduler.rs`; opted
   `57` non-backpressure test files out (`100.0` / `--max-host-cpu-pct 100`) alongside the `3` already
