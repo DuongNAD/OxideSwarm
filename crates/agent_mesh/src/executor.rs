@@ -244,8 +244,9 @@ impl CommandExecutor {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Spawn process
-        let mut child = match cmd.spawn() {
+        // Spawn process under the shared macOS spawn lock (BUG-35) so concurrent `process_group(0)`
+        // + `Stdio::piped()` calls never inherit another thread's pre-CLOEXEC pipes.
+        let mut child = match rusty_grid_core::process_spawn::spawn_tokio(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
