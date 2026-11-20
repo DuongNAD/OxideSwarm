@@ -268,7 +268,9 @@ async fn test_immediate_graceful_disconnect() {
     let disconnect_time = Instant::now();
     let _ = target_shutdown_tx.send(true);
 
-    // Assert that task is reassigned to survivor well before the 120s reaper timeout
+    // Assert that task is reassigned to survivor well before the 120s reaper timeout and takes the
+    // uncharged graceful evacuation path (`0 ms` retry backoff, leaving `retry_count` /
+    // `failover_count` at 0).
     let reassigned = wait_for(
         Duration::from_secs(60),
         Duration::from_millis(15),
@@ -294,6 +296,19 @@ async fn test_immediate_graceful_disconnect() {
     assert!(
         disconnect_elapsed < Duration::from_secs(60),
         "Graceful disconnect reassignment hung past 60s guard: {disconnect_elapsed:?}"
+    );
+    let reassigned_info = master.get_task_info(task_id).await.expect("task info");
+    assert_eq!(
+        reassigned_info.evacuation_count, 1,
+        "graceful Disconnecting farewell must route via uncharged evacuation (evacuation_count=1)"
+    );
+    assert_eq!(
+        reassigned_info.retry_count, 0,
+        "graceful evacuation must bypass exponential retry backoff (retry_count=0)"
+    );
+    assert_eq!(
+        reassigned_info.failover_count, 0,
+        "graceful evacuation must not charge failover_count"
     );
 
     // Wait for completion on survivor

@@ -72,8 +72,8 @@ async fn test_a_quic_peer_that_opens_no_stream_is_dropped_after_the_handshake_ti
     let elapsed = started.elapsed();
     println!("QUIC idle connection closed after {elapsed:?}");
     assert!(
-        elapsed < Duration::from_secs(60),
-        "closed after {elapsed:?}"
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(60),
+        "QUIC 1 s handshake timeout must bound idle close (closed after {elapsed:?})"
     );
     let _ = master.shutdown();
 }

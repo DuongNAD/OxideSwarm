@@ -566,8 +566,8 @@ async fn test_silent_unauthenticated_peer_is_dropped_after_the_handshake_timeout
     let elapsed = started.elapsed();
     println!("silent unauthenticated peer dropped in {elapsed:?}");
     assert!(
-        elapsed < Duration::from_secs(60),
-        "the handshake timeout must bound how long a silent peer is kept ({elapsed:?})"
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(60),
+        "the 1 s handshake timeout must bound how long a silent peer is kept ({elapsed:?})"
     );
     let _ = master.shutdown();
 }

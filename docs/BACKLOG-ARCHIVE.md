@@ -3310,9 +3310,10 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     while keeping `elapsed >= 900 ms` and subsequent normal-peer admission, and logged elapsed.
   - `tests/cluster_auth_e2e.rs` (`2` hits, `:515`, `:541`): configured the oversized-first-frame master with
     `with_handshake_timeout(120)` so immediate EOF/generic-reject proof does not depend on timeout, widened
-    stream read timeouts and elapsed guards from `3–4 s` to `60 s` in
+    stream read timeouts and upper elapsed guards from `3–4 s` to `60 s` in
     `test_oversized_first_frame_is_cut_off_and_master_stays_healthy` and
-    `test_silent_unauthenticated_peer_is_dropped_after_the_handshake_timeout`, and logged elapsed.
+    `test_silent_unauthenticated_peer_is_dropped_after_the_handshake_timeout` (keeping a `>= 900 ms` lower
+    bound around the `1 s` handshake timeout), and logged elapsed.
   - `tests/m10_streaming_stress.rs` (`1` hit, `:748`): in
     `test_stress_master_graceful_shutdown_drains_telemetry_streams`, applied a shared `60 s`
     `drain_deadline` (`timeout_at`) across WebSocket readers, widened `< 4 s` to `< 60 s`, and logged elapsed.
@@ -3343,7 +3344,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - `tests/master_limits_and_scheduling.rs` (`1` hit, `:136`): in
     `test_surplus_peers_are_closed_and_closing_one_frees_its_slot`, widened slot-release loop guard
     `< 5 s -> < 60 s` and logged release elapsed.
-  - `tests/master_quic_limits.rs` (`3` hits, `:73`, `:105`, `:175`): widened idle-peer close (`:73`) and
+  - `tests/master_quic_limits.rs` (`3` hits, `:73`, `:105`, `:175`): widened idle-peer close (`:73`, keeping a
+    `>= 900 ms` lower bound around its `1 s` handshake timeout) and
     3-worker registration (`:175`) guards to `60 s`; in
     `test_quic_peers_count_against_the_connection_budget_and_free_it_when_gone` (`:105`), raised handshake
     timeout `20 -> 90 s` (`deadline = 90 + 25`), widened refusal wait/guard to `60 s`, and added
@@ -3353,7 +3355,9 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     latency printing, determinism, and constraint invariants.
   - `tests/worker_crash_rescheduling_test.rs` (`2` audited + `1` coupled `wait_for` at `:272`): in
     `test_immediate_graceful_disconnect` (`:272`, `:274`), raised reaper timeout `10 -> 120 s`, widened
-    `wait_for`/elapsed guard `< 300 ms -> < 60 s`, and accepted `Scheduled | Running | Completed` on survivor;
+    `wait_for`/elapsed guard `< 300 ms -> < 60 s`, accepted `Scheduled | Running | Completed` on survivor, and
+    asserted `evacuation_count == 1`, `retry_count == 0`, and `failover_count == 0` after reassignment to
+    prove the uncharged `0 ms`-backoff graceful evacuation path;
     in `test_reaper_waiters_resolution` (`:549`), raised `duration_ms` `5000 -> 120_000` / timeout
     `30 -> 120`, widened `wait_task`/elapsed guard (`< 2 s -> < 60 s`), and logged elapsed.
   - `tests/zero_copy_quic_test.rs` (`1` hit, `:406`): in
@@ -3372,16 +3376,16 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `core::m1_3d_adversarial_stress`: single `21/21` (`88.03 s`), after `20/20` (`total=3640.83s`, `min=158.45s`, `max=272.14s`)
     - `core::m1_stress_challenge`: single `15/15` (`1.18 s`), after `20/20` (`total=48.74s`, `min=2.28s`, `max=3.81s`)
     - `rusty_grid_master --lib`: single `394/394` (`22.80 s`), after `20/20` (`total=485.30s`, `min=23.21s`, `max=25.85s`)
-    - `master::cluster_auth_e2e`: single `18/18` (`2.59 s`), after `20/20` (`total=62.43s`, `min=2.88s`, `max=7.07s`)
+    - `master::cluster_auth_e2e`: single `18/18` (`2.57 s`), post-review after `20/20` (`total=62.22s`, `min=2.88s`, `max=6.99s`; initial `62.43 s`, `2.88–7.07 s`)
     - `master::m10_streaming_stress`: single `6/6` (`0.44 s`), after `20/20` (`total=18.92s`, `min=0.72s`, `max=4.64s`)
     - `master::m2_challenger_2_stress`: single `12/12` (`0.63 s`), after `20/20` (`total=22.97s`, `min=0.92s`, `max=4.84s`)
     - `master::m2_stress_challenge`: single `6/6` (`10.06 s`), after `20/20` (`total=211.20s`, `min=10.38s`, `max=12.27s`)
     - `master::m4_challenger_2_stress`: single `11/11` (`4.51 s`), after `20/20` (`total=103.60s`, `min=4.81s`, `max=11.41s`)
     - `master::m9_stress_challenge_2`: single `10/10` (`1.90 s`), after `20/20` (`total=47.88s`, `min=2.18s`, `max=5.75s`)
     - `master::master_limits_and_scheduling`: single `5/5` (`3.48 s`), after `20/20` (`total=87.71s`, `min=4.06s`, `max=6.37s`)
-    - `master::master_quic_limits`: single `3/3` (`1.56 s`), after `20/20` (`total=45.28s`, `min=2.07s`, `max=4.54s`)
+    - `master::master_quic_limits`: single `3/3` (`1.56 s`), post-review after `20/20` (`total=73.76s`, `min=1.99s`, `max=31.99s`; initial `45.28 s`, `2.07–4.54 s`)
     - `master::test_challenger_m4_scheduler_runner`: single `3/3` (`0.00 s`), after `20/20` (`total=10.05s`, `min=0.29s`, `max=4.26s`)
-    - `master::worker_crash_rescheduling_test`: single `4/4` (`2.25 s`), after `20/20` (`total=54.84s`, `min=2.50s`, `max=6.72s`)
+    - `master::worker_crash_rescheduling_test`: single `4/4` (`2.22 s`), post-review after `20/20` (`total=53.08s`, `min=2.47s`, `max=5.18s`; initial `54.84 s`, `2.50–6.72 s`)
     - `master::zero_copy_quic_test`: single `8/8` (`0.33 s`), after `20/20` (`total=20.48s`, `min=0.89s`, `max=2.94s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
