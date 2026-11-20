@@ -3095,6 +3095,50 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - After fix: full binary `28/28` passed in `2.83 s`, and the 20-run loaded loop of the test passed
     `20/20` (`11.47 s` total, `0.54–0.61 s` per run, `0` failures).
 
+### TEST-81: Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load
+
+- **Evidence:** In Q80 confirmation Run 2 on `origin/master` `347e2a90` (10-core Apple M5 under 6 Python
+  CPU busy loops alongside the workspace test run), `-p rusty_grid_cli --test blob_transfer_e2e`
+  failed in `cli::test_cli_submit_input_and_output_round_trip_with_dedup` (`120 s` silent task timeout
+  after 2 earlier tasks completed) and `test_worker_pins_output_files_from_collection_through_upload`
+  (`60 s` `Elapsed(())`). Reproducing with `RUST_LOG=rusty_grid_master::scheduler=debug,info` on
+  `origin/master` `fd0df6a0` under 6 busy loops plus `cargo test -p rusty_grid_cli` completed submits 1
+  and 2 in `16–18 ms` and stalled submit 3 for `5 s`, emitting `51` `DEBUG` lines verbatim:
+  `2026-11-20T05:41:27.557055Z DEBUG rusty_grid_master::scheduler: Scheduling pass skipped queued tasks while worker(s) are held back by host CPU backpressure skipped=1 max_host_cpu_pct=85.0 busy_workers=[(73f372f4-c5e6-425e-84f1-ce1b419fb050, 99.60392, 0)]`.
+- **Problem:** `SchedulerConfig::max_host_cpu_pct` defaults to `85.0` so real masters protect the host,
+  and most integration/E2E tests started masters without raising it (even `WorkerClient::for_testing`
+  and `WorkerClient::simulated` report live `sysinfo` CPU usage). Under loaded CI runners or local
+  stress loops, host CPU exceeds `85 %` and unrelated task-dispatch tests stall with no indication of
+  why tasks remain `Queued`. This `85 %` host-CPU backpressure is probably behind several Windows-hunt
+  flakes (`TEST-69` to `TEST-79`) and the `TEST-68` echo stall as well.
+  Open product question for later (left unchanged here): when every worker sits above `85 %` host CPU,
+  queued tasks wait silently without any hint to the user.
+- **Do:** Add `SchedulerConfig::with_max_host_cpu_pct` and a `tracing::enabled!(Level::DEBUG)` log in
+  `WorkloadScheduler::schedule_batch` reporting `skipped`, `max_host_cpu_pct`, and `busy_workers`; opt
+  non-backpressure test masters out (`100.0` / `--max-host-cpu-pct 100`) across the suite; and keep
+  production default `85.0` and all CPU-backpressure / config-default tests untouched.
+- **Done when:** Non-backpressure test masters opt out of `85 %` CPU backpressure, host-CPU
+  backpressure and config tests remain at `85.0 %` and pass, `blob_transfer_e2e` passes `20/20` under
+  6 busy loops, and `cargo test --workspace --locked` passes cleanly.
+- **Implemented (2026-11-20, pull request TBD, open):** Added `SchedulerConfig::with_max_host_cpu_pct`,
+  gated `DEBUG` logging (`ScheduleSkipReason` with saturated workers), and unit test
+  `test_with_max_host_cpu_pct_100_allows_saturated_test_host` in `crates/master/src/scheduler.rs`; opted
+  `57` non-backpressure test files out (`100.0` / `--max-host-cpu-pct 100`) alongside the `3` already
+  opted-out files (`tests/m4_challenger_2_stress.rs`, `tests/m6_challenger_1_stress.rs`,
+  `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`), while keeping production default `85.0` and
+  all backpressure/config tests (`scheduler::tests`,
+  `e2e_cluster::test_tier3_pairwise_dynamic_load_backpressure_high_cpu`, `tests/m6_challenger_2_stress.rs`,
+  `tests/m5_challenger_1_stress.rs`, `crates/cli/src/cli_app/{tests,runtime_tests}.rs`) unchanged:
+  - `blob_transfer_e2e` loaded 20-run loop (Apple M5, 6 busy loops, private `HOME`): `20/20` before
+    (`576.66 s`, `26.18–36.63 s`; Q80 Run 2 reproduced the stall under workspace load) and `20/20` after
+    (`627.62 s`, `29.01–33.98 s`).
+  - Targeted backpressure checks: `scheduler::tests` (`82 passed`),
+    `e2e_cluster::test_tier3_pairwise_dynamic_load_backpressure_high_cpu` (`1 passed`),
+    `m6_challenger_2_stress` (`11 passed`), `m5_challenger_1_stress` (`32 passed`).
+  - Full gates: `cargo test ... --features 3d --no-run --locked`, `cargo clippy --workspace --all-targets
+    --locked -- -D warnings`, and `cargo test --workspace --locked` (`137` binaries, `2,228 passed;
+    0 failed; 5 ignored`).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with

@@ -21,8 +21,12 @@ use agent_mesh::client::AgentMeshClient;
 use agent_mesh::hub::AgentMeshHub;
 use agent_mesh::protocol::AgentMeshEnvelope;
 
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// Test harness for spawning in-process Master, Workers, Hub, and Bridge.
@@ -41,9 +45,15 @@ struct TestWorker {
 
 impl TestConvergenceHarness {
     pub async fn spawn(num_workers: usize) -> Self {
-        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-            .await
-            .expect("MasterServer::spawn failed");
+        let master = MasterServer::spawn_with_config(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+            SchedulerConfig::default()
+                .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+                .with_max_host_cpu_pct(100.0),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("MasterServer::spawn failed");
         let master_addr = master.server_addr().to_string();
 
         let hub = AgentMeshHub::new();

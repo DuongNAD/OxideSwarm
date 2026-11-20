@@ -26,8 +26,24 @@ use uuid::Uuid;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::dashboard::dto::{ClusterStatusDto, DashboardStreamMessage};
 use rusty_grid_master::queue::TaskInfo;
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::{WorkerInfo, WorkerStatus};
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
+}
 
 fn http_client() -> reqwest::Client {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -51,7 +67,7 @@ async fn test_dashboard_http_rest_endpoints() {
         .with_dashboard_port_file(&dash_port_file)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master
         .dashboard_addr()
         .expect("dashboard addr must be assigned");
@@ -220,7 +236,7 @@ async fn test_dashboard_websocket_telemetry_stream() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // 2. Connect WebSocket client to /ws
@@ -332,7 +348,7 @@ async fn test_dashboard_sse_stream() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     let client = http_client();

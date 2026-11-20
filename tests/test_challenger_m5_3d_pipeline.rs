@@ -43,8 +43,12 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{AutoRigSpec, Generative3DSpec, Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::autorig::auto_rig_mesh;
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::runner::{
@@ -218,10 +222,14 @@ impl ChallengerCluster {
         // A lost worker is charged to `max_failovers`, not to `max_retries`
         // (`RetryPolicy::failover_budget`), so both get the same limit: a task here is re-run at
         // most `max_retries` times after losing its worker.
-        let master = MasterServer::spawn(
+        let master = MasterServer::spawn_with_config(
             ServerConfig::new("127.0.0.1:0".parse().unwrap())
                 .with_max_retries(max_retries)
                 .with_max_failovers(max_retries),
+            SchedulerConfig::default()
+                .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+                .with_max_host_cpu_pct(100.0),
+            ReaperConfig::default(),
         )
         .await
         .expect("MasterServer::spawn failed");

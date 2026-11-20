@@ -6,10 +6,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+use rusty_grid_core::GridResult;
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_master::store::HEADER_LEN;
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::WorkerClient;
+
+async fn spawn_test_master_result(config: ServerConfig) -> GridResult<MasterHandle> {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0);
+    MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default()).await
+}
 
 /// In-memory log sink for the `rv158` probe: keeps the last lines the master and worker crates
 /// logged, so a round that ran its task twice can print what happened around that task (TEST-41).
@@ -96,7 +108,9 @@ async fn test_master_restart_recovers_completed_queued_uncharged_running_and_fai
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master1 = MasterServer::spawn(config).await.expect("spawn master1");
+        let master1 = spawn_test_master_result(config)
+            .await
+            .expect("spawn master1");
         let master1_addr = master1.server_addr().to_string();
 
         let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -249,7 +263,9 @@ async fn test_master_restart_recovers_completed_queued_uncharged_running_and_fai
         .with_discovery(false)
         .with_state_dir(&state_dir)
         .with_session_resume_hold(Duration::ZERO);
-    let master2 = MasterServer::spawn(config2).await.expect("spawn master2");
+    let master2 = spawn_test_master_result(config2)
+        .await
+        .expect("spawn master2");
 
     // Verify recovered states before any worker connects to master2:
     // - `t_done` is immediately readable as `Completed` without re-execution.
@@ -443,7 +459,7 @@ fn timed_sleep_marker_task(
 async fn spawn_rebound_master(config: ServerConfig, timeout: Duration) -> MasterHandle {
     let deadline = Instant::now() + timeout;
     loop {
-        match MasterServer::spawn(config.clone()).await {
+        match spawn_test_master_result(config.clone()).await {
             Ok(m) => return m,
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -471,7 +487,9 @@ async fn test_master_restart_recovers_finished_queued_and_adopts_running_task_on
         .with_web_ui(false)
         .with_discovery(false)
         .with_state_dir(&state_dir);
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -663,7 +681,9 @@ async fn test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result
         .with_web_ui(false)
         .with_discovery(false)
         .with_state_dir(&state_dir);
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -803,7 +823,9 @@ async fn test_worker_reconnecting_after_master_hold_expires_runs_task_only_once(
         .with_heartbeat_interval(1)
         .with_state_dir(&state_dir)
         .with_session_resume_hold(Duration::from_secs(8));
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -969,7 +991,9 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+        let master1 = spawn_test_master_result(config1)
+            .await
+            .expect("spawn master1");
         let master_addr = master1.server_addr();
         let (w_tx, w_rx) = watch::channel(false);
         let mut w1 = WorkerClient::for_testing(
@@ -1111,7 +1135,9 @@ async fn test_worker_connection_drop_adopts_running_task_while_master_stays_up()
         .with_web_ui(false)
         .with_discovery(false)
         .with_session_resume_hold(Duration::from_secs(30));
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master_result(config)
+        .await
+        .expect("spawn master");
     let master_addr = master.server_addr();
 
     // TCP relay that can sever the active connection on demand while accepting subsequent reconnects.
@@ -1428,6 +1454,8 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
             "master",
             "--listen",
             "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
             port_file.to_str().unwrap(),
             "--dashboard-port",

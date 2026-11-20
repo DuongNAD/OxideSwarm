@@ -25,7 +25,9 @@ use rusty_grid_core::task::{
     sha256_digest, Bytes, OutputArtifact, StagedFile, Task, TaskId, TaskRequirements, TaskResult,
     TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
-use rusty_grid_master::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterServer, ReaperConfig, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::runner::{RunnerConfig, TaskRunner};
 use rusty_grid_worker::sandbox::{normalize_relative_path_str, Sandbox, SandboxConfig};
@@ -516,9 +518,16 @@ async fn test_cli_save_output_artifacts() {
 
 #[tokio::test]
 async fn test_e2e_full_cluster_file_staging_and_artifact_retrieval() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0);
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
     let master_addr = master.server_addr();
 
     let temp_worker_dir = tempfile::tempdir().expect("worker tempdir");

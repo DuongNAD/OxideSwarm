@@ -24,7 +24,23 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 #[cfg(feature = "3d")]
 use futures::{SinkExt, StreamExt};
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+
+async fn spawn_test_master() -> MasterHandle {
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer spawn")
+}
 #[cfg(feature = "3d")]
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 #[cfg(feature = "3d")]
@@ -279,9 +295,7 @@ fn test_adv_sha256_single_bit_flip_tampering_rust() {
 
 #[tokio::test]
 async fn test_adv_bridge_binary_data_parser_fuzzing() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer spawn");
+    let master = spawn_test_master().await;
     let bridge = AgentGridBridge::new(master.clone());
 
     let test_temp = TempDir::new().unwrap();
@@ -370,9 +384,7 @@ async fn test_adv_bridge_binary_data_parser_fuzzing() {
 async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
     use agent_mesh::AgentMeshHub;
     // 1. Spawn Master
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer spawn");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // 2. Spawn Hub with Bridge
@@ -523,9 +535,7 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
 async fn test_adv_high_concurrency_mesh_burst() {
     use agent_mesh::AgentMeshHub;
     // 1. Spawn Master
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer spawn");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // 2. Spawn Hub with Bridge

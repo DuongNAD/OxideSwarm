@@ -24,7 +24,9 @@ use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -90,9 +92,16 @@ struct TestCluster {
 
 impl TestCluster {
     async fn setup() -> Self {
-        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-            .await
-            .expect("MasterServer::spawn failed");
+        let sched_cfg = SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0);
+        let master = MasterServer::spawn_with_config(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+            sched_cfg,
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("MasterServer::spawn failed");
         let master_addr = master.server_addr().to_string();
 
         let (w1_tx, w1_rx) = watch::channel(false);
@@ -518,7 +527,7 @@ async fn test_m4_parallel_batch_spread_scheduling() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
-    let sched_config = SchedulerConfig::default();
+    let sched_config = SchedulerConfig::default().with_max_host_cpu_pct(100.0);
     let reaper_config = ReaperConfig::default();
 
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap());

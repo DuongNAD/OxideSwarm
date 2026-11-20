@@ -28,7 +28,9 @@ use rusty_grid_core::task::{
     Bytes as TaskBytes, CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
 };
 use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::WorkerClient;
 use rusty_grid_worker::runner::{RunnerConfig, TaskRunner};
 
@@ -325,7 +327,15 @@ async fn test_task_requeue_preserves_checkpoint() {
 async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect() {
     // 1. Spawn Master server with max_retries = 3
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn(config).await.expect("master spawn");
+    let master = MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     // 2. Connect Worker 1

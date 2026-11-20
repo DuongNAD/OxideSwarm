@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rusty_grid_master::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterHandle, MasterServer, ReaperConfig, ServerConfig};
 use rusty_grid_worker::{WorkerClient, WorkerConfig};
 use serde_json::{json, Value};
 use tokio::sync::watch;
@@ -45,7 +47,10 @@ impl HarnessCluster {
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let config = ServerConfig::new(bind_addr).with_blob_store(&blob_dir, 128 * 1024 * 1024);
-        let master = MasterServer::spawn(config)
+        let sched_cfg = SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0);
+        let master = MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
             .await
             .expect("spawn MasterServer");
         let master_addr = master.server_addr();

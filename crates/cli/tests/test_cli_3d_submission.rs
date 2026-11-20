@@ -45,7 +45,7 @@ async fn test_cli_3d_sdf_submission_and_export() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await
@@ -131,7 +131,7 @@ async fn test_cli_autorig_submission_and_export() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await
@@ -267,7 +267,7 @@ async fn test_cli_3d_default_submit_succeeds_on_cpu_worker() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await
@@ -346,7 +346,7 @@ async fn test_cli_3d_triposr_fails_honestly_on_cpu_worker() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await
@@ -423,7 +423,7 @@ async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await

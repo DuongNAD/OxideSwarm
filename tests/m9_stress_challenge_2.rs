@@ -41,8 +41,23 @@ use rusty_grid_core::protocol::{
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
 use rusty_grid_master::reaper::ReaperConfig;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
+
+fn test_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0)
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(config, test_scheduler_config(), ReaperConfig::default())
+        .await
+        .expect("master spawn")
+}
 
 fn resolve_field<T, F>(
     cli: Option<T>,
@@ -136,9 +151,8 @@ fn find_rusty_grid_bin() -> Option<PathBuf> {
 async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     // Server configured with generous default retries (5)
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(5))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(5))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -277,9 +291,8 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
 #[tokio::test]
 async fn test_boundary_max_retries_1_single_retry_then_failure() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -437,13 +450,12 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
     // Master server configured with default_retry_max = 1 (very restrictive!) and
     // max_evacuations = 2 so the first 2 graceful drains are uncharged and the next 5
     // take the charged path (with_max_retries(5) overriding server default 1).
-    let master = MasterServer::spawn(
+    let master = spawn_test_master(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_max_retries(1)
             .with_max_evacuations(2),
     )
-    .await
-    .expect("master spawn");
+    .await;
     let master_addr = master.server_addr().to_string();
 
     // Submit task requesting max_retries = Some(5)
@@ -772,9 +784,8 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
 #[tokio::test]
 async fn test_client_wait_task_unblocks_promptly_on_crash() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -867,9 +878,10 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     // Fast reaper: 20ms scan interval, 60ms timeout threshold
     let reaper_config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(60));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0);
-    let master = MasterServer::spawn_with_config(server_config, Default::default(), reaper_config)
-        .await
-        .expect("master spawn");
+    let master =
+        MasterServer::spawn_with_config(server_config, test_scheduler_config(), reaper_config)
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr();
 
     // Raw TCP connection simulating a silent/frozen worker (no heartbeats sent)
@@ -947,9 +959,8 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
 #[tokio::test]
 async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -1056,9 +1067,8 @@ async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover()
 #[tokio::test]
 async fn test_multiple_concurrent_client_waiters_fanout() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -1157,9 +1167,8 @@ async fn test_multiple_concurrent_client_waiters_fanout() {
 #[tokio::test]
 async fn test_tcp_wire_client_submit_wait_resolution() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
-            .await
-            .expect("master spawn");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await;
     let master_addr = master.server_addr();
 
     // Spawn worker

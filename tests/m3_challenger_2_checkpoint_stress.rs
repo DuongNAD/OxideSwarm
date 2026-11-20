@@ -20,7 +20,9 @@ use rusty_grid_core::task::{
     Bytes as TaskBytes, CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
 };
 use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::WorkerClient;
 use rusty_grid_worker::runner::{RunnerConfig, TaskRunner};
 
@@ -62,7 +64,15 @@ fn compute_reference_digest(task_id: &TaskId, iters: u32) -> u64 {
 #[tokio::test]
 async fn test_adversarial_disconnect_race_during_checkpoint_emission() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);

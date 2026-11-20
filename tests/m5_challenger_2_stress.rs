@@ -43,8 +43,25 @@ use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport}
 use rusty_grid_core::GridResult;
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+async fn spawn_test_master() -> MasterHandle {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0);
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 // Match TEST-54: outer wait turns a hang into a diagnostic failure, while the MapReduce
@@ -203,9 +220,7 @@ async fn await_mapreduce_handle(
 
 #[tokio::test]
 async fn test_m5_mapreduce_word_count_multi_partition_multi_worker() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-m5-1", 2, false);
@@ -268,9 +283,7 @@ async fn test_m5_mapreduce_word_count_multi_partition_multi_worker() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_word_count_shell_pipeline_multi_worker() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-sh-1", 2, false);
@@ -332,9 +345,7 @@ done"#;
 
 #[tokio::test]
 async fn test_m5_mapreduce_empty_input() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
 
     let spec = MapReduceJobSpec::new(
         "empty_job",
@@ -365,9 +376,7 @@ async fn test_m5_mapreduce_empty_input() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_single_partition_input() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-single", 2, false);
@@ -410,9 +419,7 @@ async fn test_m5_mapreduce_single_partition_input() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_large_multiline_input_stress() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-large-1", 2, false);
@@ -512,9 +519,7 @@ async fn test_m5_mapreduce_large_multiline_input_stress() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_worker_crash_during_map_phase_rescheduled() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-mapcrash-1", 2, false);
@@ -609,9 +614,7 @@ done"#;
 
 #[tokio::test]
 async fn test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate_retained() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-redcrash-1", 2, false);
@@ -769,9 +772,7 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
 
 #[tokio::test]
 async fn test_m5_mapreduce_map_task_nonzero_exit_fails_with_error() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-fail-1", 2, false);
@@ -815,9 +816,7 @@ async fn test_m5_mapreduce_map_task_nonzero_exit_fails_with_error() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_reduce_task_nonzero_exit_fails_with_error() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-fail-2", 2, false);
@@ -861,9 +860,7 @@ async fn test_m5_mapreduce_reduce_task_nonzero_exit_fails_with_error() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_concurrent_jobs_stress() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-conc-1", 4, false);
@@ -1017,9 +1014,7 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
 
 #[tokio::test]
 async fn test_m5_mapreduce_via_client_network_transport() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let _w1 = spawn_test_worker(master_addr.clone(), "worker-net-1", 2, false);

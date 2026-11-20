@@ -266,6 +266,13 @@ impl SchedulerConfig {
         self
     }
 
+    /// Sets the host CPU usage % threshold above which anti-stuttering backpressure holds back
+    /// task assignments (default: `85.0`; pass `100.0` in tests running under synthetic load).
+    pub fn with_max_host_cpu_pct(mut self, max_host_cpu_pct: f32) -> Self {
+        self.max_host_cpu_pct = max_host_cpu_pct;
+        self
+    }
+
     /// Validates `speed_hold_factor` (`0.0` to disable, or a finite number `> 1.0`).
     pub fn validate_speed_hold_factor(factor: f64) -> Result<f64, String> {
         if factor == 0.0 {
@@ -2055,6 +2062,28 @@ impl WorkloadScheduler {
                 }
             }
         }
+        if !report.skipped.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+            let busy_workers: Vec<_> = engine
+                .seats
+                .iter()
+                .filter(|seat| seat.worker.cpu_usage_pct > self.config.max_host_cpu_pct)
+                .map(|seat| {
+                    (
+                        seat.worker.worker_id,
+                        seat.worker.cpu_usage_pct,
+                        seat.load(),
+                    )
+                })
+                .collect();
+            if !busy_workers.is_empty() {
+                debug!(
+                    skipped = report.skipped.len(),
+                    max_host_cpu_pct = self.config.max_host_cpu_pct,
+                    busy_workers = ?busy_workers,
+                    "Scheduling pass skipped queued tasks while worker(s) are held back by host CPU backpressure"
+                );
+            }
+        }
         if placements.is_empty() {
             return Ok(report);
         }
@@ -3002,6 +3031,39 @@ mod tests {
         assert_eq!(
             report.assignments[0].worker_id, healthy_worker.worker_id,
             "Overloaded worker (>85% CPU) should be bypassed by anti-stuttering backpressure"
+        );
+    }
+
+    #[test]
+    fn test_with_max_host_cpu_pct_100_allows_saturated_test_host() {
+        let mut busy_worker = make_worker("saturated-worker", 4, 8192, false, false);
+        busy_worker.cpu_usage_pct = 95.0;
+
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["test".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+
+        let default_report = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&busy_worker),
+        );
+        assert!(default_report.assignments.is_empty());
+        assert_eq!(
+            default_report.skipped,
+            vec![(task.id, ScheduleSkipReason::AllEligibleWorkersSaturated)]
+        );
+
+        let relaxed_report = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+            &[task],
+            &[busy_worker.clone()],
+        );
+        assert_eq!(relaxed_report.assignments.len(), 1);
+        assert_eq!(
+            relaxed_report.assignments[0].worker_id,
+            busy_worker.worker_id
         );
     }
 

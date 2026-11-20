@@ -60,10 +60,13 @@ impl TwoSpeedCluster {
     async fn spawn(sched_config: SchedulerConfig, include_slow: bool) -> Self {
         let sandbox_dir = TempDir::new().expect("tempdir for worker sandboxes");
         let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
-        let master =
-            MasterServer::spawn_with_config(server_cfg, sched_config, ReaperConfig::default())
-                .await
-                .expect("MasterServer::spawn_with_config failed");
+        let master = MasterServer::spawn_with_config(
+            server_cfg,
+            sched_config.with_max_host_cpu_pct(100.0),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("MasterServer::spawn_with_config failed");
         let master_addr = master.server_addr().to_string();
 
         let fast_cfg = WorkerConfig::new(master_addr.clone())
@@ -283,7 +286,7 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
     let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
     let master = MasterServer::spawn_with_config(
         server_cfg,
-        SchedulerConfig::default(),
+        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
         ReaperConfig::default(),
     )
     .await

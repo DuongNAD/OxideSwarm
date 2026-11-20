@@ -16,7 +16,11 @@ use tokio::sync::watch;
 
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// A worker running in this process; stopped on drop.
@@ -92,7 +96,12 @@ async fn closed_by_server(stream: &mut TcpStream, within: Duration) -> bool {
 }
 
 async fn spawn_master(config: ServerConfig) -> MasterHandle {
-    MasterServer::spawn(config).await.expect("spawn master")
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0);
+    MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("spawn master")
 }
 
 fn grid_config() -> ServerConfig {

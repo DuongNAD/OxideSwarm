@@ -85,8 +85,15 @@ struct Master {
 fn start_master(home: &Path) -> Master {
     let port_file = home.join("master.port");
     let mut cmd = cli(home);
-    cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"])
-        .arg(&port_file);
+    cmd.args([
+        "master",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-host-cpu-pct",
+        "100",
+        "--port-file",
+    ])
+    .arg(&port_file);
     let service = Service::spawn(cmd, home.join("master.log"));
     let mut port = None;
     assert!(

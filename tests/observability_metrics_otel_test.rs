@@ -14,9 +14,25 @@ use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::task::TaskId;
 use rusty_grid_master::auth::{AuthConfig, AuthScope};
 use rusty_grid_master::metrics::PROMETHEUS_CONTENT_TYPE;
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
+}
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -105,7 +121,7 @@ async fn test_metrics_requires_observer_scope_and_rejects_unauthenticated() {
         .with_dashboard_port(0)
         .with_auth_config(auth_config);
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{dash_addr}");
 
@@ -190,7 +206,7 @@ async fn test_metrics_scrape_live_master_worker_blob_journal_and_redaction() {
         .with_state_dir(state_dir.path())
         .with_blob_store(blob_dir.path(), 16 * 1024 * 1024);
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{dash_addr}");
 
@@ -492,7 +508,7 @@ async fn test_otel_exporter_lifecycle_spans_trace_id_and_secret_redaction() {
         .with_dashboard_port(0)
         .with_cluster_secret(secret.clone())
         .with_state_dir(state_dir.path());
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
 
     let (worker_tx, worker_handle) = spawn_test_worker(
         master.server_addr().to_string(),

@@ -25,9 +25,25 @@ use rusty_grid_core::protocol::{
     PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_AUTH, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 
 /// Helper representing a spawned test worker with an isolated sandbox directory.
 #[allow(dead_code)]
@@ -172,9 +188,7 @@ fn test_m8_discriminator_all_256_bytes_unit() {
 
 #[tokio::test]
 async fn test_m8_malformed_discriminator_handshake_rejection() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let adversarial_tags = vec![0x00, 0xFF, 0x03, 0xAA, 0xFE, 0x10, 0x7A, 0x7C];
@@ -259,9 +273,7 @@ async fn test_m8_malformed_discriminator_handshake_rejection() {
 
 #[tokio::test]
 async fn test_m8_post_handshake_malformed_discriminator_disconnects_worker() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let mut stream = TcpStream::connect(&master_addr)
@@ -327,9 +339,7 @@ async fn test_m8_post_handshake_malformed_discriminator_disconnects_worker() {
 
 #[tokio::test]
 async fn test_m8_truncated_and_empty_frames() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     // 1. Zero-length payload frame (length prefix = 0)
@@ -473,9 +483,7 @@ fn test_m8_large_binary_payload_wire_comparison() {
 
 #[tokio::test]
 async fn test_m8_large_binary_payload_gpu_compute_5mb_e2e() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn worker with simulated GPU and Bincode codec
@@ -553,9 +561,7 @@ async fn test_m8_large_binary_payload_gpu_compute_5mb_e2e() {
 
 #[tokio::test]
 async fn test_m8_rapid_mixed_stream_clients() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     // Connect Worker 1 with Bincode
@@ -735,9 +741,7 @@ async fn test_m8_rapid_mixed_stream_clients() {
 
 #[tokio::test]
 async fn test_m8_frame_boundary_and_streaming_integrity() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let stream = TcpStream::connect(&master_addr).await.expect("connect");

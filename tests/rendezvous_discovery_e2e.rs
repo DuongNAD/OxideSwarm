@@ -221,7 +221,14 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
     // 2. Start Master configured with `--rendezvous <URL>`.
     let master_port_file = root.path().join("master.port");
     let mut master_cmd = isolated_cli(&master_home);
-    master_cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"]);
+    master_cmd.args([
+        "master",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-host-cpu-pct",
+        "100",
+        "--port-file",
+    ]);
     master_cmd.arg(&master_port_file);
     master_cmd.args(["--rendezvous", &rv_url, "--secret-file"]);
     master_cmd.arg(&secret_path);

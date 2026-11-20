@@ -58,8 +58,24 @@ fn http_client(timeout: Option<Duration>) -> reqwest::Client {
 
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::dashboard::dto::{ClusterStatusDto, DashboardStreamMessage};
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .with_max_host_cpu_pct(100.0),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
+}
 
 /// Test 1: Rapid connection and abrupt disconnection bursts across /ws, /api/stream, and /api/stream/sse.
 #[tokio::test]
@@ -69,7 +85,7 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // Background task continuously submitting dummy tasks to generate telemetry events during churn
@@ -215,7 +231,7 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // 1. Connect Client A (Slow/Lagging Consumer) on /ws
@@ -317,7 +333,7 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     let client = http_client(Some(Duration::from_secs(10)));
@@ -390,7 +406,7 @@ async fn test_stress_high_throughput_concurrency() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
     let master_addr = master.server_addr();
 
@@ -533,7 +549,7 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     let ws_url = format!("ws://{}/ws", dash_addr);
@@ -679,7 +695,7 @@ async fn test_stress_master_graceful_shutdown_drains_telemetry_streams() {
         .with_dashboard_port(0)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // Connect 3 WebSocket clients

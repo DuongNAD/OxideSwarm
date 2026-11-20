@@ -231,9 +231,16 @@ fn start_loopback_members_only_master(home: &Path) -> (Service, String) {
 fn start_master_with_args(home: &Path, extra_args: &[&str]) -> (Service, String) {
     let port_file = home.join("master.port");
     let mut cmd = cli(home);
-    cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"])
-        .arg(&port_file)
-        .args(extra_args);
+    cmd.args([
+        "master",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-host-cpu-pct",
+        "100",
+        "--port-file",
+    ])
+    .arg(&port_file)
+    .args(extra_args);
     let master = Service::spawn(cmd, home.join("master.log"));
 
     let mut port = None;

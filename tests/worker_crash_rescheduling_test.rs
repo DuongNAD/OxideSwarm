@@ -19,8 +19,23 @@ use uuid::Uuid;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::reaper::ReaperConfig;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
+
+fn test_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .with_max_host_cpu_pct(100.0)
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(config, test_scheduler_config(), ReaperConfig::default())
+        .await
+        .expect("master spawn")
+}
 
 /// Asynchronously polls `condition` until it returns true or `timeout` expires.
 async fn wait_for<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
@@ -45,7 +60,7 @@ where
 #[tokio::test]
 async fn test_worker_crash_recovery() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn(config).await.expect("master spawn");
+    let master = spawn_test_master(config).await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -164,7 +179,7 @@ async fn test_immediate_graceful_disconnect() {
     let reaper_config = ReaperConfig::new(Duration::from_secs(1), Duration::from_secs(10));
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3),
-        Default::default(),
+        test_scheduler_config(),
         reaper_config,
     )
     .await
@@ -299,13 +314,12 @@ async fn test_immediate_graceful_disconnect() {
 #[tokio::test]
 async fn test_max_retries_exhaustion() {
     // Master with max_retries = 2 (failovers have their own budget; pin it to the same limit)
-    let master = MasterServer::spawn(
+    let master = spawn_test_master(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_max_retries(2)
             .with_max_failovers(2),
     )
-    .await
-    .expect("master spawn");
+    .await;
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
@@ -476,9 +490,10 @@ async fn test_reaper_waiters_resolution() {
     // Fast reaper: scans every 20ms, timeout 60ms
     let reaper_config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(60));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0);
-    let master = MasterServer::spawn_with_config(server_config, Default::default(), reaper_config)
-        .await
-        .expect("master spawn");
+    let master =
+        MasterServer::spawn_with_config(server_config, test_scheduler_config(), reaper_config)
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr();
 
     // Connect raw TCP worker that performs handshake then halts sending heartbeats
