@@ -121,7 +121,7 @@ When `TaskQueue::handle_session_evacuated(worker_id, session_id, reason)` proces
   4. a `Running` task with `with_max_retries(0)` or `RetryPolicy { max_retries: 0, .. }` transitions
      to `TaskState::Failed` on the first drain without re-running.
 - **Integration (`tests/mobile_coordination_test.rs`, `tests/m9_stress_challenge_2.rs`, `tests/m5a_challenger_2_stress.rs`, `tests/m9_stress_challenge_1.rs`):**
-  - `test_fast_evacuation_under_50ms_without_task_loss` verifies two consecutive pre-sleep
+  - `test_fast_evacuation_without_task_loss` (formerly `test_fast_evacuation_under_50ms_without_task_loss`) verifies two consecutive pre-sleep
      evacuations across three workers complete with `retry_count == 0`, `failover_count == 0`, and
      `evacuation_count == 2`.
   - `test_boundary_max_retries_5_overrides_lower_server_default` verifies `max_evacuations` uncharged

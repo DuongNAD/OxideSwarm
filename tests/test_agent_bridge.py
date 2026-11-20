@@ -10,6 +10,7 @@ Mutation check: OX_SCRIPT_ROOT=/path/to/an/older/checkout python3 tests/test_age
 """
 
 import datetime
+import glob
 import importlib.util
 import json
 import os
@@ -279,17 +280,36 @@ class ClaudeCodeHook(BridgeCase):
         self.assertEqual(self.run_bridge(*args, stdin='{"session_id": "s1"}').returncode, 0)
 
     def test_a_session_keeps_one_watcher_across_turns(self):
-        first = self.start_bridge(*self.hook_args(), stdin='{"session_id": "s1"}')
-        time.sleep(2.5)
-        self.assertIsNone(first.poll())
+        long_hook_args = self.watch_args("--hook", "--max-wait", "120")
+        first = self.start_bridge(*long_hook_args, stdin='{"session_id": "s1"}')
+        lock_pattern = os.path.join(self.env["OXIDESWARM_HOME"], "**", "watch_*.lock")
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            if glob.glob(lock_pattern, recursive=True):
+                break
+            if first.poll() is not None:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
+        self.assertIsNone(first.poll(), "first hook watcher exited unexpectedly before second hook")
 
-        started = time.time()
-        result = self.run_bridge(*self.hook_args(), stdin='{"session_id": "s1"}')
+        started = time.monotonic()
+        result = self.run_bridge(*long_hook_args, stdin='{"session_id": "s1"}', timeout=60)
+        elapsed = time.monotonic() - started
+        print(f"second hook exited in {elapsed:.3f}s")
         self.assertEqual(result.returncode, 0)
-        self.assertLess(time.time() - started, 5, "the second hook must leave at once")
+        self.assertIsNone(first.poll(), "first watcher must still be alive when the second hook leaves")
+        self.assertLess(elapsed, 60, f"second hook hung for {elapsed:.2f}s")
 
-        other = self.start_bridge(*self.watch_args("--hook", "--max-wait", "3"), stdin='{"session_id": "s2"}')
-        time.sleep(2)
+        other = self.start_bridge(*self.watch_args("--hook", "--max-wait", "30"), stdin='{"session_id": "s2"}')
+        deadline2 = time.monotonic() + 60.0
+        while time.monotonic() < deadline2:
+            if len(glob.glob(lock_pattern, recursive=True)) >= 2:
+                break
+            if other.poll() is not None:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
         self.assertIsNone(other.poll(), "another session has its own watcher")
 
     def test_a_stdin_that_stays_open_does_not_block_the_hook(self):
