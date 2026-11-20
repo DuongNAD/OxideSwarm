@@ -3177,7 +3177,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** Every audited Category 1 bound in `rusty_grid_core` and `rusty_grid_master` (outside the
   three skipped files) is structural or guarded at `60 s`, `cargo fmt`, workspace `clippy`, and doc
   hygiene pass, and all `15` binaries pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-20, pull request TBD, open):** Updated `36` audited Category 1 hits plus `4`
+- **Implemented (2026-11-20, pull request 406, open):** Updated `36` audited Category 1 hits plus `4`
   adjacent upper bounds across `18` files / `15` test binaries (`m2_challenger_1_stress`,
   `m4_challenger_1_stress`, and `master_restart_recovery` untouched):
   - `crates/core/src/capabilities.rs` (`rusty_grid_core --lib`, `5` hits): in
