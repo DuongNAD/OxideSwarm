@@ -1,0 +1,254 @@
+{
+  "benchmark": "TEST-25 soak endurance suite",
+  "date_utc": "2026-11-19T14:22:47Z",
+  "stopped_utc": "2026-11-20T13:06:33Z",
+  "git": {
+    "commit": "cfb0679c5fca2405fb0ab8089344c9683f06a660",
+    "dirty_tree": false
+  },
+  "binary": {
+    "version": "rusty-grid 0.4.4",
+    "build_profile": "release"
+  },
+  "hardware": {
+    "cpu_model": "Intel(R) Core(TM) i5-14600KF",
+    "cores": 20,
+    "ram_bytes": 51318800384
+  },
+  "os": {
+    "system": "Windows",
+    "release": "10",
+    "version": "10.0.26300",
+    "machine": "AMD64"
+  },
+  "windows_realtime_av_enabled": true,
+  "power": "mains (SetThreadExecutionState keep-awake active)",
+  "python": "3.11.9",
+  "link": "loopback",
+  "parameters": {
+    "seed": 20261119,
+    "duration": "24h",
+    "duration_s": 86400.0,
+    "fault_scale": 1.0,
+    "load_scale": 1.0,
+    "sample_interval_s": 60.0,
+    "workers": 3,
+    "slots": 4,
+    "workspaces": true,
+    "max_queue_size": 64,
+    "blob_store_mb": 4096,
+    "blob_cache_mb": 2048,
+    "session_resume_hold_secs": null,
+    "rate_mbps": null,
+    "delay_ms": 0.0
+  },
+  "early_stop": {
+    "stopped_early": true,
+    "reason": "owner_decision",
+    "actual_duration_s": 81826.46,
+    "actual_duration_hours": 22.73,
+    "target_duration_s": 86400.0,
+    "note": "Stopped early at owner decision after ~22.73 h (with ~1.27 h left). The PR 381 endurance.py soak harness keeps TaskLedger, 60 s BackgroundSampler samples, probe_samples, and fault_events_log strictly in memory and writes no partial record on interrupt, so this record is assembled from preserved master/worker logs, live CLI status, GET /api/tasks telemetry, periodic process snapshots, and final idle disk/state captures."
+  },
+  "verification_note": "Assembled from preserved master-0..11 logs, worker0/1/2 logs, pre-stop master status, GET /api/tasks retained window, periodic process snapshots, and idle disk/state measurements. Client-side TaskLedger SHA-256 verification, 60 s per-PID BackgroundSampler means, continuous probe_samples P99, and fault_events_log were lost in memory on early stop and are explicitly marked not_evaluated_due_to_early_stop.",
+  "note": "Light-load workspace builds/tests (-j 4, no busy loops) and one opt-in 250 s harness E2E ran concurrently on the host earlier in the run. Two brief host/stall intervals (2026-11-20T06:30Z and 10:33-11:55Z) coincided with 25-52 s master log timestamp gaps and 57 task timeouts (exit_code=124 after 60 s worker watchdog).",
+  "all_passed": false,
+  "soak": {
+    "passed": false,
+    "actual_duration_s": 81826.46,
+    "actual_duration_hours": 22.73,
+    "pass_checks": {
+      "1_accounting": {
+        "passed": false,
+        "status": "partial_early_stop_with_watchdog_timeouts",
+        "client_ledger_status": "not_evaluated_due_to_early_stop",
+        "client_sha256_verification": "not_evaluated_due_to_early_stop",
+        "master_evidence_present": true,
+        "master_generations": 12,
+        "worker_log_files": 71,
+        "master_first_ts": "2026-11-19T14:22:50.316028Z",
+        "master_last_ts": "2026-11-20T13:06:32.546509Z",
+        "master_result_messages_logged": 63059,
+        "master_unique_result_tasks": 63059,
+        "master_duplicate_executions": 0,
+        "master_multi_result_tasks": {},
+        "master_exit_codes_logged": {
+          "0": 61642,
+          "130": 1360,
+          "124": 57
+        },
+        "master_failover_sweeps": 112,
+        "master_superseded_failovers": 0,
+        "master_reaper_failovers": 0,
+        "master_orphan_requeues": 27,
+        "master_requeues_logged": 27,
+        "master_queue_record_errors": 0,
+        "master_log_errors": 0,
+        "master_panics": 0,
+        "worker_log_errors": 0,
+        "worker_panics": 0,
+        "stale_late_results_measured": false,
+        "stale_late_results_note": "Ignored stale/late results are logged at DEBUG level in crates/master/src and are not measured under default INFO logging",
+        "pre_stop_status_130528Z": {
+          "pending_tasks": 0,
+          "running_tasks": 0,
+          "active_bytes": 0,
+          "max_active_bytes": 268435456,
+          "worker_count": 3,
+          "total_tasks": 10000,
+          "completed_tasks": 9736,
+          "failed_tasks": 264
+        },
+        "api_tasks_130216Z_retained_window": {
+          "count": 10000,
+          "by_state": {
+            "completed": 9737,
+            "cancelled": 215,
+            "failed": 48
+          },
+          "exit_codes": {
+            "0": 9737,
+            "130": 215,
+            "124": 48
+          }
+        },
+        "cold_results_dirs": 256,
+        "watchdog_timeout_124_note": "57 of 63,059 logged task results (0.090%) failed with worker watchdog timeout exit_code=124 ('Task timed out after 60s'), execution_time_ms 60016-63255, clustered at 2026-11-20T06:30-06:31Z (9 tasks following a 50.0 s master log gap 06:29:55Z-06:30:45Z) and 10:33-11:55Z (48 tasks coincident with repeated 25-52 s master log gaps, firing simultaneously across independent workers within <1 ms on resume)."
+      },
+      "2_resource_plateau": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "60 s per-PID BackgroundSampler time series was kept only in driver memory and lost on early stop.",
+        "observational_snapshots": [
+          {
+            "elapsed": "+7h47m",
+            "master_rss_mib": 62.7,
+            "worker_rss_mib_range": [
+              30.0,
+              30.7
+            ]
+          },
+          {
+            "elapsed": "+10h47m",
+            "master_rss_mib": 59.4,
+            "worker_rss_mib_range": [
+              29.8,
+              31.1
+            ]
+          },
+          {
+            "elapsed": "+13h47m",
+            "master_rss_mib": 65.8,
+            "worker_rss_mib_range": [
+              29.3,
+              30.9
+            ]
+          },
+          {
+            "elapsed": "+16h47m",
+            "master_rss_mib": 60.0,
+            "worker_rss_mib_range": [
+              30.0,
+              31.1
+            ]
+          },
+          {
+            "elapsed": "+19h47m",
+            "master_rss_mib": 86.9,
+            "worker_rss_mib_range": [
+              55.0,
+              55.8
+            ]
+          },
+          {
+            "elapsed": "+22h43m (pre_stop_130632Z)",
+            "master": {
+              "rss_bytes": 89296896,
+              "rss_mib": 85.16,
+              "handles": 191,
+              "cpu_s": 66.25
+            },
+            "w0": {
+              "rss_bytes": 57643008,
+              "rss_mib": 54.97,
+              "handles": 301,
+              "cpu_s": 14.06
+            },
+            "w1": {
+              "rss_bytes": 57438208,
+              "rss_mib": 54.78,
+              "handles": 302,
+              "cpu_s": 1.61,
+              "note": "recently restarted"
+            },
+            "w2": {
+              "rss_bytes": 58556416,
+              "rss_mib": 55.84,
+              "handles": 309,
+              "cpu_s": 26.33
+            }
+          }
+        ]
+      },
+      "3_disk_and_journal": {
+        "passed": null,
+        "status": "partial_idle_and_runtime_compaction_verified",
+        "blob_store_130216Z_bytes": 4218423221,
+        "blob_store_idle_bytes": 4244637442,
+        "blob_store_limit_bytes": 4294967296,
+        "blob_store_idle_files": 96,
+        "blob_store_idle_ok": true,
+        "blob_store_eviction_events": 7279,
+        "blob_store_evicted_blobs_total": 12221,
+        "worker_cache_130216Z_bytes": {
+          "w0": 2136997888,
+          "w1": 2130709106,
+          "w2": 2135949312
+        },
+        "worker_cache_idle_bytes": {
+          "w0": 2102395622,
+          "w1": 2105542715,
+          "w2": 2082471936
+        },
+        "worker_cache_limit_bytes": 2147483648,
+        "worker_cache_idle_ok": true,
+        "worker_cache_peak_status": "not_evaluated_due_to_early_stop",
+        "unexpected_sandbox_entries": {},
+        "tmp_leftovers": {},
+        "part_files_count": 0,
+        "locks_leftover": {},
+        "sandbox_ok": true,
+        "master_state_idle_bytes": 14963094,
+        "snapshot_bin_130216Z_bytes": 13314208,
+        "snapshot_bin_idle_bytes": 13315075,
+        "journal_bin_130216Z_bytes": 2104993,
+        "journal_bin_idle_bytes": 54043,
+        "runtime_journal_compaction_observed": true,
+        "scheduled_restart_compactions_status": "not_evaluated_due_to_early_stop",
+        "note": "Automatic runtime master journal compaction reduced journal.bin from 2,104,993 B (13:02:16Z) to 54,043 B (snapshot.bin 13,315,075 B) around 13:05Z prior to stop. Scheduled restart compaction records and continuous mid-run 60 s peak worker cache samples were in driver memory and lost on early stop."
+      },
+      "4_probe_p99": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "Continuous per-minute probe latency samples were kept only in driver memory and lost on early stop."
+      },
+      "5_clean_stop": {
+        "passed": true,
+        "status": "evaluated",
+        "leftover_pids": [],
+        "leftover_task_trees": [],
+        "work_dir_removed": true,
+        "keep_awake_stopped": true
+      },
+      "6_fault_injection": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "Full fault_events_log was kept only in driver memory and lost on early stop.",
+        "indirect_master_log_evidence": {
+          "master_generations": 12,
+          "failover_sweeps": 112
+        }
+      }
+    }
+  }
+}

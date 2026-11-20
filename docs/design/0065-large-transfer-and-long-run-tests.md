@@ -274,3 +274,16 @@ The right column records the owner's decisions of 2026-11-19, listed in
   pull requests, not a required check; pinned action commits) running `transfer` (`T1` `1 GiB`, `T2`
   `20,000` files, `T4`, `T6`, `T7`, `T8`) and `45m` `soak` and uploading `endurance-records`; static
   checks added in `tests/test_endurance_harness.py`; stays Partial until two scheduled runs pass.
+- 2026-11-20: TEST-25 Partial (Windows loopback 24h soak attempt stopped at `22.73 h` / `81,826.46 s`,
+  branch `win/test-25-24h-soak-record`): stopped early at owner decision with ~`1.27 h` remaining;
+  committed sanitized record
+  `benchmarks/endurance/results/2026-11-19-soak-24h-loopback-windows-amd64-intel-core-i5-14600kf.json`
+  (`rusty-grid 0.4.4` at `cfb0679`) assembled from preserved logs, live status, `/api/tasks`, periodic
+  snapshots, and idle disk/state captures: `63,059` unique master-logged results (`61,642` ok, `1,360`
+  cancelled `130`, `57` `60 s` watchdog timeouts `124` clustered in `06:30–06:31Z` and `10:33–11:55Z`
+  with `25–52 s` log gaps), `0` duplicates, `0` log-level `ERROR`/panics, `112` failovers, `27` orphan
+  requeues; idle `master-blobs` `4,244,637,442 B` (`<= 4 GiB`, `7,279` LRU evictions / `12,221` blobs),
+  idle worker caches `<= 2,105,542,715 B` (`<= 2 GiB`), `0` `.part`/`.tmp`/`.locks` leftovers, runtime
+  `journal.bin` compaction (`2,104,993 -> 54,043 B`), and `0` leftover processes; in-memory ledger SHA-256,
+  60 s `BackgroundSampler` means, `probe_samples` p99, and `fault_events_log` marked
+  `not_evaluated_due_to_early_stop`. Stays Partial pending the 3-machine run.
