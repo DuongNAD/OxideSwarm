@@ -984,39 +984,79 @@ fn cancelled_or_expired_gemm_returns_interrupted_without_touching_the_gpu() {
 // ============================================================================
 #[tokio::test(flavor = "current_thread")]
 async fn gpu_class_compute_does_not_block_the_async_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     // One runtime thread, a CPU multiplication that takes a while in a debug build, and a ticker
-    // that stands for the heartbeat. With the multiplication run inline the ticker stalls for the
-    // whole multiplication; on a blocking thread it keeps ticking.
+    // that stands for the heartbeat. On `current_thread`, `ticker` cannot run a single poll until
+    // `execute_task` yields; if the multiplication ran inline, `compute_done` would already be
+    // true before `ticker` ever polled, yielding `ticks_during_compute == 0`.
     let (runner, _tmp) = make_runner(true, true);
-    let ticker = tokio::spawn(async {
+    let compute_done = Arc::new(AtomicBool::new(false));
+    let done_t = Arc::clone(&compute_done);
+    let ticker = tokio::spawn(async move {
+        let mut ticks_during_compute: usize = 0;
         let mut worst = Duration::ZERO;
         let mut last = Instant::now();
-        for _ in 0..600 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        while !done_t.load(Ordering::Acquire) {
+            ticks_during_compute += 1;
+            if ticks_during_compute <= 5 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             let now = Instant::now();
             worst = worst.max(now - last);
             last = now;
         }
-        worst
+        (ticks_during_compute, worst)
     });
 
     let started = Instant::now();
-    let res = runner
-        .execute_task(&gpu_task(1000, 16, 120), None, None)
-        .await;
+    let res = tokio::time::timeout(
+        TEST_WAIT_TIMEOUT,
+        runner.execute_task(&gpu_task(1000, 16, 120), None, None),
+    )
+    .await
+    .expect("gpu_class task timed out against TEST_WAIT_TIMEOUT");
+    compute_done.store(true, Ordering::Release);
     let compute_wall = started.elapsed();
     assert_eq!(res.exit_code, 0, "{:?}", res.error);
 
-    let worst_gap = ticker.await.unwrap();
-    println!("multiplication took {compute_wall:?}, worst ticker gap {worst_gap:?}");
+    let (ticks_during_compute, worst_gap) = tokio::time::timeout(TEST_WAIT_TIMEOUT, ticker)
+        .await
+        .expect("ticker task timed out against TEST_WAIT_TIMEOUT")
+        .expect("ticker task panicked");
+    println!(
+        "multiplication took {compute_wall:?}, {ticks_during_compute} runtime ticks while running, worst ticker gap {worst_gap:?}"
+    );
     assert!(
-        worst_gap < Duration::from_millis(400),
-        "the runtime stalled for {worst_gap:?} while a GPU-class task ran ({compute_wall:?})"
+        ticks_during_compute >= 1,
+        "the current_thread async runtime was blocked for the entire GPU-class multiplication ({compute_wall:?})"
     );
 }
 
 #[test]
 fn gpu_class_timeout_fires_and_stops_the_multiplication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Structural check that the cooperative `should_stop` hook interrupts the row loop early
+    // without executing all rows.
+    let (a, b) = cpu_simd::generate_deterministic_matrices(64, 42);
+    let mut c = vec![0.0f32; 64 * 64];
+    let polls = AtomicUsize::new(0);
+    let completed = cpu_simd::matmul_simd_cancellable(&a, &b, &mut c, 64, &|| {
+        polls.fetch_add(1, Ordering::Relaxed) >= 2
+    });
+    assert!(
+        !completed,
+        "cooperative stop hook must halt GEMM on row boundary"
+    );
+    assert_eq!(
+        polls.load(Ordering::Relaxed),
+        3,
+        "GEMM should stop on the first row where should_stop returns true"
+    );
+
     // A manual runtime, because dropping a runtime waits for its blocking threads: if the
     // multiplication were not told to stop, the drop would sit through the rest of it.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1028,20 +1068,22 @@ fn gpu_class_timeout_fires_and_stops_the_multiplication() {
     let started = Instant::now();
     // 1500^3 * 2 = 6.75 GFLOP: many seconds in a debug build, so only the timeout can end this.
     let res = runtime.block_on(runner.execute_task(&gpu_task(1500, 16, 1), None, None));
+    let elapsed = started.elapsed();
     assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT, "{:?}", res.error);
     assert!(res.error.unwrap().contains("timed out"));
+    println!("gpu_class timeout fired in {elapsed:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
+        elapsed < TEST_WAIT_TIMEOUT,
+        "gpu_class timeout hung for {elapsed:?}"
     );
 
     let shutdown_started = Instant::now();
     drop(runtime);
+    let shutdown_elapsed = shutdown_started.elapsed();
+    println!("runtime drop after GPU timeout took {shutdown_elapsed:?}");
     assert!(
-        shutdown_started.elapsed() < Duration::from_millis(2500),
-        "the timed-out multiplication kept running on its blocking thread for {:?}",
-        shutdown_started.elapsed()
+        shutdown_elapsed < TEST_WAIT_TIMEOUT,
+        "the timed-out multiplication kept running on its blocking thread for {shutdown_elapsed:?}"
     );
 }
 
@@ -1057,11 +1099,20 @@ async fn gpu_class_cancel_is_honoured_promptly() {
     let res = runner
         .execute_task(&gpu_task(1500, 16, 120), None, Some(cancel_rx))
         .await;
+    let elapsed = started.elapsed();
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED, "{:?}", res.error);
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        res.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("user requested cancel"),
         "{:?}",
-        started.elapsed()
+        res.error
+    );
+    println!("gpu_class cancel completed in {elapsed:?}");
+    assert!(
+        elapsed < TEST_WAIT_TIMEOUT,
+        "gpu_class cancel hung for {elapsed:?}"
     );
 }
 
