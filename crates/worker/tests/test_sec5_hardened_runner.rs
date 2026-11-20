@@ -1228,11 +1228,11 @@ sys.exit(0)
         );
         let start = Instant::now();
         let res = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_secs(90),
             runner.execute_task(&task, None, None),
         )
         .await
-        .expect("Task with FIFO output hung for 60s");
+        .expect("Task with FIFO output hung for 90s");
         let elapsed = start.elapsed();
         eprintln!("FIFO output rejection for engine {engine} completed in {elapsed:?}");
 

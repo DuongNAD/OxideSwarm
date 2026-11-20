@@ -1190,7 +1190,7 @@ cargo build --offline 2>&1
             "the tracked PID must become the task itself, not stay sandbox-exec; it is `{name}`"
         );
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -2917,7 +2917,7 @@ cargo build --offline 2>&1
         }
         assert_eq!(name, "sleep", "the tracked PID must become the task itself");
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();

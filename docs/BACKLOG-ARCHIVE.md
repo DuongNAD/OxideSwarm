@@ -3179,6 +3179,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      `TEST_WAIT_TIMEOUT` (`60 s`), logging compute wall time, ticks, and worst gap.
   2. `tests/gpu_wgpu_compute_test.rs:1021, :1029` (`gpu_class_timeout_fires_and_stops_the_multiplication`):
      added a deterministic `cpu_simd::matmul_simd_cancellable` row-stop proof (`!completed`, `polls == 3 < 64`),
+     added `runner::tests::test_spawn_simulated_gpu_job_stops_when_stop_flag_raised` in `crates/worker/src/runner/tests.rs`
+     (verifying `StopOnDrop` -> `spawn_simulated_gpu_job` returns `Err(GpuError::Interrupted(_))` while an unstopped control returns `Ok`),
      widened `execute_task` (`< 10 s`) and `drop(runtime)` (`< 2500 ms`) guards to `TEST_WAIT_TIMEOUT`
      (`60 s`), and logged elapsed times.
   3. `tests/gpu_wgpu_compute_test.rs:1049` (`gpu_class_cancel_is_honoured_promptly`):
@@ -3212,11 +3214,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
       changed `sleep 60` -> `sleep 120`, logged elapsed time, kept `>= 1 s` and timeout-message checks, and
       widened `< 5 s` to `< 60 s`.
   13. `crates/worker/tests/test_feat3_os_isolation.rs:1214, :2939` (`macos` and `linux` `test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it`):
-      widened `< 30 s` to `< 60 s` and logged elapsed times (Linux branch verified by CI `ubuntu-latest`; `mod windows` skipped per `TEST-69`).
+      widened `< 30 s` timeout checks and `20 s` cancel guards to `60 s` and logged elapsed times (Linux branch verified by CI `ubuntu-latest`; `mod windows` skipped per `TEST-69`).
   14. `crates/worker/tests/test_sec5_hardened_runner.rs:292, :1239` (`test_sec5_blender_large_stderr_does_not_block`,
       `test_sec5_fifo_or_non_regular_output_fails_for_both_engines`):
       raised Blender rig timeout `10` -> `60` and removed `< 8 s`; raised 3D FIFO task timeout `5` -> `60`,
-      wrapped `execute_task` in a `60 s` `tokio::time::timeout` hang guard, and removed `< 4 s` while keeping
+      wrapped `execute_task` in a `90 s` `tokio::time::timeout` hang guard, and removed `< 4 s` while keeping
       `"Failed to read generated .glb asset"` and `asset_bytes.is_none()` and logging elapsed times.
   15. `crates/worker/tests/scale1_simulated_worker.rs:268, :313, :343` (`hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_recover`):
       wrapped all three `ClusterStatus` `send_msg`/`recv_msg` awaits (registration, submitter-failure diagnostic,
@@ -3240,8 +3242,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - Gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
     `cargo clippy -p rusty_grid_worker --all-targets --features 3d,gpu-wgpu --locked -- -D warnings`, and
     `python3 tests/test_m1_challenger_hygiene.py`.
-  - After-loops (full touched binaries, `20/20` each under 6 busy loops):
-    - `rusty_grid_worker --lib --locked` (`312 passed`): `20/20` (`208.35 s` total, `9.63–10.80 s`)
+  - After-loops (full touched binaries, `20/20` each under 6 busy loops; review follow-up re-run `313 passed` single `--lib` plus `20/20` each on `test_spawn_simulated_gpu_job_stops_when_stop_flag_raised` [`5.07 s`], `macos::test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it` [`50.05 s`], and `test_sec5_fifo_or_non_regular_output_fails_for_both_engines` [`10.62 s`]):
+    - `rusty_grid_worker --lib --locked` (`312 passed` pre-review; `313 passed` post-review): `20/20` (`208.35 s` total, `9.63–10.80 s`)
     - `rusty_grid_worker --lib --features gpu-wgpu --locked -- wgpu_engine::tests::waiting_for_the_gpu_stops_on_cancel_and_on_deadline` (`1 passed`): `20/20` (`132.23 s` total, `5.89–11.71 s`)
     - `gpu_wgpu_compute_test --locked` (`14 passed`; single `--features gpu-wgpu` run `19 passed` in `6.90 s`): `20/20` (`73.06 s` total, `3.17–9.46 s`)
     - `m3_challenger_1_stress --locked` (`16 passed`): `20/20` (`81.48 s` total, `3.64–10.37 s`)

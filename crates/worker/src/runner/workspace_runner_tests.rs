@@ -266,7 +266,7 @@ async fn test_workspace_task_error_cases_and_over_limit_warning() {
     );
 
     // 5. Cancellation while waiting on a busy workspace lock finishes promptly instead of
-    //    blocking for the full `workspace_lock_wait` (5s).
+    //    blocking for the full `workspace_lock_wait` (90s).
     let store = runner
         .ensure_workspace_store()
         .await
