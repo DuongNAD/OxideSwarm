@@ -2690,6 +2690,168 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-66: worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `test_unanswered_handshake_times_out_with_a_secret`
+  (`tests/worker_cluster_auth.rs:382:5`) failed `1/5` runs at `assertion failed: started.elapsed() < Duration::from_secs(3)`.
+- **Problem:** `tests/worker_cluster_auth.rs` checked wall-clock upper bounds (`< 3 s` around a `300 ms`
+  handshake timeout in `test_unanswered_handshake_times_out_with_a_secret`, `< 2 s` in
+  `test_shutdown_interrupts_a_handshake_with_a_silent_master` after a fixed `400 ms` sleep, and `< 2 s` /
+  `5 s` in `test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interrupts_it` alongside a
+  `10 s` `RunningWorker::stop` bound), which trip on a CPU-starved host.
+- **Do:** Raise `RunningWorker::stop` to `TEST_WAIT_TIMEOUT` (`60 s`), wait by condition for the initial
+  auth attempt / silent-master TCP accept (`tokio::sync::Notify`) up to `60 s`, bound the `300 ms`
+  unanswered-handshake test by `tokio::time::timeout(TEST_WAIT_TIMEOUT, ...)` without `< 3 s` or `< 2 s`
+  wall-clock assertions, and assert `shutdown` ends the `30 s`-floored auth backoff within `25 s` with
+  `attempts == 1`.
+- **Done when:** All outcome assertions stay intact and `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 387, open):** Updated `tests/worker_cluster_auth.rs` as planned. On
+  a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`:
+  - Before fix (on `origin/master` `fc694126`): `20/20` passed (`188.76 s` total, `8.11–10.36 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`198.06 s` total, `8.54–11.57 s` per run).
+  Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `worker_cluster_auth`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-62: blob_transfer_e2e: print CLI submit output on failure and harden loaded timeouts
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  (`tests/blob_transfer_e2e.rs:1073:9`) failed `1/5` runs at `assertion left == right failed: left: Some(1), right: Some(7)`
+  when the `submit --wait --timeout-secs 30` subcheck for `exit 7` exited `1`, without printing stdout/stderr.
+- **Problem:** Inside `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, synchronous
+  `std::process::Command::output()` and `std::thread::sleep` calls blocked Tokio runtime threads hosting
+  the in-process `WorkerClient`, while `rusty-grid master` kept its `10 s` default `--heartbeat-timeout-secs`,
+  `port_file`/registration polls used `20 s`, `submit` used `30–60 s`, and failing CLI assertions suppressed
+  stdout, stderr, and `master.log`.
+- **Do:** Run `rusty-grid` CLI subprocesses via `tokio::task::spawn_blocking`, replace synchronous polling
+  with `60 s` async loops, pass `--heartbeat-timeout-secs 60` to `rusty-grid master`, raise `submit`
+  `--timeout-secs` to `120`, include stdout, stderr, and `master.log` in all CLI submit failure messages,
+  and shut down the in-process worker cleanly (`stop_worker` + `60 s` join timeout).
+- **Done when:** All assertions stay intact, failure messages include full CLI and master diagnostics, and
+  `cargo test -p rusty_grid_cli --test blob_transfer_e2e --locked -- --exact cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  passes `20/20` under `6` busy loops after the fix (plus a full-binary run).
+- **Implemented (2026-11-19, pull request 390, open):** Updated `tests/blob_transfer_e2e.rs` as planned. On a
+  10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`:
+  - Before fix (on `origin/master` `8641b67d`, with diagnostic capture added): test alone passed `20/20`
+    (`98.11 s` total, `3.61–6.98 s` per run; full binary `1/1` loaded probe `30.08 s`; reproduced `1/5`
+    in full workspace Run 5).
+  - After fix (test alone): `20/20` passed (`98.23 s` total, `3.88–6.83 s` per run).
+  Full `blob_transfer_e2e`, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+  and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-64: worker lib process_tree_tests: wait for partial stdout by condition before cancelling
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`),
+  `runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation`
+  (`crates/worker/src/runner/process_tree_tests.rs:313:5`) failed `1/5` runs with empty stdout (`""`) on
+  the cancellation subtest.
+- **Problem:** The cancellation subtest slept a fixed `600 ms` (`tokio::time::sleep(Duration::from_millis(600))`)
+  after `tokio::spawn(execute_task(...))` and immediately sent `cancel_tx`; under CPU contention `sh` had
+  not yet flushed `echo partial-out` before being cancelled. The preceding timeout subtest also used a
+  tight `1 s` task timeout.
+- **Do:** Raise the timeout subtest to `timeout_secs = 3`; in the cancellation subtest, write a temporary
+  marker file immediately after `echo partial-out`, poll every `20 ms` up to a `60 s` deadline (panicking
+  early if the task future exits beforehand) before sending cancellation, bound awaiting `run` with `60 s`,
+  and print `exit_code`/`error`/`stdout`/`stderr` on failure.
+- **Done when:** All assertions remain intact and
+  `cargo test -p rusty_grid_worker --lib --locked -- --exact runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 388, open):** Updated `crates/worker/src/runner/process_tree_tests.rs`.
+  On a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation` (`--locked`):
+  - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`62.54 s` total, `2.04–4.11 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`86.09 s` total, `3.45–5.45 s` per run).
+  All `runner::process_tree_tests` unit tests, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+  and `python3 tests/test_m1_challenger_hygiene.py` passed.
+
+### TEST-65: test_sec5_hardened_runner: condition waits for short-task pipe EOF and setsid survivor kill
+
+- **Evidence:** Two failures on `test_sec5_hardened_runner`:
+  - On 10-core Apple Silicon macOS (loaded workspace Run 5 at `origin/master` `fc694126`),
+    `test_feat2_short_task_finishes_under_one_second_without_pipe_note`
+    (`crates/worker/tests/test_sec5_hardened_runner.rs:1772:5`) failed `1/5` runs at
+    `elapsed < Duration::from_secs(1)` (`took 2.179053666s`).
+  - On `ubuntu-latest` (CI run `44525741499`, PR #383 docs-only, job `135565717998`),
+    `test_feat2_normal_task_completion_kills_setsid_survivor_within_one_second` panicked at
+    `crates/worker/tests/common/mod.rs:261:5` (`Orphaned descendant processes survived termination: [2532]`)
+    after `assert_all_dead_async(&pids, Duration::from_secs(1))`.
+- **Problem:** `test_feat2_short_task_finishes_under_one_second_without_pipe_note` checked `elapsed < 1 s`
+  instead of relying on the product invariant (`execute_process_supervised` drains stdout/stderr up to
+  `pipe_drain_grace` *before* `tree.kill_async` dismisses the lifeline supervisor, so pipe EOF arriving
+  without `"kept the output pipes open"` proves the supervisor closed inherited pipe descriptors).
+  Meanwhile, `test_feat2_normal_task_completion_kills_setsid_survivor_within_one_second` and its immediate
+  siblings used `1–2 s` / `15 s` timeouts on PID polling, process termination, and supervisor exit; `is_pid_alive`
+  only skipped `ProcessStatus::Zombie` (not `Dead`); and Linux `kill_cgroup_leaf` / `kill_escaped_by_env`
+  did not retry `open`/`read`/`SYS_getdents64` on `EINTR` if `SIGCHLD` arrived mid-sweep.
+- **Do:** Keep the legacy test names, configure `pipe_drain_grace = 10 s` and remove `< 1 s` in
+  `test_feat2_short_task_finishes_under_one_second_without_pipe_note`, raise the condition-wait deadlines to
+  `FEAT2_WAIT_TIMEOUT = 60 s` (logging elapsed kill/exit times) in the `setsid` survivor, concurrent-attempt,
+  and supervisor-exit tests, treat `ProcessStatus::Dead` as dead alongside `Zombie` with survivor `(pid, status, name)`
+  diagnostics in `crates/worker/tests/common/mod.rs`, and retry `EINTR` in Linux `kill_cgroup_leaf` and
+  `kill_escaped_by_env` (`crates/worker/src/process_tree.rs`).
+- **Done when:** All outcome invariants stay intact and `cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked`
+  passes `20/20` under `6` busy loops on macOS, with Linux verified by CI (`sec5 hardened runner (ubuntu-latest)`
+  and `workspace tests (ubuntu-latest)`).
+- **Implemented (2026-11-19, pull request 388, open):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`,
+  `crates/worker/tests/common/mod.rs`, and `crates/worker/src/process_tree.rs`. On 10-core Apple Silicon macOS
+  under `6` Python busy loops, private `HOME`, running `cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked`:
+  - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`84.62 s` total, `3.03–6.03 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`76.26 s` total, `3.02–4.08 s` per run).
+  Linux (`ubuntu-latest`) is covered by CI (`sec5 hardened runner (ubuntu-latest)` and `workspace tests (ubuntu-latest)`);
+  Docker is not installed on this Mac. Workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+  and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-67: Campaign driver tests flake on Windows log appends and macOS 0.2 s submit timeout
+
+- **Evidence:** `tests/test_campaign_driver.py` failed intermittently in the `agent bridge` CI job on
+  `master` commit `4888dd5` and pull requests 385, 388, 389, 391, and 393 across Windows and macOS
+  runners:
+  - Windows (`agent bridge (windows-latest)`, PR 393 run `44567880864`): `test_verified_run_and_privacy_scrubbing`
+    line 668 failed `AssertionError: 2 != 3` on `len(submit_calls)` while `record["summary"]["verified"] == 3`
+    already proved `benchmarks/campaigns/driver.py` completed all three units.
+  - macOS (`agent bridge (macos-latest)`, PR 393 run `44567880864`): `test_timeout_records_failed_and_cancels_task`
+    line 843 failed `KeyError: 'cancelled_on_master'`.
+- **Problem:** Both causes live in `tests/test_campaign_driver.py` (`benchmarks/campaigns/driver.py` is
+  right):
+  1. `FAKE_CLI_SOURCE` appended JSON lines to a single shared file with `open("a")` across
+     `--concurrency 2` subprocesses, which is not atomic on Windows and dropped one line cleanly while
+     `driver.py` saw all three verified completions.
+  2. `test_timeout_records_failed_and_cancels_task` passed `--submit-timeout-secs 0.2`, letting
+     `proc.communicate(timeout=0.2)` `SIGKILL` the fake Python process on loaded CI runners before
+     Python started and flushed `timeout_json` (`u001`) or `task_id=` (`u002`); without a task id in
+     stdout or stderr, `execute_submit_attempt` (`benchmarks/campaigns/driver.py:1299`) legitimately
+     left `cancelled_on_master` unset.
+- **Do:** Replace `FAKE_OXIDESWARM_LOG` append logging with `FAKE_OXIDESWARM_LOG_DIR`, writing each
+  invocation atomically via temp file + `os.replace` to `<ts_ns>-<pid>-<uuid4>.json` (and using
+  atomic writes for `.workers_calls`, `.count.<seed>`, and marker files) plus a shared chronological
+  reader `read_fake_cli_logs`; raise `--submit-timeout-secs` in
+  `test_timeout_records_failed_and_cancels_task` from `0.2` to `5`, flush `timeout_json` stdout, keep
+  `u002`'s `sleep_secs` at `30.0` (six times the `5 s` watchdog) rather than `600.0` because
+  `driver.py`'s Windows `proc.kill()` ends only the `.cmd` wrapper (`oxideswarm.cmd`) and does not
+  reach its child processes (leaving stdout/stderr pipes open until sleep ends; fine for the pilot,
+  which runs `oxideswarm.exe` directly), raise `wait_for_file`, `proc.communicate`, and interrupt
+  `sleep_secs` in `test_interrupt_records_interrupted_cancels_and_resumes` to `60.0 s` / `600.0 s`,
+  and attach full attempt records to the assertions without asserting elapsed time.
+- **Done when:** All 13 tests in `tests/test_campaign_driver.py` keep full behaviour and cancellation
+  assertions without sub-second startup windows or shared append races, and pass `20/20` under 6 CPU
+  busy loops.
+- **Implemented (2026-11-19, pull request 394, open):** Updated `tests/test_campaign_driver.py` (`driver.py`
+  unchanged) and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `b0786ed8`): `20/20` passed (`74.61 s` total, `3.64–3.84 s` per run;
+    Apple M5 starts Python under `0.2 s` while slower CI runners hit the startup race and Windows
+    non-atomic append race).
+  - After fix: `python3 tests/test_campaign_driver.py -v` passed `13/13` in `8.054 s`, and the 20-run
+    loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
+    failures).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
