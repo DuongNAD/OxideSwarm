@@ -3439,41 +3439,50 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     runs.)
   - `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs` (`cli::test_mcp_concurrent_and_deadlines`, `3`
     hits, `:470`, `:1146`, `:1407` + coupled `:466`, `:1114`, `:1153`, `:1397`): widened `recv_timeout`
-    (`4 s -> 60 s`), `exit_deadline` (`2 s -> 60 s`), and all three upper guards (`< 3 s`, `< 4 s`,
-    `< 1400 ms` -> `< 60 s`) across `test_mcp1_cancel_tool_cancelled_notification_and_progress_tokens`,
+    (`4 s -> 60 s` on cancel/EOF/discovery, `30 s` on `task_result`), `exit_deadline` (`2 s -> 60 s`),
+    and the upper guards (`< 30 s` on `task_result` to stay unambiguously below the `60 s` default,
+    `< 60 s` on the silent-master and cached-discovery checks) across
+    `test_mcp1_cancel_tool_cancelled_notification_and_progress_tokens`,
     `test_mcp1_silent_master_bounded_by_wait_secs_and_exits_on_eof`, and
     `test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_secs`, added `>= 900 ms` lower
     bounds around both `wait_secs: 1` waits, preserved `rv_hits == 1`, and logged elapsed.
   - `crates/cli/tests/test_p2p_key_persistence.rs` (`cli::test_p2p_key_persistence`, `1` hit, `:608` +
     coupled `:603`, `:692`): in `test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s`, widened
     `wait_for_non_empty_file`, ticket upper bound, and `w_deadline` from `3 s -> 60 s`, logged ticket
-    elapsed, and replaced the dead `"RustyGrid Worker started"` stdout wait with `saw_warn` (stderr
+    elapsed, replaced the dead `"RustyGrid Worker started"` stdout wait with `saw_warn` (stderr
     `"P2P minimal preset is enabled (p2p_minimal_preset=true)"`) + `saw_dialing` (stdout
-    `"iroh::_events::conn::connecting"`), asserting `saw_dialing`.
+    `"iroh::_events::conn::connecting"`), held the worker alive `2 s` after dialing starts before teardown
+    so any stray relay/lookup traffic remains observable, and asserted `saw_dialing`.
   - `tests/m5a_challenger_2_stress.rs` (`android_bridge::m5a_challenger_2_stress`, `2` hits,
     `:422`, `:507` + coupled `:300`, `:335`, `:366`, `:428`): in
-    `test_pre_sleep_fast_evacuation_under_multi_task_load`, configured `ReaperConfig(1 s, 120 s)` and
-    `TaskRequirements::generic(1, 120)`, widened polling/completion waits and `EVACUATION_GUARD` (`1–8 s ->
-    60 s`), asserted `final_info.evacuation_count == 1` alongside `retry_count == 0` / `failover_count == 0`
-    proving uncharged evacuation, widened `cancel_all_active_tasks` (`< 15 ms -> < 60 s`), and logged
-    elapsed.
+    `test_pre_sleep_fast_evacuation_under_multi_task_load`, replaced the `1.8 s` `BuiltinTest` batch with
+    `release.gate` (`ReleaseOnDrop` + cross-platform shell/`python3` waiter) tasks written only after
+    `w1`'s tasks evacuate, configured `ReaperConfig(1 s, 120 s)` and `TaskRequirements::generic(1, 120)`,
+    widened polling/completion waits and `EVACUATION_GUARD` (`1–8 s -> 60 s`), asserted
+    `final_info.evacuation_count == 1` alongside `retry_count == 0` / `failover_count == 0` proving
+    uncharged evacuation, widened `cancel_all_active_tasks` (`< 15 ms -> < 60 s`), and logged elapsed.
   - `tests/mcp_server_e2e.rs` (`cli::mcp_server_e2e`, `1` hit, `:1886`): in
     `test_mcp_and_cli_workspace_sync_dir_refusals_and_wait_warning`, widened `< 10 s -> < 60 s` and logged
     elapsed while keeping `Timed out after 1s waiting for task`.
   - `tests/mobile_coordination_test.rs` (`android_bridge::mobile_coordination_test`, `2` hits,
-    `:701`, `:789` + coupled `:620`, `:650`, `:676`, `:711`, `:742`, `:764`, `:794`): in
-    `test_fast_evacuation_under_50ms_without_task_loss`, configured `ReaperConfig(1 s, 120 s)` and
-    `TaskRequirements::generic(1, 120)`, widened waits and both `< 100 ms` evacuation guards (`100 ms / 5–6 s
-    -> 60 s`), asserted `after_first.evacuation_count == 1` alongside `final_info.evacuation_count == 2` and
-    `retry_count == 0` / `failover_count == 0`, accepted `Scheduled | Running | Completed` on `w3`, and
-    logged elapsed.
+    `:701`, `:789` + coupled `:620`, `:650`, `:676`, `:711`, `:742`, `:764`, `:794`): renamed
+    `test_fast_evacuation_under_50ms_without_task_loss` to `test_fast_evacuation_without_task_loss`
+    (updated `design/0036-bounded-uncharged-worker-evacuations.md`), replaced the `2.5 s` `BuiltinTest`
+    with a `release.gate` (`ReleaseOnDrop`) task written only after both evacuations complete (`w3`
+    assigned in `Scheduled | Running` and `evacuation_count == 2`), configured `ReaperConfig(1 s, 120 s)`
+    and `TaskRequirements::generic(1, 120)`, widened waits and both `< 100 ms` evacuation guards
+    (`100 ms / 5–6 s -> 60 s`), asserted `after_first.evacuation_count == 1` and
+    `after_second.evacuation_count == 2` with `retry_count == 0` / `failover_count == 0`, and logged
+    elapsed.
   - `tests/test_agent_bridge.py` (`python::test_agent_bridge`, `1` hit, `:301`): in
     `ClaudeCodeHook.test_second_hook_exits_while_first_waits`, used `--max-wait 120` for `first` / second
     hook (`--max-wait 30` for `other`), replaced fixed `time.sleep(2.5)` / `time.sleep(2)` sleeps with
     `60 s` `watch_*.lock` condition waits, asserted `first.poll() is None` after the second hook exits `0`
     (`timeout=60`), widened `< 5 s -> < 60 s`, and printed `elapsed`.
   - `tests/test_m2_identity_scripts.rs` (`cli::test_m2_identity_scripts`, `1` hit, `:291` + coupled
-    `:210`, `:236`, `:269`): in `test_worker_auto_reconnect_under_3_seconds`, widened `init_deadline`,
+    `:210`, `:236`, `:269`): renamed `test_worker_auto_reconnect_under_3_seconds` to
+    `test_worker_auto_reconnect_preserves_identity` (updated
+    `design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md`), widened `init_deadline`,
     `close_deadline`, `max_allowed`, and `< 3 s -> < 60 s`, logged elapsed, and preserved `worker_id`
     reconnect verification.
   - `tests/test_sec6_mesh_sandbox.py` (`python::test_sec6_mesh_sandbox`, `1` hit, `:401`): in `run_sec6_tests`
@@ -3489,13 +3498,13 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `agent_mesh --lib`: single `45/45` (`3.67 s`), after `20/20` (`total=53.26s`, `min=1.96s`, `max=4.70s`)
     - `agent_mesh::adversarial_challenge`: single `4/4` (`1.55 s`), after `20/20` (`total=38.18s`, `min=1.79s`, `max=3.60s`)
     - `rusty_grid_android_bridge --lib`: single `17/17` (`3.40 s`), after `20/20` (`total=91.60s`, `min=4.08s`, `max=8.41s`)
-    - `android_bridge::m5a_challenger_2_stress`: single `2/2` (`3.24 s`), after `20/20` (`total=86.35s`, `min=4.01s`, `max=8.48s`)
-    - `android_bridge::mobile_coordination_test`: single `9/9` (`50.47 s`), after `20/20` (`total=1046.20s`, `min=51.39s`, `max=55.58s`)
+    - `android_bridge::m5a_challenger_2_stress`: single `2/2` (`3.24 s`), post-review after `20/20` (`total=62.05s`, `min=2.50s`, `max=6.07s`; initial `86.35 s`)
+    - `android_bridge::mobile_coordination_test`: single `9/9` (`50.47 s`), post-review after `20/20` (`total=1045.91s`, `min=51.26s`, `max=57.83s`; initial `1046.20 s`)
     - `cli::mcp_server_e2e`: single `9/9` (`3.24 s`), after `20/20` (`total=75.44s`, `min=3.52s`, `max=7.37s`)
     - `cli::test_cli_cancel_and_result`: single `2/2` (`1.91 s`), after `20/20` (`total=59.86s`, `min=2.47s`, `max=9.73s`)
-    - `cli::test_m2_identity_scripts`: single `5/5` (`0.60 s`), after `20/20` (`total=27.88s`, `min=0.99s`, `max=8.13s`)
-    - `cli::test_mcp_concurrent_and_deadlines`: single `9/9` (`7.00 s`), after `20/20` (`total=160.24s`, `min=7.58s`, `max=14.93s`)
-    - `cli::test_p2p_key_persistence`: single `6/6` (1 ignored, `1.30 s`), after `20/20` (`total=43.21s`, `min=1.77s`, `max=8.05s`)
+    - `cli::test_m2_identity_scripts`: single `5/5` (`0.60 s`), post-review after `20/20` (`total=32.13s`, `min=1.17s`, `max=7.38s`; initial `27.88 s`)
+    - `cli::test_mcp_concurrent_and_deadlines`: single `9/9` (`7.00 s`), post-review after `20/20` (`total=160.00s`, `min=7.70s`, `max=11.77s`; initial `160.24 s`)
+    - `cli::test_p2p_key_persistence`: single `6/6` (1 ignored, `1.30 s`), post-review after `20/20` (`total=84.91s`, `min=3.91s`, `max=8.48s`; initial `43.21 s`)
     - `python::test_agent_bridge`: single `72/72` (`48.84 s`, second hook `0.049 s`), after `20/20` (`total=1121.88s`, `min=54.43s`, `max=56.86s`)
     - `python::test_sec6_mesh_sandbox`: single passed, after `20/20` (`total=192.31s`, `min=9.51s`, `max=9.67s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.

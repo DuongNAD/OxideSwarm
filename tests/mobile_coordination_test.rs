@@ -561,7 +561,41 @@ fn test_master_lease_ticket_lifecycle_and_role_handover() {
 /// - Task completes on the final surviving worker with exit code 0, `retry_count == 0`,
 ///   and `failover_count == 0`.
 #[tokio::test]
-async fn test_fast_evacuation_under_50ms_without_task_loss() {
+async fn test_fast_evacuation_without_task_loss() {
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"go");
+        }
+    }
+
+    fn release_gated_task(release_path: &std::path::Path) -> TaskSpec {
+        let path_str = release_path.to_string_lossy().into_owned();
+        #[cfg(not(windows))]
+        {
+            TaskSpec::command(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "i=0; while [ ! -f \"$1\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.02; i=$((i+1)); done".into(),
+                    "_".into(),
+                    path_str,
+                ],
+            )
+        }
+        #[cfg(windows)]
+        {
+            TaskSpec::command(
+                "python3",
+                vec![
+                    "-c".into(),
+                    "import os, sys, time\nfor _ in range(6000):\n    if os.path.exists(sys.argv[1]): break\n    time.sleep(0.02)\n".into(),
+                    path_str,
+                ],
+            )
+        }
+    }
+
     // Also test JNI bridge fast evacuation API directly
     assert!(trigger_fast_evacuation_impl("FAST_PRE_SLEEP_BATTERY_LOW"));
     assert_eq!(
@@ -571,6 +605,8 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let sandbox_path = temp_dir.path().to_path_buf();
+    let release_file = sandbox_path.join("release.gate");
+    let _release_guard = ReleaseOnDrop(release_file.clone());
 
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_max_retries(1)
@@ -632,15 +668,9 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Both workers must be registered"
     );
 
-    // Submit long-running BuiltinTest task (2500ms duration) with max_retries = 1
+    // Submit release-gated task (max_retries = 1) so slow registration/shutdown cannot finish it prematurely
     let task = Task::new(
-        TaskSpec::BuiltinTest {
-            test_name: "evacuation_resilience".into(),
-            iterations: 100,
-            duration_ms: 2500,
-            should_fail: false,
-            require_gpu: false,
-        },
+        release_gated_task(&release_file),
         TaskRequirements::generic(1, 120).with_max_retries(1),
     );
     let task_id = master.submit_task(task).await.expect("task submit");
@@ -726,7 +756,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Task must enter Running state on second worker before second evacuation"
     );
 
-    let (_w3_shutdown_tx, w3_shutdown_rx) = watch::channel(false);
+    let (w3_shutdown_tx, w3_shutdown_rx) = watch::channel(false);
     let w3_id = Uuid::new_v4();
     let config3 = WorkerConfig::new(&master_addr)
         .with_no_battery(true)
@@ -767,10 +797,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         || async {
             if let Ok(info) = master.get_task_info(task_id).await {
                 info.assigned_worker_id == Some(w3_id)
-                    && matches!(
-                        info.state,
-                        TaskState::Scheduled | TaskState::Running | TaskState::Completed
-                    )
+                    && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
             } else {
                 false
             }
@@ -789,6 +816,13 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Second evacuation hung past 60s guard: {:?}",
         second_evac_elapsed
     );
+    let after_second = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(after_second.evacuation_count, 2);
+    assert_eq!(after_second.retry_count, 0);
+    assert_eq!(after_second.failover_count, 0);
+
+    // Release the gate now that both uncharged evacuations have been observed
+    std::fs::write(&release_file, b"go").expect("write release.gate");
 
     // Wait for task to complete successfully on w3
     let completed = wait_for(
@@ -816,6 +850,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     assert_eq!(final_info.evacuation_count, 2);
     assert_eq!(final_info.assigned_worker_id, Some(w3_id));
 
+    let _ = w3_shutdown_tx.send(true);
     let _ = master.shutdown();
 }
 

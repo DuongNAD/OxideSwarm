@@ -228,8 +228,44 @@ fn test_master_lease_ticket_cryptographic_tamper_detection_exhaustive() {
 
 #[tokio::test]
 async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"go");
+        }
+    }
+
+    fn release_gated_task(release_path: &std::path::Path) -> TaskSpec {
+        let path_str = release_path.to_string_lossy().into_owned();
+        #[cfg(not(windows))]
+        {
+            TaskSpec::command(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "i=0; while [ ! -f \"$1\" ] && [ \"$i\" -lt 6000 ]; do sleep 0.02; i=$((i+1)); done".into(),
+                    "_".into(),
+                    path_str,
+                ],
+            )
+        }
+        #[cfg(windows)]
+        {
+            TaskSpec::command(
+                "python3",
+                vec![
+                    "-c".into(),
+                    "import os, sys, time\nfor _ in range(6000):\n    if os.path.exists(sys.argv[1]): break\n    time.sleep(0.02)\n".into(),
+                    path_str,
+                ],
+            )
+        }
+    }
+
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let sandbox_path = temp_dir.path().to_path_buf();
+    let release_file = sandbox_path.join("release.gate");
+    let _release_guard = ReleaseOnDrop(release_file.clone());
 
     // 1. Direct JNI fast evacuation hook test
     assert!(trigger_fast_evacuation_impl(
@@ -312,18 +348,12 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
         "All 3 workers must register successfully"
     );
 
-    // 4. Submit MULTIPLE concurrent tasks (batch of 6 tasks) under active load
+    // 4. Submit MULTIPLE concurrent release-gated tasks (batch of 6) so w1's tasks stay active until evacuated
     const BATCH_SIZE: usize = 6;
     let mut task_ids = Vec::with_capacity(BATCH_SIZE);
-    for i in 0..BATCH_SIZE {
+    for _ in 0..BATCH_SIZE {
         let task = Task::new(
-            TaskSpec::BuiltinTest {
-                test_name: format!("load_task_{i}"),
-                iterations: 50,
-                duration_ms: 1800,
-                should_fail: false,
-                require_gpu: false,
-            },
+            release_gated_task(&release_file),
             TaskRequirements::generic(1, 120),
         );
         let tid = master.submit_task(task).await.expect("task submit");
@@ -424,7 +454,9 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
         EVACUATION_GUARD
     );
 
-    // 7. Verify all tasks complete successfully with ZERO task loss
+    // 7. Release the gate now that w1's tasks have evacuated, then verify all 6 complete on survivors
+    std::fs::write(&release_file, b"go").expect("write release.gate");
+
     let all_completed = wait_for(
         Duration::from_secs(60),
         Duration::from_millis(50),

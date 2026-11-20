@@ -464,13 +464,13 @@ async fn test_mcp1_cancel_tool_cancelled_notification_and_progress_tokens() {
             }
         }
     }));
-    let tr_resp = mcp.recv_timeout(Duration::from_secs(60));
+    let tr_resp = mcp.recv_timeout(Duration::from_secs(30));
     let tr_elapsed = tr_start.elapsed();
     println!("task_result wait_secs: 1 finished in {tr_elapsed:?}");
     assert_eq!(tr_resp["id"], 50);
     assert!(
-        tr_elapsed >= Duration::from_millis(900) && tr_elapsed < Duration::from_secs(60),
-        "task_result wait_secs: 1 must honor 1s wait without hanging (took {:?})",
+        tr_elapsed >= Duration::from_millis(900) && tr_elapsed < Duration::from_secs(30),
+        "task_result wait_secs: 1 must honor 1s wait below the 60s default (took {:?})",
         tr_elapsed
     );
     let tr_body: Value = serde_json::from_str(

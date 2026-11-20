@@ -154,7 +154,7 @@ async fn test_0_config_master_secret_key_persistence() {
 /// reconnects and re-registers in < 3.0 seconds without manual intervention (with default worker
 /// settings, reconnect passed 9/10 under load up to 3.02 s).
 #[tokio::test]
-async fn test_worker_auto_reconnect_under_3_seconds() {
+async fn test_worker_auto_reconnect_preserves_identity() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let key_file = temp_dir.path().join("fast_reconnect_master.key");
     let ticket_file = temp_dir.path().join("fast_reconnect_master.ticket");

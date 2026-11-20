@@ -694,6 +694,14 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    if saw_warn.load(std::sync::atomic::Ordering::SeqCst)
+        && saw_dialing.load(std::sync::atomic::Ordering::SeqCst)
+        && !w_stdout_reader.is_finished()
+    {
+        // Keep the worker alive briefly after dialing starts so any stray relay or address-lookup
+        // traffic would appear in its logs before teardown.
+        std::thread::sleep(Duration::from_secs(2));
+    }
     let _ = w_child.kill();
     let _ = w_child.wait();
     let w_stdout = w_stdout_reader.join().expect("join worker stdout reader");
