@@ -21,6 +21,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn builtin_task(should_fail: bool, timeout_secs: u64) -> Task {
     Task::new(
         TaskSpec::BuiltinTest {
@@ -57,7 +59,7 @@ async fn fake_runner_handles_delay_callbacks_cancellation_timeout_and_zero_disk_
     let runner = TaskRunner::new(Uuid::new_v4(), caps, runner_cfg);
 
     // 1. Normal delayed run triggers on_task_started and avoids creating any sandbox directory.
-    let task_ok = builtin_task(false, 30);
+    let task_ok = builtin_task(false, 60);
     let t0 = Instant::now();
     let res_ok = runner
         .execute_task_with_checkpoint(&task_ok, None, None, None, None)
@@ -76,8 +78,8 @@ async fn fake_runner_handles_delay_callbacks_cancellation_timeout_and_zero_disk_
     );
 
     // 2. Dynamic delay update + immediate cancellation returns EXIT_CODE_CANCELLED.
-    shared_delay_nanos.store(Duration::from_secs(5).as_nanos() as u64, Ordering::Relaxed);
-    let task_cancel = builtin_task(false, 30);
+    shared_delay_nanos.store(Duration::from_secs(60).as_nanos() as u64, Ordering::Relaxed);
+    let task_cancel = builtin_task(false, 120);
     let (cancel_tx, cancel_rx) = oneshot::channel::<String>();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -194,7 +196,7 @@ async fn simulated_link_applies_latency_fifo_jitter_and_impairments() {
         net_ctrl.disconnect_all();
     });
     let mut read_buf = [0u8; 16];
-    let read_res = tokio::time::timeout(Duration::from_secs(2), wrapped_idle.read(&mut read_buf))
+    let read_res = tokio::time::timeout(TEST_WAIT_TIMEOUT, wrapped_idle.read(&mut read_buf))
         .await
         .expect("disconnect_all did not wake reader promptly");
     assert_eq!(read_res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
@@ -250,7 +252,7 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
 
     // 1. Wait for all 100 workers to register cleanly.
-    let reg_deadline = Instant::now() + Duration::from_secs(20);
+    let reg_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     let mut query = MessageTransport::new(
         TcpStream::connect(master_addr)
             .await
@@ -286,13 +288,13 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
             let mut transport =
                 MessageTransport::new(TcpStream::connect(addr).await.expect("connect submitter"));
             for t_idx in 0..TASKS_PER_SUBMITTER {
-                let task = builtin_task(false, 30);
+                let task = builtin_task(false, 60);
                 transport
                     .send_msg(&ClientMessage::SubmitTask { task, wait: true })
                     .await
                     .expect("submit");
                 match tokio::time::timeout(
-                    Duration::from_secs(5),
+                    TEST_WAIT_TIMEOUT,
                     transport.recv_msg::<ClientResponse>(),
                 )
                 .await
@@ -328,7 +330,7 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     let reconnected = Arc::new(AtomicBool::new(false));
     net.disconnect_all();
 
-    let recon_deadline = Instant::now() + Duration::from_secs(20);
+    let recon_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     loop {
         if net.total_handshakes() >= hs_before + WORKERS as u64
             && net.active_sessions() == WORKERS as u64
@@ -365,13 +367,13 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
             let mut transport =
                 MessageTransport::new(TcpStream::connect(addr).await.expect("connect post"));
             for _ in 0..10 {
-                let task = builtin_task(false, 30);
+                let task = builtin_task(false, 60);
                 transport
                     .send_msg(&ClientMessage::SubmitTask { task, wait: true })
                     .await
                     .expect("submit post");
                 match tokio::time::timeout(
-                    Duration::from_secs(15),
+                    TEST_WAIT_TIMEOUT,
                     transport.recv_msg::<ClientResponse>(),
                 )
                 .await
@@ -392,8 +394,9 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
 
     let _ = worker_shutdown_tx.send(true);
+    let drain_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     for h in worker_handles {
-        tokio::time::timeout(Duration::from_secs(15), h)
+        tokio::time::timeout_at(drain_deadline, h)
             .await
             .expect("worker shutdown timeout")
             .expect("worker task join")

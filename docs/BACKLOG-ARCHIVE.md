@@ -2879,6 +2879,34 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-79: scale1_simulated_worker: widen 5-20 s burst, reconnect, and drain deadlines to 60 s
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Item 11 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_recover` failed at
+  `crates/worker/tests/scale1_simulated_worker.rs:303` on task 41 of 200 across 4 submitters and
+  100 simulated workers: `submitter ... task 41 failed/timed out` hitting the `5 s` per-task response
+  timeout at `:295`.
+- **Problem:** `crates/worker/tests/scale1_simulated_worker.rs` used tight deadlines (`5 s` per-task
+  response timeout at `:295` during the 200-task 100-worker burst, `20 s` registration and
+  reconnection deadlines at `:253` and `:331`, `15 s` post-reconnect response and worker-shutdown
+  timeouts at `:374` and `:396`, `2 s` idle disconnect read timeout at `:197`, and `30 s` / `5 s`
+  non-timeout fake-runner bounds at `:60`, `:79`, `:80`, `:289`, `:368`).
+- **Do:** Add `TEST_WAIT_TIMEOUT = 60 s`; raise the registration, burst per-task, reconnection,
+  post-reconnect per-task, `wrapped_idle.read`, and shared `tokio::time::timeout_at` worker-shutdown
+  drain deadlines to `TEST_WAIT_TIMEOUT`; raise non-timeout `builtin_task(..., 60)` bounds and the
+  cancellation target delay (`60 s` / `builtin_task(false, 120)`); and keep every behaviour assertion
+  and the `1 s` `EXIT_CODE_TIMEOUT` check intact.
+- **Done when:** All 3 tests keep every latency/FIFO/impairment, fake-runner cancellation/timeout,
+  100-worker registration, 200-task burst, mass-disconnect convergence, and 50-task post-reconnect
+  assertion, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 401, open):** Updated `crates/worker/tests/scale1_simulated_worker.rs`
+  and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures
+  before the fix is expected since the `5 s` flake occurred on a 12-thread Windows laptop):
+  - Before fix (`origin/master` `d321d97f`): `20/20` passed (`37.29 s` total, `1.72–3.59 s` per run).
+  - After fix: `3/3` passed in `1.64 s`, and the 20-run loaded loop passed `20/20` (`35.51 s` total,
+    `1.70–1.85 s` per run, `0` failures).
+
 ### TEST-78: rendezvous_discovery_e2e: widen 10-30 s command and registration deadlines to 60 s
 
 - **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
