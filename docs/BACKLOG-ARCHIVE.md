@@ -2988,7 +2988,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All 28 tests in `test_sec5_hardened_runner` (`--features 3d`) keep every structural
   metadata-refusal assertion without wall-clock upper bounds on oversized sparse output, and pass `20/20`
   under 6 CPU busy loops.
-- **Implemented (2026-11-20, pull request TBD):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`
+- **Implemented (2026-11-20, pull request 402, open):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`
   and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops, `--features 3d`; `0/20`
   local failures before is expected since the `8.59 s` wall-clock failure occurred on a shared
   `macos-latest` GitHub runner):
