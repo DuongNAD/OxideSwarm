@@ -2879,6 +2879,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-78: rendezvous_discovery_e2e: widen 10-30 s command and registration deadlines to 60 s
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Item 10 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled` failed at
+  `tests/rendezvous_discovery_e2e.rs:111` (`run_with_timeout(submit_cmd, Duration::from_secs(20))` at
+  `:229`): `Command timed out after 20s`, after Tier 1 UDP + Tier 2 HTTP timeouts + rendezvous lookup
+  + auth handshake + worker spawn.
+- **Problem:** `tests/rendezvous_discovery_e2e.rs` used `10–30 s` timeouts for subprocess setup
+  (`secret generate`, `wait_for_port_file` at `10 s` / `15 s`), worker registration polling (`30 s`),
+  `workers --master auto` (`10 s`), `submit --master auto --wait` (`20 s`), and HTTPS/unsigned
+  rejection commands (`10 s`), plus `1–2 s` `discover_master_rendezvous` checks, and
+  `run_with_timeout` panicked without child `stdout`/`stderr` or rendezvous/master/worker service
+  logs.
+- **Do:** Add `TEST_WAIT_TIMEOUT = 60 s` and `run_with_timeout_with_logs` (draining child
+  `stdout`/`stderr` in background threads and printing captured child output plus service logs on
+  timeout without blocking on thread joins if a child leaves a pipe open); raise all
+  `wait_for_port_file`, registration deadline, `run_with_timeout` / `run_with_timeout_with_logs`,
+  and `discover_master_rendezvous` deadlines to `TEST_WAIT_TIMEOUT`; and include rendezvous, master,
+  and worker logs on `submit_out` assertion failure.
+- **Done when:** All 3 tests keep every Tier 3 rendezvous discovery, keyed isolation,
+  anti-harvesting, and CLI URL rejection assertion, print service + child diagnostics on failure, and
+  pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 400, open):** Updated `tests/rendezvous_discovery_e2e.rs` and
+  verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures
+  before the fix is expected since the `20 s` timeout occurred on a 12-thread Windows laptop):
+  - Before fix (`origin/master` `d321d97f`): `20/20` passed (`195.42 s` total, `9.54–11.58 s` per
+    run).
+  - After fix: `3/3` passed in `9.16 s`, and the 20-run loaded loop passed `20/20` (`193.82 s` total,
+    `9.39–10.00 s` per run, `0` failures).
+
 ### TEST-74: m5_challenger_2_stress: wait 60 s for reduce Running on w1 and use TEST-54 MapReduce timeouts
 
 - **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
