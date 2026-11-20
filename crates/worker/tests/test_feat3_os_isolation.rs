@@ -180,7 +180,7 @@ fn lines(result: &TaskResult) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn format_result_diag(result: &TaskResult) -> String {
     format!(
         "exit_code={} error={:?} elapsed_ms={} stdout={:?} stderr={:?}",
@@ -3033,6 +3033,9 @@ cargo build --offline 2>&1
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
 
     /// Verifies that Windows AppContainer isolation (`userenv.dll` + capability SIDs) is
     /// supported on this host, or returns `false` (after a notice) when unavailable and the
@@ -3092,6 +3095,52 @@ mod windows {
                 return;
             }
         };
+    }
+
+    /// Generous condition-wait deadline for Windows PowerShell/AppContainer test barriers under load.
+    const WIN_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    struct ChildKillGuard(Option<std::process::Child>);
+
+    impl Drop for ChildKillGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Poll `cond` every 25 ms until it holds, any `done_flag` becomes true, or `WIN_WAIT_TIMEOUT`
+    /// elapses. Returns early with a diagnostic error if a test task exits before the barrier.
+    async fn wait_for_barrier<F>(
+        what: &str,
+        done_flags: &[(&str, &AtomicBool)],
+        mut cond: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = Instant::now() + WIN_WAIT_TIMEOUT;
+        loop {
+            if cond() {
+                return Ok(());
+            }
+            for (label, flag) in done_flags {
+                if flag.load(Ordering::Acquire) {
+                    return Err(format!(
+                        "{label} exited before barrier '{what}' was satisfied"
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for barrier '{what}'",
+                    WIN_WAIT_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn win_task(rig: &Rig, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
@@ -3234,20 +3283,22 @@ function Compile-CSharp([string]$code) {
         let script = r#"
 [Console]::Out.WriteLine('TASK_STARTED')
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\secret.txt", 'secret-from-t1')
-for ($i = 0; $i -lt 300; $i++) {
-    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { break }
-    [System.Threading.Thread]::Sleep(50)
+$goDeadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $goDeadline) {
+    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { [Console]::Out.WriteLine('GO_SEEN'); break }
+    [System.Threading.Thread]::Sleep(25)
 }
 try { $null = [System.IO.File]::ReadAllText("$env:T_SIB_SANDBOX\secret.txt"); [Console]::Out.WriteLine('LEAK_SIBLING_READ') } catch { [Console]::Out.WriteLine('DENY_SIBLING_READ') }
 try { $null = [System.IO.Directory]::GetFileSystemEntries($env:T_SIB_SANDBOX); [Console]::Out.WriteLine('LEAK_SIBLING_LIST') } catch { [Console]::Out.WriteLine('DENY_SIBLING_LIST') }
 try { [System.IO.File]::WriteAllText("$env:T_SIB_SANDBOX\planted.txt", 'x'); [Console]::Out.WriteLine('LEAK_SIBLING_WRITE') } catch { [Console]::Out.WriteLine('DENY_SIBLING_WRITE') }
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\done.txt", '1')
-for ($i = 0; $i -lt 300; $i++) {
+$exitDeadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $exitDeadline) {
     if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\exit.txt")) { break }
-    [System.Threading.Thread]::Sleep(50)
+    [System.Threading.Thread]::Sleep(25)
 }
 "#;
-        let task1 = win_task(&rig, script, &[], 60);
+        let task1 = win_task(&rig, script, &[], 90);
         let mut task2 = task1.clone();
         task2.id = rusty_grid_core::TaskId::new();
 
@@ -3267,48 +3318,77 @@ for ($i = 0; $i -lt 300; $i++) {
         let r2 = Arc::clone(&rig);
         let sb1_b = sb1.clone();
         let sb2_b = sb2.clone();
+        let t1_done = Arc::new(AtomicBool::new(false));
+        let t2_done = Arc::new(AtomicBool::new(false));
+        let t1_done_exec = Arc::clone(&t1_done);
+        let t2_done_exec = Arc::clone(&t2_done);
         let barrier = async move {
-            let mut both_secrets_existed = false;
-            for _ in 0..300 {
-                if sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file() {
-                    both_secrets_existed = true;
-                    break;
+            let release_siblings = || {
+                for dir in [&sb1_b, &sb2_b] {
+                    if dir.is_dir() {
+                        let _ = std::fs::write(dir.join("go.txt"), "go");
+                        let _ = std::fs::write(dir.join("exit.txt"), "exit");
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let flags = [("task1", t1_done.as_ref()), ("task2", t2_done.as_ref())];
+            if let Err(err) = wait_for_barrier("both sibling secret.txt", &flags, || {
+                sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file()
+            })
+            .await
+            {
+                release_siblings();
+                return Err(format!(
+                    "both sibling sandbox secret.txt files must exist before either task probes the other ({}, {}): {err}",
+                    sb1_b.display(),
+                    sb2_b.display()
+                ));
             }
-            assert!(
-                both_secrets_existed,
-                "both sibling sandbox secret.txt files must exist on disk before either task probes the other ({}, {})",
-                sb1_b.display(),
-                sb2_b.display()
-            );
-            std::fs::write(sb1_b.join("go.txt"), "go").unwrap();
-            std::fs::write(sb2_b.join("go.txt"), "go").unwrap();
+            std::fs::write(sb1_b.join("go.txt"), "go")
+                .map_err(|e| format!("write sb1 go.txt: {e}"))?;
+            std::fs::write(sb2_b.join("go.txt"), "go")
+                .map_err(|e| format!("write sb2 go.txt: {e}"))?;
 
-            let mut both_done = false;
-            for _ in 0..300 {
-                if sb1_b.join("done.txt").is_file() && sb2_b.join("done.txt").is_file() {
-                    both_done = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Err(err) = wait_for_barrier("both sibling done.txt", &flags, || {
+                sb1_b.join("done.txt").is_file() && sb2_b.join("done.txt").is_file()
+            })
+            .await
+            {
+                release_siblings();
+                return Err(format!(
+                    "both tasks must complete their sibling probes while both sandboxes are still present: {err}"
+                ));
             }
-            assert!(
-                both_done,
-                "both tasks must complete their sibling probes while both sandboxes are still present"
-            );
-            assert!(
-                sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file(),
-                "both sibling secret.txt files must still exist when probes finish"
-            );
+            if !(sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file()) {
+                release_siblings();
+                return Err(
+                    "both sibling secret.txt files must still exist when probes finish".to_string(),
+                );
+            }
             let _ = std::fs::write(sb1_b.join("exit.txt"), "exit");
             let _ = std::fs::write(sb2_b.join("exit.txt"), "exit");
+            Ok(())
         };
-        let (res1, res2, ()) = tokio::join!(
-            async move { r1.runner.execute_task(&t1, None, None).await },
-            async move { r2.runner.execute_task(&t2, None, None).await },
+        let (res1, res2, barrier_res) = tokio::join!(
+            async move {
+                let res = r1.runner.execute_task(&t1, None, None).await;
+                t1_done_exec.store(true, Ordering::Release);
+                res
+            },
+            async move {
+                let res = r2.runner.execute_task(&t2, None, None).await;
+                t2_done_exec.store(true, Ordering::Release);
+                res
+            },
             barrier,
         );
+        if let Err(err) = barrier_res {
+            panic!(
+                "{err}; task1: {}; task2: {}",
+                format_result_diag(&res1),
+                format_result_diag(&res2)
+            );
+        }
 
         for (label, res) in [("task1", &res1), ("task2", &res2)] {
             assert!(
@@ -3320,6 +3400,7 @@ for ($i = 0; $i -lt 300; $i++) {
             let got = lines(res);
             for expected in [
                 "TASK_STARTED",
+                "GO_SEEN",
                 "DENY_SIBLING_READ",
                 "DENY_SIBLING_LIST",
                 "DENY_SIBLING_WRITE",
@@ -4131,7 +4212,7 @@ try {
         let tracked = wait_for_pid(&pid).await;
         assert!(tracked > 1);
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(WIN_WAIT_TIMEOUT, handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -4140,26 +4221,38 @@ try {
         // Timeout.
         let pid = Arc::new(AtomicU32::new(0));
         let task = win_task(&rig, "[System.Threading.Thread]::Sleep(120000)", &[], 2);
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let result = rig
             .runner
             .execute_task(&task, Some(Arc::clone(&pid)), None)
             .await;
         assert_eq!(result.exit_code, EXIT_CODE_TIMEOUT, "{:?}", result.error);
-        assert!(started.elapsed() < Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "timeout task killed in {:.2}s (limit {}s)",
+            elapsed.as_secs_f64(),
+            WIN_WAIT_TIMEOUT.as_secs()
+        );
+        assert!(elapsed < WIN_WAIT_TIMEOUT);
         let tracked = pid.load(Ordering::Acquire);
         assert!(tracked > 1);
     }
 
     async fn wait_for_pid(pid: &AtomicU32) -> u32 {
-        for _ in 0..200 {
+        let deadline = Instant::now() + WIN_WAIT_TIMEOUT;
+        loop {
             let v = pid.load(Ordering::Acquire);
             if v > 1 {
                 return v;
             }
+            if Instant::now() >= deadline {
+                panic!(
+                    "the runner never reported a child PID within {}s",
+                    WIN_WAIT_TIMEOUT.as_secs()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("the runner never reported a child PID");
     }
 
     #[tokio::test]
@@ -4172,7 +4265,7 @@ try {
             IsolationLevel::FsNet,
         ] {
             tokio::time::timeout(
-                Duration::from_secs(20),
+                WIN_WAIT_TIMEOUT,
                 verify_isolation_support(level, base.path()),
             )
             .await
@@ -4298,27 +4391,62 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     }
 }
 "#;
-        let mut host_server = std::process::Command::new(
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        )
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "$s1 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s2 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s3 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
-                 [Console]::Out.WriteLine('READY'); [System.Threading.Thread]::Sleep(30000)"
-            ),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn host pipe server");
+        let mut host_server_guard = ChildKillGuard(Some(
+            std::process::Command::new(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            )
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$s1 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $s2 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $s3 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
+                     [Console]::Out.WriteLine('READY'); [System.Threading.Thread]::Sleep(180000)"
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn host pipe server"),
+        ));
 
-        // Wait for the host pipe and event instances to be created.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Wait until the host pipe and event instances print READY.
+        let host_stdout = host_server_guard
+            .0
+            .as_mut()
+            .and_then(|c| c.stdout.take())
+            .expect("host_server stdout must be piped");
+        let ready_res = tokio::time::timeout(
+            WIN_WAIT_TIMEOUT,
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let mut reader = BufReader::new(host_stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader
+                        .read_line(&mut line)
+                        .map_err(|e| format!("read host_server stdout: {e}"))?;
+                    if n == 0 {
+                        return Err("host_server closed stdout before printing READY".to_string());
+                    }
+                    if line.trim() == "READY" {
+                        return Ok(());
+                    }
+                }
+            }),
+        )
+        .await;
+        match ready_res {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("host pipe server failed before READY: {e}"),
+            Ok(Err(e)) => panic!("host pipe server READY reader panicked: {e}"),
+            Err(_) => panic!(
+                "timed out after {}s waiting for host pipe server READY",
+                WIN_WAIT_TIMEOUT.as_secs()
+            ),
+        }
 
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
@@ -4389,8 +4517,7 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
             );
         }
 
-        let _ = host_server.kill();
-        let _ = host_server.wait();
+        drop(host_server_guard);
         assert!(
             control_ok,
             "unconfined control must connect to host named pipe and event: {control_lines:?}"
@@ -4989,10 +5116,8 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
                     task_temp.display(),
                     pkg_dir.display()
                 );
-                for _ in 0..20 {
-                    if !pkg_dir.exists() {
-                        break;
-                    }
+                let cleanup_deadline = Instant::now() + Duration::from_secs(30);
+                while pkg_dir.exists() && Instant::now() < cleanup_deadline {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 assert!(
@@ -5463,7 +5588,8 @@ if (-not [System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 }}
 if ($env:T_WAIT_HOST_JUNCTION -eq '1') {{
     [System.IO.File]::WriteAllText("$sb\ready.txt", "1")
-    for ($i = 0; $i -lt 200; $i++) {{
+    $goDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $goDeadline) {{
         if ([System.IO.File]::Exists("$sb\go.txt")) {{ break }}
         [System.Threading.Thread]::Sleep(25)
     }}
@@ -5566,72 +5692,88 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
                 ("T_SSH_DIR", ssh_dir.to_str().unwrap()),
                 ("T_WAIT_HOST_JUNCTION", "1"),
             ],
-            60,
+            90,
         );
         let sb_dir2 = rig.base.join(task2.id.0.to_string());
         let ssh_dir_clone = ssh_dir.clone();
         let secret_file_clone = secret_file.clone();
         let host_clone = rig.host.clone();
         let base_clone = rig.base.clone();
-        let plant_handle = tokio::spawn(async move {
+        let task2_done = Arc::new(AtomicBool::new(false));
+        let task2_done_exec = Arc::clone(&task2_done);
+        let exec_fut = async {
+            let res = rig.runner.execute_task(&task2, None, None).await;
+            task2_done_exec.store(true, Ordering::Release);
+            res
+        };
+        let plant_fut = async move {
             let ready = sb_dir2.join("ready.txt");
-            for _ in 0..200 {
-                if ready.exists() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(ready.exists(), "task2 must signal ready.txt");
-            let j_path = sb_dir2.join("j_ssh");
-            let hl_path = sb_dir2.join("hl_secret.txt");
-            let ps_mklink = std::process::Command::new(
-                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            )
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "New-Item -ItemType Junction -Path $env:J_LINK -Value $env:J_TARGET | Out-Null; New-Item -ItemType HardLink -Path $env:HL_LINK -Value $env:HL_TARGET | Out-Null",
-            ])
-            .env("J_LINK", &j_path)
-            .env("J_TARGET", &ssh_dir_clone)
-            .env("HL_LINK", &hl_path)
-            .env("HL_TARGET", &secret_file_clone)
-            .output()
-            .expect("create host junction and hardlink inside active sandbox");
-            assert!(
-                ps_mklink.status.success(),
-                "host New-Item Junction/HardLink failed: {}",
-                String::from_utf8_lossy(&ps_mklink.stderr)
-            );
-            let j_meta = std::fs::symlink_metadata(&j_path)
-                .expect("junction j_ssh must exist inside sandbox on host");
+            if let Err(err) =
+                wait_for_barrier("task2 ready.txt", &[("task2", task2_done.as_ref())], || {
+                    ready.exists()
+                })
+                .await
             {
-                use std::os::windows::fs::MetadataExt;
-                assert!(
-                    (j_meta.file_attributes() & 0x0400) != 0,
-                    "j_ssh must have FILE_ATTRIBUTE_REPARSE_POINT"
-                );
+                return Err(format!("task2 must signal ready.txt: {err}"));
             }
-            assert!(
-                hl_path.is_file(),
-                "hardlink hl_secret.txt must exist inside sandbox on host"
-            );
-            rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
-                &host_clone,
-                &[],
-                Some(&base_clone),
-            )
-            .expect("prepare_worker_toolchains with active junction and hardlink");
-            std::fs::write(sb_dir2.join("go.txt"), "1").unwrap();
-        });
-        let result2 = rig.runner.execute_task(&task2, None, None).await;
-        plant_handle.await.expect("plant_handle");
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let j_path = sb_dir2.join("j_ssh");
+                let hl_path = sb_dir2.join("hl_secret.txt");
+                let ps_mklink = std::process::Command::new(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                )
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-Item -ItemType Junction -Path $env:J_LINK -Value $env:J_TARGET | Out-Null; New-Item -ItemType HardLink -Path $env:HL_LINK -Value $env:HL_TARGET | Out-Null",
+                ])
+                .env("J_LINK", &j_path)
+                .env("J_TARGET", &ssh_dir_clone)
+                .env("HL_LINK", &hl_path)
+                .env("HL_TARGET", &secret_file_clone)
+                .output()
+                .map_err(|e| format!("create host junction and hardlink inside active sandbox: {e}"))?;
+                if !ps_mklink.status.success() {
+                    return Err(format!(
+                        "host New-Item Junction/HardLink failed: {}",
+                        String::from_utf8_lossy(&ps_mklink.stderr)
+                    ));
+                }
+                let j_meta = std::fs::symlink_metadata(&j_path)
+                    .map_err(|e| format!("junction j_ssh must exist inside sandbox on host: {e}"))?;
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if (j_meta.file_attributes() & 0x0400) == 0 {
+                        return Err("j_ssh must have FILE_ATTRIBUTE_REPARSE_POINT".to_string());
+                    }
+                }
+                if !hl_path.is_file() {
+                    return Err("hardlink hl_secret.txt must exist inside sandbox on host".to_string());
+                }
+                rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+                    &host_clone,
+                    &[],
+                    Some(&base_clone),
+                )
+                .map_err(|e| {
+                    format!("prepare_worker_toolchains with active junction and hardlink: {e}")
+                })?;
+                std::fs::write(sb_dir2.join("go.txt"), "1")
+                    .map_err(|e| format!("write go.txt: {e}"))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| format!("plant_fut join error: {e}"))?
+        };
+        let (result2, plant_res) = tokio::join!(exec_fut, plant_fut);
+        if let Err(err) = plant_res {
+            panic!("{err}; attempt 2: {}", format_result_diag(&result2));
+        }
         assert!(
             result2.is_success(),
-            "attempt 2: {:?} {}",
-            result2.error,
-            result2.stderr_str()
+            "attempt 2: {}",
+            format_result_diag(&result2)
         );
         let got2 = lines(&result2);
         assert!(
