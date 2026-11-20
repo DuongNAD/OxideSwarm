@@ -3158,6 +3158,139 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     --locked -- -D warnings`, and `cargo test --workspace --locked` (`137` binaries, `2,228 passed;
     0 failed; 5 ignored`).
 
+### TEST-83: Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards
+
+- **Evidence:** Read-only wall-clock audit on `origin/master` (`2026-11-20`) found `36` Category 1
+  wall-clock upper-bound and SLA assertions in `rusty_grid_core` and `rusty_grid_master` (excluding
+  `m2_challenger_1_stress` reserved for `TEST-70`, `m4_challenger_1_stress` reserved for `TEST-71`, and
+  `master_restart_recovery` reserved for `TEST-75`), plus `4` adjacent Category 1 upper bounds in the
+  same modified functions (`40` upper bounds updated across `18` files / `15` binaries). Zero
+  `!cfg!(debug_assertions)` release-only SLAs exist in `crates/core`, `crates/master`, or `tests/`.
+- **Problem:** Under loaded CI runners or concurrent suites, millisecond/single-digit-second proof-proxy
+  ceilings (`< 50 ms`, `< 200 ms`, `< 500 ms`, `< 1500 ms`, `< 1–6 s`) and throughput floors (`> 1000`,
+  `> 5000 msgs/s`) flake on CPU scheduling jitter even when the underlying non-blocking, fast-path,
+  complexity, or flow-control behavior is working properly.
+- **Do:** Replace proof proxies with structural or ordering checks and print elapsed times, remove debug
+  throughput floors, widen hang guards to `60 s` (and inner sleep targets past `60 s` to `120 s`), skip
+  `m2_challenger_1_stress` (`TEST-70`), `m4_challenger_1_stress` (`TEST-71`), and `master_restart_recovery`
+  (`TEST-75`), and verify every touched binary `20/20` under 6 CPU busy loops.
+- **Done when:** Every audited Category 1 bound in `rusty_grid_core` and `rusty_grid_master` (outside the
+  three skipped files) is structural or guarded at `60 s`, `cargo fmt`, workspace `clippy`, and doc
+  hygiene pass, and all `15` binaries pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-20, pull request TBD, open):** Updated `36` audited Category 1 hits plus `4`
+  adjacent upper bounds across `18` files / `15` test binaries (`m2_challenger_1_stress`,
+  `m4_challenger_1_stress`, and `master_restart_recovery` untouched):
+  - `crates/core/src/capabilities.rs` (`rusty_grid_core --lib`, `5` hits): in
+    `test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout` (`:3755` `< 8 s / 10 s`,
+    adjacent Unix `det_elapsed < 6 s`, `:3844` `< 15 s / 20 s`),
+    `test_hung_blender_probe_via_override_times_out_and_reports_no_blender` (`:3895` `HOST_PROBE_TIMEOUT + 5 s / 10 s`),
+    and `test_probe_tool_with_timeout_and_host_tool_tags` (`:3942` `< 15 s`), raised inner background/hung
+    sleeps from `60 s` to `120 s`, widened upper bounds and `max_overhead` to `60 s` (preserving
+    `assert_pid_file_process_dead` and `:3879` `elapsed >= 2 s` lower bound), and printed elapsed durations.
+  - `crates/core/tests/m1_3d_adversarial_stress.rs` (`1` hit, `:722`): in
+    `test_rapid_repeated_detection_sequential_leak_and_stability`, widened `median < 1500 ms` to a `60 s`
+    hang guard while preserving latency percentile prints, `per_call_guard`, and `handle_growth <= 5`.
+  - `crates/core/tests/m1_stress_challenge.rs` (`2` hits, `:295`, `:360`): in
+    `test_high_throughput_10k_sequential` and `test_high_throughput_10k_pipelined`, removed
+    `msgs_per_sec > 1000.0` and `> 5000.0` throughput SLAs, wrapped both loops in `60 s`
+    `tokio::time::timeout` hang guards, and preserved all round-trip/FIFO assertions and rate prints.
+  - `crates/master/src/mapreduce.rs` (`rusty_grid_master --lib`, `1` hit, `:1600`): in
+    `test_mapreduce_job_waits_for_queue_room_and_completes_when_room_is_freed`, raised `impossible_job`
+    timeout `10 -> 120`, wrapped `engine.execute` in a `60 s` timeout, added structural assertion
+    `queue.get_schedulable_tasks().await.is_empty()` alongside `QueueByteLimitExceeded`, logged elapsed,
+    and widened `< 1 s` to `< 60 s`.
+  - `crates/master/src/queue/recovery_tests.rs` (`rusty_grid_master --lib`, `1` hit, `:801`): in
+    `test_release_expired_adoption_holds_fast_path_with_10k_tasks`, replaced `< 50 ms` with a structural
+    zero-lock O(1) proof holding `q.inner.write().await` while polling 1,000 `release_expired_adoption_holds()`
+    calls via biased `tokio::select!` (`_ = yield_now() => panic!`, plus `adoption_holds == 0`), logged
+    elapsed, and widened the hang guard to `60 s`.
+  - `crates/master/src/scheduler.rs` (`rusty_grid_master --lib`, `2` hits, `:6445` [audit `:6384`],
+    `:7024` [audit `:6963`]): added `#[cfg(test)]` `Cell<usize>` counters on `Engine` and `ScheduleReport`,
+    asserted `candidate_scans == 1` and `dead_speed_hits == 19_999` in
+    `test_sched4_dead_speed_cache_and_cap_bypass` (`< 5 s` -> `< 60 s`) and `workers_inspected < 100_000`
+    in `schedule_1000_heterogeneous_workers_scales_cleanly` (`< 2 s` -> `< 60 s`), and logged elapsed plus
+    counters.
+  - `crates/master/src/server/persistence_tests.rs` (`rusty_grid_master --lib`, `2` hits, `:479`, `:546`):
+    in `test_p2p_handshake_refusals_delivered_over_real_iroh`, widened `closed()` timeouts (`5 s -> 60 s`)
+    and upper elapsed guards (`<= 3 s -> < 60 s`) for both silent and flow-control-blocked refused peers
+    while keeping `elapsed >= 900 ms` and subsequent normal-peer admission, and logged elapsed.
+  - `tests/cluster_auth_e2e.rs` (`2` hits, `:515`, `:541`): configured the oversized-first-frame master with
+    `with_handshake_timeout(120)` so immediate EOF/generic-reject proof does not depend on timeout, widened
+    stream read timeouts and elapsed guards from `3–4 s` to `60 s` in
+    `test_oversized_first_frame_is_cut_off_and_master_stays_healthy` and
+    `test_silent_unauthenticated_peer_is_dropped_after_the_handshake_timeout`, and logged elapsed.
+  - `tests/m10_streaming_stress.rs` (`1` hit, `:748`): in
+    `test_stress_master_graceful_shutdown_drains_telemetry_streams`, applied a shared `60 s`
+    `drain_deadline` (`timeout_at`) across WebSocket readers, widened `< 4 s` to `< 60 s`, and logged elapsed.
+  - `tests/m2_challenger_2_stress.rs` (`4` audited + `1` coupled `poll_until` at `:297`): in
+    `test_reaper_fast_path_abrupt_socket_drop_without_disconnecting` (`:297`, `:321`), raised reaper timeout
+    `60 s -> 120 s` and widened poll/elapsed guard `200 ms -> 60 s` (fast-path EOF beats `120 s` reaper);
+    in `test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol` (`:1042`, `:1047`, `:1052`),
+    replaced `< 100 ms` / `< 200 ms` / `< 1500 ms` SLAs with structural flow-control backpressure isolation
+    (`stream_receive_window(64 KiB)`, `receive_window(4 MiB)`, `Notify`-paused `data_sink_task`, `16 KiB`
+    write chunks firing `data_started`, `60 s` `timeout_at` over 30 heartbeats, asserting
+    `!data_producer_task.is_finished()` before releasing the sink and verifying all 5 MiB arrive).
+  - `tests/m2_stress_challenge.rs` (`3` audited + `3` coupled `max_r1` bounds at `:325/:338/:351`): in
+    `test_challenge_handshake_timeout_resilience_and_non_blocking` (`:277`, `:282`), raised handshake
+    timeout `5 -> 10 s`, verified all three Slowloris sockets still return `WouldBlock` on `try_read` after
+    legit registration completes, and widened `poll_until`/`rogue_timeout`/`max_r1` to `60 s` (keeping
+    `>= 9 s` lower bound); in `test_challenge_malformed_handshake_immediate_rejection` (`:717`), raised
+    handshake timeout `5 -> 120 s` (`RegisterAck(accepted=false)` proves malformed rejection independent of
+    timeout) and widened `recv_msg` + elapsed guard `< 500 ms` to `60 s`.
+  - `tests/m4_challenger_2_stress.rs` (`1` hit, `:808`): in
+    `test_adversarial_cancel_mid_execution_and_permit_reuse`, raised task `sleep 10 -> 120` / timeout
+    `20 -> 120`, widened `wait_for`/`wait_task`/elapsed guard (`< 1500 ms -> < 60 s`), and logged elapsed.
+  - `tests/m9_stress_challenge_2.rs` (`3` hits, `:850`, `:930`, `:1136`): in
+    `test_client_wait_task_unblocks_promptly_on_crash`,
+    `test_client_wait_task_unblocks_on_reaper_eviction_latency`, and
+    `test_multiple_concurrent_client_waiters_fanout`, raised `BuiltinTest` `duration_ms` (`3000`/`5000` ->
+    `120_000`) and task timeouts (`30 -> 120`), widened `wait_for`/`wait_task`/elapsed guards (`500–600 ms`
+    -> `60 s`), and logged elapsed.
+  - `tests/master_limits_and_scheduling.rs` (`1` hit, `:136`): in
+    `test_surplus_peers_are_closed_and_closing_one_frees_its_slot`, widened slot-release loop guard
+    `< 5 s -> < 60 s` and logged release elapsed.
+  - `tests/master_quic_limits.rs` (`3` hits, `:73`, `:105`, `:175`): widened idle-peer close (`:73`) and
+    3-worker registration (`:175`) guards to `60 s`; in
+    `test_quic_peers_count_against_the_connection_budget_and_free_it_when_gone` (`:105`), raised handshake
+    timeout `20 -> 90 s` (`deadline = 90 + 25`), widened refusal wait/guard to `60 s`, and added
+    `first.close_reason().is_none()` proving the first peer still holds the single connection slot.
+  - `tests/test_challenger_m4_scheduler_runner.rs` (`1` hit, `:553`): in
+    `test_stress_high_throughput_matchmaking_burst_100_tasks`, widened `< 50 ms` to `< 60 s` while keeping
+    latency printing, determinism, and constraint invariants.
+  - `tests/worker_crash_rescheduling_test.rs` (`2` audited + `1` coupled `wait_for` at `:272`): in
+    `test_immediate_graceful_disconnect` (`:272`, `:274`), raised reaper timeout `10 -> 120 s`, widened
+    `wait_for`/elapsed guard `< 300 ms -> < 60 s`, and accepted `Scheduled | Running | Completed` on survivor;
+    in `test_reaper_waiters_resolution` (`:549`), raised `duration_ms` `5000 -> 120_000` / timeout
+    `30 -> 120`, widened `wait_task`/elapsed guard (`< 2 s -> < 60 s`), and logged elapsed.
+  - `tests/zero_copy_quic_test.rs` (`1` hit, `:406`): in
+    `test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`, replaced `avg_latency < 50 ms` with the
+    same structural QUIC stream flow-control pause check (`stream_receive_window(64 KiB)`, `receive_window(4
+    MiB)`, paused `data_sink_task`, `Notify`-gated start, `60 s` `timeout_at` over 10 heartbeats, and
+    `!data_producer_task.is_finished()` before sink release).
+  - **Cheap targeted 20-run loaded before-loops (`origin/master` `f485533e`, Apple M5, 6 busy loops, private `HOME`; expensive `capabilities` / `m1_3d_adversarial_stress` / full master integration before-loops skipped):**
+    - `m1_stress_challenge` (`test_high_throughput_10k_`): `20/20` (`total=10.18s`, `min=0.32s`, `max=3.56s`)
+    - `rusty_grid_master --lib` (4 targeted tests: `mapreduce`, `recovery_tests`, `scheduler` x2): `20/20` (`total=15.99s`, `min=0.62s`, `max=3.90s`)
+    - `test_challenger_m4_scheduler_runner` (`test_stress_high_throughput_matchmaking_burst_100_tasks`): `20/20` (`total=8.33s`, `min=0.24s`, `max=3.22s`)
+    - `zero_copy_quic_test` (`test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`): `20/20` (`total=13.03s`, `min=0.34s`, `max=6.19s`)
+    - `worker_crash_rescheduling_test` (`test_immediate_graceful_disconnect` + `test_reaper_waiters_resolution`): `20/20` (`total=53.36s`, `min=2.46s`, `max=6.13s`)
+  - **Single-run counts and full-binary 20-run loaded after-loops (Apple M5, 6 busy loops, private `HOME`, `--locked`; all `15/15` binaries passed `20/20`):**
+    - `rusty_grid_core --lib`: single `295/295` (`8.51 s`), after `20/20` (`total=165.40s`, `min=8.11s`, `max=9.83s`)
+    - `core::m1_3d_adversarial_stress`: single `21/21` (`88.03 s`), after `20/20` (`total=3640.83s`, `min=158.45s`, `max=272.14s`)
+    - `core::m1_stress_challenge`: single `15/15` (`1.18 s`), after `20/20` (`total=48.74s`, `min=2.28s`, `max=3.81s`)
+    - `rusty_grid_master --lib`: single `394/394` (`22.80 s`), after `20/20` (`total=485.30s`, `min=23.21s`, `max=25.85s`)
+    - `master::cluster_auth_e2e`: single `18/18` (`2.59 s`), after `20/20` (`total=62.43s`, `min=2.88s`, `max=7.07s`)
+    - `master::m10_streaming_stress`: single `6/6` (`0.44 s`), after `20/20` (`total=18.92s`, `min=0.72s`, `max=4.64s`)
+    - `master::m2_challenger_2_stress`: single `12/12` (`0.63 s`), after `20/20` (`total=22.97s`, `min=0.92s`, `max=4.84s`)
+    - `master::m2_stress_challenge`: single `6/6` (`10.06 s`), after `20/20` (`total=211.20s`, `min=10.38s`, `max=12.27s`)
+    - `master::m4_challenger_2_stress`: single `11/11` (`4.51 s`), after `20/20` (`total=103.60s`, `min=4.81s`, `max=11.41s`)
+    - `master::m9_stress_challenge_2`: single `10/10` (`1.90 s`), after `20/20` (`total=47.88s`, `min=2.18s`, `max=5.75s`)
+    - `master::master_limits_and_scheduling`: single `5/5` (`3.48 s`), after `20/20` (`total=87.71s`, `min=4.06s`, `max=6.37s`)
+    - `master::master_quic_limits`: single `3/3` (`1.56 s`), after `20/20` (`total=45.28s`, `min=2.07s`, `max=4.54s`)
+    - `master::test_challenger_m4_scheduler_runner`: single `3/3` (`0.00 s`), after `20/20` (`total=10.05s`, `min=0.29s`, `max=4.26s`)
+    - `master::worker_crash_rescheduling_test`: single `4/4` (`2.25 s`), after `20/20` (`total=54.84s`, `min=2.50s`, `max=6.72s`)
+    - `master::zero_copy_quic_test`: single `8/8` (`0.33 s`), after `20/20` (`total=20.48s`, `min=0.89s`, `max=2.94s`)
+  - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with

@@ -792,14 +792,27 @@ async fn test_release_expired_adoption_holds_fast_path_with_10k_tasks() {
             .await
             .unwrap();
     }
+    assert_eq!(
+        q.adoption_holds.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    let inner_write_guard = q.inner.write().await;
     let start = Instant::now();
     for _ in 0..1_000 {
-        assert!(q.release_expired_adoption_holds().await.is_empty());
+        tokio::select! {
+            biased;
+            expired = q.release_expired_adoption_holds() => assert!(expired.is_empty()),
+            _ = tokio::task::yield_now() => {
+                panic!("release_expired_adoption_holds blocked on inner RwLock instead of taking O(1) fast path");
+            }
+        }
     }
     let elapsed = start.elapsed();
+    drop(inner_write_guard);
+    println!("1,000 fast-path adoption-hold checks over 10,000 retained tasks took {elapsed:?}");
     assert!(
-        elapsed < Duration::from_millis(50),
-        "1,000 calls to release_expired_adoption_holds with 10,000 retained tasks took {elapsed:?} (expected fast-path < 50ms)"
+        elapsed < Duration::from_secs(60),
+        "1,000 calls to release_expired_adoption_holds with 10,000 retained tasks hung for {elapsed:?}"
     );
 }
 

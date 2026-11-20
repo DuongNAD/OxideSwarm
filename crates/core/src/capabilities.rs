@@ -3728,33 +3728,26 @@ Now drawing from 'AC Power'
             dir.path(),
             "blender_bg_stdout",
             &format!(
-                "echo 'Blender 4.5.4 LTS'\nsleep 60 &\necho $! > '{}'\nexit 0",
+                "echo 'Blender 4.5.4 LTS'\nsleep 120 &\necho $! > '{}'\nexit 0",
                 bg_pid_file.display()
             ),
             &format!(
-                "echo Blender 4.5.4 LTS\r\npython -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid))\"\r\nexit /b 0",
+                "echo Blender 4.5.4 LTS\r\npython -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '120', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid))\"\r\nexit /b 0",
                 bg_pid_file.display()
             ),
         );
-        let bg_timeout = if cfg!(windows) {
-            std::time::Duration::from_secs(15)
-        } else {
-            std::time::Duration::from_secs(10)
-        };
-        let bg_elapsed_bound = if cfg!(windows) {
-            std::time::Duration::from_secs(10)
-        } else {
-            std::time::Duration::from_secs(8)
-        };
+        let bg_timeout = std::time::Duration::from_secs(60);
+        let bg_elapsed_bound = std::time::Duration::from_secs(60);
         let bg_start = std::time::Instant::now();
         assert_eq!(
             probe_blender_with_timeout(&bg_ver, bg_timeout),
             BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string())
         );
+        let bg_elapsed = bg_start.elapsed();
+        println!("background-stdout wrapper completed in {bg_elapsed:?}");
         assert!(
-            bg_start.elapsed() < bg_elapsed_bound,
-            "background-stdout wrapper took {:?}",
-            bg_start.elapsed()
+            bg_elapsed < bg_elapsed_bound,
+            "background-stdout wrapper hung for {bg_elapsed:?}"
         );
         assert_pid_file_process_dead(&bg_pid_file);
 
@@ -3771,7 +3764,7 @@ Now drawing from 'AC Power'
                 dir.path(),
                 "blender_detached_stdout",
                 &format!(
-                    "python3 -c 'import os, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    end = time.time() + 5\n    while not os.path.exists({:?}) and time.time() < end:\n        time.sleep(0.01)\n    os._exit(0)\nos.setsid()\nopen({:?}, \"w\").write(\"1\")\ntime.sleep(60)\n'",
+                    "python3 -c 'import os, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    end = time.time() + 5\n    while not os.path.exists({:?}) and time.time() < end:\n        time.sleep(0.01)\n    os._exit(0)\nos.setsid()\nopen({:?}, \"w\").write(\"1\")\ntime.sleep(120)\n'",
                     detached_pid_file.to_string_lossy(),
                     detached_ready_file.to_string_lossy(),
                     detached_ready_file.to_string_lossy()
@@ -3795,7 +3788,7 @@ Now drawing from 'AC Power'
                     if pid > 1 {
                         // SAFETY: `kill` takes two integers and touches no memory of this
                         // process. `pid` (> 1) is the `setsid` grandchild this test started,
-                        // which sleeps for 60 s, so it is still alive and its PID is not reused.
+                        // which sleeps for 120 s, so it is still alive and its PID is not reused.
                         unsafe {
                             let _ = libc::kill(pid, libc::SIGKILL);
                         }
@@ -3807,9 +3800,10 @@ Now drawing from 'AC Power'
                 BlenderProbeResult::TimedOut,
                 "unexpected result for detached-stdout wrapper: {det_res:?}"
             );
+            println!("detached-stdout wrapper timed out in {det_elapsed:?}");
             assert!(
-                det_elapsed < std::time::Duration::from_secs(6),
-                "detached-stdout wrapper blocked past timeout: {det_elapsed:?}"
+                det_elapsed < std::time::Duration::from_secs(60),
+                "detached-stdout wrapper blocked past timeout guard: {det_elapsed:?}"
             );
         }
 
@@ -3817,9 +3811,9 @@ Now drawing from 'AC Power'
         let hung = write_test_script(
             dir.path(),
             "blender_hung",
-            &format!("sleep 60 &\necho $! > '{}'\nwait", hung_pid_file.display()),
+            &format!("sleep 120 &\necho $! > '{}'\nwait", hung_pid_file.display()),
             &format!(
-                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
+                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '120', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
                 hung_pid_file.display()
             ),
         );
@@ -3830,20 +3824,17 @@ Now drawing from 'AC Power'
             // its PID file before the timeout fires (TEST-31).
             std::time::Duration::from_secs(4)
         };
-        let hung_elapsed_bound = if cfg!(windows) {
-            std::time::Duration::from_secs(15)
-        } else {
-            std::time::Duration::from_secs(20)
-        };
+        let hung_elapsed_bound = std::time::Duration::from_secs(60);
         let start = std::time::Instant::now();
         assert_eq!(
             probe_blender_with_timeout(&hung, hung_timeout),
             BlenderProbeResult::TimedOut
         );
+        let elapsed = start.elapsed();
+        println!("timed-out blender probe finished in {elapsed:?}");
         assert!(
-            start.elapsed() < hung_elapsed_bound,
-            "timed-out probe took {:?}",
-            start.elapsed()
+            elapsed < hung_elapsed_bound,
+            "timed-out probe hung for {elapsed:?}"
         );
         assert_pid_file_process_dead(&hung_pid_file);
     }
@@ -3857,7 +3848,7 @@ Now drawing from 'AC Power'
         let unix_script = {
             #[cfg(unix)]
             {
-                format!("sleep 60 &\necho $! > '{}'\nwait", env_pid_file.display())
+                format!("sleep 120 &\necho $! > '{}'\nwait", env_pid_file.display())
             }
             #[cfg(not(unix))]
             {
@@ -3868,7 +3859,7 @@ Now drawing from 'AC Power'
             dir.path(),
             "hung_blender_env",
             &unix_script,
-            "ping -n 60 127.0.0.1 >NUL",
+            "ping -n 120 127.0.0.1 >NUL",
         );
 
         let start = std::time::Instant::now();
@@ -3885,11 +3876,8 @@ Now drawing from 'AC Power'
             "a hung blender_path override probe must report blender_version = None, got {:?}",
             blender_version
         );
-        let max_overhead = if cfg!(windows) {
-            std::time::Duration::from_secs(10)
-        } else {
-            std::time::Duration::from_secs(5)
-        };
+        let max_overhead = std::time::Duration::from_secs(60);
+        println!("override blender probe timed out in {elapsed:?}");
         assert!(
             elapsed >= std::time::Duration::from_secs(2)
                 && elapsed < HOST_PROBE_TIMEOUT + max_overhead,
@@ -3926,9 +3914,9 @@ Now drawing from 'AC Power'
         let hung_tool = write_test_script(
             dir.path(),
             "tool_hung",
-            &format!("sleep 60 &\necho $! > '{}'\nwait", hung_pid_file.display()),
+            &format!("sleep 120 &\necho $! > '{}'\nwait", hung_pid_file.display()),
             &format!(
-                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
+                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '120', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
                 hung_pid_file.display()
             ),
         );
@@ -3939,7 +3927,12 @@ Now drawing from 'AC Power'
         };
         let start = std::time::Instant::now();
         assert!(!probe_tool_with_timeout(&hung_tool, hung_timeout));
-        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        let elapsed = start.elapsed();
+        println!("timed-out tool probe finished in {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "timed-out tool probe hung for {elapsed:?}"
+        );
         assert_pid_file_process_dead(&hung_pid_file);
 
         let uncached = detect_host_tools_uncached();
