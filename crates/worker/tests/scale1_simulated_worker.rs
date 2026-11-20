@@ -267,15 +267,18 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     );
     loop {
         if net.active_sessions() == WORKERS as u64 {
-            query
-                .send_msg(&ClientMessage::ClusterStatus)
-                .await
-                .expect("send status");
-            if let Ok(Some(ClientResponse::ClusterStatus { workers, .. })) =
-                query.recv_msg::<ClientResponse>().await
+            let remaining = reg_deadline.saturating_duration_since(Instant::now());
+            if let Ok(send_res) =
+                tokio::time::timeout(remaining, query.send_msg(&ClientMessage::ClusterStatus)).await
             {
-                if workers.len() == WORKERS {
-                    break;
+                send_res.expect("send status");
+                let remaining = reg_deadline.saturating_duration_since(Instant::now());
+                if let Ok(Ok(Some(ClientResponse::ClusterStatus { workers, .. }))) =
+                    tokio::time::timeout(remaining, query.recv_msg::<ClientResponse>()).await
+                {
+                    if workers.len() == WORKERS {
+                        break;
+                    }
                 }
             }
         }
@@ -316,8 +319,17 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
     for h in submitter_handles {
         if let Err(e) = h.await {
-            query.send_msg(&ClientMessage::ClusterStatus).await.ok();
-            let status = query.recv_msg::<ClientResponse>().await;
+            let diag_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+            let _ = tokio::time::timeout(
+                diag_deadline.saturating_duration_since(Instant::now()),
+                query.send_msg(&ClientMessage::ClusterStatus),
+            )
+            .await;
+            let status = tokio::time::timeout(
+                diag_deadline.saturating_duration_since(Instant::now()),
+                query.recv_msg::<ClientResponse>(),
+            )
+            .await;
             panic!(
                 "submitter burst failed: {e:?}; started={}, net={:?}, status={status:?}",
                 started_count.load(Ordering::Relaxed),
@@ -342,16 +354,19 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
         if net.total_handshakes() >= hs_before + WORKERS as u64
             && net.active_sessions() == WORKERS as u64
         {
-            query
-                .send_msg(&ClientMessage::ClusterStatus)
-                .await
-                .expect("send status post-disconnect");
-            if let Ok(Some(ClientResponse::ClusterStatus { workers, .. })) =
-                query.recv_msg::<ClientResponse>().await
+            let remaining = recon_deadline.saturating_duration_since(Instant::now());
+            if let Ok(send_res) =
+                tokio::time::timeout(remaining, query.send_msg(&ClientMessage::ClusterStatus)).await
             {
-                if workers.len() == WORKERS {
-                    reconnected.store(true, Ordering::Release);
-                    break;
+                send_res.expect("send status post-disconnect");
+                let remaining = recon_deadline.saturating_duration_since(Instant::now());
+                if let Ok(Ok(Some(ClientResponse::ClusterStatus { workers, .. }))) =
+                    tokio::time::timeout(remaining, query.recv_msg::<ClientResponse>()).await
+                {
+                    if workers.len() == WORKERS {
+                        reconnected.store(true, Ordering::Release);
+                        break;
+                    }
                 }
             }
         }
