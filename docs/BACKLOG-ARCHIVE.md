@@ -3229,7 +3229,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** All `24` fixed Cat 1 bounds and `3` bounded Cat 3 awaits keep structural/outcome assertions,
   `cargo fmt --all -- --check` and clippy pass with `-D warnings`, and every touched `rusty_grid_worker`
   binary passes `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-20, pull request TBD, open):** Applied all `TEST-82` changes across the 10 worker files and
+- **Implemented (2026-11-20, pull request 405, open):** Applied all `TEST-82` changes across the 10 worker files and
   verified on Apple M5 (`10` cores, private `HOME`, `--locked`, 6 Python CPU busy loops):
   - Cheap before-loops (`origin/master` `f485533e`; skipped `scale1_simulated_worker` [looped in `TEST-79`] and `test_feat3_os_isolation`):
     - `gpu_wgpu_compute_test` (`gpu_class_` 3 tests): `20/20` (`96.21 s` total, `4.60–7.97 s`)
