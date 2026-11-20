@@ -206,9 +206,16 @@ impl Cluster {
         let port_file = home.path().join("master.port");
         let ticket_file = home.path().join("master.ticket");
         let mut cmd = cli(home.path());
-        cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"])
-            .arg(&port_file)
-            .args(["--session-resume-hold-secs", RESUME_HOLD_SECS]);
+        cmd.args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
+        .arg(&port_file)
+        .args(["--session-resume-hold-secs", RESUME_HOLD_SECS]);
         if p2p {
             cmd.arg("--p2p").arg("--p2p-ticket-file").arg(&ticket_file);
         }

@@ -18,11 +18,27 @@ use rusty_grid_core::cluster_auth::{server_handshake, ClusterSecret};
 use rusty_grid_core::protocol::{MessageTransport, WorkerMessage};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_core::{GridError, GridResult};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig, AUTH_FAILURE_MIN_BACKOFF};
 
 fn secret(seed: u8) -> ClusterSecret {
     ClusterSecret::from_bytes(&[seed; 32]).unwrap()
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
 }
 
 async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
@@ -30,7 +46,7 @@ async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     if let Some(secret) = secret {
         config = config.with_cluster_secret(secret.clone());
     }
-    MasterServer::spawn(config).await.expect("spawn master")
+    spawn_test_master(config).await
 }
 
 fn worker_config(addr: SocketAddr, name: &str, secret: Option<&ClusterSecret>) -> WorkerConfig {
@@ -428,7 +444,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     let dir = tempfile::tempdir().unwrap();
     let ticket_file = dir.path().join("master.ticket");
     let secret = secret(20);
-    let master = MasterServer::spawn(
+    let master = spawn_test_master(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_p2p(true)
             .with_p2p_minimal_preset(true)
@@ -436,8 +452,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
             .with_p2p_ticket_file(&ticket_file)
             .with_cluster_secret(secret.clone()),
     )
-    .await
-    .expect("spawn p2p master");
+    .await;
     let ticket = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket")

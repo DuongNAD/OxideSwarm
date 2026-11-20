@@ -24,7 +24,22 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
-use rusty_grid_master::{MasterServer, ServerConfig, WorkerStatus};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterHandle, MasterServer, ReaperConfig, ServerConfig, WorkerStatus};
+
+async fn spawn_test_master() -> MasterHandle {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 use rusty_grid_worker::cpu_simd;
 use rusty_grid_worker::runner::{
     RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_TIMEOUT,
@@ -456,9 +471,7 @@ fn test_physical_wgpu_execution_when_available() {
 // ============================================================================
 #[tokio::test]
 async fn test_e2e_cluster_gpu_task_distribution() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let (w1_tx, w1_rx) = watch::channel(false);
@@ -1057,9 +1070,7 @@ async fn gpu_class_cancel_is_honoured_promptly() {
 // ============================================================================
 #[tokio::test]
 async fn test_adversarial_scheduling_isolation_mixed_cluster() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let (w1_tx, w1_rx) = watch::channel(false);

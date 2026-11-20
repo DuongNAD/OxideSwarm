@@ -21,7 +21,11 @@ use rusty_grid_core::protocol::{
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_core::GridResult;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::backoff::BackoffConfig;
 use rusty_grid_worker::client::{ActiveTaskTable, WorkerClient, WorkerConfig};
 use rusty_grid_worker::heartbeat::MobileTelemetryHandle;
@@ -791,9 +795,16 @@ async fn test_a_stalled_upload_to_a_master_that_stopped_reading_is_detected() {
 // ------------------------------------------------------------------------------------------
 
 async fn spawn_real_master() -> MasterHandle {
-    MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_handshake_timeout(2))
-        .await
-        .expect("spawn master")
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_handshake_timeout(2),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool

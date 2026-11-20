@@ -276,6 +276,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-68 | gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines | P2 | S |  |  | Implemented |  | 396 (open) |
 | TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Partial | In | 403 (open) |
 | TEST-80 | test_sec5_hardened_runner: drop 5 s wall-clock upper bounds in oversized sparse output test | P2 | S |  |  | Implemented |  | 402 (open) |
+| TEST-81 | Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load | P1 | M |  |  | Implemented |  | 404 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -342,6 +343,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented |  | 222, (design 0050) |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented |  | 227, (design 0050) |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | Out | 214, (design 0060) |
+| SCHED-5 | Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct | P2 | M |  |  | Planned | Out |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned | Out |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned | Out |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned | Out |  |
@@ -988,6 +990,24 @@ owner's decisions Q8, Q9 and Q12 are open.
   identical tasks finishing at least 30 % sooner than with today's placement, unknown keys keep
   today's placement exactly (the existing scheduler tests pass unchanged), and a live two-machine
   batch like the one above finishes within 1.5 times the fast machine's own time.
+
+### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
+
+- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
+  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
+  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
+- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
+  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
+  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
+  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
+- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
+  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
+  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
+  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
+  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
+     than on every scheduling pass.
+- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
+  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
 
 ## Phase 8: product and ecosystem
 
@@ -2501,3 +2521,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-68 Implemented (pull request 396, open; text in the archive): raised fixed `3–8 s` waits (`wait_for`, `wait_task`) and `5–15 s` task timeouts to `60 s` (`TEST_WAIT_TIMEOUT`, shared `wait_for_workers` dumping observed worker statuses on failure) in `tests/gpu_wgpu_compute_test.rs` (`test_e2e_cluster_gpu_task_distribution` and `test_adversarial_scheduling_isolation_mixed_cluster`), kept every strict routing check and the `500 ms` `Queued` negative check, and re-verified `stranded_id` stays `Queued` after `quick_cpu` completes on a free CPU worker; compiles with `--features gpu-wgpu` and passed `20/20` (`97.83 s`, `4.71–6.37 s`) before and `20/20` (`95.01 s`, `4.69–4.91 s`) after under 6 busy loops on Apple M5.
 - 2026-11-20: TEST-80 Implemented (pull request 402 (open); text in the archive): in `crates/worker/tests/test_sec5_hardened_runner.rs` (`test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading`), dropped both `elapsed < 5 s` wall-clock upper bounds (logging elapsed times instead), kept the metadata-refusal structural checks (`"is {sparse_bytes} bytes"`, `!"is more than"`, `asset_bytes.is_none()`), and raised the `BlenderRigProvider::execute_rigging` timeout from `15 s` to `60 s`; `--features 3d` 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`12.88 s`, `0.54–1.91 s`) and `20/20` after (`11.47 s`, `0.54–0.61 s`; single full binary `28/28` in `2.83 s`).
 - 2026-11-20: TEST-69 added and Partial (pull request 403, open; text in the archive): hardened five Windows AppContainer isolation tests in `crates/worker/tests/test_feat3_os_isolation.rs` (`mod windows`) against CPU starvation using `WIN_WAIT_TIMEOUT = 60 s`, `wait_for_barrier` with `AtomicBool` early-exit detection and `format_result_diag`, `GO_SEEN` barrier confirmation in `test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes`, `ChildKillGuard` + stdout `"READY"` pipe synchronization, `30 s` `DeleteAppContainerProfile` cleanup polling, and `90 s` `win_task` budgets on barrier-coordinated tests (`5/5` failures of `test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret` during full loaded workspace runs under `6` busy loops; pre-shutdown `20/20` passed before [`150.03–169.37 s`, median `154.22 s`] and `20/20` passed after [`148.63–157.44 s`, median `151.07 s`] in isolated `--test-threads=1` runs under `4` busy loops with `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, plus pre-shutdown `clippy`; rebased post-restart onto `8513b79` and verified `1/1` [`31 passed`, `211.33 s`] with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 --test-threads=1`, then merged `origin/master` `fd0df6a` and added `GO_SEEN` [verified by `windows-latest` CI; local `1/1` check to follow once free RAM `>= 6 GiB`]). Remains `Partial` because the failing full loaded configuration under `6` busy loops crashed this laptop twice and was not re-run here (the fix was looped only as this binary alone under `4` busy loops, where the old code also passed); confirmation in the failing configuration runs on `agent-win` after its 24-hour soak.
+- 2026-11-20: TEST-81 Implemented (pull request 404, open; text in the archive): confirmed with a temporary debug master log under 6 busy loops plus concurrent `cargo test -p rusty_grid_cli` that `SchedulerConfig::max_host_cpu_pct` (`85.0`) holds workers back (`51` `DEBUG` lines logging `max_host_cpu_pct=85.0`, `cpu_usage_pct=99.60392`, stalling the 3rd submit after `5 s`; removed per review and replaced by `SCHED-5` for the product behavior), added `SchedulerConfig::with_max_host_cpu_pct` and `SchedulerConfig::without_host_cpu_backpressure` in `crates/master/src/scheduler.rs`, and opted `57` non-backpressure test files out (`without_host_cpu_backpressure()` / `--max-host-cpu-pct 100`) while keeping production default `85.0` and all backpressure/config tests unchanged; `blob_transfer_e2e` 20-run loaded loops passed `20/20` before (`576.66 s`, `26.18–36.63 s`; reproduced in Q80 workspace Run 2) and `20/20` after (`627.62 s`, `29.01–33.98 s`), and the full workspace suite passed (`137` binaries, `2,228 passed; 0 failed; 5 ignored`).
+- 2026-11-20: Added SCHED-5 (Planned, Out): tell the user why a queued task waits when every eligible worker is above `max_host_cpu_pct` (open question from TEST-81, with PR 404 review inputs: `AllEligibleWorkersSaturated` skips only, connected workers only, once per change of the busy-worker set; visible form to be decided in a design record).

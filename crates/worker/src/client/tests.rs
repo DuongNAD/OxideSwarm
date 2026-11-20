@@ -2992,14 +2992,20 @@ async fn test_portal_caps_concurrent_connections() {
 
 #[tokio::test]
 async fn test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks() {
-    use rusty_grid_master::server::{MasterServer, ServerConfig};
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+    use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 
     let master_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();
-    let master = MasterServer::spawn(
+    let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_blob_store(master_dir.path(), 16 * 1024 * 1024)
             .with_heartbeat_interval(30),
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
     )
     .await
     .expect("spawn master");

@@ -46,7 +46,9 @@ use rusty_grid_core::arbitrage::{
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::WorkerClient;
 use rusty_grid_worker::WorkerConfig;
 
@@ -240,9 +242,15 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
     // 2. Spawn loopback MasterServer with max_retries = 3
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn(server_config)
-        .await
-        .expect("master spawn");
+    let master = MasterServer::spawn_with_config(
+        server_config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     // 3. Spawn 3 WorkerClients (Worker 1 = Mobile Candidate to be evacuated, Workers 2 & 3 = Survivors)

@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
-use rusty_grid_master::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterServer, ReaperConfig, ServerConfig};
 use rusty_grid_worker::{
     BackoffConfig, FakeRunnerConfig, LinkLossAction, RunnerConfig, SandboxConfig,
     SimulatedLinkConfig, SimulatedLinkStream, SimulatedNetworkControl, TaskRunner, WorkerClient,
@@ -219,7 +221,12 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
         .with_max_pending_handshakes(256)
         .with_max_terminal_tasks(1000)
         .with_session_resume_hold(Duration::ZERO);
-    let master = MasterServer::spawn(server_cfg).await.expect("spawn master");
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    let master = MasterServer::spawn_with_config(server_cfg, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("spawn master");
     let master_addr = master.server_addr();
     let master_addr_str = master_addr.to_string();
 

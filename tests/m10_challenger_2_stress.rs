@@ -38,8 +38,24 @@ use uuid::Uuid;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::dashboard::dto::ClusterStatusDto;
 use rusty_grid_master::queue::TaskInfo;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
+}
 
 fn http_client(timeout: Duration) -> Client {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -87,7 +103,7 @@ async fn test_malformed_queries_to_api_tasks() {
         .with_dashboard_port_file(&dash_port_file)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
@@ -328,7 +344,7 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
         .with_dashboard_port_file(&dash_port_file)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 
@@ -483,9 +499,7 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
             .with_dashboard_port_file(&port_file)
             .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-        let master = MasterServer::spawn(config)
-            .await
-            .expect("spawn master on port 0");
+        let master = spawn_test_master(config).await;
         let dash_addr = master
             .dashboard_addr()
             .expect("dashboard addr must be present");
@@ -549,9 +563,7 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
             .with_dashboard_port_file(&port_file)
             .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-        let master = MasterServer::spawn(config)
-            .await
-            .expect("spawn concurrent master");
+        let master = spawn_test_master(config).await;
         let dash_addr = master.dashboard_addr().expect("dashboard addr");
         let port = dash_addr.port();
 
@@ -613,7 +625,7 @@ async fn test_concurrent_rest_bombardment_under_load() {
         .with_dashboard_port_file(&dash_port_file)
         .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
     let base_url = format!("http://{}", dash_addr);
 

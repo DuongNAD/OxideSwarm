@@ -266,6 +266,19 @@ impl SchedulerConfig {
         self
     }
 
+    /// Sets the host CPU usage % threshold above which anti-stuttering backpressure holds back
+    /// task assignments (default: `85.0`; pass `100.0` in tests running under synthetic load).
+    pub fn with_max_host_cpu_pct(mut self, max_host_cpu_pct: f32) -> Self {
+        self.max_host_cpu_pct = max_host_cpu_pct;
+        self
+    }
+
+    /// Disables host-CPU anti-stuttering backpressure by setting `max_host_cpu_pct` to
+    /// `f32::INFINITY`. Intended for tests running under synthetic or concurrent host load.
+    pub fn without_host_cpu_backpressure(self) -> Self {
+        self.with_max_host_cpu_pct(f32::INFINITY)
+    }
+
     /// Validates `speed_hold_factor` (`0.0` to disable, or a finite number `> 1.0`).
     pub fn validate_speed_hold_factor(factor: f64) -> Result<f64, String> {
         if factor == 0.0 {
@@ -3003,6 +3016,54 @@ mod tests {
             report.assignments[0].worker_id, healthy_worker.worker_id,
             "Overloaded worker (>85% CPU) should be bypassed by anti-stuttering backpressure"
         );
+    }
+
+    #[test]
+    fn test_with_max_host_cpu_pct_100_allows_saturated_test_host() {
+        let mut busy_worker = make_worker("saturated-worker", 4, 8192, false, false);
+        busy_worker.cpu_usage_pct = 95.0;
+
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["test".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+
+        let default_report = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&busy_worker),
+        );
+        assert!(default_report.assignments.is_empty());
+        assert_eq!(
+            default_report.skipped,
+            vec![(task.id, ScheduleSkipReason::AllEligibleWorkersSaturated)]
+        );
+
+        let relaxed_report = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+            std::slice::from_ref(&task),
+            std::slice::from_ref(&busy_worker),
+        );
+        assert_eq!(relaxed_report.assignments.len(), 1);
+        assert_eq!(
+            relaxed_report.assignments[0].worker_id,
+            busy_worker.worker_id
+        );
+
+        for cpu in [100.0_f32, 100.1_f32] {
+            let mut saturated = busy_worker.clone();
+            saturated.cpu_usage_pct = cpu;
+            let opt_out_report = WorkloadScheduler::matchmake(
+                &SchedulerConfig::default().without_host_cpu_backpressure(),
+                std::slice::from_ref(&task),
+                &[saturated],
+            );
+            assert_eq!(opt_out_report.assignments.len(), 1);
+            assert_eq!(
+                opt_out_report.assignments[0].worker_id,
+                busy_worker.worker_id
+            );
+        }
     }
 
     #[test]

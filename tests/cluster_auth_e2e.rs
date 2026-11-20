@@ -36,11 +36,27 @@ use rusty_grid_core::protocol::{
 };
 use rusty_grid_core::task::{Bytes as TaskBytes, Task, TaskRequirements, TaskSpec};
 use rusty_grid_core::{GridError, GridResult};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
 
 fn secret(seed: u8) -> ClusterSecret {
     ClusterSecret::from_bytes(&[seed; 32]).unwrap()
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
 }
 
 async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
@@ -48,7 +64,7 @@ async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     if let Some(secret) = secret {
         config = config.with_cluster_secret(secret.clone());
     }
-    MasterServer::spawn(config).await.expect("spawn master")
+    spawn_test_master(config).await
 }
 
 #[allow(dead_code)]
@@ -527,7 +543,7 @@ async fn test_silent_unauthenticated_peer_is_dropped_after_the_handshake_timeout
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_handshake_timeout(1)
         .with_cluster_secret(secret(10));
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
 
     let mut stream = TcpStream::connect(master.server_addr()).await.unwrap();
     let started = Instant::now();
@@ -571,7 +587,7 @@ async fn test_discovery_beacon_is_signed_only_for_authenticated_probes() {
         .with_discovery(true)
         .with_discovery_port(udp_port)
         .with_cluster_secret(secret.clone());
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
 
     let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
@@ -672,7 +688,7 @@ mod quic {
             .with_ephemeral_key(true)
             .with_handshake_timeout(3)
             .with_cluster_secret(secret.clone());
-        let master = MasterServer::spawn(config).await.expect("spawn master");
+        let master = spawn_test_master(config).await;
         let ticket = master.p2p_ticket().expect("p2p ticket").to_string();
         let mut master_addr = parse_p2p_ticket(&ticket).expect("parse ticket");
         // Reach the master directly over the local interface; no relay is involved.

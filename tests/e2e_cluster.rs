@@ -67,9 +67,13 @@ struct TestCluster {
 }
 
 impl TestCluster {
-    /// Creates a new test cluster with default scheduler and reaper configuration.
+    /// Creates a new test cluster with host CPU backpressure opted out (`100.0%`) for loaded test runs.
     pub async fn new() -> Self {
-        Self::new_with_config(SchedulerConfig::default(), ReaperConfig::default()).await
+        Self::new_with_config(
+            SchedulerConfig::default().without_host_cpu_backpressure(),
+            ReaperConfig::default(),
+        )
+        .await
     }
 
     /// Creates a new test cluster with custom scheduler and reaper configurations.
@@ -1792,7 +1796,8 @@ async fn test_tier3_pairwise_interleaved_gpu_and_cpu_batches() {
 
 #[tokio::test]
 async fn test_tier3_pairwise_dynamic_load_backpressure_high_cpu() {
-    let cluster = TestCluster::new().await;
+    let cluster =
+        TestCluster::new_with_config(SchedulerConfig::default(), ReaperConfig::default()).await;
 
     // Worker 1: Heavy load (92% CPU, above default 85% cap)
     let caps1 = WorkerCapabilities::new("w-busy", 4, 4096, false, false, None);

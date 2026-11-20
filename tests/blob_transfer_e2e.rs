@@ -27,9 +27,22 @@ use rusty_grid_core::capabilities::MobileCapabilities;
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskResult, TaskSpec};
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::MobileTelemetryHandle;
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("master starts")
+}
 
 /// A battery reading that never makes the worker refuse work.
 fn plugged_in() -> MobileTelemetryHandle {
@@ -77,7 +90,7 @@ impl Cluster {
     }
 
     async fn start_with_config(config: ServerConfig, store_dir: TempDir) -> Self {
-        let master = MasterServer::spawn(config).await.expect("master starts");
+        let master = spawn_test_master(config).await;
         let addr = master.server_addr().to_string();
 
         let sandbox_dir = tempfile::tempdir().unwrap();
@@ -646,7 +659,7 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
     let store_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_blob_store(store_dir.path(), 256 * 1024 * 1024);
-    let master = MasterServer::spawn(config).await.expect("master starts");
+    let master = spawn_test_master(config).await;
     let addr = master.server_addr().to_string();
 
     let sandbox_dir = tempfile::tempdir().unwrap();
@@ -977,6 +990,8 @@ mod cli {
                     "127.0.0.1:0",
                     "--heartbeat-timeout-secs",
                     "60",
+                    "--max-host-cpu-pct",
+                    "100",
                     "--port-file",
                 ])
                 .arg(&port_file)
