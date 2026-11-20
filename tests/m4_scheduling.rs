@@ -94,7 +94,7 @@ impl TestCluster {
     async fn setup() -> Self {
         let sched_cfg = SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0);
+            .without_host_cpu_backpressure();
         let master = MasterServer::spawn_with_config(
             ServerConfig::new("127.0.0.1:0".parse().unwrap()),
             sched_cfg,
@@ -527,7 +527,7 @@ async fn test_m4_parallel_batch_spread_scheduling() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
-    let sched_config = SchedulerConfig::default().with_max_host_cpu_pct(100.0);
+    let sched_config = SchedulerConfig::default().without_host_cpu_backpressure();
     let reaper_config = ReaperConfig::default();
 
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap());

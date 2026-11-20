@@ -223,7 +223,7 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
         .with_session_resume_hold(Duration::ZERO);
     let sched_cfg = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     let master = MasterServer::spawn_with_config(server_cfg, sched_cfg, ReaperConfig::default())
         .await
         .expect("spawn master");

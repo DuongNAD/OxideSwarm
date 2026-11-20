@@ -61,7 +61,7 @@ async fn tasks_refused_for_a_broken_sandbox_base_complete_on_the_other_worker() 
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
         SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0),
+            .without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

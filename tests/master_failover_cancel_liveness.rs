@@ -68,7 +68,7 @@ async fn spawn_master() -> MasterHandle {
 async fn spawn_master_with_reaper(reaper: ReaperConfig) -> MasterHandle {
     MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper,
     )
     .await
@@ -1321,7 +1321,7 @@ mod quic {
             .with_ephemeral_key(true);
         let master = MasterServer::spawn_with_config(
             config,
-            SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+            SchedulerConfig::default().without_host_cpu_backpressure(),
             reaper,
         )
         .await

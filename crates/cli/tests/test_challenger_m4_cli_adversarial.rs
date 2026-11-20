@@ -540,7 +540,7 @@ async fn test_cli_deeply_nested_output_directory_creation() {
     // 1. Spawn in-process Master
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

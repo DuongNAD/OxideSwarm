@@ -342,6 +342,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented |  | 222, (design 0050) |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented |  | 227, (design 0050) |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | Out | 214, (design 0060) |
+| SCHED-5 | Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct | P2 | M |  |  | Planned | Out |  |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned | Out |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned | Out |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned | Out |  |
@@ -988,6 +989,24 @@ owner's decisions Q8, Q9 and Q12 are open.
   identical tasks finishing at least 30 % sooner than with today's placement, unknown keys keep
   today's placement exactly (the existing scheduler tests pass unchanged), and a live two-machine
   batch like the one above finishes within 1.5 times the fast machine's own time.
+
+### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
+
+- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
+  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
+  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
+- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
+  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
+  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
+  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
+- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
+  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
+  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
+  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
+  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
+     than on every scheduling pass.
+- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
+  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
 
 ## Phase 8: product and ecosystem
 
@@ -2500,4 +2519,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-73 Implemented (pull request 397, open; text in the archive): in `tests/m4_scheduling.rs`, replaced the `< 800 ms` / `< 1200 ms` parallel-batch wall-clock cap in `test_m4_parallel_batch_spread_scheduling` with a cross-platform `started_*`/`release` barrier proving `>= 3` concurrent running tasks within `60 s` (keeping 3-worker spread assertions and printing both timings), dropped the `< 1.5 s` cancellation wall-clock check in `test_m4_in_flight_task_cancellation` (`sleep 120`, printing `cancel_duration`), gated failover retry disconnect on markers instead of `sleep 0.8`, and widened registration, worker disconnect, `wait_task`, and task timeouts to `TEST_WAIT_TIMEOUT = 60 s` (`wait_for_workers` / `wait_for_task_running` diagnostics); 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`53.70 s`, `2.56–3.88 s`, expected `0/20` since the flake occurred on a 12-thread Windows laptop) and `20/20` after (`34.18 s`, `1.60–1.81 s`).
 - 2026-11-19: TEST-68 Implemented (pull request 396, open; text in the archive): raised fixed `3–8 s` waits (`wait_for`, `wait_task`) and `5–15 s` task timeouts to `60 s` (`TEST_WAIT_TIMEOUT`, shared `wait_for_workers` dumping observed worker statuses on failure) in `tests/gpu_wgpu_compute_test.rs` (`test_e2e_cluster_gpu_task_distribution` and `test_adversarial_scheduling_isolation_mixed_cluster`), kept every strict routing check and the `500 ms` `Queued` negative check, and re-verified `stranded_id` stays `Queued` after `quick_cpu` completes on a free CPU worker; compiles with `--features gpu-wgpu` and passed `20/20` (`97.83 s`, `4.71–6.37 s`) before and `20/20` (`95.01 s`, `4.69–4.91 s`) after under 6 busy loops on Apple M5.
 - 2026-11-20: TEST-80 Implemented (pull request 402 (open); text in the archive): in `crates/worker/tests/test_sec5_hardened_runner.rs` (`test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading`), dropped both `elapsed < 5 s` wall-clock upper bounds (logging elapsed times instead), kept the metadata-refusal structural checks (`"is {sparse_bytes} bytes"`, `!"is more than"`, `asset_bytes.is_none()`), and raised the `BlenderRigProvider::execute_rigging` timeout from `15 s` to `60 s`; `--features 3d` 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`12.88 s`, `0.54–1.91 s`) and `20/20` after (`11.47 s`, `0.54–0.61 s`; single full binary `28/28` in `2.83 s`).
-- 2026-11-20: TEST-81 Implemented (pull request 404, open; text in the archive): confirmed from a debug master log under 6 busy loops plus concurrent `cargo test -p rusty_grid_cli` that `SchedulerConfig::max_host_cpu_pct` (`85.0`) holds workers back (`51` `DEBUG` lines logging `max_host_cpu_pct=85.0`, `cpu_usage_pct=99.60392`, stalling the 3rd submit after `5 s`), added `SchedulerConfig::with_max_host_cpu_pct` and the gated `DEBUG` log in `crates/master/src/scheduler.rs`, and opted `57` non-backpressure test files out (`100.0` / `--max-host-cpu-pct 100`) while keeping production default `85.0` and all backpressure/config tests unchanged; `blob_transfer_e2e` 20-run loaded loops passed `20/20` before (`576.66 s`, `26.18–36.63 s`; reproduced in Q80 workspace Run 2) and `20/20` after (`627.62 s`, `29.01–33.98 s`), and the full workspace suite passed (`137` binaries, `2,228 passed; 0 failed; 5 ignored`).
+- 2026-11-20: TEST-81 Implemented (pull request 404, open; text in the archive): confirmed with a temporary debug master log under 6 busy loops plus concurrent `cargo test -p rusty_grid_cli` that `SchedulerConfig::max_host_cpu_pct` (`85.0`) holds workers back (`51` `DEBUG` lines logging `max_host_cpu_pct=85.0`, `cpu_usage_pct=99.60392`, stalling the 3rd submit after `5 s`; removed per review and replaced by `SCHED-5` for the product behavior), added `SchedulerConfig::with_max_host_cpu_pct` and `SchedulerConfig::without_host_cpu_backpressure` in `crates/master/src/scheduler.rs`, and opted `57` non-backpressure test files out (`without_host_cpu_backpressure()` / `--max-host-cpu-pct 100`) while keeping production default `85.0` and all backpressure/config tests unchanged; `blob_transfer_e2e` 20-run loaded loops passed `20/20` before (`576.66 s`, `26.18–36.63 s`; reproduced in Q80 workspace Run 2) and `20/20` after (`627.62 s`, `29.01–33.98 s`), and the full workspace suite passed (`137` binaries, `2,228 passed; 0 failed; 5 ignored`).
+- 2026-11-20: Added SCHED-5 (Planned, Out): tell the user why a queued task waits when every eligible worker is above `max_host_cpu_pct` (open question from TEST-81, with PR 404 review inputs: `AllEligibleWorkersSaturated` skips only, connected workers only, once per change of the busy-worker set; visible form to be decided in a design record).

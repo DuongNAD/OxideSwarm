@@ -19,7 +19,7 @@ use rusty_grid_worker::client::WorkerClient;
 async fn spawn_test_master_result(config: ServerConfig) -> GridResult<MasterHandle> {
     let sched_cfg = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default()).await
 }
 

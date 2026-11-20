@@ -3111,20 +3111,23 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   stress loops, host CPU exceeds `85 %` and unrelated task-dispatch tests stall with no indication of
   why tasks remain `Queued`. This `85 %` host-CPU backpressure is probably behind several Windows-hunt
   flakes (`TEST-69` to `TEST-79`) and the `TEST-68` echo stall as well.
-  Open product question for later (left unchanged here): when every worker sits above `85 %` host CPU,
-  queued tasks wait silently without any hint to the user.
-- **Do:** Add `SchedulerConfig::with_max_host_cpu_pct` and a `tracing::enabled!(Level::DEBUG)` log in
-  `WorkloadScheduler::schedule_batch` reporting `skipped`, `max_host_cpu_pct`, and `busy_workers`; opt
-  non-backpressure test masters out (`100.0` / `--max-host-cpu-pct 100`) across the suite; and keep
+  Open product question for later (now tracked in `SCHED-5` in `docs/BACKLOG.md`): when every worker
+  sits above `85 %` host CPU, queued tasks wait silently without any hint to the user.
+- **Do:** Confirm host-CPU backpressure as the cause from a debug master log, add
+  `SchedulerConfig::with_max_host_cpu_pct` and `SchedulerConfig::without_host_cpu_backpressure`
+  (leaving user-facing backpressure reporting to `SCHED-5`), opt non-backpressure test masters out
+  (`without_host_cpu_backpressure()` / `--max-host-cpu-pct 100`) across the suite, and keep
   production default `85.0` and all CPU-backpressure / config-default tests untouched.
 - **Done when:** Non-backpressure test masters opt out of `85 %` CPU backpressure, host-CPU
   backpressure and config tests remain at `85.0 %` and pass, `blob_transfer_e2e` passes `20/20` under
   6 busy loops, and `cargo test --workspace --locked` passes cleanly.
 - **Implemented (2026-11-20, pull request 404, open):** Added `SchedulerConfig::with_max_host_cpu_pct`,
-  gated `DEBUG` logging (`ScheduleSkipReason` with saturated workers), and unit test
-  `test_with_max_host_cpu_pct_100_allows_saturated_test_host` in `crates/master/src/scheduler.rs`; opted
-  `57` non-backpressure test files out (`100.0` / `--max-host-cpu-pct 100`) alongside the `3` already
-  opted-out files (`tests/m4_challenger_2_stress.rs`, `tests/m6_challenger_1_stress.rs`,
+  `SchedulerConfig::without_host_cpu_backpressure`, and unit test
+  `test_with_max_host_cpu_pct_100_allows_saturated_test_host` in `crates/master/src/scheduler.rs`
+  (removing the temporary per-pass `DEBUG` log per PR 404 review and moving user-facing reporting to
+  `SCHED-5`); opted `57` non-backpressure test files out (`without_host_cpu_backpressure()` /
+  `--max-host-cpu-pct 100`) alongside the `3` already opted-out files
+  (`tests/m4_challenger_2_stress.rs`, `tests/m6_challenger_1_stress.rs`,
   `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`), while keeping production default `85.0` and
   all backpressure/config tests (`scheduler::tests`,
   `e2e_cluster::test_tier3_pairwise_dynamic_load_backpressure_high_cpu`, `tests/m6_challenger_2_stress.rs`,

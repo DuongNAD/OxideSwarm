@@ -49,7 +49,7 @@ impl HarnessCluster {
         let config = ServerConfig::new(bind_addr).with_blob_store(&blob_dir, 128 * 1024 * 1024);
         let sched_cfg = SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0);
+            .without_host_cpu_backpressure();
         let master = MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
             .await
             .expect("spawn MasterServer");

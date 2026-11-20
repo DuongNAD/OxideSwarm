@@ -577,7 +577,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         .with_max_failovers(1);
     let sched_config = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     let master =
         MasterServer::spawn_with_config(server_config, sched_config, ReaperConfig::default())
             .await
@@ -825,7 +825,7 @@ async fn test_wifi_phone_with_short_reaper_timeout_reports_wifi_within_3s_and_st
     let reaper_config = ReaperConfig::new(Duration::from_millis(200), Duration::from_secs(2));
     let master = MasterServer::spawn_with_config(
         server_config,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper_config,
     )
     .await
@@ -914,7 +914,7 @@ async fn test_50s_task_on_wifi_phone_finishes_in_one_session_with_zero_retries()
     let reaper_config = ReaperConfig::new(Duration::from_millis(500), Duration::from_secs(10));
     let master = MasterServer::spawn_with_config(
         server_config,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper_config,
     )
     .await
@@ -1025,7 +1025,7 @@ async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_a
     let reaper_config = ReaperConfig::new(Duration::from_millis(250), Duration::from_secs(10));
     let master = MasterServer::spawn_with_config(
         server_config,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper_config,
     )
     .await
@@ -1129,7 +1129,7 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
     let reaper_config = ReaperConfig::new(Duration::from_millis(250), Duration::from_secs(10));
     let master = MasterServer::spawn_with_config(
         server_config,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper_config,
     )
     .await
@@ -1324,7 +1324,7 @@ async fn test_critical_thermal_phone_gets_zero_assignments_after_register_and_af
     let reaper_config = ReaperConfig::new(Duration::from_millis(200), Duration::from_secs(10));
     let master = MasterServer::spawn_with_config(
         server_config,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper_config,
     )
     .await

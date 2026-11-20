@@ -62,7 +62,7 @@ impl TwoSpeedCluster {
         let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
         let master = MasterServer::spawn_with_config(
             server_cfg,
-            sched_config.with_max_host_cpu_pct(100.0),
+            sched_config.without_host_cpu_backpressure(),
             ReaperConfig::default(),
         )
         .await
@@ -286,7 +286,7 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
     let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
     let master = MasterServer::spawn_with_config(
         server_cfg,
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

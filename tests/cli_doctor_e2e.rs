@@ -35,7 +35,7 @@ impl Cluster {
         let master = MasterServer::spawn_with_config(
             ServerConfig::new("127.0.0.1:0".parse().unwrap())
                 .with_blob_store(blob_dir.path(), 64 * 1024 * 1024),
-            SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+            SchedulerConfig::default().without_host_cpu_backpressure(),
             ReaperConfig::default(),
         )
         .await
@@ -320,7 +320,7 @@ async fn test_doctor_skips_throughput_when_asked_or_when_the_master_has_no_blob_
     // A master without a blob store cannot move files: skipped, not failed.
     let bare = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await
@@ -377,7 +377,7 @@ async fn test_doctor_fails_when_master_task_store_has_failed() {
     let state_dir = dir.path().join("state");
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_state_dir(&state_dir),
-        SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

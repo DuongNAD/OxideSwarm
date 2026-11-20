@@ -98,7 +98,7 @@ async fn closed_by_server(stream: &mut TcpStream, within: Duration) -> bool {
 async fn spawn_master(config: ServerConfig) -> MasterHandle {
     let sched_cfg = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
         .await
         .expect("spawn master")

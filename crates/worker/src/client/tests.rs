@@ -3004,7 +3004,7 @@ async fn test_cancel_during_output_upload_reports_result_and_decrements_master_a
             .with_heartbeat_interval(30),
         SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0),
+            .without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

@@ -62,7 +62,7 @@ impl TestCluster {
 
         let master = MasterServer::spawn_with_config(
             server_config,
-            SchedulerConfig::default().with_max_host_cpu_pct(100.0),
+            SchedulerConfig::default().without_host_cpu_backpressure(),
             ReaperConfig::default(),
         )
         .await

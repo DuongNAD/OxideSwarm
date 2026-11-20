@@ -68,7 +68,7 @@ async fn test_adversarial_disconnect_race_during_checkpoint_emission() {
         config,
         SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0),
+            .without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

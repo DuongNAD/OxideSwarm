@@ -246,7 +246,7 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
         server_config,
         SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0),
+            .without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

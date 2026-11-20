@@ -49,7 +49,7 @@ async fn spawn_test_cluster() -> (
         server_cfg,
         SchedulerConfig::default()
             .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-            .with_max_host_cpu_pct(100.0),
+            .without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await

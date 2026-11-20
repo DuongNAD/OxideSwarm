@@ -520,7 +520,7 @@ async fn test_cli_save_output_artifacts() {
 async fn test_e2e_full_cluster_file_staging_and_artifact_retrieval() {
     let sched_cfg = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
         sched_cfg,

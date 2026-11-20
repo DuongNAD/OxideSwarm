@@ -797,7 +797,7 @@ async fn test_a_stalled_upload_to_a_master_that_stopped_reading_is_detected() {
 async fn spawn_real_master() -> MasterHandle {
     let sched_cfg = SchedulerConfig::default()
         .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
-        .with_max_host_cpu_pct(100.0);
+        .without_host_cpu_backpressure();
     MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_handshake_timeout(2),
         sched_cfg,
