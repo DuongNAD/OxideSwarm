@@ -2690,6 +2690,33 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-63: master_limits_and_scheduling: prove MapReduce concurrency with a barrier instead of a 7 s window
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `test_mapreduce_tasks_run_on_all_workers_at_once`
+  (`tests/master_limits_and_scheduling.rs:256:5`) failed `1/5` runs at
+  `9 one-second tasks on 4 slots took 20.682465417s: tasks are not running concurrently`.
+- **Problem:** The test used `sleep 1` in 4 mappers and 5 reducers and checked `elapsed < Duration::from_secs(7)`
+  with a `60 s` mapper timeout (left unchanged by `TEST-54` in pull request `333`); under heavy host CPU
+  contention, spawning 9 sequential/wave shell + Python subprocesses stretched past `7 s` even when scheduled
+  concurrently, without directly proving all 4 slots ran mappers at the same time.
+- **Do:** Replace `sleepy_job` with `barrier_job`: each mapper writes `$RUSTY_GRID_WORKER_ID` into a temporary
+  barrier directory (`$barrier/active-$RUSTY_GRID_TASK_ID`) and polls until all `4` `active-*` files exist
+  simultaneously (impossible unless both 2-slot workers hold 2 active mappers at once), assert `4` markers
+  distributed `2`/`2` across the `2` workers, use `WAIT = 180 s` (`mapper_timeout_secs = 540`) with queue +
+  barrier diagnostics on timeout, drop `elapsed < Duration::from_secs(7)`, and shut down `w1`/`w2` cleanly
+  before `TempDir` drop.
+- **Done when:** Concurrency across both workers is proven directly by the barrier, all outcome assertions
+  stay intact, and `cargo test -p rusty_grid_master --test master_limits_and_scheduling --locked -- --exact test_mapreduce_tasks_run_on_all_workers_at_once`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 389, open):** Updated `tests/master_limits_and_scheduling.rs` as planned.
+  On a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `test_mapreduce_tasks_run_on_all_workers_at_once` (`--locked`):
+  - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`120.02 s` total, `5.05–7.33 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`57.08 s` total, `1.90–5.25 s` per run).
+  Full `master_limits_and_scheduling`, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+
 ### TEST-66: worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests
 
 - **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
