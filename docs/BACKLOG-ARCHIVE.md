@@ -3415,7 +3415,7 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** Every audited Category 1 bound across `android_bridge`, `cli`, `agent_mesh`, and Python
   tests is structural or guarded at `60 s`, `cargo fmt`, workspace `clippy`, and doc hygiene pass, and
   all `12` binaries pass `20/20` under 6 CPU busy loops.
-- **Implemented (2026-11-20, pull request TBD, open):** Updated all `19` audited Category 1 hits (plus
+- **Implemented (2026-11-20, pull request 407, open):** Updated all `19` audited Category 1 hits (plus
   coupled waits/sleep targets in the same tests) across `12` files / `12` binaries:
   - `crates/agent_mesh/src/executor.rs` (`agent_mesh --lib`, `1` hit, `:775`): in
     `test_command_timeout_kills_hung_process`, raised inner sleep `10 -> 120` (Windows and Unix), widened
