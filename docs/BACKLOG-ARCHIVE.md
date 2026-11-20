@@ -2690,6 +2690,87 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `ox-mode test size`, and `ox-mode doc verify` all passed.
 
+### TEST-63: master_limits_and_scheduling: prove MapReduce concurrency with a barrier instead of a 7 s window
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `test_mapreduce_tasks_run_on_all_workers_at_once`
+  (`tests/master_limits_and_scheduling.rs:256:5`) failed `1/5` runs at
+  `9 one-second tasks on 4 slots took 20.682465417s: tasks are not running concurrently`.
+- **Problem:** The test used `sleep 1` in 4 mappers and 5 reducers and checked `elapsed < Duration::from_secs(7)`
+  with a `60 s` mapper timeout (left unchanged by `TEST-54` in pull request `333`); under heavy host CPU
+  contention, spawning 9 sequential/wave shell + Python subprocesses stretched past `7 s` even when scheduled
+  concurrently, without directly proving all 4 slots ran mappers at the same time.
+- **Do:** Replace `sleepy_job` with `barrier_job`: each mapper writes `$RUSTY_GRID_WORKER_ID` into a temporary
+  barrier directory (`$barrier/active-$RUSTY_GRID_TASK_ID`) and polls until all `4` `active-*` files exist
+  simultaneously (impossible unless both 2-slot workers hold 2 active mappers at once), assert `4` markers
+  distributed `2`/`2` across the `2` workers, use `WAIT = 180 s` (`mapper_timeout_secs = 540`) with queue +
+  barrier diagnostics on timeout, drop `elapsed < Duration::from_secs(7)`, and shut down `w1`/`w2` cleanly
+  before `TempDir` drop.
+- **Done when:** Concurrency across both workers is proven directly by the barrier, all outcome assertions
+  stay intact, and `cargo test -p rusty_grid_master --test master_limits_and_scheduling --locked -- --exact test_mapreduce_tasks_run_on_all_workers_at_once`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 389, open):** Updated `tests/master_limits_and_scheduling.rs` as planned.
+  On a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `test_mapreduce_tasks_run_on_all_workers_at_once` (`--locked`):
+  - Before fix (on `origin/master` `8641b67d`): `20/20` passed (`120.02 s` total, `5.05–7.33 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`57.08 s` total, `1.90–5.25 s` per run).
+  Full `master_limits_and_scheduling`, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+
+### TEST-66: worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `test_unanswered_handshake_times_out_with_a_secret`
+  (`tests/worker_cluster_auth.rs:382:5`) failed `1/5` runs at `assertion failed: started.elapsed() < Duration::from_secs(3)`.
+- **Problem:** `tests/worker_cluster_auth.rs` checked wall-clock upper bounds (`< 3 s` around a `300 ms`
+  handshake timeout in `test_unanswered_handshake_times_out_with_a_secret`, `< 2 s` in
+  `test_shutdown_interrupts_a_handshake_with_a_silent_master` after a fixed `400 ms` sleep, and `< 2 s` /
+  `5 s` in `test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interrupts_it` alongside a
+  `10 s` `RunningWorker::stop` bound), which trip on a CPU-starved host.
+- **Do:** Raise `RunningWorker::stop` to `TEST_WAIT_TIMEOUT` (`60 s`), wait by condition for the initial
+  auth attempt / silent-master TCP accept (`tokio::sync::Notify`) up to `60 s`, bound the `300 ms`
+  unanswered-handshake test by `tokio::time::timeout(TEST_WAIT_TIMEOUT, ...)` without `< 3 s` or `< 2 s`
+  wall-clock assertions, and assert `shutdown` ends the `30 s`-floored auth backoff within `25 s` with
+  `attempts == 1`.
+- **Done when:** All outcome assertions stay intact and `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`
+  passes `20/20` under `6` busy loops after the fix.
+- **Implemented (2026-11-19, pull request 387, open):** Updated `tests/worker_cluster_auth.rs` as planned. On
+  a 10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`, running `cargo test -p rusty_grid_worker --test worker_cluster_auth --locked`:
+  - Before fix (on `origin/master` `fc694126`): `20/20` passed (`188.76 s` total, `8.11–10.36 s` per run;
+    reproduced `1/5` in full workspace Run 5).
+  - After fix: `20/20` passed (`198.06 s` total, `8.54–11.57 s` per run).
+  Workspace `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `worker_cluster_auth`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-62: blob_transfer_e2e: print CLI submit output on failure and harden loaded timeouts
+
+- **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
+  `6` Python CPU busy loops, private `HOME`), `cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  (`tests/blob_transfer_e2e.rs:1073:9`) failed `1/5` runs at `assertion left == right failed: left: Some(1), right: Some(7)`
+  when the `submit --wait --timeout-secs 30` subcheck for `exit 7` exited `1`, without printing stdout/stderr.
+- **Problem:** Inside `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, synchronous
+  `std::process::Command::output()` and `std::thread::sleep` calls blocked Tokio runtime threads hosting
+  the in-process `WorkerClient`, while `rusty-grid master` kept its `10 s` default `--heartbeat-timeout-secs`,
+  `port_file`/registration polls used `20 s`, `submit` used `30–60 s`, and failing CLI assertions suppressed
+  stdout, stderr, and `master.log`.
+- **Do:** Run `rusty-grid` CLI subprocesses via `tokio::task::spawn_blocking`, replace synchronous polling
+  with `60 s` async loops, pass `--heartbeat-timeout-secs 60` to `rusty-grid master`, raise `submit`
+  `--timeout-secs` to `120`, include stdout, stderr, and `master.log` in all CLI submit failure messages,
+  and shut down the in-process worker cleanly (`stop_worker` + `60 s` join timeout).
+- **Done when:** All assertions stay intact, failure messages include full CLI and master diagnostics, and
+  `cargo test -p rusty_grid_cli --test blob_transfer_e2e --locked -- --exact cli::test_cli_submit_input_and_output_round_trip_with_dedup`
+  passes `20/20` under `6` busy loops after the fix (plus a full-binary run).
+- **Implemented (2026-11-19, pull request 390, open):** Updated `tests/blob_transfer_e2e.rs` as planned. On a
+  10-core Apple Silicon Mac under `6` Python CPU busy loops (`python3 -c 'while True: pass'`), private
+  `HOME`:
+  - Before fix (on `origin/master` `8641b67d`, with diagnostic capture added): test alone passed `20/20`
+    (`98.11 s` total, `3.61–6.98 s` per run; full binary `1/1` loaded probe `30.08 s`; reproduced `1/5`
+    in full workspace Run 5).
+  - After fix (test alone): `20/20` passed (`98.23 s` total, `3.88–6.83 s` per run).
+  Full `blob_transfer_e2e`, workspace `fmt`, `clippy --workspace --all-targets --locked -- -D warnings`,
+  and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
 ### TEST-64: worker lib process_tree_tests: wait for partial stdout by condition before cancelling
 
 - **Evidence:** In loaded workspace Run 5 on a 10-core Apple Silicon Mac (`origin/master` `fc694126` under
@@ -2825,6 +2906,165 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - Before fix (`origin/master` `d321d97f`): `20/20` passed (`37.29 s` total, `1.72–3.59 s` per run).
   - After fix: `3/3` passed in `1.64 s`, and the 20-run loaded loop passed `20/20` (`35.51 s` total,
     `1.70–1.85 s` per run, `0` failures).
+
+### TEST-78: rendezvous_discovery_e2e: widen 10-30 s command and registration deadlines to 60 s
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Item 10 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled` failed at
+  `tests/rendezvous_discovery_e2e.rs:111` (`run_with_timeout(submit_cmd, Duration::from_secs(20))` at
+  `:229`): `Command timed out after 20s`, after Tier 1 UDP + Tier 2 HTTP timeouts + rendezvous lookup
+  + auth handshake + worker spawn.
+- **Problem:** `tests/rendezvous_discovery_e2e.rs` used `10–30 s` timeouts for subprocess setup
+  (`secret generate`, `wait_for_port_file` at `10 s` / `15 s`), worker registration polling (`30 s`),
+  `workers --master auto` (`10 s`), `submit --master auto --wait` (`20 s`), and HTTPS/unsigned
+  rejection commands (`10 s`), plus `1–2 s` `discover_master_rendezvous` checks, and
+  `run_with_timeout` panicked without child `stdout`/`stderr` or rendezvous/master/worker service
+  logs.
+- **Do:** Add `TEST_WAIT_TIMEOUT = 60 s` and `run_with_timeout_with_logs` (draining child
+  `stdout`/`stderr` in background threads and printing captured child output plus service logs on
+  timeout without blocking on thread joins if a child leaves a pipe open); raise all
+  `wait_for_port_file`, registration deadline, `run_with_timeout` / `run_with_timeout_with_logs`,
+  and `discover_master_rendezvous` deadlines to `TEST_WAIT_TIMEOUT`; and include rendezvous, master,
+  and worker logs on `submit_out` assertion failure.
+- **Done when:** All 3 tests keep every Tier 3 rendezvous discovery, keyed isolation,
+  anti-harvesting, and CLI URL rejection assertion, print service + child diagnostics on failure, and
+  pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 400, open):** Updated `tests/rendezvous_discovery_e2e.rs` and
+  verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures
+  before the fix is expected since the `20 s` timeout occurred on a 12-thread Windows laptop):
+  - Before fix (`origin/master` `d321d97f`): `20/20` passed (`195.42 s` total, `9.54–11.58 s` per
+    run).
+  - After fix: `3/3` passed in `9.16 s`, and the 20-run loaded loop passed `20/20` (`193.82 s` total,
+    `9.39–10.00 s` per run, `0` failures).
+
+### TEST-74: m5_challenger_2_stress: wait 60 s for reduce Running on w1 and use TEST-54 MapReduce timeouts
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate_retained` failed at
+  `tests/m5_challenger_2_stress.rs:623`: `mapreduce execution after reduce worker crash: Timeout { operation: "MapReduce task ...", duration_secs: 60 }`.
+  Reproduced locally on Apple M5 (`98570ab9`, 6 CPU busy loops) in `2/20` runs (runs 11 and 12 of
+  20, both at `:623:10` after `67.40 s` / `67.42 s`, with the other 18 runs splitting into `~5.1 s` vs
+  `~7.6 s`).
+- **Problem:** In `test_m5_mapreduce_worker_crash_during_reduce_phase_retried_intermediate_retained`,
+  `tasks.iter().find(|t| t.assigned_worker_id == Some(w1.worker_id))` returned `w1`'s first task in
+  `HashMap` iteration order (`TaskQueue::list_tasks`): when hash order put `w1`'s already-`Completed`
+  map task first instead of a `Running` reduce task, the loop spun for its full `6 s` deadline before
+  falling back to `w1.abort()`. The `60 s` failure itself is the engine's idle timeout; the old test
+  printed no diagnostics, so which task stalled is unknown (the two consecutive `~67.4 s` local runs
+  point to a load burst and 85 % host-CPU backpressure), and the post-job assertion only checked
+  `retry_count == 0` on `>= 2` tasks without verifying `tasks.len() == 7` or reduce failover on the
+  surviving worker. Sibling `test_m5_mapreduce_worker_crash_during_map_phase_rescheduled` also used
+  a `4 s` fallback loop, `wait_for_workers` used `5 s`, `MapReduceJobSpec` used `30–60 s` without an
+  outer `WAIT`, and `spawn_test_worker` omitted `.with_ram_mb(4096)` / `.with_no_gpu` /
+  `.with_no_blender(true)` / `.with_no_cuda(true)` / `.with_redirection_portal(false)` (`TEST-20`).
+- **Do:** Poll up to `TEST_WAIT_TIMEOUT = 60 s` for a `TaskState::Running` task on either `w1` or
+  `w2` (plus `completed_count >= 2` in the reduce-crash test), crash whichever worker holds that
+  `Running` task, and panic with `task_summary` diagnostics instead of falling back after `4–6 s`
+  (this repairs crash injection separately from the `60 s` stall); protect against the `60 s` idle
+  stall with the `TEST-54` MapReduce timeout pairing (`MR_WAIT = 180 s` outer `tokio::time::timeout`
+  dumping `queue_stats` + `task_summary`, and `MR_TASK_TIMEOUT_SECS = 540` strictly above `MR_WAIT`
+  across all specs); assert `tasks.len() == 7` (2 map + 5 reduce, proving no map recomputation) and
+  at least one `Completed` task with `failover_count >= 1` assigned to the surviving worker (not the
+  aborted worker); widen all `wait_for_workers` calls (`5 s` -> `60 s`); and apply the `TEST-20`
+  worker config flags in `spawn_test_worker`.
+- **Done when:** All 11 tests keep every MapReduce, intermediate shuffle retention, reduce failover,
+  and `retry_count == 0` map-phase invariant, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 398, open):** Updated `tests/m5_challenger_2_stress.rs` and
+  verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `98570ab9`): `18/20` passed, **`2/20` failed** at `:623:10`
+    (`252.31 s` total, `4.97–67.79 s` per run).
+  - After fix: `11/11` passed in `3.51 s`, and the 20-run loaded loop passed `20/20` (`74.45 s` total,
+    `3.61–3.86 s` per run, `0` failures).
+
+### TEST-77: e2e_cluster: widen 3-5 s worker and wait_task deadlines to 60 s
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_tier2_bva_max_concurrency_limit_throttles_worker` failed at `tests/e2e_cluster.rs:1142`:
+  `called Result::unwrap() on an Err value: Timeout { operation: "wait_task(...)", duration_secs: 5 }`.
+- **Problem:** Across `tests/e2e_cluster.rs`, `wait_for_workers`, `poll_until`, `submit_and_wait`,
+  and dozens of direct `wait_task`, `Instant::now() + 2–3 s`, and `tokio::time::timeout(3 s)` calls
+  used `2–15 s` deadlines (paired with `5–15 s` task timeouts), and `TestCluster::spawn_worker` plus
+  `test_tier2_bva_max_concurrency_limit_throttles_worker` omitted `TEST-20` no-Blender/no-CUDA/no-portal
+  flags.
+- **Do:** Add `TEST_WAIT_TIMEOUT = 60 s`, floor `wait_for_workers`, `submit_and_wait`, and
+  `poll_until` at `TEST_WAIT_TIMEOUT`, raise all direct `wait_task` (`5–15 s` -> `60 s`),
+  registration (`3–30 s` -> `60 s`), cancellation/routing deadlines (`2–3 s` -> `60 s`), `sleep 2`/`10`
+  cancellation targets (`sleep 120`, `timeout_secs = 180`), MapReduce specs (`20–30 s` -> `180 s`), and
+  non-timeout `TaskRequirements` (`10–30 s` -> `60 s`), and apply `TEST-20` worker config flags in
+  `spawn_worker` and `test_tier2_bva_max_concurrency_limit_throttles_worker` (keeping every routing,
+  serial `>= 250 ms`, negative `Queued`, and `1 s` timeout test assertion intact).
+- **Done when:** All 65 tests keep full assertions (including `elapsed >= 250 ms` serialization and the
+  `1 s` timeout test) and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 399, open):** Updated `tests/e2e_cluster.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` local failures before the fix is
+  expected since the `5 s` timeout occurred on a 12-thread Windows laptop):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`162.16 s` total, `7.52–9.50 s` per run).
+  - After fix: `65/65` passed in `2.50 s`, and the 20-run loaded loop passed `20/20` (`63.93 s` total,
+    `2.99–3.38 s` per run, `0` failures).
+
+### TEST-73: m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_m4_parallel_batch_spread_scheduling` failed at `tests/m4_scheduling.rs:433`:
+  `Batch of 5 tasks should execute in parallel across 3 workers in < 1.2s, took 1.242767s`. Sibling
+  `test_m4_in_flight_task_cancellation` also enforced `cancel_duration < 1500 ms` (`:630`), and all
+  five tests in `tests/m4_scheduling.rs` used fixed `3–8 s` waits (`5 s` / `12 s` registration,
+  `3–6 s` waits / disconnects, `8 s` failover wait against `sleep 0.8`, `3–4 s` cancel/quick waits).
+- **Problem:** Wall-clock upper bounds (`1.2 s` / `1.5 s`) and tight `3–8 s` waits flake when a
+  loaded test runner schedules child shells slower than nominal desktop latency.
+- **Do:** Replace `wait_for` with `TEST_WAIT_TIMEOUT = 60 s` helpers (`wait_for_workers` and
+  `wait_for_task_running` with observed worker/status diagnostics); in
+  `test_m4_parallel_batch_spread_scheduling`, replace `sleep 0.2` and the `< 800 ms` / `< 1200 ms`
+  wall-clock assertion with a cross-platform `sh -c` concurrency barrier in `tempfile::tempdir()`
+  (`started_<i>` markers + host-released `release` gate after observing `>= 3` concurrent tasks
+  within `60 s`, printing both time-to-3 and total batch time) while keeping all 5 exit-0 and 3-worker
+  spread assertions; in `test_m4_worker_disconnect_during_execution_triggers_retry`, gate the first
+  attempt on `first_started` / `first_aborted` markers instead of `sleep 0.8`; and in
+  `test_m4_in_flight_task_cancellation`, sleep `120 s` (`timeout_secs = 180`), drop the `< 1.5 s`
+  wall-clock cap while printing `cancel_duration`, and widen all remaining `wait_task` / registration /
+  task timeouts to `60 s` (keeping the `400 ms` `Queued` negative check untouched).
+- **Done when:** All 5 tests keep every routing, spread, retry, and cancellation assertion with no
+  wall-clock window, compile cleanly, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 397, open):** Updated `tests/m4_scheduling.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` failures before the fix on macOS
+  is expected because the `< 1.2 s` flake hit a 12-thread Windows laptop):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`53.70 s` total, `2.56–3.88 s` per run).
+  - After fix: `5/5` passed in `1.39 s` (`m4 parallel batch: 5 tasks running concurrently after 21.459708ms, total batch 81.544416ms`),
+    and the 20-run loaded loop under 6 busy loops passed `20/20` (`34.18 s` total, `1.60–1.81 s` per
+    run, `0` failures).
+
+### TEST-68: gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines
+
+- **Evidence:** During CI on pull request 387 (`workspace tests (windows-latest)`, run `44597494223`,
+  `cargo test --workspace --locked --no-fail-fast`), `test_adversarial_scheduling_isolation_mixed_cluster`
+  panicked at `tests/gpu_wgpu_compute_test.rs:1218:10`:
+  `quick wait: Timeout { operation: "wait_task(...)", duration_secs: 3 }`.
+- **Problem:** `tests/gpu_wgpu_compute_test.rs` used fixed `3–8 s` condition-wait and `wait_task`
+  timeouts (`5 s` worker registration and `5 s` `wait_task` with `15 s` task timeout in Scenario 7
+  `test_e2e_cluster_gpu_task_distribution`; `5 s` registration, `8 s` × 12 `wait_task` calls with
+  `10 s`/`15 s` task timeouts, `3 s` Worker 3 `Disconnected` wait, and `3 s` `quick_cpu` `wait_task`
+  with `5 s` task timeout in Scenario 11 `test_adversarial_scheduling_isolation_mixed_cluster`), causing
+  false timeouts on loaded CI runners.
+- **Do:** Define `TEST_WAIT_TIMEOUT = 60 s` and shared helper `wait_for_workers` polling
+  `master.list_workers()` until the predicate passes or dumping observed `(worker_id, status)` pairs on
+  timeout; raise the worker registration (`5 s` -> `60 s`), Worker 3 disconnect (`3 s` -> `60 s`),
+  `wait_task` (`3–8 s` -> `60 s`), and `TaskRequirements` task execution timeouts (`5–15 s` -> `60 s`)
+  with descriptive failure panics naming the awaited condition and task/worker IDs; keep every strict
+  capability routing assertion and the `500 ms` negative check before asserting `stranded_id` stays
+  `Queued`, and strengthen the negative check by re-checking `master.get_task_status(stranded_id)` is
+  still `Queued` after `quick_cpu` completes on a free CPU worker.
+- **Done when:** All 14 tests in `tests/gpu_wgpu_compute_test.rs` keep full routing and negative checks,
+  compile with and without `--features gpu-wgpu`, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 396, open):** Updated `tests/gpu_wgpu_compute_test.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`97.83 s` total, `4.71–6.37 s` per run).
+  - After fix: `cargo test -p rusty_grid_worker --test gpu_wgpu_compute_test --features gpu-wgpu --no-run --locked`
+    compiled cleanly, default `14/14` passed in `4.41 s`, and the 20-run loop under 6 Python busy loops
+    passed `20/20` (`95.01 s` total, `4.69–4.91 s` per run, `0` failures).
 
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
