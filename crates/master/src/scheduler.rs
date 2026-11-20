@@ -327,6 +327,12 @@ pub struct ScheduleReport {
     pub assignments: Vec<ScheduleAssignment>,
     pub skipped: Vec<(TaskId, ScheduleSkipReason)>,
     pub unfulfillable: Vec<(TaskId, String)>,
+    #[cfg(test)]
+    pub(crate) dead_speed_hits: usize,
+    #[cfg(test)]
+    pub(crate) candidate_scans: usize,
+    #[cfg(test)]
+    pub(crate) workers_inspected: usize,
 }
 
 /// Everything about a task that decides whether a worker may take it. Two queued tasks with the
@@ -485,6 +491,12 @@ struct Engine<'a> {
     /// Cleared whenever the pass places a task, newly reserves a worker in `hold_back`, or
     /// flips `gpu_waiting`.
     dead_speed: HashMap<TaskKey, HashMap<Shape, f64>>,
+    #[cfg(test)]
+    dead_speed_hits: usize,
+    #[cfg(test)]
+    candidate_scans: std::cell::Cell<usize>,
+    #[cfg(test)]
+    workers_inspected: std::cell::Cell<usize>,
 }
 
 /// Returns the latest [`MobileLiveStatus`] for `worker`, preferring the live telemetry snapshot
@@ -708,6 +720,12 @@ impl<'a> Engine<'a> {
             active_workspaces: HashSet::new(),
             speed_book: None,
             dead_speed: HashMap::new(),
+            #[cfg(test)]
+            dead_speed_hits: 0,
+            #[cfg(test)]
+            candidate_scans: std::cell::Cell::new(0),
+            #[cfg(test)]
+            workers_inspected: std::cell::Cell::new(0),
         }
     }
 
@@ -867,6 +885,10 @@ impl<'a> Engine<'a> {
             {
                 let waited_ms = view.queued_for.as_secs_f64() * 1_000.0;
                 if waited_ms < min_expected {
+                    #[cfg(test)]
+                    {
+                        self.dead_speed_hits += 1;
+                    }
                     return Verdict::Skip(ScheduleSkipReason::WaitingForFasterWorker);
                 }
             }
@@ -1159,6 +1181,8 @@ impl<'a> Engine<'a> {
         let mut found: Vec<usize> = Vec::new();
         full.clear();
         matching.clear();
+        #[cfg(test)]
+        self.candidate_scans.set(self.candidate_scans.get() + 1);
 
         let Ok(ref placement) = view.placement else {
             return found;
@@ -1178,6 +1202,8 @@ impl<'a> Engine<'a> {
                 avoided,
             ) {
                 for idx in mask.iter_ones() {
+                    #[cfg(test)]
+                    self.workers_inspected.set(self.workers_inspected.get() + 1);
                     let seat = &self.seats[idx];
                     if !statically_fits(req, seat.worker)
                         || self.is_seat_ram_short(seat, req.ram_mb)
@@ -1207,6 +1233,8 @@ impl<'a> Engine<'a> {
                 avoided,
             ) {
                 for idx in mask.iter_ones() {
+                    #[cfg(test)]
+                    self.workers_inspected.set(self.workers_inspected.get() + 1);
                     let seat = &self.seats[idx];
                     if !statically_fits(req, seat.worker)
                         || self.is_seat_ram_short(seat, req.ram_mb)
@@ -1236,6 +1264,8 @@ impl<'a> Engine<'a> {
             avoided,
         ) {
             for idx in mask.iter_ones() {
+                #[cfg(test)]
+                self.workers_inspected.set(self.workers_inspected.get() + 1);
                 let seat = &self.seats[idx];
                 if !statically_fits(req, seat.worker)
                     || !seat.worker.features.contains(view.required_features)
@@ -1650,6 +1680,12 @@ impl WorkloadScheduler {
                 Verdict::Skip(reason) => report.skipped.push((task.id, reason)),
                 Verdict::Unfulfillable(reason) => report.unfulfillable.push((task.id, reason)),
             }
+        }
+        #[cfg(test)]
+        {
+            report.dead_speed_hits = engine.dead_speed_hits;
+            report.candidate_scans = engine.candidate_scans.get();
+            report.workers_inspected = engine.workers_inspected.get();
         }
         report
     }
@@ -6441,9 +6477,18 @@ mod tests {
             &empty_queued_for,
         );
         let elapsed = t0.elapsed();
+        println!(
+            "20,000-held-task pass took {elapsed:?} (candidate_scans={}, dead_speed_hits={})",
+            bulk_report.candidate_scans, bulk_report.dead_speed_hits
+        );
+        assert_eq!(
+            bulk_report.candidate_scans, 1,
+            "first task populates dead_speed and remaining 19,999 skip without rescanning"
+        );
+        assert_eq!(bulk_report.dead_speed_hits, 19_999);
         assert!(
-            elapsed < Duration::from_secs(5),
-            "20,000-held-task pass took too long ({elapsed:?})"
+            elapsed < Duration::from_secs(60),
+            "20,000-held-task pass hung ({elapsed:?})"
         );
         assert!(bulk_report.assignments.is_empty());
         assert_eq!(bulk_report.skipped.len(), 20_000);
@@ -7020,9 +7065,18 @@ mod tests {
             "expected 0 skipped, got {:?}",
             report.skipped.len()
         );
+        println!(
+            "1000-worker heterogeneous scheduling took {elapsed:?} (workers_inspected={})",
+            report.workers_inspected
+        );
         assert!(
-            elapsed < Duration::from_secs(2),
-            "1000-worker heterogeneous scheduling took {elapsed:?} (>= 2s)"
+            report.workers_inspected < 100_000,
+            "bitset index should prune far below 1,000,000 naive worker checks, inspected {}",
+            report.workers_inspected
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "1000-worker heterogeneous scheduling hung ({elapsed:?})"
         );
     }
 

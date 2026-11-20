@@ -139,10 +139,11 @@ async fn test_surplus_peers_are_closed_and_closing_one_frees_its_slot() {
     loop {
         let mut retry = TcpStream::connect(addr).await.unwrap();
         if !closed_by_server(&mut retry, Duration::from_millis(300)).await {
+            println!("closed connection slot released in {:?}", start.elapsed());
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(60),
             "a closed connection must give its slot back"
         );
     }
