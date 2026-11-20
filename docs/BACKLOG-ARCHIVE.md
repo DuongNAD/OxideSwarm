@@ -2967,6 +2967,35 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     compiled cleanly, default `14/14` passed in `4.41 s`, and the 20-run loop under 6 Python busy loops
     passed `20/20` (`95.01 s` total, `4.69–4.91 s` per run, `0` failures).
 
+### TEST-80: test_sec5_hardened_runner: drop 5 s wall-clock upper bounds in oversized sparse output test
+
+- **Evidence:** In CI run `44660865104` on pull request 391 (`sec5 hardened runner (macos-latest)`,
+  `cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --features 3d --locked`),
+  `test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading` failed at
+  `crates/worker/tests/test_sec5_hardened_runner.rs:1388`:
+  `Oversized sparse file must fail without reading into memory, took 8.590504708s`.
+- **Problem:** The test asserted `elapsed < Duration::from_secs(5)` for both the Generative3D subprocess
+  run (`:1389`) and `BlenderRigProvider::execute_rigging` (`:1426`) as a proxy for "refused without
+  reading into memory", even though wall-clock elapsed includes Python startup and sandbox setup on a
+  loaded runner, and used a `15 s` rig timeout (`:1420`). Meanwhile, the structural proof was already
+  in place: `capture.rs:359-369` checks `meta.len()` before allocating or reading and formats
+  `"is {size} bytes"`, whereas the capped-read fallback formats `"is more than {max_bytes} bytes"`, so
+  asserting `"is {sparse_bytes} bytes"`, `!"is more than"`, and `res.asset_bytes.is_none()` already
+  proves the file was never read.
+- **Do:** Drop both `elapsed < Duration::from_secs(5)` assertions (printing elapsed durations with
+  `eprintln!` instead), raise the `BlenderRigProvider::execute_rigging` timeout argument from `15` to
+  `60`, and keep all exit-code, error-message, and `asset_bytes.is_none()` assertions.
+- **Done when:** All 28 tests in `test_sec5_hardened_runner` (`--features 3d`) keep every structural
+  metadata-refusal assertion without wall-clock upper bounds on oversized sparse output, and pass `20/20`
+  under 6 CPU busy loops.
+- **Implemented (2026-11-20, pull request TBD):** Updated `crates/worker/tests/test_sec5_hardened_runner.rs`
+  and verified on Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops, `--features 3d`; `0/20`
+  local failures before is expected since the `8.59 s` wall-clock failure occurred on a shared
+  `macos-latest` GitHub runner):
+  - Before fix (`origin/master` `347e2a90`): `20/20` passed (`12.88 s` total, `0.54–1.91 s` per run).
+  - After fix: full binary `28/28` passed in `2.83 s`, and the 20-run loaded loop of the test passed
+    `20/20` (`11.47 s` total, `0.54–0.61 s` per run, `0` failures).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
