@@ -2852,6 +2852,38 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     loop under 6 Python busy loops passed `20/20` (`173.79 s` total, `8.52–9.21 s` per run, `0`
     failures).
 
+### TEST-73: m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows
+
+- **Evidence:** In `agent-win-2`'s loaded Windows 11 Home flake hunt (`OxideSwarm_Agent_Hub`
+  `test_runs/win2_flakehunt_2026-11-20.md`, Run 1 on `435fa58`, 12 logical threads under 6 CPU busy
+  loops), `test_m4_parallel_batch_spread_scheduling` failed at `tests/m4_scheduling.rs:433`:
+  `Batch of 5 tasks should execute in parallel across 3 workers in < 1.2s, took 1.242767s`. Sibling
+  `test_m4_in_flight_task_cancellation` also enforced `cancel_duration < 1500 ms` (`:630`), and all
+  five tests in `tests/m4_scheduling.rs` used fixed `3–8 s` waits (`5 s` / `12 s` registration,
+  `3–6 s` waits / disconnects, `8 s` failover wait against `sleep 0.8`, `3–4 s` cancel/quick waits).
+- **Problem:** Wall-clock upper bounds (`1.2 s` / `1.5 s`) and tight `3–8 s` waits flake when a
+  loaded test runner schedules child shells slower than nominal desktop latency.
+- **Do:** Replace `wait_for` with `TEST_WAIT_TIMEOUT = 60 s` helpers (`wait_for_workers` and
+  `wait_for_task_running` with observed worker/status diagnostics); in
+  `test_m4_parallel_batch_spread_scheduling`, replace `sleep 0.2` and the `< 800 ms` / `< 1200 ms`
+  wall-clock assertion with a cross-platform `sh -c` concurrency barrier in `tempfile::tempdir()`
+  (`started_<i>` markers + host-released `release` gate after observing `>= 3` concurrent tasks
+  within `60 s`, printing both time-to-3 and total batch time) while keeping all 5 exit-0 and 3-worker
+  spread assertions; in `test_m4_worker_disconnect_during_execution_triggers_retry`, gate the first
+  attempt on `first_started` / `first_aborted` markers instead of `sleep 0.8`; and in
+  `test_m4_in_flight_task_cancellation`, sleep `120 s` (`timeout_secs = 180`), drop the `< 1.5 s`
+  wall-clock cap while printing `cancel_duration`, and widen all remaining `wait_task` / registration /
+  task timeouts to `60 s` (keeping the `400 ms` `Queued` negative check untouched).
+- **Done when:** All 5 tests keep every routing, spread, retry, and cancellation assertion with no
+  wall-clock window, compile cleanly, and pass `20/20` under 6 CPU busy loops.
+- **Implemented (2026-11-19, pull request 397, open):** Updated `tests/m4_scheduling.rs` and verified on
+  Apple M5 (10 cores, private `HOME`, 6 Python CPU busy loops; `0/20` failures before the fix on macOS
+  is expected because the `< 1.2 s` flake hit a 12-thread Windows laptop):
+  - Before fix (`origin/master` `98570ab9`): `20/20` passed (`53.70 s` total, `2.56–3.88 s` per run).
+  - After fix: `5/5` passed in `1.39 s` (`m4 parallel batch: 5 tasks running concurrently after 21.459708ms, total batch 81.544416ms`),
+    and the 20-run loaded loop under 6 busy loops passed `20/20` (`34.18 s` total, `1.60–1.81 s` per
+    run, `0` failures).
+
 ### TEST-68: gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines
 
 - **Evidence:** During CI on pull request 387 (`workspace tests (windows-latest)`, run `44597494223`,
