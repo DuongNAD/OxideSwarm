@@ -499,6 +499,8 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
         }
     }
 
+    crate::blob_cache::sweep_dead_owner_tmp(&base_dir.join("cache").join("blobs"));
+
     let mut swept_sandboxes: usize = 0;
 
     let dir_entries = match std::fs::read_dir(base_dir) {
@@ -1182,7 +1184,7 @@ pub fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return false;
     }
@@ -1240,7 +1242,7 @@ pub(crate) fn is_real_owned_file(path: &Path, meta: &std::fs::Metadata) -> bool 
     true
 }
 
-fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
@@ -1401,7 +1403,7 @@ fn release_task_lock(lock_file: std::fs::File) {
 }
 
 /// True when `lock_path` still names the file that `file` (already locked) refers to.
-fn lock_file_is_still_named(
+pub(crate) fn lock_file_is_still_named(
     lock_path: &Path,
     file: &std::fs::File,
     file_meta: &std::fs::Metadata,
