@@ -325,7 +325,8 @@ async fn test_attach_store_and_replay_adoptable_by_hold_and_adopt_session_tasks(
         .adopt_session_tasks(worker_id, 7, &[adopted_id, stale_unknown])
         .await;
 
-    assert_eq!(outcome.adopted, vec![adopted_id]);
+    assert_eq!(outcome.newly_adopted, vec![adopted_id]);
+    assert!(outcome.already_owned.is_empty());
     assert_eq!(outcome.stale_to_cancel, vec![stale_unknown]);
     assert_eq!(outcome.newly_failed, vec![omitted_zero_retry_id]);
 
@@ -1093,7 +1094,8 @@ async fn test_session_disconnect_with_session_resume_defers_failover_until_unado
     // - `t_omitted` is released immediately with its deferred failover charge (`failover_count == 1`)
     // - `t_zero` fails immediately because `max_retries == 0`
     let outcome = queue.adopt_session_tasks(worker_id, 2, &[t_adopted]).await;
-    assert_eq!(outcome.adopted, vec![t_adopted]);
+    assert_eq!(outcome.newly_adopted, vec![t_adopted]);
+    assert!(outcome.already_owned.is_empty());
     assert!(outcome.stale_to_cancel.is_empty());
     assert_eq!(outcome.newly_failed, vec![t_zero]);
 
@@ -1125,7 +1127,8 @@ async fn test_session_disconnect_with_session_resume_defers_failover_until_unado
 
     // Late `ResumeSession` after the hold expired must report `t_adopted` in `stale_to_cancel`.
     let late = queue.adopt_session_tasks(worker_id, 3, &[t_adopted]).await;
-    assert!(late.adopted.is_empty());
+    assert!(late.newly_adopted.is_empty());
+    assert!(late.already_owned.is_empty());
     assert_eq!(late.stale_to_cancel, vec![t_adopted]);
 }
 
@@ -1309,7 +1312,8 @@ async fn test_cross_worker_cannot_adopt_another_workers_held_task() {
 
     // `worker_b` attempts to adopt `worker_a`'s held task: must be rejected in `stale_to_cancel`.
     let b_outcome = queue.adopt_session_tasks(worker_b, 2, &[tid]).await;
-    assert!(b_outcome.adopted.is_empty());
+    assert!(b_outcome.newly_adopted.is_empty());
+    assert!(b_outcome.already_owned.is_empty());
     assert_eq!(b_outcome.stale_to_cancel, vec![tid]);
 
     // `worker_b` attempts to send a Checkpoint and a TaskResult for `worker_a`'s held task:
@@ -1339,7 +1343,8 @@ async fn test_cross_worker_cannot_adopt_another_workers_held_task() {
 
     // And `worker_a`'s hold must still be intact so `worker_a` can adopt it.
     let a_outcome = queue.adopt_session_tasks(worker_a, 3, &[tid]).await;
-    assert_eq!(a_outcome.adopted, vec![tid]);
+    assert_eq!(a_outcome.newly_adopted, vec![tid]);
+    assert!(a_outcome.already_owned.is_empty());
     assert!(a_outcome.stale_to_cancel.is_empty());
     let info = queue.get_task(&tid).await.unwrap();
     assert_eq!(info.state, TaskState::Running);
@@ -1447,7 +1452,7 @@ async fn rv158b_probe_evicted_live_worker_gets_no_hold() {
         "live worker's zero-retry task must be held for ResumeSession after disconnect despite churn"
     );
     let outcome = queue.adopt_session_tasks(live_worker, 2, &[tid]).await;
-    assert_eq!(outcome.adopted, vec![tid]);
+    assert_eq!(outcome.newly_adopted, vec![tid]);
 }
 
 #[tokio::test]
@@ -1623,7 +1628,7 @@ async fn test_workspace_one_at_a_time_across_master_restart_and_disconnect_holds
 
     // After `adopt_session_tasks`, only A is Running and B stays Queued.
     let adopted = q2.adopt_session_tasks(worker_a, 2, &[task_a_id]).await;
-    assert_eq!(adopted.adopted, vec![task_a_id]);
+    assert_eq!(adopted.newly_adopted, vec![task_a_id]);
     assert_eq!(q2.get_state(&task_a_id).await, Some(TaskState::Running));
     assert_eq!(q2.get_state(&task_b_id).await, Some(TaskState::Queued));
     assert!(q2.pop_and_schedule(worker_b, |_| true).await.is_none());
@@ -1644,7 +1649,7 @@ async fn test_workspace_one_at_a_time_across_master_restart_and_disconnect_holds
 
     // Re-adopt and complete task A; now task B can be scheduled.
     let adopted2 = q2.adopt_session_tasks(worker_a, 3, &[task_a_id]).await;
-    assert_eq!(adopted2.adopted, vec![task_a_id]);
+    assert_eq!(adopted2.newly_adopted, vec![task_a_id]);
     q2.record_result_from(
         worker_a,
         Some(3),
@@ -2376,7 +2381,8 @@ async fn test_handle_worker_revoked_requeues_at_once_and_drops_checkpoints() {
     let outcome = queue
         .adopt_session_tasks(revoked, 3, &[held, running])
         .await;
-    assert!(outcome.adopted.is_empty());
+    assert!(outcome.newly_adopted.is_empty());
+    assert!(outcome.already_owned.is_empty());
     assert!(!queue
         .record_checkpoint_from(
             revoked,
@@ -2540,5 +2546,145 @@ async fn test_handle_workers_revoked_drops_checkpoints_of_tasks_last_failed_on_t
     assert_eq!(
         queue.get_task(&running).await.unwrap().state,
         TaskState::Queued
+    );
+}
+
+#[tokio::test]
+async fn tier5_adopt_session_tasks_dedup_already_owned_and_cancelled_session_live() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+    use std::sync::atomic::AtomicBool;
+
+    let queue = TaskQueue::new();
+    queue.set_session_resume_hold(Duration::from_secs(30)).await;
+    let worker_id = Uuid::new_v4();
+    let other_worker = Uuid::new_v4();
+    queue.set_worker_session_resume(worker_id, true);
+
+    // 1. Held task waiting for adoption.
+    let t_held = queue.submit(echo_task("held")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(t_held, worker_id, 1)])
+        .await;
+    queue
+        .mark_running_from(worker_id, Some(1), &t_held)
+        .await
+        .unwrap();
+    queue
+        .handle_session_disconnected(&worker_id, Some(1), "drop", true)
+        .await;
+
+    // 2. Task already Running on session 2 with an existing session_live handle.
+    let t_running = queue.submit(echo_task("running-s2")).await.unwrap();
+    let existing_live = Arc::new(AtomicBool::new(true));
+    queue
+        .schedule_tasks_batch_in_sessions(&[(t_running, worker_id, 2)])
+        .await;
+    assert_eq!(
+        queue
+            .deliver_if_scheduled_with_live(
+                &t_running,
+                &worker_id,
+                2,
+                Arc::clone(&existing_live),
+                || Some(())
+            )
+            .await,
+        Some(())
+    );
+    queue
+        .mark_running_from(worker_id, Some(2), &t_running)
+        .await
+        .unwrap();
+
+    // 3. Task Scheduled on session 2 with assigned_session_live == None.
+    let t_scheduled = queue.submit(echo_task("scheduled-s2")).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(t_scheduled, worker_id, 2)])
+        .await;
+
+    // 4. Repeatable task where worker_id owns an active speculative attempt on session 2.
+    let spec_task = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let t_spec = queue.submit(spec_task).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(t_spec, other_worker, 10)])
+        .await;
+    queue
+        .mark_running_from(other_worker, Some(10), &t_spec)
+        .await
+        .unwrap();
+    assert!(queue
+        .try_start_speculative(t_spec, worker_id, 2)
+        .await
+        .is_some());
+
+    let t_unknown = TaskId::new();
+    let outcome = queue
+        .adopt_session_tasks(
+            worker_id,
+            2,
+            &[
+                t_held,
+                t_held,
+                t_running,
+                t_running,
+                t_scheduled,
+                t_spec,
+                t_unknown,
+            ],
+        )
+        .await;
+    assert_eq!(outcome.newly_adopted, vec![t_held]);
+    assert_eq!(outcome.already_owned, vec![t_running, t_scheduled, t_spec]);
+    assert_eq!(outcome.stale_to_cancel, vec![t_unknown]);
+    assert!(outcome.newly_failed.is_empty());
+
+    // Simulate concurrent cancel of `t_held` before `set_assigned_session_live` runs (Effect D).
+    let cancel_out = queue
+        .cancel_task_detailed(&t_held, Some("concurrent cancel".into()))
+        .await
+        .unwrap();
+    assert!(cancel_out.newly_cancelled);
+
+    let session2_live = Arc::new(AtomicBool::new(true));
+    let mut to_bind = outcome.newly_adopted.clone();
+    to_bind.extend_from_slice(&outcome.already_owned);
+    queue
+        .set_assigned_session_live(&to_bind, worker_id, 2, Arc::clone(&session2_live))
+        .await;
+
+    let inner = queue.inner.read().await;
+    let held_entry = inner.tasks.get(&t_held).unwrap();
+    assert_eq!(held_entry.state, TaskState::Cancelled);
+    assert!(
+        held_entry
+            .assigned_session_live
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(l, &session2_live)),
+        "cancelled adopted task must still bind session2_live"
+    );
+    let sched_entry = inner.tasks.get(&t_scheduled).unwrap();
+    assert!(
+        sched_entry
+            .assigned_session_live
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(l, &session2_live)),
+        "already_owned Scheduled task with None must bind session2_live"
+    );
+    let run_entry = inner.tasks.get(&t_running).unwrap();
+    assert!(
+        run_entry
+            .assigned_session_live
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(l, &existing_live)),
+        "already_owned task with existing session_live must keep its handle"
+    );
+    let spec_entry = inner.tasks.get(&t_spec).unwrap();
+    assert!(
+        spec_entry.assigned_session_live.is_none(),
+        "speculative attempt must not touch primary assigned_session_live"
     );
 }

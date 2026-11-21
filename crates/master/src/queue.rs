@@ -760,10 +760,16 @@ fn owned_by_speculative(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<
 /// Outcome of [`TaskQueue::adopt_session_tasks`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdoptionOutcome {
-    /// Tasks adopted into `TaskState::Running` on `(worker_id, session_id)`.
-    pub adopted: Vec<TaskId>,
-    /// Tasks reported in `running` that could not be adopted (unknown, terminal, expired hold, or
-    /// owned by another worker) and must receive `MasterMessage::CancelTask`.
+    /// Tasks newly adopted from an `adoptable_by` hold into `TaskState::Running` on
+    /// `(worker_id, session_id)`. Only these tasks need a fresh active-task slot credit.
+    pub newly_adopted: Vec<TaskId>,
+    /// Tasks reported in `running` that were already active (`Scheduled` or `Running`) on
+    /// `(worker_id, session_id)` (including active speculative attempts on this session).
+    /// These already hold a slot and must neither be re-credited nor cancelled.
+    pub already_owned: Vec<TaskId>,
+    /// Tasks reported in `running` that could not be adopted (unknown, terminal on another
+    /// worker/session, expired hold, or owned by another worker/session) and must receive
+    /// `MasterMessage::CancelTask`.
     pub stale_to_cancel: Vec<TaskId>,
     /// Tasks previously held for `worker_id` that were omitted from `running` (or whose hold
     /// expired) and transitioned to `TaskState::Failed` (for example `Running` with

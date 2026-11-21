@@ -2095,7 +2095,8 @@ async fn tier5_session_resume_hold_mid_speculative_primary_disconnect() {
 
     // Old primary reconnects and offers id1 in ResumeSession: must be in stale_to_cancel.
     let adopt = queue.adopt_session_tasks(w_primary, 11, &[id1]).await;
-    assert!(adopt.adopted.is_empty());
+    assert!(adopt.newly_adopted.is_empty());
+    assert!(adopt.already_owned.is_empty());
     assert_eq!(adopt.stale_to_cancel, vec![id1]);
     assert_eq!(
         queue.get_task(&id1).await.unwrap().assigned_worker_id,
@@ -2141,7 +2142,8 @@ async fn tier5_session_resume_hold_mid_speculative_secondary_disconnect() {
 
     // Speculative worker reconnects and offers id1 in ResumeSession: must cancel orphaned copy.
     let adopt = queue.adopt_session_tasks(w_spec, 21, &[id1]).await;
-    assert!(adopt.adopted.is_empty());
+    assert!(adopt.newly_adopted.is_empty());
+    assert!(adopt.already_owned.is_empty());
     assert_eq!(adopt.stale_to_cancel, vec![id1]);
     assert_eq!(
         queue.get_task(&id1).await.unwrap().assigned_worker_id,

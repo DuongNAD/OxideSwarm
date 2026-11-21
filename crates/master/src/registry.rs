@@ -1196,6 +1196,24 @@ impl WorkerRegistry {
         None
     }
 
+    /// Returns `session_id`'s current `session_live` handle without modifying `active_tasks`.
+    ///
+    /// Returns `Some` whenever the worker still tracks `session_id` (even if currently
+    /// `Disconnected`, in which case the returned `AtomicBool` is already `false`) so callers can
+    /// bind an uninitialized `assigned_session_live` field rather than leaving it `None`.
+    pub async fn session_live_handle(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+    ) -> Option<Arc<AtomicBool>> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .filter(|entry| entry.session_id == session_id)
+            .map(|entry| Arc::clone(&entry.session_live))
+    }
+
     /// Records that `worker_id` handed a task back without running it (battery, capability or
     /// sandbox rejection) and excludes it from scheduling for an exponentially growing cooldown.
     ///

@@ -1701,26 +1701,51 @@ impl<
                     .queue
                     .adopt_session_tasks(worker_id, session_id, &running)
                     .await;
-                if !outcome.adopted.is_empty() {
-                    if let Some(live) = self
+                let mut to_bind =
+                    Vec::with_capacity(outcome.newly_adopted.len() + outcome.already_owned.len());
+                to_bind.extend_from_slice(&outcome.newly_adopted);
+                to_bind.extend_from_slice(&outcome.already_owned);
+
+                if !outcome.newly_adopted.is_empty() {
+                    let live = match self
                         .registry
-                        .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
+                        .add_adopted_tasks(&worker_id, session_id, outcome.newly_adopted.len())
                         .await
                     {
+                        Some(live) => Some(live),
+                        None => {
+                            self.registry
+                                .session_live_handle(&worker_id, session_id)
+                                .await
+                        }
+                    };
+                    if let Some(live) = live {
                         self.queue
-                            .set_assigned_session_live(
-                                &outcome.adopted,
-                                worker_id,
-                                session_id,
-                                live,
-                            )
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
                             .await;
                     }
                     info!(
                         worker_id = %worker_id,
                         session_id = session_id,
-                        adopted = ?outcome.adopted,
+                        adopted = ?outcome.newly_adopted,
+                        already_owned = ?outcome.already_owned,
                         "Worker resumed session and adopted in-flight task(s)"
+                    );
+                } else if !outcome.already_owned.is_empty() {
+                    if let Some(live) = self
+                        .registry
+                        .session_live_handle(&worker_id, session_id)
+                        .await
+                    {
+                        self.queue
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
+                            .await;
+                    }
+                    debug!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        already_owned = ?outcome.already_owned,
+                        "Worker ResumeSession reported task(s) already owned by this session"
                     );
                 }
                 for stale_id in outcome.stale_to_cancel {
@@ -1748,7 +1773,11 @@ impl<
                 }
                 #[cfg(feature = "dashboard")]
                 if let Some(ref b_tx) = self.broadcast_tx {
-                    for tid in outcome.adopted.iter().chain(outcome.newly_failed.iter()) {
+                    for tid in outcome
+                        .newly_adopted
+                        .iter()
+                        .chain(outcome.newly_failed.iter())
+                    {
                         if let Some(info) = self.queue.get_task(tid).await {
                             let _ = b_tx.send(
                                 crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),

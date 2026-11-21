@@ -883,6 +883,7 @@ impl TaskQueue {
         }
         let mut outcome = AdoptionOutcome::default();
         let mut acks: Vec<DurableAck> = Vec::new();
+        let mut seen = HashSet::with_capacity(running.len());
 
         {
             let mut inner = self.inner.write().await;
@@ -890,6 +891,9 @@ impl TaskQueue {
             let now_epoch = Utc::now().timestamp() as u64;
 
             for &task_id in running {
+                if !seen.insert(task_id) {
+                    continue;
+                }
                 let can_adopt = inner.tasks.get(&task_id).is_some_and(|entry| {
                     entry.state == TaskState::Queued
                         && entry
@@ -928,19 +932,24 @@ impl TaskQueue {
                         worker_id,
                         timestamp_utc: now_epoch,
                     });
-                    outcome.adopted.push(task_id);
+                    outcome.newly_adopted.push(task_id);
                 } else {
                     let (already_owned, already_completed_in_session) =
                         inner.tasks.get(&task_id).map_or((false, false), |entry| {
-                            let same_session = entry.assigned_worker_id == Some(worker_id)
+                            let same_primary_session = entry.assigned_worker_id == Some(worker_id)
                                 && entry.assigned_session == Some(session_id);
+                            let same_spec_session = entry.state.is_active()
+                                && entry.speculative.as_ref().is_some_and(|spec| {
+                                    spec.worker_id == worker_id && spec.session_id == session_id
+                                });
                             (
-                                entry.state == TaskState::Running && same_session,
-                                entry.state.is_terminal() && same_session,
+                                (entry.state.is_active() && same_primary_session)
+                                    || same_spec_session,
+                                entry.state.is_terminal() && same_primary_session,
                             )
                         });
                     if already_owned {
-                        outcome.adopted.push(task_id);
+                        outcome.already_owned.push(task_id);
                     } else if !already_completed_in_session {
                         outcome.stale_to_cancel.push(task_id);
                     }
@@ -999,7 +1008,9 @@ impl TaskQueue {
         outcome
     }
 
-    /// Records the live reservation handle for tasks just adopted via `ResumeSession`.
+    /// Records the live reservation handle for tasks adopted or already owned via `ResumeSession`
+    /// when `assigned_session_live` is not yet bound (including tasks concurrently cancelled
+    /// between `adopt_session_tasks` and this call).
     pub(crate) async fn set_assigned_session_live(
         &self,
         task_ids: &[TaskId],
@@ -1013,9 +1024,9 @@ impl TaskQueue {
         let mut inner = self.inner.write().await;
         for task_id in task_ids {
             if let Some(entry) = inner.tasks.get_mut(task_id) {
-                if entry.state.is_active()
-                    && entry.assigned_worker_id == Some(worker_id)
+                if entry.assigned_worker_id == Some(worker_id)
                     && entry.assigned_session == Some(session_id)
+                    && entry.assigned_session_live.is_none()
                 {
                     entry.assigned_session_live = Some(Arc::clone(&session_live));
                 }
