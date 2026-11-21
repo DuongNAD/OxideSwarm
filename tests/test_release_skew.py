@@ -435,6 +435,81 @@ class ReleaseSkewCiWorkflowTests(unittest.TestCase):
             with open(summary_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "### Release skew\nNo release exists yet.\n")
 
+    def test_pair_env_scrubs_rusty_grid_vars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pair = skew.Pair("test", "master-bin", "worker-bin", 5, tmp)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "RUSTY_GRID_AUTH": "secret-leak",
+                        "RUSTY_GRID_MASTER_KEY": "key-leak",
+                        "OXIDESWARM_SECRET": "ox-leak",
+                        "OXIDE_TOKEN": "tok-leak",
+                    },
+                ):
+                    scrubbed = pair.env()
+                for key in (
+                    "RUSTY_GRID_AUTH",
+                    "RUSTY_GRID_MASTER_KEY",
+                    "OXIDESWARM_SECRET",
+                    "OXIDE_TOKEN",
+                ):
+                    self.assertNotIn(key, scrubbed)
+                self.assertEqual(scrubbed["HOME"], pair.home)
+                self.assertEqual(scrubbed["USERPROFILE"], pair.home)
+            finally:
+                pair.cleanup()
+
+    def test_release_skew_nonexistent_release_tag_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_bin = os.path.join(tmp, "oxideswarm")
+            with open(bad_bin, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(bad_bin, os.stat(bad_bin).st_mode | stat.S_IXUSR)
+            proto_rs = os.path.join(tmp, "protocol.rs")
+            with open(proto_rs, "w", encoding="utf-8") as f:
+                f.write(PROTOCOL_RS)
+
+            # 1. Missing binary fails cleanly with exit code 2.
+            missing_proc = subprocess.run(
+                [
+                    "python3",
+                    os.path.join(ROOT, "scripts", "release_skew.py"),
+                    os.path.join(tmp, "does-not-exist"),
+                    bad_bin,
+                    "--release-tag",
+                    "v99.99.99-nonexistent",
+                ],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing_proc.returncode, 2)
+
+            # 2. Failing binary labeled with nonexistent release tag exits non-zero cleanly.
+            proc = subprocess.run(
+                [
+                    "python3",
+                    os.path.join(ROOT, "scripts", "release_skew.py"),
+                    bad_bin,
+                    bad_bin,
+                    "--timeout",
+                    "2",
+                    "--release-protocol-rs",
+                    proto_rs,
+                    "--release-tag",
+                    "v99.99.99-nonexistent",
+                ],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("v99.99.99-nonexistent", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

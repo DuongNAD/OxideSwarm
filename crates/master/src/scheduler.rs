@@ -8274,4 +8274,104 @@ mod tests {
         assert!(r2.assignments.is_empty());
         assert_eq!(sink.saturated_count(), 0);
     }
+
+    #[tokio::test]
+    async fn tier5_sched5_live_recovery_via_backpressure_drop_and_multi_transition_antiflood() {
+        let sink = SchedulerLogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+
+        let w1 = Uuid::new_v4();
+        let w2 = Uuid::new_v4();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(16);
+        registry
+            .register(
+                w1,
+                WorkerCapabilities::new("live-cpu-1", 2, 8192, false, false, None),
+                "127.0.0.1:9521".parse().unwrap(),
+                tx1,
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&w1, 0, 1001, 95.0, 4096, None)
+            .await
+            .unwrap();
+
+        queue
+            .submit(Task::new(
+                TaskSpec::new_command("echo", vec!["t1".into()]),
+                TaskRequirements::generic(1, 64),
+            ))
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_max_host_cpu_pct(85.0),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        );
+
+        // Busy set {w1} -> emits once, then stays suppressed on repeat ticks.
+        assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
+        assert_eq!(sink.saturated_count(), 1);
+        assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
+        assert_eq!(sink.saturated_count(), 1);
+
+        // Connect saturated w2 -> busy set {w1, w2} -> emits once more (2).
+        registry
+            .register(
+                w2,
+                WorkerCapabilities::new("live-cpu-2", 2, 8192, false, false, None),
+                "127.0.0.1:9522".parse().unwrap(),
+                tx2,
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&w2, 0, 1002, 92.0, 4096, None)
+            .await
+            .unwrap();
+        assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
+        assert_eq!(sink.saturated_count(), 2);
+
+        // Live recovery without restart: w2 drops below threshold -> task drains and state clears.
+        registry
+            .record_heartbeat(&w2, 0, 1003, 15.0, 4096, None)
+            .await
+            .unwrap();
+        let rec = sched.schedule_once().await.unwrap();
+        assert_eq!(rec.assignments.len(), 1);
+        assert_eq!(rec.assignments[0].worker_id, w2);
+        assert_eq!(sink.saturated_count(), 2);
+
+        // Re-saturate {w1, w2} on a new queued task -> emits cleanly (3), suppressed on repeat.
+        registry
+            .record_heartbeat(&w2, 0, 1004, 93.0, 4096, None)
+            .await
+            .unwrap();
+        queue
+            .submit(Task::new(
+                TaskSpec::new_command("echo", vec!["t2".into()]),
+                TaskRequirements::generic(1, 64),
+            ))
+            .await
+            .unwrap();
+        assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
+        assert_eq!(sink.saturated_count(), 3);
+        assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
+        assert_eq!(sink.saturated_count(), 3);
+    }
 }

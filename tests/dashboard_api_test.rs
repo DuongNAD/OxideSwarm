@@ -1634,3 +1634,184 @@ async fn test_dashboard_exposes_worker_speed_in_status_and_workers_api() {
     h_slow.abort();
     let _ = master.shutdown();
 }
+
+#[tokio::test]
+async fn test_invites_http_validation_boundaries_and_observer_rbac() {
+    let auth = AuthConfig {
+        dev_mode: false,
+        ..AuthConfig::default()
+    }
+    .with_token("admin-token-123456", "admin", &[AuthScope::Admin])
+    .with_token("obs-token-123456", "obs", &[AuthScope::Observer]);
+    let (_dir, master, addr, _) =
+        spawn_v3_master(AuthMode::Members, auth, Duration::from_secs(5)).await;
+    let client = client();
+    let base = format!("http://{addr}");
+    let admin = "Bearer admin-token-123456";
+    let obs = "Bearer obs-token-123456";
+
+    // Observer denied on admin-only member & invite endpoints (403)
+    for path in ["/api/members", "/api/invites"] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .header("Authorization", obs)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "GET {path}");
+    }
+
+    // Empty/whitespace body without Content-Type succeeds with defaults (200)
+    for body in ["", "   "] {
+        let resp = client
+            .post(format!("{base}/api/invites"))
+            .header("Authorization", admin)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Non-empty body with non-JSON Content-Type -> 400
+    let resp = client
+        .post(format!("{base}/api/invites"))
+        .header("Authorization", admin)
+        .header("Content-Type", "text/plain")
+        .body(r#"{"max_uses":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Invalid payloads -> 400
+    let invalid_bodies = [
+        r#"{"bogus":1}"#.to_string(),
+        r#"{"max_uses":0}"#.to_string(),
+        r#"{"expires_in_secs":0}"#.to_string(),
+        r#"{"roles":[]}"#.to_string(),
+        r#"{"roles":["admin"],"require_approval":false,"max_uses":1}"#.to_string(),
+        r#"{"roles":["admin"],"require_approval":true,"max_uses":2}"#.to_string(),
+        r#"{"master_addr":"127.0.0.1:8088 extra"}"#.to_string(),
+        serde_json::json!({"master_addr": "a".repeat(2049)}).to_string(),
+    ];
+    for payload in invalid_bodies {
+        let resp = client
+            .post(format!("{base}/api/invites"))
+            .header("Authorization", admin)
+            .header("Content-Type", "application/json")
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for {payload}"
+        );
+    }
+
+    // Valid edge cases: roles dedup, whitespace-only master_addr fallback, 2048-char master_addr
+    let dedup_resp = client
+        .post(format!("{base}/api/invites"))
+        .header("Authorization", admin)
+        .json(&serde_json::json!({"roles": ["worker", "worker"], "master_addr": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dedup_resp.status(), StatusCode::OK);
+    let dedup_json: Value = dedup_resp.json().await.unwrap();
+    assert_eq!(dedup_json["roles"], serde_json::json!(["worker"]));
+
+    let max_addr_resp = client
+        .post(format!("{base}/api/invites"))
+        .header("Authorization", admin)
+        .json(&serde_json::json!({"master_addr": "a".repeat(2048)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(max_addr_resp.status(), StatusCode::OK);
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_member_duplicate_rename_and_concurrent_revoke_rename_race() {
+    let (_dir, master, addr, _) =
+        spawn_v3_master(AuthMode::Members, AuthConfig::dev(), Duration::from_secs(5)).await;
+    let client = client();
+    let base = format!("http://{addr}");
+
+    let kp_a = NodeKeypair::generate().unwrap();
+    let kp_b = NodeKeypair::generate().unwrap();
+    enroll_member_for_test(master.members(), &kp_a, "alpha", vec![MemberRole::Worker]);
+    enroll_member_for_test(master.members(), &kp_b, "beta", vec![MemberRole::Worker]);
+    let id_b = kp_b.member_id().to_string();
+
+    // Rename B -> "alpha" (duplicates A's display name) succeeds (200),
+    // and subsequent name-based lookup is ambiguous (400).
+    let dup_rename = client
+        .post(format!("{base}/api/members/{id_b}/rename"))
+        .json(&serde_json::json!({ "name": "alpha" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup_rename.status(), StatusCode::OK);
+
+    let ambig_revoke = client
+        .post(format!("{base}/api/members/alpha/revoke"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ambig_revoke.status(), StatusCode::BAD_REQUEST);
+    let ambig_err: Value = ambig_revoke.json().await.unwrap();
+    assert!(
+        ambig_err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("ambiguous")),
+        "{ambig_err}"
+    );
+
+    // Unknown member returns 404.
+    let unknown_rename = client
+        .post(format!("{base}/api/members/does-not-exist/rename"))
+        .json(&serde_json::json!({ "name": "nope" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_rename.status(), StatusCode::NOT_FOUND);
+
+    // Concurrent revoke vs rename by full ID on B: serialized cleanly, zero 500s,
+    // and subsequent rename/revoke on B both return 404.
+    let revoke_fut = client
+        .post(format!("{base}/api/members/{id_b}/revoke"))
+        .send();
+    let rename_fut = client
+        .post(format!("{base}/api/members/{id_b}/rename"))
+        .json(&serde_json::json!({ "name": "beta-raced" }))
+        .send();
+    let (r_rev, r_ren) = tokio::join!(revoke_fut, rename_fut);
+    let s_rev = r_rev.unwrap().status();
+    let s_ren = r_ren.unwrap().status();
+    assert_eq!(s_rev, StatusCode::OK);
+    assert!(
+        s_ren == StatusCode::OK || s_ren == StatusCode::NOT_FOUND,
+        "unexpected rename status during concurrent revoke: {s_ren}"
+    );
+
+    let post_rev = client
+        .post(format!("{base}/api/members/{id_b}/revoke"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_rev.status(), StatusCode::NOT_FOUND);
+    let post_ren = client
+        .post(format!("{base}/api/members/{id_b}/rename"))
+        .json(&serde_json::json!({ "name": "after-revoke" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_ren.status(), StatusCode::NOT_FOUND);
+
+    let _ = master.shutdown();
+}

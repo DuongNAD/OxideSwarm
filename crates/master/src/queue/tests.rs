@@ -2049,3 +2049,96 @@ async fn sched4c_speculative_lifecycle_cancel_sibling_and_failure_tolerance() {
     assert_eq!(cancel.extra_worker_to_notify, Some((w_spec, 22)));
     assert!(queue.assigned_loads().await.is_empty());
 }
+
+#[tokio::test]
+async fn tier5_session_resume_hold_mid_speculative_primary_disconnect() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    queue.set_session_resume_hold(Duration::from_secs(30)).await;
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    let t1 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+
+    // Primary disconnects while speculative copy is running: speculative promotes immediately
+    // rather than holding the task for primary resume.
+    queue
+        .handle_session_disconnected(&w_primary, Some(10), "disconnect", false)
+        .await;
+    let task_after = queue.get_task(&id1).await.unwrap();
+    assert_eq!(task_after.assigned_worker_id, Some(w_spec));
+    assert_eq!(task_after.state, TaskState::Running);
+
+    // Old primary reconnects and offers id1 in ResumeSession: must be in stale_to_cancel.
+    let adopt = queue.adopt_session_tasks(w_primary, 11, &[id1]).await;
+    assert!(adopt.adopted.is_empty());
+    assert_eq!(adopt.stale_to_cancel, vec![id1]);
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+}
+
+#[tokio::test]
+async fn tier5_session_resume_hold_mid_speculative_secondary_disconnect() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    queue.set_session_resume_hold(Duration::from_secs(30)).await;
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    let t1 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+
+    // Speculative worker disconnects: speculative attempt clears and primary keeps ownership.
+    queue
+        .handle_session_disconnected(&w_spec, Some(20), "disconnect", false)
+        .await;
+    let task_after = queue.get_task(&id1).await.unwrap();
+    assert_eq!(task_after.assigned_worker_id, Some(w_primary));
+    assert_eq!(task_after.state, TaskState::Running);
+
+    // Speculative worker reconnects and offers id1 in ResumeSession: must cancel orphaned copy.
+    let adopt = queue.adopt_session_tasks(w_spec, 21, &[id1]).await;
+    assert!(adopt.adopted.is_empty());
+    assert_eq!(adopt.stale_to_cancel, vec![id1]);
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_primary)
+    );
+}
