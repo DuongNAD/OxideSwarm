@@ -204,7 +204,7 @@ flowchart LR
   (`--max-host-cpu-pct`). When queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`,
   the master emits a warning containing `"saturated"` once per change of the connected busy-worker
   set (excluding `Disconnected` workers and capability/GPU mismatches such as `NoGpuWorkersAvailable`,
-  [design 0095](design/0095-scheduler-backpressure-visibility.md)). Tasks run at below-normal priority.
+  [design 0099](design/0099-scheduler-backpressure-visibility.md)). Tasks run at below-normal priority.
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
   log still ends with its summary ([design 0022](design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` detects GPU compute hardware (`--gpu`,
@@ -625,7 +625,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--scheduler-policy <POLICY>` | `weighted` (`RUSTY_GRID_SCHEDULER_POLICY`, `[master].scheduler_policy`) | Load-balancing policy across eligible workers: `weighted` (`weighted-least-loaded`), `least-loaded`, or `round-robin` |
 | `--speed-hold-factor <FACTOR>` | `1.5` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`) | Hold-back factor for speed-aware placement (`0` turns D2 off; otherwise finite `> 1.0`; holds a repeated task or excludes clearly slower candidates when their expected run time is at least `factor` times the fastest worker's, [design 0060](design/0060-speed-aware-placement.md)) |
 | `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
-| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch; when queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`, the master logs a warning once per change of the connected busy-worker set ([design 0095](design/0095-scheduler-backpressure-visibility.md)) |
+| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch; when queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`, the master logs a warning once per change of the connected busy-worker set ([design 0099](design/0099-scheduler-backpressure-visibility.md)) |
 | `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
 | `--fail-unfulfillable-tasks [BOOL]` | `false` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) | When at least one connected (`Connected` or `Busy`) worker is schedulable, immediately fail tasks whose required capabilities or placement constraints no registered worker can satisfy (`--fail-unfulfillable-tasks` with no value sets `true`). A task whose only matching worker is `Disconnected` stays queued until that worker reconnects or is pruned `1 hour` after its last heartbeat (`ReaperConfig::stale_worker_timeout` in `crates/master/src/reaper.rs`, no CLI flag), so a `--wait` caller blocks until then (or `--timeout-secs`). |
 | `--p2p` | `false` (`RUSTY_GRID_P2P`, `[master].p2p`) | Enable Iroh QUIC/DERP P2P endpoint for NAT traversal |

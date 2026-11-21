@@ -1,4 +1,4 @@
-# 0095: Scheduler host-CPU backpressure visibility (`SCHED-5`)
+# 0099: Scheduler host-CPU backpressure visibility (`SCHED-5`)
 
 Status: Implemented
 Created: 2026-11-21    Updated: 2026-11-21

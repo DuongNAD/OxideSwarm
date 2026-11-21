@@ -1291,7 +1291,7 @@ owner's decisions Q8, Q9 and Q12 are open.
      than on every scheduling pass.
 - **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
   those constraints without flooding or stale disconnected entries, and tests cover the behavior.
-- **Implemented (`2026-11-21`):** Added [design 0095](design/0095-scheduler-backpressure-visibility.md)
+- **Implemented (`2026-11-21`):** Added [design 0099](design/0099-scheduler-backpressure-visibility.md)
   and transition-triggered `warn!` holdback reporting in `WorkloadScheduler::schedule_batch`
   (`crates/master/src/scheduler.rs`), gated on `ScheduleSkipReason::AllEligibleWorkersSaturated` skips
   and connected (`status != WorkerStatus::Disconnected`), free-slotted, `host_busy` seats, emitting
