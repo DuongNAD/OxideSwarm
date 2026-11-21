@@ -3,6 +3,7 @@
 
 Usage: release_skew.py RELEASE_OXIDESWARM PR_OXIDESWARM [--timeout SECONDS]
                        [--release-protocol-rs FILE] [--pr-protocol-rs FILE]
+                       [--release-tag TAG]
 
 Runs three master/worker/client pairs on loopback, each with a private temporary HOME, an
 ephemeral grid port and no use of the real ~/.oxideswarm:
@@ -301,14 +302,14 @@ def render_table(rows):
     return "\n".join(lines)
 
 
-def versions_text(pair_index, versions):
+def versions_text(pair_index, versions, release_label="release"):
     """Human text for the protocol versions a pair revealed. `versions` is (peer, refuser)."""
     if not versions:
         return "same or compatible"
     peer, refuser = versions
     if pair_index == 1:  # release master refuses the PR peer
-        return f"release {refuser}, pull request {peer}"
-    return f"pull request {refuser}, release {peer}"
+        return f"{release_label} {refuser}, pull request {peer}"
+    return f"pull request {refuser}, {release_label} {peer}"
 
 
 def main(argv=None):
@@ -325,7 +326,15 @@ def main(argv=None):
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crates", "core", "src", "protocol.rs"),
         help="crates/core/src/protocol.rs of the pull request (default: this working tree)",
     )
+    parser.add_argument(
+        "--release-tag",
+        default=None,
+        help="tag of the release being tested (labels the summary heading and rows)",
+    )
     args = parser.parse_args(argv)
+
+    release_label = f"release ({args.release_tag})" if args.release_tag else "release"
+    summary_heading = f"### Release skew ({args.release_tag})" if args.release_tag else "### Release skew"
 
     release_bin = os.path.abspath(args.release_bin)
     pr_bin = os.path.abspath(args.pr_bin)
@@ -351,8 +360,8 @@ def main(argv=None):
         )
 
     plan = [
-        ("release", "pull request", release_bin, pr_bin),
-        ("pull request", "release", pr_bin, release_bin),
+        (release_label, "pull request", release_bin, pr_bin),
+        ("pull request", release_label, pr_bin, release_bin),
         ("pull request", "pull request", pr_bin, pr_bin),
     ]
     root = tempfile.mkdtemp(prefix="release-skew-")
@@ -364,7 +373,14 @@ def main(argv=None):
             )
             want = expected[index - 1]
             rows.append(
-                (master_label, worker_label, verdict, versions_text(index, versions), detail, want or "not derived")
+                (
+                    master_label,
+                    worker_label,
+                    verdict,
+                    versions_text(index, versions, release_label=release_label),
+                    detail,
+                    want or "not derived",
+                )
             )
             if not ok:
                 failed.append(f"{master_label} master with {worker_label} worker: {detail}")
@@ -384,7 +400,7 @@ def main(argv=None):
     if summary:
         try:
             with open(summary, "a", encoding="utf-8") as f:
-                f.write("### Release skew\n\n" + table + "\n")
+                f.write(f"{summary_heading}\n\n{table}\n\n")
         except OSError as err:
             print(f"warning: could not write {summary}: {err}", file=sys.stderr)
     if failed:

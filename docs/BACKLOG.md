@@ -174,6 +174,7 @@ Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged):
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
 Recounted on 2026-11-21 from the rows after items through TEST-84, APP-6, and FEAT-9 Implemented: 247 items, 172 Implemented, 21 Partial and 54 Planned; 25 open items are In and 50 are Out (TEST-56 keeps `Line` `In` while pull request 361 is marked open).
+Recounted on 2026-11-21 after LV-10 (steps 1–3) and PROTO-5 Partial: 247 items, 172 Implemented, 23 Partial and 52 Planned; 25 open items are In and 50 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -370,13 +371,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342, (design 0058) |
-| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Partial | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented |  | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
-| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Partial | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
@@ -1245,6 +1246,10 @@ none needs a design record of its own.
 - **Done when:** The new test passes on Linux, macOS and Windows, and the repository page shows
   "Cite this repository". Step 4 is finished when the DOI of a release is in `README.md`. Until
   then the item is Partial.
+- **Status (2026-11-21, Partial):** Steps 1 to 3 are complete (`CITATION.cff` at format version `1.2.0`
+  matching `Cargo.toml` `0.4.4` and `MIT` / `Apache-2.0`, stdlib check in
+  `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`). Step 4 (enabling
+  Zenodo archiving and adding the release DOI) stays with the owner.
 
 ### LV-14: Governance files and a licence that GitHub detects
 
@@ -1316,6 +1321,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Pin a second release (v0.3.0 while the window reaches back to 9) in the skew job, with its
   `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
 - **Done when:** Each pull request shows a table row of a real release one protocol back.
+- **Status (2026-11-21, Partial):** Local implementation and tests pass (`.github/workflows/ci.yml`
+  `release-skew` pins `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release with
+  per-tag directory isolation, `scripts/release_skew.py` adds `--release-tag` for distinct summary
+  tables, `tests/test_release_skew.py` tests both CLI behavior and static CI workflow invariants,
+  and `CLAUDE.md` / `docs/reference.md` are updated); awaiting a live GitHub pull request CI run of
+  `release skew (ubuntu-latest)` showing the `v0.3.0` table row per "Done when".
 
 ### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
 
@@ -2551,3 +2562,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-20: TEST-84 Implemented (pull request 407, open; text in the archive): replaced all `19` audited Category 1 wall-clock upper bounds across `12` files / `12` binaries in `agent_mesh` (`lib`, `adversarial_challenge`), `rusty_grid_android_bridge` (`lib`, `m5a_challenger_2_stress`, `mobile_coordination_test`), `rusty_grid_cli` (`mcp_server_e2e`, `test_cli_cancel_and_result`, `test_m2_identity_scripts`, `test_mcp_concurrent_and_deadlines`, `test_p2p_key_persistence`), and Python tests (`tests/test_agent_bridge.py`, `tests/test_sec6_mesh_sandbox.py`), with `0` `!cfg!(debug_assertions)` release-only SLAs in those crates or scripts; replaced proof proxies with structural checks (`drain_finished` in `android_bridge`, `Cancelled` queue state in `test_cli_cancel_and_result`, `release.gate` + `ReleaseOnDrop` release-gated evacuation tasks with `evacuation_count == 1`/`2` + `ReaperConfig(1 s, 120 s)` in `m5a_challenger_2_stress` and `mobile_coordination_test`, `watch_*.lock` + `first.poll() is None` in `test_agent_bridge.py`), replaced the dead `"RustyGrid Worker started"` wait in `test_p2p_key_persistence` with `saw_warn` + `saw_dialing` (keeping a `2 s` post-dial window), preserved `>= 900 ms` / `>= 950 ms` `1 s` lower bounds (`30 s` `task_result` guard), renamed `test_worker_auto_reconnect_preserves_identity` and `test_fast_evacuation_without_task_loss`, and widened hang guards to `60 s` (`120 s` inner sleeps); `5` cheap targeted before-loops passed `20/20` on `origin/master` (`e31b69e3`), and all `12` touched binaries passed `20/20` after (including post-review re-runs of the 5 review-updated binaries) under 6 Python CPU busy loops on Apple M5 with private `HOME` (`agent_mesh --lib` `53.26 s`, `adversarial_challenge` `38.18 s`, `android_bridge --lib` `91.60 s`, `m5a_challenger_2_stress` `62.05 s`, `mobile_coordination_test` `1045.91 s`, `mcp_server_e2e` `75.44 s`, `test_cli_cancel_and_result` `59.86 s`, `test_m2_identity_scripts` `32.13 s`, `test_mcp_concurrent_and_deadlines` `160.00 s`, `test_p2p_key_persistence` `84.91 s`, `test_agent_bridge.py` `1121.88 s`, `test_sec6_mesh_sandbox.py` `192.31 s`).
 - 2026-11-21: FEAT-9 Implemented (default of D6; text in the archive): updated `PROJECT.md` and `README.md` (alongside `docs/reference.md`) to state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels) while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`), alongside `FEAT-9a` VRAM accounting (pull request 232, [design 0068](design/0068-task-vram-accounting.md)).
 - 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header from the rows after `TEST-84`, `APP-6`, and `FEAT-9` Implemented: 247 items, 172 Implemented, 21 Partial, 54 Planned, 0 Design only; 25 open items are In and 50 are Out (`TEST-56` keeps `Line` `In` while pull request 361 is marked open).
+- 2026-11-21: LV-10 Partial (steps 1–3, [design 0058](design/0058-lasting-value.md)): added `CITATION.cff` (CFF 1.2.0, `version: "0.4.4"`, `MIT` / `Apache-2.0`, `"The OxideSwarm Authors"`), stdlib metadata/version-sync test in `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`; step 4 (Zenodo DOI) stays with the owner.
+- 2026-11-21: PROTO-5 Partial ([design 0083](design/0083-one-version-window.md)): pinned `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release in `.github/workflows/ci.yml` `release-skew` with per-tag directory isolation, added `--release-tag` to `scripts/release_skew.py`, added CLI and static CI workflow tests in `tests/test_release_skew.py`, and updated `CLAUDE.md` and `docs/reference.md`; stays Partial awaiting live GitHub pull request CI run of `release skew (ubuntu-latest)` showing the `v0.3.0` table row.
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `LV-10` and `PROTO-5` Partial: 247 items, 172 Implemented, 23 Partial, 52 Planned, 0 Design only; 25 open items are In and 50 are Out.

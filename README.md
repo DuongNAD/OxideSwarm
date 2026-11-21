@@ -137,6 +137,11 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first. A change to behaviour, a CLI flag
 variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update
 of [docs/reference.md](docs/reference.md), in the same pull request.
 
+## How to cite
+
+If you use OxideSwarm in research, coursework, or a published project, please cite it using the
+metadata in [CITATION.cff](CITATION.cff) (or GitHub's "Cite this repository" button).
+
 ## License
 
 OxideSwarm is dual-licensed under:
