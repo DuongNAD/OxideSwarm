@@ -55,7 +55,7 @@ The binaries are not signed. On macOS, remove the quarantine flag before the fir
 `xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin`. Targets, the `-gpu` archives,
 what the attestation proves and the service installers: [docs/reference.md](docs/reference.md#install).
 
-Build from source (Rust 1.91 or newer; add `--features gpu-wgpu` for a worker whose GPU should do work):
+Build from source (Rust 1.91 or newer; add `--features gpu-wgpu` for hardware GPU detection and the built-in `GpuCompute` benchmark):
 
 ```bash
 cargo build --release --bin oxideswarm
@@ -114,6 +114,8 @@ Add `oxideswarm mcp` as a stdio MCP server in Claude Code, Codex or Cursor:
   review has been published yet.
 - Android: the app does not build yet (AND-1), and the Termux worker has not run on a device.
 - No language model serving yet: release `0.5.0` is Design only.
+- Built-in GPU compute (`GpuCompute`) is benchmark only (seeded matrix multiplication, no user WGSL
+  kernels); user GPU workloads run as `Command` tasks ([docs/guides/gpu-workloads.md](docs/guides/gpu-workloads.md)).
 - Mixed versions: upgrade the master first; it accepts peers one protocol version back.
 
 The full list is in [docs/reference.md](docs/reference.md#status-and-limits), the plan in

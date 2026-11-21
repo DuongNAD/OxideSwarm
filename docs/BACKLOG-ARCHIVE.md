@@ -1052,6 +1052,17 @@ Each item below needs a design record before code.
 - **Done when:** A changed `Task` layout fails CI without a bump. Mismatched peers refuse with a clear
   message.
 
+### FEAT-9: GPU workloads beyond the benchmark
+
+- **Evidence:** Read.
+- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
+- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
+- **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
+  puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
+- **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
+  Vulkan and DirectX 12.
+- **Implemented (2026-11-21, default of D6):** `PROJECT.md` and `README.md` (alongside `docs/reference.md`) now state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels), while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`). `FEAT-9a` (`--vram-mb` / `vram_mb` VRAM accounting) landed in pull request 232 ([design 0068](design/0068-task-vram-accounting.md)); live per-process free VRAM polling (`FEAT-9b`, [design 0067](design/0067-multi-node-llm-serving-and-admission.md)) and Linux GPU isolation rules (`R20`, [design 0074](design/0074-external-runtime-allowlist-and-gpu-workloads.md)) remain tracked separately. (Historical note: `compute_intensity` was removed from `TaskSpec::GpuCompute` in `F1-b` / [design 0044](design/0044-dead-code-and-connection-loop-unification.md).)
+
 ### FEAT-10: Compile crates with cargo
 
 - **Evidence:** Read.
