@@ -1115,6 +1115,23 @@ impl WorkerRegistry {
         Ok((entry.sender.clone(), Arc::clone(&entry.session_live)))
     }
 
+    fn release_dispatch_entry(entry: &mut WorkerEntry) {
+        entry.active_tasks = entry.active_tasks.saturating_sub(1);
+        if let Some(ref status) = entry.mobile_status {
+            let active = entry.visible_active_tasks();
+            if let Some(candidate) = status.adaptive_keepalive_interval(active) {
+                entry.heartbeat_interval = Some(
+                    entry
+                        .heartbeat_interval
+                        .map_or(candidate, |prev| prev.max(candidate)),
+                );
+            }
+        }
+        if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
+            entry.status = WorkerStatus::Connected;
+        }
+    }
+
     /// Gives back the slot [`reserve_dispatch`](Self::reserve_dispatch) took on `session_id`
     /// because the task was not delivered after all. A worker that has re-registered since started
     /// its books from zero, so its counter is left alone.
@@ -1122,20 +1139,32 @@ impl WorkerRegistry {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             if entry.session_id == session_id {
-                entry.active_tasks = entry.active_tasks.saturating_sub(1);
-                if let Some(ref status) = entry.mobile_status {
-                    let active = entry.visible_active_tasks();
-                    if let Some(candidate) = status.adaptive_keepalive_interval(active) {
-                        entry.heartbeat_interval = Some(
-                            entry
-                                .heartbeat_interval
-                                .map_or(candidate, |prev| prev.max(candidate)),
-                        );
-                    }
-                }
-                if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
-                    entry.status = WorkerStatus::Connected;
-                }
+                Self::release_dispatch_entry(entry);
+            }
+        }
+    }
+
+    /// Gives back the slot [`reserve_dispatch`](Self::reserve_dispatch) took on `session_id`
+    /// only while `entry` still holds the exact same live reservation handle (`session_live`).
+    ///
+    /// When a worker times out (`reap_stale_sessions_at` zeros `active_tasks` and sets
+    /// `session_live = false`) and is later revived on the same `session_id`
+    /// (`HeartbeatOutcome::Revived` replaces `entry.session_live` with a new `Arc`), a stale
+    /// pre-reap reservation handle is rejected so it cannot decrement post-revive `active_tasks`.
+    pub async fn release_dispatch_if_live(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+        session_live: &Arc<AtomicBool>,
+    ) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id
+                && entry.status != WorkerStatus::Disconnected
+                && Arc::ptr_eq(&entry.session_live, session_live)
+                && session_live.load(Ordering::Acquire)
+            {
+                Self::release_dispatch_entry(entry);
             }
         }
     }
@@ -3364,5 +3393,79 @@ mod tests {
             "M1: failed release must restore v3 owner in WorkerRegistry"
         );
         assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid_v3]);
+    }
+
+    #[tokio::test]
+    async fn test_release_dispatch_if_live_ignores_pre_reap_handle_after_revive() {
+        let registry = WorkerRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(4);
+        let session = registry
+            .register(
+                id,
+                caps("revive-race-worker"),
+                "127.0.0.1:9060".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_sender_pre, pre_live) = registry.reserve_dispatch(&id, session).await.unwrap();
+        assert!(pre_live.load(Ordering::Acquire));
+        let pre_info = registry.get_worker(id).await.unwrap();
+        assert_eq!(pre_info.active_tasks, 1);
+        assert_eq!(pre_info.status, WorkerStatus::Busy);
+
+        // Reaping clears active_tasks and sets pre_live to false without bumping session_id.
+        let reaped = registry
+            .reap_stale_sessions_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(reaped, vec![(id, session)]);
+        assert!(!pre_live.load(Ordering::Acquire));
+        let reaped_info = registry.get_worker(id).await.unwrap();
+        assert_eq!(reaped_info.status, WorkerStatus::Disconnected);
+        assert_eq!(reaped_info.active_tasks, 0);
+
+        // Calling release_dispatch_if_live while Disconnected is a safe no-op.
+        registry
+            .release_dispatch_if_live(&id, session, &pre_live)
+            .await;
+        let still_reaped = registry.get_worker(id).await.unwrap();
+        assert_eq!(still_reaped.status, WorkerStatus::Disconnected);
+        assert_eq!(still_reaped.active_tasks, 0);
+
+        // Reviving on the same session_id replaces entry.session_live with a fresh Arc.
+        let revived = registry
+            .record_heartbeat_session(&id, 0, 100, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        assert_eq!(revived, HeartbeatOutcome::Revived);
+
+        let (_sender_post, post_live) = registry.reserve_dispatch(&id, session).await.unwrap();
+        assert!(post_live.load(Ordering::Acquire));
+        assert!(!Arc::ptr_eq(&pre_live, &post_live));
+        let post_reserved = registry.get_worker(id).await.unwrap();
+        assert_eq!(post_reserved.active_tasks, 1);
+        assert_eq!(post_reserved.status, WorkerStatus::Busy);
+
+        // A stale pre-reap rollback on the same session_id must NOT clobber post-revive state.
+        registry
+            .release_dispatch_if_live(&id, session, &pre_live)
+            .await;
+        let after_stale_release = registry.get_worker(id).await.unwrap();
+        assert_eq!(after_stale_release.active_tasks, 1);
+        assert_eq!(after_stale_release.status, WorkerStatus::Busy);
+
+        // The live post-revive handle releases its own reservation cleanly.
+        registry
+            .release_dispatch_if_live(&id, session, &post_live)
+            .await;
+        let after_live_release = registry.get_worker(id).await.unwrap();
+        assert_eq!(after_live_release.active_tasks, 0);
+        assert_eq!(after_live_release.status, WorkerStatus::Connected);
     }
 }

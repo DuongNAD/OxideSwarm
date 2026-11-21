@@ -2295,7 +2295,7 @@ impl WorkloadScheduler {
             outcome = tracing::field::Empty,
         );
 
-        let (sender, _session_live) =
+        let (sender, session_live) =
             match self.registry.reserve_dispatch(&worker_id, session_id).await {
                 Ok(sender) => sender,
                 Err(e) => {
@@ -2320,12 +2320,19 @@ impl WorkloadScheduler {
         // outbound channel is full do we defer to a bounded background waiter (`BUG-20`).
         match sender.try_reserve() {
             Ok(permit) => {
+                let live_for_deliver = Arc::clone(&session_live);
                 match self
                     .queue
                     .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
-                        permit.send(msg)
+                        if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(permit);
+                            return None;
+                        }
+                        permit.send(msg);
+                        Some(())
                     })
                     .await
+                    .flatten()
                 {
                     Some(()) => {
                         #[cfg(feature = "otel")]
@@ -2343,9 +2350,11 @@ impl WorkloadScheduler {
                             task_id = %task_id,
                             worker_id = %worker_id,
                             session_id = session_id,
-                            "Task is no longer scheduled on this session; not delivering AssignTask"
+                            "Task is no longer scheduled on a live session; not delivering AssignTask"
                         );
-                        self.registry.release_dispatch(&worker_id, session_id).await;
+                        self.registry
+                            .release_dispatch_if_live(&worker_id, session_id, &session_live)
+                            .await;
                     }
                 }
                 return;
@@ -2361,6 +2370,7 @@ impl WorkloadScheduler {
                     task_id,
                     worker_id,
                     session_id,
+                    &session_live,
                 )
                 .await;
                 return;
@@ -2382,7 +2392,9 @@ impl WorkloadScheduler {
                 cap = self.max_in_flight_dispatches_per_worker,
                 "Worker channel is full and deferred dispatch waiter cap is reached; returning assignment to the queue"
             );
-            self.registry.release_dispatch(&worker_id, session_id).await;
+            self.registry
+                .release_dispatch_if_live(&worker_id, session_id, &session_live)
+                .await;
             if self
                 .queue
                 .requeue_dispatch_failure(&task_id, &worker_id, session_id)
@@ -2405,12 +2417,19 @@ impl WorkloadScheduler {
         match initial_poll {
             std::task::Poll::Ready(Ok(permit)) => {
                 drop(in_flight_guard);
+                let live_for_deliver = Arc::clone(&session_live);
                 match self
                     .queue
                     .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
+                        if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(permit);
+                            return None;
+                        }
                         let _ = permit.send(msg);
+                        Some(())
                     })
                     .await
+                    .flatten()
                 {
                     Some(()) => {
                         #[cfg(feature = "otel")]
@@ -2428,9 +2447,11 @@ impl WorkloadScheduler {
                             task_id = %task_id,
                             worker_id = %worker_id,
                             session_id = session_id,
-                            "Task is no longer scheduled on this session; not delivering AssignTask"
+                            "Task is no longer scheduled on a live session; not delivering AssignTask"
                         );
-                        self.registry.release_dispatch(&worker_id, session_id).await;
+                        self.registry
+                            .release_dispatch_if_live(&worker_id, session_id, &session_live)
+                            .await;
                     }
                 }
                 return;
@@ -2447,6 +2468,7 @@ impl WorkloadScheduler {
                     task_id,
                     worker_id,
                     session_id,
+                    &session_live,
                 )
                 .await;
                 return;
@@ -2464,11 +2486,18 @@ impl WorkloadScheduler {
             let _guard = in_flight_guard;
             match tokio::time::timeout_at(deadline, reserve_fut).await {
                 Ok(Ok(permit)) => {
+                    let live_for_deliver = Arc::clone(&session_live);
                     match queue
                         .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
+                            if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                                drop(permit);
+                                return None;
+                            }
                             let _ = permit.send(msg);
+                            Some(())
                         })
                         .await
+                        .flatten()
                     {
                         Some(()) => {
                             #[cfg(feature = "otel")]
@@ -2488,9 +2517,11 @@ impl WorkloadScheduler {
                                 task_id = %task_id,
                                 worker_id = %worker_id,
                                 session_id = session_id,
-                                "Task is no longer scheduled on this session; not delivering deferred AssignTask"
+                                "Task is no longer scheduled on a live session; not delivering deferred AssignTask"
                             );
-                            registry.release_dispatch(&worker_id, session_id).await;
+                            registry
+                                .release_dispatch_if_live(&worker_id, session_id, &session_live)
+                                .await;
                         }
                     }
                 }
@@ -2505,6 +2536,7 @@ impl WorkloadScheduler {
                         task_id,
                         worker_id,
                         session_id,
+                        &session_live,
                     )
                     .await;
                 }
@@ -2518,7 +2550,9 @@ impl WorkloadScheduler {
                         timeout_ms = timeout.as_millis() as u64,
                         "Timed out waiting for room in worker channel; returning assignment to the queue"
                     );
-                    registry.release_dispatch(&worker_id, session_id).await;
+                    registry
+                        .release_dispatch_if_live(&worker_id, session_id, &session_live)
+                        .await;
                     if queue
                         .requeue_dispatch_failure(&task_id, &worker_id, session_id)
                         .await
@@ -2531,6 +2565,7 @@ impl WorkloadScheduler {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn rollback_closed_dispatch(
         registry: &WorkerRegistry,
         queue: &TaskQueue,
@@ -2539,6 +2574,7 @@ impl WorkloadScheduler {
         task_id: TaskId,
         worker_id: Uuid,
         session_id: u64,
+        session_live: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         warn!(
             task_id = %task_id,
@@ -2546,7 +2582,9 @@ impl WorkloadScheduler {
             session_id = session_id,
             "Failed to dispatch AssignTask to worker; rolling back assignment"
         );
-        registry.release_dispatch(&worker_id, session_id).await;
+        registry
+            .release_dispatch_if_live(&worker_id, session_id, session_live)
+            .await;
         // Requeue this task first, uncharged: it never left the master, and the sweep below
         // would otherwise count it as a failover.
         let _ = queue
@@ -8374,5 +8412,195 @@ mod tests {
         assert_eq!(sink.saturated_count(), 3);
         assert!(sched.schedule_once().await.unwrap().assignments.is_empty());
         assert_eq!(sink.saturated_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn tier5_scheduler_case5_revive_race_preserves_post_revive_active_tasks() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_dispatch_reserve_timeout(Duration::from_secs(5));
+
+        let w = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let session = registry
+            .register(
+                w,
+                WorkerCapabilities::new("case5-revive-worker", 4, 8192, false, false, None),
+                "127.0.0.1:9531".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Fill the 1-slot outbound channel so t1 enters the deferred reserve_owned waiter path.
+        tx.try_send(MasterMessage::HeartbeatAck { timestamp: 0 })
+            .unwrap();
+
+        let t1 = queue
+            .submit(Task::new(
+                TaskSpec::new_command("echo", vec!["t1".into()]),
+                TaskRequirements::generic(1, 64),
+            ))
+            .await
+            .unwrap();
+
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, t1);
+        tokio::task::yield_now().await;
+
+        // Reaper marks worker Disconnected (active_tasks = 0, old session_live = false) and sweeps t1.
+        let reaped = registry
+            .reap_stale_sessions_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(reaped, vec![(w, session)]);
+        let swept = queue
+            .handle_session_disconnected(
+                &w,
+                Some(session),
+                "Heartbeat timeout (reaper detected)",
+                false,
+            )
+            .await;
+        assert_eq!(swept, vec![t1]);
+
+        // Worker heartbeats on the same session_id -> HeartbeatOutcome::Revived (new session_live Arc).
+        let revived = registry
+            .record_heartbeat_session(&w, 0, 1001, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        assert_eq!(revived, crate::registry::HeartbeatOutcome::Revived);
+
+        // Post-revive task t2 is scheduled while channel is still full; its waiter queues behind t1.
+        let t2 = queue
+            .submit(Task::new(
+                TaskSpec::new_command("echo", vec!["t2".into()]),
+                TaskRequirements::generic(1, 64),
+            ))
+            .await
+            .unwrap();
+        let r2 = sched.schedule_once().await.unwrap();
+        assert_eq!(r2.assignments.len(), 1);
+        assert_eq!(r2.assignments[0].task_id, t2);
+        tokio::task::yield_now().await;
+
+        let before_drain = registry.get_worker(w).await.unwrap();
+        assert_eq!(before_drain.status, WorkerStatus::Busy);
+        assert_eq!(before_drain.active_tasks, 1);
+
+        // Drain the filler frame: wakes t1's pre-reap waiter first (FIFO), which must NOT deliver t1
+        // and must NOT decrement post-revive active_tasks via release_dispatch_if_live, then wakes t2's waiter.
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first,
+            MasterMessage::HeartbeatAck { timestamp: 0 }
+        ));
+
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match second {
+            MasterMessage::AssignTask { task } => assert_eq!(task.id, t2),
+            other => panic!("expected AssignTask for t2, got {other:?}"),
+        }
+
+        // Allow any trailing cleanup in the deferred waiter tasks to settle, verify t1 was not sent.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "t1 must never be delivered");
+
+        let after_drain = registry.get_worker(w).await.unwrap();
+        assert_eq!(after_drain.status, WorkerStatus::Busy);
+        assert_eq!(after_drain.active_tasks, 1);
+        assert_eq!(
+            queue.get_task(&t2).await.unwrap().state,
+            crate::queue::TaskState::Scheduled
+        );
+    }
+
+    #[tokio::test]
+    async fn tier5_scheduler_stale_session_live_blocks_deferred_delivery_before_sweep() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_dispatch_reserve_timeout(Duration::from_secs(5));
+
+        let w = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let session = registry
+            .register(
+                w,
+                WorkerCapabilities::new("stale-live-worker", 4, 8192, false, false, None),
+                "127.0.0.1:9532".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tx.try_send(MasterMessage::HeartbeatAck { timestamp: 1 })
+            .unwrap();
+
+        let t1 = queue
+            .submit(Task::new(
+                TaskSpec::new_command("echo", vec!["t1-unswept".into()]),
+                TaskRequirements::generic(1, 64),
+            ))
+            .await
+            .unwrap();
+
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, t1);
+        tokio::task::yield_now().await;
+
+        // Reap sets session_live = false BEFORE handle_session_disconnected sweeps t1 out of Scheduled.
+        let reaped = registry
+            .reap_stale_sessions_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(reaped, vec![(w, session)]);
+
+        // Draining the filler frame wakes t1's waiter while t1 is still Scheduled in queue,
+        // yet deliver_if_scheduled must refuse to send onto the stale session_live handle.
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first,
+            MasterMessage::HeartbeatAck { timestamp: 1 }
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "t1 must NOT be delivered onto a stale session_live handle"
+        );
+        let info = registry.get_worker(w).await.unwrap();
+        assert_eq!(info.status, WorkerStatus::Disconnected);
+        assert_eq!(info.active_tasks, 0);
     }
 }

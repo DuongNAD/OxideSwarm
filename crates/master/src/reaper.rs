@@ -511,7 +511,7 @@ pub(crate) async fn run_straggler_pass(
             | crate::queue::SpeculativeStartOutcome::WithheldFromPeer
             | crate::queue::SpeculativeStartOutcome::DeliveryFailed => {
                 registry
-                    .release_dispatch(&target.worker_id, target.session_id)
+                    .release_dispatch_if_live(&target.worker_id, target.session_id, &session_live)
                     .await;
             }
         }
