@@ -119,7 +119,7 @@ pub(crate) async fn cancel_task_and_notify(
             debug!(task_id = %task_id, worker_id = %worker_id, error = %e, "Could not deliver CancelTask to worker");
         }
     }
-    if let Some((spec_wid, spec_sid)) = outcome.extra_worker_to_notify {
+    if let Some((spec_wid, spec_sid, spec_live)) = outcome.extra_worker_to_notify {
         let msg = MasterMessage::CancelTask {
             task_id,
             reason: Some(format!(
@@ -137,7 +137,14 @@ pub(crate) async fn cancel_task_and_notify(
                 "Could not deliver CancelTask to speculative worker"
             );
         }
-        registry.release_dispatch(&spec_wid, spec_sid).await;
+        match spec_live {
+            Some(live) => {
+                registry
+                    .release_dispatch_if_live(&spec_wid, spec_sid, &live)
+                    .await;
+            }
+            None => registry.release_dispatch(&spec_wid, spec_sid).await,
+        }
     }
 
     let result = outcome.result.unwrap_or_else(|| {
@@ -624,7 +631,19 @@ async fn apply_task_result_inner(
 
     // 2. Release the worker's slot immediately and keep its circuit breaker current
     if !outcome.adopted_from_hold {
-        let _ = registry.decrement_active_tasks(&worker_id).await;
+        match (outcome.session_id, outcome.session_live.as_ref()) {
+            (Some(sid), Some(live)) => {
+                registry
+                    .release_dispatch_if_live(&worker_id, sid, live)
+                    .await;
+            }
+            (Some(sid), None) => {
+                registry.release_dispatch(&worker_id, sid).await;
+            }
+            (None, _) => {
+                let _ = registry.decrement_active_tasks(&worker_id).await;
+            }
+        }
     }
     if outcome.rejected {
         let _ = registry.record_rejection(&worker_id, session_id).await;
@@ -641,7 +660,7 @@ async fn apply_task_result_inner(
     //    input pins. When terminal, input pins are released and output pins stay held for
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
-        if let Some((loser_wid, loser_sid)) = outcome.cancel_sibling {
+        if let Some((loser_wid, loser_sid, loser_live)) = outcome.cancel_sibling {
             let cancel_msg = MasterMessage::CancelTask {
                 task_id,
                 reason: Some(
@@ -660,9 +679,17 @@ async fn apply_task_result_inner(
                     "Could not deliver CancelTask to losing sibling worker"
                 );
             }
-            match loser_sid {
-                Some(sid) => registry.release_dispatch(&loser_wid, sid).await,
-                None => {
+            match (loser_sid, loser_live) {
+                (Some(sid), Some(live)) => {
+                    registry
+                        .release_dispatch_if_live(&loser_wid, sid, &live)
+                        .await;
+                }
+                (Some(sid), None) => registry.release_dispatch(&loser_wid, sid).await,
+                (None, _) => {
+                    // Only reachable via sessionless test helpers (`schedule_task` / `pop_and_schedule`);
+                    // production `WorkloadScheduler` and `adopt_session_tasks` always record both
+                    // `session_id` and `session_live`.
                     let _ = registry.decrement_active_tasks(&loser_wid).await;
                 }
             }
@@ -822,11 +849,11 @@ pub(crate) async fn handle_oversized_master_message(
         Some(reason),
     );
 
-    let disposition = match queue
+    let (disposition, session_live) = match queue
         .fail_unsendable_assignment(worker_id, Some(session_id), result.clone())
         .await
     {
-        Ok(d) => d,
+        Ok(pair) => pair,
         Err(e) => {
             warn!(task_id = %task_id, error = %e, "Failed to record oversized assignment failure");
             return;
@@ -851,7 +878,14 @@ pub(crate) async fn handle_oversized_master_message(
         }
     }
 
-    let _ = registry.decrement_active_tasks(&worker_id).await;
+    match session_live {
+        Some(live) => {
+            registry
+                .release_dispatch_if_live(&worker_id, session_id, &live)
+                .await;
+        }
+        None => registry.release_dispatch(&worker_id, session_id).await,
+    }
 
     if disposition == ResultDisposition::Terminal {
         if let Some(store) = blob_store {

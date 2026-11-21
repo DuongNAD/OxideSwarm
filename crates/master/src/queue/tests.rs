@@ -1961,7 +1961,9 @@ async fn sched4c_speculative_lifecycle_cancel_sibling_and_failure_tolerance() {
         .unwrap();
     assert_eq!(win.disposition, ResultDisposition::Terminal);
     assert_eq!(win.state, TaskState::Completed);
-    assert_eq!(win.cancel_sibling, Some((w_primary, Some(10))));
+    let (sib_wid, sib_sid, sib_live) = win.cancel_sibling.expect("expected cancel_sibling");
+    assert_eq!((sib_wid, sib_sid), (w_primary, Some(10)));
+    assert!(sib_live.is_none());
     assert_eq!(
         queue.get_task(&id1).await.unwrap().assigned_worker_id,
         Some(w_spec)
@@ -2046,7 +2048,11 @@ async fn sched4c_speculative_lifecycle_cancel_sibling_and_failure_tolerance() {
         .unwrap();
     assert!(cancel.newly_cancelled);
     assert_eq!(cancel.worker_to_notify, Some(w_primary));
-    assert_eq!(cancel.extra_worker_to_notify, Some((w_spec, 22)));
+    let (extra_wid, extra_sid, extra_live) = cancel
+        .extra_worker_to_notify
+        .expect("expected extra_worker_to_notify");
+    assert_eq!((extra_wid, extra_sid), (w_spec, 22));
+    assert!(extra_live.is_some());
     assert!(queue.assigned_loads().await.is_empty());
 }
 

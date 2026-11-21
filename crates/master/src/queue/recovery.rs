@@ -2,6 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,6 +154,7 @@ impl TaskQueue {
             entry.state = TaskState::Failed;
             entry.assigned_worker_id = None;
             entry.assigned_session = None;
+            entry.assigned_session_live = None;
             entry.adoptable_by = None;
             entry.fail_if_not_adopted = false;
             entry.pending_failover_charge = false;
@@ -265,6 +267,7 @@ impl TaskQueue {
                     entry.state = TaskState::Failed;
                     entry.assigned_worker_id = None;
                     entry.assigned_session = None;
+                    entry.assigned_session_live = None;
                     entry.adoptable_by = None;
                     entry.fail_if_not_adopted = false;
                     entry.pending_failover_charge = false;
@@ -638,6 +641,7 @@ impl TaskQueue {
                     rejection_count: p.rejection_count,
                     avoid_workers: p.avoid_workers,
                     assigned_session: None,
+                    assigned_session_live: None,
                     resumed_from_checkpoint: false,
                     adoptable_by,
                     fail_if_not_adopted,
@@ -906,6 +910,7 @@ impl TaskQueue {
                         entry.state = TaskState::Running;
                         entry.assigned_worker_id = Some(worker_id);
                         entry.assigned_session = Some(session_id);
+                        entry.assigned_session_live = None;
                         entry.started_instant = Some(now);
                         entry.adoptable_by = None;
                         entry.fail_if_not_adopted = false;
@@ -992,6 +997,30 @@ impl TaskQueue {
             }
         }
         outcome
+    }
+
+    /// Records the live reservation handle for tasks just adopted via `ResumeSession`.
+    pub(crate) async fn set_assigned_session_live(
+        &self,
+        task_ids: &[TaskId],
+        worker_id: Uuid,
+        session_id: u64,
+        session_live: Arc<AtomicBool>,
+    ) {
+        if task_ids.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        for task_id in task_ids {
+            if let Some(entry) = inner.tasks.get_mut(task_id) {
+                if entry.state.is_active()
+                    && entry.assigned_worker_id == Some(worker_id)
+                    && entry.assigned_session == Some(session_id)
+                {
+                    entry.assigned_session_live = Some(Arc::clone(&session_live));
+                }
+            }
+        }
     }
 
     /// Releases any `adoptable_by` holds whose deadline has passed, failing tasks marked

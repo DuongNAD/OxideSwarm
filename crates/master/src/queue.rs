@@ -5,6 +5,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -328,6 +329,7 @@ pub struct RetryAttempt {
 pub struct SpeculativeAttempt {
     pub worker_id: Uuid,
     pub session_id: u64,
+    pub session_live: Arc<AtomicBool>,
     pub scheduled_instant: Instant,
     pub started_instant: Option<Instant>,
     pub state: TaskState,
@@ -375,6 +377,10 @@ pub struct TaskEntry {
     /// assignments made without session information). Results, progress and checkpoints are only
     /// accepted from this worker *and* session, so a superseded or reaped session cannot touch it.
     pub assigned_session: Option<u64>,
+    /// Per-session liveness flag from the `WorkerRegistry` reservation that dispatched or adopted
+    /// this assignment (`None` when assigned without registry reservation info). Used so late or
+    /// pre-sweep cleanups never decrement `active_tasks` on a session that was reaped and revived.
+    pub assigned_session_live: Option<Arc<AtomicBool>>,
     /// True when the current dispatch resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
     /// When set (`Some((worker_id, hold_until))`), this `Queued` task is held for `worker_id` to
@@ -655,7 +661,7 @@ pub enum ResultDisposition {
 }
 
 /// Outcome of `TaskQueue::record_result_from`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResultOutcome {
     pub disposition: ResultDisposition,
     /// State of the task after the call.
@@ -673,20 +679,26 @@ pub struct ResultOutcome {
     pub timeout_secs: u64,
     /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
+    /// Reporting worker's assigned session id, when tracked.
+    pub session_id: Option<u64>,
+    /// Reporting worker's dispatch reservation `session_live` handle, when tracked.
+    pub session_live: Option<Arc<AtomicBool>>,
     /// When a speculative sibling existed and this result completed the task cleanly, the losing
-    /// `(worker_id, session_id)` that must receive `MasterMessage::CancelTask` (`0060` D3).
-    pub cancel_sibling: Option<(Uuid, Option<u64>)>,
+    /// `(worker_id, session_id, session_live)` that must receive `MasterMessage::CancelTask` and
+    /// have its dispatch released (`0060` D3).
+    pub cancel_sibling: Option<(Uuid, Option<u64>, Option<Arc<AtomicBool>>)>,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CancelOutcome {
     /// False when the task had already finished; nothing was changed.
     pub newly_cancelled: bool,
     /// Worker currently executing the task, which must be told to stop.
     pub worker_to_notify: Option<Uuid>,
-    /// Speculative sibling `(worker_id, session_id)` also executing the task, which must stop too.
-    pub extra_worker_to_notify: Option<(Uuid, u64)>,
+    /// Speculative sibling `(worker_id, session_id, session_live)` also executing the task, which
+    /// must stop too.
+    pub extra_worker_to_notify: Option<(Uuid, u64, Option<Arc<AtomicBool>>)>,
     /// The cancelled result recorded for the task, to hand to everybody waiting on it.
     pub result: Option<TaskResult>,
 }
@@ -988,6 +1000,7 @@ fn mark_entry_scheduled(
     entry.state = TaskState::Scheduled;
     entry.assigned_worker_id = Some(worker_id);
     entry.assigned_session = session_id;
+    entry.assigned_session_live = None;
     entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
     entry.adoptable_by = None;
     entry.fail_if_not_adopted = false;

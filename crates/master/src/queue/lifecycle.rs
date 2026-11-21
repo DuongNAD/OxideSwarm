@@ -2,6 +2,8 @@
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -291,6 +293,8 @@ impl TaskQueue {
             task_key,
             timeout_secs,
             resumed_from_checkpoint,
+            reporting_session_id,
+            reporting_session_live,
         ) = {
             let entry = inner
                 .tasks
@@ -304,6 +308,17 @@ impl TaskQueue {
                 && entry
                     .adoptable_by
                     .is_some_and(|(w, until)| w == worker_id && now_instant < until);
+            let (reporting_session_id, reporting_session_live) = if spec_owner {
+                entry
+                    .speculative
+                    .as_ref()
+                    .map(|s| (Some(s.session_id), Some(Arc::clone(&s.session_live))))
+                    .unwrap_or((None, None))
+            } else if owner {
+                (entry.assigned_session, entry.assigned_session_live.clone())
+            } else {
+                (None, None)
+            };
             (
                 entry.state,
                 owner,
@@ -318,6 +333,8 @@ impl TaskQueue {
                 } else {
                     entry.resumed_from_checkpoint
                 },
+                reporting_session_id,
+                reporting_session_live,
             )
         };
 
@@ -338,6 +355,8 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    session_id: None,
+                    session_live: None,
                     cancel_sibling: None,
                 },
                 None,
@@ -354,6 +373,7 @@ impl TaskQueue {
                 entry.state = TaskState::Running;
                 entry.assigned_worker_id = Some(worker_id);
                 entry.assigned_session = session_id;
+                entry.assigned_session_live = None;
                 entry.started_instant = Some(now_instant);
                 entry.adoptable_by = None;
                 entry.fail_if_not_adopted = false;
@@ -386,6 +406,8 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    session_id: reporting_session_id,
+                    session_live: reporting_session_live,
                     cancel_sibling: None,
                 },
                 None,
@@ -414,6 +436,7 @@ impl TaskQueue {
                     }
                     entry.assigned_worker_id = Some(spec.worker_id);
                     entry.assigned_session = Some(spec.session_id);
+                    entry.assigned_session_live = Some(spec.session_live);
                     entry.state = spec.state;
                     entry.scheduled_instant = Some(spec.scheduled_instant);
                     entry.started_instant = spec.started_instant;
@@ -454,6 +477,8 @@ impl TaskQueue {
                         task_key,
                         timeout_secs,
                         resumed_from_checkpoint,
+                        session_id: reporting_session_id,
+                        session_live: reporting_session_live,
                         cancel_sibling: None,
                     },
                     ack,
@@ -463,7 +488,7 @@ impl TaskQueue {
 
         let mut delay_key_to_insert = None;
         let mut ready_key_to_insert = None;
-        let mut cancel_sibling: Option<(Uuid, Option<u64>)> = None;
+        let mut cancel_sibling: Option<(Uuid, Option<u64>, Option<Arc<AtomicBool>>)> = None;
 
         let (res_state, disposition, journal_record) = {
             let entry = inner
@@ -481,14 +506,23 @@ impl TaskQueue {
                 }
                 if let Some(spec) = entry.speculative.take() {
                     if spec_owner {
-                        cancel_sibling = entry
-                            .assigned_worker_id
-                            .map(|wid| (wid, entry.assigned_session));
+                        cancel_sibling = entry.assigned_worker_id.map(|wid| {
+                            (
+                                wid,
+                                entry.assigned_session,
+                                entry.assigned_session_live.clone(),
+                            )
+                        });
                         entry.assigned_worker_id = Some(worker_id);
                         entry.assigned_session = session_id;
+                        entry.assigned_session_live = Some(spec.session_live);
                         entry.resumed_from_checkpoint = false;
                     } else {
-                        cancel_sibling = Some((spec.worker_id, Some(spec.session_id)));
+                        cancel_sibling = Some((
+                            spec.worker_id,
+                            Some(spec.session_id),
+                            Some(spec.session_live),
+                        ));
                     }
                 }
                 entry.state = TaskState::Completed;
@@ -553,6 +587,7 @@ impl TaskQueue {
                 entry.state = TaskState::Queued;
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 entry.scheduled_instant = None;
                 entry.started_instant = None;
                 ready_key_to_insert = Some(QueueOrderKey {
@@ -582,6 +617,7 @@ impl TaskQueue {
                 entry.state = TaskState::Retrying;
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 entry.retry_after_instant = Some(retry_after);
                 let attempt = RetryAttempt {
                     attempt: entry.retry_count,
@@ -633,7 +669,7 @@ impl TaskQueue {
             }
         };
 
-        if let Some((loser_wid, _)) = cancel_sibling {
+        if let Some((loser_wid, _, _)) = cancel_sibling {
             if let Some(tasks) = inner.worker_assignments.get_mut(&loser_wid) {
                 tasks.remove(&task_id);
             }
@@ -699,6 +735,8 @@ impl TaskQueue {
                 task_key,
                 timeout_secs,
                 resumed_from_checkpoint,
+                session_id: reporting_session_id,
+                session_live: reporting_session_live,
                 cancel_sibling,
             },
             ack,
@@ -708,28 +746,42 @@ impl TaskQueue {
     /// Fails a task terminally when its assignment message exceeds `MAX_FRAME_SIZE`
     /// (`ProtocolError::FrameTooLarge`). Never retries, even when `retry_on_execution_failure` is
     /// enabled, because the assignment itself cannot fit a protocol frame.
+    ///
+    /// Also returns the dispatch reservation's `session_live` handle (if recorded on the entry) so
+    /// the caller does not decrement post-revive `active_tasks` if the session was reaped and
+    /// revived before this failure ran.
     pub async fn fail_unsendable_assignment(
         &self,
         worker_id: Uuid,
         session_id: Option<u64>,
         result: TaskResult,
-    ) -> GridResult<ResultDisposition> {
+    ) -> GridResult<(ResultDisposition, Option<Arc<AtomicBool>>)> {
         let task_id = result.task_id;
-        let ack = {
+        let (reporting_live, ack) = {
             let mut inner = self.inner.write().await;
 
-            let (state, owner, spec_owner) = {
+            let (state, owner, spec_owner, reporting_live) = {
                 let entry = inner
                     .tasks
                     .get(&task_id)
                     .ok_or(GridError::TaskNotFound(task_id.0))?;
                 let owner = owned_by(entry, &worker_id, session_id);
                 let spec_owner = !owner && owned_by_speculative(entry, &worker_id, session_id);
-                (entry.state, owner, spec_owner)
+                let reporting_live = if spec_owner {
+                    entry
+                        .speculative
+                        .as_ref()
+                        .map(|s| Arc::clone(&s.session_live))
+                } else if owner {
+                    entry.assigned_session_live.clone()
+                } else {
+                    None
+                };
+                (entry.state, owner, spec_owner, reporting_live)
             };
 
             if !owner && !spec_owner {
-                return Ok(ResultDisposition::Stale);
+                return Ok((ResultDisposition::Stale, None));
             }
 
             if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
@@ -738,7 +790,7 @@ impl TaskQueue {
             inner.refresh_worker_resume_protection(worker_id);
 
             if state.is_terminal() {
-                return Ok(ResultDisposition::Late);
+                return Ok((ResultDisposition::Late, reporting_live));
             }
 
             let now_epoch = Utc::now().timestamp() as u64;
@@ -746,7 +798,7 @@ impl TaskQueue {
                 if let Some(entry) = inner.tasks.get_mut(&task_id) {
                     entry.speculative = None;
                 }
-                return Ok(ResultDisposition::SiblingFailed);
+                return Ok((ResultDisposition::SiblingFailed, reporting_live));
             }
             let promoted = {
                 let entry = inner
@@ -756,6 +808,7 @@ impl TaskQueue {
                 if let Some(spec) = entry.speculative.take() {
                     entry.assigned_worker_id = Some(spec.worker_id);
                     entry.assigned_session = Some(spec.session_id);
+                    entry.assigned_session_live = Some(spec.session_live);
                     entry.state = spec.state;
                     entry.scheduled_instant = Some(spec.scheduled_instant);
                     entry.started_instant = spec.started_instant;
@@ -781,7 +834,7 @@ impl TaskQueue {
                     });
                 }
                 inner.maybe_trigger_compaction();
-                return Ok(ResultDisposition::SiblingFailed);
+                return Ok((ResultDisposition::SiblingFailed, reporting_live));
             }
 
             let record = {
@@ -819,7 +872,7 @@ impl TaskQueue {
             inner.track_terminal_task(task_id);
             let ack = inner.append_durable_warn(&record);
             inner.maybe_trigger_compaction();
-            ack
+            (reporting_live, ack)
         };
 
         if let Some(ack) = ack {
@@ -828,7 +881,7 @@ impl TaskQueue {
             }
         }
         self.flush_cold_maintenance().await;
-        Ok(ResultDisposition::Terminal)
+        Ok((ResultDisposition::Terminal, reporting_live))
     }
 
     /// Fails a queued task terminally when no registered worker in the cluster can satisfy its
@@ -992,6 +1045,7 @@ impl TaskQueue {
                 if let Some(spec) = entry.speculative.take() {
                     entry.assigned_worker_id = Some(spec.worker_id);
                     entry.assigned_session = Some(spec.session_id);
+                    entry.assigned_session_live = Some(spec.session_live);
                     entry.state = spec.state;
                     entry.scheduled_instant = Some(spec.scheduled_instant);
                     entry.started_instant = spec.started_instant;
@@ -1044,6 +1098,7 @@ impl TaskQueue {
                     entry.state = TaskState::Queued;
                     entry.assigned_worker_id = None;
                     entry.assigned_session = None;
+                    entry.assigned_session_live = None;
                     entry.scheduled_instant = None;
                     entry.started_instant = None;
                     entry.retry_after_instant = None;
@@ -1075,6 +1130,7 @@ impl TaskQueue {
                         entry.failover_count += 1;
                         entry.assigned_worker_id = None;
                         entry.assigned_session = None;
+                        entry.assigned_session_live = None;
                         let attempt = RetryAttempt {
                             attempt: entry.retry_count,
                             timestamp_utc: now_epoch,
@@ -1113,6 +1169,7 @@ impl TaskQueue {
                         entry.state = TaskState::Failed;
                         entry.assigned_worker_id = None;
                         entry.assigned_session = None;
+                        entry.assigned_session_live = None;
                         let err_msg = format!(
                             "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
                         );
@@ -1432,6 +1489,7 @@ impl TaskQueue {
             if let Some(spec) = entry.speculative.take() {
                 entry.assigned_worker_id = Some(spec.worker_id);
                 entry.assigned_session = Some(spec.session_id);
+                entry.assigned_session_live = Some(spec.session_live);
                 entry.state = spec.state;
                 entry.scheduled_instant = Some(spec.scheduled_instant);
                 entry.started_instant = spec.started_instant;
@@ -1462,6 +1520,7 @@ impl TaskQueue {
                 entry.state = TaskState::Queued;
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 entry.scheduled_instant = None;
                 entry.started_instant = None;
                 entry.retry_after_instant = None;
@@ -1490,6 +1549,7 @@ impl TaskQueue {
 
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 let attempt = RetryAttempt {
                     attempt: entry.retry_count,
                     timestamp_utc: now_epoch,
@@ -1545,6 +1605,7 @@ impl TaskQueue {
                 entry.state = TaskState::Failed;
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 let err_msg = format!(
                         "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
                     );
@@ -1816,8 +1877,8 @@ impl TaskQueue {
                 .tasks
                 .get_mut(task_id)
                 .and_then(|entry| entry.speculative.take())
-                .map(|spec| (spec.worker_id, spec.session_id));
-            if let Some((spec_wid, _)) = extra_worker_to_notify {
+                .map(|spec| (spec.worker_id, spec.session_id, Some(spec.session_live)));
+            if let Some((spec_wid, _, _)) = extra_worker_to_notify {
                 if let Some(tasks) = inner.worker_assignments.get_mut(&spec_wid) {
                     tasks.remove(task_id);
                 }

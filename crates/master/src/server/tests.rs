@@ -1731,3 +1731,724 @@ async fn test_submit_task_refuses_unknown_critical_and_oversized_extensions() {
     ));
     server_task.abort();
 }
+
+#[tokio::test]
+async fn tier5_tasks_and_blobs_case6_cancel_140_ignores_stale_speculative_after_revive() {
+    use crate::reaper::ReaperConfig;
+    use crate::registry::{HeartbeatOutcome, WorkerStatus};
+    use crate::scheduler::SchedulerConfig;
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+    use rusty_grid_core::task::{TaskRequirements, TaskSpec};
+    use std::time::Duration;
+
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::new(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await
+    .unwrap();
+
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+    let (tx_primary, mut rx_primary) = tokio::sync::mpsc::channel(16);
+    let (tx_spec, mut rx_spec) = tokio::sync::mpsc::channel(16);
+
+    let mut caps_primary = WorkerCapabilities::new("primary", 4, 8192, false, false, None);
+    caps_primary.tags.push("role=primary".into());
+    let s_primary = master
+        .registry
+        .register(
+            w_primary,
+            caps_primary,
+            "127.0.0.1:9701".parse().unwrap(),
+            tx_primary,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut caps_spec = WorkerCapabilities::new("spec", 4, 8192, false, false, None);
+    caps_spec.tags.push("role=spec".into());
+    let s_spec = master
+        .registry
+        .register(
+            w_spec,
+            caps_spec,
+            "127.0.0.1:9702".parse().unwrap(),
+            tx_spec,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let t1 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case6-t1".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![
+                OPT_REPEATABLE_TAG.to_string(),
+                "require:worker=primary".into(),
+            ]),
+        )
+        .await
+        .unwrap();
+
+    let assigned_t1 = tokio::time::timeout(Duration::from_secs(2), rx_primary.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t1, MasterMessage::AssignTask { ref task } if task.id == t1));
+    master
+        .queue
+        .mark_running_from(w_primary, Some(s_primary), &t1)
+        .await
+        .unwrap();
+
+    let (spec_sender, spec_live) = master
+        .registry
+        .reserve_dispatch(&w_spec, s_spec)
+        .await
+        .unwrap();
+    let spec_outcome = master
+        .queue
+        .try_start_speculative_and_deliver(
+            t1,
+            w_spec,
+            s_spec,
+            Arc::clone(&spec_live),
+            Some(PROTOCOL_VERSION_CURRENT),
+            |task| {
+                spec_sender
+                    .try_send(MasterMessage::AssignTask { task })
+                    .is_ok()
+            },
+        )
+        .await;
+    assert_eq!(
+        spec_outcome,
+        crate::queue::SpeculativeStartOutcome::Delivered
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx_spec.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Reap w_spec ONLY (advance past w_spec's heartbeat while keeping w_primary fresh), then revive
+    // w_spec on the same session_id before the reaper sweeps t1's speculative slot.
+    let spec_hb = master
+        .registry
+        .last_heartbeat_instant(&w_spec)
+        .await
+        .unwrap();
+    let reaped = master
+        .registry
+        .reap_stale_sessions_at(spec_hb + Duration::from_secs(30), Duration::from_secs(5))
+        .await;
+    assert!(reaped.contains(&(w_spec, s_spec)));
+
+    let revived = master
+        .registry
+        .record_heartbeat_session(&w_spec, 0, 1001, 10.0, 4096, Some(s_spec))
+        .await
+        .unwrap();
+    assert_eq!(revived, HeartbeatOutcome::Revived);
+
+    let t2 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case6-t2".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec!["require:worker=spec".into()]),
+        )
+        .await
+        .unwrap();
+    let assigned_t2 = tokio::time::timeout(Duration::from_secs(2), rx_spec.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t2, MasterMessage::AssignTask { ref task } if task.id == t2));
+
+    let before = master.registry.get_worker(w_spec).await.unwrap();
+    assert_eq!(before.status, WorkerStatus::Busy);
+    assert_eq!(before.active_tasks, 1);
+
+    // Pre-sweep cancel of t1 hits tasks_and_blobs.rs:140; must NOT release t2's post-revive slot.
+    master.cancel_task(t1).await.unwrap();
+
+    let after = master.registry.get_worker(w_spec).await.unwrap();
+    assert_eq!(after.status, WorkerStatus::Busy);
+    assert_eq!(after.active_tasks, 1);
+    assert_eq!(
+        master.queue.get_task(&t2).await.unwrap().state,
+        TaskState::Scheduled
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn tier5_tasks_and_blobs_case7_result_spec_loser_664_ignores_stale_speculative_after_revive()
+{
+    use crate::reaper::ReaperConfig;
+    use crate::registry::{HeartbeatOutcome, WorkerStatus};
+    use crate::scheduler::SchedulerConfig;
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+    use rusty_grid_core::task::{TaskRequirements, TaskResult, TaskSpec};
+    use std::time::Duration;
+
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::new(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await
+    .unwrap();
+
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+    let (tx_primary, mut rx_primary) = tokio::sync::mpsc::channel(16);
+    let (tx_spec, mut rx_spec) = tokio::sync::mpsc::channel(16);
+
+    let mut caps_primary = WorkerCapabilities::new("primary", 4, 8192, false, false, None);
+    caps_primary.tags.push("role=primary".into());
+    let s_primary = master
+        .registry
+        .register(
+            w_primary,
+            caps_primary,
+            "127.0.0.1:9703".parse().unwrap(),
+            tx_primary,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut caps_spec = WorkerCapabilities::new("spec", 4, 8192, false, false, None);
+    caps_spec.tags.push("role=spec".into());
+    let s_spec = master
+        .registry
+        .register(
+            w_spec,
+            caps_spec,
+            "127.0.0.1:9704".parse().unwrap(),
+            tx_spec,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let t1 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case7-t1".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![
+                OPT_REPEATABLE_TAG.to_string(),
+                "require:worker=primary".into(),
+            ]),
+        )
+        .await
+        .unwrap();
+
+    let assigned_t1 = tokio::time::timeout(Duration::from_secs(2), rx_primary.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t1, MasterMessage::AssignTask { ref task } if task.id == t1));
+    master
+        .queue
+        .mark_running_from(w_primary, Some(s_primary), &t1)
+        .await
+        .unwrap();
+
+    let (spec_sender, spec_live) = master
+        .registry
+        .reserve_dispatch(&w_spec, s_spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        master
+            .queue
+            .try_start_speculative_and_deliver(
+                t1,
+                w_spec,
+                s_spec,
+                Arc::clone(&spec_live),
+                Some(PROTOCOL_VERSION_CURRENT),
+                |task| spec_sender
+                    .try_send(MasterMessage::AssignTask { task })
+                    .is_ok(),
+            )
+            .await,
+        crate::queue::SpeculativeStartOutcome::Delivered
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx_spec.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let spec_hb = master
+        .registry
+        .last_heartbeat_instant(&w_spec)
+        .await
+        .unwrap();
+    let reaped = master
+        .registry
+        .reap_stale_sessions_at(spec_hb + Duration::from_secs(30), Duration::from_secs(5))
+        .await;
+    assert!(reaped.contains(&(w_spec, s_spec)));
+
+    assert_eq!(
+        master
+            .registry
+            .record_heartbeat_session(&w_spec, 0, 1002, 10.0, 4096, Some(s_spec))
+            .await
+            .unwrap(),
+        HeartbeatOutcome::Revived
+    );
+    // Keep w_primary alive in case reap_stale_sessions_at touched it (both registered ~together).
+    let _ = master
+        .registry
+        .record_heartbeat_session(&w_primary, 1, 1002, 10.0, 4096, Some(s_primary))
+        .await
+        .unwrap();
+
+    let t2 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case7-t2".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec!["require:worker=spec".into()]),
+        )
+        .await
+        .unwrap();
+    let assigned_t2 = tokio::time::timeout(Duration::from_secs(2), rx_spec.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t2, MasterMessage::AssignTask { ref task } if task.id == t2));
+
+    let before = master.registry.get_worker(w_spec).await.unwrap();
+    assert_eq!(before.status, WorkerStatus::Busy);
+    assert_eq!(before.active_tasks, 1);
+
+    // Primary wins t1 pre-sweep -> losing-sibling cleanup hits tasks_and_blobs.rs:664.
+    super::tasks_and_blobs::handle_task_result(
+        &master.registry,
+        &master.queue,
+        &master.scheduler_notify,
+        &master.waiters,
+        TaskResult::success(w_primary, t1, "ok\n", 15, false),
+    )
+    .await;
+
+    let after = master.registry.get_worker(w_spec).await.unwrap();
+    assert_eq!(after.status, WorkerStatus::Busy);
+    assert_eq!(after.active_tasks, 1);
+    assert_eq!(
+        master.queue.get_task(&t2).await.unwrap().state,
+        TaskState::Scheduled
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn tier5_tasks_and_blobs_case8_result_primary_loser_664_ignores_stale_primary_after_revive() {
+    use crate::reaper::ReaperConfig;
+    use crate::registry::{HeartbeatOutcome, WorkerStatus};
+    use crate::scheduler::SchedulerConfig;
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+    use rusty_grid_core::task::{TaskRequirements, TaskResult, TaskSpec};
+    use std::time::Duration;
+
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::new(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await
+    .unwrap();
+
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+    let (tx_primary, mut rx_primary) = tokio::sync::mpsc::channel(16);
+    let (tx_spec, mut rx_spec) = tokio::sync::mpsc::channel(16);
+
+    let mut caps_primary = WorkerCapabilities::new("primary", 4, 8192, false, false, None);
+    caps_primary.tags.push("role=primary".into());
+    let s_primary = master
+        .registry
+        .register(
+            w_primary,
+            caps_primary,
+            "127.0.0.1:9705".parse().unwrap(),
+            tx_primary,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut caps_spec = WorkerCapabilities::new("spec", 4, 8192, false, false, None);
+    caps_spec.tags.push("role=spec".into());
+    let s_spec = master
+        .registry
+        .register(
+            w_spec,
+            caps_spec,
+            "127.0.0.1:9706".parse().unwrap(),
+            tx_spec,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let t1 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case8-t1".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![
+                OPT_REPEATABLE_TAG.to_string(),
+                "require:worker=primary".into(),
+            ]),
+        )
+        .await
+        .unwrap();
+
+    let assigned_t1 = tokio::time::timeout(Duration::from_secs(2), rx_primary.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t1, MasterMessage::AssignTask { ref task } if task.id == t1));
+    master
+        .queue
+        .mark_running_from(w_primary, Some(s_primary), &t1)
+        .await
+        .unwrap();
+
+    let (spec_sender, spec_live) = master
+        .registry
+        .reserve_dispatch(&w_spec, s_spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        master
+            .queue
+            .try_start_speculative_and_deliver(
+                t1,
+                w_spec,
+                s_spec,
+                Arc::clone(&spec_live),
+                Some(PROTOCOL_VERSION_CURRENT),
+                |task| spec_sender
+                    .try_send(MasterMessage::AssignTask { task })
+                    .is_ok(),
+            )
+            .await,
+        crate::queue::SpeculativeStartOutcome::Delivered
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx_spec.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    master
+        .queue
+        .mark_running_from(w_spec, Some(s_spec), &t1)
+        .await
+        .unwrap();
+
+    // Reap & revive w_primary, then dispatch t2 onto w_primary.
+    let prim_hb = master
+        .registry
+        .last_heartbeat_instant(&w_primary)
+        .await
+        .unwrap();
+    let reaped = master
+        .registry
+        .reap_stale_sessions_at(prim_hb + Duration::from_secs(30), Duration::from_secs(5))
+        .await;
+    assert!(reaped.contains(&(w_primary, s_primary)));
+
+    assert_eq!(
+        master
+            .registry
+            .record_heartbeat_session(&w_primary, 0, 1003, 10.0, 4096, Some(s_primary))
+            .await
+            .unwrap(),
+        HeartbeatOutcome::Revived
+    );
+    let _ = master
+        .registry
+        .record_heartbeat_session(&w_spec, 1, 1003, 10.0, 4096, Some(s_spec))
+        .await
+        .unwrap();
+
+    let t2 = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("echo", vec!["case8-t2".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec!["require:worker=primary".into()]),
+        )
+        .await
+        .unwrap();
+    let assigned_t2 = tokio::time::timeout(Duration::from_secs(2), rx_primary.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t2, MasterMessage::AssignTask { ref task } if task.id == t2));
+
+    let before = master.registry.get_worker(w_primary).await.unwrap();
+    assert_eq!(before.status, WorkerStatus::Busy);
+    assert_eq!(before.active_tasks, 1);
+
+    // Speculative wins t1 pre-sweep -> primary losing-sibling cleanup hits tasks_and_blobs.rs:664.
+    super::tasks_and_blobs::handle_task_result(
+        &master.registry,
+        &master.queue,
+        &master.scheduler_notify,
+        &master.waiters,
+        TaskResult::success(w_spec, t1, "fast\n", 12, false),
+    )
+    .await;
+
+    let after = master.registry.get_worker(w_primary).await.unwrap();
+    assert_eq!(after.status, WorkerStatus::Busy);
+    assert_eq!(after.active_tasks, 1);
+    assert_eq!(
+        master.queue.get_task(&t2).await.unwrap().state,
+        TaskState::Scheduled
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn tier5_tasks_and_blobs_case9_late_result_627_ignores_stale_session_after_revive() {
+    use crate::reaper::ReaperConfig;
+    use crate::registry::{HeartbeatOutcome, WorkerStatus};
+    use crate::scheduler::SchedulerConfig;
+    use rusty_grid_core::task::{TaskRequirements, TaskResult, TaskSpec};
+    use std::time::Duration;
+
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::new(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await
+    .unwrap();
+
+    let w = Uuid::new_v4();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let session = master
+        .registry
+        .register(
+            w,
+            WorkerCapabilities::new("late-worker", 4, 8192, false, false, None),
+            "127.0.0.1:9707".parse().unwrap(),
+            tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let t1 = master
+        .submit_task(Task::new(
+            TaskSpec::command("sleep", vec!["60".into()]),
+            TaskRequirements::generic(1, 64),
+        ))
+        .await
+        .unwrap();
+    let assigned_t1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t1, MasterMessage::AssignTask { ref task } if task.id == t1));
+    master
+        .queue
+        .mark_running_from(w, Some(session), &t1)
+        .await
+        .unwrap();
+
+    // Cancel t1 (state becomes Cancelled; assigned_worker_id/session/session_live remain for late result),
+    // then reap + sweep w (sweep skips terminal t1), revive w, and dispatch t2.
+    master.cancel_task(t1).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let hb = master.registry.last_heartbeat_instant(&w).await.unwrap();
+    let reaped = master
+        .registry
+        .reap_stale_sessions_at(hb + Duration::from_secs(30), Duration::from_secs(5))
+        .await;
+    assert_eq!(reaped, vec![(w, session)]);
+    master
+        .queue
+        .handle_session_disconnected(&w, Some(session), "reaped", false)
+        .await;
+
+    assert_eq!(
+        master
+            .registry
+            .record_heartbeat_session(&w, 0, 1004, 10.0, 4096, Some(session))
+            .await
+            .unwrap(),
+        HeartbeatOutcome::Revived
+    );
+
+    let t2 = master
+        .submit_task(Task::new(
+            TaskSpec::command("echo", vec!["case9-t2".into()]),
+            TaskRequirements::generic(1, 64),
+        ))
+        .await
+        .unwrap();
+    let assigned_t2 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t2, MasterMessage::AssignTask { ref task } if task.id == t2));
+
+    let before = master.registry.get_worker(w).await.unwrap();
+    assert_eq!(before.status, WorkerStatus::Busy);
+    assert_eq!(before.active_tasks, 1);
+
+    // Late result for t1 hits tasks_and_blobs.rs:627; must NOT decrement t2's post-revive slot.
+    super::tasks_and_blobs::handle_task_result(
+        &master.registry,
+        &master.queue,
+        &master.scheduler_notify,
+        &master.waiters,
+        TaskResult::failure(w, t1, 130, "", "", 5, Some("cancelled".into())),
+    )
+    .await;
+
+    let after = master.registry.get_worker(w).await.unwrap();
+    assert_eq!(after.status, WorkerStatus::Busy);
+    assert_eq!(after.active_tasks, 1);
+    assert_eq!(
+        master.queue.get_task(&t2).await.unwrap().state,
+        TaskState::Scheduled
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn tier5_tasks_and_blobs_case10_oversized_854_ignores_stale_session_after_revive() {
+    use crate::reaper::ReaperConfig;
+    use crate::registry::{HeartbeatOutcome, WorkerStatus};
+    use crate::scheduler::SchedulerConfig;
+    use rusty_grid_core::protocol::MAX_FRAME_SIZE;
+    use rusty_grid_core::task::{TaskRequirements, TaskSpec};
+    use std::time::Duration;
+
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::new(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await
+    .unwrap();
+
+    let w = Uuid::new_v4();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let session = master
+        .registry
+        .register(
+            w,
+            WorkerCapabilities::new("oversized-worker", 4, 8192, false, false, None),
+            "127.0.0.1:9708".parse().unwrap(),
+            tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let t1_task = Task::new(
+        TaskSpec::command("echo", vec!["case10-t1".into()]),
+        TaskRequirements::generic(1, 64),
+    );
+    let t1 = master.submit_task(t1_task).await.unwrap();
+    let assigned_t1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let oversized_msg = match assigned_t1 {
+        MasterMessage::AssignTask { ref task } if task.id == t1 => assigned_t1,
+        other => panic!("expected AssignTask for t1, got {other:?}"),
+    };
+
+    let hb = master.registry.last_heartbeat_instant(&w).await.unwrap();
+    let reaped = master
+        .registry
+        .reap_stale_sessions_at(hb + Duration::from_secs(30), Duration::from_secs(5))
+        .await;
+    assert_eq!(reaped, vec![(w, session)]);
+
+    assert_eq!(
+        master
+            .registry
+            .record_heartbeat_session(&w, 0, 1005, 10.0, 4096, Some(session))
+            .await
+            .unwrap(),
+        HeartbeatOutcome::Revived
+    );
+
+    let t2 = master
+        .submit_task(Task::new(
+            TaskSpec::command("echo", vec!["case10-t2".into()]),
+            TaskRequirements::generic(1, 64),
+        ))
+        .await
+        .unwrap();
+    let assigned_t2 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(assigned_t2, MasterMessage::AssignTask { ref task } if task.id == t2));
+
+    let before = master.registry.get_worker(w).await.unwrap();
+    assert_eq!(before.status, WorkerStatus::Busy);
+    assert_eq!(before.active_tasks, 1);
+
+    // Pre-sweep oversized-frame failure for t1 hits tasks_and_blobs.rs:854; must NOT decrement
+    // t2's post-revive slot.
+    super::tasks_and_blobs::handle_oversized_master_message(
+        oversized_msg,
+        MAX_FRAME_SIZE + 1,
+        MAX_FRAME_SIZE,
+        &master.registry,
+        &master.queue,
+        &master.scheduler_notify,
+        &master.waiters,
+        w,
+        session,
+        None,
+        #[cfg(feature = "dashboard")]
+        None,
+    )
+    .await;
+
+    let after = master.registry.get_worker(w).await.unwrap();
+    assert_eq!(after.status, WorkerStatus::Busy);
+    assert_eq!(after.active_tasks, 1);
+    assert_eq!(
+        master.queue.get_task(&t2).await.unwrap().state,
+        TaskState::Scheduled
+    );
+
+    let _ = master.shutdown();
+}

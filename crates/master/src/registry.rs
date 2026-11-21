@@ -1171,9 +1171,17 @@ impl WorkerRegistry {
 
     /// Credits `count` adopted tasks (`WorkerMessage::ResumeSession`) to `session_id`'s active task
     /// count and marks the worker `Busy` if it was `Connected`.
-    pub async fn add_adopted_tasks(&self, worker_id: &Uuid, session_id: u64, count: usize) {
+    ///
+    /// Returns the live reservation handle (`session_live`) when credited so the caller can bind
+    /// the adopted `TaskEntry` records to the exact session handle.
+    pub async fn add_adopted_tasks(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+        count: usize,
+    ) -> Option<Arc<AtomicBool>> {
         if count == 0 {
-            return;
+            return None;
         }
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
@@ -1182,8 +1190,10 @@ impl WorkerRegistry {
                 if entry.status == WorkerStatus::Connected {
                     entry.status = WorkerStatus::Busy;
                 }
+                return Some(Arc::clone(&entry.session_live));
             }
         }
+        None
     }
 
     /// Records that `worker_id` handed a task back without running it (battery, capability or

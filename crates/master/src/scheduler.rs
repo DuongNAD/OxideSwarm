@@ -2323,16 +2323,21 @@ impl WorkloadScheduler {
                 let live_for_deliver = Arc::clone(&session_live);
                 match self
                     .queue
-                    .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
-                        if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
-                            drop(permit);
-                            return None;
-                        }
-                        permit.send(msg);
-                        Some(())
-                    })
+                    .deliver_if_scheduled_with_live(
+                        &task_id,
+                        &worker_id,
+                        session_id,
+                        Arc::clone(&session_live),
+                        move || {
+                            if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                                drop(permit);
+                                return None;
+                            }
+                            permit.send(msg);
+                            Some(())
+                        },
+                    )
                     .await
-                    .flatten()
                 {
                     Some(()) => {
                         #[cfg(feature = "otel")]
@@ -2420,16 +2425,21 @@ impl WorkloadScheduler {
                 let live_for_deliver = Arc::clone(&session_live);
                 match self
                     .queue
-                    .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
-                        if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
-                            drop(permit);
-                            return None;
-                        }
-                        let _ = permit.send(msg);
-                        Some(())
-                    })
+                    .deliver_if_scheduled_with_live(
+                        &task_id,
+                        &worker_id,
+                        session_id,
+                        Arc::clone(&session_live),
+                        move || {
+                            if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                                drop(permit);
+                                return None;
+                            }
+                            let _ = permit.send(msg);
+                            Some(())
+                        },
+                    )
                     .await
-                    .flatten()
                 {
                     Some(()) => {
                         #[cfg(feature = "otel")]
@@ -2488,16 +2498,21 @@ impl WorkloadScheduler {
                 Ok(Ok(permit)) => {
                     let live_for_deliver = Arc::clone(&session_live);
                     match queue
-                        .deliver_if_scheduled(&task_id, &worker_id, session_id, move || {
-                            if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
-                                drop(permit);
-                                return None;
-                            }
-                            let _ = permit.send(msg);
-                            Some(())
-                        })
+                        .deliver_if_scheduled_with_live(
+                            &task_id,
+                            &worker_id,
+                            session_id,
+                            Arc::clone(&session_live),
+                            move || {
+                                if !live_for_deliver.load(std::sync::atomic::Ordering::Acquire) {
+                                    drop(permit);
+                                    return None;
+                                }
+                                let _ = permit.send(msg);
+                                Some(())
+                            },
+                        )
                         .await
-                        .flatten()
                     {
                         Some(()) => {
                             #[cfg(feature = "otel")]

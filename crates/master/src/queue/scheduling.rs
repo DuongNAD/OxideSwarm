@@ -3,6 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -170,6 +171,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                assigned_session_live: None,
                 resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
@@ -359,6 +361,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                assigned_session_live: None,
                 resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
@@ -1158,6 +1161,7 @@ impl TaskQueue {
                     });
                 }
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 entry.assigned_worker_id.take()
             };
 
@@ -1233,6 +1237,27 @@ impl TaskQueue {
         Some(deliver())
     }
 
+    /// Like [`deliver_if_scheduled`](Self::deliver_if_scheduled), but atomically records the
+    /// `WorkerRegistry` reservation's `session_live` handle on [`TaskEntry`] when `deliver`
+    /// returns `Some(r)`.
+    pub async fn deliver_if_scheduled_with_live<R>(
+        &self,
+        task_id: &TaskId,
+        worker_id: &Uuid,
+        session_id: u64,
+        session_live: Arc<AtomicBool>,
+        deliver: impl FnOnce() -> Option<R>,
+    ) -> Option<R> {
+        let mut inner = self.inner.write().await;
+        let entry = inner.tasks.get_mut(task_id)?;
+        if entry.state != TaskState::Scheduled || !owned_by(entry, worker_id, Some(session_id)) {
+            return None;
+        }
+        let out = deliver()?;
+        entry.assigned_session_live = Some(session_live);
+        Some(out)
+    }
+
     /// Puts back a task whose `AssignTask` could not be delivered to `worker_id`'s `session_id`.
     ///
     /// The task never reached the worker, so no retry or failover budget is charged. It is only
@@ -1257,6 +1282,7 @@ impl TaskQueue {
             entry.state = TaskState::Queued;
             entry.assigned_worker_id = None;
             entry.assigned_session = None;
+            entry.assigned_session_live = None;
             entry.scheduled_instant = None;
             let record = JournalRecord::TaskRequeued {
                 task_id: *task_id,
@@ -1471,6 +1497,7 @@ impl TaskQueue {
             entry.speculative = Some(SpeculativeAttempt {
                 worker_id,
                 session_id,
+                session_live: Arc::new(AtomicBool::new(true)),
                 scheduled_instant: Instant::now(),
                 started_instant: None,
                 state: TaskState::Scheduled,
@@ -1497,6 +1524,7 @@ impl TaskQueue {
         task_id: TaskId,
         worker_id: Uuid,
         session_id: u64,
+        session_live: Arc<AtomicBool>,
         peer_version: Option<u32>,
         deliver: impl FnOnce(Task) -> bool,
     ) -> SpeculativeStartOutcome {
@@ -1532,6 +1560,7 @@ impl TaskQueue {
             entry.speculative = Some(SpeculativeAttempt {
                 worker_id,
                 session_id,
+                session_live,
                 scheduled_instant: Instant::now(),
                 started_instant: None,
                 state: TaskState::Scheduled,

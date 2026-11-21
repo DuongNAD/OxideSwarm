@@ -148,6 +148,7 @@ async fn test_attach_store_and_replay_recovers_all_d2_5_states_and_preserves_cou
                     rejection_count: 0,
                     avoid_workers: Vec::new(),
                     assigned_session: None,
+                    assigned_session_live: None,
                     resumed_from_checkpoint: false,
                     adoptable_by: None,
                     fail_if_not_adopted: false,

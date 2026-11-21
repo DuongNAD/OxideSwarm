@@ -478,14 +478,16 @@ pub(crate) async fn run_straggler_pass(
             continue;
         };
 
+        let live_for_deliver = Arc::clone(&session_live);
         match queue
             .try_start_speculative_and_deliver(
                 cand.view.task_id,
                 target.worker_id,
                 target.session_id,
+                Arc::clone(&session_live),
                 peer_version,
                 |task| {
-                    session_live.load(Ordering::Acquire)
+                    live_for_deliver.load(Ordering::Acquire)
                         && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
                 },
             )
@@ -1345,10 +1347,17 @@ mod tests {
                 .await
                 .unwrap();
             let outcome = queue
-                .try_start_speculative_and_deliver(id1, w_fast, s_fast, Some(10), |task| {
-                    session_live.load(Ordering::Acquire)
-                        && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
-                })
+                .try_start_speculative_and_deliver(
+                    id1,
+                    w_fast,
+                    s_fast,
+                    Arc::clone(&session_live),
+                    Some(10),
+                    |task| {
+                        session_live.load(Ordering::Acquire)
+                            && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    },
+                )
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
             registry.release_dispatch(&w_fast, s_fast).await;
@@ -1376,10 +1385,17 @@ mod tests {
             let (sender2, session_live2) =
                 registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
             let outcome2 = queue
-                .try_start_speculative_and_deliver(id2, w_fast, s_fast, Some(10), |task| {
-                    session_live2.load(Ordering::Acquire)
-                        && sender2.try_send(MasterMessage::AssignTask { task }).is_ok()
-                })
+                .try_start_speculative_and_deliver(
+                    id2,
+                    w_fast,
+                    s_fast,
+                    Arc::clone(&session_live2),
+                    Some(10),
+                    |task| {
+                        session_live2.load(Ordering::Acquire)
+                            && sender2.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    },
+                )
                 .await;
             assert_eq!(outcome2, SpeculativeStartOutcome::Delivered);
             let fail_outcome = queue
@@ -1463,15 +1479,22 @@ mod tests {
                 .await
                 .unwrap();
             // Primary completed before speculative was recorded, so cancel_sibling is None!
-            assert_eq!(win.cancel_sibling, None);
+            assert!(win.cancel_sibling.is_none());
 
             let outcome = queue
-                .try_start_speculative_and_deliver(id, w_fast, s_fast, Some(10), |task| {
-                    spec_live.load(Ordering::Acquire)
-                        && spec_sender
-                            .try_send(MasterMessage::AssignTask { task })
-                            .is_ok()
-                })
+                .try_start_speculative_and_deliver(
+                    id,
+                    w_fast,
+                    s_fast,
+                    Arc::clone(&spec_live),
+                    Some(10),
+                    |task| {
+                        spec_live.load(Ordering::Acquire)
+                            && spec_sender
+                                .try_send(MasterMessage::AssignTask { task })
+                                .is_ok()
+                    },
+                )
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
             registry.release_dispatch(&w_fast, s_fast).await;
@@ -1555,10 +1578,17 @@ mod tests {
             assert!(!session_live.load(Ordering::Acquire));
 
             let outcome = queue
-                .try_start_speculative_and_deliver(tid, w_fast, s_fast, Some(10), |task| {
-                    session_live.load(Ordering::Acquire)
-                        && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
-                })
+                .try_start_speculative_and_deliver(
+                    tid,
+                    w_fast,
+                    s_fast,
+                    Arc::clone(&session_live),
+                    Some(10),
+                    |task| {
+                        session_live.load(Ordering::Acquire)
+                            && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    },
+                )
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::DeliveryFailed);
             registry.release_dispatch(&w_fast, s_fast).await;
@@ -1660,10 +1690,17 @@ mod tests {
                 .await;
 
             let outcome = queue
-                .try_start_speculative_and_deliver(tid, w_fast, reg1.session_id, Some(10), |task| {
-                    live1.load(Ordering::Acquire)
-                        && sender1.try_send(MasterMessage::AssignTask { task }).is_ok()
-                })
+                .try_start_speculative_and_deliver(
+                    tid,
+                    w_fast,
+                    reg1.session_id,
+                    Arc::clone(&live1),
+                    Some(10),
+                    |task| {
+                        live1.load(Ordering::Acquire)
+                            && sender1.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    },
+                )
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::DeliveryFailed);
             registry.release_dispatch(&w_fast, reg1.session_id).await;

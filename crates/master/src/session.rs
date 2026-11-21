@@ -1702,9 +1702,20 @@ impl<
                     .adopt_session_tasks(worker_id, session_id, &running)
                     .await;
                 if !outcome.adopted.is_empty() {
-                    self.registry
+                    if let Some(live) = self
+                        .registry
                         .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
-                        .await;
+                        .await
+                    {
+                        self.queue
+                            .set_assigned_session_live(
+                                &outcome.adopted,
+                                worker_id,
+                                session_id,
+                                live,
+                            )
+                            .await;
+                    }
                     info!(
                         worker_id = %worker_id,
                         session_id = session_id,
