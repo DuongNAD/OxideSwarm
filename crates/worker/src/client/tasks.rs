@@ -1072,6 +1072,36 @@ impl WorkerClient {
         count
     }
 
+    /// Gracefully stops active tasks on worker shutdown within `drain_timeout` so process tasks
+    /// can emit final checkpoints before `Disconnecting` is sent. Returns `0` immediately when idle.
+    pub(super) async fn drain_active_tasks_for_shutdown(&self, drain_timeout: Duration) -> usize {
+        let handles: Vec<TaskExecutionHandle> = {
+            let mut lock = self.active_task_table.write().await;
+            lock.drain().map(|(_, handle)| handle).collect()
+        };
+        if handles.is_empty() {
+            return 0;
+        }
+        let count = handles.len();
+        info!(
+            worker_id = %self.worker_id,
+            tasks = count,
+            "Draining active tasks for final checkpoint flush before worker disconnect"
+        );
+        let joins: Vec<JoinHandle<()>> = handles
+            .into_iter()
+            .filter_map(|handle| Self::begin_stop(handle, "Graceful worker checkpoint drain"))
+            .collect();
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        for mut join in joins {
+            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                warn!("Active task did not finish checkpoint drain within timeout; aborting it");
+                join.abort();
+            }
+        }
+        count
+    }
+
     /// Removes (or, with `keep_sandboxes`, moves aside) a `<task id>` sandbox directory that no
     /// run of this worker owns. Called only after any earlier run of the id has been awaited.
     pub(super) async fn reclaim_stale_sandbox(&self, task_id: TaskId) {

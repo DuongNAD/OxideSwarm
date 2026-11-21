@@ -943,6 +943,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory (or the workspace `tree/` directory for workspace tasks) |
 | `RUSTY_GRID_WORKSPACE` | Task Runner | Workspace name when the task runs inside a persistent named workspace (`Task::workspace`) |
 | `RUSTY_GRID_WORKSPACE_DIR` | Task Runner | Absolute path to `<workspace_root>/<name>/tree` when the task runs inside a persistent named workspace |
+| `OXIDESWARM_CHECKPOINT_DIR` | Task Runner | Absolute path to the sandbox-private checkpoint directory for `Command`, `ShellScript`, and `Workspace` tasks (excluded from `--output` globs; [design 0102](design/0102-process-task-checkpoints.md)) |
 
 #### Tier E: Subnet Discovery & Network Helpers
 | Variable | Component | Purpose |

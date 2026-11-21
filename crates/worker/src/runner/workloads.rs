@@ -26,6 +26,7 @@ use crate::workspace::WorkspaceError;
 #[cfg(feature = "3d")]
 use super::capture::read_output_file;
 use super::capture::{append_note, cancellation, check_cancelled_now};
+use super::checkpoint::{ProcessCheckpointCtx, PROCESS_CHECKPOINT_DIR_NAME};
 #[cfg(not(windows))]
 use super::supervise::resolve_default_shell;
 #[cfg(windows)]
@@ -59,10 +60,13 @@ pub(crate) fn base_refusal(
 
 impl TaskRunner {
     /// Executes a `Command` or `ShellScript` task inside a persistent named workspace (`design 0039`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_workspace_workload(
         &self,
         task: &Task,
         ws: &WorkspaceRef,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -309,8 +313,28 @@ impl TaskRunner {
             task_env: ws_task_env,
         };
 
+        let cp_dir = tmp_dir.join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                checkpoint_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => return fail(e),
+            Err(e) => return fail(format!("checkpoint preparation panicked: {e}")),
+        };
+
         let result = self
-            .execute_process_supervised_with_workspace(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 &tree_dir,
                 &program,
@@ -323,6 +347,7 @@ impl TaskRunner {
                 cancel_rx,
                 start_time,
                 Some(ws_ctx),
+                Some(cp_ctx),
             )
             .await;
 
@@ -374,6 +399,8 @@ impl TaskRunner {
         env: &HashMap<String, String>,
         working_dir: Option<&PathBuf>,
         stdin: Option<&[u8]>,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -458,8 +485,50 @@ impl TaskRunner {
             sandbox.path().to_path_buf()
         };
 
+        let cp_dir = sandbox.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                checkpoint_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Failed to initialize checkpoint directory: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint directory error: {e}")),
+                );
+            }
+            Err(e) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Checkpoint preparation panicked: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint preparation panicked: {e}")),
+                );
+            }
+        };
+
         let result = self
-            .execute_process_supervised(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 sandbox.path(),
                 program,
@@ -471,6 +540,8 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
+                Some(cp_ctx),
             )
             .await;
 
@@ -491,6 +562,8 @@ impl TaskRunner {
         script: &str,
         interpreter: Option<&str>,
         env: &HashMap<String, String>,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -612,8 +685,50 @@ impl TaskRunner {
             )
         };
 
+        let cp_dir = sandbox.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                checkpoint_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Failed to initialize checkpoint directory: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint directory error: {e}")),
+                );
+            }
+            Err(e) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Checkpoint preparation panicked: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint preparation panicked: {e}")),
+                );
+            }
+        };
+
         let result = self
-            .execute_process_supervised(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 sandbox.path(),
                 &prog,
@@ -625,6 +740,8 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
+                Some(cp_ctx),
             )
             .await;
 

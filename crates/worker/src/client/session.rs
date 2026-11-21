@@ -1163,7 +1163,23 @@ impl WorkerClient {
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
-                        let reason = current_evacuation_reason()
+                        let evac_reason = current_evacuation_reason();
+                        if evac_reason.is_none() {
+                            let drained = self
+                                .drain_active_tasks_for_shutdown(Duration::from_secs(2))
+                                .await;
+                            if drained > 0 {
+                                let flush_deadline =
+                                    tokio::time::Instant::now() + Duration::from_millis(500);
+                                while session.data_tx.capacity() < session.data_tx.max_capacity()
+                                    && !session.data_tx.is_closed()
+                                    && tokio::time::Instant::now() < flush_deadline
+                                {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
+                        let reason = evac_reason
                             .unwrap_or_else(|| "Graceful worker shutdown".to_string());
                         info!(worker_id = %worker_id, reason = %reason, "Worker shutdown initiated; notifying Master");
                         farewell = Some(WorkerMessage::Disconnecting {

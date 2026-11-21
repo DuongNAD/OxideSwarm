@@ -419,6 +419,14 @@ impl TaskRunner {
         let mut total_bytes: usize = 0;
 
         for expected in expected_outputs {
+            if let Ok(norm) = crate::sandbox::normalize_relative_path_str(expected) {
+                if super::is_reserved_checkpoint_rel(&norm) {
+                    warn!(task_id = %task_id, path = %expected, "Ignoring illegal expected output path targeting checkpoint directory");
+                    return Err(format!(
+                        "output artifact '{expected}' targets the reserved checkpoint directory"
+                    ));
+                }
+            }
             let target = match sanitize_relative_path(root_dir, Path::new(expected)) {
                 Ok(p) => p,
                 Err(err) => {
