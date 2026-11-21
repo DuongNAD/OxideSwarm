@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -113,6 +114,10 @@ pub struct WorkerEntry {
     /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
     /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
     pub preserved_thermal_until: Option<Instant>,
+    /// Per-session liveness flag cleared under `WorkerRegistry::inner`'s write lock whenever
+    /// this session ends (disconnect, reap, remove, prune, or supersede), strictly before any
+    /// queue failover sweep runs.
+    pub session_live: Arc<AtomicBool>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -512,12 +517,14 @@ impl WorkerRegistry {
             if existing.status != WorkerStatus::Disconnected {
                 superseded_session = Some(existing.session_id);
             }
+            existing.session_live.store(false, Ordering::Release);
             // Cancel old connection tasks if still running
             if let Some(old_abort) = existing.abort_handle.take() {
                 abort_unless_current(old_abort);
             }
             let ram = capabilities.ram_mb;
             existing.session_id = session_id;
+            existing.session_live = Arc::new(AtomicBool::new(true));
             existing.capabilities = capabilities;
             existing.features = features;
             existing.status = WorkerStatus::Connected;
@@ -625,6 +632,7 @@ impl WorkerRegistry {
                 mobile_status,
                 peer_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
                 preserved_thermal_until: None,
+                session_live: Arc::new(AtomicBool::new(true)),
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -797,9 +805,11 @@ impl WorkerRegistry {
             }
             // IDEMPOTENCY: If already disconnected, do not trigger failover again
             if entry.status == WorkerStatus::Disconnected {
+                entry.session_live.store(false, Ordering::Release);
                 return Ok(false);
             }
             entry.status = WorkerStatus::Disconnected;
+            entry.session_live.store(false, Ordering::Release);
             entry.active_tasks = 0; // Clear active tasks on eviction
             entry.reported_active_tasks = 0;
             if let Some(abort) = entry.abort_handle.take() {
@@ -823,6 +833,7 @@ impl WorkerRegistry {
             inner.network_types.remove(worker_id);
             inner.owner_member_ids.remove(worker_id);
             if let Some(entry) = inner.workers.remove(worker_id) {
+                entry.session_live.store(false, Ordering::Release);
                 inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
                 if let Some(abort) = entry.abort_handle.clone() {
                     abort_unless_current(abort);
@@ -857,6 +868,7 @@ impl WorkerRegistry {
                 inner.network_types.remove(id);
                 inner.owner_member_ids.remove(id);
                 if let Some(entry) = inner.workers.remove(id) {
+                    entry.session_live.store(false, Ordering::Release);
                     if let Some(abort) = entry.abort_handle {
                         abort_unless_current(abort);
                     }
@@ -895,7 +907,13 @@ impl WorkerRegistry {
                 return Ok(());
             }
         }
+        let was_disconnected = entry.status == WorkerStatus::Disconnected;
         entry.status = status;
+        if status == WorkerStatus::Disconnected {
+            entry.session_live.store(false, Ordering::Release);
+        } else if was_disconnected {
+            entry.session_live = Arc::new(AtomicBool::new(true));
+        }
         Ok(())
     }
 
@@ -976,6 +994,7 @@ impl WorkerRegistry {
             };
         }
         if revive {
+            entry.session_live = Arc::new(AtomicBool::new(true));
             tracing::warn!(
                 worker_id = %worker_id,
                 session_id = entry.session_id,
@@ -1070,7 +1089,8 @@ impl WorkerRegistry {
         Ok(changed)
     }
 
-    /// Atomically reserves a dispatch slot on `session_id`'s connection and returns its channel.
+    /// Atomically reserves a dispatch slot on `session_id`'s connection and returns its channel
+    /// along with the per-session liveness flag.
     ///
     /// Fails with `ConnectionClosed` when the worker has since been disconnected or re-registered
     /// on a newer session, so a task assigned against a stale snapshot is never delivered to (or
@@ -1079,7 +1099,7 @@ impl WorkerRegistry {
         &self,
         worker_id: &Uuid,
         session_id: u64,
-    ) -> GridResult<mpsc::Sender<MasterMessage>> {
+    ) -> GridResult<(mpsc::Sender<MasterMessage>, Arc<AtomicBool>)> {
         let mut inner = self.inner.write().await;
         let entry = inner
             .workers
@@ -1092,7 +1112,7 @@ impl WorkerRegistry {
         if entry.status == WorkerStatus::Connected {
             entry.status = WorkerStatus::Busy;
         }
-        Ok(entry.sender.clone())
+        Ok((entry.sender.clone(), Arc::clone(&entry.session_live)))
     }
 
     /// Gives back the slot [`reserve_dispatch`](Self::reserve_dispatch) took on `session_id`
@@ -1578,6 +1598,7 @@ impl WorkerRegistry {
                 if entry.status != WorkerStatus::Disconnected && entry.is_silent(now, timeout) {
                     let elapsed = now.saturating_duration_since(entry.last_heartbeat_instant);
                     entry.status = WorkerStatus::Disconnected;
+                    entry.session_live.store(false, Ordering::Release);
                     entry.active_tasks = 0;
                     entry.reported_active_tasks = 0;
                     if let Some(abort) = entry.abort_handle.take() {
@@ -2246,7 +2267,8 @@ mod tests {
         assert!(registry.reserve_dispatch(&id, old).await.is_err());
         assert_eq!(registry.get_worker(id).await.unwrap().active_tasks, 0);
 
-        let sender = registry.reserve_dispatch(&id, new).await.unwrap();
+        let (sender, session_live) = registry.reserve_dispatch(&id, new).await.unwrap();
+        assert!(session_live.load(Ordering::Acquire));
         assert_eq!(registry.get_worker(id).await.unwrap().active_tasks, 1);
         sender
             .send(MasterMessage::HeartbeatAck { timestamp: 7 })
@@ -2258,6 +2280,7 @@ mod tests {
         ));
 
         registry.unregister(&id, Some(new)).await.unwrap();
+        assert!(!session_live.load(Ordering::Acquire));
         assert!(registry.reserve_dispatch(&id, new).await.is_err());
     }
 

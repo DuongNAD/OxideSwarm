@@ -4,6 +4,7 @@
 //! any worker whose last heartbeat exceeds the timeout (default: 10.0s) to `WorkerStatus::Disconnected`.
 
 use rusty_grid_core::protocol::MasterMessage;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -470,7 +471,7 @@ pub(crate) async fn run_straggler_pass(
             .peer_version_of(&target.worker_id, target.session_id)
             .await;
 
-        let Ok(sender) = registry
+        let Ok((sender, session_live)) = registry
             .reserve_dispatch(&target.worker_id, target.session_id)
             .await
         else {
@@ -483,7 +484,10 @@ pub(crate) async fn run_straggler_pass(
                 target.worker_id,
                 target.session_id,
                 peer_version,
-                |task| sender.try_send(MasterMessage::AssignTask { task }).is_ok(),
+                |task| {
+                    session_live.load(Ordering::Acquire)
+                        && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                },
             )
             .await
         {
@@ -1331,7 +1335,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let (sender, session_live) = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
             let _ = queue
                 .record_result_from(
                     w_slow,
@@ -1342,7 +1346,8 @@ mod tests {
                 .unwrap();
             let outcome = queue
                 .try_start_speculative_and_deliver(id1, w_fast, s_fast, Some(10), |task| {
-                    sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    session_live.load(Ordering::Acquire)
+                        && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
                 })
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
@@ -1368,10 +1373,12 @@ mod tests {
                 .mark_running_from(w_slow, Some(s_slow), &id2)
                 .await
                 .unwrap();
-            let sender2 = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let (sender2, session_live2) =
+                registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
             let outcome2 = queue
                 .try_start_speculative_and_deliver(id2, w_fast, s_fast, Some(10), |task| {
-                    sender2.try_send(MasterMessage::AssignTask { task }).is_ok()
+                    session_live2.load(Ordering::Acquire)
+                        && sender2.try_send(MasterMessage::AssignTask { task }).is_ok()
                 })
                 .await;
             assert_eq!(outcome2, SpeculativeStartOutcome::Delivered);
@@ -1425,7 +1432,7 @@ mod tests {
                 .unwrap();
 
             // Reserve 1 unrelated active task on w_fast.
-            let _unrelated_sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let (_unrelated_sender, _) = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
             assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 1);
 
             // Primary completes between reserve_dispatch and try_start_speculative_and_deliver.
@@ -1443,7 +1450,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let spec_sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let (spec_sender, spec_live) =
+                registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
             assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 2);
 
             let win = queue
@@ -1459,9 +1467,10 @@ mod tests {
 
             let outcome = queue
                 .try_start_speculative_and_deliver(id, w_fast, s_fast, Some(10), |task| {
-                    spec_sender
-                        .try_send(MasterMessage::AssignTask { task })
-                        .is_ok()
+                    spec_live.load(Ordering::Acquire)
+                        && spec_sender
+                            .try_send(MasterMessage::AssignTask { task })
+                            .is_ok()
                 })
                 .await;
             assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
@@ -1470,6 +1479,249 @@ mod tests {
             // Unrelated task's slot count remains exactly 1 (never 0!).
             assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 1);
             assert!(rx_fast.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn tier5_reaper_bug2c_target_disconnect_during_speculative_dispatch() {
+        use crate::queue::{SpeculativeStartOutcome, TaskState};
+        use crate::registry::HeartbeatOutcome;
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::protocol::ProtocolCapabilities;
+        use rusty_grid_core::task::{Task, TaskRequirements, TaskResult, TaskSpec};
+
+        // Case 1: Target worker disconnects (unregister + sweep_worker_tasks) AFTER
+        // reserve_dispatch and BEFORE try_start_speculative_and_deliver while its writer task
+        // still keeps outbound_rx open. Delivery must fail cleanly without recording an orphaned
+        // SpeculativeAttempt on the Disconnected worker.
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let notify = tokio::sync::Notify::new();
+            let w_fast = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx_fast, mut rx_fast) = mpsc::channel(8);
+            let (tx_slow, _rx_slow) = mpsc::channel(8);
+            let s_fast = registry
+                .register(
+                    w_fast,
+                    WorkerCapabilities::new("fast", 4, 8192, false, false, None),
+                    "127.0.0.1:9651".parse().unwrap(),
+                    tx_fast,
+                    None,
+                )
+                .await
+                .unwrap();
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                    "127.0.0.1:9652".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let task = Task::new(
+                TaskSpec::command("echo", vec!["2c-disconnect".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let tid = queue.submit(task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(tid, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &tid)
+                .await
+                .unwrap();
+
+            let (sender, session_live) = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            assert!(session_live.load(Ordering::Acquire));
+
+            // Keep `rx_fast` alive (writer task has not exited yet), while disconnect cleanup
+            // unregisters w_fast and sweeps its tasks in queue.
+            crate::server::handle_worker_disconnect(
+                &registry,
+                &queue,
+                &notify,
+                &w_fast,
+                Some(s_fast),
+                "EOF before writer drop",
+                false,
+            )
+            .await;
+            assert!(!session_live.load(Ordering::Acquire));
+
+            let outcome = queue
+                .try_start_speculative_and_deliver(tid, w_fast, s_fast, Some(10), |task| {
+                    session_live.load(Ordering::Acquire)
+                        && sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                })
+                .await;
+            assert_eq!(outcome, SpeculativeStartOutcome::DeliveryFailed);
+            registry.release_dispatch(&w_fast, s_fast).await;
+
+            let fast_info = registry.get_worker(w_fast).await.unwrap();
+            assert_eq!(fast_info.status, WorkerStatus::Disconnected);
+            assert_eq!(fast_info.active_tasks, 0);
+            assert!(rx_fast.try_recv().is_err());
+
+            // Primary failure must NOT wedge the task in Scheduled on Disconnected w_fast.
+            let fail_outcome = queue
+                .record_result_from(
+                    w_slow,
+                    Some(s_slow),
+                    TaskResult::failure(w_slow, tid, 1, "", "primary boom", 50, None),
+                )
+                .await
+                .unwrap();
+            assert_ne!(fail_outcome.state, TaskState::Scheduled);
+            let stored = queue.get_task(&tid).await.unwrap();
+            assert_ne!(stored.state, TaskState::Scheduled);
+            assert_ne!(stored.assigned_worker_id, Some(w_fast));
+        }
+
+        // Case 2: Target worker is superseded by a new session (register_session_with_member_store)
+        // AFTER reserve_dispatch and BEFORE try_start_speculative_and_deliver while old rx1 is open.
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let w_fast = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx1, mut rx1) = mpsc::channel(8);
+            let (tx2, _rx2) = mpsc::channel(8);
+            let (tx_slow, _rx_slow) = mpsc::channel(8);
+            let reg1 = registry
+                .register_session_with_member_store(
+                    w_fast,
+                    WorkerCapabilities::new("fast", 4, 8192, false, false, None),
+                    ProtocolCapabilities::empty(),
+                    "127.0.0.1:9653".parse().unwrap(),
+                    tx1,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                    "127.0.0.1:9654".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let task = Task::new(
+                TaskSpec::command("echo", vec!["2c-supersede".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let tid = queue.submit(task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(tid, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &tid)
+                .await
+                .unwrap();
+
+            let (sender1, live1) = registry
+                .reserve_dispatch(&w_fast, reg1.session_id)
+                .await
+                .unwrap();
+            assert!(live1.load(Ordering::Acquire));
+
+            // Re-registration supersedes session 1 and invalidates live1 under registry write lock.
+            let reg2 = registry
+                .register_session_with_member_store(
+                    w_fast,
+                    WorkerCapabilities::new("fast", 4, 8192, false, false, None),
+                    ProtocolCapabilities::empty(),
+                    "127.0.0.1:9655".parse().unwrap(),
+                    tx2,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reg2.superseded_session, Some(reg1.session_id));
+            assert!(!live1.load(Ordering::Acquire));
+            queue
+                .handle_session_disconnected(&w_fast, Some(reg1.session_id), "superseded", true)
+                .await;
+
+            let outcome = queue
+                .try_start_speculative_and_deliver(tid, w_fast, reg1.session_id, Some(10), |task| {
+                    live1.load(Ordering::Acquire)
+                        && sender1.try_send(MasterMessage::AssignTask { task }).is_ok()
+                })
+                .await;
+            assert_eq!(outcome, SpeculativeStartOutcome::DeliveryFailed);
+            registry.release_dispatch(&w_fast, reg1.session_id).await;
+
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 0);
+            assert!(rx1.try_recv().is_err());
+
+            let fail_outcome = queue
+                .record_result_from(
+                    w_slow,
+                    Some(s_slow),
+                    TaskResult::failure(w_slow, tid, 1, "", "primary boom", 50, None),
+                )
+                .await
+                .unwrap();
+            assert_ne!(fail_outcome.state, TaskState::Scheduled);
+            assert_ne!(
+                queue.get_task(&tid).await.unwrap().assigned_worker_id,
+                Some(w_fast)
+            );
+        }
+
+        // Case 3: Reaper timeout clears session_live; subsequent HeartbeatOutcome::Revived
+        // keeps pre-reap handle false while issuing a fresh live flag for post-revive dispatches.
+        {
+            let registry = WorkerRegistry::new();
+            let w_id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel(8);
+            let session = registry
+                .register(
+                    w_id,
+                    WorkerCapabilities::new("reap-revive", 4, 8192, false, false, None),
+                    "127.0.0.1:9656".parse().unwrap(),
+                    tx,
+                    None,
+                )
+                .await
+                .unwrap();
+            let (_sender_pre, live_pre) = registry.reserve_dispatch(&w_id, session).await.unwrap();
+            assert!(live_pre.load(Ordering::Acquire));
+
+            let hb_at = registry.last_heartbeat_instant(&w_id).await.unwrap();
+            let reaped = registry
+                .reap_stale_sessions_at(hb_at + Duration::from_secs(30), Duration::from_secs(5))
+                .await;
+            assert_eq!(reaped, vec![(w_id, session)]);
+            assert!(!live_pre.load(Ordering::Acquire));
+
+            let revived = registry
+                .record_heartbeat_session(&w_id, 0, 2000, 10.0, 4096, Some(session))
+                .await
+                .unwrap();
+            assert_eq!(revived, HeartbeatOutcome::Revived);
+            assert!(!live_pre.load(Ordering::Acquire));
+
+            let (_sender_post, live_post) =
+                registry.reserve_dispatch(&w_id, session).await.unwrap();
+            assert!(live_post.load(Ordering::Acquire));
         }
     }
 }

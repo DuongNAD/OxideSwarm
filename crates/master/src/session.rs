@@ -2136,7 +2136,7 @@ mod tests {
         );
 
         let session_id = info.session_id;
-        let outbound_tx = registry
+        let (outbound_tx, _) = registry
             .reserve_dispatch(&worker_id, session_id)
             .await
             .unwrap();
@@ -2789,7 +2789,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();
@@ -2961,7 +2961,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();

@@ -2295,25 +2295,26 @@ impl WorkloadScheduler {
             outcome = tracing::field::Empty,
         );
 
-        let sender = match self.registry.reserve_dispatch(&worker_id, session_id).await {
-            Ok(sender) => sender,
-            Err(e) => {
-                #[cfg(feature = "otel")]
-                assign_span.record("outcome", "session_gone");
-                warn!(
-                    task_id = %task_id,
-                    worker_id = %worker_id,
-                    session_id = session_id,
-                    error = %e,
-                    "Worker session is gone; returning assignment to the queue"
-                );
-                let _ = self
-                    .queue
-                    .requeue_dispatch_failure(&task_id, &worker_id, session_id)
-                    .await;
-                return;
-            }
-        };
+        let (sender, _session_live) =
+            match self.registry.reserve_dispatch(&worker_id, session_id).await {
+                Ok(sender) => sender,
+                Err(e) => {
+                    #[cfg(feature = "otel")]
+                    assign_span.record("outcome", "session_gone");
+                    warn!(
+                        task_id = %task_id,
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        error = %e,
+                        "Worker session is gone; returning assignment to the queue"
+                    );
+                    let _ = self
+                        .queue
+                        .requeue_dispatch_failure(&task_id, &worker_id, session_id)
+                        .await;
+                    return;
+                }
+            };
 
         // Fast path: try to reserve a permit without blocking the pass. Only when the worker's
         // outbound channel is full do we defer to a bounded background waiter (`BUG-20`).
