@@ -28,6 +28,7 @@ mod lifecycle;
 mod recovery;
 mod retention;
 mod scheduling;
+pub use scheduling::SpeculativeStartOutcome;
 
 #[cfg(test)]
 mod recovery_tests;

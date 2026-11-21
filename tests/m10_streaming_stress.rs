@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 //! Milestone 10 Stress Challenge Suite: Empirical Telemetry Streaming Engine Stress Tests.
 //!
 //! Authored by challenger_m10_1 (Streaming Stress Challenger) to empirically verify:

@@ -188,8 +188,11 @@ class Pair:
             return 124, (err.stdout or b"").decode("utf-8", "replace") + "\n[timed out]"
 
     def read_log(self, name):
+        path = self.logs.get(name)
+        if not path:
+            return ""
         try:
-            with open(self.logs[name], "rb") as f:
+            with open(path, "rb") as f:
                 return f.read().decode("utf-8", "replace")
         except OSError:
             return ""

@@ -466,76 +466,28 @@ pub(crate) async fn run_straggler_pass(
             continue;
         };
 
-        let Some(mut task) = queue
-            .try_start_speculative(cand.view.task_id, target.worker_id, target.session_id)
+        let peer_version = registry
+            .peer_version_of(&target.worker_id, target.session_id)
+            .await;
+
+        let Ok(sender) = registry
+            .reserve_dispatch(&target.worker_id, target.session_id)
             .await
         else {
             continue;
         };
 
-        if let Some(version) = registry
-            .peer_version_of(&target.worker_id, target.session_id)
-            .await
-        {
-            if task.withheld_from_peer(version) {
-                queue
-                    .rollback_speculative_dispatch(
-                        &cand.view.task_id,
-                        &target.worker_id,
-                        target.session_id,
-                    )
-                    .await;
-                continue;
-            }
-        }
-        task.latest_checkpoint = None;
-        task.strip_master_extensions();
-
-        let sender = match registry
-            .reserve_dispatch(&target.worker_id, target.session_id)
-            .await
-        {
-            Ok(s) => s,
-            Err(_) => {
-                queue
-                    .rollback_speculative_dispatch(
-                        &cand.view.task_id,
-                        &target.worker_id,
-                        target.session_id,
-                    )
-                    .await;
-                continue;
-            }
-        };
-
-        let msg = MasterMessage::AssignTask { task };
         match queue
-            .deliver_if_speculative_scheduled(
-                &cand.view.task_id,
-                &target.worker_id,
+            .try_start_speculative_and_deliver(
+                cand.view.task_id,
+                target.worker_id,
                 target.session_id,
-                || sender.try_send(msg).is_ok(),
+                peer_version,
+                |task| sender.try_send(MasterMessage::AssignTask { task }).is_ok(),
             )
             .await
         {
-            None => {
-                registry
-                    .release_dispatch(&target.worker_id, target.session_id)
-                    .await;
-            }
-            Some(false) => {
-                queue
-                    .rollback_speculative_dispatch(
-                        &cand.view.task_id,
-                        &target.worker_id,
-                        target.session_id,
-                    )
-                    .await;
-                registry
-                    .release_dispatch(&target.worker_id, target.session_id)
-                    .await;
-            }
-            Some(true) => {
+            crate::queue::SpeculativeStartOutcome::Delivered => {
                 let load = loads.entry(target.worker_id).or_default();
                 load.tasks += 1;
                 load.slots += weight;
@@ -550,6 +502,13 @@ pub(crate) async fn run_straggler_pass(
                     fastest_avg_ms = fastest_avg_ms as u64,
                     "Dispatched speculative straggler copy for repeatable task"
                 );
+            }
+            crate::queue::SpeculativeStartOutcome::NotEligible
+            | crate::queue::SpeculativeStartOutcome::WithheldFromPeer
+            | crate::queue::SpeculativeStartOutcome::DeliveryFailed => {
+                registry
+                    .release_dispatch(&target.worker_id, target.session_id)
+                    .await;
             }
         }
     }
@@ -961,5 +920,556 @@ mod tests {
             rx_fast.try_recv().is_err(),
             "10% cluster slot cap (1 of 10 slots) must prevent a second speculative copy"
         );
+    }
+
+    #[tokio::test]
+    async fn tier5_reaper_20_slot_cluster_allows_2_speculative_and_excludes_workspace_tasks() {
+        use crate::speed::{mutate_shared_speed_book, new_shared_speed_book, TaskKey};
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, WorkspaceRef};
+
+        let registry = WorkerRegistry::new();
+        let speed_book = new_shared_speed_book();
+        registry.set_speed_book(Arc::clone(&speed_book));
+        let queue = TaskQueue::new();
+
+        // 20 total cluster slots: w_fast (16), w_s1 (1), w_s2 (1), w_s3 (2) => cap = 20 / 10 = 2.
+        let w_fast = Uuid::new_v4();
+        let w_s1 = Uuid::new_v4();
+        let w_s2 = Uuid::new_v4();
+        let w_s3 = Uuid::new_v4();
+        let (tx_fast, mut rx_fast) = mpsc::channel(16);
+        let (tx_s1, _rx_s1) = mpsc::channel(16);
+        let (tx_s2, _rx_s2) = mpsc::channel(16);
+        let (tx_s3, _rx_s3) = mpsc::channel(16);
+
+        let s_fast = registry
+            .register(
+                w_fast,
+                WorkerCapabilities::new("fast-16", 16, 32_768, false, false, None),
+                "127.0.0.1:9611".parse().unwrap(),
+                tx_fast,
+                None,
+            )
+            .await
+            .unwrap();
+        let s_s1 = registry
+            .register(
+                w_s1,
+                WorkerCapabilities::new("slow-1", 1, 4096, false, false, None),
+                "127.0.0.1:9612".parse().unwrap(),
+                tx_s1,
+                None,
+            )
+            .await
+            .unwrap();
+        let s_s2 = registry
+            .register(
+                w_s2,
+                WorkerCapabilities::new("slow-2", 1, 4096, false, false, None),
+                "127.0.0.1:9613".parse().unwrap(),
+                tx_s2,
+                None,
+            )
+            .await
+            .unwrap();
+        let s_s3 = registry
+            .register(
+                w_s3,
+                WorkerCapabilities::new("slow-3", 2, 4096, false, false, None),
+                "127.0.0.1:9614".parse().unwrap(),
+                tx_s3,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let spec = TaskSpec::command("sleep", vec!["20".into()]);
+        let key = TaskKey::for_task(&Task::new(spec.clone(), TaskRequirements::generic(1, 64)));
+        mutate_shared_speed_book(&speed_book, |sb| {
+            sb.record_sample(w_fast, key, 50, 60);
+        });
+
+        let rep1 = Task::new(spec.clone(), TaskRequirements::generic(1, 64))
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+        let rep1_id = queue.submit(rep1).await.unwrap();
+        let rep2 = Task::new(spec.clone(), TaskRequirements::generic(1, 64))
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+        let rep2_id = queue.submit(rep2).await.unwrap();
+        let rep3 = Task::new(spec.clone(), TaskRequirements::generic(1, 64))
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+        let rep3_id = queue.submit(rep3).await.unwrap();
+        let ws_rep = Task::new(spec, TaskRequirements::generic(1, 64))
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()])
+            .with_workspace(WorkspaceRef {
+                name: "shared-ws".to_string(),
+                source: None,
+            });
+        let ws_rep_id = queue.submit(ws_rep).await.unwrap();
+
+        queue
+            .schedule_tasks_batch_in_sessions(&[
+                (rep1_id, w_s1, s_s1),
+                (rep2_id, w_s2, s_s2),
+                (rep3_id, w_s3, s_s3),
+                (ws_rep_id, w_s3, s_s3),
+            ])
+            .await;
+        for (wid, sid, tid) in [
+            (w_s1, s_s1, rep1_id),
+            (w_s2, s_s2, rep2_id),
+            (w_s3, s_s3, rep3_id),
+            (w_s3, s_s3, ws_rep_id),
+        ] {
+            queue.mark_running_from(wid, Some(sid), &tid).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        let fast_cfg = ReaperConfig::default()
+            .with_scheduler_config(SchedulerConfig::default().without_host_cpu_backpressure())
+            .with_straggler_min_elapsed(Duration::from_millis(200))
+            .with_straggler_multiplier(3.0);
+        run_straggler_pass(&registry, &queue, &fast_cfg).await;
+
+        let mut dispatched = Vec::new();
+        while let Ok(MasterMessage::AssignTask { task }) = rx_fast.try_recv() {
+            assert_ne!(
+                task.id, ws_rep_id,
+                "workspace-bound task must never receive a speculative copy"
+            );
+            dispatched.push(task.id);
+        }
+        assert_eq!(
+            dispatched.len(),
+            2,
+            "20-slot cluster must permit 2 concurrent speculative copies, got {dispatched:?}"
+        );
+
+        // Complete the first speculative copy -> 3rd repeatable straggler can now be speculated,
+        // while ws_rep remains excluded.
+        let completed_id = dispatched[0];
+        let _ = queue
+            .record_result_from(
+                w_fast,
+                Some(s_fast),
+                rusty_grid_core::task::TaskResult::success(w_fast, completed_id, "ok", 50, false),
+            )
+            .await
+            .unwrap();
+        registry.release_dispatch(&w_fast, s_fast).await;
+
+        run_straggler_pass(&registry, &queue, &fast_cfg).await;
+        let mut second_wave = Vec::new();
+        while let Ok(MasterMessage::AssignTask { task }) = rx_fast.try_recv() {
+            assert_ne!(task.id, ws_rep_id);
+            second_wave.push(task.id);
+        }
+        assert_eq!(second_wave.len(), 1);
+        assert!(!dispatched.contains(&second_wave[0]));
+        assert!([rep1_id, rep2_id, rep3_id].contains(&second_wave[0]));
+    }
+
+    #[tokio::test]
+    async fn tier5_reaper_cold_start_no_speed_samples_does_not_speculate() {
+        use crate::speed::new_shared_speed_book;
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+
+        let registry = WorkerRegistry::new();
+        registry.set_speed_book(new_shared_speed_book());
+        let queue = TaskQueue::new();
+
+        let w_fast = Uuid::new_v4();
+        let w_slow = Uuid::new_v4();
+        let (tx_fast, mut rx_fast) = mpsc::channel(16);
+        let (tx_slow, _rx_slow) = mpsc::channel(16);
+        registry
+            .register(
+                w_fast,
+                WorkerCapabilities::new("fast", 4, 8192, false, false, None),
+                "127.0.0.1:9621".parse().unwrap(),
+                tx_fast,
+                None,
+            )
+            .await
+            .unwrap();
+        let s_slow = registry
+            .register(
+                w_slow,
+                WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                "127.0.0.1:9622".parse().unwrap(),
+                tx_slow,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let rep = Task::new(
+            TaskSpec::command("sleep", vec!["20".into()]),
+            TaskRequirements::generic(1, 64),
+        )
+        .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+        let rep_id = queue.submit(rep).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(rep_id, w_slow, s_slow)])
+            .await;
+        queue
+            .mark_running_from(w_slow, Some(s_slow), &rep_id)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        let fast_cfg = ReaperConfig::default()
+            .with_scheduler_config(SchedulerConfig::default().without_host_cpu_backpressure())
+            .with_straggler_min_elapsed(Duration::from_millis(200))
+            .with_straggler_multiplier(3.0);
+        run_straggler_pass(&registry, &queue, &fast_cfg).await;
+
+        assert!(
+            rx_fast.try_recv().is_err(),
+            "cold-start SpeedBook with zero samples must not emit speculative copies"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier5_reaper_rollback_branches_withheld_reserve_fail_and_channel_full() {
+        use crate::speed::{mutate_shared_speed_book, new_shared_speed_book, TaskKey};
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::task::{Extension, Task, TaskRequirements, TaskSpec};
+
+        let fast_cfg = ReaperConfig::default()
+            .with_scheduler_config(SchedulerConfig::default().without_host_cpu_backpressure())
+            .with_straggler_min_elapsed(Duration::from_millis(200))
+            .with_straggler_multiplier(3.0);
+
+        // Branch 1: target worker on protocol v9 with critical Worker extension -> WithheldFromPeer.
+        {
+            let registry = WorkerRegistry::new();
+            let sb = new_shared_speed_book();
+            registry.set_speed_book(Arc::clone(&sb));
+            let queue = TaskQueue::new();
+
+            let w_v9 = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx_v9, mut rx_v9) = mpsc::channel(4);
+            let (tx_slow, _rx_slow) = mpsc::channel(4);
+            let s_v9 = registry
+                .register(
+                    w_v9,
+                    WorkerCapabilities::new("fast-v9", 8, 16384, false, false, None),
+                    "127.0.0.1:9631".parse().unwrap(),
+                    tx_v9,
+                    None,
+                )
+                .await
+                .unwrap();
+            registry.set_peer_version(&w_v9, s_v9, 9).await;
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow-v10", 1, 4096, false, false, None),
+                    "127.0.0.1:9632".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut task = Task::new(
+                TaskSpec::command("sleep", vec!["20".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            task.extensions = vec![Extension {
+                id: 0x8002,
+                critical: true,
+                bytes: vec![1],
+            }];
+            let key = TaskKey::for_task(&task);
+            mutate_shared_speed_book(&sb, |b| b.record_sample(w_v9, key, 40, 60));
+
+            let tid = queue.submit(task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(tid, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &tid)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            run_straggler_pass(&registry, &queue, &fast_cfg).await;
+
+            assert!(rx_v9.try_recv().is_err());
+            assert_eq!(registry.get_worker(w_v9).await.unwrap().active_tasks, 0);
+            let (in_flight, cands) = queue.speculative_snapshot().await;
+            assert_eq!(in_flight, 0);
+            assert_eq!(cands.len(), 1);
+        }
+
+        // Branch 2: channel full -> DeliveryFailed -> slot released and speculative not recorded.
+        {
+            let registry = WorkerRegistry::new();
+            let sb = new_shared_speed_book();
+            registry.set_speed_book(Arc::clone(&sb));
+            let queue = TaskQueue::new();
+
+            let w_full = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx_full, _rx_full) = mpsc::channel(1);
+            // Pre-fill the 1-slot outbound channel so try_send fails.
+            tx_full
+                .try_send(MasterMessage::Shutdown {
+                    reason: "fill".into(),
+                    grace_period_secs: None,
+                })
+                .unwrap();
+            let (tx_slow, _rx_slow) = mpsc::channel(4);
+            let _s_full = registry
+                .register(
+                    w_full,
+                    WorkerCapabilities::new("fast-full", 8, 16384, false, false, None),
+                    "127.0.0.1:9633".parse().unwrap(),
+                    tx_full,
+                    None,
+                )
+                .await
+                .unwrap();
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                    "127.0.0.1:9634".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let task = Task::new(
+                TaskSpec::command("sleep", vec!["20".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let key = TaskKey::for_task(&task);
+            mutate_shared_speed_book(&sb, |b| b.record_sample(w_full, key, 40, 60));
+
+            let tid = queue.submit(task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(tid, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &tid)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            run_straggler_pass(&registry, &queue, &fast_cfg).await;
+
+            assert_eq!(registry.get_worker(w_full).await.unwrap().active_tasks, 0);
+            let (in_flight, cands) = queue.speculative_snapshot().await;
+            assert_eq!(in_flight, 0);
+            assert_eq!(cands.len(), 1);
+
+            // Branch 3: disconnected target -> reserve_dispatch Err handled cleanly without panic.
+            registry.mark_disconnected(&w_full).await.unwrap();
+            run_straggler_pass(&registry, &queue, &fast_cfg).await;
+            let (in_flight2, cands2) = queue.speculative_snapshot().await;
+            assert_eq!(in_flight2, 0);
+            assert_eq!(cands2.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn tier5_reaper_bug2_promotion_and_completion_during_speculative_dispatch() {
+        use crate::queue::SpeculativeStartOutcome;
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::task::{Task, TaskRequirements, TaskResult, TaskSpec};
+
+        // Sub-case 2a: Primary fails after reserve_dispatch and before try_start_speculative_and_deliver
+        // acquires queue lock, vs after Delivered. Never leaves a promoted task in Scheduled with empty rx_fast!
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let w_fast = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx_fast, mut rx_fast) = mpsc::channel(8);
+            let (tx_slow, _rx_slow) = mpsc::channel(8);
+            let s_fast = registry
+                .register(
+                    w_fast,
+                    WorkerCapabilities::new("fast", 4, 8192, false, false, None),
+                    "127.0.0.1:9641".parse().unwrap(),
+                    tx_fast,
+                    None,
+                )
+                .await
+                .unwrap();
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                    "127.0.0.1:9642".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Case A: primary fails between reserve_dispatch and try_start_speculative_and_deliver.
+            let t1 = Task::new(
+                TaskSpec::command("echo", vec!["2a-before".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let id1 = queue.submit(t1).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(id1, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &id1)
+                .await
+                .unwrap();
+
+            let sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let _ = queue
+                .record_result_from(
+                    w_slow,
+                    Some(s_slow),
+                    TaskResult::failure(w_slow, id1, 1, "", "boom", 50, None),
+                )
+                .await
+                .unwrap();
+            let outcome = queue
+                .try_start_speculative_and_deliver(id1, w_fast, s_fast, Some(10), |task| {
+                    sender.try_send(MasterMessage::AssignTask { task }).is_ok()
+                })
+                .await;
+            assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
+            registry.release_dispatch(&w_fast, s_fast).await;
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 0);
+            assert!(rx_fast.try_recv().is_err());
+            assert_ne!(
+                queue.get_state(&id1).await,
+                Some(crate::queue::TaskState::Scheduled)
+            );
+
+            // Case B: primary fails after Delivered -> AssignTask is already in rx_fast.
+            let t2 = Task::new(
+                TaskSpec::command("echo", vec!["2a-after".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let id2 = queue.submit(t2).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(id2, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &id2)
+                .await
+                .unwrap();
+            let sender2 = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            let outcome2 = queue
+                .try_start_speculative_and_deliver(id2, w_fast, s_fast, Some(10), |task| {
+                    sender2.try_send(MasterMessage::AssignTask { task }).is_ok()
+                })
+                .await;
+            assert_eq!(outcome2, SpeculativeStartOutcome::Delivered);
+            let fail_outcome = queue
+                .record_result_from(
+                    w_slow,
+                    Some(s_slow),
+                    TaskResult::failure(w_slow, id2, 1, "", "boom", 50, None),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fail_outcome.state, crate::queue::TaskState::Scheduled);
+            assert_eq!(
+                queue.get_task(&id2).await.unwrap().assigned_worker_id,
+                Some(w_fast)
+            );
+            assert!(matches!(
+                rx_fast.try_recv(),
+                Ok(MasterMessage::AssignTask { task }) if task.id == id2
+            ));
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 1);
+        }
+
+        // Sub-case 2b: Unrelated active task on w_fast must not be undercounted by double release_dispatch.
+        {
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let w_fast = Uuid::new_v4();
+            let w_slow = Uuid::new_v4();
+            let (tx_fast, mut rx_fast) = mpsc::channel(8);
+            let (tx_slow, _rx_slow) = mpsc::channel(8);
+            let s_fast = registry
+                .register(
+                    w_fast,
+                    WorkerCapabilities::new("fast", 8, 8192, false, false, None),
+                    "127.0.0.1:9643".parse().unwrap(),
+                    tx_fast,
+                    None,
+                )
+                .await
+                .unwrap();
+            let s_slow = registry
+                .register(
+                    w_slow,
+                    WorkerCapabilities::new("slow", 1, 4096, false, false, None),
+                    "127.0.0.1:9644".parse().unwrap(),
+                    tx_slow,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Reserve 1 unrelated active task on w_fast.
+            let _unrelated_sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 1);
+
+            // Primary completes between reserve_dispatch and try_start_speculative_and_deliver.
+            let t = Task::new(
+                TaskSpec::command("echo", vec!["2b".into()]),
+                TaskRequirements::generic(1, 64),
+            )
+            .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+            let id = queue.submit(t).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(id, w_slow, s_slow)])
+                .await;
+            queue
+                .mark_running_from(w_slow, Some(s_slow), &id)
+                .await
+                .unwrap();
+
+            let spec_sender = registry.reserve_dispatch(&w_fast, s_fast).await.unwrap();
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 2);
+
+            let win = queue
+                .record_result_from(
+                    w_slow,
+                    Some(s_slow),
+                    TaskResult::success(w_slow, id, "done", 50, false),
+                )
+                .await
+                .unwrap();
+            // Primary completed before speculative was recorded, so cancel_sibling is None!
+            assert_eq!(win.cancel_sibling, None);
+
+            let outcome = queue
+                .try_start_speculative_and_deliver(id, w_fast, s_fast, Some(10), |task| {
+                    spec_sender
+                        .try_send(MasterMessage::AssignTask { task })
+                        .is_ok()
+                })
+                .await;
+            assert_eq!(outcome, SpeculativeStartOutcome::NotEligible);
+            registry.release_dispatch(&w_fast, s_fast).await;
+
+            // Unrelated task's slot count remains exactly 1 (never 0!).
+            assert_eq!(registry.get_worker(w_fast).await.unwrap().active_tasks, 1);
+            assert!(rx_fast.try_recv().is_err());
+        }
     }
 }

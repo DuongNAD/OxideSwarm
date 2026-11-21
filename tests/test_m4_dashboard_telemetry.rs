@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 //! Integration Test Suite for Milestone 4 (R4: Dashboard & CLI Telemetry Visualization).
 //!
 //! Validates:

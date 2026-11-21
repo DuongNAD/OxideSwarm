@@ -22,6 +22,19 @@ use super::{
     WorkspaceAffinity,
 };
 
+/// Outcome of [`TaskQueue::try_start_speculative_and_deliver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeStartOutcome {
+    /// Speculative attempt was recorded and `deliver` succeeded inside the same write lock.
+    Delivered,
+    /// Task was no longer `Running`/eligible for a speculative attempt; queue state unchanged.
+    NotEligible,
+    /// Task carries a critical worker extension unsupported by `peer_version`; queue state unchanged.
+    WithheldFromPeer,
+    /// `deliver` returned `false` (channel full or closed); queue state unchanged.
+    DeliveryFailed,
+}
+
 impl TaskQueue {
     // --- Task Submission ---
 
@@ -1435,6 +1448,7 @@ impl TaskQueue {
 
     /// Attempts to register a speculative straggler copy on `(worker_id, session_id)` for a
     /// currently `Running` repeatable task (`0060` D3). Returns `Some(task)` on success.
+    #[cfg(test)]
     pub async fn try_start_speculative(
         &self,
         task_id: TaskId,
@@ -1472,55 +1486,63 @@ impl TaskQueue {
         Some(task)
     }
 
-    /// Runs `deliver` while `task_id` still has an active `Scheduled` speculative attempt on
-    /// `(worker_id, session_id)`.
-    pub async fn deliver_if_speculative_scheduled<R>(
+    /// Atomically checks eligibility, checks `peer_version` extension compatibility, delivers the
+    /// prepared `Task` via non-blocking `deliver`, and records `entry.speculative` under a single
+    /// `queue.inner.write()` lock. Because no `.await` occurs between recording `entry.speculative`
+    /// and queuing `AssignTask`, a concurrent primary failure/promotion cannot strand the task in
+    /// `Scheduled` without delivery, and a concurrent primary completion/cancel cannot double-call
+    /// `release_dispatch`.
+    pub async fn try_start_speculative_and_deliver(
         &self,
-        task_id: &TaskId,
-        worker_id: &Uuid,
+        task_id: TaskId,
+        worker_id: Uuid,
         session_id: u64,
-        deliver: impl FnOnce() -> R,
-    ) -> Option<R> {
-        let inner = self.inner.read().await;
-        let entry = inner.tasks.get(task_id)?;
-        let spec = entry.speculative.as_ref()?;
-        if spec.state != TaskState::Scheduled
-            || spec.worker_id != *worker_id
-            || spec.session_id != session_id
-        {
-            return None;
-        }
-        Some(deliver())
-    }
-
-    /// Rolls back a speculative attempt that could not be delivered before reaching the worker.
-    pub async fn rollback_speculative_dispatch(
-        &self,
-        task_id: &TaskId,
-        worker_id: &Uuid,
-        session_id: u64,
-    ) {
+        peer_version: Option<u32>,
+        deliver: impl FnOnce(Task) -> bool,
+    ) -> SpeculativeStartOutcome {
         let mut inner = self.inner.write().await;
-        let removed = if let Some(entry) = inner.tasks.get_mut(task_id) {
-            if entry
-                .speculative
-                .as_ref()
-                .is_some_and(|s| s.worker_id == *worker_id && s.session_id == session_id)
+        let prepared = {
+            let Some(entry) = inner.tasks.get(&task_id) else {
+                return SpeculativeStartOutcome::NotEligible;
+            };
+            if entry.state != TaskState::Running
+                || entry.speculative.is_some()
+                || entry.speculative_spawned
+                || entry.task.workspace.is_some()
+                || !entry.task.is_repeatable()
+                || entry.assigned_worker_id == Some(worker_id)
             {
-                entry.speculative = None;
-                entry.speculative_spawned = false;
-                true
-            } else {
-                false
+                return SpeculativeStartOutcome::NotEligible;
             }
-        } else {
-            false
+            if peer_version.is_some_and(|v| entry.task.withheld_from_peer(v)) {
+                return SpeculativeStartOutcome::WithheldFromPeer;
+            }
+            let mut task = entry.task.clone();
+            task.latest_checkpoint = None;
+            task.strip_master_extensions();
+            task
         };
-        if removed {
-            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
-                tasks.remove(task_id);
-            }
-            inner.refresh_worker_resume_protection(*worker_id);
+
+        if !deliver(prepared) {
+            return SpeculativeStartOutcome::DeliveryFailed;
         }
+
+        if let Some(entry) = inner.tasks.get_mut(&task_id) {
+            entry.speculative_spawned = true;
+            entry.speculative = Some(SpeculativeAttempt {
+                worker_id,
+                session_id,
+                scheduled_instant: Instant::now(),
+                started_instant: None,
+                state: TaskState::Scheduled,
+            });
+        }
+        inner
+            .worker_assignments
+            .entry(worker_id)
+            .or_default()
+            .insert(task_id);
+        inner.refresh_worker_resume_protection(worker_id);
+        SpeculativeStartOutcome::Delivered
     }
 }

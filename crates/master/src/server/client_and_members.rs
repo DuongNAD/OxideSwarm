@@ -91,6 +91,12 @@ async fn listed_worker(
     let link = "link:TCP/LAN".to_string();
 
     let mut caps = w.capabilities;
+    caps.tags.retain(|t| {
+        !(t.starts_with(rusty_grid_core::placement::LINK_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::ID_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::STATE_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::FEAT_TAG_PREFIX))
+    });
     caps.tags.push(link);
     caps.tags.push(format!(
         "{}{}",

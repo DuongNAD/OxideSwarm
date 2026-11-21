@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
-#[cfg(feature = "p2p")]
+#[cfg(any(feature = "p2p", test))]
 use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
@@ -51,7 +51,7 @@ use client_and_members::{
     run_member_store_blocking as run_member_store_blocking_inner, spawn_member_store_resync,
     ENROLL_CONFIRM_TIMEOUT_SECS,
 };
-#[cfg(feature = "p2p")]
+#[cfg(any(feature = "p2p", test))]
 use handshakes::handle_multiplexed_connection;
 #[cfg(feature = "p2p")]
 pub(crate) use handshakes::P2pConnGuard;

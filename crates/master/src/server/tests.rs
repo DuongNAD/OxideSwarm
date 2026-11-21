@@ -215,6 +215,7 @@ fn test_beacon_advertises_the_dashboard_where_it_really_listens() {
     );
 }
 
+#[cfg(feature = "dashboard")]
 #[tokio::test]
 async fn test_beacon_of_a_master_with_a_loopback_dashboard_advertises_no_dashboard() {
     let disc_port = 18091;
