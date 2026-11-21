@@ -932,6 +932,21 @@ pub struct SubmitArgs {
     )]
     pub repeatable: bool,
 
+    #[arg(
+        long = "matrix",
+        value_name = "KEY=V1,V2",
+        help = crate::matrix::MATRIX_HELP
+    )]
+    pub matrix: Vec<String>,
+
+    #[arg(
+        long = "max-matrix-cells",
+        value_name = "N",
+        requires = "matrix",
+        help = crate::matrix::MAX_MATRIX_CELLS_HELP
+    )]
+    pub max_matrix_cells: Option<usize>,
+
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
 

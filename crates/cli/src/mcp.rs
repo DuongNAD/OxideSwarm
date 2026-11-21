@@ -53,7 +53,8 @@ use crate::secret_cmd::SecretOpts;
 mod cancel;
 mod doctor;
 mod status;
-mod submit;
+pub(crate) mod submit;
+mod submit_matrix;
 mod submit_support;
 mod task_result;
 mod workers;
@@ -705,6 +706,15 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Mark this task as safe to re-run speculatively on another worker if a running attempt becomes a straggler (attaches opt:repeatable)"
                     },
+                    "matrix": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Implies wait. Fan out the task over the Cartesian product of placement or env:<VAR> axes (default limit 64 cells, max 256), e.g. [\"os=macos,linux\", \"tag=fast,gpu\"]. Supported keys: os, arch, worker, iso, tool, tag, and env:<VAR> for command/shell tasks. Unplaced cells are reported immediately without hanging."
+                    },
+                    "max_matrix_cells": {
+                        "type": "integer",
+                        "description": "With 'matrix': maximum expanded cells allowed (default: 64, maximum: 256)"
+                    },
                     "output_dir": {
                         "type": "string",
                         "description": "Local directory inside the working directory to download declared output files into when wait is true (symbolic links and paths outside the working directory are refused)"
@@ -1067,7 +1077,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
                     placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
                 }
             }
-            Placement::from_task_tags(&placement_tags)
+            let base_placement = Placement::from_task_tags(&placement_tags)
                 .map_err(|e| format!("Invalid placement constraints: {e}"))?;
 
             check_opt_u64(obj, "timeout_secs")?;
@@ -1077,6 +1087,34 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             check_opt_bool(obj, "repeatable")?;
             check_opt_u64(obj, "matrix_dim")?;
             check_opt_u64(obj, "work_group_size")?;
+            let max_matrix_cells = check_opt_u64(obj, "max_matrix_cells")?;
+            let matrix_val = obj.get("matrix").filter(|v| !v.is_null());
+            if max_matrix_cells.is_some() && matrix_val.is_none() {
+                return Err("Property 'max_matrix_cells' requires 'matrix'".to_string());
+            }
+            if let Some(mval) = matrix_val {
+                if obj.get("verify").is_some_and(|v| !v.is_null()) {
+                    return Err(
+                        "Property 'matrix' cannot be used together with 'verify'".to_string()
+                    );
+                }
+                if obj.get("wait").and_then(Value::as_bool) == Some(false) {
+                    return Err(
+                        "Property 'matrix' requires 'wait' to be true (or omitted)".to_string()
+                    );
+                }
+                let max_cells_u64 =
+                    max_matrix_cells.unwrap_or(crate::matrix::DEFAULT_MAX_MATRIX_CELLS as u64);
+                let max_cells = usize::try_from(max_cells_u64).map_err(|_| {
+                    format!(
+                        "Property 'max_matrix_cells' exceeds limit of {}",
+                        crate::matrix::HARD_MAX_MATRIX_CELLS
+                    )
+                })?;
+                let spec = crate::matrix::MatrixSpec::parse_mcp_value(mval, max_cells)?;
+                let allow_env = matches!(task_type.as_str(), "command" | "shell");
+                crate::matrix::expand_cells(&spec, &base_placement, allow_env)?;
+            }
             let files_opt = check_opt_str_array(obj, "files")?;
             if let Some(ws_val) = obj.get("workspace") {
                 if !ws_val.is_null() {
@@ -2283,6 +2321,71 @@ mod tests {
                 "type": "gpu",
                 "workspace": { "name": "ok" }
             })
+        )
+        .is_err());
+
+        // Matrix schema and validation in submit (design 0101, AX-1).
+        assert_eq!(schema["properties"]["matrix"]["type"], "array");
+        assert_eq!(schema["properties"]["matrix"]["items"]["type"], "string");
+        assert_eq!(schema["properties"]["max_matrix_cells"]["type"], "integer");
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": ["tag=a,b", "tag=c,d"]})
+        )
+        .is_ok());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": {"tag": ["a", "b"], "env:MODE": ["x", "y"]}})
+        )
+        .is_ok());
+        assert!(
+            validate_tool_arguments("submit", &json!({"command": "echo", "matrix": []})).is_err()
+        );
+        assert!(
+            validate_tool_arguments("submit", &json!({"command": "echo", "matrix": {}})).is_err()
+        );
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": "not-valid"})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": ["os=macos"], "os": "linux"})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": ["tag=a"], "verify": 1, "outputs": ["o.txt"]})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": ["tag=a"], "wait": false})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"type": "gpu", "matrix": ["env:SEED=1,2"]})
+        )
+        .is_err());
+        let big_vals = (0..65)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": [format!("tag={big_vals}")]})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "matrix": [format!("tag={big_vals}")], "max_matrix_cells": 100})
+        )
+        .is_ok());
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "max_matrix_cells": 10})
         )
         .is_err());
 

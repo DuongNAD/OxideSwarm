@@ -124,6 +124,19 @@ If the master is stopped or unreachable, response `id: 3` reports `"isError": tr
 {"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"Failed to connect to Master at 127.0.0.1:8088: Connection failed: ...","type":"text"}],"isError":true}}
 ```
 
+### Matrix fan-out via MCP `submit`
+
+On the client machine, send a `tools/call` for `submit` with `matrix` to fan out across tagged or multi-OS workers (`crates/cli/src/mcp/submit_matrix.rs`, [design 0101](../design/0101-matrix-fanout.md)):
+
+```bash
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1.0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit","arguments":{"command":"hostname","matrix":["tag=alpha,beta"]}}}' \
+  | <OXIDESWARM_BIN> mcp --master 127.0.0.1:8088
+```
+
+Expected output on `stdout` includes a single-line JSON-RPC `2.0` response for `id: 2` containing `"matrix": true`, `"total_cells": 2`, and a `"cells"` array with one record per cell (`"status"`, `"worker"`, `"exit_code"`, `"stdout"`), or `"unplaced": true` without hanging if no connected worker matches a cell.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
