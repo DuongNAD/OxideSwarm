@@ -620,6 +620,82 @@ async fn test_cli_matrix_partial_failure_and_invalid_flag_refusals() {
     assert!(!run_bad(&["--matrix", "tag=a", "-o", "out.glb"])
         .status
         .success());
+    assert!(!run_bad(&["--matrix", "env:BAD=KEY=1"]).status.success());
+    assert!(!run_bad(&["--matrix", "iso=off"]).status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cli_and_mcp_matrix_huge_timeout_and_delimiter_validation() {
+    let cluster = Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"])]).await;
+
+    // 1. CLI --timeout-secs u64::MAX with --matrix must succeed without panic
+    let cli_huge = cluster
+        .cli()
+        .args([
+            "submit",
+            "--master",
+            &cluster.addr,
+            "--timeout-secs",
+            "18446744073709551615",
+            "--matrix",
+            "tag=cell-a",
+            "--json",
+            "--command",
+            "echo",
+            "--",
+            "huge-timeout",
+        ])
+        .output()
+        .unwrap();
+    assert!(cli_huge.status.success(), "{}", describe(&cli_huge));
+    let cv = json_of(&cli_huge);
+    assert_eq!(cv["completed_cells"], 1);
+    assert_eq!(cv["cells"][0]["stdout"], "huge-timeout\n");
+
+    let mut mcp = Mcp::start(&cluster);
+
+    // 2. MCP matrix with wait_secs = u64::MAX and timeout_secs = u64::MAX must succeed without panic
+    let (body_huge, err_huge) = mcp.submit(json!({
+        "command": "echo",
+        "args": ["mcp-huge"],
+        "timeout_secs": 18446744073709551615u64,
+        "wait_secs": 18446744073709551615u64,
+        "matrix": ["tag=cell-a"],
+    }));
+    assert!(!err_huge, "{body_huge}");
+    assert_eq!(body_huge["completed_cells"], 1);
+    assert_eq!(body_huge["cells"][0]["stdout"], "mcp-huge\n");
+    mcp.ping();
+
+    // 3. Non-matrix MCP submit with wait_secs = u64::MAX also succeeds without panic
+    let (body_single, err_single) = mcp.submit(json!({
+        "command": "echo",
+        "args": ["single-huge"],
+        "wait": true,
+        "wait_secs": 18446744073709551615u64,
+    }));
+    assert!(!err_single, "{body_single}");
+    assert_eq!(body_single["status"], "completed");
+    mcp.ping();
+
+    // 4. Unified delimiter and iso=off rejections return -32602 and keep server alive
+    for bad in [
+        json!(["env:BAD=KEY=1"]),
+        json!({"env:BAD": ["KEY=1"]}),
+        json!(["tag=a=b"]),
+        json!(["iso=off"]),
+        json!({"iso": ["off"]}),
+    ] {
+        let resp = mcp.call(
+            "tools/call",
+            json!({
+                "name": "submit",
+                "arguments": {"command": "echo", "matrix": bad}
+            }),
+        );
+        assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+        mcp.ping();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

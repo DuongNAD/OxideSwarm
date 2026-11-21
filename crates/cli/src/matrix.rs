@@ -43,6 +43,19 @@ pub const DEFAULT_CELL_OUTPUT_BYTES: usize = 16_384;
 /// Cap concurrent TCP/Noise handshakes under the master's default `max_pending_handshakes` (64).
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 
+/// Upper bound on wait deadlines so `u64::MAX` / `Duration::MAX` timeouts cannot overflow `Instant`.
+const MAX_MATRIX_WAIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Computes `Instant::now() + timeout`, capping at [`MAX_MATRIX_WAIT`] and using `checked_add`
+/// so extreme user-supplied timeouts never panic.
+pub(crate) fn safe_deadline(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let capped = timeout.min(MAX_MATRIX_WAIT);
+    now.checked_add(capped)
+        .or_else(|| now.checked_add(Duration::from_secs(60)))
+        .unwrap_or(now)
+}
+
 /// Help text for `--matrix`.
 pub const MATRIX_HELP: &str = "Fan out the task over the Cartesian product of KEY=V1,V2,... axes (repeatable; implies --wait). Placement keys: os, arch, worker, iso, tool, tag; process tasks also accept env:<VAR>. Unplaced cells fail upfront via ListWorkers without hanging";
 
@@ -138,7 +151,6 @@ fn validate_axis_values(
     key: &str,
     kind: &MatrixAxisKind,
     raw_values: Vec<String>,
-    reject_delimiters: bool,
 ) -> Result<Vec<String>, String> {
     if raw_values.is_empty() {
         return Err(format!(
@@ -148,7 +160,7 @@ fn validate_axis_values(
     let mut normalized = Vec::with_capacity(raw_values.len());
     let mut seen = BTreeSet::new();
     for raw in raw_values {
-        if reject_delimiters && (raw.contains(',') || raw.contains('=')) {
+        if raw.contains(',') || raw.contains('=') {
             return Err(format!(
                 "matrix axis '{key}' value '{raw}' must not contain ',' or '='"
             ));
@@ -186,8 +198,7 @@ fn validate_axis_values(
                 if t.is_empty() {
                     return Err(format!("matrix axis '{key}' contains an empty value"));
                 }
-                let level = t
-                    .parse::<IsolationLevel>()
+                let level = IsolationLevel::parse_required(t)
                     .map_err(|e| format!("matrix axis '{key}': {e}"))?;
                 let s = level.to_string();
                 (s.clone(), s)
@@ -264,7 +275,7 @@ impl MatrixSpec {
                 ));
             }
             let raw_values: Vec<String> = raw_vals.split(',').map(str::to_string).collect();
-            let values = validate_axis_values(&key, &kind, raw_values, false)?;
+            let values = validate_axis_values(&key, &kind, raw_values)?;
             axes.push(MatrixAxis { key, kind, values });
         }
         validate_axes_list(axes, max_cells)
@@ -305,7 +316,7 @@ impl MatrixSpec {
                         })?;
                         raw_values.push(s.to_string());
                     }
-                    let values = validate_axis_values(&key, &kind, raw_values, true)?;
+                    let values = validate_axis_values(&key, &kind, raw_values)?;
                     axes.push(MatrixAxis { key, kind, values });
                 }
                 validate_axes_list(axes, max_cells)
@@ -655,6 +666,34 @@ where
     .await;
 }
 
+fn cancelled_execution(cell: MatrixCell, task_id: TaskId) -> CellExecution {
+    CellExecution {
+        cell,
+        status: CellStatus::Cancelled,
+        task_id: Some(task_id),
+        worker_name: None,
+        result: None,
+        error: Some(format!("Task {task_id} cancelled by client")),
+        saved_outputs: None,
+        saved_artifacts: None,
+        download_error: None,
+    }
+}
+
+async fn wait_for_cancel(cancel_rx: &mut Option<watch::Receiver<bool>>) {
+    if let Some(rx) = cancel_rx.as_mut() {
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// Executes all placeable cells concurrently via dedicated connections, returning one
 /// [`CellExecution`] per cell in the original expansion order.
 #[allow(clippy::too_many_arguments)]
@@ -682,7 +721,7 @@ where
     let total = cells.len();
     let mut outcomes: Vec<Option<CellExecution>> = vec![None; total];
     let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = safe_deadline(timeout);
     let mut set = tokio::task::JoinSet::new();
 
     for (cell, unplaced_reason) in cells.into_iter().zip(placeability) {
@@ -720,94 +759,109 @@ where
         set.spawn(async move {
             let label = cell.label.clone();
             if cell_cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
-                return CellExecution {
-                    cell,
-                    status: CellStatus::Cancelled,
-                    task_id: Some(task_id),
-                    worker_name: None,
-                    result: None,
-                    error: Some(format!("Task {task_id} cancelled by client")),
-                    saved_outputs: None,
-                    saved_artifacts: None,
-                    download_error: None,
-                };
+                return cancelled_execution(cell, task_id);
             }
 
-            let permit = match tokio::time::timeout_at(deadline, sem.acquire()).await {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => {
-                    return CellExecution {
-                        cell,
-                        status: CellStatus::Error,
-                        task_id: Some(task_id),
-                        worker_name: None,
-                        result: None,
-                        error: Some("internal handshake semaphore closed".to_string()),
-                        saved_outputs: None,
-                        saved_artifacts: None,
-                        download_error: None,
-                    };
+            let permit = tokio::select! {
+                biased;
+                () = wait_for_cancel(&mut cell_cancel) => {
+                    return cancelled_execution(cell, task_id);
                 }
-                Err(_) => {
-                    return CellExecution {
-                        cell,
-                        status: CellStatus::TimedOut,
-                        task_id: Some(task_id),
-                        worker_name: None,
-                        result: None,
-                        error: Some(format!("timed out after {}s", timeout.as_secs())),
-                        saved_outputs: None,
-                        saved_artifacts: None,
-                        download_error: None,
-                    };
+                res = tokio::time::timeout_at(deadline, sem.acquire()) => match res {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(_)) => {
+                        return CellExecution {
+                            cell,
+                            status: CellStatus::Error,
+                            task_id: Some(task_id),
+                            worker_name: None,
+                            result: None,
+                            error: Some("internal handshake semaphore closed".to_string()),
+                            saved_outputs: None,
+                            saved_artifacts: None,
+                            download_error: None,
+                        };
+                    }
+                    Err(_) => {
+                        return CellExecution {
+                            cell,
+                            status: CellStatus::TimedOut,
+                            task_id: Some(task_id),
+                            worker_name: None,
+                            result: None,
+                            error: Some(format!("timed out after {}s", timeout.as_secs())),
+                            saved_outputs: None,
+                            saved_artifacts: None,
+                            download_error: None,
+                        };
+                    }
                 }
             };
 
-            let mut transport = match tokio::time::timeout_at(deadline, connect()).await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
+            let mut transport = tokio::select! {
+                biased;
+                () = wait_for_cancel(&mut cell_cancel) => {
                     drop(permit);
-                    return CellExecution {
-                        cell,
-                        status: CellStatus::Error,
-                        task_id: Some(task_id),
-                        worker_name: None,
-                        result: None,
-                        error: Some(e),
-                        saved_outputs: None,
-                        saved_artifacts: None,
-                        download_error: None,
-                    };
+                    return cancelled_execution(cell, task_id);
                 }
-                Err(_) => {
-                    drop(permit);
-                    return CellExecution {
-                        cell,
-                        status: CellStatus::TimedOut,
-                        task_id: Some(task_id),
-                        worker_name: None,
-                        result: None,
-                        error: Some(format!(
-                            "timed out connecting to master after {}s",
-                            timeout.as_secs()
-                        )),
-                        saved_outputs: None,
-                        saved_artifacts: None,
-                        download_error: None,
-                    };
+                res = tokio::time::timeout_at(deadline, connect()) => match res {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        drop(permit);
+                        return CellExecution {
+                            cell,
+                            status: CellStatus::Error,
+                            task_id: Some(task_id),
+                            worker_name: None,
+                            result: None,
+                            error: Some(e),
+                            saved_outputs: None,
+                            saved_artifacts: None,
+                            download_error: None,
+                        };
+                    }
+                    Err(_) => {
+                        drop(permit);
+                        return CellExecution {
+                            cell,
+                            status: CellStatus::TimedOut,
+                            task_id: Some(task_id),
+                            worker_name: None,
+                            result: None,
+                            error: Some(format!(
+                                "timed out connecting to master after {}s",
+                                timeout.as_secs()
+                            )),
+                            saved_outputs: None,
+                            saved_artifacts: None,
+                            download_error: None,
+                        };
+                    }
                 }
             };
             drop(permit);
 
+            if cell_cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
+                transport.close().await;
+                return cancelled_execution(cell, task_id);
+            }
+
             let msg = ClientMessage::SubmitTask { task, wait: true };
-            let send_outcome = match tokio::time::timeout_at(deadline, transport.send_msg(&msg)).await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(err)) => Err((CellStatus::Error, format!("could not submit cell: {err}"))),
-                Err(_) => Err((
-                    CellStatus::TimedOut,
-                    format!("timed out submitting cell after {}s", timeout.as_secs()),
-                )),
+            let send_outcome = tokio::select! {
+                biased;
+                () = wait_for_cancel(&mut cell_cancel) => {
+                    drop(transport);
+                    send_best_effort_cancel(&*connect, task_id).await;
+                    return cancelled_execution(cell, task_id);
+                }
+                res = tokio::time::timeout_at(deadline, transport.send_msg(&msg)) => match res {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err((CellStatus::Error, format!("could not submit cell: {err}"))),
+                    Err(_) => Err((
+                        CellStatus::TimedOut,
+                        format!("timed out submitting cell after {}s", timeout.as_secs()),
+                    )),
+                }
             };
             if let Err((status, error)) = send_outcome {
                 transport.close().await;
@@ -1642,6 +1696,110 @@ mod tests {
         assert_eq!(j["matrix"], true);
         assert_eq!(j["status"], "failed");
         assert_eq!(j["cells"][2]["unplaced"], true);
+    }
+
+    #[test]
+    fn reject_delimiters_in_values_and_iso_off_consistently() {
+        for bad in ["env:BAD=KEY=1", "tag=a=b", "iso=off"] {
+            assert!(
+                MatrixSpec::parse(&[bad.to_string()], 64).is_err(),
+                "CLI parse should reject {bad}"
+            );
+            assert!(
+                MatrixSpec::parse_mcp_value(&json!([bad]), 64).is_err(),
+                "MCP array parse should reject {bad}"
+            );
+        }
+        assert!(MatrixSpec::parse_mcp_value(&json!({"env:BAD": ["KEY=1"]}), 64).is_err());
+        assert!(MatrixSpec::parse_mcp_value(&json!({"env:BAD=KEY": ["1"]}), 64).is_err());
+        assert!(MatrixSpec::parse_mcp_value(&json!({"tag": ["a=b"]}), 64).is_err());
+        assert!(MatrixSpec::parse_mcp_value(&json!({"iso": ["off"]}), 64).is_err());
+
+        let valid_iso = MatrixSpec::parse(&["iso=fs,fs+net".to_string()], 64).unwrap();
+        assert_eq!(valid_iso.axes[0].values, vec!["fs", "fs+net"]);
+    }
+
+    #[tokio::test]
+    async fn execute_matrix_with_max_duration_does_not_panic() {
+        let _ = safe_deadline(Duration::MAX);
+        let _ = safe_deadline(Duration::from_secs(u64::MAX));
+
+        let w = worker("w-1", &["cell-a"], false);
+        let spec = MatrixSpec::parse(&["tag=cell-a,cell-missing".to_string()], 64).unwrap();
+        let cells = expand_cells(&spec, &Placement::default(), true).unwrap();
+        let reqs = TaskRequirements::new(1, 0, false, u64::MAX);
+        let placeability = check_placeability(&cells, std::slice::from_ref(&w), &reqs, false);
+        let tpl = Task::new(
+            TaskSpec::Command {
+                program: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            reqs,
+        );
+        let connect = Arc::new(|| async { Err("simulated connect failure".to_string()) });
+        let execs = execute_matrix(
+            cells,
+            &[w],
+            placeability,
+            &tpl,
+            Duration::from_secs(u64::MAX),
+            None,
+            None,
+            connect,
+        )
+        .await;
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[0].status, CellStatus::Error);
+        assert_eq!(execs[1].status, CellStatus::Unplaced);
+    }
+
+    #[tokio::test]
+    async fn execute_matrix_cancels_during_slow_connect_before_submit() {
+        let w = worker("w-1", &["cell-a"], false);
+        let spec = MatrixSpec::parse(&["tag=cell-a".to_string()], 64).unwrap();
+        let cells = expand_cells(&spec, &Placement::default(), true).unwrap();
+        let reqs = TaskRequirements::new(1, 0, false, 60);
+        let placeability = check_placeability(&cells, std::slice::from_ref(&w), &reqs, false);
+        let tpl = Task::new(
+            TaskSpec::Command {
+                program: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            reqs,
+        );
+        let (tx, rx) = watch::channel(false);
+        let connect = Arc::new(|| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err("should have been cancelled before connect finished".to_string())
+        });
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(true);
+        });
+        let execs = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_matrix(
+                cells,
+                &[w],
+                placeability,
+                &tpl,
+                Duration::from_secs(60),
+                Some(rx),
+                None,
+                connect,
+            ),
+        )
+        .await
+        .expect("cancellation should interrupt slow connect promptly");
+        let _ = cancel_task.await;
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].status, CellStatus::Cancelled);
     }
 
     use std::collections::HashMap;

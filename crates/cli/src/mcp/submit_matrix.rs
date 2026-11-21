@@ -21,6 +21,37 @@ use super::submit::prepare_mcp_output_dir_in_dir;
 use super::submit_support::WorkspaceSubmitMeta;
 use super::{McpState, ToolCallContext, ToolCallResult, DEFAULT_MASTER_RPC_TIMEOUT};
 
+fn ensure_non_symlink_cell_dir(
+    base_out_dir: &std::path::Path,
+    slug: &str,
+) -> Result<std::path::PathBuf, String> {
+    let cell_dir = base_out_dir.join(slug);
+    match std::fs::symlink_metadata(&cell_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "cell output directory '{}' is a symbolic link, which is refused in MCP output_dir",
+                    cell_dir.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!(
+                    "cell output path '{}' exists and is not a directory",
+                    cell_dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect cell output directory '{}': {e}",
+                cell_dir.display()
+            ));
+        }
+    }
+    Ok(cell_dir)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_mcp_matrix(
     state: &McpState,
@@ -246,7 +277,14 @@ pub(super) async fn run_mcp_matrix(
                         if result.outputs.is_empty() {
                             continue;
                         }
-                        let cell_dir = base_out_dir.join(&exec.cell.slug);
+                        let cell_dir =
+                            match ensure_non_symlink_cell_dir(&base_out_dir, &exec.cell.slug) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    exec.download_error = Some(e);
+                                    continue;
+                                }
+                            };
                         match crate::blobs::download_outputs(&conn, &result.outputs, &cell_dir)
                             .await
                         {
@@ -277,7 +315,13 @@ pub(super) async fn run_mcp_matrix(
                 continue;
             };
             if !result.artifacts.is_empty() {
-                let cell_dir = base_out_dir.join(&exec.cell.slug);
+                let cell_dir = match ensure_non_symlink_cell_dir(&base_out_dir, &exec.cell.slug) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        exec.download_error.get_or_insert(e);
+                        continue;
+                    }
+                };
                 match save_output_artifacts(&result.artifacts, &cell_dir) {
                     Ok(paths) => exec.saved_artifacts = Some(paths),
                     Err(e) => {
@@ -328,4 +372,26 @@ pub(super) async fn run_mcp_matrix(
     let mut out = ToolCallResult::ok_json(&report.to_json());
     out.is_error = is_error;
     out
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ensure_non_symlink_cell_dir;
+
+    #[test]
+    fn rejects_preexisting_symlink_cell_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_out = tmp.path().join("out");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&base_out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let slug = "cell-00-a";
+        std::os::unix::fs::symlink(&outside, base_out.join(slug)).unwrap();
+
+        let err = ensure_non_symlink_cell_dir(&base_out, slug).unwrap_err();
+        assert!(err.contains("symbolic link"), "unexpected error: {err}");
+
+        assert!(ensure_non_symlink_cell_dir(&base_out, "cell-01-b").is_ok());
+    }
 }

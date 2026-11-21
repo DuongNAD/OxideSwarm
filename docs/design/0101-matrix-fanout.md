@@ -52,7 +52,7 @@ Created: 2026-11-21    Updated: 2026-11-21
 - When zero cells are placeable, input blob and workspace uploads are skipped completely.
 - When at least one cell is placeable, `scan_inputs` / `upload_inputs` (or workspace scan and upload) runs once before cell dispatch, and every cell `Task` reuses the resulting `BlobFile` inputs or `WorkspaceRef`.
 - Each placeable cell receives a fresh `TaskId::new()`, merged `require:` tags, and process environment injections `OXIDESWARM_MATRIX_CELL`, `OXIDESWARM_MATRIX_INDEX`, and any `env:<VAR>` overrides.
-- Placeable cells run concurrently in a `tokio::task::JoinSet` over dedicated connections (`connect_master` / `McpState::connect_dedicated_until`, handshake concurrency bounded to 32 under the master's 64-pending-handshake limit), respecting the task timeout and MCP `cancel_rx` (`CancelTask` best-effort on cancellation).
+- Placeable cells run concurrently in a `tokio::task::JoinSet` over dedicated connections (`connect_master` bounded by `MAX_CONCURRENT_HANDSHAKES = 32` semaphore under the master's 64-pending-handshake limit), respecting the task timeout and MCP `cancel_rx` (`CancelTask` best-effort on cancellation).
 
 ### D4: Output isolation, bounded streams, and reporting
 

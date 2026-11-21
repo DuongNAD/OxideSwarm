@@ -1194,7 +1194,7 @@ pub(super) async fn tool_submit(
         }
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+    let deadline = crate::matrix::safe_deadline(Duration::from_secs(wait_secs));
     let preflight_timeout =
         Duration::from_millis(500).min(Duration::from_secs(wait_secs.max(1)) / 2);
     let warning = check_matching_worker_warning(
