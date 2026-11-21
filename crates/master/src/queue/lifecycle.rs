@@ -330,6 +330,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    action_cache_key: None,
                 },
                 None,
             ));
@@ -377,6 +378,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    action_cache_key: None,
                 },
                 None,
             ));
@@ -590,6 +592,17 @@ impl TaskQueue {
             );
         }
 
+        let action_cache_key =
+            if disposition == ResultDisposition::Terminal && res_state == TaskState::Completed {
+                inner
+                    .tasks
+                    .get(&task_id)
+                    .filter(|e| e.task.is_action_cache_enabled())
+                    .map(|e| rusty_grid_core::task::compute_action_cache_key(&e.task))
+            } else {
+                None
+            };
+
         let ack = inner.append_durable_warn(&journal_record);
         inner.maybe_trigger_compaction();
 
@@ -602,6 +615,7 @@ impl TaskQueue {
                 task_key,
                 timeout_secs,
                 resumed_from_checkpoint,
+                action_cache_key,
             },
             ack,
         ))

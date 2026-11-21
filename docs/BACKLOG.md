@@ -174,6 +174,7 @@ Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged):
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
 Recounted on 2026-11-19 from the rows, with BUG-22 Partial (draft, design 0098): 225 items, 152 Implemented, 19 Partial and 54 Planned; 23 open items are In and 50 are Out.
+Recounted on 2026-11-22 from the rows, with CACHE-1 Partial (draft, design 0100): 225 items, 152 Implemented, 20 Partial and 53 Planned; 23 open items are In and 50 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -311,7 +312,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented |  | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented |  | 118 (design), 125, 126, 127, 131 |
 | MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Implemented |  | 211, 212, 230, 231, 242, 249, 250, 253, 259 |
-| CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned | In |  |
+| CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Partial | In | (design 0100) |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned | Out |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented |  | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented |  | 75 |
@@ -708,7 +709,7 @@ Each item below needs a design record before code.
 - **Done when:** A test submits the same cacheable task twice: the worker runs it once, and the
   second result downloads byte-identical outputs. A change to one input file, one environment
   variable or the `os` constraint is a miss. A failed run is not stored. An entry survives a master
-  restart.
+  restart. (Steps 1–4 implemented in [design 0100](design/0100-action-cache.md) on the protocol `11` train; step 5 live hit-rate recording on WS-7 remains pending before marking `Implemented`.)
 
 ### REAPI-1: Serve the blob store as a Remote Execution API cache
 
@@ -2406,3 +2407,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: BUG-33 Implemented (pull request 367, open): `crates/worker/src/process_tree.rs` (`close_fds_except`) now lists open descriptors on macOS via `proc_pidinfo(PROC_PIDLISTFDS)` into a 1,024-entry stack buffer (`close_open_fds_macos`, keeping `close_fds_range_fallback` on error or overflow), cutting per-task close time from `111.889 ms` wall / `111.095 ms` CPU to `0.688 ms` / `0.183 ms` at `1,048,576` and `7.683 ms` / `7.248 ms` to `0.678 ms` / `0.181 ms` at `65,536`, verified by `test_supervisor_closes_high_numbered_fd`, `rusty_grid_worker --lib`, and `test_sec5_hardened_runner` (with and without `--features 3d`); text in the archive.
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
 - 2026-11-19: BUG-22 Partial (draft, [design 0098](design/0098-protocol-11-train.md)): implements the protocol 11 train base (`PROTOCOL_VERSION_CURRENT = 11`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 10`, `v0.4.4` in `wire_layout_previous.txt`) with `cancelled_tasks: usize` in `ClientResponse::ClusterStatus`, `TaskQueue::cluster_buckets`, `oxideswarm status` / `--json`, MCP `status`, and v10 peer folding (`ClientResponse::for_peer(10)`), verified by `window_v10_peers` and `test_status_cancelled_tasks`; stays Partial in draft until the stability release and train wire PRs (`NET-10`, `ECO-9`) merge and release.
+- 2026-11-22: CACHE-1 Partial (draft, [design 0100](design/0100-action-cache.md), on the protocol 11 train): implements opt-in content-addressed action caching across `core` (`action-cache` extension `id = 1`, `ActionCacheKey` domain-separated BLAKE3 canonical hash, declared-inputs and synced-workspace validation, `TaskResult::cached: bool`, `LegacyV10BinaryTaskResult` / `HumanLegacyV10TaskResult` v10 peer folding), `master` (`ActionCache` with `512 MiB` default cap, `BlobStore` cache pinning, LRU eviction, `<state_dir>/action_cache.json` persistence, `STORE_FORMAT_VERSION = 5`, `oxideswarm_action_cache_*` Prometheus metrics), and `cli`/`mcp` (`--cache`, `--action-cache-mb` / `RUSTY_GRID_ACTION_CACHE_MB`, `--verify` mutual exclusion and replica stripping, `Cached: yes` / JSON `"cached"`, MCP `submit` `cache` & `"cached"`), verified by `rusty_grid_core` (`305` lib tests), `rusty_grid_master` (`397` lib tests + `--no-default-features` check), `window_v10_peers` (`8/8`), and `action_cache_e2e` (`6/6`); stays `Partial` until `CACHE-1d` / step 5 live hit-rate recording on WS-7 across two real machines is complete.

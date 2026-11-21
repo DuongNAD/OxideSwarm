@@ -10,10 +10,14 @@ use uuid::Uuid;
 use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS};
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::protocol::ClientResponse;
-use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
-use rusty_grid_core::{GridResult, MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::task::{
+    compute_action_cache_key, CheckpointData, Task, TaskId, TaskResult, TaskStatus,
+};
+use rusty_grid_core::{GridError, GridResult, MasterMessage, MessageTransport, WorkerMessage};
 
+use crate::action_cache::ActionCache;
 use crate::blob_store::BlobStore;
+use crate::fair_share::SubmitterId;
 use crate::queue::{ResultDisposition, TaskQueue, TaskState};
 use crate::registry::WorkerRegistry;
 
@@ -453,6 +457,7 @@ pub async fn handle_task_result(
         None,
         result,
         None,
+        None,
         #[cfg(feature = "dashboard")]
         None,
     )
@@ -481,9 +486,85 @@ pub async fn handle_task_result_with_broadcast(
         None,
         result,
         None,
+        None,
         broadcast_tx,
     )
     .await;
+}
+
+/// Serves an action-cache hit before queueing when `task` opts into caching and all output blobs
+/// remain present and pinnable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_serve_action_cache_hit(
+    task: &Task,
+    priority: u32,
+    submitter: SubmitterId,
+    queue: &TaskQueue,
+    waiters: &WaiterMap,
+    blob_store: Option<&Arc<BlobStore>>,
+    action_cache: Option<&Arc<ActionCache>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
+) -> GridResult<Option<TaskResult>> {
+    if !task.is_action_cache_enabled() {
+        return Ok(None);
+    }
+    task.validate().map_err(GridError::Config)?;
+    let Some(cache) = action_cache else {
+        return Ok(None);
+    };
+    let key = compute_action_cache_key(task);
+    let Some(cached_result) = cache.lookup(&key) else {
+        return Ok(None);
+    };
+    let output_pin = match pin_result_outputs(blob_store, &cached_result) {
+        Ok(pin) => pin,
+        Err(reason) => {
+            warn!(
+                task_id = %task.id,
+                key = %key,
+                reason = %reason,
+                "Action cache hit invalidated because output blobs are no longer available"
+            );
+            cache.invalidate(&key);
+            return Ok(None);
+        }
+    };
+
+    let task_id = task.id;
+    let completed = queue
+        .record_cached_completion(task.clone(), priority, submitter, cached_result)
+        .await?;
+    if let Some(pin) = output_pin {
+        pin.commit_terminal(task_id).await;
+    }
+    if let Some(store) = blob_store {
+        store.unpin_task(&task_id).await;
+    }
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        if b_tx.receiver_count() > 0 {
+            if let Some(info) = queue.get_task(&task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
+            ));
+        }
+    }
+
+    {
+        let mut lock = waiters.write().await;
+        if let Some(senders) = lock.remove(&task_id) {
+            for tx in senders {
+                let _ = tx.send(completed.clone());
+            }
+        }
+    }
+
+    Ok(Some(completed))
 }
 
 /// Applies one worker result: records it in the queue FSM on behalf of the sending connection
@@ -502,6 +583,7 @@ pub(super) async fn apply_task_result(
     session_id: Option<u64>,
     result: TaskResult,
     blob_store: Option<&Arc<BlobStore>>,
+    action_cache: Option<&Arc<ActionCache>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     apply_task_result_inner(
@@ -513,6 +595,7 @@ pub(super) async fn apply_task_result(
         session_id,
         result,
         blob_store,
+        action_cache,
         false,
         #[cfg(feature = "dashboard")]
         broadcast_tx,
@@ -530,10 +613,13 @@ async fn apply_task_result_inner(
     session_id: Option<u64>,
     mut result: TaskResult,
     blob_store: Option<&Arc<BlobStore>>,
+    action_cache: Option<&Arc<ActionCache>>,
     spawn_waiter_ack: bool,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     let task_id = result.task_id;
+    // Worker results are fresh executions; only the master marks cache hits.
+    result.cached = false;
     if result.worker_id != worker_id {
         warn!(
             worker_id = %worker_id,
@@ -626,6 +712,11 @@ async fn apply_task_result_inner(
                 crate::speed::mutate_shared_speed_book(&sb, |book| {
                     book.record_result(worker_id, outcome.task_key, outcome.timeout_secs, &result);
                 });
+            }
+        }
+        if result.is_success() {
+            if let (Some(cache), Some(key)) = (action_cache, outcome.action_cache_key) {
+                cache.insert(key, &result);
             }
         }
         if let Some(store) = blob_store {
@@ -982,6 +1073,7 @@ pub(crate) async fn handle_session_task_message(
     worker_id: Uuid,
     session_id: u64,
     blob_store: Option<&Arc<BlobStore>>,
+    action_cache: Option<&Arc<ActionCache>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     match msg {
@@ -1034,6 +1126,7 @@ pub(crate) async fn handle_session_task_message(
                 asset_bytes,
                 artifacts,
                 outputs,
+                cached: false,
             };
             // Once a result starts being applied it must finish, even if this connection is
             // aborted meanwhile (reaper, or the worker re-registering): the queue transition and
@@ -1044,6 +1137,7 @@ pub(crate) async fn handle_session_task_message(
             let scheduler_notify = Arc::clone(scheduler_notify);
             let waiters = Arc::clone(waiters);
             let blob_store = blob_store.cloned();
+            let action_cache = action_cache.cloned();
             #[cfg(feature = "dashboard")]
             let broadcast_tx = broadcast_tx.cloned();
             let _ = tokio::spawn(async move {
@@ -1056,6 +1150,7 @@ pub(crate) async fn handle_session_task_message(
                     Some(session_id),
                     result,
                     blob_store.as_ref(),
+                    action_cache.as_ref(),
                     true,
                     #[cfg(feature = "dashboard")]
                     broadcast_tx.as_ref(),

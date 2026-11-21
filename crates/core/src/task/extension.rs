@@ -154,9 +154,31 @@ pub struct ExtensionInfo {
     pub decode: fn(&[u8]) -> Result<(), String>,
 }
 
-/// The extensions this build knows. Empty until the first feature that needs one; the wire layout
-/// test records this table. The first real id comes with its design record.
-pub const EXTENSION_REGISTRY: &[ExtensionInfo] = &[];
+/// Extension id for opt-in content-addressed action caching (design 0100).
+pub const ACTION_CACHE_EXTENSION_ID: u16 = 1;
+/// Payload byte enabling read-write action cache lookup and population (design 0100).
+pub const ACTION_CACHE_EXT_PAYLOAD_READ_WRITE: u8 = 0x01;
+
+fn decode_action_cache(bytes: &[u8]) -> Result<(), String> {
+    if bytes == [ACTION_CACHE_EXT_PAYLOAD_READ_WRITE] {
+        Ok(())
+    } else {
+        Err(format!(
+            "action-cache extension requires a 1-byte mode flag [0x{ACTION_CACHE_EXT_PAYLOAD_READ_WRITE:02x}], got {} byte(s)",
+            bytes.len()
+        ))
+    }
+}
+
+/// The extensions this build knows; the wire layout test records this table.
+pub const EXTENSION_REGISTRY: &[ExtensionInfo] = &[ExtensionInfo {
+    id: ACTION_CACHE_EXTENSION_ID,
+    name: "action-cache",
+    list: ExtensionList::Task,
+    critical: false,
+    scope: ExtensionScope::Master,
+    decode: decode_action_cache,
+}];
 
 /// Test-only registry (experimental id range), visible to this crate's tests and, through the
 /// `test-extensions` feature, to the dev-dependencies of the master and worker crates.
@@ -398,6 +420,43 @@ impl Task {
             copy.requirements.extensions.clear();
         }
         copy
+    }
+
+    /// Opts this task into the master's content-addressed action cache (`CACHE-1`, design 0100).
+    pub fn with_action_cache(mut self) -> Self {
+        self.extensions
+            .retain(|ext| ext.id != ACTION_CACHE_EXTENSION_ID);
+        self.extensions.push(Extension {
+            id: ACTION_CACHE_EXTENSION_ID,
+            critical: false,
+            bytes: vec![ACTION_CACHE_EXT_PAYLOAD_READ_WRITE],
+        });
+        self
+    }
+
+    /// True when this task opts into read-write action caching.
+    pub fn is_action_cache_enabled(&self) -> bool {
+        self.extensions.iter().any(|ext| {
+            ext.id == ACTION_CACHE_EXTENSION_ID
+                && ext.bytes == [ACTION_CACHE_EXT_PAYLOAD_READ_WRITE]
+        })
+    }
+
+    /// Removes the action-cache opt-in extension (e.g. for `--verify` spot-check replicas).
+    pub fn strip_action_cache(&mut self) {
+        self.extensions
+            .retain(|ext| ext.id != ACTION_CACHE_EXTENSION_ID);
+    }
+
+    /// True when the task declares explicit content-addressed inputs, inline staged files, or a
+    /// pinned workspace tree source suitable for deterministic cache keying.
+    pub fn has_declared_cache_inputs(&self) -> bool {
+        !self.inputs.is_empty()
+            || !self.staged_files.is_empty()
+            || self
+                .workspace
+                .as_ref()
+                .is_some_and(|ws| ws.source.is_some())
     }
 }
 

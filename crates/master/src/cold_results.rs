@@ -387,7 +387,7 @@ impl ColdResultStore {
                 path.display()
             )));
         }
-        let decoded: TaskResult = bincode::deserialize(payload).map_err(|e| {
+        let decoded: TaskResult = TaskResult::from_bincode_bytes(payload).map_err(|e| {
             GridError::Storage(format!(
                 "cold result {} failed to decode bincode payload: {e}",
                 path.display()

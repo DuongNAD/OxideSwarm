@@ -713,6 +713,7 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
         asset_bytes: Some(original_task_bytes.clone()),
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     // Check pointer inside TaskResult
@@ -1015,6 +1016,7 @@ fn test_adv_08_concurrent_multithreaded_zero_copy_access() {
         asset_bytes: Some(original_bytes.clone()),
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     });
 
     let num_threads = 8;

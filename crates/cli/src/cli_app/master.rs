@@ -544,6 +544,14 @@ async fn run_master_inner(
         ),
     }
 
+    let action_cache_mb = resolve_u64(
+        args.action_cache_mb,
+        &["RUSTY_GRID_ACTION_CACHE_MB"],
+        master_cfg.as_ref().and_then(|m| m.action_cache_mb),
+        rusty_grid_master::DEFAULT_ACTION_CACHE_MAX_BYTES / MIB,
+    );
+    server_config = server_config.with_action_cache_max_bytes(action_cache_mb.saturating_mul(MIB));
+
     // Cluster secret policy: a master reachable beyond this machine (non-loopback listener, or
     // the P2P listener, since an iroh ticket is an address and not a credential) must
     // authenticate its peers. Resolve the secret, generate the default file if nothing resolves,

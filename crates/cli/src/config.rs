@@ -111,6 +111,8 @@ pub struct MasterFileConfig {
     pub blob_dir: Option<String>,
     /// Megabytes the blob store may hold (`master --blob-store-mb`).
     pub blob_store_mb: Option<u64>,
+    /// Megabytes the master action cache may retain (`master --action-cache-mb`, default 512, 0 disables).
+    pub action_cache_mb: Option<u64>,
     /// Directory of the durable task queue state (`master --state-dir`).
     pub state_dir: Option<String>,
     /// Seconds the master holds a disconnected session-resume worker's tasks (`master --session-resume-hold-secs`).

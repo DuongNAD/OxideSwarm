@@ -706,6 +706,7 @@ impl TaskRunner {
                     asset_bytes: None,
                     artifacts: Vec::new(),
                     outputs: Vec::new(),
+                    cached: false,
                 };
             }
         }
@@ -1143,6 +1144,7 @@ impl TaskRunner {
                     asset_bytes: None,
                     artifacts: Vec::new(),
                     outputs: Vec::new(),
+                    cached: false,
                 },
                 Ok(Err(err)) => self.gpu_failure(task_id, &err, timeout, start_time),
                 Err(join_error) => {

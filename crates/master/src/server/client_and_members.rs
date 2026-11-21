@@ -17,6 +17,7 @@ use rusty_grid_core::protocol::{
 use rusty_grid_core::task::{TaskId, TaskStatus};
 use rusty_grid_core::{GridError, GridResult, MessageTransport, WorkerCapabilities};
 
+use crate::action_cache::ActionCache;
 use crate::blob_store::BlobStore;
 use crate::mapreduce::MapReduceEngine;
 use crate::member_connections::ConnectionId;
@@ -27,7 +28,8 @@ use super::handshakes::{check_v3_client_message_role, MasterAuthContext, REFUSAL
 use super::members::{self, MemberStore};
 use super::tasks_and_blobs::{
     admit_blob_task, cancel_task_and_notify, handle_workers_revoked_with_broadcast,
-    prune_closed_waiters, send_client_response, BlobPipeline, UploadOwner, NO_BLOB_STORE,
+    prune_closed_waiters, send_client_response, try_serve_action_cache_hit, BlobPipeline,
+    UploadOwner, NO_BLOB_STORE,
 };
 use super::WaiterMap;
 
@@ -121,6 +123,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
     waiters: WaiterMap,
     mapreduce_parallelism: usize,
     blob_store: Option<Arc<BlobStore>>,
+    action_cache: Option<Arc<ActionCache>>,
     auth_ctx: MasterAuthContext,
     v3_peer: Option<AuthenticatedV3Peer>,
     member_conn: Option<ConnectionId>,
@@ -245,6 +248,45 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                                 &ClientResponse::Error { message },
                             )
                             .await?;
+                            continue;
+                        }
+                    }
+
+                    match try_serve_action_cache_hit(
+                        &task,
+                        0,
+                        client_submitter,
+                        &queue,
+                        &waiters,
+                        blob_store.as_ref(),
+                        action_cache.as_ref(),
+                        #[cfg(feature = "dashboard")]
+                        broadcast_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(cached_result)) => {
+                            let resp = if wait {
+                                ClientResponse::TaskCompleted {
+                                    task_id,
+                                    result: cached_result,
+                                }
+                            } else {
+                                ClientResponse::TaskSubmitted { task_id }
+                            };
+                            send_client_response(&mut transport, &resp).await?;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if let Some(store) = blob_store.as_ref() {
+                                store.unpin_task(&task_id).await;
+                            }
+                            warn!(task_id = %task_id, error = %e, "SubmitTask rejected");
+                            let resp = ClientResponse::Error {
+                                message: e.to_string(),
+                            };
+                            send_client_response(&mut transport, &resp).await?;
                             continue;
                         }
                     }

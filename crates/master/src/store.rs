@@ -94,7 +94,7 @@ pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
 /// bincode form of `Task` (protocol version 6), version 3 appended `TaskRequirements::vram_mb`
 /// (protocol version 9), and version 4 appended `Task::extensions` and
 /// `TaskRequirements::extensions` (protocol version 10, design 0082).
-pub const STORE_FORMAT_VERSION: u32 = 4;
+pub const STORE_FORMAT_VERSION: u32 = 5;
 /// Oldest layout version this module still opens. A version 1 journal can only hold records of
 /// the old `Task` layout, and the protocol version in its header (below 6) refuses those records
 /// (`read_journal`); a version 1 snapshot is JSON and carries over unchanged, as does a version 1

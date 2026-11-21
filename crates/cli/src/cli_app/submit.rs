@@ -901,6 +901,25 @@ async fn run_submit_with_secret_inner(
     } else {
         Vec::new()
     };
+    if args.cache && args.verify.is_some() {
+        eprintln!("--cache cannot be combined with --verify: verification runs replicas directly on workers");
+        return ExitCode::FAILURE;
+    }
+    if args.cache && workspace_ref.as_ref().is_some_and(|ws| ws.source.is_none()) {
+        eprintln!(
+            "action cache (--cache) cannot be used with an unsynced persistent workspace (--no-sync)"
+        );
+        return ExitCode::FAILURE;
+    }
+    if args.cache
+        && args.inputs.is_empty()
+        && workspace_ref.as_ref().is_none_or(|ws| ws.source.is_none())
+    {
+        eprintln!(
+            "action cache (--cache) requires at least one declared input (--input or a synced --workspace)"
+        );
+        return ExitCode::FAILURE;
+    }
     if let Some(replicas) = args.verify {
         if let Err(e) = crate::verify::check_options(
             replicas,
@@ -1095,6 +1114,13 @@ async fn run_submit_with_secret_inner(
         .with_output_globs(output_globs.clone());
     if let Some(ws) = workspace_ref {
         task = task.with_workspace(ws);
+    }
+    if args.cache {
+        task = task.with_action_cache();
+        if let Err(e) = task.validate() {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     }
     let task_id = task.id;
     let verify_template = args.verify.map(|_| task.clone());
@@ -1342,6 +1368,9 @@ async fn run_submit_with_secret_inner(
                 println!("Execution Time: {}ms", result.execution_time_ms);
                 println!("{}", summary.tasks_line());
                 println!("{}", summary.waited_line());
+                if result.cached {
+                    println!("Cached: yes");
+                }
                 if let Some(ref saved) = saved_artifacts {
                     println!(
                         "Artifacts ({} saved to {}):",

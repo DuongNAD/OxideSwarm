@@ -649,6 +649,7 @@ pub(super) async fn format_completed_task_result_with_start(
         "task_id": result.task_id.to_string(),
         "status": status_str,
         "exit_code": result.exit_code,
+        "cached": result.cached,
         "stdout": stdout_str,
         "stderr": stderr_str,
         "truncated": truncated,
@@ -693,6 +694,13 @@ pub(super) async fn tool_submit(
         .unwrap_or("command")
         .to_lowercase();
     let verify = VerifyArgs::parse(args);
+    let cache = args.get("cache").and_then(Value::as_bool).unwrap_or(false);
+    if cache && verify.replicas.is_some() {
+        return ToolCallResult::error(
+            "Property 'cache' cannot be combined with 'verify': verification runs replicas directly on workers"
+                .to_string(),
+        );
+    }
     let wait =
         verify.replicas.is_some() || args.get("wait").and_then(Value::as_bool).unwrap_or(false);
 
@@ -1074,6 +1082,12 @@ pub(super) async fn tool_submit(
     }
     if !output_globs.is_empty() {
         task = task.with_output_globs(output_globs);
+    }
+    if cache {
+        task = task.with_action_cache();
+        if let Err(e) = task.validate() {
+            return ToolCallResult::error(format!("Invalid cached submission: {e}"));
+        }
     }
     let task_id = task.id;
     let verify_template = verify.replicas.map(|_| task.clone());

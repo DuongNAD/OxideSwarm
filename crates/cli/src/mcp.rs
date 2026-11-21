@@ -701,6 +701,10 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "With 'verify': let the replicas run on matching workers with another operating system or CPU architecture than the first run (default false: the same deterministic program can give different results on two systems)"
                     },
+                    "cache": {
+                        "type": "boolean",
+                        "description": "Opt into the master's content-addressed action cache (default false). Requires at least one declared input ('files' or synced 'workspace.sync_dir'); cannot combine with 'verify'. Assumes task outputs depend only on spec and declared inputs — tasks reading network, clocks, randomness, or undeclared host paths may receive stale hits"
+                    },
                     "output_dir": {
                         "type": "string",
                         "description": "Local directory inside the working directory to download declared output files into when wait is true (symbolic links and paths outside the working directory are refused)"
@@ -1128,7 +1132,13 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             check_opt_str(obj, "output_dir")?;
             check_opt_u64(obj, "max_output_bytes")?;
+            check_opt_bool(obj, "cache")?;
             VerifyArgs::check(obj)?;
+            if obj.get("cache").and_then(Value::as_bool) == Some(true)
+                && obj.get("verify").is_some_and(|v| !v.is_null())
+            {
+                return Err("Property 'cache' cannot be combined with 'verify'".to_string());
+            }
             Ok(())
         }
         "task_result" => {

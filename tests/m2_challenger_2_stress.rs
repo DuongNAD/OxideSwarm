@@ -1281,6 +1281,7 @@ fn test_adversarial_zero_copy_huge_payload_slicing_and_cow() {
         asset_bytes: None,
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     let stdout_cow = res.stdout_str();

@@ -278,6 +278,7 @@ pub(super) async fn lane_writer<W: AsyncWrite + Unpin>(
                                 asset_bytes,
                                 artifacts,
                                 outputs,
+                                cached: false,
                             },
                             size,
                             max,

@@ -1977,6 +1977,8 @@ pub struct Task {
     pub extensions: Vec<Extension>,
 }
 
+mod action_cache;
+pub use action_cache::*;
 mod extension;
 pub use extension::*;
 
@@ -2267,6 +2269,25 @@ impl Task {
             }
         }
 
+        if self.is_action_cache_enabled() {
+            if !self.has_declared_cache_inputs() {
+                return Err(
+                    "action cache (--cache) requires at least one declared input (--input, --stage-file, or a synced workspace source)"
+                        .to_string(),
+                );
+            }
+            if self
+                .workspace
+                .as_ref()
+                .is_some_and(|ws| ws.source.is_none())
+            {
+                return Err(
+                    "action cache (--cache) cannot be used with an unsynced persistent workspace"
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -2310,6 +2331,8 @@ pub struct TaskResult {
     /// Files matched by `Task::output_globs` (and a `RustCompilation`'s artifacts), as blobs the
     /// worker uploaded to the Master's blob store (see [`crate::blob`]).
     pub outputs: Vec<crate::blob::BlobFile>,
+    /// Whether this result was served from the Master's action cache (design 0100, protocol 11).
+    pub cached: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2337,6 +2360,8 @@ struct HumanTaskResult {
     pub artifacts: Vec<OutputArtifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<crate::blob::BlobFile>,
+    #[serde(default)]
+    pub cached: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2357,6 +2382,59 @@ struct BinaryTaskResult {
     #[serde(default)]
     pub artifacts: Vec<OutputArtifact>,
     #[serde(default)]
+    pub outputs: Vec<crate::blob::BlobFile>,
+    #[serde(default)]
+    pub cached: bool,
+}
+
+/// Protocol v10 bincode layout of [`TaskResult`] (ends at `outputs`, before `cached` in v11).
+#[derive(Serialize, Deserialize)]
+pub(crate) struct LegacyV10BinaryTaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    pub device_name: Option<String>,
+    pub error: Option<String>,
+    #[serde(default, with = "opt_bytes_serde")]
+    pub asset_bytes: Option<Bytes>,
+    #[serde(default)]
+    pub artifacts: Vec<OutputArtifact>,
+    #[serde(default)]
+    pub outputs: Vec<crate::blob::BlobFile>,
+}
+
+/// Protocol v10 JSON layout of [`TaskResult`] (omits `cached`).
+/// Name starts with `Human` per `skip_serializing_if_is_kept_off_bincode_types` in `crates/core/src/lib.rs`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct HumanLegacyV10TaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(
+        default,
+        with = "opt_bytes_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub asset_bytes: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<OutputArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<crate::blob::BlobFile>,
 }
 
@@ -2390,6 +2468,85 @@ impl From<LegacyBinaryTaskResult> for TaskResult {
             asset_bytes: None,
             artifacts: Vec::new(),
             outputs: Vec::new(),
+            cached: false,
+        }
+    }
+}
+
+impl From<&TaskResult> for LegacyV10BinaryTaskResult {
+    fn from(r: &TaskResult) -> Self {
+        Self {
+            worker_id: r.worker_id,
+            task_id: r.task_id,
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            execution_time_ms: r.execution_time_ms,
+            is_gpu_executed: r.is_gpu_executed,
+            device_name: r.device_name.clone(),
+            error: r.error.clone(),
+            asset_bytes: r.asset_bytes.clone(),
+            artifacts: r.artifacts.clone(),
+            outputs: r.outputs.clone(),
+        }
+    }
+}
+
+impl From<LegacyV10BinaryTaskResult> for TaskResult {
+    fn from(v: LegacyV10BinaryTaskResult) -> Self {
+        Self {
+            worker_id: v.worker_id,
+            task_id: v.task_id,
+            exit_code: v.exit_code,
+            stdout: v.stdout,
+            stderr: v.stderr,
+            execution_time_ms: v.execution_time_ms,
+            is_gpu_executed: v.is_gpu_executed,
+            device_name: v.device_name,
+            error: v.error,
+            asset_bytes: v.asset_bytes,
+            artifacts: v.artifacts,
+            outputs: v.outputs,
+            cached: false,
+        }
+    }
+}
+
+impl From<&TaskResult> for HumanLegacyV10TaskResult {
+    fn from(r: &TaskResult) -> Self {
+        Self {
+            worker_id: r.worker_id,
+            task_id: r.task_id,
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            execution_time_ms: r.execution_time_ms,
+            is_gpu_executed: r.is_gpu_executed,
+            device_name: r.device_name.clone(),
+            error: r.error.clone(),
+            asset_bytes: r.asset_bytes.clone(),
+            artifacts: r.artifacts.clone(),
+            outputs: r.outputs.clone(),
+        }
+    }
+}
+
+impl From<HumanLegacyV10TaskResult> for TaskResult {
+    fn from(v: HumanLegacyV10TaskResult) -> Self {
+        Self {
+            worker_id: v.worker_id,
+            task_id: v.task_id,
+            exit_code: v.exit_code,
+            stdout: v.stdout,
+            stderr: v.stderr,
+            execution_time_ms: v.execution_time_ms,
+            is_gpu_executed: v.is_gpu_executed,
+            device_name: v.device_name,
+            error: v.error,
+            asset_bytes: v.asset_bytes,
+            artifacts: v.artifacts,
+            outputs: v.outputs,
+            cached: false,
         }
     }
 }
@@ -2409,6 +2566,7 @@ impl From<&TaskResult> for HumanTaskResult {
             asset_bytes: r.asset_bytes.clone(),
             artifacts: r.artifacts.clone(),
             outputs: r.outputs.clone(),
+            cached: r.cached,
         }
     }
 }
@@ -2428,6 +2586,7 @@ impl From<HumanTaskResult> for TaskResult {
             asset_bytes: h.asset_bytes,
             artifacts: h.artifacts,
             outputs: h.outputs,
+            cached: h.cached,
         }
     }
 }
@@ -2447,6 +2606,7 @@ impl From<&TaskResult> for BinaryTaskResult {
             asset_bytes: r.asset_bytes.clone(),
             artifacts: r.artifacts.clone(),
             outputs: r.outputs.clone(),
+            cached: r.cached,
         }
     }
 }
@@ -2466,6 +2626,7 @@ impl From<BinaryTaskResult> for TaskResult {
             asset_bytes: b.asset_bytes,
             artifacts: b.artifacts,
             outputs: b.outputs,
+            cached: b.cached,
         }
     }
 }
@@ -2552,6 +2713,7 @@ impl TaskResult {
             asset_bytes: None,
             artifacts: Vec::new(),
             outputs: Vec::new(),
+            cached: false,
         }
     }
 
@@ -2578,6 +2740,7 @@ impl TaskResult {
             asset_bytes: None,
             artifacts: Vec::new(),
             outputs: Vec::new(),
+            cached: false,
         }
     }
 
@@ -2599,14 +2762,23 @@ impl TaskResult {
         self
     }
 
-    /// Deserializes a `TaskResult` from bincode bytes with legacy binary schema fallback.
+    /// Builder method to mark whether this result came from the action cache.
+    pub fn with_cached(mut self, cached: bool) -> Self {
+        self.cached = cached;
+        self
+    }
+
+    /// Deserializes a `TaskResult` from bincode bytes with v10 and legacy binary schema fallback.
     pub fn from_bincode_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         match bincode::deserialize::<BinaryTaskResult>(bytes) {
             Ok(b) => Ok(b.into()),
-            Err(_) => {
-                let legacy: LegacyBinaryTaskResult = bincode::deserialize(bytes)?;
-                Ok(legacy.into())
-            }
+            Err(_) => match bincode::deserialize::<LegacyV10BinaryTaskResult>(bytes) {
+                Ok(v10) => Ok(v10.into()),
+                Err(_) => {
+                    let legacy: LegacyBinaryTaskResult = bincode::deserialize(bytes)?;
+                    Ok(legacy.into())
+                }
+            },
         }
     }
 }
@@ -3844,5 +4016,119 @@ mod tests {
                 let _ = (entry.decode)(&bytes);
             }
         }
+    }
+
+    #[test]
+    fn action_cache_validation_requires_declared_inputs_and_synced_workspace() {
+        let bare = Task::new(
+            TaskSpec::BuiltinTest {
+                test_name: "cache-val".into(),
+                iterations: 1,
+                duration_ms: 1,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_action_cache();
+        assert!(bare.validate().is_err());
+
+        let unsynced_ws = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["hi".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("persist"))
+        .with_action_cache();
+        assert!(unsynced_ws.validate().is_err());
+
+        let mut with_staged = bare.clone();
+        with_staged
+            .staged_files
+            .push(StagedFile::new("in.txt", b"data".to_vec(), false));
+        assert!(with_staged.validate().is_ok());
+
+        let mut with_input = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["hi".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_action_cache();
+        with_input.inputs.push(crate::blob::TaskInput::file(
+            "in.txt",
+            crate::blob::BlobId::of(b"data"),
+            4,
+            false,
+        ));
+        assert!(with_input.validate().is_ok());
+
+        let synced_ws = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec!["hi".into()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("persist").with_tree(crate::blob::BlobId::of(b"tree"), 16),
+        )
+        .with_action_cache();
+        assert!(synced_ws.validate().is_ok());
+    }
+
+    #[test]
+    fn task_result_from_bincode_bytes_decodes_v11_v10_and_legacy_schemas() {
+        let worker = Uuid::new_v4();
+        let tid = TaskId::new();
+        let result = TaskResult::success(worker, tid, "ok", 12, false).with_cached(true);
+
+        let v11_bytes = bincode::serialize(&result).expect("serialize v11");
+        let decoded_v11 = TaskResult::from_bincode_bytes(&v11_bytes).expect("decode v11");
+        assert!(decoded_v11.cached);
+
+        let v10_bytes =
+            bincode::serialize(&LegacyV10BinaryTaskResult::from(&result)).expect("serialize v10");
+        let decoded_v10 = TaskResult::from_bincode_bytes(&v10_bytes).expect("decode v10");
+        assert!(!decoded_v10.cached);
+        assert_eq!(decoded_v10.stdout.as_bytes(), b"ok");
+
+        let legacy = LegacyBinaryTaskResult {
+            worker_id: worker,
+            task_id: tid,
+            exit_code: 0,
+            stdout: Bytes::from_static(b"legacy"),
+            stderr: Bytes::new(),
+            execution_time_ms: 5,
+            is_gpu_executed: false,
+            device_name: None,
+            error: None,
+        };
+        let legacy_bytes = bincode::serialize(&legacy).expect("serialize legacy");
+        let decoded_legacy = TaskResult::from_bincode_bytes(&legacy_bytes).expect("decode legacy");
+        assert!(!decoded_legacy.cached);
+        assert_eq!(decoded_legacy.stdout.as_bytes(), b"legacy");
+    }
+
+    #[test]
+    fn human_task_result_missing_cached_defaults_to_false() {
+        let v10_res = TaskResult::success(Uuid::new_v4(), TaskId::new(), "hi", 1, false);
+        let json = serde_json::to_string(&HumanLegacyV10TaskResult::from(&v10_res))
+            .expect("serialize v10 json");
+        assert!(!json.contains("cached"));
+        let decoded: TaskResult = serde_json::from_str(&json).expect("decode v11 from v10 json");
+        assert!(!decoded.cached);
     }
 }

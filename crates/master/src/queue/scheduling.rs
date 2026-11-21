@@ -426,6 +426,121 @@ impl TaskQueue {
         Ok(task_id)
     }
 
+    /// Records an immediate action-cache hit completion directly in terminal state without
+    /// queueing or dispatching to any worker.
+    pub async fn record_cached_completion(
+        &self,
+        task: Task,
+        priority: u32,
+        submitter: SubmitterId,
+        mut result: rusty_grid_core::task::TaskResult,
+    ) -> GridResult<rusty_grid_core::task::TaskResult> {
+        task.validate().map_err(GridError::Config)?;
+
+        let task_id = task.id;
+        result.task_id = task_id;
+        result.cached = true;
+
+        let ack = {
+            let mut inner = self.inner.write().await;
+
+            if inner.store_closed {
+                return Err(GridError::Storage(
+                    "task store is closed (master shutting down)".into(),
+                ));
+            }
+
+            if let Some(existing) = inner.tasks.get(&task_id) {
+                return Err(GridError::Config(format!(
+                    "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
+                    task_id, existing.state
+                )));
+            }
+
+            let sequence = inner.next_sequence;
+            let now_instant = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+            inner.next_sequence += 1;
+
+            let ack = if inner.store.is_some() {
+                let submitted = JournalRecord::TaskSubmitted {
+                    task: Box::new(task.clone()),
+                    priority,
+                    sequence,
+                    submitted_at_utc: now_epoch,
+                };
+                inner.append_non_durable(&submitted);
+                let terminal = JournalRecord::TaskTerminal {
+                    task_id,
+                    state: TaskState::Completed,
+                    assigned_worker_id: Some(result.worker_id),
+                    retry_count: 0,
+                    failover_count: 0,
+                    evacuation_count: 0,
+                    rejection_count: 0,
+                    retry_attempt: None,
+                    result: Some(result.clone()),
+                    error_message: None,
+                    timestamp_utc: now_epoch,
+                };
+                inner.append_durable(&terminal)?
+            } else {
+                None
+            };
+
+            let task_key = crate::speed::TaskKey::for_task(&task);
+            let entry = TaskEntry {
+                task,
+                task_key,
+                priority,
+                sequence,
+                submitter,
+                state: TaskState::Completed,
+                assigned_worker_id: Some(result.worker_id),
+                submitted_at_utc: now_epoch,
+                submitted_instant: now_instant,
+                queued_instant: now_instant,
+                scheduled_instant: Some(now_instant),
+                started_instant: Some(now_instant),
+                retry_after_instant: None,
+                retry_count: 0,
+                failover_count: 0,
+                evacuation_count: 0,
+                rejection_count: 0,
+                avoid_workers: Vec::new(),
+                assigned_session: None,
+                resumed_from_checkpoint: false,
+                adoptable_by: None,
+                fail_if_not_adopted: false,
+                pending_failover_charge: false,
+                pending_failover_reason: None,
+                retry_history: Vec::new(),
+                result: Some(result.clone()),
+                cold_result: None,
+                error_message: None,
+                requires_tree_v2: false,
+            };
+
+            inner.tasks.insert(task_id, entry);
+            inner.metrics.record_submitted();
+            inner.track_terminal_task(task_id);
+            inner.maybe_trigger_compaction();
+            ack
+        };
+
+        if let Some(durable_ack) = ack {
+            if let Err(err) = durable_ack.await {
+                tracing::warn!(
+                    task_id = %task_id.0,
+                    error = %err,
+                    "Failed to sync TaskTerminal journal record for cached completion"
+                );
+            }
+        }
+        self.flush_cold_maintenance().await;
+        Ok(result)
+    }
+
     // --- Scheduler Matchmaking & Queries ---
 
     /// Records whether `task_id` requires `ProtocolCapabilities::TREE_V2` (used when store replay

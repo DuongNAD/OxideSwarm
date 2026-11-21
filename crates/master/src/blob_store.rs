@@ -143,6 +143,7 @@ struct Inner {
     output_pins: HashMap<TaskId, OutputPinEntry>,
     output_pin_counts: HashMap<BlobId, u32>,
     output_pin_seq: u64,
+    cache_pins: HashMap<[u8; 32], Vec<BlobId>>,
     pin_counts: HashMap<BlobId, u32>,
     uploads: HashMap<(u64, BlobId), UploadSlot>,
 }
@@ -1032,6 +1033,63 @@ impl BlobStore {
             let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
         }
     }
+
+    /// Pins every unique blob in `ids` for action cache key `key`, marking each present blob as
+    /// recently used. Returns `false` without partial pinning if any blob is absent.
+    pub fn pin_cache_entry(&self, key: [u8; 32], ids: &[BlobId]) -> bool {
+        let mut inner = self.lock();
+        let mut unique = Vec::with_capacity(ids.len());
+        let mut seen = HashSet::with_capacity(ids.len());
+        for &id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if inner.touch(&id) {
+                unique.push(id);
+            } else {
+                return false;
+            }
+        }
+        for &id in &unique {
+            *inner.pin_counts.entry(id).or_insert(0) += 1;
+        }
+        if let Some(previous) = inner.cache_pins.insert(key, unique) {
+            release_pins(&mut inner, previous);
+        }
+        true
+    }
+
+    /// Synchronously releases action-cache pins for `key`, returning whether total bytes now exceed
+    /// `max_bytes` and need an eviction pass.
+    pub fn unpin_cache_entry_sync(&self, key: &[u8; 32]) -> bool {
+        let mut inner = self.lock();
+        if let Some(ids) = inner.cache_pins.remove(key) {
+            release_pins(&mut inner, ids);
+            inner.total_bytes.saturating_add(inner.upload_bytes) > self.max_bytes
+        } else {
+            false
+        }
+    }
+
+    /// Releases action-cache pins for `key` and runs background eviction when over capacity.
+    pub async fn unpin_cache_entry(self: &Arc<Self>, key: &[u8; 32]) {
+        if self.unpin_cache_entry_sync(key) {
+            let store = Arc::clone(self);
+            let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
+        }
+    }
+
+    /// Triggers unpinned eviction when called after `unpin_cache_entry_sync` returns `true`.
+    pub fn spawn_evict_if_over_limit(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let store = Arc::clone(self);
+            drop(tokio::task::spawn_blocking(move || {
+                store.evict_to_fit(None)
+            }));
+        } else {
+            self.evict_to_fit(None);
+        }
+    }
 }
 
 /// Temporary pin on a task result's output blobs, held from the atomic check in
@@ -1770,5 +1828,36 @@ mod tests {
             .await
             .unwrap();
         assert!(reopened_v2_needs_v2);
+    }
+
+    #[tokio::test]
+    async fn cache_pins_prevent_eviction_and_unpin_restores_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 1500);
+        let a = store.put(&[b'a'; 700]).await.unwrap();
+        let b = store.put(&[b'b'; 700]).await.unwrap();
+        let key = [7u8; 32];
+
+        assert!(store.pin_cache_entry(key, &[a]));
+        // Missing blob rejects atomically without leaving partial pins.
+        let missing = BlobId::of(b"never-uploaded");
+        assert!(!store.pin_cache_entry([8u8; 32], &[b, missing]));
+
+        // Putting `c` (700 bytes) overflows 1500: unpinned `b` is evicted, pinned `a` stays.
+        let c = store.put(&[b'c'; 700]).await.unwrap();
+        assert!(
+            store.contains(&a),
+            "cache-pinned blob must survive eviction"
+        );
+        assert!(!store.contains(&b), "unpinned blob must be evicted first");
+        assert!(store.contains(&c));
+
+        // Releasing the cache pin lets subsequent pressure evict `a`.
+        store.unpin_cache_entry(&key).await;
+        let _d = store.put(&[b'd'; 1000]).await.unwrap();
+        assert!(
+            !store.contains(&a),
+            "unpinned cache blob must become evictable"
+        );
     }
 }

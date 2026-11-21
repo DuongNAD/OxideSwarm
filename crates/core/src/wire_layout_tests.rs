@@ -347,6 +347,7 @@ fn task_result() -> TaskResult {
             size: 2_048,
             executable: true,
         }],
+        cached: true,
     }
 }
 

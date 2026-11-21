@@ -136,6 +136,7 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
         asset_bytes: None,
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     let cow_stdout = result.stdout_str();

@@ -372,6 +372,13 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "MB",
+        help = "Megabytes of deterministic task results the action cache may retain; 0 disables caching (default 512; env RUSTY_GRID_ACTION_CACHE_MB)"
+    )]
+    pub action_cache_mb: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "DIR",
         help = "Directory for durable task queue persistence (store.lock, snapshot.bin, journal.bin; env RUSTY_GRID_STATE_DIR)"
     )]
@@ -925,6 +932,12 @@ pub struct SubmitArgs {
         help = "Workspace tasks: maximum megabytes one workspace sync may scan (default: 2048)"
     )]
     pub workspace_max_mb: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Opt into the master's content-addressed action cache (`CACHE-1`); requires `--input`, `--stage-file`, or a synced workspace source and cannot combine with `--verify`. Assumes task outputs depend only on spec and declared inputs; tasks reading network resources, wall-clock time, randomness, or undeclared paths may receive stale hits"
+    )]
+    pub cache: bool,
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,

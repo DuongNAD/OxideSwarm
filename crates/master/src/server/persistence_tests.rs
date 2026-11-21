@@ -1223,6 +1223,7 @@ async fn test_storage_failure_on_result_releases_worker_slot_unpins_blobs_and_wa
         Some(session_id),
         TaskResult::success(worker_id, task_id, "done", 3, false),
         handle.blob_store.as_ref(),
+        None,
         #[cfg(feature = "dashboard")]
         None,
     )
@@ -1371,6 +1372,7 @@ async fn test_worker_session_50_results_batch_in_group_commit() {
             worker_id,
             session_id,
             handle.blob_store.as_ref(),
+            None,
             #[cfg(feature = "dashboard")]
             None,
         )
@@ -1607,6 +1609,7 @@ async fn rvb_hundred_results_one_session() {
             w,
             sid,
             h.blob_store.as_ref(),
+            None,
             #[cfg(feature = "dashboard")]
             None,
         )

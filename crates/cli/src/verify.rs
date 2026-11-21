@@ -291,6 +291,7 @@ pub fn pick_targets(
 pub fn replica_task(template: &Task, worker: Uuid) -> Task {
     let mut task = template.clone();
     task.id = TaskId::new();
+    task.strip_action_cache();
     let pin = format!("{REQUIRE_PREFIX}worker=");
     task.tags.retain(|t| !t.starts_with(&pin));
     task.tags.push(format!("{pin}{worker}"));
@@ -700,5 +701,27 @@ mod tests {
         // Workers that report no system are listed by name only.
         let plain = [run("a", &[("o", b"1")]), run("b", &[("o", b"1")])];
         assert!(compare(&plain, None).unwrap().text().ends_with("(a, b)"));
+    }
+
+    #[test]
+    fn replica_task_strips_action_cache_extension() {
+        use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+        let template = Task::new(
+            TaskSpec::BuiltinTest {
+                test_name: "verify-cache".into(),
+                iterations: 1,
+                duration_ms: 1,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 30),
+        )
+        .with_action_cache();
+        assert!(template.is_action_cache_enabled());
+        let replica = replica_task(&template, Uuid::new_v4());
+        assert!(
+            !replica.is_action_cache_enabled(),
+            "verification replicas must strip action cache opt-in"
+        );
     }
 }
