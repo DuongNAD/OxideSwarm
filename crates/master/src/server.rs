@@ -1098,6 +1098,8 @@ impl MasterServer {
             server.broadcast_tx = Some(b_tx.clone());
         }
 
+        let reaper_config = reaper_config.with_scheduler_config(sched_config.clone());
+
         // Build scheduler before starting accept loop so its SpeedBook is attached to `registry`
         // before any worker connection is handled.
         let sched = Arc::new(

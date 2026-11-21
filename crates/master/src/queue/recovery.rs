@@ -649,6 +649,8 @@ impl TaskQueue {
                     submitter: SubmitterId::Default,
                     cold_result: p.cold_result,
                     requires_tree_v2,
+                    speculative: None,
+                    speculative_spawned: false,
                 };
 
                 let is_terminal = entry.state.is_terminal();

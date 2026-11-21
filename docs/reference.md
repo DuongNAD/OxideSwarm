@@ -201,7 +201,10 @@ flowchart LR
   keys, MAC-protected `p2p_ticket` P2P fallback, and upfront rejection of unsupported `https://`
   rendezvous URLs (terminate TLS in a local reverse proxy).
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker
-  (`--max-host-cpu-pct`). Tasks run at below-normal priority.
+  (`--max-host-cpu-pct`). When queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`,
+  the master emits a warning containing `"saturated"` once per change of the connected busy-worker
+  set (excluding `Disconnected` workers and capability/GPU mismatches such as `NoGpuWorkersAvailable`,
+  [design 0095](design/0095-scheduler-backpressure-visibility.md)). Tasks run at below-normal priority.
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
   log still ends with its summary ([design 0022](design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` detects GPU compute hardware (`--gpu`,
@@ -622,7 +625,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--scheduler-policy <POLICY>` | `weighted` (`RUSTY_GRID_SCHEDULER_POLICY`, `[master].scheduler_policy`) | Load-balancing policy across eligible workers: `weighted` (`weighted-least-loaded`), `least-loaded`, or `round-robin` |
 | `--speed-hold-factor <FACTOR>` | `1.5` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`) | Hold-back factor for speed-aware placement (`0` turns D2 off; otherwise finite `> 1.0`; holds a repeated task or excludes clearly slower candidates when their expected run time is at least `factor` times the fastest worker's, [design 0060](design/0060-speed-aware-placement.md)) |
 | `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
-| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch |
+| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch; when queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`, the master logs a warning once per change of the connected busy-worker set ([design 0095](design/0095-scheduler-backpressure-visibility.md)) |
 | `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
 | `--fail-unfulfillable-tasks [BOOL]` | `false` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) | When at least one connected (`Connected` or `Busy`) worker is schedulable, immediately fail tasks whose required capabilities or placement constraints no registered worker can satisfy (`--fail-unfulfillable-tasks` with no value sets `true`). A task whose only matching worker is `Disconnected` stays queued until that worker reconnects or is pruned `1 hour` after its last heartbeat (`ReaperConfig::stale_worker_timeout` in `crates/master/src/reaper.rs`, no CLI flag), so a `--wait` caller blocks until then (or `--timeout-secs`). |
 | `--p2p` | `false` (`RUSTY_GRID_P2P`, `[master].p2p`) | Enable Iroh QUIC/DERP P2P endpoint for NAT traversal |
@@ -658,7 +661,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
-| `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` |
+| `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` (`os:`, `arch:`, `slots:`, `link:`, `id:`, `state:`, `iso:`, `tool:`, `feat:`, `ext:`, `proto:`, `opt:`, and `speed:` are reserved) |
 | `--cores <N>` (alias `--cpu-cores`) | Auto-detected (`RUSTY_GRID_CORES`, `RUSTY_GRID_CPU_CORES`, `[worker].cores`) | Override advertised CPU core count |
 | `--ram-mb <MB>` (aliases `--override-ram-mb`, `--ram`) | Auto-detected (`RUSTY_GRID_RAM_MB`, `RUSTY_GRID_OVERRIDE_RAM_MB`, `[worker].ram_mb`) | Override advertised RAM in megabytes |
 | `--gpu` | `false` (`RUSTY_GRID_GPU`, `RUSTY_GRID_ENABLE_GPU`, `[worker].gpu`) | Insist on a real hardware wgpu adapter (warns if unavailable or built without `gpu-wgpu`) |
@@ -710,7 +713,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--os <OS>` | — | Pin to worker OS: `macos` (`mac`, `darwin`, `osx`), `windows` (`win`), `linux`, `android` |
 | `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
 | `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
-| `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`) |
+| `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`; reserved prefixes such as `opt:` and `speed:` are refused) |
 | `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, e.g. `cargo`, `rustc`, `git`) |
 | `--require-isolation <LEVEL>` | — | Require a worker confined at least at `fs` or `fs+net` (`worker --isolation`); the constraint is `require:iso=<level>`, met when the worker's `iso:` tag is at that level or above (`off < fs < fs+net`; a worker without the tag counts as `off`) |
 | `--source <PATH[:SANDBOX]>` (alias `--source-dir`) | Repeatable | Compile tasks: Rust source file or Cargo crate directory to compile (`cargo build --offline` when `Cargo.toml` is present, else `rustc`) |
@@ -730,6 +733,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--verify <N>` | — | After the task completes, run it again on `N` other connected workers that match its placement (each pinned with `require:worker=<id>`) and compare the declared outputs by BLAKE3. The replicas run only on workers with the operating system and CPU architecture of the worker that ran the first copy, since one deterministic program can give different results on two systems (design 0089 D6). Prints `verified` or `mismatch` (the differing files and workers) and exits `4` on a mismatch; `--json` adds a `verify` object (`status`, `workers`, `differing`). Needs `--output` or `--verify-file`, not `--worker`; fewer than `N` matching workers or a failed replica is an error (exit 1). Client side only (no wire change; design 0089 D3). Only for deterministic tasks: a non-deterministic task will report a mismatch. The D5 run summary (`Tasks:`, `Waited:`, `waited_ms`, `task_time_sum_ms`, `machines`) covers the first submitted task only and does not count `--verify` replicas. The MCP `submit` tool takes `verify` and `verify_file` |
 | `--verify-file <PATH>` | — | With `--verify`: compare only this sandbox file (for example a `checksums.sha256` the task writes) byte for byte instead of every declared output; it is collected even without `--output` |
 | `--verify-any-system` | Off | With `--verify`: let the replicas run on matching workers with another operating system or CPU architecture; the MCP `submit` tool takes `verify_any_system` |
+| `--repeatable` | `false` | Mark the task safe to re-run speculatively (`opt:repeatable` in `Task::tags`, MCP `repeatable`): if a non-workspace attempt runs past `10 s` and past `3x` the fastest matching worker's `SpeedBook` average, the reaper assigns one extra copy on an idle matching worker (capped at `max(1, total_cluster_slots / 10)`), keeps the first clean result, and cancels the sibling ([design 0060](design/0060-speed-aware-placement.md)) |
 | `--matrix-dim <N>` | `64` | GPU tasks: square matrix dimension $N \times N$ (up to `8192` on physical GPU, `2048` on simulated GPU) |
 | `--work-group-size <N>` | `16` | GPU tasks: compute shader workgroup tile edge length |
 | `--prompt <TEXT>` | — | 3D generation tasks: text prompt describing the mesh to synthesize |
@@ -749,7 +753,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | Subcommand | Flags / Aliases | Description |
 | :--- | :--- | :--- |
 | `oxideswarm status` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
-| `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
+| `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags (including master-computed `speed:<factor>` from `SpeedBook` over shared keys, also exposed as `speed` in `workers --json`, `status --json`, and `WorkerUiInfo::speed_factor` on `/api/status` and the dashboard, [design 0060](design/0060-speed-aware-placement.md)), and running task counts |
 | `oxideswarm workspaces` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |

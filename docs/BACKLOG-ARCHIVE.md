@@ -1274,6 +1274,31 @@ owner's decisions Q8, Q9 and Q12 are open.
   `2026-11-15-scale2-windows-amd64-1000w.json`). The status rests on the 500-worker target
   (DOC-9).
 
+### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
+
+- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
+  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
+  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
+- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
+  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
+  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
+  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
+- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
+  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
+  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
+  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
+  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
+     than on every scheduling pass.
+- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
+  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
+- **Implemented (`2026-11-21`):** Added [design 0095](design/0095-scheduler-backpressure-visibility.md)
+  and transition-triggered `warn!` holdback reporting in `WorkloadScheduler::schedule_batch`
+  (`crates/master/src/scheduler.rs`), gated on `ScheduleSkipReason::AllEligibleWorkersSaturated` skips
+  and connected (`status != WorkerStatus::Disconnected`), free-slotted, `host_busy` seats, emitting
+  once per change of the sorted busy-worker ID set and clearing silently (`info!` without
+  `"saturated"`) on recovery, with unit tests in `crates/master/src/scheduler.rs`, integration tests
+  in `tests/e2e_cluster.rs`, and `docs/reference.md` updated.
+
 ## Phase 8: product and ecosystem
 
 Draft, added on 2026-11-09 with Phase G of [ROADMAP.md](ROADMAP.md). The items start after the

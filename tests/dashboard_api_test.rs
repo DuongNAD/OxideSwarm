@@ -1450,3 +1450,187 @@ async fn test_ambiguous_hex_prefix_returns_400_and_blocks_name_shadowing() {
 
     let _ = master.shutdown();
 }
+
+#[tokio::test]
+async fn test_dashboard_exposes_worker_speed_in_status_and_workers_api() {
+    use rusty_grid_core::task::TaskResult;
+
+    let (master, addr) = spawn_master(AuthConfig::dev()).await;
+    let client = client();
+    let base = format!("http://{addr}");
+
+    async fn connect_wire(
+        master_addr: SocketAddr,
+        name: &str,
+        tag: &str,
+    ) -> (
+        Uuid,
+        tokio::sync::mpsc::Sender<WorkerMessage>,
+        tokio::sync::mpsc::Receiver<MasterMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let wid = Uuid::new_v4();
+        let (tx_up, mut rx_up) = tokio::sync::mpsc::channel::<WorkerMessage>(16);
+        let (tx_down, rx_down) = tokio::sync::mpsc::channel::<MasterMessage>(16);
+        let stream = TcpStream::connect(master_addr).await.unwrap();
+        let mut transport = MessageTransport::new(stream);
+        transport
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid,
+                capabilities: WorkerCapabilities::new(name, 4, 8192, false, false, None)
+                    .with_tags(vec![tag.into()]),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let ack: Option<MasterMessage> = transport.recv_msg().await.unwrap();
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let h = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = transport.recv_msg::<MasterMessage>() => {
+                        match msg {
+                            Ok(Some(m)) => {
+                                if tx_down.send(m).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    up = rx_up.recv() => {
+                        match up {
+                            Some(m) => {
+                                if transport.send_msg(&m).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+        (wid, tx_up, rx_down, h)
+    }
+
+    let (w_fast, tx_fast, mut rx_fast, h_fast) =
+        connect_wire(master.server_addr(), "dash-fast", "tier-fast").await;
+    let (w_slow, tx_slow, mut rx_slow, h_slow) =
+        connect_wire(master.server_addr(), "dash-slow", "tier-slow").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if master.list_workers().await.unwrap_or_default().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let shared_spec = TaskSpec::command("echo", vec!["bench".into()]);
+    for (wid, tx, rx, tag, ms) in [
+        (
+            w_fast,
+            &tx_fast,
+            &mut rx_fast,
+            "require:tag=tier-fast",
+            100u64,
+        ),
+        (
+            w_slow,
+            &tx_slow,
+            &mut rx_slow,
+            "require:tag=tier-slow",
+            250u64,
+        ),
+    ] {
+        let tid = master
+            .submit_task(
+                Task::new(shared_spec.clone(), TaskRequirements::generic(1, 32))
+                    .with_tags(vec![tag.into()]),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(MasterMessage::AssignTask { task }) = rx.recv().await {
+                    if task.id == tid {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerMessage::from(TaskResult::success(
+            wid, tid, "ok", ms, false,
+        )))
+        .await
+        .unwrap();
+        assert!(master
+            .wait_task(tid, Some(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .is_success());
+    }
+
+    let status: Value = client
+        .get(format!("{base}/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let s_workers = status["workers"].as_array().unwrap();
+    let sf_fast = s_workers.iter().find(|w| w["name"] == "dash-fast").unwrap()["speed_factor"]
+        .as_f64()
+        .unwrap();
+    let sf_slow = s_workers.iter().find(|w| w["name"] == "dash-slow").unwrap()["speed_factor"]
+        .as_f64()
+        .unwrap();
+    assert!((sf_fast - 1.0).abs() < 1e-6, "got {sf_fast}");
+    assert!((sf_slow - 2.5).abs() < 1e-6, "got {sf_slow}");
+
+    let api_workers: Value = client
+        .get(format!("{base}/api/workers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aw = api_workers.as_array().unwrap();
+    let fast_tags = aw
+        .iter()
+        .find(|w| w["capabilities"]["name"] == "dash-fast")
+        .unwrap()["capabilities"]["tags"]
+        .as_array()
+        .unwrap();
+    let slow_tags = aw
+        .iter()
+        .find(|w| w["capabilities"]["name"] == "dash-slow")
+        .unwrap()["capabilities"]["tags"]
+        .as_array()
+        .unwrap();
+    assert!(fast_tags.iter().any(|t| t == "speed:1.0"), "{fast_tags:?}");
+    assert!(slow_tags.iter().any(|t| t == "speed:2.5"), "{slow_tags:?}");
+
+    let html = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("badge-speed") && html.contains("mSpeed"));
+
+    h_fast.abort();
+    h_slow.abort();
+    let _ = master.shutdown();
+}

@@ -1093,6 +1093,10 @@ async fn run_submit_with_secret_inner(
         .with_placement(&placement)
         .with_inputs(inputs.inputs)
         .with_output_globs(output_globs.clone());
+    if args.repeatable {
+        task.tags
+            .push(rusty_grid_core::placement::OPT_REPEATABLE_TAG.to_string());
+    }
     if let Some(ws) = workspace_ref {
         task = task.with_workspace(ws);
     }

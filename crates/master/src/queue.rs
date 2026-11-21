@@ -320,6 +320,26 @@ pub struct RetryAttempt {
     pub error: Option<String>,
 }
 
+/// Active in-memory speculative copy of a running `opt:repeatable` task (`0060` D3).
+///
+/// Not persisted across master restarts (`STORE_FORMAT_VERSION` remains `4`).
+#[derive(Debug, Clone)]
+pub struct SpeculativeAttempt {
+    pub worker_id: Uuid,
+    pub session_id: u64,
+    pub scheduled_instant: Instant,
+    pub started_instant: Option<Instant>,
+    pub state: TaskState,
+}
+
+/// Snapshot of a running `opt:repeatable` task eligible for straggler inspection by the reaper.
+#[derive(Debug, Clone)]
+pub struct StragglerCandidate {
+    pub view: TaskView,
+    pub primary_worker_id: Uuid,
+    pub elapsed: Duration,
+}
+
 /// Internal in-memory task entry holding complete metadata.
 #[derive(Debug, Clone)]
 pub struct TaskEntry {
@@ -382,6 +402,10 @@ pub struct TaskEntry {
     /// (`ProtocolCapabilities::TREE_V2`), recorded when `BlobStore::resolve_inputs_with_features`
     /// decodes the manifest at task admission or store recovery.
     pub requires_tree_v2: bool,
+    /// Active speculative attempt when the reaper launched a straggler copy (`0060` D3).
+    pub speculative: Option<SpeculativeAttempt>,
+    /// True once a speculative copy has been launched for this task (at most one per task).
+    pub speculative_spawned: bool,
 }
 
 impl TaskEntry {
@@ -624,6 +648,9 @@ pub enum ResultDisposition {
     /// From a worker or session the task is not currently assigned to (failed over, reaped,
     /// superseded, or simply never its task). Dropped without touching the FSM.
     Stale,
+    /// One attempt of a speculatively duplicated `opt:repeatable` task failed or could not be
+    /// delivered while the sibling attempt continues running (`0060` D3).
+    SiblingFailed,
 }
 
 /// Outcome of `TaskQueue::record_result_from`.
@@ -645,6 +672,9 @@ pub struct ResultOutcome {
     pub timeout_secs: u64,
     /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
+    /// When a speculative sibling existed and this result completed the task cleanly, the losing
+    /// `(worker_id, session_id)` that must receive `MasterMessage::CancelTask` (`0060` D3).
+    pub cancel_sibling: Option<(Uuid, Option<u64>)>,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.
@@ -654,6 +684,8 @@ pub struct CancelOutcome {
     pub newly_cancelled: bool,
     /// Worker currently executing the task, which must be told to stop.
     pub worker_to_notify: Option<Uuid>,
+    /// Speculative sibling `(worker_id, session_id)` also executing the task, which must stop too.
+    pub extra_worker_to_notify: Option<(Uuid, u64)>,
     /// The cancelled result recorded for the task, to hand to everybody waiting on it.
     pub result: Option<TaskResult>,
 }
@@ -699,6 +731,17 @@ fn owned_by(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<u64>) -> boo
             (Some(claimed), Some(assigned)) => claimed == assigned,
             _ => true,
         }
+}
+
+/// True when `entry`'s active speculative attempt belongs to `(worker_id, session_id)`.
+fn owned_by_speculative(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<u64>) -> bool {
+    entry.speculative.as_ref().is_some_and(|spec| {
+        spec.worker_id == *worker_id
+            && match session_id {
+                Some(claimed) => claimed == spec.session_id,
+                None => true,
+            }
+    })
 }
 
 /// Outcome of [`TaskQueue::adopt_session_tasks`].

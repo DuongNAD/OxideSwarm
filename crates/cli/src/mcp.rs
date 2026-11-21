@@ -701,6 +701,10 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "With 'verify': let the replicas run on matching workers with another operating system or CPU architecture than the first run (default false: the same deterministic program can give different results on two systems)"
                     },
+                    "repeatable": {
+                        "type": "boolean",
+                        "description": "Mark this task as safe to re-run speculatively on another worker if a running attempt becomes a straggler (attaches opt:repeatable)"
+                    },
                     "output_dir": {
                         "type": "string",
                         "description": "Local directory inside the working directory to download declared output files into when wait is true (symbolic links and paths outside the working directory are refused)"
@@ -1070,6 +1074,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             check_opt_u64(obj, "wait_secs")?;
             check_opt_u64(obj, "max_retries")?;
             check_opt_bool(obj, "wait")?;
+            check_opt_bool(obj, "repeatable")?;
             check_opt_u64(obj, "matrix_dim")?;
             check_opt_u64(obj, "work_group_size")?;
             let files_opt = check_opt_str_array(obj, "files")?;
@@ -2594,6 +2599,74 @@ mod tests {
         assert_eq!(task.requirements.vram_mb, Some(4096));
         assert!(task.requirements.gpu_required);
         assert!(task.requirements.requires_gpu_or_vram());
+
+        let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_submit_repeatable_argument_validates_and_attaches_opt_repeatable_tag() {
+        assert_eq!(
+            validate_tool_arguments("submit", &json!({"command": "echo", "repeatable": true})),
+            Ok(())
+        );
+        assert!(validate_tool_arguments(
+            "submit",
+            &json!({"command": "echo", "repeatable": "yes"})
+        )
+        .is_err());
+
+        let submit_schema = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap()
+            .input_schema;
+        assert_eq!(submit_schema["properties"]["repeatable"]["type"], "boolean");
+
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+
+        let state = McpState::new(master.server_addr().to_string(), None);
+        let submit_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "command",
+                "command": "echo",
+                "args": ["rep"],
+                "repeatable": true,
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!submit_res.is_error, "{submit_res:?}");
+
+        let body: Value = serde_json::from_str(match &submit_res.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        let tid = rusty_grid_core::TaskId::from_uuid(
+            Uuid::parse_str(body["task_id"].as_str().unwrap()).unwrap(),
+        );
+        let task = master
+            .queue()
+            .get_task_spec(&tid)
+            .await
+            .expect("submitted task spec");
+        assert!(task.is_repeatable());
+        assert!(task
+            .tags
+            .iter()
+            .any(|t| t == rusty_grid_core::placement::OPT_REPEATABLE_TAG));
 
         let _ = master.shutdown();
     }

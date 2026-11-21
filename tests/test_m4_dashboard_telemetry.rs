@@ -55,6 +55,7 @@ fn test_m4_worker_ui_info_schema_and_serialization() {
         interconnect_type: "Direct P2P (QUIC)".to_string(),
         is_relayed: false,
         rtt_ms: Some(14.8),
+        speed_factor: Some(1.0),
     };
 
     let json_direct = serde_json::to_string(&direct_worker).expect("serialize direct worker");
@@ -88,6 +89,7 @@ fn test_m4_worker_ui_info_schema_and_serialization() {
         interconnect_type: "Relay (DERP)".to_string(),
         is_relayed: true,
         rtt_ms: Some(182.5),
+        speed_factor: None,
     };
 
     let json_relay = serde_json::to_string(&relay_worker).expect("serialize relay worker");

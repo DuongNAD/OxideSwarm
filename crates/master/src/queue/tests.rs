@@ -1903,3 +1903,149 @@ async fn test_three_d_tasks_require_three_d_protocol_capability_for_placement() 
         worker_with_3d.worker_id
     );
 }
+
+#[tokio::test]
+async fn sched4c_speculative_lifecycle_cancel_sibling_and_failure_tolerance() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    // 1. Speculative winner completes first, cancels primary sibling, and ignores stale primary result.
+    let t1 = Task::new(
+        TaskSpec::command("echo", vec!["rep-1".into()]),
+        TaskRequirements::generic(2, 128),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    assert!(queue
+        .try_start_speculative(id1, Uuid::new_v4(), 30)
+        .await
+        .is_none());
+
+    // Loads and active running tasks charge both primary and speculative workers.
+    let loads = queue.assigned_loads().await;
+    assert_eq!(loads[&w_primary].slots, 2);
+    assert_eq!(loads[&w_spec].slots, 2);
+    assert_eq!(
+        loads[&w_spec].unstarted_ram_mb,
+        TaskRequirements::generic(2, 128).ram_mb
+    );
+    let active = queue.active_running_tasks().await;
+    assert_eq!(active[&w_primary].len(), 1);
+    assert_eq!(active[&w_spec].len(), 1);
+
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+    assert_eq!(queue.assigned_loads().await[&w_spec].unstarted_ram_mb, 0);
+
+    let win = queue
+        .record_result_from(
+            w_spec,
+            Some(20),
+            TaskResult::success(w_spec, id1, "fast\n", 50, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(win.disposition, ResultDisposition::Terminal);
+    assert_eq!(win.state, TaskState::Completed);
+    assert_eq!(win.cancel_sibling, Some((w_primary, Some(10))));
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+    assert!(queue.assigned_loads().await.is_empty());
+
+    let late_primary = queue
+        .record_result_from(
+            w_primary,
+            Some(10),
+            TaskResult::success(w_primary, id1, "slow\n", 900, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late_primary.disposition, ResultDisposition::Stale);
+
+    // 2. Primary fails while speculative is running -> speculative is promoted and completes task.
+    let t2 = Task::new(
+        TaskSpec::command("echo", vec!["rep-2".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id2 = queue.submit(t2).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id2, w_primary, 11)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(11), &id2)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id2, w_spec, 21).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(21), &id2)
+        .await
+        .unwrap();
+
+    let primary_fail = queue
+        .record_result_from(
+            w_primary,
+            Some(11),
+            TaskResult::failure(w_primary, id2, 2, "", "boom", 100, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(primary_fail.disposition, ResultDisposition::SiblingFailed);
+    assert_eq!(primary_fail.state, TaskState::Running);
+    assert_eq!(
+        queue.get_task(&id2).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+
+    let spec_win = queue
+        .record_result_from(
+            w_spec,
+            Some(21),
+            TaskResult::success(w_spec, id2, "ok\n", 80, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spec_win.disposition, ResultDisposition::Terminal);
+    assert_eq!(spec_win.state, TaskState::Completed);
+
+    // 3. Cancel notifies both primary and speculative workers.
+    let t3 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id3 = queue.submit(t3).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id3, w_primary, 12)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(12), &id3)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id3, w_spec, 22).await.is_some());
+
+    let cancel = queue
+        .cancel_task_detailed(&id3, Some("user abort".into()))
+        .await
+        .unwrap();
+    assert!(cancel.newly_cancelled);
+    assert_eq!(cancel.worker_to_notify, Some(w_primary));
+    assert_eq!(cancel.extra_worker_to_notify, Some((w_spec, 22)));
+    assert!(queue.assigned_loads().await.is_empty());
+}

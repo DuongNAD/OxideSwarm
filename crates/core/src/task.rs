@@ -2184,6 +2184,11 @@ impl Task {
         !self.inputs.is_empty() || !self.output_globs.is_empty()
     }
 
+    /// True when the task carries `opt:repeatable` for speculative straggler re-run (`0060` D3).
+    pub fn is_repeatable(&self) -> bool {
+        crate::placement::is_repeatable_tags(&self.tags)
+    }
+
     /// Mutates the task to record an updated checkpoint snapshot.
     pub fn update_checkpoint(&mut self, checkpoint: CheckpointData) {
         self.latest_checkpoint = Some(checkpoint);
@@ -2201,6 +2206,7 @@ impl Task {
         }
 
         self.placement()?;
+        crate::placement::validate_task_user_tags(&self.tags)?;
         self.validate_extensions("master")?;
 
         let mut total_staged: u64 = 0;

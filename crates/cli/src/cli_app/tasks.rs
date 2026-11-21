@@ -149,10 +149,19 @@ async fn run_status_inner(
                         .iter()
                         .map(|w| {
                             let link = parse_worker_link(w);
+                            let speed = parse_worker_speed(w);
                             let mut val = serde_json::to_value(w).unwrap_or_default();
-                            if let Some(l) = link {
-                                if let Some(obj) = val.as_object_mut() {
+                            if let Some(obj) = val.as_object_mut() {
+                                if let Some(l) = link {
                                     obj.insert("link".to_string(), serde_json::Value::String(l));
+                                }
+                                if let Some(s) = speed {
+                                    if let Some(num) = serde_json::Number::from_f64(s) {
+                                        obj.insert(
+                                            "speed".to_string(),
+                                            serde_json::Value::Number(num),
+                                        );
+                                    }
                                 }
                             }
                             val
@@ -174,9 +183,18 @@ async fn run_status_inner(
                             Some(state) if state != "connected" => format!(" [{state}]"),
                             _ => String::new(),
                         };
+                        let speed_suffix = parse_worker_speed_str(w)
+                            .map(|s| format!(", Speed: {s}x"))
+                            .unwrap_or_default();
                         println!(
-                            "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {}){}",
-                            w.name, w.cpu_cores, w.ram_mb, w.has_gpu, w.is_simulated_gpu, state,
+                            "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {}{}){}",
+                            w.name,
+                            w.cpu_cores,
+                            w.ram_mb,
+                            w.has_gpu,
+                            w.is_simulated_gpu,
+                            speed_suffix,
+                            state,
                         );
                         if let Some(link) = parse_worker_link(w) {
                             println!("  └─ {}", link);
@@ -221,10 +239,19 @@ async fn run_status_inner(
                         .iter()
                         .map(|w| {
                             let link = parse_worker_link(w);
+                            let speed = parse_worker_speed(w);
                             let mut val = serde_json::to_value(w).unwrap_or_default();
-                            if let Some(l) = link {
-                                if let Some(obj) = val.as_object_mut() {
+                            if let Some(obj) = val.as_object_mut() {
+                                if let Some(l) = link {
                                     obj.insert("link".to_string(), serde_json::Value::String(l));
+                                }
+                                if let Some(s) = speed {
+                                    if let Some(num) = serde_json::Number::from_f64(s) {
+                                        obj.insert(
+                                            "speed".to_string(),
+                                            serde_json::Value::Number(num),
+                                        );
+                                    }
                                 }
                             }
                             val
@@ -273,9 +300,12 @@ async fn run_status_inner(
                     if !workers.is_empty() {
                         println!("\nWorkers:");
                         for w in &workers {
+                            let speed_suffix = parse_worker_speed_str(w)
+                                .map(|s| format!(", Speed: {s}x"))
+                                .unwrap_or_default();
                             println!(
-                                "  • [{}] (Cores: {}, RAM: {}MB, GPU: {})",
-                                w.name, w.cpu_cores, w.ram_mb, w.has_gpu
+                                "  • [{}] (Cores: {}, RAM: {}MB, GPU: {}{})",
+                                w.name, w.cpu_cores, w.ram_mb, w.has_gpu, speed_suffix
                             );
                             if let Some(link) = parse_worker_link(w) {
                                 println!("    └─ {}", link);
@@ -688,6 +718,15 @@ pub(super) fn worker_state(w: &rusty_grid_core::WorkerCapabilities) -> Option<&s
 /// which is how such a listing was meant before the master added the tag.
 pub(super) fn worker_is_connected(w: &rusty_grid_core::WorkerCapabilities) -> bool {
     worker_state(w).is_none_or(|state| state == "connected")
+}
+
+pub(super) fn parse_worker_speed_str(w: &rusty_grid_core::WorkerCapabilities) -> Option<&str> {
+    rusty_grid_core::placement::tag_value(&w.tags, rusty_grid_core::placement::SPEED_TAG_PREFIX)
+        .filter(|v| v.parse::<f64>().is_ok_and(|f| f.is_finite() && f > 0.0))
+}
+
+pub(super) fn parse_worker_speed(w: &rusty_grid_core::WorkerCapabilities) -> Option<f64> {
+    parse_worker_speed_str(w).and_then(|v| v.parse::<f64>().ok())
 }
 
 pub(super) fn parse_worker_link(w: &rusty_grid_core::WorkerCapabilities) -> Option<String> {

@@ -158,6 +158,8 @@ async fn test_attach_store_and_replay_recovers_all_d2_5_states_and_preserves_cou
                     cold_result: None,
                     error_message: None,
                     requires_tree_v2: false,
+                    speculative: None,
+                    speculative_spawned: false,
                 },
             );
         }

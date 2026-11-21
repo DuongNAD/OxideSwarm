@@ -521,6 +521,8 @@ pub struct WorkerUiInfo {
     pub interconnect_type: String,
     pub is_relayed: bool,
     pub rtt_ms: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -714,6 +716,13 @@ async fn api_status(
             }
         };
 
+        let speed_factor = rusty_grid_core::placement::tag_value(
+            &w.capabilities.tags,
+            rusty_grid_core::placement::SPEED_TAG_PREFIX,
+        )
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+
         workers.push(WorkerUiInfo {
             id: w.worker_id.to_string(),
             name: w.capabilities.name,
@@ -734,6 +743,7 @@ async fn api_status(
             interconnect_type,
             is_relayed,
             rtt_ms,
+            speed_factor,
         });
     }
 
@@ -1623,6 +1633,7 @@ mod tests {
             interconnect_type: "Direct P2P (QUIC)".to_string(),
             is_relayed: false,
             rtt_ms: Some(18.5),
+            speed_factor: Some(1.25),
         };
 
         let json = serde_json::to_string(&info).expect("WorkerUiInfo should serialize to json");
@@ -1637,6 +1648,7 @@ mod tests {
         assert!(json.contains("\"interconnect_type\":\"Direct P2P (QUIC)\""));
         assert!(json.contains("\"is_relayed\":false"));
         assert!(json.contains("\"rtt_ms\":18.5"));
+        assert!(json.contains("\"speed_factor\":1.25"));
     }
 
     #[test]
@@ -1740,6 +1752,12 @@ mod tests {
         assert!(
             html.contains(".node-title-group {"),
             "node-title-group CSS rule must be defined"
+        );
+        assert!(
+            html.contains(".badge-speed {")
+                && html.contains("id=\"mSpeed\"")
+                && html.contains("speed_factor"),
+            "Worker speed badge and modal detail row must be present (SCHED-4d)"
         );
         assert!(
             html.matches(".innerHTML").count() == 1,

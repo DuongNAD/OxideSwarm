@@ -1278,9 +1278,44 @@ impl WorkerRegistry {
     }
 
     /// Returns snapshots of all registered workers regardless of operational status.
+    ///
+    /// When a [`crate::speed::SpeedBook`] is attached, connected workers with shared-key samples
+    /// receive a computed `speed:<factor>` tag (`0060` D4).
     pub async fn list_all_workers(&self) -> Vec<WorkerInfo> {
-        let inner = self.inner.read().await;
-        inner.workers.values().map(|e| e.to_info()).collect()
+        let (mut workers, active_ids) = {
+            let inner = self.inner.read().await;
+            let mut workers = Vec::with_capacity(inner.workers.len());
+            let mut active_ids = HashSet::with_capacity(inner.workers.len());
+            for e in inner.workers.values() {
+                if e.status != WorkerStatus::Disconnected {
+                    active_ids.insert(e.worker_id);
+                }
+                workers.push(e.to_info());
+            }
+            (workers, active_ids)
+        };
+        if active_ids.len() >= 2 {
+            if let Some(sb) = self.speed_book() {
+                let book = sb.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if !book.is_empty() {
+                    let factors = book.relative_speed_factors(&active_ids);
+                    for w in &mut workers {
+                        if let Some(&factor) = factors.get(&w.worker_id) {
+                            if !w.capabilities.tags.iter().any(|t| {
+                                t.starts_with(rusty_grid_core::placement::SPEED_TAG_PREFIX)
+                            }) {
+                                w.capabilities.tags.push(format!(
+                                    "{}{}",
+                                    rusty_grid_core::placement::SPEED_TAG_PREFIX,
+                                    crate::speed::format_speed_factor(factor)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        workers
     }
 
     /// Alias for `list_all_workers`.
@@ -1388,6 +1423,34 @@ impl WorkerRegistry {
                 .get(worker_id)
                 .ok_or(GridError::WorkerNotFound(*worker_id))?;
             if entry.status == WorkerStatus::Disconnected {
+                return Err(GridError::ConnectionClosed);
+            }
+            entry.sender.clone()
+        };
+
+        sender
+            .send(msg)
+            .await
+            .map_err(|_| GridError::ConnectionClosed)?;
+        Ok(())
+    }
+
+    /// Sends a MasterMessage to `(worker_id, expected_session)` if connected on that session.
+    pub async fn send_to_worker_session(
+        &self,
+        worker_id: &Uuid,
+        expected_session: Option<u64>,
+        msg: MasterMessage,
+    ) -> GridResult<()> {
+        let sender = {
+            let inner = self.inner.read().await;
+            let entry = inner
+                .workers
+                .get(worker_id)
+                .ok_or(GridError::WorkerNotFound(*worker_id))?;
+            if entry.status == WorkerStatus::Disconnected
+                || expected_session.is_some_and(|s| entry.session_id != s)
+            {
                 return Err(GridError::ConnectionClosed);
             }
             entry.sender.clone()

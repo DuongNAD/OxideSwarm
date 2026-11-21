@@ -12,9 +12,9 @@ use uuid::Uuid;
 use crate::store::{DurableAck, JournalRecord};
 
 use super::{
-    is_worker_rejection, owned_by, retained_bytes, CancelOutcome, DelayedRetryKey, QueueOrderKey,
-    ResultDisposition, ResultOutcome, RetryAttempt, TaskEntry, TaskQueue, TaskQueueInner,
-    TaskState, MAX_WORKER_REJECTIONS_PER_TASK,
+    is_worker_rejection, owned_by, owned_by_speculative, retained_bytes, CancelOutcome,
+    DelayedRetryKey, QueueOrderKey, ResultDisposition, ResultOutcome, RetryAttempt, TaskEntry,
+    TaskQueue, TaskQueueInner, TaskState, MAX_WORKER_REJECTIONS_PER_TASK,
 };
 
 /// What one worker's failover sweep did, for the caller that holds the queue lock to journal.
@@ -284,6 +284,7 @@ impl TaskQueue {
         let (
             state,
             owner,
+            spec_owner,
             adoptable_by_sender,
             priority,
             sequence,
@@ -296,7 +297,9 @@ impl TaskQueue {
                 .get(&task_id)
                 .ok_or(GridError::TaskNotFound(task_id.0))?;
             let owner = owned_by(entry, &worker_id, session_id);
+            let spec_owner = !owner && owned_by_speculative(entry, &worker_id, session_id);
             let adoptable = !owner
+                && !spec_owner
                 && entry.state == TaskState::Queued
                 && entry
                     .adoptable_by
@@ -304,16 +307,21 @@ impl TaskQueue {
             (
                 entry.state,
                 owner,
+                spec_owner,
                 adoptable,
                 entry.priority,
                 entry.sequence,
                 entry.task_key,
                 entry.task.requirements.timeout_secs,
-                entry.resumed_from_checkpoint,
+                if spec_owner {
+                    false
+                } else {
+                    entry.resumed_from_checkpoint
+                },
             )
         };
 
-        if !owner && !adoptable_by_sender {
+        if !owner && !spec_owner && !adoptable_by_sender {
             tracing::debug!(
                 task_id = %task_id,
                 worker_id = %worker_id,
@@ -330,6 +338,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    cancel_sibling: None,
                 },
                 None,
             ));
@@ -377,6 +386,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    cancel_sibling: None,
                 },
                 None,
             ));
@@ -384,8 +394,76 @@ impl TaskQueue {
 
         let rejected = is_worker_rejection(&result);
 
+        // If a speculative sibling is running alongside this failed attempt, keep the task alive
+        // on the remaining attempt without charging retries or waking waiters (`0060` D3).
+        if !result.is_success() {
+            let sibling_outcome = {
+                let entry = inner
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                if spec_owner {
+                    entry.speculative = None;
+                    if rejected && !entry.avoid_workers.contains(&worker_id) {
+                        entry.avoid_workers.push(worker_id);
+                    }
+                    Some((entry.state, None))
+                } else if let Some(spec) = entry.speculative.take() {
+                    if rejected && !entry.avoid_workers.contains(&worker_id) {
+                        entry.avoid_workers.push(worker_id);
+                    }
+                    entry.assigned_worker_id = Some(spec.worker_id);
+                    entry.assigned_session = Some(spec.session_id);
+                    entry.state = spec.state;
+                    entry.scheduled_instant = Some(spec.scheduled_instant);
+                    entry.started_instant = spec.started_instant;
+                    entry.resumed_from_checkpoint = false;
+                    Some((spec.state, Some((spec.worker_id, spec.state))))
+                } else {
+                    None
+                }
+            };
+            if let Some((next_state, promoted)) = sibling_outcome {
+                let mut ack = None;
+                if let Some((spec_wid, spec_state)) = promoted {
+                    inner.update_active_task(task_id);
+                    inner.sync_workspace_active(task_id);
+                    let dispatch_rec = JournalRecord::TaskDispatched {
+                        task_id,
+                        worker_id: spec_wid,
+                        timestamp_utc: now_epoch,
+                    };
+                    if spec_state == TaskState::Running {
+                        inner.append_non_durable(&dispatch_rec);
+                        ack = inner.append_durable_warn(&JournalRecord::TaskRunning {
+                            task_id,
+                            worker_id: spec_wid,
+                            timestamp_utc: now_epoch,
+                        });
+                    } else {
+                        ack = inner.append_durable_warn(&dispatch_rec);
+                    }
+                    inner.maybe_trigger_compaction();
+                }
+                return Ok((
+                    ResultOutcome {
+                        disposition: ResultDisposition::SiblingFailed,
+                        state: next_state,
+                        rejected,
+                        adopted_from_hold: false,
+                        task_key,
+                        timeout_secs,
+                        resumed_from_checkpoint,
+                        cancel_sibling: None,
+                    },
+                    ack,
+                ));
+            }
+        }
+
         let mut delay_key_to_insert = None;
         let mut ready_key_to_insert = None;
+        let mut cancel_sibling: Option<(Uuid, Option<u64>)> = None;
 
         let (res_state, disposition, journal_record) = {
             let entry = inner
@@ -400,6 +478,18 @@ impl TaskQueue {
                         current: format!("{:?}", entry.state),
                         attempted: "Completed".into(),
                     });
+                }
+                if let Some(spec) = entry.speculative.take() {
+                    if spec_owner {
+                        cancel_sibling = entry
+                            .assigned_worker_id
+                            .map(|wid| (wid, entry.assigned_session));
+                        entry.assigned_worker_id = Some(worker_id);
+                        entry.assigned_session = session_id;
+                        entry.resumed_from_checkpoint = false;
+                    } else {
+                        cancel_sibling = Some((spec.worker_id, Some(spec.session_id)));
+                    }
                 }
                 entry.state = TaskState::Completed;
                 entry.result = Some(result.clone());
@@ -543,6 +633,13 @@ impl TaskQueue {
             }
         };
 
+        if let Some((loser_wid, _)) = cancel_sibling {
+            if let Some(tasks) = inner.worker_assignments.get_mut(&loser_wid) {
+                tasks.remove(&task_id);
+            }
+            inner.refresh_worker_resume_protection(loser_wid);
+        }
+
         if let Some(key) = delay_key_to_insert {
             inner.delayed_retries.insert(key);
         }
@@ -602,6 +699,7 @@ impl TaskQueue {
                 task_key,
                 timeout_secs,
                 resumed_from_checkpoint,
+                cancel_sibling,
             },
             ack,
         ))
@@ -620,15 +718,17 @@ impl TaskQueue {
         let ack = {
             let mut inner = self.inner.write().await;
 
-            let (state, owner) = {
+            let (state, owner, spec_owner) = {
                 let entry = inner
                     .tasks
                     .get(&task_id)
                     .ok_or(GridError::TaskNotFound(task_id.0))?;
-                (entry.state, owned_by(entry, &worker_id, session_id))
+                let owner = owned_by(entry, &worker_id, session_id);
+                let spec_owner = !owner && owned_by_speculative(entry, &worker_id, session_id);
+                (entry.state, owner, spec_owner)
             };
 
-            if !owner {
+            if !owner && !spec_owner {
                 return Ok(ResultDisposition::Stale);
             }
 
@@ -642,6 +742,48 @@ impl TaskQueue {
             }
 
             let now_epoch = Utc::now().timestamp() as u64;
+            if spec_owner {
+                if let Some(entry) = inner.tasks.get_mut(&task_id) {
+                    entry.speculative = None;
+                }
+                return Ok(ResultDisposition::SiblingFailed);
+            }
+            let promoted = {
+                let entry = inner
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                if let Some(spec) = entry.speculative.take() {
+                    entry.assigned_worker_id = Some(spec.worker_id);
+                    entry.assigned_session = Some(spec.session_id);
+                    entry.state = spec.state;
+                    entry.scheduled_instant = Some(spec.scheduled_instant);
+                    entry.started_instant = spec.started_instant;
+                    entry.resumed_from_checkpoint = false;
+                    Some((spec.worker_id, spec.state))
+                } else {
+                    None
+                }
+            };
+            if let Some((spec_wid, spec_state)) = promoted {
+                inner.update_active_task(task_id);
+                inner.sync_workspace_active(task_id);
+                inner.append_non_durable(&JournalRecord::TaskDispatched {
+                    task_id,
+                    worker_id: spec_wid,
+                    timestamp_utc: now_epoch,
+                });
+                if spec_state == TaskState::Running {
+                    inner.append_non_durable(&JournalRecord::TaskRunning {
+                        task_id,
+                        worker_id: spec_wid,
+                        timestamp_utc: now_epoch,
+                    });
+                }
+                inner.maybe_trigger_compaction();
+                return Ok(ResultDisposition::SiblingFailed);
+            }
+
             let record = {
                 let entry = inner
                     .tasks
@@ -819,6 +961,20 @@ impl TaskQueue {
                 let Some(entry) = inner.tasks.get_mut(&task_id) else {
                     continue;
                 };
+                let spec_matches = entry.speculative.as_ref().is_some_and(|spec| {
+                    spec.worker_id == *worker_id
+                        && match session_id {
+                            Some(swept) => spec.session_id <= swept,
+                            None => true,
+                        }
+                });
+                if spec_matches {
+                    entry.speculative = None;
+                    if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                        tasks.remove(&task_id);
+                    }
+                    continue;
+                }
                 let session_matches = match (session_id, entry.assigned_session) {
                     (Some(swept), Some(assigned)) => assigned <= swept,
                     _ => true,
@@ -830,10 +986,32 @@ impl TaskQueue {
                     continue;
                 }
 
-                affected.push(task_id);
                 if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
                     tasks.remove(&task_id);
                 }
+                if let Some(spec) = entry.speculative.take() {
+                    entry.assigned_worker_id = Some(spec.worker_id);
+                    entry.assigned_session = Some(spec.session_id);
+                    entry.state = spec.state;
+                    entry.scheduled_instant = Some(spec.scheduled_instant);
+                    entry.started_instant = spec.started_instant;
+                    entry.resumed_from_checkpoint = false;
+                    records.push(JournalRecord::TaskDispatched {
+                        task_id,
+                        worker_id: spec.worker_id,
+                        timestamp_utc: now_epoch,
+                    });
+                    if spec.state == TaskState::Running {
+                        records.push(JournalRecord::TaskRunning {
+                            task_id,
+                            worker_id: spec.worker_id,
+                            timestamp_utc: now_epoch,
+                        });
+                    }
+                    continue;
+                }
+
+                affected.push(task_id);
 
                 let running_with_zero_retries =
                     entry.state == TaskState::Running && policy.zero_retries_for(entry);
@@ -1221,6 +1399,20 @@ impl TaskQueue {
             let Some(entry) = inner.tasks.get_mut(&task_id) else {
                 continue;
             };
+            let spec_matches = entry.speculative.as_ref().is_some_and(|spec| {
+                spec.worker_id == *worker_id
+                    && match session_id {
+                        Some(swept) => spec.session_id <= swept,
+                        None => true,
+                    }
+            });
+            if spec_matches {
+                entry.speculative = None;
+                if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                    tasks.remove(&task_id);
+                }
+                continue;
+            }
             // Session ids only grow, and a newer session of a worker id aborts every older one,
             // so a task on an older session than the swept one is stranded for sure.
             let session_matches = match (session_id, entry.assigned_session) {
@@ -1234,12 +1426,34 @@ impl TaskQueue {
                 continue;
             }
 
+            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                tasks.remove(&task_id);
+            }
+            if let Some(spec) = entry.speculative.take() {
+                entry.assigned_worker_id = Some(spec.worker_id);
+                entry.assigned_session = Some(spec.session_id);
+                entry.state = spec.state;
+                entry.scheduled_instant = Some(spec.scheduled_instant);
+                entry.started_instant = spec.started_instant;
+                entry.resumed_from_checkpoint = false;
+                records.push(JournalRecord::TaskDispatched {
+                    task_id,
+                    worker_id: spec.worker_id,
+                    timestamp_utc: now_epoch,
+                });
+                if spec.state == TaskState::Running {
+                    records.push(JournalRecord::TaskRunning {
+                        task_id,
+                        worker_id: spec.worker_id,
+                        timestamp_utc: now_epoch,
+                    });
+                }
+                continue;
+            }
+
             affected.push(task_id);
             if revoked && entry.task.latest_checkpoint.take().is_some() {
                 dropped_checkpoints += 1;
-            }
-            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
-                tasks.remove(&task_id);
             }
 
             if hold_for_resume {
@@ -1593,8 +1807,21 @@ impl TaskQueue {
                 return Ok(CancelOutcome {
                     newly_cancelled: false,
                     worker_to_notify: None,
+                    extra_worker_to_notify: None,
                     result,
                 });
+            }
+
+            let extra_worker_to_notify = inner
+                .tasks
+                .get_mut(task_id)
+                .and_then(|entry| entry.speculative.take())
+                .map(|spec| (spec.worker_id, spec.session_id));
+            if let Some((spec_wid, _)) = extra_worker_to_notify {
+                if let Some(tasks) = inner.worker_assignments.get_mut(&spec_wid) {
+                    tasks.remove(task_id);
+                }
+                inner.refresh_worker_resume_protection(spec_wid);
             }
 
             let worker_to_notify = match state {
@@ -1688,6 +1915,7 @@ impl TaskQueue {
                 CancelOutcome {
                     newly_cancelled: true,
                     worker_to_notify,
+                    extra_worker_to_notify,
                     result: recorded,
                 },
                 ack,

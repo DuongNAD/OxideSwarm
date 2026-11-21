@@ -4,7 +4,10 @@ use super::submit::{
     apply_default_spec_placement, build_placement, build_task_spec, read_task_input,
     run_submit_with_secret, MAX_TASK_INPUT_BYTES,
 };
-use super::tasks::{parse_worker_link, worker_is_connected, worker_state};
+use super::tasks::{
+    parse_worker_link, parse_worker_speed, parse_worker_speed_str, worker_is_connected,
+    worker_state,
+};
 use super::worker::{resolve_isolation, run_worker, ISOLATION_ENV};
 use super::*;
 use crate::config::SecretText;
@@ -1477,4 +1480,32 @@ fn test_submit_require_tool_flag_parses_and_builds_placement() {
         build_placement(&submit_args(&["--require-tool", "git", "--", "true"])).unwrap();
     apply_default_spec_placement(&cargo_spec, &mut explicit_placement);
     assert_eq!(explicit_placement.to_task_tags(), ["require:tool=git"]);
+}
+
+#[test]
+fn test_submit_repeatable_flag_and_reserved_opt_speed_tags() {
+    let default_args = submit_args(&["--", "echo", "hi"]);
+    assert!(!default_args.repeatable);
+
+    let rep_args = submit_args(&["--repeatable", "--", "echo", "hi"]);
+    assert!(rep_args.repeatable);
+
+    let mut caps = WorkerCapabilities::new("w1", 4, 4096, false, false, None)
+        .with_tags(vec!["os:linux".into(), "speed:1.25".into()]);
+    assert_eq!(parse_worker_speed_str(&caps), Some("1.25"));
+    assert_eq!(parse_worker_speed(&caps), Some(1.25));
+
+    caps.tags = vec!["speed:invalid".into()];
+    assert_eq!(parse_worker_speed(&caps), None);
+
+    assert!(rusty_grid_core::placement::validate_user_tag("opt:repeatable").is_err());
+    assert!(rusty_grid_core::placement::validate_user_tag("speed:1.0").is_err());
+    assert!(build_placement(&submit_args(&[
+        "--require-tag",
+        "opt:repeatable",
+        "--",
+        "true"
+    ]))
+    .is_err());
+    assert!(build_placement(&submit_args(&["--require-tag", "speed:1.0", "--", "true"])).is_err());
 }

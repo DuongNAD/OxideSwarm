@@ -119,6 +119,26 @@ pub(crate) async fn cancel_task_and_notify(
             debug!(task_id = %task_id, worker_id = %worker_id, error = %e, "Could not deliver CancelTask to worker");
         }
     }
+    if let Some((spec_wid, spec_sid)) = outcome.extra_worker_to_notify {
+        let msg = MasterMessage::CancelTask {
+            task_id,
+            reason: Some(format!(
+                "{reason}; task is no longer assigned to this worker"
+            )),
+        };
+        if let Err(e) = registry
+            .send_to_worker_session(&spec_wid, Some(spec_sid), msg)
+            .await
+        {
+            debug!(
+                task_id = %task_id,
+                worker_id = %spec_wid,
+                error = %e,
+                "Could not deliver CancelTask to speculative worker"
+            );
+        }
+        registry.release_dispatch(&spec_wid, spec_sid).await;
+    }
 
     let result = outcome.result.unwrap_or_else(|| {
         TaskResult::failure(
@@ -621,6 +641,32 @@ async fn apply_task_result_inner(
     //    input pins. When terminal, input pins are released and output pins stay held for
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
+        if let Some((loser_wid, loser_sid)) = outcome.cancel_sibling {
+            let cancel_msg = MasterMessage::CancelTask {
+                task_id,
+                reason: Some(
+                    "Speculative sibling completed; task is no longer assigned to this worker"
+                        .to_string(),
+                ),
+            };
+            if let Err(e) = registry
+                .send_to_worker_session(&loser_wid, loser_sid, cancel_msg)
+                .await
+            {
+                debug!(
+                    task_id = %task_id,
+                    worker_id = %loser_wid,
+                    error = %e,
+                    "Could not deliver CancelTask to losing sibling worker"
+                );
+            }
+            match loser_sid {
+                Some(sid) => registry.release_dispatch(&loser_wid, sid).await,
+                None => {
+                    let _ = registry.decrement_active_tasks(&loser_wid).await;
+                }
+            }
+        }
         if !outcome.resumed_from_checkpoint {
             if let Some(sb) = registry.speed_book() {
                 crate::speed::mutate_shared_speed_book(&sb, |book| {

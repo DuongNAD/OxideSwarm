@@ -2665,3 +2665,151 @@ async fn test_tier4_scenario_heavy_burst_load_distribution() {
         );
     }
 }
+
+#[derive(Clone, Default)]
+struct E2eLogSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl E2eLogSink {
+    fn saturated_count(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|l| l.to_ascii_lowercase().contains("saturated"))
+            .count()
+    }
+}
+
+struct E2eLogLine {
+    sink: E2eLogSink,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for E2eLogLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for E2eLogLine {
+    fn drop(&mut self) {
+        let line = String::from_utf8_lossy(&self.buf).trim_end().to_string();
+        self.sink
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for E2eLogSink {
+    type Writer = E2eLogLine;
+    fn make_writer(&'a self) -> E2eLogLine {
+        E2eLogLine {
+            sink: self.clone(),
+            buf: Vec::new(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn sched5_backpressure_warns_once_and_dispatches_on_recovery() {
+    let sink = E2eLogSink::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    let cluster = TestCluster::new_with_config(
+        SchedulerConfig::default().with_max_host_cpu_pct(50.0),
+        ReaperConfig::default(),
+    )
+    .await;
+
+    let caps = WorkerCapabilities::new("bp-mock", 2, 4096, false, false, None);
+    let (wid, tx_up, mut rx_down, worker_handle) =
+        spawn_mock_wire_worker(cluster.master_addr, caps).await;
+
+    assert!(cluster.wait_for_workers(1, TEST_WAIT_TIMEOUT).await);
+
+    // Saturate the worker above max_host_cpu_pct (50.0).
+    tx_up
+        .send(WorkerMessage::Heartbeat {
+            worker_id: wid,
+            timestamp: 1,
+            active_tasks: 0,
+            cpu_usage_pct: 92.0,
+            ram_available_mb: 2048,
+        })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx_down.recv()).await;
+
+    let task = Task::new(
+        TaskSpec::new_command("echo", vec!["ok".into()]),
+        TaskRequirements::generic(1, 64),
+    );
+    let task_id = cluster.master.submit_task(task).await.unwrap();
+
+    let warned = poll_until(TEST_WAIT_TIMEOUT, Duration::from_millis(25), || async {
+        sink.saturated_count() >= 1
+    })
+    .await;
+    assert!(warned, "expected host-CPU backpressure warning");
+
+    // Across several scheduler ticks (tick_interval = 100ms), no additional warning is logged.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(sink.saturated_count(), 1);
+    assert_eq!(
+        cluster.master.get_task_status(task_id).await.unwrap(),
+        TaskStatus::Queued
+    );
+
+    // Drop host CPU below max_host_cpu_pct; task is dispatched and completed.
+    tx_up
+        .send(WorkerMessage::Heartbeat {
+            worker_id: wid,
+            timestamp: 2,
+            active_tasks: 0,
+            cpu_usage_pct: 15.0,
+            ram_available_mb: 2048,
+        })
+        .await
+        .unwrap();
+
+    let mut assigned = false;
+    let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(Some(MasterMessage::AssignTask { task })) =
+            tokio::time::timeout(Duration::from_secs(1), rx_down.recv()).await
+        {
+            assert_eq!(task.id, task_id);
+            tx_up
+                .send(WorkerMessage::from(TaskResult::success(
+                    wid, task_id, "ok\n", 10, false,
+                )))
+                .await
+                .unwrap();
+            assigned = true;
+            break;
+        }
+    }
+    assert!(assigned, "expected task dispatch after CPU recovery");
+
+    let res = cluster
+        .master
+        .wait_task(task_id, Some(TEST_WAIT_TIMEOUT))
+        .await
+        .unwrap();
+    assert_eq!(res.exit_code, 0);
+    assert_eq!(sink.saturated_count(), 1);
+
+    worker_handle.abort();
+}

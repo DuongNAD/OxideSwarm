@@ -705,6 +705,16 @@
             font-weight: 700;
             white-space: nowrap;
         }
+        .badge-speed {
+            font-size: 9.5px;
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
 
         /* Link Badges: Direct P2P, DERP Relay, TCP/LAN */
         .link-badge {
@@ -1537,6 +1547,10 @@
                 <div class="detail-item">
                     <div class="detail-label">Độ trễ (RTT)</div>
                     <div class="detail-val" id="mRtt">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Tốc độ tương đối (Speed)</div>
+                    <div class="detail-val" id="mSpeed">--</div>
                 </div>
                 <div class="detail-item" style="grid-column: span 2;">
                     <div class="detail-label">Node ID & P2P Heartbeat</div>
@@ -2973,6 +2987,14 @@
                     gpuBadge = html`<span class="badge-gpu" title="${w.gpu_device_name || 'GPU'}">⚡ ${gName}</span>`;
                 }
 
+                // Telemetry: Relative Speed Badge (SCHED-4d)
+                let speedBadge = '';
+                if (w.speed_factor !== null && w.speed_factor !== undefined && Number.isFinite(Number(w.speed_factor))) {
+                    const sf = Number(w.speed_factor);
+                    const speedStr = Number.isInteger(sf) ? sf.toFixed(1) : String(Math.round(sf * 100) / 100);
+                    speedBadge = html`<span class="badge-speed" title="Relative task speed (${speedStr}x; 1.0x = fastest)">Speed ${speedStr}x</span>`;
+                }
+
                 // Telemetry: Mobile Battery & Thermal
                 const mobileParts = [];
                 if (w.battery_pct !== null && w.battery_pct !== undefined) {
@@ -3029,6 +3051,7 @@
                                     <span>${ramUsedGb}/${ramTotalGb}GB</span>
                                 </div>
                                 ${gpuBadge}
+                                ${speedBadge}
                                 ${mobileParts}
                             </div>
                         </div>
@@ -3205,6 +3228,17 @@
             const rttEl = document.getElementById('mRtt');
             if (rttEl) {
                 rttEl.textContent = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(num(w.rtt_ms))} ms` : '--';
+            }
+
+            const speedEl = document.getElementById('mSpeed');
+            if (speedEl) {
+                if (w.speed_factor !== null && w.speed_factor !== undefined && Number.isFinite(Number(w.speed_factor))) {
+                    const sf = Number(w.speed_factor);
+                    const speedStr = Number.isInteger(sf) ? sf.toFixed(1) : String(Math.round(sf * 100) / 100);
+                    speedEl.textContent = `${speedStr}x (1.0x = fastest)`;
+                } else {
+                    speedEl.textContent = '--';
+                }
             }
 
             const idEl = document.getElementById('mId');

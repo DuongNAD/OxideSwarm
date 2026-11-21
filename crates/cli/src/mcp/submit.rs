@@ -1066,6 +1066,14 @@ pub(super) async fn tool_submit(
     }
 
     let mut task = Task::new(spec, requirements.clone()).with_placement(&placement);
+    if args
+        .get("repeatable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        task.tags
+            .push(rusty_grid_core::placement::OPT_REPEATABLE_TAG.to_string());
+    }
     if !prepared_inputs.inputs.is_empty() {
         task = task.with_inputs(prepared_inputs.inputs.clone());
     }
