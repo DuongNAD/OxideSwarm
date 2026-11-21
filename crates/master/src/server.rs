@@ -1758,6 +1758,13 @@ impl MasterServer {
                         break;
                     }
                     tokio::select! {
+                        biased;
+                        res = p2p_shutdown.changed() => {
+                            if res.is_err() || *p2p_shutdown.borrow() {
+                                endpoint.close().await;
+                                break;
+                            }
+                        }
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else {
                                 // The endpoint was closed: nothing will ever be accepted again.
@@ -1930,12 +1937,6 @@ impl MasterServer {
                             });
                             let _ = abort_tx.send(conn_task.abort_handle());
                         }
-                        res = p2p_shutdown.changed() => {
-                            if res.is_err() || *p2p_shutdown.borrow() {
-                                endpoint.close().await;
-                                break;
-                            }
-                        }
                     }
                 }
             });
@@ -1949,6 +1950,15 @@ impl MasterServer {
                 break;
             }
             tokio::select! {
+                biased;
+                res = shutdown_rx.changed() => {
+                    if res.is_ok() && *shutdown_rx.borrow() {
+                        info!("Master server received shutdown signal; stopping accept loop");
+                        break;
+                    } else if res.is_err() {
+                        break;
+                    }
+                }
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok((stream, remote_addr)) => {
@@ -2028,14 +2038,6 @@ impl MasterServer {
                                 }
                             }
                         }
-                    }
-                }
-                res = shutdown_rx.changed() => {
-                    if res.is_ok() && *shutdown_rx.borrow() {
-                        info!("Master server received shutdown signal; stopping accept loop");
-                        break;
-                    } else if res.is_err() {
-                        break;
                     }
                 }
             }

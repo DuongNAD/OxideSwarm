@@ -687,6 +687,9 @@ pub struct ResultOutcome {
     /// `(worker_id, session_id, session_live)` that must receive `MasterMessage::CancelTask` and
     /// have its dispatch released (`0060` D3).
     pub cancel_sibling: Option<(Uuid, Option<u64>, Option<Arc<AtomicBool>>)>,
+    /// True when the attached `TaskStore` failed to enqueue the durable journal record or had
+    /// already entered a failed state (so callers must not send `oxs:result-ack:<token>`).
+    pub durability_failed: bool,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.

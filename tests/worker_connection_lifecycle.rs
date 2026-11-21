@@ -338,13 +338,18 @@ async fn test_master_shutdown_frame_makes_the_worker_wait_and_reconnect() {
     })
     .await;
 
-    // The worker says goodbye...
+    // The worker must NOT send `WorkerMessage::Disconnecting` when the Master announced its own
+    // shutdown (sending `Disconnecting` would trigger task evacuation instead of `SESSION_RESUME`
+    // hold): it closes the transport cleanly (EOF) and reconnects.
     let farewell = conn
         .wait_for(Duration::from_secs(5), |m| {
             matches!(m, WorkerMessage::Disconnecting { .. })
         })
         .await;
-    assert!(farewell.is_some(), "the worker announces its departure");
+    assert!(
+        farewell.is_none(),
+        "the worker must not send WorkerMessage::Disconnecting on MasterMessage::Shutdown, got {farewell:?}"
+    );
     drop(conn);
 
     // ...and keeps running: it comes back as the same worker, promptly (a restarted master is

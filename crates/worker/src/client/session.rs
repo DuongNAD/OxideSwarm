@@ -1067,14 +1067,12 @@ impl WorkerClient {
                                 self.heartbeat_tracker.record_ack(timestamp, current_epoch_secs());
                             }
                             MasterMessage::Shutdown { reason, .. } => {
-                                // The Master is going away, not telling this worker to quit: say
-                                // goodbye and reconnect (the supervisor waits for it to come back).
+                                // The Master is going away (not the worker): keep `farewell = None`
+                                // so we close cleanly without sending `WorkerMessage::Disconnecting`,
+                                // preserving any `SESSION_RESUME` tasks/outbox without triggering
+                                // evacuation on the master.
                                 warn!(reason = %reason, "Master announced its shutdown; disconnecting and waiting for it to return");
                                 self.master_shutdown_announced = true;
-                                farewell = Some(WorkerMessage::Disconnecting {
-                                    worker_id,
-                                    reason: "Master ordered shutdown".into(),
-                                });
                                 break Err(GridError::ConnectionClosed);
                             }
                             MasterMessage::AssignTask { task } => {

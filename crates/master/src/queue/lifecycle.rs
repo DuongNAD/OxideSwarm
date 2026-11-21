@@ -358,6 +358,7 @@ impl TaskQueue {
                     session_id: None,
                     session_live: None,
                     cancel_sibling: None,
+                    durability_failed: false,
                 },
                 None,
             ));
@@ -397,6 +398,10 @@ impl TaskQueue {
         // If task is already terminal (e.g. Cancelled by master directive, Completed, Failed), preserve state
         if state.is_terminal() {
             tracing::debug!(task_id = %task_id, state = ?state, "Ignoring result for terminal task");
+            let durability_failed = inner
+                .store
+                .as_ref()
+                .is_some_and(|s| s.failure_reason().is_some());
             return Ok((
                 ResultOutcome {
                     disposition: ResultDisposition::Late,
@@ -409,6 +414,7 @@ impl TaskQueue {
                     session_id: reporting_session_id,
                     session_live: reporting_session_live,
                     cancel_sibling: None,
+                    durability_failed,
                 },
                 None,
             ));
@@ -448,6 +454,10 @@ impl TaskQueue {
             };
             if let Some((next_state, promoted)) = sibling_outcome {
                 let mut ack = None;
+                let mut durability_failed = inner
+                    .store
+                    .as_ref()
+                    .is_some_and(|s| s.failure_reason().is_some());
                 if let Some((spec_wid, spec_state)) = promoted {
                     inner.update_active_task(task_id);
                     inner.sync_workspace_active(task_id);
@@ -456,15 +466,28 @@ impl TaskQueue {
                         worker_id: spec_wid,
                         timestamp_utc: now_epoch,
                     };
-                    if spec_state == TaskState::Running {
+                    let durable_res = if spec_state == TaskState::Running {
                         inner.append_non_durable(&dispatch_rec);
-                        ack = inner.append_durable_warn(&JournalRecord::TaskRunning {
+                        inner.append_durable(&JournalRecord::TaskRunning {
                             task_id,
                             worker_id: spec_wid,
                             timestamp_utc: now_epoch,
-                        });
+                        })
                     } else {
-                        ack = inner.append_durable_warn(&dispatch_rec);
+                        inner.append_durable(&dispatch_rec)
+                    };
+                    match durable_res {
+                        Ok(maybe_ack) => {
+                            ack = maybe_ack;
+                            durability_failed = false;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "Failed to enqueue durable task journal record"
+                            );
+                            durability_failed = true;
+                        }
                     }
                     inner.maybe_trigger_compaction();
                 }
@@ -480,6 +503,7 @@ impl TaskQueue {
                         session_id: reporting_session_id,
                         session_live: reporting_session_live,
                         cancel_sibling: None,
+                        durability_failed,
                     },
                     ack,
                 ));
@@ -723,7 +747,13 @@ impl TaskQueue {
             );
         }
 
-        let ack = inner.append_durable_warn(&journal_record);
+        let (ack, durability_failed) = match inner.append_durable(&journal_record) {
+            Ok(ack) => (ack, false),
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to enqueue durable task journal record");
+                (None, true)
+            }
+        };
         inner.maybe_trigger_compaction();
 
         Ok((
@@ -738,6 +768,7 @@ impl TaskQueue {
                 session_id: reporting_session_id,
                 session_live: reporting_session_live,
                 cancel_sibling,
+                durability_failed,
             },
             ack,
         ))
