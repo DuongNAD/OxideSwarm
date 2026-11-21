@@ -674,15 +674,19 @@ impl MemberStoreInner {
     }
 }
 
-/// Resolves a target identifier by exact ID or unique hex ID prefix (`>= 4` hex characters).
-/// Never matches by display name so an attacker cannot shadow an ID prefix with a crafted name.
-fn resolve_id_or_prefix<'a, I>(target: &str, ids: I, kind: &str) -> GridResult<String>
+enum IdLookupError {
+    Empty,
+    Ambiguous(usize),
+    NotFound,
+}
+
+fn resolve_id_or_prefix_typed<'a, I>(target: &str, ids: I) -> Result<String, IdLookupError>
 where
     I: IntoIterator<Item = &'a str>,
 {
     let q = target.trim();
     if q.is_empty() {
-        return Err(GridError::Config(format!("{kind} target cannot be empty")));
+        return Err(IdLookupError::Empty);
     }
     let q_clean = q.replace('-', "").to_ascii_lowercase();
     let all: Vec<&'a str> = ids.into_iter().collect();
@@ -704,17 +708,36 @@ where
             return Ok(prefix_matches[0].to_string());
         }
         if prefix_matches.len() > 1 {
-            return Err(GridError::Config(format!(
-                "ambiguous {kind} ID prefix '{q}'; matches {} entries",
-                prefix_matches.len()
-            )));
+            return Err(IdLookupError::Ambiguous(prefix_matches.len()));
         }
     }
-    Err(GridError::Config(format!("no {kind} matching ID '{q}'")))
+    Err(IdLookupError::NotFound)
 }
 
-/// Resolves a target identifier for `members rename` by exact ID, unique hex ID prefix (`>= 4`
-/// hex chars), or finally unique exact `name`.
+/// Resolves a target identifier by exact ID or unique hex ID prefix (`>= 4` hex characters).
+/// Never matches by display name so an attacker cannot shadow an ID prefix with a crafted name.
+fn resolve_id_or_prefix<'a, I>(target: &str, ids: I, kind: &str) -> GridResult<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let q = target.trim();
+    match resolve_id_or_prefix_typed(target, ids) {
+        Ok(id) => Ok(id),
+        Err(IdLookupError::Empty) => {
+            Err(GridError::Config(format!("{kind} target cannot be empty")))
+        }
+        Err(IdLookupError::Ambiguous(count)) => Err(GridError::Config(format!(
+            "ambiguous {kind} ID prefix '{q}'; matches {count} entries"
+        ))),
+        Err(IdLookupError::NotFound) => {
+            Err(GridError::Config(format!("no {kind} matching ID '{q}'")))
+        }
+    }
+}
+
+/// Resolves a target identifier by exact ID, unique hex ID prefix (`>= 4` hex chars), or finally
+/// unique exact `name`. Exact IDs and ID prefixes take precedence so a crafted name cannot shadow
+/// an ID prefix.
 fn resolve_id_prefix_or_name<'a, I>(target: &str, items: I, kind: &str) -> GridResult<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -724,8 +747,17 @@ where
         return Err(GridError::Config(format!("{kind} target cannot be empty")));
     }
     let all: Vec<(&'a str, &'a str)> = items.into_iter().collect();
-    if let Ok(id) = resolve_id_or_prefix(q, all.iter().map(|(id, _)| *id), kind) {
-        return Ok(id);
+    match resolve_id_or_prefix_typed(q, all.iter().map(|(id, _)| *id)) {
+        Ok(id) => return Ok(id),
+        Err(IdLookupError::Ambiguous(count)) => {
+            return Err(GridError::Config(format!(
+                "ambiguous {kind} ID prefix '{q}'; matches {count} entries"
+            )));
+        }
+        Err(IdLookupError::Empty) => {
+            return Err(GridError::Config(format!("{kind} target cannot be empty")));
+        }
+        Err(IdLookupError::NotFound) => {}
     }
     let name_matches: Vec<&str> = all
         .iter()
@@ -2152,15 +2184,19 @@ impl MemberStore {
         )
     }
 
-    /// Revokes an enrolled member by exact ID or unique hex ID prefix (`>= 4` chars), records its
-    /// public key in `revoked_keys`, and releases its owned worker IDs.
-    /// Returns `(revoked_entry, owned_worker_ids)`.
+    /// Revokes an enrolled member by exact ID, unique hex ID prefix (`>= 4` chars), or unique
+    /// exact display name, records its public key in `revoked_keys`, and releases its owned worker
+    /// IDs. Returns `(revoked_entry, owned_worker_ids)`.
     pub fn revoke_member(&self, target: &str) -> GridResult<(MemberEntry, Vec<Uuid>)> {
         self.run_admin_mutation(
             |guard| {
-                let id = resolve_id_or_prefix(
+                let id = resolve_id_prefix_or_name(
                     target,
-                    guard.state.by_pubkey.values().map(|m| m.id.as_str()),
+                    guard
+                        .state
+                        .by_pubkey
+                        .values()
+                        .map(|m| (m.id.as_str(), m.name.as_str())),
                     "member",
                 )?;
                 let pubkey = *guard
@@ -4857,5 +4893,91 @@ mod non_member_claim_tests {
             vec![member_wid]
         );
         assert!(!on_disk.worker_last_seq.contains_key(&orphan_wid));
+    }
+
+    fn deterministic_keys_with_same_4hex_prefix() -> (String, PublicKey, PublicKey, PublicKey) {
+        let mut seen: std::collections::HashMap<String, PublicKey> =
+            std::collections::HashMap::new();
+        let mut pair: Option<(String, PublicKey, PublicKey)> = None;
+        for i in 0u32..200_000 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let pk = PublicKey::from_bytes(bytes);
+            let prefix = pk.member_id()[..4].to_string();
+            if let Some(first) = seen.get(&prefix) {
+                match pair {
+                    None => pair = Some((prefix, *first, pk)),
+                    Some((shared_prefix, pk_a, pk_b)) if shared_prefix != prefix => {
+                        return (shared_prefix, pk_a, pk_b, pk);
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                seen.insert(prefix, pk);
+            }
+        }
+        panic!("failed to find deterministic keys sharing a 4-hex member ID prefix");
+    }
+
+    #[test]
+    fn ambiguous_hex_prefix_rejects_name_shadowing_on_rename_and_revoke() {
+        let (shared_prefix, pk_a, pk_b, pk_shadower) = deterministic_keys_with_same_4hex_prefix();
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemberStore::from_entries(vec![
+            MemberEntry::new("honest-a", pk_a, vec![MemberRole::Worker]),
+            MemberEntry::new("honest-b", pk_b, vec![MemberRole::Worker]),
+            MemberEntry::new(&shared_prefix, pk_shadower, vec![MemberRole::Worker]),
+        ])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+
+        let err_rename = store.rename_member(&shared_prefix, "hijacked").unwrap_err();
+        assert!(
+            matches!(&err_rename, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error on rename, got {err_rename:?}"
+        );
+
+        let err_revoke = store.revoke_member(&shared_prefix).unwrap_err();
+        assert!(
+            matches!(&err_revoke, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error on revoke, got {err_revoke:?}"
+        );
+
+        // No member was modified or revoked.
+        let members = store.list_members();
+        assert_eq!(members.len(), 3);
+        assert_eq!(
+            members
+                .iter()
+                .find(|m| m.public_key == pk_shadower)
+                .unwrap()
+                .name,
+            shared_prefix
+        );
+
+        // Also test without any member named `shared_prefix`: still ambiguous, never "no member".
+        store.revoke_member(&pk_shadower.member_id()).unwrap();
+        let err_rename_unmatched = store
+            .rename_member(&shared_prefix, "still-blocked")
+            .unwrap_err();
+        assert!(
+            matches!(&err_rename_unmatched, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error without matching name on rename, got {err_rename_unmatched:?}"
+        );
+        let err_revoke_unmatched = store.revoke_member(&shared_prefix).unwrap_err();
+        assert!(
+            matches!(&err_revoke_unmatched, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error without matching name on revoke, got {err_revoke_unmatched:?}"
+        );
+        assert_eq!(store.list_members().len(), 2);
+
+        // Control: an unambiguous 4-hex prefix still takes precedence over a matching name.
+        let unique_prefix = pk_a.member_id()[..4].to_string();
+        let uniq_store = MemberStore::from_entries(vec![
+            MemberEntry::new("target-by-id", pk_a, vec![MemberRole::Worker]),
+            MemberEntry::new(&unique_prefix, pk_shadower, vec![MemberRole::Worker]),
+        ]);
+        let renamed = uniq_store.rename_member(&unique_prefix, "id-won").unwrap();
+        assert_eq!(renamed.id, pk_a.member_id());
+        assert_eq!(renamed.name, "id-won");
     }
 }

@@ -889,12 +889,15 @@ then JOIN-2 and USB-1 in parallel.
   its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
   machine on another network joins through `--p2p` with an invite sent by chat, and the run is
   recorded with its date.
-- **Status (2026-11-18, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
+- **Status (2026-11-21, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
   loses every connection at once (worker sessions over TCP and QUIC, client connections over TCP
   and P2P, blob and MCP connections), and the tasks on its workers are requeued at once without the
-  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. Open:
+  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. ENROLL-1d
+  dashboard API/UI, tests, and docs are built (`crates/master/src/web_ui/members.rs`,
+  `crates/master/src/dashboard.html`, `tests/dashboard_api_test.rs`, `tests/dashboard_security_test.rs`,
+  `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`). Open:
   cancelling the member's submitted tasks (design 0051 D5 step 2, a store format change for the
-  owner) and ENROLL-1d.
+  owner) and the recorded live `--p2p` invite run from another network.
 
 ### USB-1: Set up machines from a USB stick
 
@@ -2565,3 +2568,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-21: LV-10 Partial (steps 1–3, [design 0058](design/0058-lasting-value.md)): added `CITATION.cff` (CFF 1.2.0, `version: "0.4.4"`, `MIT` / `Apache-2.0`, `"The OxideSwarm Authors"`), stdlib metadata/version-sync test in `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`; step 4 (Zenodo DOI) stays with the owner.
 - 2026-11-21: PROTO-5 Partial ([design 0083](design/0083-one-version-window.md)): pinned `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release in `.github/workflows/ci.yml` `release-skew` with per-tag directory isolation, added `--release-tag` to `scripts/release_skew.py`, added CLI and static CI workflow tests in `tests/test_release_skew.py`, and updated `CLAUDE.md` and `docs/reference.md`; stays Partial awaiting live GitHub pull request CI run of `release skew (ubuntu-latest)` showing the `v0.3.0` table row.
 - 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `LV-10` and `PROTO-5` Partial: 247 items, 172 Implemented, 23 Partial, 52 Planned, 0 Design only; 25 open items are In and 50 are Out.
+- 2026-11-21: ENROLL-1d Partial (API/UI/tests/docs complete; [design 0051](design/0051-machine-identity-and-invites.md)): wired `MasterAuthContext` and `WaiterMap` onto `MasterHandle` and `WebUiState`; added `MemberConnections::list_active`, `revoke_member_with_teardown` reuse, `AuthScope::Admin` enforcement on all `/api/members*` and `/api/invites*` routes (`crates/master/src/auth.rs`), `Method::DELETE` CORS preflight, and `crates/master/src/web_ui/members.rs`; added XSS-safe `Members` tab to `crates/master/src/dashboard.html`; expanded `tests/dashboard_api_test.rs` and `tests/dashboard_security_test.rs`; updated `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`, and `design/0051`. `ENROLL-1` remains `Partial` pending `ENROLL-1c` step 2 (store format change) and the recorded live two-network `--p2p` run.
