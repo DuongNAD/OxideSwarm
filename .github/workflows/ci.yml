@@ -155,6 +155,23 @@ jobs:
         run: cargo build -p agent_mesh --locked
       - name: run Rust hub + Python agent interop suites
         run: python tests/test_agent_mesh_rust_hub_cross_interop.py
+      - name: build CLI and agent mesh binaries for Wave 2 E2E tests
+        if: matrix.os != 'windows-latest'
+        run: cargo build -p rusty_grid_cli -p agent_mesh --locked
+      - name: run Wave 2 E2E tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPISO="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/oxs_e2e.XXXXXX")"
+          trap 'rm -rf "$TMPISO"' EXIT
+          chmod 700 "$TMPISO"
+          mkdir -p "$TMPISO/bin" "$TMPISO/home" "$TMPISO/tmp"
+          printf '#!/bin/sh\necho "Now drawing from '\''AC Power'\''"\nexit 0\n' > "$TMPISO/bin/pmset"
+          chmod 755 "$TMPISO/bin/pmset"
+          HOME="$TMPISO/home" USERPROFILE="$TMPISO/home" TMPDIR="$TMPISO/tmp" PATH="$TMPISO/bin:$PATH" \
+            RUSTY_GRID_NO_BATTERY=1 OXIDESWARM_PROFILE=debug \
+            python3 -m unittest tests/test_wave2_e2e.py -v
 
   workspace-test:
     # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
