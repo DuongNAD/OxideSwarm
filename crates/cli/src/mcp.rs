@@ -52,6 +52,7 @@ use crate::secret_cmd::SecretOpts;
 
 mod cancel;
 mod doctor;
+mod shard;
 mod status;
 pub(crate) mod submit;
 mod submit_matrix;
@@ -728,6 +729,101 @@ pub fn available_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "shard",
+            description: "Run a command, shell script, or Cargo nextest build-once test suite across N parallel shards with 1-based OX_SHARD_INDEX and OX_SHARD_TOTAL environment injection, slot-aware worker spreading, fail-fast cancellation, and optional JUnit XML merging.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 256,
+                        "description": "Number of parallel shards to run (1..=256)"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["command", "shell"],
+                        "description": "Task execution type per shard (default: command)"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Executable name (or shell command string when type is 'shell')"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Command arguments (or extra cargo nextest run arguments in build_once mode)"
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "Shell script body when type is 'shell'"
+                    },
+                    "interpreter": {
+                        "type": "string",
+                        "description": "Shell interpreter override (default: sh or cmd.exe)"
+                    },
+                    "stdin": {
+                        "type": "string",
+                        "description": "Standard input string passed to command shards"
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Environment variables for each shard (OX_SHARD_INDEX and OX_SHARD_TOTAL are always injected)"
+                    },
+                    "build_once": {
+                        "type": "boolean",
+                        "description": "Build once per (os, arch) via cargo nextest archive and pass the archive via Task::inputs"
+                    },
+                    "build_source": {
+                        "type": "string",
+                        "description": "Relative Rust project directory inside the working directory for build_once (default: '.')"
+                    },
+                    "fail_fast": {
+                        "type": "boolean",
+                        "description": "Cancel remaining in-flight shards via CancelTask on the first shard failure"
+                    },
+                    "junit_out": {
+                        "type": "string",
+                        "description": "Relative file path inside the working directory to write merged JUnit XML"
+                    },
+                    "junit_glob": {
+                        "type": "string",
+                        "description": "Sandbox-relative glob selecting per-shard JUnit XML files (default: '**/junit*.xml')"
+                    },
+                    "cores": { "type": "integer", "description": "Minimum CPU cores required per shard" },
+                    "ram_mb": { "type": "integer", "description": "Minimum RAM in MB required per shard" },
+                    "vram_mb": { "type": "integer", "description": "Minimum GPU VRAM in MB required per shard" },
+                    "gpu": { "type": "boolean", "description": "Require GPU worker node" },
+                    "os": { "type": "string", "description": "Required worker OS (macos, windows, linux, android)" },
+                    "arch": { "type": "string", "description": "Required worker CPU arch (x86_64, aarch64)" },
+                    "worker": { "type": "string", "description": "Target worker name or UUID" },
+                    "isolation": { "type": "string", "description": "Minimum worker isolation level (fs, fs+net)" },
+                    "require_tags": { "type": "array", "items": { "type": "string" }, "description": "Required worker user tags" },
+                    "tools": { "type": "array", "items": { "type": "string" }, "description": "Required host tool tags" },
+                    "timeout_secs": { "type": "integer", "description": "Per-shard execution timeout in seconds (default: 60, or 1800 with build_once)" },
+                    "wait_secs": { "type": "integer", "description": "Alias for timeout_secs" },
+                    "max_retries": { "type": "integer", "description": "Maximum retries per shard" },
+                    "repeatable": { "type": "boolean", "description": "Attach opt:repeatable for speculative straggler re-run" },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Local files/directories inside working directory to stage as Task::inputs" },
+                    "workspace": {
+                        "type": "object",
+                        "description": "Single-worker persistent workspace (mutually exclusive with files and build_once)",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "sync_dir": { "type": "string" },
+                            "cwd": { "type": "string" }
+                        },
+                        "required": ["name"]
+                    },
+                    "outputs": { "type": "array", "items": { "type": "string" }, "description": "Sandbox output file paths or globs to retrieve" },
+                    "output_dir": { "type": "string", "description": "Local directory inside working directory to download per-shard outputs into" },
+                    "max_output_bytes": { "type": "integer", "description": "Maximum escaped bytes of stdout and stderr combined across the response (default: 16384)" }
+                },
+                "required": ["count"]
+            }),
+        },
+        ToolDefinition {
             name: "task_result",
             description: "Fetch execution results, output logs, exit code, and artifacts for a task ID with optional blocking wait.",
             input_schema: json!({
@@ -1174,6 +1270,222 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             VerifyArgs::check(obj)?;
             Ok(())
         }
+        "shard" => {
+            let count_u64 = check_opt_u64(obj, "count")?
+                .ok_or_else(|| "Missing required property 'count'".to_string())?;
+            let count = usize::try_from(count_u64).map_err(|_| {
+                format!(
+                    "Property 'count' must be between 1 and {}",
+                    crate::shard::HARD_MAX_SHARDS
+                )
+            })?;
+            crate::shard::validate_shard_count(count)?;
+
+            let build_once = obj
+                .get("build_once")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            check_opt_bool(obj, "build_once")?;
+            check_opt_bool(obj, "fail_fast")?;
+            let build_source = check_opt_str(obj, "build_source")?;
+            let raw_type = check_opt_str(obj, "type")?.unwrap_or("command");
+            let task_type = raw_type.to_ascii_lowercase();
+            if !matches!(task_type.as_str(), "command" | "shell") {
+                return Err(format!(
+                    "Invalid shard 'type': '{raw_type}' (expected 'command' or 'shell')"
+                ));
+            }
+            let cmd_opt = check_opt_str(obj, "command")?;
+            let script_opt = check_opt_str(obj, "script")?;
+            let interp_opt = check_opt_str(obj, "interpreter")?;
+            let stdin_opt = check_opt_str(obj, "stdin")?;
+
+            if build_once {
+                if task_type != "command" {
+                    return Err(
+                        "Property 'build_once' cannot be combined with type 'shell'".to_string()
+                    );
+                }
+                if cmd_opt.is_some()
+                    || script_opt.is_some()
+                    || interp_opt.is_some()
+                    || stdin_opt.is_some()
+                {
+                    return Err(
+                        "Property 'build_once' cannot be combined with 'command', 'script', 'interpreter', or 'stdin'"
+                            .to_string(),
+                    );
+                }
+                if let Some(src) = build_source {
+                    if src.trim().is_empty()
+                        || std::path::Path::new(src)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(format!(
+                            "Property 'build_source' ('{src}') must be non-empty and must not contain '..'"
+                        ));
+                    }
+                }
+            } else {
+                if build_source.is_some() {
+                    return Err("Property 'build_source' requires 'build_once: true'".to_string());
+                }
+                match task_type.as_str() {
+                    "command" => {
+                        if cmd_opt.is_none_or(|c| c.trim().is_empty()) {
+                            return Err(
+                                "Command shard requires a non-empty 'command' property".to_string()
+                            );
+                        }
+                    }
+                    "shell" => {
+                        let has_script = script_opt.is_some_and(|s| !s.trim().is_empty());
+                        let has_cmd = cmd_opt.is_some_and(|c| !c.trim().is_empty());
+                        if !has_script && !has_cmd {
+                            return Err(
+                                "Shell shard requires a non-empty 'script' or 'command' property"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            check_opt_str_array(obj, "args")?;
+            if let Some(env_val) = obj.get("env") {
+                if !env_val.is_null() {
+                    let env_obj = env_val.as_object().ok_or_else(|| {
+                        "Property 'env' must be an object mapping strings to strings".to_string()
+                    })?;
+                    for (k, v) in env_obj {
+                        if !v.is_string() {
+                            return Err(format!("Environment variable '{k}' must be a string"));
+                        }
+                    }
+                }
+            }
+            check_opt_u64(obj, "cores")?;
+            check_opt_u64(obj, "ram_mb")?;
+            check_opt_u64(obj, "vram_mb")?;
+            check_opt_bool(obj, "gpu")?;
+
+            let os_opt = check_opt_str(obj, "os")?;
+            let arch_opt = check_opt_str(obj, "arch")?;
+            let worker_opt = check_opt_str(obj, "worker")?;
+            let req_tags = check_opt_str_array(obj, "require_tags")?;
+            let tools_opt = check_opt_str_array(obj, "tools")?;
+            let isolation_opt = check_opt_str(obj, "isolation")?;
+            let mut placement_tags = Vec::new();
+            if let Some(level) = isolation_opt {
+                let level = IsolationLevel::parse_required(level)
+                    .map_err(|e| format!("Invalid placement constraints: {e}"))?;
+                placement_tags.push(format!("{REQUIRE_PREFIX}iso={level}"));
+            }
+            if let Some(os) = os_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}os={os}"));
+            }
+            if let Some(arch) = arch_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}arch={arch}"));
+            }
+            if let Some(worker) = worker_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
+            }
+            if let Some(tags) = req_tags {
+                for t in tags {
+                    placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
+                }
+            }
+            if let Some(tools) = tools_opt {
+                for t in tools {
+                    placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
+                }
+            }
+            Placement::from_task_tags(&placement_tags)
+                .map_err(|e| format!("Invalid placement constraints: {e}"))?;
+
+            check_opt_u64(obj, "timeout_secs")?;
+            check_opt_u64(obj, "wait_secs")?;
+            check_opt_u64(obj, "max_retries")?;
+            check_opt_bool(obj, "repeatable")?;
+
+            let files_opt = check_opt_str_array(obj, "files")?;
+            if let Some(ws_val) = obj.get("workspace") {
+                if !ws_val.is_null() {
+                    if build_once {
+                        return Err(
+                            "Property 'workspace' cannot be used together with 'build_once'"
+                                .to_string(),
+                        );
+                    }
+                    if files_opt.is_some() {
+                        return Err(
+                            "Property 'workspace' cannot be used together with 'files'".to_string()
+                        );
+                    }
+                    let ws_obj = ws_val
+                        .as_object()
+                        .ok_or_else(|| "Property 'workspace' must be an object".to_string())?;
+                    for key in ws_obj.keys() {
+                        if !matches!(key.as_str(), "name" | "sync_dir" | "cwd") {
+                            return Err(format!("Unknown property 'workspace.{key}'"));
+                        }
+                    }
+                    let ws_name = check_opt_str(ws_obj, "name")?
+                        .ok_or_else(|| "Missing required property 'workspace.name'".to_string())?;
+                    rusty_grid_core::task::validate_workspace_name(ws_name)?;
+                    if let Some(sync_dir) = check_opt_str(ws_obj, "sync_dir")? {
+                        if sync_dir.trim().is_empty()
+                            || std::path::Path::new(sync_dir)
+                                .components()
+                                .any(|c| matches!(c, std::path::Component::ParentDir))
+                        {
+                            return Err(format!(
+                                "Property 'workspace.sync_dir' ('{sync_dir}') must be non-empty and must not contain '..'"
+                            ));
+                        }
+                    }
+                    if let Some(cwd_rel) = check_opt_str(ws_obj, "cwd")? {
+                        if task_type != "command" {
+                            return Err(
+                                "Property 'workspace.cwd' requires task type 'command'".to_string()
+                            );
+                        }
+                        crate::cli_app::normalize_workspace_cwd(cwd_rel)?;
+                    }
+                }
+            }
+
+            if let Some(outputs) = check_opt_str_array(obj, "outputs")? {
+                if !outputs.is_empty() {
+                    rusty_grid_core::blob::validate_output_patterns(&outputs)
+                        .map_err(|e| format!("Expected outputs error: {e}"))?;
+                }
+            }
+            let junit_out = check_opt_str(obj, "junit_out")?;
+            if let Some(jout) = junit_out {
+                if jout.trim().is_empty()
+                    || std::path::Path::new(jout)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(format!(
+                        "Property 'junit_out' ('{jout}') must be non-empty and must not contain '..'"
+                    ));
+                }
+            }
+            if let Some(jglob) = check_opt_str(obj, "junit_glob")? {
+                if junit_out.is_none() {
+                    return Err("Property 'junit_glob' requires 'junit_out'".to_string());
+                }
+                rusty_grid_core::blob::OutputPattern::parse(jglob)
+                    .map_err(|e| format!("Invalid 'junit_glob': {e}"))?;
+            }
+            check_opt_str(obj, "output_dir")?;
+            check_opt_u64(obj, "max_output_bytes")?;
+            Ok(())
+        }
         "task_result" => {
             let tid = check_opt_str(obj, "task_id")?
                 .ok_or_else(|| "Missing required property 'task_id'".to_string())?;
@@ -1224,6 +1536,7 @@ pub async fn call_tool_with_context(
         "status" => status::tool_status(state, args).await,
         "workers" => workers::tool_workers(state, args).await,
         "submit" => submit::tool_submit(state, args, ctx).await,
+        "shard" => shard::tool_shard(state, args, ctx).await,
         "task_result" => task_result::tool_task_result(state, args, ctx).await,
         "cancel" => cancel::tool_cancel(state, args).await,
         "doctor" => doctor::tool_doctor(state, args).await,
@@ -2191,7 +2504,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),
@@ -2260,6 +2573,26 @@ mod tests {
             })
         )
         .is_ok());
+
+        // Shard validation
+        assert!(validate_tool_arguments("shard", &json!({})).is_err());
+        assert!(validate_tool_arguments("shard", &json!({"count": 0, "command": "echo"})).is_err());
+        assert!(
+            validate_tool_arguments("shard", &json!({"count": 257, "command": "echo"})).is_err()
+        );
+        assert!(validate_tool_arguments("shard", &json!({"count": 3})).is_err());
+        assert!(validate_tool_arguments("shard", &json!({"count": 3, "command": "echo"})).is_ok());
+        assert!(validate_tool_arguments("shard", &json!({"count": 3, "build_once": true})).is_ok());
+        assert!(validate_tool_arguments(
+            "shard",
+            &json!({"count": 3, "build_once": true, "command": "echo"})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "shard",
+            &json!({"count": 3, "command": "echo", "junit_glob": "**/junit.xml"})
+        )
+        .is_err());
         assert!(validate_tool_arguments(
             "submit",
             &json!({
@@ -2772,5 +3105,44 @@ mod tests {
             .any(|t| t == rusty_grid_core::placement::OPT_REPEATABLE_TAG));
 
         let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_tool_shard_direct_defense_in_depth_refuses_workspace_with_build_once_or_files() {
+        let state = McpState::new("127.0.0.1:0".to_string(), None);
+        let mut ctx = ToolCallContext::default();
+
+        let res_bo = shard::tool_shard(
+            &state,
+            &json!({
+                "count": 1,
+                "workspace": "ws",
+                "build_once": true
+            }),
+            &mut ctx,
+        )
+        .await;
+        assert!(res_bo.is_error, "{res_bo:?}");
+        let msg_bo = match &res_bo.content[0] {
+            ToolContent::Text { text } => text.as_str(),
+        };
+        assert!(msg_bo.contains("build_once"), "{msg_bo}");
+
+        let res_files = shard::tool_shard(
+            &state,
+            &json!({
+                "count": 1,
+                "workspace": "ws",
+                "files": ["a.txt"],
+                "command": "echo"
+            }),
+            &mut ctx,
+        )
+        .await;
+        assert!(res_files.is_error, "{res_files:?}");
+        let msg_files = match &res_files.content[0] {
+            ToolContent::Text { text } => text.as_str(),
+        };
+        assert!(msg_files.contains("files"), "{msg_files}");
     }
 }

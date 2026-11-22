@@ -16,6 +16,8 @@ python3 benchmarks/grid/scale_harness.py --workers 500 --submitters 20 --tasks 2
 python3 benchmarks/grid/scale_harness.py --workers 1000 --submitters 20 --tasks 2000 --runs 3
 python3 benchmarks/grid/scale_harness.py --quick --no-write                     # smoke run, 64 simulated workers
 python3 tests/test_scale_harness.py                                             # helper checks, no binary
+python3 benchmarks/grid/bench_shard_r2_m1.py --bin target/release/oxideswarm    # (e) AX-2 Spike R2 & Measure M1 (loopback)
+python3 benchmarks/grid/test_bench_shard.py                                     # AX-2 helper checks, no binary
 ```
 
 Every run starts its own master and workers on `127.0.0.1` with ephemeral ports, gives each process a
@@ -219,6 +221,19 @@ Compared against the `SCALE-1` baseline on the same host, `500w` burst throughpu
 and `1000w` maintains `414.4` tasks/s with `91.8 MiB` steady master RSS while holding full fair-share
 queues, bitset worker indexing, and durable cold-result spilling.
 
+**(e) Sharded test runs (`AX-2`, Spike `R2` & Measure `M1`).** `2026-11-22` (UTC), Apple M5 (`10` cores, `32 GiB`, macOS `arm64`, AC power, single-host loopback `127.0.0.1` — NOT 3 physical machines), release build of `oxideswarm` (`rusty-grid 0.4.4`), running `725` compiled `--lib` unit tests (`rusty_grid_core` + `rusty_grid_master`, `worker_threads=2`, `1` warmup + `3` measured runs per worker count):
+
+- Record: [`results/2026-11-22-r2-m1-macos-arm64-apple-m5.json`](results/2026-11-22-r2-m1-macos-arm64-apple-m5.json)
+
+| Workers | R2 `submit` wall, s (median, range) | M1 `shard` wall, s (median, range) | M1 `waited_ms` (median) | M1 `task_time_sum_ms` (median) |
+|---|---|---|---|---|
+| 1 | 56.05 (54.78 to 68.18) | 54.85 (52.46 to 65.24) | 54846 | 54843 |
+| 2 | 37.47 (34.37 to 37.54) | 34.36 (34.18 to 36.01) | 34351 | 62004 |
+| 3 | 27.32 (25.18 to 27.84) | 27.76 (25.54 to 28.11) | 27754 | 70305 |
+
+- **Spike `R2` (`submit --wait`)**: `3` loopback workers saved **`51.26 %`** wall time vs `1` worker (`27.32 s` vs `56.05 s`), clearing design `0056`'s `>= 30 %` stop-rule threshold (`stop_rule_triggered: false`).
+- **Measure `M1` (`oxideswarm shard`)**: `3` loopback workers ran in **`0.5061x`** of `1`-worker median time (`27.76 s` vs `54.85 s`; minimum `25.54 s`, `0.466x`) on a loaded host (`load_average_before: [7.44, 14.24, 12.48]`), where shared-CPU contention raised `task_time_sum_ms` from `54.8 s` (`1w`) to `70.3 s` (`3w`).
+
 ## Limits
 
 - (a) and (b) run on one machine over loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
@@ -234,3 +249,4 @@ queues, bitset worker indexing, and durable cold-result spilling.
 - (c) is one pair of machines on one LAN, a single worker and one crate: it shows what a reused `target/` saves, not how the grid scales, and a
   relayed or Internet link would add transfer time to a first run.
 - (d) isolates the master's control plane, blob store and journal by running simulated workers in one driver process on the same host over loopback (or user-space stream delays): it skips per-task OS process spawn, sandbox setup, and real multi-host NIC/router queues, and submit-to-assign timestamps include the Windows timer and scheduler quantum (~15.6 ms).
+- (e) runs on **single-host loopback (`127.0.0.1`) only; NOT 3 physical machines**: all 3 workers, the master, and the CLI client share one machine's CPU cores (`10` cores), memory bus, and disk, and the run experienced background host load (`load_average_before: [7.44, 14.24, 12.48]`). These numbers validate `oxideswarm shard` scheduling, overhead, and relative sharding speedup under loopback contention; they do not claim 3 physical machines.

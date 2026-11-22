@@ -18,6 +18,7 @@ pub mod pair;
 pub mod rendezvous_cmd;
 pub mod run_summary;
 pub mod secret_cmd;
+pub mod shard;
 pub mod size_check;
 pub mod usb_kit;
 pub mod verify;
