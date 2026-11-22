@@ -2100,6 +2100,10 @@ impl MemberStore {
     /// Rejects a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)
     /// without consuming an invite use.
     pub fn reject_pending(&self, target: &str) -> GridResult<String> {
+        // Same lock order as `run_admin_mutation`: a reject never lands between an approval's
+        // check and its commit, so a concurrent approve and reject resolve to one success and
+        // one "no pending enrollment".
+        let _write_guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         guard.prune_pending(now);
